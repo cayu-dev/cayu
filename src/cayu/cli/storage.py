@@ -1,4 +1,4 @@
-"""`cayu storage` subcommands: schema status / migrate, and JSON/JSONL export.
+"""`cayu storage` subcommands: schema status / migrate, JSON/JSONL export, and prune.
 
 Realizes ADR 0001 Phase 2 (explicit migrate + status) and Phase 3 (JSONL
 export). Migrations are an explicit, operator-run step — never silent on import
@@ -20,7 +20,7 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -45,6 +45,7 @@ _SUBCOMMANDS = (
     ("status", "Show the database schema revision and any pending migrations."),
     ("migrate", "Apply pending forward migrations under the backend lock."),
     ("export", "Export sessions (or tasks) as JSON or JSONL for backup/replay."),
+    ("prune", "Dry-run or apply storage retention to sessions, evals, artifacts, workspaces."),
 )
 
 #: ``cayu storage status`` exit codes. 1 remains a general error and 2 an
@@ -121,6 +122,9 @@ def add_storage_parser(subparsers: Any) -> None:
                 help="Session component byte ceiling (default: 8388608); does not change stored-value validation.",
             )
             add_output_options(sub, formats=("json", "jsonl"))
+        elif name == "prune":
+            _add_prune_arguments(sub)
+            add_output_options(sub)
         else:
             if name == "migrate":
                 backup = sub.add_mutually_exclusive_group()
@@ -180,13 +184,23 @@ def add_storage_parser(subparsers: Any) -> None:
 def run_storage(args: argparse.Namespace) -> int:
     """Dispatch a parsed ``storage`` invocation; return a process exit code."""
     try:
-        _resolve_storage_target(args)
+        if args.storage_command == "prune" and _prune_needs_app(args):
+            if args.sqlite is not None or args.postgres is not None:
+                raise ValueError(
+                    "--target artifacts, workspaces and all use the project's application "
+                    "stores; --sqlite and --postgres apply only to sessions and evals."
+                )
+            args.target_source = "project-application"
+        else:
+            _resolve_storage_target(args)
         if args.storage_command == "status":
             return _status(args)
         if args.storage_command == "migrate":
             return _migrate(args)
         if args.storage_command == "export":
             return _export(args)
+        if args.storage_command == "prune":
+            return _prune(args)
     except (schema.SchemaError, OSError, RuntimeError, ValueError) as exc:
         message = str(exc)
         if args.postgres is not None:
@@ -231,6 +245,132 @@ def _resolve_storage_target(args: argparse.Namespace) -> None:
     else:
         args.postgres = dsn
     args.target_source = source
+
+
+_RETENTION_DURATION = re.compile(r"([1-9][0-9]{0,8})([smhdw])")
+_RETENTION_DURATION_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86_400, "w": 604_800}
+
+
+def _retention_duration(value: str) -> timedelta:
+    match = _RETENTION_DURATION.fullmatch(value.strip())
+    if match is None:
+        raise argparse.ArgumentTypeError("duration must look like 90s, 30m, 12h, 30d, or 2w.")
+    return timedelta(seconds=int(match.group(1)) * _RETENTION_DURATION_SECONDS[match.group(2)])
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("value must be a positive integer.") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer.")
+    return parsed
+
+
+_PRUNE_TARGETS = ("sessions", "evals", "artifacts", "workspaces", "all")
+#: Targets that need the project's application factory rather than one store.
+_APP_PRUNE_TARGETS = frozenset({"artifacts", "workspaces"})
+
+
+def _add_prune_arguments(sub: argparse.ArgumentParser) -> None:
+    action = sub.add_mutually_exclusive_group(required=True)
+    action.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be removed; change nothing.",
+    )
+    action.add_argument(
+        "--apply",
+        action="store_true",
+        help="Remove the selected data and write a durable audit record.",
+    )
+    sub.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        choices=_PRUNE_TARGETS,
+        help=(
+            "What to prune; repeat or use all (default: sessions). sessions and evals "
+            "use the resolved store; artifacts, workspaces and all build the project's "
+            "application to use its configured stores."
+        ),
+    )
+    sub.add_argument(
+        "--older-than",
+        required=True,
+        type=_retention_duration,
+        metavar="DURATION",
+        help="Select items last updated or finished longer ago than this (for example 30d).",
+    )
+    sub.add_argument(
+        "--mode",
+        choices=("compact", "delete"),
+        default="compact",
+        help=(
+            "Sessions only: compact removes delta events and large stored tool outputs "
+            "and keeps the session; delete removes whole sessions (default: compact). "
+            "Other targets always delete."
+        ),
+    )
+    sub.add_argument(
+        "--status",
+        dest="statuses",
+        action="append",
+        choices=("completed", "failed"),
+        help="Sessions and workspaces: terminal session status to select (default: both).",
+    )
+    sub.add_argument(
+        "--max-items",
+        "--max-sessions",
+        dest="max_items",
+        type=_positive_int,
+        help="Act on at most this many items per target in one run (default: 1000).",
+    )
+    sub.add_argument(
+        "--max-bytes",
+        type=_positive_int,
+        help="Stop a target after its selected items reach this many stored bytes.",
+    )
+    sub.add_argument(
+        "--compact-tool-output-min-bytes",
+        type=_positive_int,
+        help="Sessions: compact stored tool outputs at least this large (default: 16384).",
+    )
+    sub.add_argument(
+        "--artifact-min-bytes",
+        type=_positive_int,
+        help="Artifacts: select only artifacts at least this large.",
+    )
+    sub.add_argument(
+        "--artifact-target-total-bytes",
+        type=_positive_int,
+        help="Artifacts: stop once a store's total size is at or below this.",
+    )
+    for flag, dest, metavar, help_text in (
+        ("--protect-session", "protected_session_ids", "SESSION_ID", "session or its lineage"),
+        ("--protect-eval", "protected_eval_ids", "RUN_ID", "eval run (or result revision)"),
+        ("--protect-artifact", "protected_artifact_ids", "ARTIFACT_ID", "artifact"),
+    ):
+        sub.add_argument(
+            flag,
+            dest=dest,
+            action="append",
+            default=[],
+            metavar=metavar,
+            help=f"Never prune this {help_text}; repeat for each reference outside the app.",
+        )
+
+
+def _prune_targets(args: argparse.Namespace) -> frozenset[str]:
+    targets = set(getattr(args, "targets", None) or ["sessions"])
+    if "all" in targets:
+        targets = {"sessions", "evals", "artifacts", "workspaces"}
+    return frozenset(targets)
+
+
+def _prune_needs_app(args: argparse.Namespace) -> bool:
+    return bool(_prune_targets(args) & _APP_PRUNE_TARGETS)
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -1942,6 +2082,181 @@ def _export(args: argparse.Namespace) -> int:
     except Exception as exc:
         _render_error(args, _sanitize(str(exc), args.postgres))
         return 1
+
+
+def _prune_policy(args: argparse.Namespace) -> Any:
+    from cayu.storage.retention import (
+        ArtifactRetentionPolicy,
+        EvalRetentionPolicy,
+        RetentionMode,
+        SessionRetentionPolicy,
+        StorageRetentionPolicy,
+        WorkspaceRetentionPolicy,
+    )
+
+    targets = _prune_targets(args)
+    dry_run = not args.apply
+    common: dict[str, Any] = {"older_than": args.older_than, "dry_run": dry_run}
+    if args.max_items is not None:
+        common["max_items"] = args.max_items
+    if args.max_bytes is not None:
+        common["max_bytes"] = args.max_bytes
+    statuses = {"statuses": frozenset(args.statuses)} if args.statuses else {}
+    session_extra: dict[str, Any] = {}
+    if args.compact_tool_output_min_bytes is not None:
+        session_extra["compact_tool_output_min_bytes"] = args.compact_tool_output_min_bytes
+    artifact_extra: dict[str, Any] = {}
+    if args.artifact_min_bytes is not None:
+        artifact_extra["min_size_bytes"] = args.artifact_min_bytes
+    if args.artifact_target_total_bytes is not None:
+        artifact_extra["target_total_bytes"] = args.artifact_target_total_bytes
+    return StorageRetentionPolicy(
+        sessions=(
+            SessionRetentionPolicy(
+                mode=RetentionMode(args.mode), **common, **statuses, **session_extra
+            )
+            if "sessions" in targets
+            else None
+        ),
+        evals=EvalRetentionPolicy(**common) if "evals" in targets else None,
+        artifacts=(
+            ArtifactRetentionPolicy(**common, **artifact_extra) if "artifacts" in targets else None
+        ),
+        workspaces=(
+            WorkspaceRetentionPolicy(**common, **statuses) if "workspaces" in targets else None
+        ),
+        dry_run=dry_run,
+        protected_session_ids=frozenset(args.protected_session_ids),
+        protected_eval_ids=frozenset(args.protected_eval_ids),
+        protected_artifact_ids=frozenset(args.protected_artifact_ids),
+    )
+
+
+def _eval_store_for(session_store: Any) -> Any:
+    """The eval store that shares the session store's target, as the control plane uses."""
+
+    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    if isinstance(session_store, SQLiteSessionStore) and str(session_store.path) != ":memory:":
+        from cayu.storage.evals_sqlite import SQLiteEvalStore
+
+        return SQLiteEvalStore(session_store.path, schema_mode=schema.SchemaMode.VALIDATE)
+    conninfo = getattr(session_store, "_conninfo", None)
+    if isinstance(session_store, PostgresSessionStore) and isinstance(conninfo, str):
+        from cayu.storage.evals_postgres import PostgresEvalStore
+
+        return PostgresEvalStore(conninfo, schema_mode=schema.SchemaMode.VALIDATE)
+    return None
+
+
+async def _close_quietly(store: Any) -> None:
+    close = getattr(store, "close", None)
+    if close is not None:
+        await close()
+
+
+def _prune(args: argparse.Namespace) -> int:
+    from cayu.runtime.storage_retention import apply_storage_retention
+
+    policy = _prune_policy(args)
+    targets = _prune_targets(args)
+
+    async def run_with_store() -> int:
+        store = _session_store(args)
+        eval_store = None
+        try:
+            await _ensure_store_ready_for_export(store)
+            if "evals" in targets:
+                eval_store = _eval_store_for(store)
+            report = await apply_storage_retention(
+                policy, session_store=store, eval_store=eval_store
+            )
+        finally:
+            await _close_quietly(eval_store)
+            await store.close()
+        _render_prune(args, report)
+        return 1 if report.errors else 0
+
+    async def run_with_app() -> int:
+        from cayu.cli.project import (
+            _discover_configured_project,
+            build_project_app,
+            close_project_app,
+            project_context,
+        )
+
+        project = _discover_configured_project(
+            command="cayu storage prune",
+            configuration_example='[tool.cayu] factory = "module:build_app"',
+            explicit_target_example=None,
+        )
+        with project_context(project.root):
+            app = build_project_app(project.factory_target, command="Storage prune")
+            eval_store = _eval_store_for(app.session_store) if "evals" in targets else None
+            try:
+                report = await app.apply_storage_retention(policy, eval_store=eval_store)
+            finally:
+                await _close_quietly(eval_store)
+                await close_project_app(app)
+        _render_prune(args, report)
+        return 1 if report.errors else 0
+
+    run = run_with_app if _prune_needs_app(args) else run_with_store
+    if args.postgres is None:
+        return asyncio.run(run())
+    try:
+        return asyncio.run(run())
+    except schema.SchemaError:
+        raise
+    except Exception as exc:
+        _render_error(args, _sanitize(str(exc), args.postgres))
+        return 1
+
+
+def _render_prune(args: argparse.Namespace, report: Any) -> None:
+    with _output_stream(args.output) as stream:
+        if args.output_format == "json":
+            payload = {
+                "schema_version": "1",
+                "backend": (
+                    "application"
+                    if args.sqlite is None and args.postgres is None
+                    else "sqlite"
+                    if args.sqlite is not None
+                    else "postgres"
+                ),
+                "target_source": getattr(args, "target_source", "explicit"),
+                "dry_run": report.dry_run,
+                "totals": report.totals(),
+                "reports": [item.model_dump(mode="json") for item in report.reports],
+                "skipped": report.skipped,
+                "errors": report.errors,
+            }
+            print(json.dumps(payload, sort_keys=True), file=stream)
+            return
+        action = "would act on" if report.dry_run else "acted on"
+        for target_report in report.reports:
+            totals = target_report.totals()
+            print(
+                f"{target_report.store_kind} {target_report.mode.value} "
+                f"{'dry run' if target_report.dry_run else 'apply'}: {action} "
+                f"{totals['items']} item(s), {totals['bytes']} byte(s); "
+                f"{totals['protected']} protected, {totals['deferred']} deferred",
+                file=stream,
+            )
+            for item in target_report.items:
+                counts = ", ".join(f"{key}={value}" for key, value in item.counts.items())
+                print(f"  {item.item_id}: {item.bytes} byte(s) ({counts})", file=stream)
+            for item in target_report.protected:
+                reasons = ", ".join(protection.value for protection in item.protections)
+                print(f"  kept {item.item_id}: {reasons}", file=stream)
+            if target_report.audit_id is not None:
+                print(f"  audit: {target_report.audit_id}", file=stream)
+        for target, reason in report.skipped.items():
+            print(f"{target}: skipped ({reason})", file=stream)
+        for target, error in report.errors.items():
+            print(f"{target}: failed ({error})", file=stream)
 
 
 async def _export_sessions(

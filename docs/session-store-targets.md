@@ -83,8 +83,8 @@ non-mutating backend contract.
 
 ## Storage commands
 
-`cayu storage status`, `cayu storage migrate`, and `cayu storage export` use
-this resolver. Without `--sqlite` or `--postgres` they select the store from
+`cayu storage status`, `cayu storage migrate`, `cayu storage export`, and
+`cayu storage prune` use this resolver. Without `--sqlite` or `--postgres` they select the store from
 `CAYU_DATABASE_URL`, then `[tool.cayu.session_store]`, then the existing
 `data/cayu.db` convention. An explicit option always wins, and `--postgres`
 still accepts a libpq key/value DSN as well as a URL. The JSON output names
@@ -95,6 +95,10 @@ Output and errors never contain the connection string. The Postgres `target`
 field and the migration receipt carry only the scheme, host, port, and
 database name; credentials and query parameters are removed, including from
 driver errors after a failed connection.
+
+`cayu storage prune` dry-runs or applies storage retention; its sessions and
+evals targets use this resolver, and its artifacts and workspaces targets use
+the project's application stores. See [Storage retention](storage-retention.md).
 
 ### Direct connection for migrations
 

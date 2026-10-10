@@ -5,7 +5,7 @@ import hmac
 import json
 import math
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -74,6 +74,15 @@ if TYPE_CHECKING:
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.storage.retention import (
+        RetentionAuditEntry,
+        RetentionAuditRecord,
+        RetentionMode,
+        RetentionProgressCallback,
+        RetentionProtection,
+        RetentionReport,
+        SessionRetentionPolicy,
+    )
 
 
 from cayu._clock import utc_clock, utc_duration_cutoff
@@ -1622,6 +1631,7 @@ class SQLiteSessionStore(
     supports_session_closure_detachment: ClassVar[bool] = True
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
     supports_session_closure_progress: ClassVar[bool] = True
+    supports_storage_retention: ClassVar[bool] = True
     participant_session_binding_version: ClassVar[int | None] = 1
     recipient_continuation_selection_version: ClassVar[int | None] = 1
     context_view_selection_fence_version: ClassVar[int | None] = 1
@@ -6197,100 +6207,228 @@ class SQLiteSessionStore(
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                session = self._load_unlocked(session_id)
-                if _access_bounds is not None:
-                    _access_bounds.require_action(session, "delete")
-                if session is None:
+                if not self._delete_session_in_transaction_unlocked(
+                    session_id,
+                    closure_receipt=closure_receipt,
+                    _access_bounds=_access_bounds,
+                ):
                     self._connection.rollback()
                     return
-                for owner in self._closure_lineage_owners_unlocked((session_id,)):
-                    _check_closure_lineage_owner(owner, (session_id,), closure_receipt)
-                if (
-                    self._connection.execute(
-                        "SELECT 1 FROM cayu_session_closure_progress AS p "
-                        "JOIN cayu_sessions AS child ON child.id = p.root_session_id "
-                        "WHERE child.parent_session_id = ? LIMIT 1",
-                        (session_id,),
-                    ).fetchone()
-                    is not None
-                ):
-                    raise ValueError("Session lineage is owned by an unfinished recursive closure.")
-                if closure_receipt is not None and closure_receipt.get("operation") == "recursive":
-                    expected_parent = closure_receipt.get("original_parent_session_id")
-                    if (
-                        type(expected_parent) is not str
-                        or session.parent_session_id != expected_parent
-                    ):
-                        raise ValueError("Recursive closure child parent identity conflict.")
-                if session.status in DELETE_BLOCKED_SESSION_STATUSES:
-                    raise ValueError(
-                        f"Cannot delete a session while it is {session.status}; "
-                        f"interrupt it first: {session_id}"
-                    )
-                if (
-                    self.context_view_version is not None
-                    and self._connection.execute(
-                        "SELECT 1 FROM cayu_context_view_selections s "
-                        "LEFT JOIN cayu_context_views v ON v.view_id = s.view_id "
-                        "WHERE (v.source_session_id = ? OR v.view_id IS NULL) "
-                        "AND s.state IN ('selected', 'adopted', 'transferred') "
-                        "AND (s.state <> 'selected' OR s.expires_at_ms > ?) LIMIT 1",
-                        (session_id, int(self._ownership_clock().timestamp() * 1000)),
-                    ).fetchone()
-                    is not None
-                ):
-                    raise ValueError("Session has an active context-view retention pin.")
-                durable_child = self._connection.execute(
-                    "SELECT id FROM cayu_sessions "
-                    "WHERE parent_session_id = ? "
-                    "AND json_extract(metadata_json, '$.subagent.mode') = ? "
-                    "ORDER BY id LIMIT 1",
-                    (session_id, "durable"),
-                ).fetchone()
-                if (
-                    closure_receipt is not None or _access_bounds is not None
-                ) and self._connection.execute(
-                    "SELECT 1 FROM cayu_sessions WHERE parent_session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone() is not None:
-                    raise ValueError("Closure deletion requires no remaining child edges.")
-                if durable_child is not None:
-                    raise ValueError(
-                        _durable_subagent_parent_delete_block_reason(durable_child["id"])
-                    )
-                self._require_session_erasure_quiescence_unlocked(session)
-                self._connection.execute(
-                    "UPDATE cayu_peer_content_receipts SET target_deleted = 1 "
-                    "WHERE json_extract(receipt_json, '$.status') = 'appended' "
-                    "AND json_extract(receipt_json, '$.target_session_id') = ? "
-                    "AND json_extract(receipt_json, '$.target_session_instance_id') = ?",
-                    (session.id, session.instance_id),
-                )
-                # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
-                # the self-FK is ON DELETE SET NULL so children keep loading.
-                self._connection.execute(
-                    "DELETE FROM cayu_sessions WHERE id = ?",
-                    (session_id,),
-                )
-                if closure_receipt is not None:
-                    receipt_plan_id = closure_receipt.get("plan_id")
-                    if type(receipt_plan_id) is not str:
-                        raise ValueError("Session closure receipt is missing plan identity.")
-                    self._connection.execute(
-                        "INSERT INTO cayu_session_closure_receipts "
-                        "(session_id, plan_id, committed_at, receipt_json) VALUES (?, ?, ?, ?) "
-                        "ON CONFLICT(session_id, plan_id) DO UPDATE SET receipt_json = excluded.receipt_json",
-                        (
-                            session_id,
-                            receipt_plan_id,
-                            datetime.now(UTC).isoformat(),
-                            json.dumps(closure_receipt, ensure_ascii=False, separators=(",", ":")),
-                        ),
-                    )
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
                 raise
+
+    async def apply_retention_policy(
+        self,
+        policy: SessionRetentionPolicy,
+        *,
+        protected_session_ids: Collection[str] = (),
+        references: Mapping[RetentionProtection, Collection[str]] | None = None,
+        progress: RetentionProgressCallback | None = None,
+    ) -> RetentionReport:
+        from cayu.storage import _session_retention as retention
+
+        return await retention.apply_retention_policy(
+            retention.SQLiteSessionRetentionBackend(self),
+            policy,
+            protected_session_ids=protected_session_ids,
+            references=references,
+            progress=progress,
+        )
+
+    async def inspect_session_retention(
+        self,
+        session_ids: Collection[str],
+        *,
+        mode: RetentionMode | None = None,
+        include_store_guards: bool = True,
+    ) -> dict[str, tuple[RetentionProtection, ...]]:
+        from cayu.storage import _session_retention as retention
+        from cayu.storage.retention import RetentionMode
+
+        return await retention.inspect_session_protections(
+            retention.SQLiteSessionRetentionBackend(self),
+            session_ids,
+            mode=RetentionMode.DELETE if mode is None else RetentionMode(mode),
+            store_guards=include_store_guards,
+        )
+
+    async def retention_artifact_references(self) -> frozenset[str]:
+        from cayu.storage import _session_retention as retention
+
+        return await retention.session_artifact_references(
+            retention.SQLiteSessionRetentionBackend(self)
+        )
+
+    async def list_retention_audits(
+        self,
+        *,
+        limit: int = 20,
+        item_id: str | None = None,
+        store_kind: str | None = None,
+    ) -> tuple[RetentionAuditRecord, ...]:
+        from cayu.storage import _session_retention as retention
+
+        return await retention.list_retention_audits(
+            retention.SQLiteSessionRetentionBackend(self),
+            limit=limit,
+            item_id=None if item_id is None else require_clean_nonblank(item_id, "item_id"),
+            store_kind=store_kind,
+        )
+
+    async def load_retention_audit(self, audit_id: str) -> RetentionAuditRecord | None:
+        from cayu.storage import _session_retention as retention
+
+        return await retention.load_retention_audit(
+            retention.SQLiteSessionRetentionBackend(self),
+            require_clean_nonblank(audit_id, "audit_id"),
+        )
+
+    async def begin_retention_audit(
+        self,
+        *,
+        store_kind: str,
+        mode: RetentionMode,
+        policy: Mapping[str, Any],
+        started_at: datetime,
+    ) -> str:
+        from cayu.storage import _session_retention as retention
+
+        return await retention.begin_retention_audit(
+            retention.SQLiteSessionRetentionBackend(self),
+            store_kind=require_clean_nonblank(store_kind, "store_kind"),
+            mode=mode,
+            policy=dict(policy),
+            started_at=started_at,
+        )
+
+    async def record_retention_entry(self, audit_id: str, entry: RetentionAuditEntry) -> None:
+        from cayu.storage import _session_retention as retention
+
+        await retention.record_retention_entry(
+            retention.SQLiteSessionRetentionBackend(self), audit_id, entry
+        )
+
+    async def complete_retention_audit(
+        self, audit_id: str, *, completed_at: datetime, summary: Mapping[str, Any]
+    ) -> None:
+        from cayu.storage import _session_retention as retention
+
+        await retention.complete_retention_audit(
+            retention.SQLiteSessionRetentionBackend(self),
+            audit_id,
+            completed_at=completed_at,
+            summary=dict(summary),
+        )
+
+    def _require_session_deletion_admission_unlocked(
+        self,
+        session: Session,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+    ) -> None:
+        """Check deletion guards that do not depend on remaining child edges."""
+
+        session_id = session.id
+        for owner in self._closure_lineage_owners_unlocked((session_id,)):
+            _check_closure_lineage_owner(owner, (session_id,), closure_receipt)
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM cayu_session_closure_progress AS p "
+                "JOIN cayu_sessions AS child ON child.id = p.root_session_id "
+                "WHERE child.parent_session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("Session lineage is owned by an unfinished recursive closure.")
+        if closure_receipt is not None and closure_receipt.get("operation") == "recursive":
+            expected_parent = closure_receipt.get("original_parent_session_id")
+            if type(expected_parent) is not str or session.parent_session_id != expected_parent:
+                raise ValueError("Recursive closure child parent identity conflict.")
+        if session.status in DELETE_BLOCKED_SESSION_STATUSES:
+            raise ValueError(
+                f"Cannot delete a session while it is {session.status}; "
+                f"interrupt it first: {session_id}"
+            )
+        if (
+            self.context_view_version is not None
+            and self._connection.execute(
+                "SELECT 1 FROM cayu_context_view_selections s "
+                "LEFT JOIN cayu_context_views v ON v.view_id = s.view_id "
+                "WHERE (v.source_session_id = ? OR v.view_id IS NULL) "
+                "AND s.state IN ('selected', 'adopted', 'transferred') "
+                "AND (s.state <> 'selected' OR s.expires_at_ms > ?) LIMIT 1",
+                (session_id, int(self._ownership_clock().timestamp() * 1000)),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("Session has an active context-view retention pin.")
+
+    def _delete_session_in_transaction_unlocked(
+        self,
+        session_id: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> bool:
+        """Apply delete_session inside the caller's write transaction.
+
+        Returns ``False`` when the session does not exist. Guards raise
+        ``ValueError``; the caller owns commit and rollback.
+        """
+
+        session = self._load_unlocked(session_id)
+        if _access_bounds is not None:
+            _access_bounds.require_action(session, "delete")
+        if session is None:
+            return False
+        self._require_session_deletion_admission_unlocked(session, closure_receipt=closure_receipt)
+        durable_child = self._connection.execute(
+            "SELECT id FROM cayu_sessions "
+            "WHERE parent_session_id = ? "
+            "AND json_extract(metadata_json, '$.subagent.mode') = ? "
+            "ORDER BY id LIMIT 1",
+            (session_id, "durable"),
+        ).fetchone()
+        if (closure_receipt is not None or _access_bounds is not None) and self._connection.execute(
+            "SELECT 1 FROM cayu_sessions WHERE parent_session_id = ? LIMIT 1",
+            (session_id,),
+        ).fetchone() is not None:
+            raise ValueError("Closure deletion requires no remaining child edges.")
+        if durable_child is not None:
+            raise ValueError(_durable_subagent_parent_delete_block_reason(durable_child["id"]))
+        self._require_session_erasure_quiescence_unlocked(session)
+        self._connection.execute(
+            "UPDATE cayu_peer_content_receipts SET target_deleted = 1 "
+            "WHERE json_extract(receipt_json, '$.status') = 'appended' "
+            "AND json_extract(receipt_json, '$.target_session_id') = ? "
+            "AND json_extract(receipt_json, '$.target_session_instance_id') = ?",
+            (session.id, session.instance_id),
+        )
+        # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
+        # the self-FK is ON DELETE SET NULL so children keep loading.
+        self._connection.execute(
+            "DELETE FROM cayu_sessions WHERE id = ?",
+            (session_id,),
+        )
+        if closure_receipt is not None:
+            receipt_plan_id = closure_receipt.get("plan_id")
+            if type(receipt_plan_id) is not str:
+                raise ValueError("Session closure receipt is missing plan identity.")
+            self._connection.execute(
+                "INSERT INTO cayu_session_closure_receipts "
+                "(session_id, plan_id, committed_at, receipt_json) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id, plan_id) DO UPDATE SET receipt_json = excluded.receipt_json",
+                (
+                    session_id,
+                    receipt_plan_id,
+                    datetime.now(UTC).isoformat(),
+                    json.dumps(closure_receipt, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+        return True
 
     @runtime_session_mutation
     async def update_labels(

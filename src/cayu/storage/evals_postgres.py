@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime, timedelta
 from time import monotonic
-from typing import Any, ClassVar, LiteralString, cast
+from typing import TYPE_CHECKING, Any, ClassVar, LiteralString, cast
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from cayu.storage.retention import (
+        EvalRetentionPolicy,
+        RetentionAuditRecord,
+        RetentionProgressCallback,
+        RetentionProtection,
+        RetentionReport,
+    )
 
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
@@ -406,6 +415,58 @@ def _baseline_mutation_from_row(row: Any) -> EvalBaselineMutationRecord:
 
 class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     """Restart-durable, multi-worker eval persistence for PostgreSQL."""
+
+    supports_storage_retention: ClassVar[bool] = True
+
+    async def apply_retention_policy(
+        self,
+        policy: EvalRetentionPolicy,
+        *,
+        protected_ids: Collection[str] = (),
+        references: Mapping[RetentionProtection, Collection[str]] | None = None,
+        progress: RetentionProgressCallback | None = None,
+    ) -> RetentionReport:
+        from cayu.storage import _eval_retention as retention
+
+        return await retention.apply_eval_retention_policy(
+            retention.PostgresEvalRetentionBackend(self),
+            policy,
+            protected_ids=protected_ids,
+            references=references,
+            progress=progress,
+        )
+
+    async def list_retention_audits(
+        self,
+        *,
+        limit: int = 20,
+        item_id: str | None = None,
+        store_kind: str | None = None,
+    ) -> tuple[RetentionAuditRecord, ...]:
+        from cayu.storage import _eval_retention as retention
+        from cayu.storage import _retention_sql as audit
+
+        async with retention.PostgresEvalRetentionBackend(self).snapshot() as sql:
+            return await audit.list_audits(sql, limit=limit, store_kind=store_kind, item_id=item_id)
+
+    async def load_retention_audit(self, audit_id: str) -> RetentionAuditRecord | None:
+        from cayu.storage import _eval_retention as retention
+        from cayu.storage import _retention_sql as audit
+
+        async with retention.PostgresEvalRetentionBackend(self).snapshot() as sql:
+            return await audit.load_audit(sql, audit_id)
+
+    async def retention_artifact_references(self) -> frozenset[str]:
+        from cayu.storage import _eval_retention as retention
+
+        return await retention.eval_artifact_references(
+            retention.PostgresEvalRetentionBackend(self)
+        )
+
+    async def retention_session_references(self) -> frozenset[str]:
+        from cayu.storage import _eval_retention as retention
+
+        return await retention.eval_session_references(retention.PostgresEvalRetentionBackend(self))
 
     durable: ClassVar[bool] = True
     captured_results: ClassVar[bool] = True

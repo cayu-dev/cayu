@@ -2763,6 +2763,15 @@ class AgentSnapshotComponentProvider(ABC):
 
 
 class AgentSnapshotStore(ABC):
+    async def retention_held_identifiers(self) -> frozenset[str]:
+        """Identifiers named by snapshots that an unreleased pin or protection holds.
+
+        Storage retention keeps sessions, eval runs and artifacts whose ids or
+        result digests appear here. The set is deliberately broad: every short
+        string value and every SHA-256 hex digest in the held documents.
+        """
+        raise NotImplementedError("This snapshot store does not report held identifiers.")
+
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return local files that own this store's durable state."""
 
@@ -4161,6 +4170,30 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         if self.path == Path(":memory:"):
             return ()
         return (self.path.resolve(),)
+
+    async def retention_held_identifiers(self) -> frozenset[str]:
+        return await asyncio.to_thread(self._retention_held_identifiers)
+
+    def _retention_held_identifiers(self) -> frozenset[str]:
+        from cayu.storage._retention_sql import held_snapshot_identifiers
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                "WITH held AS ("
+                "SELECT snapshot_root, binding_id FROM cayu_agent_snapshot_pins WHERE released = 0 "
+                "UNION SELECT snapshot_root, binding_id FROM cayu_agent_snapshot_protections "
+                "WHERE released = 0) "
+                "SELECT b.binding_document, b.snapshot_document, b.put_receipt_document "
+                "FROM cayu_agent_snapshot_bindings b JOIN held h ON h.binding_id = b.binding_id "
+                "UNION ALL SELECT r.manifest_document, '', '' FROM cayu_agent_snapshot_roots r "
+                "WHERE r.snapshot_root IN (SELECT snapshot_root FROM held) "
+                "UNION ALL SELECT n.document, '', '' FROM cayu_agent_snapshot_nodes n "
+                "JOIN cayu_agent_snapshot_root_nodes rn ON rn.node_digest = n.digest "
+                "WHERE rn.snapshot_root IN (SELECT snapshot_root FROM held)"
+            ).fetchall()
+        return held_snapshot_identifiers(
+            str(value) for row in rows for value in tuple(row) if value
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)

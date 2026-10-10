@@ -8,13 +8,13 @@ import logging
 import math
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from time import monotonic
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from uuid import uuid4
 
 from pydantic import (
@@ -3124,6 +3124,16 @@ def run_spec(request: EvalRunRequest) -> EvalRunSpec:
     return EvalRunSpec.model_validate(values)
 
 
+if TYPE_CHECKING:
+    from cayu.storage.retention import (
+        EvalRetentionPolicy,
+        RetentionAuditRecord,
+        RetentionProgressCallback,
+        RetentionProtection,
+        RetentionReport,
+    )
+
+
 class EvalStore(ABC):
     """Bounded persistence for public eval corpora, run state, and safe results."""
 
@@ -3134,10 +3144,52 @@ class EvalStore(ABC):
     trial_checkpointing: ClassVar[bool] = False
     suite_authoring: ClassVar[bool] = False
     judge_calibrations: ClassVar[bool] = False
+    #: Storage retention is an explicit operator capability, never implicit.
+    supports_storage_retention: ClassVar[bool] = False
 
     @abstractmethod
     async def close(self) -> None:
         """Release store resources; process-local stores may perform no work."""
+
+    async def apply_retention_policy(
+        self,
+        policy: EvalRetentionPolicy,
+        *,
+        protected_ids: Collection[str] = (),
+        references: Mapping[RetentionProtection, Collection[str]] | None = None,
+        progress: RetentionProgressCallback | None = None,
+    ) -> RetentionReport:
+        """Dry-run or apply eval retention to terminal runs; an operator-only action.
+
+        A run is kept while a baseline or baseline history selects its result,
+        while it retains campaign trial checkpoints, while another run's retry
+        lineage names it, while an agent-snapshot pin in the same database
+        references it, or while ``protected_ids`` or ``references`` (keyed by
+        the protection they imply) names its run id, result revision or a trial
+        result digest. Each run is re-checked and deleted in its own transaction with
+        its audit entry. Default raises ``NotImplementedError``.
+        """
+        raise NotImplementedError("This EvalStore does not support storage retention.")
+
+    async def list_retention_audits(
+        self,
+        *,
+        limit: int = 20,
+        item_id: str | None = None,
+        store_kind: str | None = None,
+    ) -> tuple[RetentionAuditRecord, ...]:
+        raise NotImplementedError("This EvalStore does not support storage retention.")
+
+    async def load_retention_audit(self, audit_id: str) -> RetentionAuditRecord | None:
+        raise NotImplementedError("This EvalStore does not support storage retention.")
+
+    async def retention_artifact_references(self) -> frozenset[str]:
+        """Artifact ids that stored runs, results and trial checkpoints name."""
+        raise NotImplementedError("This EvalStore does not support storage retention.")
+
+    async def retention_session_references(self) -> frozenset[str]:
+        """Session ids that stored runs, results and trial checkpoints name."""
+        raise NotImplementedError("This EvalStore does not support storage retention.")
 
     @abstractmethod
     async def save_corpus(

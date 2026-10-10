@@ -369,6 +369,12 @@ class LocalArtifactStore(ArtifactStore):
             _change_artifact_pin, self.root, self._root_identity, artifact_id, owner, False
         )
 
+    async def has_retention_pins(self, artifact_id: str) -> bool | None:
+        artifact_id = _validate_artifact_id(artifact_id)
+        return await asyncio.to_thread(
+            _artifact_has_pins, self.root, self._root_identity, artifact_id
+        )
+
     def _resource_metadata(self, artifact_id: str) -> ArtifactMetadata:
         target = _artifact_dir(self.root, artifact_id)
         with (
@@ -1425,6 +1431,22 @@ def _delete_artifact(
             parent_fd=root_fd,
             ignore_errors=False,
         )
+
+
+def _artifact_has_pins(root: Path, root_identity: tuple[int, int], artifact_id: str) -> bool:
+    target = _artifact_dir(root, artifact_id)
+    with (
+        _artifact_ownership_lock(root, target.name),
+        _open_store_root(root, root_identity) as root_fd,
+    ):
+        try:
+            with _open_artifact_directory(target, parent_fd=root_fd) as (directory_fd, _):
+                return any(
+                    name.startswith("pin_")
+                    for name in os.listdir(directory_fd if directory_fd is not None else target)
+                )
+        except FileNotFoundError:
+            return False
 
 
 def _artifact_dir(root: Path, artifact_id: str) -> Path:

@@ -12,7 +12,7 @@ import traceback as traceback_module
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -536,6 +536,15 @@ if TYPE_CHECKING:
         ExternalWaitRetirement,
         ExternalWaitRetirementRequest,
         ExternalWaitScope,
+    )
+    from cayu.storage.retention import (
+        RetentionAuditEntry,
+        RetentionAuditRecord,
+        RetentionMode,
+        RetentionProgressCallback,
+        RetentionProtection,
+        RetentionReport,
+        SessionRetentionPolicy,
     )
 
 from pydantic import (
@@ -6718,6 +6727,8 @@ class SessionStore(ABC):
     supports_session_closure_detachment: ClassVar[bool] = False
     supports_session_closure_recursive_deletion: ClassVar[bool] = False
     supports_session_closure_progress: ClassVar[bool] = False
+    # Storage retention is an explicit operator capability, never implicit.
+    supports_storage_retention: ClassVar[bool] = False
     model_completion_recovery_fence_version: ClassVar[int] = 0
     model_failover_stage_version: ClassVar[int] = 0
     supports_completion_result_event_publication_reservations: ClassVar[bool] = False
@@ -11377,6 +11388,86 @@ class SessionStore(ABC):
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.
         """
         raise NotImplementedError("This SessionStore does not support delete_session.")
+
+    async def apply_retention_policy(
+        self,
+        policy: SessionRetentionPolicy,
+        *,
+        protected_session_ids: Collection[str] = (),
+        references: Mapping[RetentionProtection, Collection[str]] | None = None,
+        progress: RetentionProgressCallback | None = None,
+    ) -> RetentionReport:
+        """Dry-run or apply a session retention policy; an operator-only action.
+
+        Only sessions whose status the policy selects and whose last update is
+        older than ``policy.older_than`` are considered. A store never compacts
+        or deletes a session it cannot prove unreferenced: live tasks and
+        leases, pending actions and clarifications, dependent context views,
+        snapshot pins, eval and knowledge references, undelivered events and
+        lineage members that must be kept all protect a session, and a lineage
+        is pruned whole or not at all. ``protected_session_ids`` and
+        ``references`` (session ids other stores reference, keyed by the
+        protection they imply) add references the store cannot see. A dry run reports exactly what an apply
+        with the same inputs and store state acts on. An apply changes one
+        lineage per write transaction, re-checking it there, and releases the
+        store between lineages; ``progress`` is awaited after planning and after
+        each lineage. Every apply writes a durable audit record.
+
+        Default raises ``NotImplementedError``; retention is off unless a store
+        implements it and a caller applies a policy.
+        """
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def inspect_session_retention(
+        self,
+        session_ids: Collection[str],
+        *,
+        mode: RetentionMode | None = None,
+        include_store_guards: bool = True,
+    ) -> dict[str, tuple[RetentionProtection, ...]]:
+        """Report the direct retention protections of existing sessions.
+
+        ``mode`` defaults to delete. Lineage and age selection are not applied. Other retention targets use
+        this to keep resources that belong to protected sessions.
+        """
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def retention_artifact_references(self) -> frozenset[str]:
+        """Artifact ids that this store's transcripts, operations or evidence name."""
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def list_retention_audits(
+        self,
+        *,
+        limit: int = 20,
+        item_id: str | None = None,
+        store_kind: str | None = None,
+    ) -> tuple[RetentionAuditRecord, ...]:
+        """List retention audit records, newest first, optionally filtered."""
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def load_retention_audit(self, audit_id: str) -> RetentionAuditRecord | None:
+        """Load one retention audit record with every entry it wrote."""
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def begin_retention_audit(
+        self,
+        *,
+        store_kind: str,
+        mode: RetentionMode,
+        policy: Mapping[str, Any],
+        started_at: datetime,
+    ) -> str:
+        """Start a durable audit record for another store's retention apply."""
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def record_retention_entry(self, audit_id: str, entry: RetentionAuditEntry) -> None:
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def complete_retention_audit(
+        self, audit_id: str, *, completed_at: datetime, summary: Mapping[str, Any]
+    ) -> None:
+        raise NotImplementedError("This SessionStore does not support storage retention.")
 
     async def detach_session_children(
         self,

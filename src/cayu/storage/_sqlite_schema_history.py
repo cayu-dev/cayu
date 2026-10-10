@@ -23,6 +23,7 @@ from cayu.storage._external_wait_schema import SQLITE_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import SQLITE_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import SQLITE_PARTICIPANT_BINDINGS_DDL
 from cayu.storage._product_operation_schema import SQLITE_PRODUCT_OPERATION_DDL
+from cayu.storage._retention_schema import SQLITE_RETENTION_AUDIT_DDL
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
 from cayu.storage._sqlite_closure_schema import SQLITE_CLOSURE_DDL
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
@@ -717,6 +718,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     115: SQLITE_EXTERNAL_WAIT_DDL,
     116: SQLITE_COMPLETION_VERIFIER_DISPATCH_DDL,
     117: SQLITE_COMPLETION_EVALUATION_DDL,
+    118: SQLITE_RETENTION_AUDIT_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,

@@ -4,14 +4,23 @@ import asyncio
 import logging
 import math
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from cayu.storage.retention import (
+        EvalRetentionPolicy,
+        RetentionAuditRecord,
+        RetentionProgressCallback,
+        RetentionProtection,
+        RetentionReport,
+    )
 
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
@@ -505,6 +514,7 @@ class SQLiteEvalStore(EvalStore):
         if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
             raise ValueError("Read-only SQLite EvalStores require schema_mode=VALIDATE.")
         self.path = db_path
+        self._read_only = read_only
         self._diagnostic_source_missing = diagnostic_source_missing
         self.writer_contention_policy = writer_contention_policy
         self._lock = TimedStoreLock()
@@ -760,6 +770,56 @@ class SQLiteEvalStore(EvalStore):
                 "retry_in_seconds": retry_in_seconds,
             },
         )
+
+    supports_storage_retention: ClassVar[bool] = True
+
+    async def apply_retention_policy(
+        self,
+        policy: EvalRetentionPolicy,
+        *,
+        protected_ids: Collection[str] = (),
+        references: Mapping[RetentionProtection, Collection[str]] | None = None,
+        progress: RetentionProgressCallback | None = None,
+    ) -> RetentionReport:
+        from cayu.storage import _eval_retention as retention
+
+        return await retention.apply_eval_retention_policy(
+            retention.SQLiteEvalRetentionBackend(self),
+            policy,
+            protected_ids=protected_ids,
+            references=references,
+            progress=progress,
+        )
+
+    async def list_retention_audits(
+        self,
+        *,
+        limit: int = 20,
+        item_id: str | None = None,
+        store_kind: str | None = None,
+    ) -> tuple[RetentionAuditRecord, ...]:
+        from cayu.storage import _eval_retention as retention
+        from cayu.storage import _retention_sql as audit
+
+        async with retention.SQLiteEvalRetentionBackend(self).snapshot() as sql:
+            return await audit.list_audits(sql, limit=limit, store_kind=store_kind, item_id=item_id)
+
+    async def load_retention_audit(self, audit_id: str) -> RetentionAuditRecord | None:
+        from cayu.storage import _eval_retention as retention
+        from cayu.storage import _retention_sql as audit
+
+        async with retention.SQLiteEvalRetentionBackend(self).snapshot() as sql:
+            return await audit.load_audit(sql, audit_id)
+
+    async def retention_artifact_references(self) -> frozenset[str]:
+        from cayu.storage import _eval_retention as retention
+
+        return await retention.eval_artifact_references(retention.SQLiteEvalRetentionBackend(self))
+
+    async def retention_session_references(self) -> frozenset[str]:
+        from cayu.storage import _eval_retention as retention
+
+        return await retention.eval_session_references(retention.SQLiteEvalRetentionBackend(self))
 
     async def close(self) -> None:
         try:

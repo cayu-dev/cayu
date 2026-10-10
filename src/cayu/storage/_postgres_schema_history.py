@@ -31,6 +31,7 @@ from cayu.storage._external_wait_schema import POSTGRES_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import POSTGRES_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import POSTGRES_PARTICIPANT_BINDINGS_DDL
 from cayu.storage._product_operation_schema import POSTGRES_PRODUCT_OPERATION_DDL
+from cayu.storage._retention_schema import POSTGRES_RETENTION_AUDIT_DDL
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL
 from cayu.storage._task_graph_schema import POSTGRES_TASK_GRAPH_DDL
@@ -758,6 +759,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     115: POSTGRES_EXTERNAL_WAIT_DDL,
     116: POSTGRES_COMPLETION_VERIFIER_DISPATCH_DDL,
     117: POSTGRES_COMPLETION_EVALUATION_DDL,
+    118: POSTGRES_RETENTION_AUDIT_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (

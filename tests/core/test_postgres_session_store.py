@@ -183,6 +183,8 @@ _TABLES = (
     "cayu_eval_cases",
     "cayu_eval_suites",
     "cayu_eval_corpora",
+    "cayu_storage_retention_entries",
+    "cayu_storage_retention_runs",
     "cayu_schema_migrations",
 )
 

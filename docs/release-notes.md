@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Add storage retention for runtime-owned storage, off by default.
+  `SQLiteSessionStore` and `PostgresSessionStore` apply a
+  `SessionRetentionPolicy`: `compact` removes model text and thinking delta
+  events and replaces large stored tool-output bodies with a size-and-digest
+  marker, keeping the transcript, terminal record and usage; `delete` removes
+  whole sessions through the store's own deletion guards. Sessions referenced by
+  live tasks or leases, pending approvals or clarifications, dependent context
+  views, snapshot pins, eval or knowledge evidence, undelivered events,
+  closures, or a lineage member that must be kept are never pruned, and the
+  report names the protection. Applies change one lineage per transaction and
+  release the store between lineages.
+- `SQLiteEvalStore` and `PostgresEvalStore` apply an `EvalRetentionPolicy` to
+  terminal eval runs and keep runs that baselines, campaign checkpoints, retry
+  lineage or snapshot pins reference. `apply_artifact_retention_policy` prunes
+  artifacts by age and size and keeps pinned artifacts and those that sessions,
+  evals, knowledge or snapshots reference. `apply_workspace_retention` disposes
+  leftover environment allocations of old terminal sessions through
+  incomplete-session recovery.
+- `StorageRetentionPolicy` and `CayuApp.apply_storage_retention` combine the
+  per-store policies and collect references from every configured store,
+  including task, eval and snapshot stores in other databases.
+  `run_storage_retention_worker` applies a policy on an interval when a project
+  worker starts it. `cayu storage prune --dry-run|--apply --older-than ...
+  --target sessions|evals|artifacts|workspaces|all` exposes the same parts.
+- A dry run lists exactly what an apply removes, and every apply writes a
+  durable, queryable audit record. Storage revision 118 is an additive
+  migration that adds the retention audit tables; older binaries keep working
+  against it, and only a retention apply requires it. See
+  `docs/storage-retention.md`.
 - Interactive browser observations no longer have a default 64 KiB text cap.
   Set `max_snapshot_bytes` explicitly to opt into truncation. Larger observations
   within the shared durable-record ceiling remain available after recovery;

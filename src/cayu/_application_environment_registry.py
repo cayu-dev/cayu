@@ -184,6 +184,13 @@ class ApplicationEnvironmentRegistry:
         self._publish(registered_environment, artifact_store_registration, default=default)
         return factory
 
+    def registered_artifact_stores(self) -> tuple[ArtifactStore, ...]:
+        """Every distinct artifact store registered with an environment."""
+
+        return tuple(
+            registration.store for registration in self._artifact_store_registrations_by_id.values()
+        )
+
     def _validate_artifact_store_registration(
         self,
         artifact_store: ArtifactStore | None,

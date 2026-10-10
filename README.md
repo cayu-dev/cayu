@@ -674,6 +674,7 @@ Start with the document that matches the job:
 | Use, customize, or replace the operator control plane | [Open and replaceable control plane](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) |
 | Start a named worker process | [Project workers](https://github.com/cayu-dev/cayu/blob/main/docs/project-workers.md) |
 | Configure CLI session-store discovery | [Session-store targets](https://github.com/cayu-dev/cayu/blob/main/docs/session-store-targets.md) |
+| Prune old sessions, evals, artifacts and workspaces | [Storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md) |
 | Inspect durable sessions safely | [Session inspection](https://github.com/cayu-dev/cayu/blob/main/docs/session-inspection.md) |
 | Configure a control-plane server deployment | [Server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md) |
 | Embed Cayu behind tenant-aware product APIs | [Server authentication and tenant isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md) |

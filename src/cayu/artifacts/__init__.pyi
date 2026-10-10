@@ -73,6 +73,9 @@ from cayu.artifacts.resources import ResourceTransferIntent as ResourceTransferI
 from cayu.artifacts.resources import ResourceTransferReceipt as ResourceTransferReceipt
 from cayu.artifacts.resources import ResourceTransferTemplate as ResourceTransferTemplate
 from cayu.artifacts.resources import resource_operation_digest as resource_operation_digest
+from cayu.artifacts.retention import (
+    apply_artifact_retention_policy as apply_artifact_retention_policy,
+)
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementEvidence as ArtifactWriteSettlementEvidence,
 )

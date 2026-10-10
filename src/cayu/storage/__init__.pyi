@@ -278,6 +278,42 @@ from cayu.storage.product_operations_postgres import (
 from cayu.storage.product_operations_sqlite import (
     SQLiteProductOperationStore as SQLiteProductOperationStore,
 )
+from cayu.storage.retention import (
+    DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES as DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES,
+)
+from cayu.storage.retention import (
+    DEFAULT_RETENTION_ITEMS_PER_RUN as DEFAULT_RETENTION_ITEMS_PER_RUN,
+)
+from cayu.storage.retention import MAX_RETENTION_ITEMS_PER_RUN as MAX_RETENTION_ITEMS_PER_RUN
+from cayu.storage.retention import RETENTION_ARTIFACT_SCOPES as RETENTION_ARTIFACT_SCOPES
+from cayu.storage.retention import (
+    RETENTION_TERMINAL_EVAL_RUN_STATUSES as RETENTION_TERMINAL_EVAL_RUN_STATUSES,
+)
+from cayu.storage.retention import (
+    RETENTION_TERMINAL_SESSION_STATUSES as RETENTION_TERMINAL_SESSION_STATUSES,
+)
+from cayu.storage.retention import ArtifactRetentionPolicy as ArtifactRetentionPolicy
+from cayu.storage.retention import EvalRetentionPolicy as EvalRetentionPolicy
+from cayu.storage.retention import RetentionAuditEntry as RetentionAuditEntry
+from cayu.storage.retention import RetentionAuditRecord as RetentionAuditRecord
+from cayu.storage.retention import RetentionAuditSink as RetentionAuditSink
+from cayu.storage.retention import RetentionAuditState as RetentionAuditState
+from cayu.storage.retention import RetentionAuditUnavailable as RetentionAuditUnavailable
+from cayu.storage.retention import RetentionDisposition as RetentionDisposition
+from cayu.storage.retention import RetentionItem as RetentionItem
+from cayu.storage.retention import RetentionMode as RetentionMode
+from cayu.storage.retention import RetentionPhase as RetentionPhase
+from cayu.storage.retention import RetentionPolicy as RetentionPolicy
+from cayu.storage.retention import RetentionProgress as RetentionProgress
+from cayu.storage.retention import RetentionProgressCallback as RetentionProgressCallback
+from cayu.storage.retention import RetentionProtection as RetentionProtection
+from cayu.storage.retention import RetentionReport as RetentionReport
+from cayu.storage.retention import SessionRetentionPolicy as SessionRetentionPolicy
+from cayu.storage.retention import SessionRetentionTarget as SessionRetentionTarget
+from cayu.storage.retention import StorageRetentionPolicy as StorageRetentionPolicy
+from cayu.storage.retention import StorageRetentionReport as StorageRetentionReport
+from cayu.storage.retention import StorageRetentionTarget as StorageRetentionTarget
+from cayu.storage.retention import WorkspaceRetentionPolicy as WorkspaceRetentionPolicy
 from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
@@ -291,6 +327,7 @@ from cayu.storage.work_context_sqlite import (
 # Match the runtime wildcard surface; explicit optional imports remain declared above.
 __all__ = [
     "BUILTIN_KNOWLEDGE_KINDS",
+    "DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES",
     "DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES",
     "DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES",
     "DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT",
@@ -299,6 +336,7 @@ __all__ = [
     "DEFAULT_KNOWLEDGE_LIMIT",
     "DEFAULT_KNOWLEDGE_MAX_BYTES",
     "DEFAULT_KNOWLEDGE_NAMESPACE",
+    "DEFAULT_RETENTION_ITEMS_PER_RUN",
     "KNOWLEDGE_CHUNK_TEXT_GENERATOR",
     "KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION",
     "KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION",
@@ -332,6 +370,12 @@ __all__ = [
     "MAX_KNOWLEDGE_RELATION_LIMIT",
     "MAX_KNOWLEDGE_REVISION",
     "MAX_KNOWLEDGE_REVISION_SEARCH_REFS",
+    "MAX_RETENTION_ITEMS_PER_RUN",
+    "RETENTION_ARTIFACT_SCOPES",
+    "RETENTION_TERMINAL_EVAL_RUN_STATUSES",
+    "RETENTION_TERMINAL_SESSION_STATUSES",
+    "ArtifactRetentionPolicy",
+    "EvalRetentionPolicy",
     "InMemoryEmbeddingKnowledgeStore",
     "InMemoryKnowledgeStore",
     "KnowledgeAccessDenied",
@@ -416,6 +460,20 @@ __all__ = [
     "KnowledgeStatus",
     "KnowledgeStore",
     "KnowledgeVisibility",
+    "RetentionAuditEntry",
+    "RetentionAuditRecord",
+    "RetentionAuditSink",
+    "RetentionAuditState",
+    "RetentionAuditUnavailable",
+    "RetentionDisposition",
+    "RetentionItem",
+    "RetentionMode",
+    "RetentionPhase",
+    "RetentionPolicy",
+    "RetentionProgress",
+    "RetentionProgressCallback",
+    "RetentionProtection",
+    "RetentionReport",
     "SQLiteAgentWorkContextStore",
     "SQLiteBudgetLedger",
     "SQLiteEvalStore",
@@ -424,6 +482,12 @@ __all__ = [
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "SessionRetentionPolicy",
+    "SessionRetentionTarget",
+    "StorageRetentionPolicy",
+    "StorageRetentionReport",
+    "StorageRetentionTarget",
+    "WorkspaceRetentionPolicy",
     "assess_knowledge_revision_transition",
     "copy_knowledge_revision_refs",
     "knowledge_access_scope_sha256",

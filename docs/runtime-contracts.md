@@ -1981,6 +1981,59 @@ extent only for an unfiltered, fully retained history. This contract does not
 add backend retention APIs, alter model-context compaction, or promise indefinite
 payload retention.
 
+### Storage retention
+
+`SessionStore.apply_retention_policy(policy, protected_session_ids=(), references=None,
+progress=None)` dry-runs or applies a `SessionRetentionPolicy`. Retention is off
+unless a caller applies a policy, and only stores with
+`supports_storage_retention = True` implement it; the base method raises
+`NotImplementedError`. `SQLiteSessionStore` and `PostgresSessionStore` share one
+implementation and one conformance suite; the in-memory store does not support
+retention.
+
+A policy selects only terminal (`completed`, `failed`) sessions last updated
+before `now - older_than`, oldest first, bounded by `max_items` and an optional
+`max_bytes`. `compact` removes model text and thinking delta events and replaces
+large stored tool-output bodies with a size-and-digest marker; it keeps the
+session, transcript, checkpoint, terminal events and usage-bearing events.
+`delete` runs the store's own `delete_session` transaction body and guards. A
+store keeps every session it cannot prove unreferenced and reports a
+`RetentionProtection` for it: live tasks and execution leases, pending actions
+and clarifications, active context-view selections, snapshot pins, eval and
+knowledge references visible in its database, undelivered events, closure
+ownership, its own erasure guards, and identifiers the caller or other stores
+supply. A parent/fork lineage is pruned whole or not at all, children before
+parents.
+
+Planning reads from a non-blocking snapshot and evaluates protections in
+bounded batches. A dry run reports exactly what an apply with the same inputs
+and store state acts on. An apply changes one lineage per write transaction:
+it locks the lineage the way `delete_session` does, re-reads it, re-checks every
+protection and writes the lineage's audit entries before committing, and it
+releases the store's write lock between lineages. The run record completes with
+a summary afterwards. `inspect_session_retention` reports the direct
+protections of named sessions, `retention_artifact_references` reports the
+artifact ids the store's transcripts, operations and knowledge evidence name,
+and `list_retention_audits` / `load_retention_audit` read the records. The
+session store also implements `RetentionAuditSink` for targets without a
+database of their own. The audit tables are additive storage revision 118; dry
+runs do not need them.
+
+`EvalStore.apply_retention_policy` (SQLite and Postgres) deletes terminal eval
+runs with their results and trial checkpoints and keeps runs selected by a
+baseline, retaining campaign checkpoints, named by a retry lineage or a held
+snapshot. `apply_artifact_retention_policy` deletes old artifacts that no
+durable pin, existing owning session, closure claim or supplied reference
+retains. It rechecks the configured SQL reference sources under database locks
+held through each artifact deletion; sources that cannot be fenced protect the
+artifact with `erasure_guard`. Cancellation waits for the active artifact batch
+and its audit entry to settle. `apply_workspace_retention` disposes leftover environment allocations
+of old terminal sessions through incomplete-session recovery.
+`CayuApp.apply_storage_retention` applies a `StorageRetentionPolicy` across the
+configured stores after collecting their cross-store references, and
+`run_storage_retention_worker` applies one on an interval when an application
+starts it. See [Storage retention](storage-retention.md).
+
 ### Durable operation ownership and reconstructed session-create claims
 
 Runtime workflows that need a renewable dispatch fence may embed the internal

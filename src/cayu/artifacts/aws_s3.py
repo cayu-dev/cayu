@@ -816,6 +816,12 @@ class S3ArtifactStore(ArtifactStore):
         client = await self._get_client()
         await asyncio.to_thread(self._release_pin, client, artifact_id, owner_digest)
 
+    async def has_retention_pins(self, artifact_id: str) -> bool | None:
+        artifact_id = _validate_artifact_id(artifact_id)
+        client = await self._get_client()
+        state, _ = await asyncio.to_thread(self._pin_state(client).read, artifact_id)
+        return bool(state["owners"])
+
     def _pin_state(self, client: Any) -> S3ArtifactPinState:
         return S3ArtifactPinState(
             client, bucket=self.bucket, prefix=self.prefix, encryption=self._encryption_options()

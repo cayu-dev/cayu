@@ -3,6 +3,10 @@
 EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactClosureClaim": ("cayu.artifacts._closure", "ArtifactClosureClaim"),
     "ArtifactClosureItem": ("cayu.artifacts._closure", "ArtifactClosureItem"),
+    "apply_artifact_retention_policy": (
+        "cayu.artifacts.retention",
+        "apply_artifact_retention_policy",
+    ),
     "copy_artifact_closure_claim": ("cayu.artifacts._closure", "copy_artifact_closure_claim"),
     "ArtifactIdentityConflictError": ("cayu.artifacts.base", "ArtifactIdentityConflictError"),
     "ArtifactListResult": ("cayu.artifacts.base", "ArtifactListResult"),
@@ -140,6 +144,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 PUBLIC_NAMES = [
     "ArtifactClosureClaim",
     "ArtifactClosureItem",
+    "apply_artifact_retention_policy",
     "copy_artifact_closure_claim",
     "ArtifactIdentityConflictError",
     "ArtifactListResult",

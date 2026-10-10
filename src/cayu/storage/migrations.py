@@ -521,6 +521,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Independent completion evaluations record each evaluator run and its
     # receipt in a new table that older binaries never read or write.
     Revision(revision=117, kind=RevisionKind.ADDITIVE, compatible_from=115),
+    # Storage-retention audit runs and entries are new tables that older
+    # binaries never read or write. Retention applies require them.
+    Revision(revision=118, kind=RevisionKind.ADDITIVE, compatible_from=115),
 )
 
 #: The revision an empty database is initialized to.

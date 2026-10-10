@@ -809,6 +809,11 @@ if TYPE_CHECKING:
         ParticipantSessionReference,
     )
     from cayu.sessions._session_continuation import ContinuationRecord
+    from cayu.storage.retention import (
+        RetentionProgressCallback,
+        StorageRetentionPolicy,
+        StorageRetentionReport,
+    )
     from cayu.tasks.groups import (
         TaskGroupCreate,
         TaskGroupCreationReceipt,
@@ -6109,6 +6114,35 @@ class CayuApp:
     def list_environments(self) -> tuple[str, ...]:
         """Return the names of all registered environments (concrete or factory), sorted."""
         return self._environment_registry.names()
+
+    async def apply_storage_retention(
+        self,
+        policy: StorageRetentionPolicy,
+        *,
+        eval_store: Any = None,
+        snapshot_stores: Iterable[Any] = (),
+        progress: RetentionProgressCallback | None = None,
+    ) -> StorageRetentionReport:
+        """Apply an application-level storage retention policy on demand.
+
+        Uses the configured session store, task store and every registered
+        artifact store. Pass the application's eval store and agent snapshot
+        stores, if any, so their references protect what they name. Retention
+        is off by default and never runs implicitly.
+        """
+
+        from cayu.runtime.storage_retention import apply_storage_retention
+
+        return await apply_storage_retention(
+            policy,
+            session_store=self.session_store,
+            task_store=self.task_store,
+            eval_store=eval_store,
+            artifact_stores=self._environment_registry.registered_artifact_stores(),
+            snapshot_stores=snapshot_stores,
+            app=self,
+            progress=progress,
+        )
 
     def has_registered_artifact_store(self) -> bool:
         """Return whether any registered environment exposes artifact storage.

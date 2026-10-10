@@ -491,6 +491,15 @@ class ArtifactStore(ABC):
         """Release only this owner. Callers must first retire dependent state."""
         raise NotImplementedError("Artifact store does not support durable pins.")
 
+    async def has_retention_pins(self, artifact_id: str) -> bool | None:
+        """Report whether any durable pin retains the artifact, for retention planning.
+
+        Covers public pins and resource-retention pins. ``None`` means the store
+        cannot tell; retention then keeps the artifact. Deletion still enforces
+        pins itself, so this is a planning read, not an authority.
+        """
+        return None
+
     @abstractmethod
     async def delete(self, artifact_id: str) -> None:
         """Delete an artifact if it exists."""

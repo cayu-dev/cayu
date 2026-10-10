@@ -1101,3 +1101,178 @@ def test_session_export_cli_passes_explicit_limits(monkeypatch, tmp_path):
         )
         assert "session" in output.getvalue()
     assert observed == [limits, limits]
+
+
+def _seed_retention_store(db) -> None:
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from tests.core.session_retention_conformance import (
+        RetentionClock,
+        RetentionHarness,
+        create_retention_session,
+    )
+
+    from cayu import SQLiteSessionStore
+    from cayu.sessions.records import SessionStatus
+
+    async def seed() -> None:
+        clock = RetentionClock()
+        clock.now = datetime.now(UTC) - timedelta(days=10)
+        store = SQLiteSessionStore(db, ownership_clock=clock)
+        try:
+            harness = RetentionHarness(
+                store=store, tasks=None, clock=clock, execute=None, snapshot_tables=None
+            )
+            await create_retention_session(harness, "old")
+            await create_retention_session(harness, "running", status=SessionStatus.RUNNING)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+
+def test_storage_prune_dry_run_lists_what_apply_removes(tmp_path, capsys):
+    db = tmp_path / "prune.sqlite"
+    _seed_retention_store(db)
+    command = ["storage", "prune", "--sqlite", str(db), "--older-than", "1d", "--mode", "delete"]
+
+    assert main([*command, "--dry-run", "--json"]) == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert planned["schema_version"] == "1"
+    assert planned["backend"] == "sqlite"
+    assert planned["dry_run"] is True
+    [plan] = planned["reports"]
+    assert plan["store_kind"] == "sessions"
+    assert plan["audit_id"] is None
+    assert [item["item_id"] for item in plan["items"]] == ["old"]
+    assert planned["totals"]["sessions"]["sessions_removed"] == 1
+
+    assert main([*command, "--apply", "--json"]) == 0
+    applied = json.loads(capsys.readouterr().out)
+    [done] = applied["reports"]
+    assert done["audit_id"]
+    assert [(item["item_id"], item["counts"], item["bytes"]) for item in done["items"]] == [
+        (item["item_id"], item["counts"], item["bytes"]) for item in plan["items"]
+    ]
+
+    assert main([*command, "--dry-run", "--table"]) == 0
+    assert "would act on 0 item(s)" in capsys.readouterr().out
+
+
+def test_storage_prune_evals_target_uses_the_same_database(tmp_path, capsys):
+    db = tmp_path / "prune.sqlite"
+    _seed_retention_store(db)
+    assert (
+        main(
+            [
+                "storage",
+                "prune",
+                "--sqlite",
+                str(db),
+                "--target",
+                "evals",
+                "--target",
+                "sessions",
+                "--older-than",
+                "1d",
+                "--dry-run",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert [report["store_kind"] for report in payload["reports"]] == ["evals", "sessions"]
+    assert payload["errors"] == {}
+
+
+def test_storage_prune_app_targets_reject_explicit_stores(tmp_path, capsys):
+    db = tmp_path / "prune.sqlite"
+    assert (
+        main(
+            [
+                "storage",
+                "prune",
+                "--sqlite",
+                str(db),
+                "--target",
+                "artifacts",
+                "--older-than",
+                "1d",
+                "--dry-run",
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "application stores" in payload["error"]["message"]
+
+
+def test_storage_prune_requires_an_explicit_action_and_valid_duration(tmp_path, capsys):
+    db = tmp_path / "prune.sqlite"
+    with pytest.raises(SystemExit) as missing_action:
+        main(["storage", "prune", "--sqlite", str(db), "--older-than", "1d"])
+    assert missing_action.value.code == 2
+    with pytest.raises(SystemExit) as bad_duration:
+        main(["storage", "prune", "--sqlite", str(db), "--dry-run", "--older-than", "soon"])
+    assert bad_duration.value.code == 2
+    capsys.readouterr()
+
+
+def test_storage_prune_reports_store_failures_as_json(tmp_path, capsys):
+    db = tmp_path / "empty.sqlite"
+    assert main(["storage", "prune", "--sqlite", str(db), "--dry-run", "--older-than", "1d"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "STORAGE_COMMAND_FAILED"
+
+
+def test_storage_prune_all_targets_use_the_project_application(tmp_path, capsys, monkeypatch):
+    import textwrap
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "retention-app"\nversion = "0.0.0"\n\n'
+        '[tool.cayu]\nfactory = "retention_app:build_app"\n'
+    )
+    (tmp_path / "retention_app.py").write_text(
+        textwrap.dedent(
+            """
+            from pathlib import Path
+
+            from cayu import CayuApp, SQLiteSessionStore
+            from cayu.artifacts.local import LocalArtifactStore
+            from cayu.environments.base import Environment, EnvironmentSpec
+
+            ROOT = Path(__file__).parent
+
+
+            def build_app():
+                (ROOT / "data").mkdir(exist_ok=True)
+                app = CayuApp(
+                    session_store=SQLiteSessionStore(ROOT / "data" / "cayu.db"),
+                    enable_logging=False,
+                )
+                app.register_environment(
+                    Environment(
+                        EnvironmentSpec(name="files"),
+                        artifact_store=LocalArtifactStore(ROOT / "artifacts"),
+                    )
+                )
+                return app
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    command = ["storage", "prune", "--target", "all", "--older-than", "1d", "--dry-run", "--json"]
+    assert main(command) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backend"] == "application"
+    assert payload["target_source"] == "project-application"
+    assert [report["store_kind"] for report in payload["reports"]] == [
+        "workspaces",
+        "evals",
+        "sessions",
+        "artifacts",
+    ]
+    assert payload["skipped"] == {}
+    assert payload["errors"] == {}
