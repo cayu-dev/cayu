@@ -46110,5 +46110,13 @@
     "tests/core/test_session_creation_rules_layout.py::test_creation_event_batch_authority_without_implementations": 0.3399263739702292,
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[event_delivery-restore_persisted_event_authority]": 0.0003972090198658407,
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-SessionStatusConflict]": 2.9710290000075474,
-    "tests/core/test_session_creation_rules_layout.py::test_creation_status_contracts_without_implementations": 0.4067393320146948
+    "tests/core/test_session_creation_rules_layout.py::test_creation_status_contracts_without_implementations": 0.4067393320146948,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_metadata_and_prepared_authority_without_implementations": 1.3053816669853404,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[creation-run_request_with_prepared_work_attempt_creation]": 0.0004435840528458357,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[creation-session_metadata_for_creation]": 0.0004384589847177267,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-copy_session_user_metadata]": 0.00045149889774620533,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-is_runtime_owned_session_metadata_key]": 0.0005131240468472242,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-replace_session_user_metadata]": 0.0005215010023675859,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-session_user_metadata]": 0.000435834052041173,
+    "tests/core/test_session_creation_rules_layout.py::test_user_metadata_preserves_runtime_authority_without_implementations": 0.7471306250081398
 }

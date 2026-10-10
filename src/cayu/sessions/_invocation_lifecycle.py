@@ -75,7 +75,6 @@ from cayu.sessions.base import (
     SessionModelTransition,
     SessionRunFenced,
     apply_runtime_publication_checkpoint_mutation,
-    session_user_metadata,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -96,6 +95,7 @@ from cayu.sessions.records import (
     copy_session,
     copy_session_identity,
     copy_session_runtime_identity,
+    session_user_metadata,
 )
 from cayu.sessions.requests import (
     RunRequest,

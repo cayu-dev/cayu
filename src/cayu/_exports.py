@@ -4808,8 +4808,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "SCENARIO_PREFLIGHT_MAX_DIAGNOSTICS",
     ),
     "SEARCH_TOOLS_NAME": ("cayu.tools.catalogue", "SEARCH_TOOLS_NAME"),
-    "SESSION_RUNTIME_METADATA_KEYS": ("cayu.sessions.base", "SESSION_RUNTIME_METADATA_KEYS"),
-    "SESSION_RUNTIME_METADATA_PREFIX": ("cayu.sessions.base", "SESSION_RUNTIME_METADATA_PREFIX"),
+    "SESSION_RUNTIME_METADATA_KEYS": ("cayu.sessions.records", "SESSION_RUNTIME_METADATA_KEYS"),
+    "SESSION_RUNTIME_METADATA_PREFIX": ("cayu.sessions.records", "SESSION_RUNTIME_METADATA_PREFIX"),
     "SHARED_ARTIFACT_REFERENCE_PREFIX": (
         "cayu.tools.shared_artifacts",
         "SHARED_ARTIFACT_REFERENCE_PREFIX",
@@ -6047,7 +6047,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "copy_retry_policy": ("cayu.providers.retry_policy", "copy_retry_policy"),
     "copy_run_limits": ("cayu.budgets.run_limits", "copy_run_limits"),
     "copy_secret_env": ("cayu.vaults.base", "copy_secret_env"),
-    "copy_session_user_metadata": ("cayu.sessions.base", "copy_session_user_metadata"),
+    "copy_session_user_metadata": ("cayu.sessions.records", "copy_session_user_metadata"),
     "copy_tool_capability_ceiling": ("cayu.tools.exposure", "copy_tool_capability_ceiling"),
     "copy_tool_catalog_snapshot": ("cayu.tools.catalogue", "copy_tool_catalog_snapshot"),
     "copy_tool_descriptor": ("cayu.tools.catalogue", "copy_tool_descriptor"),
@@ -6247,7 +6247,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "inspect_process_eval_run": ("cayu.evals.process_inspection", "inspect_process_eval_run"),
     "interrupted_task_handoff_request": ("cayu.tasks.handoff", "interrupted_task_handoff_request"),
     "is_runtime_owned_session_metadata_key": (
-        "cayu.sessions.base",
+        "cayu.sessions.records",
         "is_runtime_owned_session_metadata_key",
     ),
     "keyed_evidence_fingerprint": ("cayu.memory.evidence", "keyed_evidence_fingerprint"),
@@ -6452,7 +6452,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.evals.scenario_authoring",
         "replace_eval_scenario_artifact_requirement",
     ),
-    "replace_session_user_metadata": ("cayu.sessions.base", "replace_session_user_metadata"),
+    "replace_session_user_metadata": ("cayu.sessions.records", "replace_session_user_metadata"),
     "replay_session": ("cayu.evals.runtime_replay", "replay_session"),
     "require_immutable_input_projection": (
         "cayu.immutable_inputs",

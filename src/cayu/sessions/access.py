@@ -310,7 +310,7 @@ class ScopedSessionAccess:
         return await self.__store._access_create_session(await self._bounds(), request, identity)
 
     async def update_metadata(self, session_id: str, metadata: dict) -> Session:
-        from cayu.sessions.base import copy_session_user_metadata
+        from cayu.sessions.records import copy_session_user_metadata
 
         metadata = copy_session_user_metadata(metadata)
         return await self.__store._access_update_metadata(

@@ -617,7 +617,6 @@ from cayu.sessions.base import (
     fork_session_invocation,
     model_completion_stage_settlement_request,
     queued_interaction_profile_handoff_evidence,
-    run_request_with_prepared_work_attempt_creation,
     runtime_publication_checkpoint_mutation,
     session_invocation_for_run_request,
     session_model_projection_cursor,
@@ -633,6 +632,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
+from cayu.sessions.creation import run_request_with_prepared_work_attempt_creation
 from cayu.sessions.creation_claims import bind_runtime_session_create_claim
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectDelivery,

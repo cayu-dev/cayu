@@ -74,8 +74,8 @@ from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, session_user_metadata
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.base import InMemorySessionStore, ModelTarget
+from cayu.sessions.records import SessionStatus, session_user_metadata
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.tools import _argument_publication as tool_argument_publication

@@ -26,7 +26,7 @@ from cayu.evals.runner import EvalCase
 from cayu.messages import Message
 from cayu.proxies.base import ProxyAuthorizationResult
 from cayu.runtime.loop_policies import BeforeStopDecision
-from cayu.sessions.base import replace_session_user_metadata
+from cayu.sessions.records import replace_session_user_metadata
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -146,7 +146,7 @@ def test_index_request_metadata_limit_precedes_indexing(field) -> None:
 def test_complete_metadata_merge_counts_retained_runtime_authority() -> None:
     user = _metadata_bytes(DURABLE_METADATA_LIMITS.max_bytes)
     # Use a runtime-owned prefix, not a guessed absence of a user marker.
-    from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX
+    from cayu.sessions.records import SESSION_RUNTIME_METADATA_PREFIX
 
     key = SESSION_RUNTIME_METADATA_PREFIX + "limit_probe"
     merged = {**user, key: ""}

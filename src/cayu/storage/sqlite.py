@@ -325,8 +325,6 @@ from cayu.sessions.base import (
     _validate_tool_round_publication,
     _validate_user_input_checkpoint_mutation,
     checkpoint_root_field_projection_from_storage,
-    copy_session_user_metadata,
-    replace_session_user_metadata,
     transform_fork_checkpoint,
 )
 from cayu.sessions.event_delivery import (
@@ -399,6 +397,8 @@ from cayu.sessions.records import (
     _validate_status_set,
     copy_session_identity,
     copy_session_runtime_identity,
+    copy_session_user_metadata,
+    replace_session_user_metadata,
 )
 from cayu.sessions.requests import (
     RunRequest,

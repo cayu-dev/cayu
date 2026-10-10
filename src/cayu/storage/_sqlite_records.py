@@ -10,7 +10,8 @@ from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.events import Event
-from cayu.sessions.base import session_invocation_for_run_request, session_metadata_for_creation
+from cayu.sessions.base import session_invocation_for_run_request
+from cayu.sessions.creation import session_metadata_for_creation
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.sessions.queries import SessionOrder

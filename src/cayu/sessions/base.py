@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import heapq
 import math
 import secrets
@@ -37,12 +36,6 @@ from cayu.collaboration.peer_content import (
     PeerContentReceipt,
     PeerContentUnavailable,
 )
-from cayu.deadlines import (
-    EXECUTION_DEADLINE_METADATA_KEY,
-    ExecutionDeadline,
-    current_execution_deadline,
-    effective_deadline,
-)
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
@@ -75,6 +68,10 @@ from cayu.sessions._model_failover import (
 from cayu.sessions._model_failover import (
     MODEL_TARGET_PROJECTION_SCHEMA_VERSION as MODEL_TARGET_PROJECTION_SCHEMA_VERSION,
 )
+from cayu.sessions.creation import (
+    run_request_with_prepared_work_attempt_creation as run_request_with_prepared_work_attempt_creation,
+)
+from cayu.sessions.creation import session_metadata_for_creation as session_metadata_for_creation
 from cayu.sessions.creation_claims import (
     RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS as RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS,
 )
@@ -365,6 +362,8 @@ from cayu.sessions.records import MAX_SESSION_ID_BYTES as MAX_SESSION_ID_BYTES
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY as RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
 )
+from cayu.sessions.records import SESSION_RUNTIME_METADATA_KEYS as SESSION_RUNTIME_METADATA_KEYS
+from cayu.sessions.records import SESSION_RUNTIME_METADATA_PREFIX as SESSION_RUNTIME_METADATA_PREFIX
 from cayu.sessions.records import CheckpointTransform as CheckpointTransform
 from cayu.sessions.records import EventRecord as EventRecord
 from cayu.sessions.records import PendingActionKind as PendingActionKind
@@ -386,9 +385,15 @@ from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.records import copy_session as copy_session
 from cayu.sessions.records import copy_session_identity as copy_session_identity
 from cayu.sessions.records import copy_session_runtime_identity as copy_session_runtime_identity
+from cayu.sessions.records import copy_session_user_metadata as copy_session_user_metadata
+from cayu.sessions.records import (
+    is_runtime_owned_session_metadata_key as is_runtime_owned_session_metadata_key,
+)
+from cayu.sessions.records import replace_session_user_metadata as replace_session_user_metadata
 from cayu.sessions.records import (
     runtime_build_provenance_from_session_metadata as runtime_build_provenance_from_session_metadata,
 )
+from cayu.sessions.records import session_user_metadata as session_user_metadata
 from cayu.sessions.recovery import (
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES as MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
 )
@@ -773,9 +778,7 @@ from cayu._validation import (
     compact_json_utf8_size,
     copy_durable_json_object,
     copy_durable_json_value,
-    copy_durable_metadata,
     copy_label_map,
-    copy_session_metadata,
     require_durable_clean_nonblank,
 )
 from cayu._validation import (
@@ -904,7 +907,6 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.sessions._execution_profile_checkpoint import (
-    EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
@@ -912,7 +914,6 @@ from cayu.sessions._execution_profile_checkpoint import (
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
     execution_profile_metadata_after_adoption,
-    execution_profile_session_metadata,
 )
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
@@ -983,7 +984,6 @@ from cayu.sessions.messaging import (
 )
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import (
-    TOOL_CAPABILITY_CEILING_METADATA_KEY,
     ToolCapabilityCeiling,
     copy_tool_capability_ceiling,
     session_metadata_after_tool_capability_ceiling_narrowing,
@@ -1769,64 +1769,6 @@ def _assert_session_run_epoch_value(session_id: str, current_run_epoch: int) -> 
             f"Session run epoch no longer owns {session_id}: expected {expected}, "
             f"current {current_run_epoch}."
         )
-
-
-SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
-SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
-
-
-def is_runtime_owned_session_metadata_key(key: str) -> bool:
-    """Return whether a session metadata entry is owned by Cayu's runtime."""
-
-    return key in SESSION_RUNTIME_METADATA_KEYS or key.startswith(SESSION_RUNTIME_METADATA_PREFIX)
-
-
-def copy_session_user_metadata(replacement: dict[str, Any]) -> dict[str, Any]:
-    """Validate and detach a complete user-authored metadata replacement."""
-
-    copied_replacement = copy_durable_metadata(replacement)
-    for key in copied_replacement:
-        if is_runtime_owned_session_metadata_key(key):
-            raise ValueError("Session metadata contains a runtime-owned key.")
-    return copied_replacement
-
-
-def session_user_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    """Detach only caller-authored metadata from a durable session record."""
-
-    if type(metadata) is not dict:
-        raise TypeError("Session metadata must be an object.")
-    return copy_durable_json_object(
-        {
-            key: value
-            for key, value in metadata.items()
-            if not is_runtime_owned_session_metadata_key(key)
-        },
-        "session.user_metadata",
-    )
-
-
-def replace_session_user_metadata(
-    current: dict[str, Any],
-    replacement: dict[str, Any],
-) -> dict[str, Any]:
-    """Combine validated user metadata with the current runtime-owned entries.
-
-    Callers perform this merge while holding the store's session lock. Runtime
-    metadata participates in recovery and policy enforcement, so it must be read
-    and retained in the same transaction that writes the replacement.
-    """
-
-    if type(current) is not dict:
-        raise TypeError("Current session metadata must be an object.")
-    if type(replacement) is not dict:
-        raise TypeError("Session metadata replacement must be an object.")
-    if any(is_runtime_owned_session_metadata_key(key) for key in replacement):
-        raise ValueError("Session user metadata replacement contains a runtime-owned key.")
-    runtime_metadata = {
-        key: value for key, value in current.items() if is_runtime_owned_session_metadata_key(key)
-    }
-    return copy_session_metadata({**replacement, **runtime_metadata})
 
 
 def session_model_projection_cursor(session: Session) -> int:
@@ -21711,129 +21653,6 @@ def _fork_initial_invocation_request_sha256(request: ResumeRequest) -> str:
             "fork_initial_invocation",
         )
     ).hexdigest()
-
-
-def _prepared_work_attempt_creation_sha256(request: RunRequest, identity: SessionIdentity) -> str:
-    return hashlib.sha256(
-        canonical_durable_json_bytes(
-            {
-                "request": request.model_dump(mode="json", warnings=False),
-                "private_authority": session_request_contracts._run_request_invocation_lifecycle_authority_sha256(
-                    request
-                ),
-                "identity": identity.model_dump(mode="json", warnings=False),
-            },
-            "prepared_work_attempt_creation",
-        )
-    ).hexdigest()
-
-
-def run_request_with_prepared_work_attempt_creation(
-    request: RunRequest, *, identity: SessionIdentity, admission: object
-) -> RunRequest:
-    """Internal runtime entrance; raw request equality cannot confer this authority."""
-    from cayu.tasks.admission import (
-        WorkAttemptAdmissionState,
-        require_work_attempt_admission_result,
-    )
-
-    prepared = require_work_attempt_admission_result(
-        admission, operation_name="Prepared session creation authority"
-    )
-    copied = copy_run_request(request)
-    if (
-        prepared.state is not WorkAttemptAdmissionState.PREPARING
-        or prepared.kind != "initial"
-        or prepared.execution_entry is not None
-        or prepared.run_semantics is None
-        or copied.session_id != prepared.session_id
-        or copied.task_id != prepared.task_id
-        or session_request_contracts._authenticated_session_instance_id_for_run_request(
-            copied, session_id=prepared.session_id
-        )
-        != prepared.session_invocation.session_instance_id
-        or copied.execution_deadline.model_dump() != prepared.run_semantics.deadline.model_dump()
-        or identity.execution_profile is None
-        or identity.execution_profile.fingerprint != prepared.source_execution_profile_fingerprint
-    ):
-        raise ValueError("Prepared session creation conflicts with admission authority.")
-    copied._runtime_work_attempt_creation = session_request_contracts._PreparedWorkAttemptCreation(
-        _prepared_work_attempt_creation_sha256(copied, identity),
-        session_request_contracts._PREPARED_WORK_ATTEMPT_CREATION_TOKEN,
-    )
-    return copied
-
-
-def session_metadata_for_creation(
-    metadata: dict[str, Any],
-    *,
-    identity: SessionIdentity,
-    tool_capability_ceiling: ToolCapabilityCeiling | None = None,
-    execution_deadline: ExecutionDeadline | None = None,
-    parent_session: Session | None = None,
-    prepared_request: RunRequest | None = None,
-) -> dict[str, Any]:
-    """Combine caller metadata with runtime-owned creation authority."""
-
-    copied = copy_durable_metadata(metadata)
-    if EXECUTION_DEADLINE_METADATA_KEY in copied:
-        raise ValueError("Session metadata contains runtime-owned deadline authority.")
-    boundary = effective_deadline(
-        execution_deadline or ExecutionDeadline(),
-        current_execution_deadline(),
-        parent_session.execution_deadline if parent_session is not None else ExecutionDeadline(),
-    )
-    prepared_creation = (
-        None if prepared_request is None else prepared_request._runtime_work_attempt_creation
-    )
-    if prepared_creation is not None:
-        if (
-            type(prepared_creation) is not session_request_contracts._PreparedWorkAttemptCreation
-            or prepared_creation.token
-            is not session_request_contracts._PREPARED_WORK_ATTEMPT_CREATION_TOKEN
-            or prepared_request is None
-            or prepared_creation.request_sha256
-            != _prepared_work_attempt_creation_sha256(prepared_request, identity)
-            or prepared_request.metadata != metadata
-            or prepared_request.tool_capability_ceiling != tool_capability_ceiling
-            or prepared_request.execution_deadline.model_dump() != boundary.model_dump()
-        ):
-            raise ValueError("Prepared session creation authority changed.")
-    else:
-        boundary.require_admission("session_creation")
-    if boundary.expires_at is not None:
-        copied[EXECUTION_DEADLINE_METADATA_KEY] = boundary.model_dump(mode="json")
-    if EXECUTION_PROFILE_METADATA_KEY in copied:
-        raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
-    if RUNTIME_BUILD_PROVENANCE_METADATA_KEY in copied:
-        raise ValueError("Session metadata contains runtime-owned build-provenance authority.")
-    if FORK_EXECUTION_PROFILE_METADATA_KEY in copied:
-        raise ValueError("Session metadata contains runtime-owned fork-profile authority.")
-    if TOOL_CAPABILITY_CEILING_METADATA_KEY in copied:
-        raise ValueError(
-            "Session metadata contains runtime-owned tool-capability-ceiling authority."
-        )
-    if tool_capability_ceiling is not None and identity.execution_profile is None:
-        raise ValueError("A tool capability ceiling requires a durable session execution profile.")
-    if identity.execution_profile is not None:
-        if tool_capability_ceiling is not None and identity.execution_profile.component(
-            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
-        ) != direct_tool_capability_ceiling_component(tool_capability_ceiling.tool_names):
-            raise ValueError(
-                "Session execution profile conflicts with its tool capability ceiling."
-            )
-        copied[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
-            identity.execution_profile
-        )
-    copied[RUNTIME_BUILD_PROVENANCE_METADATA_KEY] = identity.runtime_build_provenance.model_dump(
-        mode="json"
-    )
-    if tool_capability_ceiling is not None:
-        copied = session_metadata_with_tool_capability_ceiling(
-            copied,
-            tool_capability_ceiling,
-        )
-    return copy_session_metadata(copied)
 
 
 def _copy_optional_execution_profile(

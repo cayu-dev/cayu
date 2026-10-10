@@ -19,6 +19,12 @@ import cayu
     (
         ("records", "SessionStatusConflict"),
         ("event_delivery", "restore_persisted_event_authority"),
+        ("records", "is_runtime_owned_session_metadata_key"),
+        ("records", "copy_session_user_metadata"),
+        ("records", "session_user_metadata"),
+        ("records", "replace_session_user_metadata"),
+        ("creation", "run_request_with_prepared_work_attempt_creation"),
+        ("creation", "session_metadata_for_creation"),
     ),
 )
 def test_creation_prerequisites_preserve_public_identity(module, name):
@@ -110,5 +116,64 @@ assert not event_delivery._event_input_contract_is_runtime_owned(
     event_delivery.restore_persisted_event_authority(event))
 rejected(lambda: event_delivery._copy_session_event_batch("foreign", [owned]))
 rejected(lambda: event_delivery._copy_session_event_batch("session", [owned, owned]))
+"""
+    )
+
+
+def test_user_metadata_preserves_runtime_authority_without_implementations():
+    _without_implementations(
+        """
+from cayu.sessions import records
+
+current = {"customer": {"values": [1]}, "cayu:private": {"values": [2]}, "subagent": True}
+replacement = records.copy_session_user_metadata({"customer": {"values": [3]}})
+merged = records.replace_session_user_metadata(current, replacement)
+assert merged == {"customer": {"values": [3]}, "cayu:private": {"values": [2]},
+                  "subagent": True}
+assert records.session_user_metadata(merged) == {"customer": {"values": [3]}}
+merged["cayu:private"]["values"].clear()
+merged["customer"]["values"].clear()
+assert current["cayu:private"]["values"] == [2]
+assert replacement["customer"]["values"] == [3]
+for reserved in ("cayu:private", "subagent"):
+    rejected(lambda: records.copy_session_user_metadata({reserved: "forged"}))
+    rejected(lambda: records.replace_session_user_metadata(current, {reserved: "forged"}))
+"""
+    )
+
+
+def test_creation_metadata_and_prepared_authority_without_implementations():
+    _without_implementations(
+        """
+from datetime import UTC, datetime
+from cayu.deadlines import EXECUTION_DEADLINE_METADATA_KEY, ExecutionDeadline
+from cayu.sessions import creation, records, requests
+
+identity = records.SessionIdentity(provider_name="fake", model="fake-model")
+metadata = {"customer": {"values": [1]}}
+deadline = ExecutionDeadline(expires_at=datetime(2099, 1, 1, tzinfo=UTC))
+created = creation.session_metadata_for_creation(metadata, identity=identity,
+                                               execution_deadline=deadline)
+assert created[EXECUTION_DEADLINE_METADATA_KEY] == deadline.model_dump(mode="json")
+assert created[records.RUNTIME_BUILD_PROVENANCE_METADATA_KEY] == (
+    identity.runtime_build_provenance.model_dump(mode="json"))
+created["customer"]["values"].clear()
+assert metadata["customer"]["values"] == [1]
+rejected(lambda: creation.session_metadata_for_creation(
+    {EXECUTION_DEADLINE_METADATA_KEY: {}}, identity=identity))
+request = requests.RunRequest(agent_name="agent", session_id="session", messages=[],
+                              metadata=metadata, execution_deadline=deadline)
+try:
+    creation.run_request_with_prepared_work_attempt_creation(
+        request, identity=identity, admission=object())
+except RuntimeError as error:
+    assert str(error) == "Prepared session creation authority returned invalid work-attempt authority."
+else:
+    raise AssertionError("Untyped admission authority was accepted")
+request._runtime_work_attempt_creation = requests._PreparedWorkAttemptCreation(
+    creation._prepared_work_attempt_creation_sha256(request, identity), object())
+rejected(lambda: creation.session_metadata_for_creation(
+    metadata, identity=identity, execution_deadline=deadline, prepared_request=request))
+assert metadata == {"customer": {"values": [1]}}
 """
     )

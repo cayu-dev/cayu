@@ -15,7 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
+    copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
     copy_label_map,
     copy_session_metadata,
 )
@@ -594,3 +596,63 @@ def _validate_status_set(
         if not isinstance(status, SessionStatus):
             raise ValueError(f"{field_name} must contain SessionStatus values.")
     return set(statuses)
+
+
+SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
+
+
+SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
+
+
+def is_runtime_owned_session_metadata_key(key: str) -> bool:
+    """Return whether a session metadata entry is owned by Cayu's runtime."""
+
+    return key in SESSION_RUNTIME_METADATA_KEYS or key.startswith(SESSION_RUNTIME_METADATA_PREFIX)
+
+
+def copy_session_user_metadata(replacement: dict[str, Any]) -> dict[str, Any]:
+    """Validate and detach a complete user-authored metadata replacement."""
+
+    copied_replacement = copy_durable_metadata(replacement)
+    for key in copied_replacement:
+        if is_runtime_owned_session_metadata_key(key):
+            raise ValueError("Session metadata contains a runtime-owned key.")
+    return copied_replacement
+
+
+def session_user_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Detach only caller-authored metadata from a durable session record."""
+
+    if type(metadata) is not dict:
+        raise TypeError("Session metadata must be an object.")
+    return copy_durable_json_object(
+        {
+            key: value
+            for key, value in metadata.items()
+            if not is_runtime_owned_session_metadata_key(key)
+        },
+        "session.user_metadata",
+    )
+
+
+def replace_session_user_metadata(
+    current: dict[str, Any],
+    replacement: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine validated user metadata with the current runtime-owned entries.
+
+    Callers perform this merge while holding the store's session lock. Runtime
+    metadata participates in recovery and policy enforcement, so it must be read
+    and retained in the same transaction that writes the replacement.
+    """
+
+    if type(current) is not dict:
+        raise TypeError("Current session metadata must be an object.")
+    if type(replacement) is not dict:
+        raise TypeError("Session metadata replacement must be an object.")
+    if any(is_runtime_owned_session_metadata_key(key) for key in replacement):
+        raise ValueError("Session user metadata replacement contains a runtime-owned key.")
+    runtime_metadata = {
+        key: value for key, value in current.items() if is_runtime_owned_session_metadata_key(key)
+    }
+    return copy_session_metadata({**replacement, **runtime_metadata})

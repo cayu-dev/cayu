@@ -229,11 +229,10 @@ from cayu.sessions.base import (
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
-    session_user_metadata,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
-from cayu.sessions.records import CheckpointTransform, Session, SessionStatus
+from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
