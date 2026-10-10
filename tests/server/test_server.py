@@ -5714,6 +5714,7 @@ def test_server_pending_actions_uses_one_store_native_query() -> None:
         "has_more": False,
         "total_count": None,
         "inspected_candidate_count": 0,
+        "execution_profiles": None,
     }
     assert store.pending_query_count == 1
 

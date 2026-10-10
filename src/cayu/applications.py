@@ -6462,6 +6462,7 @@ class CayuApp:
         """Return the names of all registered environments (concrete or factory), sorted."""
         return self._environment_registry.names()
 
+    @_tracked_entrance
     async def apply_storage_retention(
         self,
         policy: StorageRetentionPolicy,

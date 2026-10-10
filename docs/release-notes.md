@@ -1,6 +1,9 @@
 # Release notes
 
-## Unreleased
+## v0.11.0
+
+Cayu adds managed process snapshots, opt-in storage retention, and execution-profile
+inspection to help applications preserve and resume long-running work.
 
 - Three fixes keep provider prompt-cache prefixes stable across calls.
   Automatic recall no longer removes an earlier interaction's memory block from
@@ -23,95 +26,61 @@
   Completions adapters send `number` schema bounds as floats, so `100.0` no longer
   reaches OpenAI as `100`. The late-system-message caching example gains a
   `recall_exposure` variant.
-- `cayu cloud deploy`, `cayu cloud deployment retry` and `cayu cloud rollback` take
-  Cayu Cloud's choice for the serving release's unfinished sessions:
-  `--session-policy {wait,block,proceed}`, `--session-wait-seconds N` (60 to 3,600)
-  and a repeatable `--acknowledge-session ID` (`'*'` for every unfinished session)
-  that implies `proceed`. Invalid combinations fail locally with `invalid_input`.
-  Without the flags, requests and deploy idempotency keys are unchanged; a
-  non-default choice is part of the deploy's key. Refusals report `error.code`
-  `unfinished_sessions` or `sessions_unreadable` with `error.acknowledge_sessions`, an
-  `error.commands.retry` that acknowledges those sessions together with the ones the
-  release's choice already acknowledged (none when Cloud's list is truncated), and an
-  `error.commands.retry_wait` that waits for them again, keeping a longer stored wait.
-  While Cloud holds a publication for sessions, `deploy`, `deployment wait` and
-  `rollback --wait` report its message and extend their wait to each new check's
-  deadline plus their own wait; a release another one superseded while it waited ends
-  them with `release_superseded`. Rerunning `deploy` with any of the flags (even
-  `--session-policy wait` alone) gives the existing release that choice through a retry
-  or its promote, and `result.not_applied` (or `not_applied` for `deployment retry`)
-  reports a choice or acknowledgement Cloud didn't take, comparing a promoted choice with
-  the session check Cloud recorded. When the release can publish over sessions the
-  requested choice would protect (judged from the recorded check, or from the kept choice
-  before there is one) and it wasn't already published, the command exits `2` with
-  category `session_choice_not_applied`. See
-  [unfinished sessions](cayu-cloud.md#unfinished-sessions).
-- Hosts can predict whether stored sessions resume on a new release before
-  publishing it. `GET /api/sessions` and `GET /api/pending-actions` accept
-  `include=execution_profile` and return each session's expected and
-  active-invocation execution profiles (redacted identities: component classes,
-  fingerprints and typed egress authority) and the boundary Runtime meets it at
-  next; an unreadable session reports an issue instead of failing the page.
-  `cayu execution-profile candidates --json` prints a release's candidate
-  profiles, and `cayu execution-profile predict` compares stored profiles with
-  candidates resolved for each session's environment, target and causal budget
-  id, exiting `3` when a session may not resume. The Python API is
-  `CayuApp.inspect_session_execution_profiles`,
-  `CayuApp.inspect_candidate_execution_profile` and
-  `predict_execution_profile_admission`, which reports Runtime's decision class
-  or `policy_dependent` when an `ExecutionProfilePolicy` would decide.
-  `inspect_run_execution_profile` and `inspect_effective_run_configuration` no
-  longer load the session the request names.
-- Add storage retention for runtime-owned storage, off by default.
-  `SQLiteSessionStore` and `PostgresSessionStore` apply a
-  `SessionRetentionPolicy`: `compact` removes model text and thinking delta
-  events and replaces large stored tool-output bodies with a size-and-digest
-  marker, keeping the transcript, terminal record and usage; `delete` removes
-  whole sessions through the store's own deletion guards. Sessions referenced by
-  live tasks or leases, pending approvals or clarifications, dependent context
-  views, snapshot pins, eval or knowledge evidence, undelivered events,
-  closures, or a lineage member that must be kept are never pruned, and the
-  report names the protection. Applies change one lineage per transaction and
-  release the store between lineages.
-- `SQLiteEvalStore` and `PostgresEvalStore` apply an `EvalRetentionPolicy` to
-  terminal eval runs and keep runs that baselines, campaign checkpoints, retry
-  lineage or snapshot pins reference. `apply_artifact_retention_policy` prunes
-  artifacts by age and size and keeps pinned artifacts and those that sessions,
-  evals, knowledge or snapshots reference. `apply_workspace_retention` disposes
-  leftover environment allocations of old terminal sessions through
-  incomplete-session recovery.
-- `StorageRetentionPolicy` and `CayuApp.apply_storage_retention` combine the
-  per-store policies and collect references from every configured store,
-  including task, eval and snapshot stores in other databases.
-  `run_storage_retention_worker` applies a policy on an interval when a project
-  worker starts it. `cayu storage prune --dry-run|--apply --older-than ...
-  --target sessions|evals|artifacts|workspaces|all` exposes the same parts.
-- A dry run lists exactly what an apply removes, and every apply writes a
-  durable, queryable audit record. Storage revision 118 is an additive
-  migration that adds the retention audit tables; older binaries keep working
-  against it, and only a retention apply requires it. See
-  `docs/storage-retention.md`.
-- Interactive browser observations no longer have a default 64 KiB text cap.
-  Set `max_snapshot_bytes` explicitly to opt into truncation. Larger observations
-  within the shared durable-record ceiling remain available after recovery;
-  observations that exceed it return a persisted refusal without replaying the
-  browser action. Rebuild the browser image using
-  `cayu-browser-fetch:19-playwright-1.62.0`. The model-catalog verifier also allows
-  larger documentation DOMs within the browser's existing 100,000-node maximum.
+- Capture and restore explicitly managed processes and their owned workspaces on
+  Docker and AWS Lambda MicroVM with `DmtcpExecutionSnapshotAdapter`. Durable
+  snapshot records, compatibility checks, recovery, and resume validation protect
+  the capture and restore lifecycle. This opt-in adapter requires a prepared image
+  and does not capture arbitrary running commands or a complete VM. See
+  [execution snapshots](https://github.com/cayu-dev/cayu/blob/v0.11.0/docs/execution-snapshots.md).
+- Add opt-in retention for sessions, eval runs, artifacts, and workspaces through
+  `StorageRetentionPolicy`, `CayuApp.apply_storage_retention`, and
+  `cayu storage prune`. Dry runs report the proposed changes; applies preserve
+  referenced or active work and record a durable audit. Retention is disabled by
+  default. See [storage retention](https://github.com/cayu-dev/cayu/blob/v0.11.0/docs/storage-retention.md).
+- Inspect stored and candidate execution profiles through the Python API,
+  `include=execution_profile` on session and pending-action listings, and
+  `cayu execution-profile candidates|predict`. Predictions account for the
+  session's continuation boundary, environment, model target, and causal budget;
+  application-defined admission policies remain explicitly undetermined.
+  Candidate inspection does not load or create sessions.
+- Add session-aware deployment controls: `--session-policy`,
+  `--session-wait-seconds`, and `--acknowledge-session`. Deployment commands report
+  publication holds, superseded releases, and choices that were not applied;
+  retry guidance preserves existing acknowledgements.
+- Add `cayu.human_attention_handoff`, an HTTP event sink and reconciler for
+  committed attention observations. It waits for durable receiver acceptance and
+  repairs delivery from a receiver-persisted cursor. It remains inactive until
+  configured. See
+  [human-attention handoff](https://github.com/cayu-dev/cayu/blob/v0.11.0/src/cayu/guides/human-attention.md).
+- Let `SubagentSpec.environment_name` select a registered environment for each
+  child. Recovery preserves the selected environment identity and reconnects the
+  same allocation.
+- Preserve bounded, redacted exception causes and exception-group details in
+  `RunOutcome.error_detail`, and export collaboration contract reference types
+  through their public namespaces.
+- Remove the default 64 KiB text cap from interactive browser observations.
+  Explicit `max_snapshot_bytes` limits still apply, and observations beyond the
+  durable-record limit produce a persisted refusal without replaying the action.
+
+- Update the dashboard lockfile to seroval 1.6.9 and source-map-js 1.2.2 to
+  address dependency security advisories.
+
+### Upgrade
+
+- Storage revision 118 adds retention audit tables. Existing binaries remain
+  compatible; retention applies require the migration, while dry runs work on
+  older databases.
+- Rebuild browser images with `cayu-browser-fetch:19-playwright-1.62.0`. Set
+  `max_snapshot_bytes` explicitly if an application requires bounded observation
+  text.
+- Server contract 49 and the bundled dashboard include execution-snapshot support
+  and the new profile inspection fields. Rebuild customized dashboards from the
+  matching source bundle.
 
 ## v0.10.1
 
 Cayu preserves prompt-cache prefixes, improves interrupted tool-call recovery,
 and keeps no-progress compaction out of model-facing context.
-
-- Add `cayu.human_attention_handoff`, a ready-made, provider-neutral human-attention
-  handoff: an `EventSink` and a bounded reconciler that hand committed attention
-  observations (identities, fixed summaries, states and an application-owned requester
-  reference, never question text or tool arguments) to any HTTP receiver implementing the
-  versioned `cayu.human-attention-handoff/v1` protocol. It returns from `emit` only after
-  the receiver durably accepted, repairs from a receiver-persisted cursor, and is inert
-  without `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`. See
-  `cayu guide human-attention`.
 
 - Providers keep later system messages in conversation order instead of moving
   them into the leading prompt. OpenAI Responses uses developer messages; Chat

@@ -43230,6 +43230,8 @@
     "tests/core/test_application_shutdown.py::test_in_flight_run_finishes_and_persists_while_new_runs_are_refused": 1.402805499965325,
     "tests/core/test_application_shutdown.py::test_knowledge_publications_from_runs_belong_to_the_running_app": 1.8111294159898534,
     "tests/core/test_application_shutdown.py::test_owned_resources_close_once_in_reverse_order_only_after_settling": 0.004370833048596978,
+    "tests/core/test_application_shutdown.py::test_storage_retention_holds_owned_store_until_settled[False]": 0.5800427080830559,
+    "tests/core/test_application_shutdown.py::test_storage_retention_holds_owned_store_until_settled[True]": 0.30922054208349437,
     "tests/core/test_application_shutdown_process.py::test_aclose_leaves_no_pending_work_behind_closed_stores": 14.158907666918822,
     "tests/core/test_application_shutdown_process.py::test_closing_stores_without_aclose_leaves_pending_work": 5.74084854091052,
     "tests/core/test_application_stores.py::test_a_concurrent_close_waits_for_and_reports_the_close_in_progress": 0.0008655830752104521,

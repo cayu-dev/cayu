@@ -520,6 +520,59 @@ def test_an_allowed_operation_in_flight_holds_owned_resources_open() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_storage_retention_holds_owned_store_until_settled(sqlite_resources, cancel) -> None:
+    from datetime import timedelta
+
+    from cayu.storage.retention import RetentionPhase, StorageRetentionPolicy
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    async def scenario() -> None:
+        async with sqlite_resources as resources:
+            store = resources.own(SQLiteSessionStore(resources.path()))
+            closed: list[str] = []
+            app = _app(session_store=store, owned_resources=(_ClosingStore(store, closed),))
+            planned = asyncio.Event()
+            release = asyncio.Event()
+
+            async def progress(event) -> None:
+                assert event.phase is RetentionPhase.PLANNED
+                planned.set()
+                await release.wait()
+
+            policy = StorageRetentionPolicy.for_targets(
+                ["sessions"], older_than=timedelta(days=1), dry_run=False
+            )
+            retaining = resources.task(app.apply_storage_retention(policy, progress=progress))
+            try:
+                await asyncio.wait_for(planned.wait(), 5)
+                outcome = await app.aclose(timeout_s=0.1)
+                assert outcome.status == "incomplete" and outcome.open_operations == 1
+                assert outcome.owned_resources == "retained" and closed == []
+                if cancel:
+                    retaining.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await retaining
+                else:
+                    release.set()
+                    report = await retaining
+                    assert report.errors == {}
+                    [session_report] = report.reports
+                    audit = await store.load_retention_audit(session_report.audit_id)
+                    assert audit is not None and audit.completed_at is not None
+                settled = await app.aclose(timeout_s=5)
+                assert settled.settled and settled.open_operations == 0
+                assert settled.owned_resources == "released" and closed == ["closed"]
+                with pytest.raises(ApplicationAdmissionsSealed, match="closed"):
+                    await app.apply_storage_retention(policy)
+            finally:
+                release.set()
+                await asyncio.gather(retaining, return_exceptions=True)
+                await app.aclose(timeout_s=5)
+
+    asyncio.run(scenario())
+
+
 def test_aclose_stops_model_policy_workers(monkeypatch) -> None:
     async def scenario() -> None:
         app = _app()
