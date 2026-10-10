@@ -314,6 +314,7 @@ from cayu.sessions._invocation_scope import (
     _activate_owned_session_run_fence,
     _deactivate_session_interaction,
 )
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -324,7 +325,6 @@ from cayu.sessions._terminal_evidence import (
     _SessionRunOperation,
 )
 from cayu.sessions.base import (
-    RuntimePublicationReceipt,
     SessionRunFenced,
     SessionStore,
     _checkpoint_with_session_run_operation,
@@ -2600,7 +2600,7 @@ class RecoveryCoordinator:
         request: ToolEffectReconciliationRequest,
     ) -> _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None:
         """Read exact settlement and consumption proof without acquiring execution authority."""
-        from cayu.sessions.base import runtime_publication_event_reference
+        from cayu.sessions._runtime_publication import runtime_publication_event_reference
 
         if request.session_instance_id != session.instance_id:
             raise ToolEffectConflict("Receipt replay has a different session incarnation.")

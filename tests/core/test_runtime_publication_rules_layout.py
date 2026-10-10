@@ -24,6 +24,11 @@ import cayu
         ("_operation_records", "RuntimePublicationOperationRecordMutation"),
         ("_operation_records", "runtime_publication_operation_record_value_digest"),
         ("_checkpoint_mutations", "runtime_publication_checkpoint_mutation"),
+        ("_runtime_publication", "RuntimePublicationEventReference"),
+        ("_runtime_publication", "RuntimePublicationRequest"),
+        ("_runtime_publication", "RuntimePublicationReceipt"),
+        ("_runtime_publication", "RuntimePublicationResult"),
+        ("_runtime_publication", "runtime_publication_event_reference"),
     ),
 )
 def test_publication_rules_preserve_public_identity(module, name):
@@ -124,5 +129,80 @@ assert len(projected.scalar_text) == authority.CHECKPOINT_ROOT_FIELD_SCALAR_MAX_
 assert projected == authority.checkpoint_root_field_projection_from_storage(
     json_type="integer", scalar_text=value)
 rejected(lambda: authority._validate_optional_runtime_publication_fence(True, "epoch"), TypeError)
+"""
+    )
+
+
+def test_publication_contracts_detach_values_and_bind_referenced_events_without_stores():
+    _without_stores(
+        """
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions import _runtime_publication as contracts
+from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation
+
+event = Event(type=EventType.MODEL_COMPLETED, session_id="session", interaction_id="interaction",
+    payload={"nested": [1]})
+message = Message.text("assistant", "answer")
+intent = {"nested": [1]}
+request = contracts.RuntimePublicationRequest(publication_id="publication", kind="model-step",
+    interaction_id="interaction", intent=intent, mutation=RuntimePublicationMutation(),
+    transcript_messages=[message], events=[event])
+event.payload["nested"].clear()
+intent["nested"].clear()
+assert request.intent == {"nested": [1]}
+assert request.events[0].payload == {"nested": [1]}
+assert request.transcript_messages[0] is not message
+rejected(lambda: contracts.RuntimePublicationRequest(publication_id="duplicate", kind="model-step",
+    intent={}, mutation=RuntimePublicationMutation(), transcript_messages=[], events=[event, event]))
+reference = contracts.runtime_publication_event_reference(event)
+contracts._validate_runtime_publication_event_references(
+    (reference,), {event.id: event}, interaction_id="interaction")
+event.payload["changed"] = True
+rejected(lambda: contracts._validate_runtime_publication_event_references(
+    (reference,), {event.id: event}, interaction_id="interaction"))
+"""
+    )
+
+
+def test_publication_checkpoint_scope_restores_nested_and_cancelled_contexts_without_stores():
+    _without_stores(
+        """
+import asyncio
+from cayu.sessions import _checkpoint_publication as rules
+
+def decode(session, checkpoint): return checkpoint
+def encode(session, checkpoint): return checkpoint
+def apply(session, checkpoint, mutation): return checkpoint
+
+async def scenario():
+    assert rules._active_runtime_publication_checkpoint_codec() is None
+    with rules._runtime_publication_checkpoint_codec_scope(decode=decode, encode=encode, apply_mutation=apply):
+        outer = rules._active_runtime_publication_checkpoint_codec()
+        assert outer.decode is decode and outer.encode is encode and outer.apply_mutation is apply
+        entered = asyncio.Event()
+        async def child():
+            assert rules._active_runtime_publication_checkpoint_codec() is outer
+            try:
+                with rules._runtime_publication_checkpoint_codec_scope(
+                    decode=decode, encode=encode, apply_mutation=apply):
+                    assert rules._active_runtime_publication_checkpoint_codec() is not outer
+                    entered.set()
+                    await asyncio.Future()
+            finally:
+                assert rules._active_runtime_publication_checkpoint_codec() is outer
+        task = asyncio.create_task(child())
+        await entered.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("Cancellation disappeared")
+        assert rules._active_runtime_publication_checkpoint_codec() is outer
+    assert rules._active_runtime_publication_checkpoint_codec() is None
+asyncio.run(scenario())
+rejected(lambda: rules._validate_checkpoint_codec_pair(decode, None))
 """
     )

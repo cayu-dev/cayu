@@ -54,12 +54,12 @@ from cayu.sessions._pending_tool_round import (
     pending_tool_round_identity,
 )
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
-from cayu.sessions.base import (
+from cayu.sessions._runtime_publication import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    SessionStore,
     runtime_publication_event_reference,
 )
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
 

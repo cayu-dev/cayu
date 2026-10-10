@@ -261,6 +261,10 @@ from cayu.sessions._operation_records import (
     RuntimePublicationOperationRecordMutation,
     runtime_publication_operation_record_value_digest,
 )
+from cayu.sessions._runtime_publication import (
+    RuntimePublicationRequest,
+    runtime_publication_event_reference,
+)
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     BudgetReservationIdentityConflict,
@@ -268,13 +272,11 @@ from cayu.sessions.base import (
     ModelCompletionStageRequest,
     ModelTarget,
     QueuedDispatchTerminalReceiptQuery,
-    RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
     SessionStore,
     _checkpoint_with_session_run_operation,
-    runtime_publication_event_reference,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,

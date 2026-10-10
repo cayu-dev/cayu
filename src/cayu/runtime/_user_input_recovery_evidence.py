@@ -26,11 +26,12 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import RuntimePublicationReceipt, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     EventRecord,

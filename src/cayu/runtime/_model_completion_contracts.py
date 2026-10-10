@@ -62,12 +62,11 @@ from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._operation_records import RuntimePublicationOperationRecordMutation
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt, RuntimePublicationResult
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     ModelCompletionStage,
     ModelCompletionStageResult,
-    RuntimePublicationReceipt,
-    RuntimePublicationResult,
 )
 from cayu.sessions.records import Session
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority

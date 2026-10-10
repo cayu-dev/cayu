@@ -50,11 +50,8 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RuntimePublicationRequest,
-    RuntimePublicationResult,
-)
+from cayu.sessions._runtime_publication import RuntimePublicationRequest, RuntimePublicationResult
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

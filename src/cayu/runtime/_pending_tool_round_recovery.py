@@ -119,15 +119,11 @@ from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflic
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
 )
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
 )
-from cayu.sessions.base import (
-    RuntimePublicationReceipt,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import SessionOperationPublication, SessionRunFenced, SessionStore
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (
     Session,

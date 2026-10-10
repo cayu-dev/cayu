@@ -32,7 +32,8 @@ from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
 )
-from cayu.sessions.base import InMemorySessionStore, RuntimePublicationRequest
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import Session
 from cayu.sessions.requests import RunRequest
 from cayu.tools.exposure import ToolCapabilityCeiling

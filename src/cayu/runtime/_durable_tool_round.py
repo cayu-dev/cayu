@@ -96,8 +96,8 @@ from cayu.sessions._invocation_scope import (
     _activate_session_run_fence,
     _deactivate_session_run_fence,
 )
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt
 from cayu.sessions.base import (
-    RuntimePublicationReceipt,
     SessionRunFenced,
     SessionStore,
     _initial_transcript_pending_interaction_id,

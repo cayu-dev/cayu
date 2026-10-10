@@ -29,12 +29,12 @@ from cayu.runtime._child_session_notifications import (
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.sessions._access_rules import runtime_session_query
+from cayu.sessions._runtime_publication import _tool_round_lifecycle_event_limit
 from cayu.sessions.base import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _child_session_lifecycle_entry,
     _child_session_lifecycle_entry_sort_key,
     _child_session_lifecycle_occurrence,
-    _tool_round_lifecycle_event_limit,
     _validate_interaction_page,
     _validate_tool_round_call_ids,
 )

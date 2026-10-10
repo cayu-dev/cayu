@@ -20,9 +20,7 @@ from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflic
 from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_value_digest as digest,
 )
-from cayu.sessions.base import (
-    RuntimePublicationRequest as Request,
-)
+from cayu.sessions._runtime_publication import RuntimePublicationRequest as Request
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,

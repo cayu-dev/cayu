@@ -75,12 +75,8 @@ from cayu.runtime._tool_invocation import workspace_capture as workspace_capture
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RuntimePublicationRequest,
-    RuntimePublicationResult,
-    runtime_publication_request_digest,
-)
+from cayu.sessions._runtime_publication import RuntimePublicationRequest, RuntimePublicationResult
+from cayu.sessions.base import InMemorySessionStore, runtime_publication_request_digest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest

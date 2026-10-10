@@ -33,7 +33,8 @@ from cayu import (
     artifact_store_identity_sha256,
     record_artifact_write_settlement,
 )
-from cayu.sessions.base import RuntimePublicationRequest, RuntimePublicationResult, SessionStore
+from cayu.sessions._runtime_publication import RuntimePublicationRequest, RuntimePublicationResult
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionStatus
 
 

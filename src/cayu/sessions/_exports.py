@@ -375,7 +375,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions._checkpoint_mutations",
         "RuntimePublicationCheckpointOperation",
     ),
-    "RuntimePublicationEventReference": ("cayu.sessions.base", "RuntimePublicationEventReference"),
+    "RuntimePublicationEventReference": (
+        "cayu.sessions._runtime_publication",
+        "RuntimePublicationEventReference",
+    ),
     "RuntimePublicationMutation": (
         "cayu.sessions._checkpoint_mutations",
         "RuntimePublicationMutation",
@@ -384,9 +387,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions._operation_records",
         "RuntimePublicationOperationRecordMutation",
     ),
-    "RuntimePublicationReceipt": ("cayu.sessions.base", "RuntimePublicationReceipt"),
-    "RuntimePublicationRequest": ("cayu.sessions.base", "RuntimePublicationRequest"),
-    "RuntimePublicationResult": ("cayu.sessions.base", "RuntimePublicationResult"),
+    "RuntimePublicationReceipt": (
+        "cayu.sessions._runtime_publication",
+        "RuntimePublicationReceipt",
+    ),
+    "RuntimePublicationRequest": (
+        "cayu.sessions._runtime_publication",
+        "RuntimePublicationRequest",
+    ),
+    "RuntimePublicationResult": ("cayu.sessions._runtime_publication", "RuntimePublicationResult"),
     "SESSION_RUNTIME_METADATA_KEYS": ("cayu.sessions.records", "SESSION_RUNTIME_METADATA_KEYS"),
     "SESSION_RUNTIME_METADATA_PREFIX": ("cayu.sessions.records", "SESSION_RUNTIME_METADATA_PREFIX"),
     "SerializedRecordSummary": ("cayu.sessions.inspection", "SerializedRecordSummary"),
@@ -550,7 +559,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "runtime_publication_checkpoint_value_digest",
     ),
     "runtime_publication_event_reference": (
-        "cayu.sessions.base",
+        "cayu.sessions._runtime_publication",
         "runtime_publication_event_reference",
     ),
     "runtime_publication_operation_record_value_digest": (

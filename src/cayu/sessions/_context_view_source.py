@@ -20,7 +20,8 @@ from cayu.sessions._model_completion_publication import (
     ModelStepPublicationCheckpoint,
     model_step_publication_from_checkpoint,
 )
-from cayu.sessions.base import RuntimePublicationReceipt, ToolCallPart, ToolResultPart
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt
+from cayu.sessions.base import ToolCallPart, ToolResultPart
 from cayu.sessions.context_views import CONTEXT_VIEW_MAX_MESSAGES, ParticipantSessionBinding
 from cayu.sessions.records import Session, TranscriptRecord
 

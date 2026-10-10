@@ -36,10 +36,10 @@ from cayu.sessions._model_completion_publication import (
     ModelStepPublicationCheckpoint,
 )
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY, ModelFailoverProgress
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
 from cayu.sessions.base import (
     InMemorySessionStore,
     ModelCompletionStageRequest,
-    RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
     SessionStore,
     model_completion_stage_settlement_request,

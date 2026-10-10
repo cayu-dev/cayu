@@ -8,9 +8,7 @@ import secrets
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,12 +32,14 @@ from cayu.collaboration.peer_content import (
 )
 from cayu.sessions import _checkpoint_mutations as checkpoint_mutation_rules
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions import _checkpoint_publication as checkpoint_publication
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _operation_records as operation_record_rules
+from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import creation_fence
@@ -57,7 +57,6 @@ from cayu.sessions import terminal_evidence as terminal_session_evidence
 from cayu.sessions import transcript_input as session_transcript_input
 from cayu.sessions import transcript_queries as session_transcript_queries
 from cayu.sessions import usage as session_usage_rules
-from cayu.sessions._argument_continuity import ArgumentContinuity
 from cayu.sessions._checkpoint_mutations import (
     RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS as RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS,
 )
@@ -164,6 +163,32 @@ from cayu.sessions._operation_records import (
 )
 from cayu.sessions._operation_records import (
     runtime_publication_operation_record_value_digest as runtime_publication_operation_record_value_digest,
+)
+from cayu.sessions._runtime_publication import (
+    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS as RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
+)
+from cayu.sessions._runtime_publication import (
+    RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES as RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES,
+)
+from cayu.sessions._runtime_publication import (
+    RUNTIME_PUBLICATION_RECORD_TYPE as RUNTIME_PUBLICATION_RECORD_TYPE,
+)
+from cayu.sessions._runtime_publication import (
+    RUNTIME_PUBLICATION_SCHEMA_VERSION as RUNTIME_PUBLICATION_SCHEMA_VERSION,
+)
+from cayu.sessions._runtime_publication import (
+    RuntimePublicationEventReference as RuntimePublicationEventReference,
+)
+from cayu.sessions._runtime_publication import RuntimePublicationKind as RuntimePublicationKind
+from cayu.sessions._runtime_publication import (
+    RuntimePublicationReceipt as RuntimePublicationReceipt,
+)
+from cayu.sessions._runtime_publication import (
+    RuntimePublicationRequest as RuntimePublicationRequest,
+)
+from cayu.sessions._runtime_publication import RuntimePublicationResult as RuntimePublicationResult
+from cayu.sessions._runtime_publication import (
+    runtime_publication_event_reference as runtime_publication_event_reference,
 )
 from cayu.sessions.authority import (
     CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS as CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
@@ -1736,68 +1761,6 @@ def _completion_result_event_publication_delete_block_reason(
     return "completion-result event publication is incomplete"
 
 
-def _validate_checkpoint_codec_pair(
-    checkpoint_decode: CheckpointTransform | None,
-    checkpoint_encode: CheckpointTransform | None,
-) -> None:
-    if (checkpoint_decode is None) != (checkpoint_encode is None):
-        raise ValueError("Checkpoint decode and encode transforms must be supplied together.")
-    if checkpoint_decode is not None and not callable(checkpoint_decode):
-        raise TypeError("checkpoint_decode must be callable.")
-    if checkpoint_encode is not None and not callable(checkpoint_encode):
-        raise TypeError("checkpoint_encode must be callable.")
-
-
-@dataclass(frozen=True)
-class _RuntimePublicationCheckpointCodec:
-    """Task-scoped checkpoint projection captured by a prepared publication."""
-
-    decode: CheckpointTransform
-    encode: CheckpointTransform
-    apply_mutation: Callable[
-        [Session, dict[str, Any] | None, RuntimePublicationMutation],
-        dict[str, Any] | None,
-    ]
-
-    def __post_init__(self) -> None:
-        _validate_checkpoint_codec_pair(self.decode, self.encode)
-        if not callable(self.apply_mutation):
-            raise TypeError("Checkpoint mutation projection must be callable.")
-
-
-_RUNTIME_PUBLICATION_CHECKPOINT_CODEC: ContextVar[_RuntimePublicationCheckpointCodec | None] = (
-    ContextVar("cayu_runtime_publication_checkpoint_codec", default=None)
-)
-
-
-@contextmanager
-def _runtime_publication_checkpoint_codec_scope(
-    *,
-    decode: CheckpointTransform,
-    encode: CheckpointTransform,
-    apply_mutation: Callable[
-        [Session, dict[str, Any] | None, RuntimePublicationMutation],
-        dict[str, Any] | None,
-    ],
-) -> Iterator[None]:
-    """Carry one codec through legacy-compatible public store overrides."""
-
-    codec = _RuntimePublicationCheckpointCodec(
-        decode=decode,
-        encode=encode,
-        apply_mutation=apply_mutation,
-    )
-    token = _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.set(codec)
-    try:
-        yield
-    finally:
-        _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.reset(token)
-
-
-def _active_runtime_publication_checkpoint_codec() -> _RuntimePublicationCheckpointCodec | None:
-    return _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.get()
-
-
 ForkCheckpointAuthorityDecoder = Callable[
     [dict[str, Any] | None],
     dict[str, Any] | None,
@@ -1837,10 +1800,6 @@ def transform_fork_checkpoint(
         raise
 
 
-RUNTIME_PUBLICATION_RECORD_TYPE = "cayu.runtime-publication"
-RUNTIME_PUBLICATION_SCHEMA_VERSION = 2
-RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
-RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
 _PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -1866,17 +1825,6 @@ _STRUCTURED_OUTPUT_AUXILIARY_INTENT_KEYS = frozenset(
         "event_ids",
     }
 )
-RuntimePublicationKind = Literal[
-    "model-step",
-    "context-compaction",
-    "auxiliary-inference",
-    "tool-round",
-    "approval-open",
-    "approval-close",
-    "user-input-open",
-    "user-input-close",
-    "workspace-observation",
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1892,326 +1840,6 @@ class _StructuredOutputToolRoundAuxiliary:
     errors: tuple[dict[str, Any], ...]
 
 
-class RuntimePublicationEventReference(BaseModel):
-    """Content-bound reference to one already-durable runtime event."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    event_id: str = Field(max_length=EVENT_ID_MAX_CHARS)
-    event_digest: str
-
-    @field_validator("event_id")
-    @classmethod
-    def validate_event_id(cls, value: str) -> str:
-        return require_clean_nonblank(value, "event_id")
-
-    @field_validator("event_digest")
-    @classmethod
-    def validate_event_digest(cls, value: str) -> str:
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError("event_digest must be a lowercase SHA-256 digest.")
-        return value
-
-
-def _copy_runtime_publication_event_reference(
-    reference: RuntimePublicationEventReference | dict[str, Any],
-) -> RuntimePublicationEventReference:
-    try:
-        if type(reference) is RuntimePublicationEventReference:
-            return RuntimePublicationEventReference(
-                event_id=reference.event_id,
-                event_digest=reference.event_digest,
-            )
-        if type(reference) is dict:
-            return RuntimePublicationEventReference.model_validate(reference)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("Runtime publication event reference is malformed.") from exc
-    raise TypeError(
-        "Runtime publication event references must be "
-        "RuntimePublicationEventReference values or objects."
-    )
-
-
-class RuntimePublicationRequest(BaseModel):
-    """Immutable input bundle for one logical model-step or tool-round publication."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    publication_id: str = Field(max_length=256)
-    kind: RuntimePublicationKind
-    interaction_id: str | None = Field(default=None, max_length=256)
-    intent: dict[str, Any]
-    mutation: RuntimePublicationMutation
-    transcript_messages: tuple[Message, ...]
-    events: tuple[Event, ...]
-    argument_continuity: ArgumentContinuity | None = Field(default=None, repr=False)
-    operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = Field(
-        default_factory=tuple
-    )
-    referenced_events: tuple[RuntimePublicationEventReference, ...] = Field(default_factory=tuple)
-
-    @field_validator("publication_id", "kind")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("argument_continuity", mode="before")
-    @classmethod
-    def copy_argument_continuity(
-        cls, value: ArgumentContinuity | dict[str, Any] | None
-    ) -> ArgumentContinuity | None:
-        if value is None:
-            return None
-        if type(value) is ArgumentContinuity:
-            value = {
-                "nonce": value.nonce,
-                "profile": value.profile,
-                "scope": value.scope,
-                "arguments": value.arguments,
-            }
-        return ArgumentContinuity.model_validate(value)
-
-    @field_validator("interaction_id")
-    @classmethod
-    def validate_optional_interaction_id(cls, value: str | None) -> str | None:
-        return None if value is None else require_clean_nonblank(value, "interaction_id")
-
-    @field_validator("intent", mode="before")
-    @classmethod
-    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "intent")
-
-    @field_validator("mutation", mode="before")
-    @classmethod
-    def copy_mutation(
-        cls,
-        value: RuntimePublicationMutation | dict[str, Any],
-    ) -> RuntimePublicationMutation:
-        return checkpoint_mutation_rules._copy_runtime_publication_mutation_value(value)
-
-    @field_validator("transcript_messages", mode="before")
-    @classmethod
-    def copy_transcript_messages(cls, value) -> tuple[Message, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("transcript_messages must be a list or tuple of Message values.")
-        return tuple(detach_message(message) for message in value)
-
-    @field_validator("events", mode="before")
-    @classmethod
-    def copy_events(cls, value) -> tuple[Event, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("events must be a list or tuple of Event values.")
-        copied: list[Event] = []
-        seen: set[str] = set()
-        for event in value:
-            # Runtime publications are a separate atomic persistence path from
-            # append_events(). Apply the same origin-lineage trust boundary here
-            # before the request and event digests are derived. The publication
-            # preparation path reconstructs this model, so this also sanitizes
-            # validator-bypassed model_copy/model_construct inputs before commit.
-            copied_event = session_event_rules._copy_event_for_session_store(event)
-            if copied_event.id in seen:
-                raise ValueError(f"Runtime publication event id is duplicated: {copied_event.id}")
-            seen.add(copied_event.id)
-            copied.append(copied_event)
-        return tuple(copied)
-
-    @field_validator("operation_record_mutations", mode="before")
-    @classmethod
-    def copy_operation_record_mutations(
-        cls,
-        value: object,
-    ) -> tuple[RuntimePublicationOperationRecordMutation, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("operation_record_mutations must be a list or tuple.")
-        mutation_values = cast(
-            "operation_record_rules._RuntimePublicationOperationRecordMutationValues", value
-        )
-        if len(mutation_values) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
-            raise ValueError(
-                "operation_record_mutations cannot exceed the runtime publication bound."
-            )
-        copied = tuple(
-            sorted(
-                (
-                    operation_record_rules._copy_runtime_publication_operation_record_mutation(
-                        mutation
-                    )
-                    for mutation in mutation_values
-                ),
-                key=lambda mutation: mutation.key,
-            )
-        )
-        keys = tuple(mutation.key for mutation in copied)
-        if len(keys) != len(set(keys)):
-            raise ValueError("operation_record_mutations cannot repeat a key.")
-        return copied
-
-    @field_validator("referenced_events", mode="before")
-    @classmethod
-    def copy_referenced_events(
-        cls,
-        value,
-    ) -> tuple[RuntimePublicationEventReference, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("referenced_events must be a list or tuple of event references.")
-        copied: list[RuntimePublicationEventReference] = []
-        seen: set[str] = set()
-        for reference in value:
-            try:
-                copied_reference = _copy_runtime_publication_event_reference(reference)
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise ValueError("referenced_events contains a malformed reference.") from exc
-            if copied_reference.event_id in seen:
-                raise ValueError(f"Referenced event id is duplicated: {copied_reference.event_id}")
-            seen.add(copied_reference.event_id)
-            copied.append(copied_reference)
-        return tuple(copied)
-
-    @model_validator(mode="after")
-    def validate_batch_limits(self) -> RuntimePublicationRequest:
-        if len(self.transcript_messages) > RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES:
-            raise ValueError(
-                "transcript_messages cannot contain more than "
-                f"{RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES} messages."
-            )
-        event_binding_count = len(self.events) + len(self.referenced_events)
-        event_binding_limit = _runtime_publication_event_limit(self.kind, self.intent)
-        if event_binding_count > event_binding_limit:
-            raise ValueError(
-                "events and referenced_events cannot contain more than "
-                f"{event_binding_limit} total event bindings."
-            )
-        appended_event_ids = {event.id for event in self.events}
-        referenced_event_ids = {reference.event_id for reference in self.referenced_events}
-        if appended_event_ids & referenced_event_ids:
-            raise ValueError("Appended and referenced runtime publication events cannot overlap.")
-        return self
-
-
-class RuntimePublicationReceipt(BaseModel):
-    """Store-owned, insert-only proof of one atomic runtime publication."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.runtime-publication"] = RUNTIME_PUBLICATION_RECORD_TYPE
-    schema_version: Literal[2] = RUNTIME_PUBLICATION_SCHEMA_VERSION
-    session_id: str
-    publication_id: str = Field(max_length=256)
-    kind: RuntimePublicationKind
-    interaction_id: str | None = Field(default=None, max_length=256)
-    intent: dict[str, Any]
-    request_digest: str
-    publication_digest: str
-    checkpoint_digest: str
-    transcript_digest: str
-    events_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    transcript_start_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    transcript_end_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    appended_event_ids: tuple[str, ...]
-    referenced_events: tuple[RuntimePublicationEventReference, ...]
-    published_at: datetime
-
-    @field_validator("session_id", "publication_id", "kind")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("interaction_id")
-    @classmethod
-    def validate_optional_interaction_id(cls, value: str | None) -> str | None:
-        return None if value is None else require_clean_nonblank(value, "interaction_id")
-
-    @field_validator("intent", mode="before")
-    @classmethod
-    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "intent")
-
-    @field_validator(
-        "request_digest",
-        "publication_digest",
-        "checkpoint_digest",
-        "transcript_digest",
-        "events_digest",
-    )
-    @classmethod
-    def validate_digest(cls, value: str, info) -> str:
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("appended_event_ids", mode="before")
-    @classmethod
-    def copy_event_ids(cls, value, info) -> tuple[str, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError(f"{info.field_name} must be a list or tuple of event ids.")
-        copied = tuple(
-            require_clean_nonblank(event_id, f"{info.field_name} item") for event_id in value
-        )
-        if len(set(copied)) != len(copied):
-            raise ValueError(f"{info.field_name} must not contain duplicate event ids.")
-        return copied
-
-    @field_validator("referenced_events", mode="before")
-    @classmethod
-    def copy_referenced_events(
-        cls,
-        value,
-    ) -> tuple[RuntimePublicationEventReference, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("referenced_events must be a list or tuple of event references.")
-        copied = tuple(_copy_runtime_publication_event_reference(item) for item in value)
-        event_ids = tuple(reference.event_id for reference in copied)
-        if len(set(event_ids)) != len(event_ids):
-            raise ValueError("referenced_events must not contain duplicate event ids.")
-        return copied
-
-    @field_validator("published_at")
-    @classmethod
-    def normalize_published_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("published_at must include a timezone.")
-        return value.astimezone(UTC)
-
-    @model_validator(mode="after")
-    def validate_boundaries(self) -> RuntimePublicationReceipt:
-        if self.transcript_end_cursor < self.transcript_start_cursor:
-            raise ValueError("transcript_end_cursor cannot precede transcript_start_cursor.")
-        if (
-            self.transcript_end_cursor - self.transcript_start_cursor
-            > RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES
-        ):
-            raise ValueError("Runtime publication receipt transcript span is too large.")
-        if len(self.appended_event_ids) + len(
-            self.referenced_events
-        ) > _runtime_publication_event_limit(self.kind, self.intent):
-            raise ValueError("Runtime publication receipt event binding count is too large.")
-        referenced_event_ids = {reference.event_id for reference in self.referenced_events}
-        if set(self.appended_event_ids) & referenced_event_ids:
-            raise ValueError("Appended and referenced event ids must not overlap.")
-        return self
-
-
-class RuntimePublicationResult(BaseModel):
-    """Result of a new runtime publication or an exact durable replay."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    session: Session
-    receipt: RuntimePublicationReceipt
-    replayed: StrictBool
-
-
 @dataclass(frozen=True)
 class _PreparedRuntimePublication:
     session_id: str
@@ -2225,7 +1853,7 @@ class _PreparedRuntimePublication:
     expected_statuses: frozenset[SessionStatus] | None
     expected_run_epoch: int | None
     expected_transcript_cursor: int | None
-    checkpoint_codec: _RuntimePublicationCheckpointCodec | None = None
+    checkpoint_codec: checkpoint_publication._RuntimePublicationCheckpointCodec | None = None
 
 
 MODEL_COMPLETION_STAGE_RECORD_TYPE = "cayu.model-completion-stage"
@@ -6712,7 +6340,7 @@ class SessionStore(ABC):
 
         session_id = require_clean_nonblank(session_id, "session_id")
         publication_id = require_clean_nonblank(publication_id, "publication_id")
-        storage_key = _runtime_publication_storage_key(publication_id)
+        storage_key = publication_contracts._runtime_publication_storage_key(publication_id)
         record = await self._load_runtime_publication_receipt_record(
             session_id,
             storage_key,
@@ -7333,7 +6961,9 @@ class SessionStore(ABC):
                 if record.event.payload.get("tool_call_id") not in selected_ids:
                     continue
                 lifecycle_events.append(copy_event(record.event))
-                if len(lifecycle_events) > _tool_round_lifecycle_event_limit(copied_ids):
+                if len(lifecycle_events) > publication_contracts._tool_round_lifecycle_event_limit(
+                    copied_ids
+                ):
                     raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             after_sequence = records[-1].sequence
             if len(records) < 5000:
@@ -7386,7 +7016,9 @@ class SessionStore(ABC):
                 ):
                     continue
                 lifecycle_events.append(copy_event(event))
-                if len(lifecycle_events) > _tool_round_lifecycle_event_limit(copied_ids):
+                if len(lifecycle_events) > publication_contracts._tool_round_lifecycle_event_limit(
+                    copied_ids
+                ):
                     raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             after_sequence = records[-1].sequence
             if len(records) < 5000:
@@ -10895,7 +10527,7 @@ class InMemorySessionStore(
             tool_receipt = None
             if pointer.tool_round_id is not None:
                 publication_id = f"tool-round:{pointer.tool_round_id}"
-                key = _runtime_publication_storage_key(publication_id)
+                key = publication_contracts._runtime_publication_storage_key(publication_id)
                 record = self._session_operation_records.get(session_id, {}).get(key)
                 if record is None:
                     from itertools import islice
@@ -10918,7 +10550,7 @@ class InMemorySessionStore(
                         )
                     )
                     publication_id = closed_round_publication_id(pointer, closures)
-                    key = _runtime_publication_storage_key(publication_id)
+                    key = publication_contracts._runtime_publication_storage_key(publication_id)
                     record = self._session_operation_records.get(session_id, {}).get(key)
                 if record is not None:
                     tool_receipt = _reconstruct_runtime_publication_receipt(
@@ -13200,7 +12832,9 @@ class InMemorySessionStore(
                     ),
                     receipt_exists=(
                         operation_records.get(
-                            _runtime_publication_storage_key(stage.logical_step_id)
+                            publication_contracts._runtime_publication_storage_key(
+                                stage.logical_step_id
+                            )
                         )
                         is not None
                     ),
@@ -16268,7 +15902,9 @@ class InMemorySessionStore(
             receipt.session_id,
             [],
         )[receipt.transcript_start_cursor : receipt.transcript_end_cursor]
-        referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
+        referenced_event_ids = publication_contracts._runtime_publication_referenced_event_ids(
+            receipt.referenced_events
+        )
         requested_event_ids = set((*receipt.appended_event_ids, *referenced_event_ids))
         events_by_id = {}
         for event_id in requested_event_ids:
@@ -16943,7 +16579,11 @@ class InMemorySessionStore(
                         is not None
                     ),
                     receipt_exists=(
-                        records.get(_runtime_publication_storage_key(active.stage.logical_step_id))
+                        records.get(
+                            publication_contracts._runtime_publication_storage_key(
+                                active.stage.logical_step_id
+                            )
+                        )
                         is not None
                     ),
                 )
@@ -17105,7 +16745,10 @@ class InMemorySessionStore(
                 if (
                     records.get(_model_completion_stage_winner_storage_key(logical_step_id))
                     is not None
-                    or records.get(_runtime_publication_storage_key(logical_step_id)) is not None
+                    or records.get(
+                        publication_contracts._runtime_publication_storage_key(logical_step_id)
+                    )
+                    is not None
                 ):
                     raise SessionModelCompletionStageConflict(
                         "An abandoned model-completion stage has durable publication state."
@@ -17117,7 +16760,9 @@ class InMemorySessionStore(
                 session_id=session_id,
             )
             winner_storage_key = _model_completion_stage_winner_storage_key(stage.logical_step_id)
-            publication_storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+            publication_storage_key = publication_contracts._runtime_publication_storage_key(
+                stage.logical_step_id
+            )
             _validate_model_completion_stage_for_abandonment(
                 session=session,
                 stage=stage,
@@ -17182,7 +16827,9 @@ class InMemorySessionStore(
             if stage is None:
                 raise KeyError(f"Model-completion stage not found: {stage_id}")
 
-            publication_storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+            publication_storage_key = publication_contracts._runtime_publication_storage_key(
+                stage.logical_step_id
+            )
             winner_storage_key = _model_completion_stage_winner_storage_key(stage.logical_step_id)
             receipt_record = records.get(publication_storage_key)
             if receipt_record is not None:
@@ -17319,7 +16966,9 @@ class InMemorySessionStore(
 
         appended_event_ids = {event.id for event in request.events}
         referenced_event_ids = set(
-            _runtime_publication_referenced_event_ids(request.referenced_events)
+            publication_contracts._runtime_publication_referenced_event_ids(
+                request.referenced_events
+            )
         )
         if appended_event_ids & referenced_event_ids:
             raise ValueError("Appended and referenced runtime publication events overlap.")
@@ -17328,7 +16977,7 @@ class InMemorySessionStore(
             record = self._event_records_by_id.get((session_id, event_id))
             if record is not None:
                 durable_events_by_id[event_id] = record.event
-        _validate_runtime_publication_event_references(
+        publication_contracts._validate_runtime_publication_event_references(
             request.referenced_events,
             durable_events_by_id,
             interaction_id=request.interaction_id,
@@ -17366,7 +17015,9 @@ class InMemorySessionStore(
                         execution_identity,
                     )
                 )
-            if len(durable_tool_events) > _tool_round_lifecycle_event_limit(tool_call_ids):
+            if len(durable_tool_events) > publication_contracts._tool_round_lifecycle_event_limit(
+                tool_call_ids
+            ):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
         _validate_tool_round_publication(
             request,
@@ -17613,7 +17264,7 @@ class InMemorySessionStore(
                 if record.event.type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES
             ]
             records.sort(key=lambda record: record.sequence)
-            if len(records) > _tool_round_lifecycle_event_limit(copied_ids):
+            if len(records) > publication_contracts._tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [copy_event(record.event) for record in records]
 
@@ -17644,7 +17295,7 @@ class InMemorySessionStore(
                 )
             ]
             records.sort(key=lambda record: record.sequence)
-            if len(records) > _tool_round_lifecycle_event_limit(copied_ids):
+            if len(records) > publication_contracts._tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [copy_event(record.event) for record in records]
 
@@ -19928,16 +19579,6 @@ def _prepare_initial_session_operation_records(
     return copied
 
 
-def _runtime_publication_storage_key(publication_id: str) -> str:
-    publication_id = require_clean_nonblank(publication_id, "publication_id")
-    if len(publication_id) > 256:
-        raise ValueError("publication_id must contain at most 256 characters.")
-    return (
-        RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX
-        + sha256(publication_id.encode("utf-8")).hexdigest()
-    )
-
-
 def _model_completion_stage_storage_identity(
     session_id: str,
     stage_id: str,
@@ -20088,71 +19729,6 @@ def _apply_queue_completion_checkpoint_mutation(
     )
     assert updated is not None
     return updated
-
-
-def _runtime_publication_event_digest(event: Event) -> str:
-    copied_event = copy_event(event)
-    return session_authority_rules._canonical_runtime_publication_digest(
-        copied_event.model_dump(mode="json")
-    )
-
-
-def runtime_publication_event_reference(event: Event) -> RuntimePublicationEventReference:
-    """Return an immutable ID-and-content reference for one exact event value."""
-
-    copied_event = copy_event(event)
-    return RuntimePublicationEventReference(
-        event_id=copied_event.id,
-        event_digest=session_authority_rules._canonical_runtime_publication_digest(
-            copied_event.model_dump(mode="json")
-        ),
-    )
-
-
-def _runtime_publication_referenced_event_ids(
-    references: Iterable[RuntimePublicationEventReference],
-) -> tuple[str, ...]:
-    return tuple(reference.event_id for reference in references)
-
-
-def _validate_runtime_publication_event_references(
-    references: Iterable[RuntimePublicationEventReference],
-    durable_events_by_id: Mapping[str, Event],
-    *,
-    interaction_id: str | None,
-) -> None:
-    for reference in references:
-        durable_event = durable_events_by_id.get(reference.event_id)
-        if durable_event is None:
-            raise ValueError(
-                "Runtime publication references an event that is not durable for the "
-                f"session: {reference.event_id}"
-            )
-        if _runtime_publication_event_digest(durable_event) != reference.event_digest:
-            raise ValueError(
-                "Runtime publication event reference does not match durable event content "
-                f"for the session: {reference.event_id}"
-            )
-        if durable_event.interaction_id != interaction_id:
-            raise ValueError(
-                "Runtime publication event reference belongs to a different interaction "
-                f"for the session: {reference.event_id}"
-            )
-
-
-def _tool_round_lifecycle_event_limit(tool_call_ids: list[str] | tuple[str, ...]) -> int:
-    # At most one started and one terminal event per admitted call. Retain the
-    # historical allowance for small/legacy lookups; semantic validation still
-    # rejects duplicate or contradictory lifecycle evidence.
-    return max(RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS, 2 * len(tool_call_ids))
-
-
-def _runtime_publication_event_limit(kind: str, intent: dict[str, Any]) -> int:
-    if kind in {"tool-round", "user-input-close"}:
-        call_ids = intent.get("tool_call_ids")
-        if type(call_ids) is list or type(call_ids) is tuple:
-            return _tool_round_lifecycle_event_limit(call_ids)
-    return RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS
 
 
 def _validate_tool_round_call_ids(
@@ -21149,7 +20725,9 @@ def _prepare_model_completion_stage(
             copied_request.stage_id
         ),
         winner_storage_key=winner_key,
-        publication_storage_key=_runtime_publication_storage_key(copied_request.logical_step_id),
+        publication_storage_key=publication_contracts._runtime_publication_storage_key(
+            copied_request.logical_step_id
+        ),
         request=copied_request,
         request_digest=request_digest,
         expected_statuses=allowed_statuses,
@@ -21221,9 +20799,9 @@ def _model_failover_selection_event(
 
 
 def _validate_model_failover_selection_replay(expected: Event, observed: Event | None) -> None:
-    if observed is None or _runtime_publication_event_digest(
+    if observed is None or publication_contracts._runtime_publication_event_digest(
         observed
-    ) != _runtime_publication_event_digest(expected):
+    ) != publication_contracts._runtime_publication_event_digest(expected):
         raise SessionModelCompletionStageConflict(
             "Model failover preparation lost its exact durable selection event."
         )
@@ -21248,7 +20826,7 @@ def _model_failover_progress_storage_keys(expected: ModelFailoverProgress) -> tu
         preparation_key,
         terminal_key,
         _model_completion_stage_winner_storage_key(expected.logical_step_id),
-        _runtime_publication_storage_key(expected.logical_step_id),
+        publication_contracts._runtime_publication_storage_key(expected.logical_step_id),
         _model_completion_stage_abandonment_storage_key(expected.stage_id),
         _model_completion_stage_dispatch_storage_key(expected.stage_id),
         _model_completion_stage_settlement_storage_key(expected.stage_id),
@@ -21889,7 +21467,9 @@ def _validate_model_completion_stage_publication(
             raise ValueError("Model completion event session_id does not match target session.")
     appended_event_ids = {event.id for event in publication.events}
     overlap = appended_event_ids & set(
-        _runtime_publication_referenced_event_ids(publication.referenced_events)
+        publication_contracts._runtime_publication_referenced_event_ids(
+            publication.referenced_events
+        )
     )
     if overlap:
         raise ValueError(
@@ -24002,7 +23582,7 @@ def _replay_promoted_model_completion_stage(
         raise SessionModelCompletionStageIncomplete(
             f"Model-completion stage is still in flight: {stage.stage_id}"
         )
-    storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+    storage_key = publication_contracts._runtime_publication_storage_key(stage.logical_step_id)
     receipt = _reconstruct_runtime_publication_receipt(
         receipt_record,
         storage_key=storage_key,
@@ -24119,7 +23699,9 @@ def _prepare_runtime_publication(
 
     appended_event_ids = {event.id for event in copied_request.events}
     referenced_event_ids = set(
-        _runtime_publication_referenced_event_ids(copied_request.referenced_events)
+        publication_contracts._runtime_publication_referenced_event_ids(
+            copied_request.referenced_events
+        )
     )
     overlap = appended_event_ids & referenced_event_ids
     if overlap:
@@ -24184,7 +23766,9 @@ def _prepare_runtime_publication(
     )
     return _PreparedRuntimePublication(
         session_id=session_id,
-        storage_key=_runtime_publication_storage_key(copied_request.publication_id),
+        storage_key=publication_contracts._runtime_publication_storage_key(
+            copied_request.publication_id
+        ),
         request=copied_request,
         request_digest=request_digest,
         transcript_payloads=transcript_payloads,
@@ -24194,7 +23778,7 @@ def _prepare_runtime_publication(
         expected_statuses=allowed_statuses,
         expected_run_epoch=expected_run_epoch,
         expected_transcript_cursor=expected_transcript_cursor,
-        checkpoint_codec=_active_runtime_publication_checkpoint_codec(),
+        checkpoint_codec=checkpoint_publication._active_runtime_publication_checkpoint_codec(),
     )
 
 
@@ -24492,7 +24076,9 @@ def _validate_user_input_checkpoint_mutation(
             raise ValueError("User-input closure call identities conflict with its pause.")
         referenced_event_ids = intent.get("referenced_event_ids")
         if type(referenced_event_ids) is not list or referenced_event_ids != list(
-            _runtime_publication_referenced_event_ids(request.referenced_events)
+            publication_contracts._runtime_publication_referenced_event_ids(
+                request.referenced_events
+            )
         ):
             raise ValueError("User-input closure referenced events conflict with its intent.")
         for key, raw_value in (
@@ -25231,7 +24817,10 @@ def _reconstruct_runtime_publication_receipt(
             raise ValueError
         if receipt.session_id != session_id or receipt.publication_id != publication_id:
             raise ValueError
-        if _runtime_publication_storage_key(receipt.publication_id) != storage_key:
+        if (
+            publication_contracts._runtime_publication_storage_key(receipt.publication_id)
+            != storage_key
+        ):
             raise ValueError
         digest_payload = receipt.model_dump(mode="json", exclude={"publication_digest"})
         if (
@@ -25333,7 +24922,9 @@ def _validate_runtime_publication_durable_material(
             "The durable runtime publication event attribution conflicts with its receipt."
         )
 
-    referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
+    referenced_event_ids = publication_contracts._runtime_publication_referenced_event_ids(
+        receipt.referenced_events
+    )
     if tuple(event.id for event in durable_references) != referenced_event_ids:
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication references a missing event."
@@ -25343,7 +24934,10 @@ def _validate_runtime_publication_durable_material(
         durable_references,
         strict=True,
     ):
-        if _runtime_publication_event_digest(durable_event) != reference.event_digest:
+        if (
+            publication_contracts._runtime_publication_event_digest(durable_event)
+            != reference.event_digest
+        ):
             raise SessionRuntimePublicationConflict(
                 "The durable runtime publication referenced event content conflicts with "
                 "its receipt."

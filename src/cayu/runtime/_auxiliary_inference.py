@@ -95,10 +95,10 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.retry_policy import RetryDecision, retry_decision
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
 from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
-    RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
     SessionStore,
 )

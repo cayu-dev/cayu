@@ -26,12 +26,12 @@ from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions._invocation_scope import attribute_events_to_current_interaction
-from cayu.sessions.base import (
+from cayu.sessions._runtime_publication import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    SessionStore,
     runtime_publication_event_reference,
 )
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionStatus
 
 PendingActionPublicationKind = Literal[

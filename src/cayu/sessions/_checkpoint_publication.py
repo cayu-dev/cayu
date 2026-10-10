@@ -1,11 +1,16 @@
 """Publication schema composition within the caller's native transaction.
 
-Reuse the canonical publication records, checkpoint decoder and writer projection.
-Runtime dispatch and the task-local codec scope retain their existing owners.
+Compose canonical publication records, checkpoint decoding and writer projection.
+The task-local codec scope is captured by publication preparation; callers retain
+runtime dispatch and the complete atomic store operation.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from cayu._validation import copy_durable_json_object
@@ -15,7 +20,7 @@ from cayu.sessions._checkpoint_mutations import (
     _apply_runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.sessions.base import RuntimePublicationRequest
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -27,7 +32,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
-from cayu.sessions.records import Session
+from cayu.sessions.records import CheckpointTransform, Session
 
 
 def _versioned_publication_request(
@@ -263,3 +268,65 @@ def _apply_publication_checkpoint_mutation(
             )
         decoded_target[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = preserved_lifecycle_receipt
     return decoded_target
+
+
+def _validate_checkpoint_codec_pair(
+    checkpoint_decode: CheckpointTransform | None,
+    checkpoint_encode: CheckpointTransform | None,
+) -> None:
+    if (checkpoint_decode is None) != (checkpoint_encode is None):
+        raise ValueError("Checkpoint decode and encode transforms must be supplied together.")
+    if checkpoint_decode is not None and not callable(checkpoint_decode):
+        raise TypeError("checkpoint_decode must be callable.")
+    if checkpoint_encode is not None and not callable(checkpoint_encode):
+        raise TypeError("checkpoint_encode must be callable.")
+
+
+@dataclass(frozen=True)
+class _RuntimePublicationCheckpointCodec:
+    """Task-scoped checkpoint projection captured by a prepared publication."""
+
+    decode: CheckpointTransform
+    encode: CheckpointTransform
+    apply_mutation: Callable[
+        [Session, dict[str, Any] | None, RuntimePublicationMutation],
+        dict[str, Any] | None,
+    ]
+
+    def __post_init__(self) -> None:
+        _validate_checkpoint_codec_pair(self.decode, self.encode)
+        if not callable(self.apply_mutation):
+            raise TypeError("Checkpoint mutation projection must be callable.")
+
+
+_RUNTIME_PUBLICATION_CHECKPOINT_CODEC: ContextVar[_RuntimePublicationCheckpointCodec | None] = (
+    ContextVar("cayu_runtime_publication_checkpoint_codec", default=None)
+)
+
+
+@contextmanager
+def _runtime_publication_checkpoint_codec_scope(
+    *,
+    decode: CheckpointTransform,
+    encode: CheckpointTransform,
+    apply_mutation: Callable[
+        [Session, dict[str, Any] | None, RuntimePublicationMutation],
+        dict[str, Any] | None,
+    ],
+) -> Iterator[None]:
+    """Carry one codec through legacy-compatible public store overrides."""
+
+    codec = _RuntimePublicationCheckpointCodec(
+        decode=decode,
+        encode=encode,
+        apply_mutation=apply_mutation,
+    )
+    token = _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.set(codec)
+    try:
+        yield
+    finally:
+        _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.reset(token)
+
+
+def _active_runtime_publication_checkpoint_codec() -> _RuntimePublicationCheckpointCodec | None:
+    return _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.get()

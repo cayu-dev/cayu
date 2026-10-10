@@ -1,4 +1,11 @@
 {
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_checkpoint_scope_restores_nested_and_cancelled_contexts_without_stores": 0.5364883340080269,
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_contracts_detach_values_and_bind_referenced_events_without_stores": 0.5417424999759533,
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_rules_preserve_public_identity[_runtime_publication-RuntimePublicationEventReference]": 0.0001925000688061118,
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_rules_preserve_public_identity[_runtime_publication-RuntimePublicationReceipt]": 0.000186040997505188,
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_rules_preserve_public_identity[_runtime_publication-RuntimePublicationRequest]": 0.0002927090390585363,
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_rules_preserve_public_identity[_runtime_publication-RuntimePublicationResult]": 0.00016620702808722854,
+  "tests/core/test_runtime_publication_rules_layout.py::test_publication_rules_preserve_public_identity[_runtime_publication-runtime_publication_event_reference]": 0.00018370902398601174,
   "tests/core/test_runtime_publication_rules_layout.py::test_checkpoint_projection_and_diff_preserve_bounded_authority_without_stores": 0.1555408330168575,
   "tests/core/test_runtime_publication_rules_layout.py::test_operation_record_mutations_preserve_cas_and_namespaces_without_stores": 0.735406041960232,
   "tests/core/test_runtime_publication_rules_layout.py::test_publication_rules_preserve_public_identity[_checkpoint_mutations-runtime_publication_checkpoint_mutation]": 0.0001562500256113708,

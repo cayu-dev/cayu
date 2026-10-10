@@ -25,7 +25,8 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.sessions.base import RuntimePublicationRequest, SessionStore
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
