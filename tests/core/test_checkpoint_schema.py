@@ -31,7 +31,7 @@ from cayu.approvals.user_input import (
     pending_user_input_from_checkpoint,
 )
 from cayu.context.base import _compaction_checkpoint
-from cayu.runtime import _session_engine as session_engine
+from cayu.runtime import _session_operation_state
 from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
@@ -207,7 +207,7 @@ def test_frozen_versionless_root_payloads_decode_and_supported_shapes_remain_con
     elif fixture_name == "pending-tool-round":
         assert pending_tool_round_from_checkpoint(decoded) is not None
     elif fixture_name == "session-operation":
-        assert session_engine._session_operation_state(decoded)["version"] == 1
+        assert _session_operation_state._session_operation_state(decoded)["version"] == 1
     elif fixture_name == "compaction":
         assert _compaction_checkpoint(decoded) is not None
 

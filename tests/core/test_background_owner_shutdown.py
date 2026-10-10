@@ -24,6 +24,7 @@ from cayu.observability.watchers import (
     EventWatcherDeliveryStatus,
     InMemoryEventWatcherStore,
 )
+from cayu.runtime import _session_compaction
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
@@ -188,9 +189,8 @@ def test_unsettled_browser_control_keeps_owned_resources(monkeypatch: pytest.Mon
 def test_shutdown_waits_for_a_session_write_kept_past_its_bounded_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cayu.runtime import _session_engine as engine_module
 
-    monkeypatch.setattr(engine_module, "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(_session_compaction, "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS", 0.05)
 
     async def scenario() -> None:
         store = _OwnedWatcherStore()
@@ -205,7 +205,7 @@ def test_shutdown_waits_for_a_session_write_kept_past_its_bounded_wait(
 
         write = asyncio.create_task(opaque_write())
         try:
-            outcome = await app._session_engine._await_session_operation_store_task(write)
+            outcome = await app._session_compaction._await_session_operation_store_task(write)
             assert outcome.timed_out and not write.done()
 
             closing = await app.aclose(timeout_s=0.3)
@@ -850,7 +850,9 @@ def test_retained_work_that_failed_after_its_caller_left_is_reported_once(owner:
         app = CayuApp(enable_logging=False, owned_resources=(store,))
         task = asyncio.create_task(_failing("late accounting failed"))
         if owner == "final_session_accounting":
-            app._session_engine._track_detached_session_operation_task(task, report_failure=True)
+            app._session_compaction._track_detached_session_operation_task(
+                task, report_failure=True
+            )
             subsystem = "session_operations"
         else:
             app._model_step_executor._provider_operation_start._retain_reconciliation(task)
@@ -877,7 +879,9 @@ def test_a_cancelled_kept_write_that_fails_is_not_reported(owner: str) -> None:
         if owner == "model_step_write":
             app._model_step_executor._retain_detached_task(task)
         else:
-            app._session_engine._track_detached_session_operation_task(task, report_failure=False)
+            app._session_compaction._track_detached_session_operation_task(
+                task, report_failure=False
+            )
         with contextlib.suppress(ConnectionError):
             await task
         # Its caller already treated the outcome as unknown.
@@ -1088,9 +1092,8 @@ def test_a_late_cancellation_that_fails_after_its_bounded_wait_is_reported(
 def test_a_timed_out_session_write_that_then_fails_is_not_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cayu.runtime import _session_engine as engine_module
 
-    monkeypatch.setattr(engine_module, "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(_session_compaction, "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS", 0.05)
 
     async def scenario() -> None:
         store = _OwnedWatcherStore()
@@ -1105,7 +1108,7 @@ def test_a_timed_out_session_write_that_then_fails_is_not_reported(
 
         write = asyncio.create_task(opaque_write())
         try:
-            outcome = await app._session_engine._await_session_operation_store_task(write)
+            outcome = await app._session_compaction._await_session_operation_store_task(write)
             assert outcome.timed_out
         finally:
             release.set()
@@ -1118,7 +1121,7 @@ def test_a_timed_out_session_write_that_then_fails_is_not_reported(
 
 
 def test_superseded_final_accounting_is_not_reported() -> None:
-    from cayu.runtime._session_engine import SessionCompactionAttemptSuperseded
+    from cayu.runtime._session_compaction import SessionCompactionAttemptSuperseded
 
     async def superseded() -> None:
         raise SessionCompactionAttemptSuperseded("a recovering owner took over")
@@ -1127,7 +1130,7 @@ def test_superseded_final_accounting_is_not_reported() -> None:
         store = _OwnedWatcherStore()
         app = CayuApp(enable_logging=False, owned_resources=(store,))
         task = asyncio.create_task(superseded())
-        app._session_engine._track_detached_session_operation_task(task, report_failure=True)
+        app._session_compaction._track_detached_session_operation_task(task, report_failure=True)
         with contextlib.suppress(SessionCompactionAttemptSuperseded):
             await task
         # The recovering owner owns that outcome now.
@@ -1230,7 +1233,9 @@ def test_cancelling_the_public_session_drain_keeps_a_final_accounting_failure() 
         store = _OwnedWatcherStore()
         app = CayuApp(enable_logging=False, owned_resources=(store,))
         accounting = asyncio.create_task(_failing("final accounting failed"))
-        app._session_engine._track_detached_session_operation_task(accounting, report_failure=True)
+        app._session_compaction._track_detached_session_operation_task(
+            accounting, report_failure=True
+        )
         with contextlib.suppress(ConnectionError):
             await accounting
         # Another retained write keeps the combined drain waiting.

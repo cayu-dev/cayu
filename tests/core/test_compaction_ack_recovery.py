@@ -16,6 +16,7 @@ from cayu.applications import CayuApp
 from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.events import EventType
 from cayu.messages import Message
+from cayu.runtime import _session_compaction
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
@@ -363,9 +364,8 @@ def test_failed_reconciliation_preserves_original_error(backend, boundary, tmp_p
 def test_initial_reconciliation_timeout_is_bounded_and_preserves_claim(
     monkeypatch, tmp_path, request
 ):
-    from cayu.runtime import _session_engine
 
-    monkeypatch.setattr(_session_engine, "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(_session_compaction, "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS", 0.05)
 
     async def run():
         store = _store("memory", tmp_path, request)

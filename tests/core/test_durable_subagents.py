@@ -33,6 +33,7 @@ from cayu.observability.hooks import (
     RuntimeHook,
 )
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import _session_execution_profile
 from cayu.runtime._durable_subagent_coordinator import DurableSubagentCoordinator
 from cayu.runtime._durable_subagents import (
     DurableSubagentAuthority,
@@ -4949,11 +4950,12 @@ def test_worker_rejects_changed_runtime_build_before_provider_dispatch(monkeypat
                 "current_runtime_build_provenance",
                 lambda: build_b,
             )
-            build_b_context.setattr(
-                session_engine_module,
-                "current_runtime_build_provenance",
-                lambda: build_b,
-            )
+            for provenance_owner in (session_engine_module, _session_execution_profile):
+                build_b_context.setattr(
+                    provenance_owner,
+                    "current_runtime_build_provenance",
+                    lambda: build_b,
+                )
             worker = CayuApp(
                 session_store=sessions,
                 task_store=tasks,

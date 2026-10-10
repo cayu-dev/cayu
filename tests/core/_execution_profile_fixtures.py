@@ -21,7 +21,8 @@ from cayu.observability.hooks import RuntimeHook
 from cayu.providers import ModelProvider
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
-from cayu.runtime import _session_engine as session_engine_module
+from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
+from cayu.runtime import _session_execution_profile
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
@@ -348,7 +349,7 @@ def profiled_session_identity(
     if resolved_profile is None:
         if app is not None:
             registered_agent = app._agents[agent_name]
-            resolved_profile = session_engine_module._execution_profile_identity(
+            resolved_profile = _session_execution_profile._execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=provider_name,
                 registered_provider=app._provider_registry.registrations.get(provider_name),
@@ -436,7 +437,7 @@ def profiled_session_identity(
                     )
                 )
             ),
-            structured_output=session_engine_module._execution_profile_structured_output(
+            structured_output=execution_profile_continuation._execution_profile_structured_output(
                 structured_output
             ),
             finalization=execution_profile_admission.model_finalization_material(

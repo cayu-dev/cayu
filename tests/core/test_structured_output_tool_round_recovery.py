@@ -18,7 +18,7 @@ from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _session_engine as session_engine_module
+from cayu.runtime import _session_execution_profile
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
@@ -204,7 +204,7 @@ async def _publish_structured_model_step(
         tools=tools,
     )
     tool_capability_ceiling = ToolCapabilityCeiling(tool_names=tuple(tool.name for tool in tools))
-    execution_profile = session_engine_module._execution_profile_identity(
+    execution_profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=profile_app._agents["assistant"],
         provider_name=provider.name,

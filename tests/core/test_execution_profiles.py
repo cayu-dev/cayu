@@ -106,6 +106,7 @@ from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runners.docker import DockerRunner
 from cayu.runners.local import LocalRunner
 from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
+from cayu.runtime import _session_execution_profile
 from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
     project_persisted_runtime_event,
@@ -1644,7 +1645,7 @@ def test_application_versioned_provider_still_binds_exact_stream_deadlines() -> 
         app = CayuApp(enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="deadline-model"))
-        return session_engine_module._execution_profile_identity(
+        return _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name=provider.name,
@@ -1815,7 +1816,7 @@ def _model_semantics_profile(
         ),
         context_policy=context_policy,
     )
-    return session_engine_module._execution_profile_identity(
+    return _session_execution_profile._execution_profile_identity(
         registered_agent=app._agents["assistant"],
         provider_name="fake",
         registered_provider=app._provider_registry.registrations["fake"],
@@ -1938,7 +1939,7 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
         context_policy=policy,
     )
 
-    first_profile = session_engine_module._execution_profile_identity(
+    first_profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=first_app._agents["assistant"],
         provider_name="fake",
@@ -1949,7 +1950,7 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
         process_identity=first_app._execution_profile_process_identity,
     )
     compactor.behavior_version = "2"
-    repeated_profile = session_engine_module._execution_profile_identity(
+    repeated_profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=first_app._agents["assistant"],
         provider_name="fake",
@@ -1966,7 +1967,7 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
         AgentSpec(name="assistant", model="fake-model"),
         context_policy=policy,
     )
-    replacement_profile = session_engine_module._execution_profile_identity(
+    replacement_profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=second_app._agents["assistant"],
         provider_name="fake",
@@ -2001,7 +2002,7 @@ def test_nested_model_compactor_provider_identity_is_copied_at_agent_registratio
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=policy,
         )
-        return session_engine_module._execution_profile_identity(
+        return _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
@@ -2015,7 +2016,7 @@ def test_nested_model_compactor_provider_identity_is_copied_at_agent_registratio
     first_app = CayuApp(enable_logging=False)
     first_profile = registered_profile(first_app)
     provider._behavior_version = "2"
-    repeated_profile = session_engine_module._execution_profile_identity(
+    repeated_profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=first_app._agents["assistant"],
         provider_name="fake",
@@ -2099,7 +2100,7 @@ def test_model_compactor_binds_its_snapshotted_provider_identity() -> None:
 
 
 def _registered_context_profile(app: CayuApp) -> ExecutionProfileIdentity:
-    return session_engine_module._execution_profile_identity(
+    return _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=app._agents["assistant"],
         provider_name="fake",
@@ -2126,7 +2127,7 @@ def test_private_automatic_recall_configuration_is_secret_safe_and_distinct() ->
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=_automatic_recall_context(namespace=namespace),
         )
-        return session_engine_module._execution_profile_identity(
+        return _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
@@ -2474,7 +2475,7 @@ def test_opaque_provider_options_are_secret_safe_and_content_bound_within_proces
     )
 
     profiles = [
-        session_engine_module._execution_profile_identity(
+        _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents[agent_name],
             provider_name="fake",
@@ -2525,7 +2526,7 @@ def test_runtime_owned_private_option_commitments_survive_secret_collision() -> 
         app.register_agent(AgentSpec(name=name, model="fake-model", provider_options=options))
 
     components = [
-        session_engine_module._execution_profile_identity(
+        _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents[name],
             provider_name="fake",
@@ -2574,7 +2575,7 @@ def test_provider_request_profile_uses_only_selected_adapter_effective_options()
         app.register_agent(AgentSpec(name=name, model="openai-test", provider_options=options))
 
     components = {
-        name: session_engine_module._execution_profile_identity(
+        name: _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents[name],
             provider_name="openai",
@@ -2709,7 +2710,7 @@ def test_anthropic_cache_override_changes_effective_provider_request_profile() -
         )
 
     components = [
-        session_engine_module._execution_profile_identity(
+        _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents[name],
             provider_name="anthropic",
@@ -2748,7 +2749,7 @@ def test_custom_provider_cache_options_are_private_process_local_material() -> N
         )
 
     components = [
-        session_engine_module._execution_profile_identity(
+        _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents[name],
             provider_name="unversioned",
@@ -2870,7 +2871,7 @@ def test_runtime_owned_private_context_commitments_survive_secret_collision() ->
         )
 
     components = [
-        session_engine_module._execution_profile_identity(
+        _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents[name],
             provider_name="fake",
@@ -4130,7 +4131,7 @@ def test_redactor_known_builtin_material_is_process_local(
     fingerprints: list[str | None] = []
     for _ in range(2):
         app = configured_app()
-        profile = session_engine_module._execution_profile_identity(
+        profile = _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
@@ -4164,7 +4165,7 @@ def test_remember_knowledge_application_policy_is_process_local_and_secret_safe(
                 )
             ],
         )
-        profile = session_engine_module._execution_profile_identity(
+        profile = _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
@@ -4190,7 +4191,7 @@ def test_remember_knowledge_default_policy_retains_structural_identity() -> None
         tools=[RememberKnowledgeTool()],
     )
 
-    profile = session_engine_module._execution_profile_identity(
+    profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=app._agents["assistant"],
         provider_name="fake",
@@ -4228,7 +4229,7 @@ def test_declared_remember_knowledge_policy_identity_is_portable() -> None:
                 )
             ],
         )
-        profile = session_engine_module._execution_profile_identity(
+        profile = _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
@@ -5955,11 +5956,12 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
             source_revision="revision-b",
         )
         monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
-        monkeypatch.setattr(
-            session_engine_module,
-            "current_runtime_build_provenance",
-            lambda: build_a,
-        )
+        for provenance_owner in (session_engine_module, _session_execution_profile):
+            monkeypatch.setattr(
+                provenance_owner,
+                "current_runtime_build_provenance",
+                lambda: build_a,
+            )
         store = (
             InMemorySessionStore()
             if store_kind == "memory"
@@ -5983,11 +5985,12 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
             baseline = before.metadata[EXECUTION_PROFILE_METADATA_KEY]["baseline"]
 
             monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
-            monkeypatch.setattr(
-                session_engine_module,
-                "current_runtime_build_provenance",
-                lambda: build_b,
-            )
+            for provenance_owner in (session_engine_module, _session_execution_profile):
+                monkeypatch.setattr(
+                    provenance_owner,
+                    "current_runtime_build_provenance",
+                    lambda: build_b,
+                )
             policy = RecordingExecutionProfilePolicy(
                 ExecutionProfilePolicyResult(
                     action=ExecutionProfilePolicyAction.ADOPT,
@@ -6071,11 +6074,12 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
             artifact_digest="b" * 64,
         )
         monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
-        monkeypatch.setattr(
-            session_engine_module,
-            "current_runtime_build_provenance",
-            lambda: build_a,
-        )
+        for provenance_owner in (session_engine_module, _session_execution_profile):
+            monkeypatch.setattr(
+                provenance_owner,
+                "current_runtime_build_provenance",
+                lambda: build_a,
+            )
         store = (
             InMemorySessionStore()
             if store_kind == "memory"
@@ -6096,11 +6100,12 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
             )
 
             monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
-            monkeypatch.setattr(
-                session_engine_module,
-                "current_runtime_build_provenance",
-                lambda: build_b,
-            )
+            for provenance_owner in (session_engine_module, _session_execution_profile):
+                monkeypatch.setattr(
+                    provenance_owner,
+                    "current_runtime_build_provenance",
+                    lambda: build_b,
+                )
             policy = RecordingExecutionProfilePolicy(
                 ExecutionProfilePolicyResult(
                     action=ExecutionProfilePolicyAction.ADOPT,
@@ -9172,7 +9177,7 @@ def test_runtime_generated_model_profile_survives_exact_workload_secret_collisio
         baseline_app = CayuApp(enable_logging=False)
         baseline_app.register_provider(_completed_provider(), default=True)
         baseline_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        baseline_profile = session_engine_module._execution_profile_identity(
+        baseline_profile = _session_execution_profile._execution_profile_identity(
             max_steps=64,
             registered_agent=baseline_app._agents["assistant"],
             provider_name="fake",
@@ -9382,11 +9387,12 @@ def test_public_run_fails_closed_before_work_when_required_identity_is_unavailab
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        monkeypatch.setattr(
-            session_engine_module,
-            "current_runtime_build_provenance",
-            lambda: RuntimeBuildProvenance.unavailable("test_unavailable"),
-        )
+        for provenance_owner in (session_engine_module, _session_execution_profile):
+            monkeypatch.setattr(
+                provenance_owner,
+                "current_runtime_build_provenance",
+                lambda: RuntimeBuildProvenance.unavailable("test_unavailable"),
+            )
 
         with pytest.raises(RuntimeError, match="unavailable required components: runtime"):
             await _collect(
@@ -9656,7 +9662,7 @@ def test_profile_resolution_failure_does_not_admit_resume(monkeypatch) -> None:
             raise RuntimeError("profile resolution failed")
 
         monkeypatch.setattr(
-            session_engine_module,
+            _session_execution_profile,
             "_execution_profile_identity",
             fail_resolution,
         )

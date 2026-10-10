@@ -56,6 +56,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.runtime import _session_execution_profile
 from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
     InvocationContext,
@@ -2206,11 +2207,12 @@ def test_fork_current_child_rejects_unavailable_identity_before_child_creation(
         )
         app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        monkeypatch.setattr(
-            session_engine_module,
-            "current_runtime_build_provenance",
-            lambda: RuntimeBuildProvenance.unavailable("test_unavailable"),
-        )
+        for provenance_owner in (session_engine_module, _session_execution_profile):
+            monkeypatch.setattr(
+                provenance_owner,
+                "current_runtime_build_provenance",
+                lambda: RuntimeBuildProvenance.unavailable("test_unavailable"),
+            )
 
         with pytest.raises(
             RuntimeError,

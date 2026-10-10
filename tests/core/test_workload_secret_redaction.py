@@ -46,6 +46,7 @@ from cayu.runners.base import (
     attach_cancellation_artifacts,
 )
 from cayu.runners.local import LocalRunner
+from cayu.runtime import _session_checkpoint_admission
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
@@ -4945,7 +4946,6 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
 
 def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() -> None:
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _session_engine as session_engine
     from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-compaction-pending-secret-canary"
@@ -4970,7 +4970,7 @@ def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() 
     }
 
     with pytest.raises(ValueError, match="workload secret") as exc_info:
-        session_engine._reject_unresumable_session_checkpoint(
+        _session_checkpoint_admission._reject_unresumable_session_checkpoint(
             cast("Session", object()),
             checkpoint,
             redactor=SecretRedactor(secret),

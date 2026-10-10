@@ -432,13 +432,14 @@ from cayu.runtime._session_closure_projection import (
     project_closure_manifest,
     project_closure_report,
 )
+from cayu.runtime._session_checkpoint_admission import _reject_unresumable_session_checkpoint
+from cayu.runtime._session_compaction import SessionCompaction
 from cayu.runtime._session_control import (
     SessionControl,
 )
 from cayu.runtime._session_engine import (
     SessionEngine,
     _environment_name,
-    _reject_unresumable_session_checkpoint,
     _replace_checkpoint_preserving_runtime_state,
 )
 from cayu.runtime._session_execution_presence import process_owner_id
@@ -1683,7 +1684,27 @@ class CayuApp:
             loop_policies=self._loop_policies,
         )
 
+        self._session_compaction = SessionCompaction(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            get_budget_policy=lambda: self.budget_policy,
+            event_writer=self._event_writer,
+            run_limit_controller=self._run_limit_controller,
+            request_footprint=self._request_footprint,
+            recovery_ownership=self._recovery_ownership,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=self._loop_policy_execution_profile_identities,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            execution_profile_process_identity=self._execution_profile_process_identity,
+        )
+
         self._session_engine = SessionEngine(
+            compaction=self._session_compaction,
             session_finalization=self._session_finalization,
             foreground_gate_policy_owner=self._foreground_gate_policy_owner,
             deferred_input=self._deferred_input,
@@ -3082,9 +3103,9 @@ class CayuApp:
 
         if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be a finite positive number.")
-        engine, executor = self._session_engine, self._model_step_executor
+        compaction, executor = self._session_compaction, self._model_step_executor
         waits = await asyncio.gather(
-            engine.wait_for_session_operations(timeout_s=float(timeout_s)),
+            compaction.wait_for_session_operations(timeout_s=float(timeout_s)),
             executor.drain_detached_writes(timeout_s=float(timeout_s)),
             executor.wait_for_provider_reconciliations(timeout_s=float(timeout_s)),
             wait_until_idle(self._detached_session_store_work, timeout_s=float(timeout_s)),
@@ -3094,7 +3115,7 @@ class CayuApp:
         # so cancelling this drain leaves them for the next drain or shutdown.
         failures = collect_failures(
             (
-                engine.raise_session_operation_failures,
+                compaction.raise_session_operation_failures,
                 executor.raise_provider_reconciliation_failures,
             )
         )
@@ -5204,16 +5225,16 @@ class CayuApp:
             )
 
         async def session_operations(budget: float) -> bool:
-            engine = self._session_engine
+            compaction = self._session_compaction
             waits = await asyncio.gather(
-                engine.wait_for_session_operations(timeout_s=budget),
+                compaction.wait_for_session_operations(timeout_s=budget),
                 self._model_step_executor.drain_detached_writes(timeout_s=budget),
                 wait_until_idle(self._detached_session_store_work, timeout_s=budget),
                 return_exceptions=True,
             )
             # No await from here, so an interrupted wait consumes no failure.
             return combine_drain_results(
-                [*waits, *collect_failures((engine.raise_session_operation_failures,))]
+                [*waits, *collect_failures((compaction.raise_session_operation_failures,))]
             )
 
         async def browser_control(budget: float) -> bool:
@@ -5332,7 +5353,7 @@ class CayuApp:
         if self._model_step_executor.provider_reconciliations_pending:
             late["provider_reconciliations"] = "late_work"
         if (
-            self._session_engine.session_operations_pending
+            self._session_compaction.session_operations_pending
             or self._model_step_executor.detached_writes_pending
             or any(not task.done() for task in self._detached_session_store_work())
         ):

@@ -26,10 +26,13 @@ from cayu.messages import (
     ToolCallPart,
     ToolResultPart,
     copy_message_part,
+    detach_message,
 )
 from cayu.runtime import _message_redaction as message_redaction
+from cayu.runtime import _model_target as model_target
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
 from cayu.sessions.base import SessionStore
+from cayu.sessions.transcript_queries import TranscriptSnapshot
 from cayu.vaults import SecretRedactor
 
 
@@ -645,3 +648,22 @@ def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
     if key not in payload or payload[key] is None:
         return None
     return _require_payload_string(payload, key)
+
+
+def _transcript_snapshot_messages(snapshot: TranscriptSnapshot) -> list[Message]:
+    return [detach_message(record.message) for record in snapshot.records]
+
+
+def _project_model_target_snapshot(
+    snapshot: TranscriptSnapshot,
+    projection_cursor: int,
+) -> model_target.PortableTranscriptProjection:
+    """Project retained rows preceding one permanent absolute cursor."""
+
+    if projection_cursor > snapshot.cursor:
+        raise ValueError("Model-target projection cursor exceeds the session transcript.")
+    prefix_count = sum(record.index < projection_cursor for record in snapshot.records)
+    return model_target.project_portable_transcript_prefix(
+        _transcript_snapshot_messages(snapshot),
+        prefix_count,
+    )

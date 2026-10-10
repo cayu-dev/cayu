@@ -53,6 +53,7 @@ from cayu.providers.base import (
 )
 from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.runtime import _session_compaction
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     public_event_id,
@@ -596,7 +597,7 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS",
             0.01,
         )
@@ -769,7 +770,7 @@ def test_compact_session_cancellation_does_not_wait_for_stalled_completion_sink(
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS",
             0.01,
         )
@@ -915,7 +916,7 @@ def test_compact_session_late_completion_commit_is_not_republished(
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS",
             0.01,
         )
@@ -2094,12 +2095,12 @@ class BlockingCompactionProvider(ModelProvider):
 
 def _test_compaction_heartbeat_state(
     claim_expires_at: datetime,
-) -> session_engine_module._SessionOperationClaimHeartbeatState:
-    state = session_engine_module._SessionOperationClaimHeartbeatState()
+) -> _session_compaction._SessionOperationClaimHeartbeatState:
+    state = _session_compaction._SessionOperationClaimHeartbeatState()
     state.confirm_claim(
         claim_expires_at,
         claim_deadline_monotonic=(
-            time.monotonic() + session_engine_module._SESSION_OPERATION_CLAIM_LEASE.total_seconds()
+            time.monotonic() + _session_compaction._SESSION_OPERATION_CLAIM_LEASE.total_seconds()
         ),
     )
     return state
@@ -4018,7 +4019,7 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
                     "records": {
                         request.idempotency_key: {
                             "status": "completed",
-                            "request_digest": session_engine_module._compact_session_request_digest(
+                            "request_digest": _session_compaction._compact_session_request_digest(
                                 request
                             ),
                             "event_ids": [event.id for event in replay_events],
@@ -4411,7 +4412,7 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
             if self.fail_heartbeat_reconciliation and kwargs.get("events") == []:
                 self.fail_heartbeat_reconciliation = False
                 self.heartbeat_failed.set()
-                raise session_engine_module.SessionCompactionAttemptSuperseded(
+                raise _session_compaction.SessionCompactionAttemptSuperseded(
                     "Session compaction operation ownership changed during renewal."
                 )
             if any(
@@ -4445,7 +4446,7 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -4844,7 +4845,7 @@ def test_compact_session_expired_initial_claim_never_enters_compactor(
         completed = await store.update_status(created.id, SessionStatus.COMPLETED)
 
         with pytest.raises(
-            session_engine_module.SessionCompactionAttemptSuperseded,
+            _session_compaction.SessionCompactionAttemptSuperseded,
             match="(?:initial publication|operation claim).*expired",
         ):
             async for _event in app.compact_session(
@@ -4878,7 +4879,7 @@ def test_compact_session_heartbeats_claim_during_blocked_provider_dispatch(
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -4996,7 +4997,7 @@ def test_compact_session_claim_heartbeat_loss_cancels_provider_and_fences_public
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5082,12 +5083,12 @@ def test_compact_session_claim_heartbeat_retries_transient_store_failure(monkeyp
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_RETRY_SECONDS",
             0.01,
         )
@@ -5176,7 +5177,7 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5188,7 +5189,9 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
             clock=lambda: now["value"],
         )
         reconciliation_finished = asyncio.Event()
-        reconcile_claim = app._session_engine._reconcile_compaction_operation_claim_before_deadline
+        reconcile_claim = (
+            app._session_compaction._reconcile_compaction_operation_claim_before_deadline
+        )
 
         async def observe_reconciliation(**kwargs):
             result = await reconcile_claim(**kwargs)
@@ -5197,7 +5200,7 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
             return result
 
         monkeypatch.setattr(
-            app._session_engine,
+            app._session_compaction,
             "_reconcile_compaction_operation_claim_before_deadline",
             observe_reconciliation,
         )
@@ -5248,7 +5251,7 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
         assert datetime.fromisoformat(record["claim_expires_at"]) == (
             accepted_at + timedelta(minutes=9)
         )
-        assert now["value"] > accepted_at + session_engine_module._SESSION_OPERATION_CLAIM_LEASE
+        assert now["value"] > accepted_at + _session_compaction._SESSION_OPERATION_CLAIM_LEASE
         assert not task.done()
         assert not provider.cancelled.is_set()
 
@@ -5292,14 +5295,14 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_LEASE",
             # Leave time for admission and provider startup on loaded workers;
             # the test expires the admitted claim, not the startup machinery.
             timedelta(seconds=5),
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.2,
         )
@@ -5354,7 +5357,7 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
             await asyncio.wait_for(store.renewal_committed.wait(), timeout=10)
             now["value"] = accepted_at + timedelta(seconds=10)
             monkeypatch.setattr(
-                session_engine_module,
+                _session_compaction,
                 "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
                 60.0,
             )
@@ -5390,7 +5393,7 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_renewal_fai
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5400,7 +5403,7 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_renewal_fai
             enable_logging=False,
             clock=lambda: accepted_at,
         )
-        engine = app._session_engine
+        engine = app._session_compaction
         heartbeat_task: asyncio.Task[None] | None = None
 
         async def reconcile_claim(**_kwargs) -> datetime:
@@ -5470,7 +5473,7 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_reconciliat
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5480,13 +5483,13 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_reconciliat
             enable_logging=False,
             clock=lambda: accepted_at,
         )
-        engine = app._session_engine
+        engine = app._session_compaction
         heartbeat_task: asyncio.Task[None] | None = None
 
         async def reconcile_claim(**_kwargs) -> datetime:
             assert heartbeat_task is not None
             heartbeat_task.cancel("cancel heartbeat while reconciliation fails")
-            raise session_engine_module.SessionCompactionAttemptSuperseded(
+            raise _session_compaction.SessionCompactionAttemptSuperseded(
                 "ownership changed during concurrent reconciliation"
             )
 
@@ -5533,7 +5536,7 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_reconciliat
         assert task.cancelled()
         assert isinstance(
             exc_info.value.__cause__,
-            session_engine_module.SessionCompactionAttemptSuperseded,
+            _session_compaction.SessionCompactionAttemptSuperseded,
         )
         assert "ownership changed" in str(exc_info.value.__cause__)
         assert any(
@@ -5553,7 +5556,7 @@ def test_compaction_claim_heartbeat_converts_concurrent_child_cancellation_to_fa
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5563,7 +5566,7 @@ def test_compaction_claim_heartbeat_converts_concurrent_child_cancellation_to_fa
             enable_logging=False,
             clock=lambda: accepted_at,
         )
-        engine = app._session_engine
+        engine = app._session_compaction
         heartbeat_task: asyncio.Task[None] | None = None
 
         async def cancel_child() -> datetime:
@@ -5665,7 +5668,7 @@ def test_claimed_compaction_surfaces_failure_carried_by_cancelled_heartbeat() ->
             raise AssertionError("operation must not start after heartbeat failure")
 
         with pytest.raises(RuntimeError, match="heartbeat ownership changed"):
-            await session_engine_module._run_while_session_operation_claimed(
+            await _session_compaction._run_while_session_operation_claimed(
                 operation,
                 heartbeat_task=heartbeat_task,
             )
@@ -5704,7 +5707,7 @@ def test_claimed_compaction_observes_cancelled_heartbeat_cause_only_once() -> No
             RuntimeError,
             match="heartbeat ownership changed during operation startup",
         ):
-            await session_engine_module._run_while_session_operation_claimed(
+            await _session_compaction._run_while_session_operation_claimed(
                 operation,
                 heartbeat_task=heartbeat_task,
             )
@@ -5749,7 +5752,7 @@ def test_compact_session_caller_cancellation_does_not_wait_for_uncertain_claim_c
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5823,7 +5826,7 @@ def test_compact_session_claim_heartbeat_cannot_revive_an_expired_lease(monkeypa
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -5929,14 +5932,14 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_LEASE",
             # A 100ms lease can expire during admission before the injected
             # stalled renewal is reached. Keep real expiry but permit startup.
             timedelta(seconds=5),
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6050,12 +6053,12 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_LEASE",
             timedelta(milliseconds=100),
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6203,12 +6206,12 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_LEASE",
             timedelta(seconds=5),
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6363,7 +6366,7 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6466,7 +6469,7 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
         store_now = {"value": accepted_at}
         worker_now = {"value": accepted_at}
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6673,7 +6676,7 @@ def test_compact_session_terminal_publication_wins_blocked_heartbeat_race(monkey
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6793,7 +6796,7 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -6964,7 +6967,7 @@ def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypa
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -7048,7 +7051,7 @@ def test_compact_session_caller_cancellation_interrupts_blocked_claim_heartbeat(
 
     async def run() -> None:
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -7244,7 +7247,7 @@ def test_compact_session_renews_operation_claim_between_provider_dispatches(monk
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             1.0,
         )
@@ -7451,12 +7454,12 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
             SimpleNamespace(monotonic=lambda: monotonic_now["value"]),
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_LEASE",
             timedelta(seconds=2),
         )
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -7922,7 +7925,7 @@ def test_failed_attempt_evidence_extends_an_archived_abandoned_record() -> None:
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        transform = session_engine_module._fail_session_operation_checkpoint(
+        transform = _session_compaction._fail_session_operation_checkpoint(
             idempotency_key="expired-operation",
             operation_id="operation-id",
             attempt_id="attempt-id",

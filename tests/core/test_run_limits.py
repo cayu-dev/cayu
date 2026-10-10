@@ -49,6 +49,7 @@ from cayu.providers import (
     ModelStreamEvent,
     bedrock_billing_identity,
 )
+from cayu.runtime import _session_execution_profile
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limits import (
@@ -124,7 +125,7 @@ def _profiled_identity_for_app(
 ) -> SessionIdentity:
     registered_agent = app._agents["assistant"]
     registered_provider = app._provider_registry.registrations["fake"]
-    profile = session_engine_module._execution_profile_identity(
+    profile = _session_execution_profile._execution_profile_identity(
         max_steps=64,
         registered_agent=registered_agent,
         provider_name=registered_provider.name,

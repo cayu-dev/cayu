@@ -46,7 +46,6 @@ from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._session_control as session_control_module
-import cayu.runtime._session_engine as session_engine_module
 import cayu.sessions.base as sessions_module
 import cayu.tools.shared_artifacts as shared_artifacts_module
 from cayu._exception_groups import iter_exception_tree
@@ -171,6 +170,7 @@ from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_b
 from cayu.providers.operations import ProviderOperationState, ProviderOperationStatus
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
+from cayu.runtime import _session_compaction
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._approval_support import _pending_approval_for_atomic_claim
 from cayu.runtime._child_session_notifications import (
@@ -22687,7 +22687,7 @@ def test_session_store_conformance_heartbeats_active_compaction_claim(
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
         monkeypatch.setattr(
-            session_engine_module,
+            _session_compaction,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
