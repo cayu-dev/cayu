@@ -1175,6 +1175,14 @@ connections, locks, readiness, clocks and session readers. Selection/exclusion
 arbitration shares the native transaction and advisory-lock helpers; planning
 entry points, completed-turn capture and compaction validation retain their owners.
 
+Native SQLite session creation and fork persistence live in
+`storage/_sqlite_session_creation.py`. Each complete operation owns its immediate
+write transaction, including creation/closure admission, initial state,
+transcript/checkpoint copying and event publication. The store supplies its native
+connection, lock, clock, transaction-local readers and authority checks as explicit
+capabilities. Public creation/fork variants and access checks remain on the store;
+shared validation and runtime fork orchestration retain their existing owners.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and
