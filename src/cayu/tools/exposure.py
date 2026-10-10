@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
+from enum import StrEnum
 from functools import cached_property
 from hashlib import sha256
 from typing import Any, Literal, cast
@@ -961,6 +962,40 @@ def unexposed_tool_result() -> ToolResult:
         content="Tool unavailable for this model request.",
         is_error=True,
     )
+
+
+class ToolExposureMode(StrEnum):
+    """How a model request carries the tools a policy exposed for one step."""
+
+    FILTERED_TOOLS = "filtered_tools"
+    """Send only the exposed tools. Any exposure change changes the tool list."""
+
+    STABLE_CATALOGUE = "stable_catalogue"
+    """Send every tool in the session's capability ceiling on every step.
+
+    The exposed subset travels as the runtime-owned ``callable_tool_names``
+    request option. OpenAI Responses maps it to an ``allowed_tools`` tool
+    choice, so exposure changes leave the cached prompt prefix intact. Other
+    providers see the full catalogue. The runtime refuses a call to a tool
+    outside the exposure on every provider, as it does in either mode.
+    """
+
+
+def copy_tool_exposure_mode(
+    value: object,
+    field_name: str = "tool_exposure_mode",
+) -> ToolExposureMode:
+    """Return one exact tool-exposure delivery mode."""
+
+    if type(value) is ToolExposureMode:
+        return value
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a ToolExposureMode or string.")
+    try:
+        return ToolExposureMode(value)
+    except ValueError:
+        supported = ", ".join(mode.value for mode in ToolExposureMode)
+        raise ValueError(f"{field_name} must be one of: {supported}.") from None
 
 
 class ToolExposurePolicy(ABC):

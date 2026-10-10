@@ -20,6 +20,7 @@ from cayu.execution_profiles import (
 from cayu.execution_units import ModelAttemptIdentity
 from cayu.memory.base import AutomaticRecallContribution, AutomaticRecallPolicy
 from cayu.memory.evidence import (
+    MAX_CONTEXT_EXPOSURE_CARRIED_RECEIPTS,
     ContextExposure,
     ContextExposureEvidenceKind,
     ContextExposureState,
@@ -50,8 +51,10 @@ from cayu.messages import MessageRole
 from cayu.providers.base import ModelRequest
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.sessions.base import SessionStore
+from cayu.sessions.checkpoints import AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY
 from cayu.tools.exposure import ResolvedToolExposure
 
+_CARRIED_RECEIPT_BINDING_CONTEXT = b"cayu.automatic-recall-carried-receipt.v1"
 _MEMORY_EVIDENCE_KEY_DERIVATION_CONTEXT = b"cayu.memory-evidence.request-footprint-key.v1"
 _AUTOMATIC_RECALL_CHECKPOINT_BINDING_CONTEXT = b"cayu.automatic-recall-checkpoint-binding.v1"
 _AUTOMATIC_RECALL_OPEN_TAG = '<cayu_automatic_memory version="2">'
@@ -117,13 +120,85 @@ class MemoryEvidenceItemReference:
             raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest.")
 
 
+def _require_sha256(value: object, field_name: str) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest.")
+
+
+@dataclass(frozen=True, slots=True)
+class CarriedMemoryReference:
+    """One earlier interaction's manifest, bound to its receipt by two keyed digests."""
+
+    receipt_id: str
+    receipt_document_sha256: str
+    receipt_manifest_binding_hmac_sha256: str
+    carried_receipt_binding_hmac_sha256: str
+    manifest_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "receipt_id",
+            require_durable_clean_nonblank(self.receipt_id, "receipt_id"),
+        )
+        for field_name in (
+            "receipt_document_sha256",
+            "receipt_manifest_binding_hmac_sha256",
+            "carried_receipt_binding_hmac_sha256",
+            "manifest_sha256",
+        ):
+            _require_sha256(getattr(self, field_name), field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class CarriedMemoryPlacement:
+    """Earlier manifests that lead one user message, in their sent order.
+
+    ``context_user_ordinal`` counts user messages from the start of the
+    request; the runtime only appends after or prepends non-user messages
+    around the built context, so the ordinal survives request assembly.
+    """
+
+    context_user_ordinal: int
+    manifests: tuple[CarriedMemoryReference, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.context_user_ordinal) is not int or self.context_user_ordinal < 0:
+            raise ValueError("context_user_ordinal must be a non-negative integer.")
+        if (
+            type(self.manifests) is not tuple
+            or not self.manifests
+            or any(type(item) is not CarriedMemoryReference for item in self.manifests)
+        ):
+            raise TypeError("A carried placement must contain CarriedMemoryReference values.")
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryEvidenceReference:
     items: tuple[MemoryEvidenceItemReference, ...]
+    # Earlier interactions' manifests stay where they were sent. Each provider
+    # attempt that sends them again links their receipts as carried.
+    carried: tuple[CarriedMemoryPlacement, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.items) is not tuple or not self.items:
+        if type(self.items) is not tuple or type(self.carried) is not tuple:
+            raise TypeError("Memory evidence references must be tuples.")
+        if not self.items and not self.carried:
             raise ValueError("Memory evidence must contain at least one receipt reference.")
+        if any(type(item) is not CarriedMemoryPlacement for item in self.carried):
+            raise TypeError("Carried memory must be CarriedMemoryPlacement values.")
+        ordinals = [placement.context_user_ordinal for placement in self.carried]
+        if len(ordinals) != len(set(ordinals)):
+            raise ValueError("Carried memory places two manifest runs on one message.")
+        carried_ids = set(self.carried_receipt_ids)
+        if len(carried_ids) > MAX_CONTEXT_EXPOSURE_CARRIED_RECEIPTS:
+            raise ValueError("Carried memory exceeds its receipt-reference bound.")
+        if not carried_ids.isdisjoint(item.receipt_id for item in self.items):
+            raise ValueError("Memory evidence cannot repeat a receipt reference.")
         if len(self.items) > 32:
             raise ValueError("Memory evidence exceeds its receipt-reference bound.")
         if any(type(item) is not MemoryEvidenceItemReference for item in self.items):
@@ -131,6 +206,16 @@ class MemoryEvidenceReference:
         receipt_ids = [item.receipt_id for item in self.items]
         if len(receipt_ids) != len(set(receipt_ids)):
             raise ValueError("Memory evidence cannot repeat a receipt reference.")
+
+    @property
+    def carried_receipt_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                manifest.receipt_id
+                for placement in self.carried
+                for manifest in placement.manifests
+            )
+        )
 
 
 _ACTIVE_MEMORY_EVIDENCE_KEY: ContextVar[MemoryEvidenceKey | None] = ContextVar(
@@ -390,6 +475,36 @@ def recall_receipt_manifest_binding_hmac_sha256(
     ).hex()
 
 
+def carried_receipt_binding_hmac_sha256(
+    *,
+    receipt_id: str,
+    receipt_document_sha256: str,
+    manifest_sha256: str,
+    key: MemoryEvidenceKey,
+) -> str:
+    """Bind a retained manifest's receipt id to its receipt-document and manifest digests.
+
+    The receipt-to-manifest binding does not cover the receipt id, so without
+    this an edited id could name another receipt than the one the text came from.
+    """
+
+    _require_sha256(receipt_document_sha256, "receipt_document_sha256")
+    _require_sha256(manifest_sha256, "manifest_sha256")
+    if type(key) is not MemoryEvidenceKey:
+        raise TypeError("key must be a MemoryEvidenceKey.")
+    material = canonical_durable_json_bytes(
+        {
+            "schema_version": 1,
+            "key_id": key.key_id,
+            "receipt_id": require_durable_clean_nonblank(receipt_id, "receipt_id"),
+            "receipt_document_sha256": receipt_document_sha256,
+            "manifest_sha256": manifest_sha256,
+        },
+        "automatic recall carried receipt binding",
+    )
+    return hmac.digest(key.key, _CARRIED_RECEIPT_BINDING_CONTEXT + b"\0" + material, "sha256").hex()
+
+
 async def prepare_context_exposure(
     *,
     store: SessionStore,
@@ -414,7 +529,30 @@ async def prepare_context_exposure(
         raise ValueError("request_fingerprint_sha256 must be a lowercase SHA-256 digest.")
     receipts: list[RecallReceipt] = []
     representations: list[dict[int, str]] = []
-    included = _request_includes_exact_memory_manifests(model_request, reference.items)
+    included = _request_includes_exact_memory_manifests(
+        model_request,
+        reference.items,
+        carried=reference.carried,
+    )
+    for placement in reference.carried:
+        for manifest in placement.manifests:
+            if not hmac.compare_digest(
+                recall_receipt_manifest_binding_hmac_sha256(
+                    receipt_document_sha256=manifest.receipt_document_sha256,
+                    manifest_sha256=manifest.manifest_sha256,
+                    key=key,
+                ),
+                manifest.receipt_manifest_binding_hmac_sha256,
+            ) or not hmac.compare_digest(
+                carried_receipt_binding_hmac_sha256(
+                    receipt_id=manifest.receipt_id,
+                    receipt_document_sha256=manifest.receipt_document_sha256,
+                    manifest_sha256=manifest.manifest_sha256,
+                    key=key,
+                ),
+                manifest.carried_receipt_binding_hmac_sha256,
+            ):
+                raise RuntimeError("A carried automatic memory receipt binding is invalid.")
     for item_reference, include_items in zip(reference.items, included, strict=True):
         receipt = await store.load_recall_receipt(session_id, item_reference.receipt_id)
         if receipt is None:
@@ -476,7 +614,7 @@ async def prepare_context_exposure(
         },
         "context policy availability",
     )
-    now = max(datetime.now(UTC), *(receipt.created_at for receipt in receipts))
+    now = max([datetime.now(UTC), *(receipt.created_at for receipt in receipts)])
     planned = ContextExposureTransition(
         transition_id=new_context_exposure_transition_id(),
         revision=0,
@@ -520,6 +658,7 @@ async def prepare_context_exposure(
             key,
         ),
         receipt_ids=tuple(receipt.receipt_id for receipt in receipts),
+        carried_receipt_ids=reference.carried_receipt_ids,
         contributor_ids=("automatic_recall",),
         created_at=now,
         updated_at=now,
@@ -848,8 +987,9 @@ def memory_evidence_reference_from_checkpoint(
 ) -> MemoryEvidenceReference | None:
     if type(checkpoint) is not dict:
         return None
+    carried = _carried_memory_references(checkpoint)
     if "automatic_recall" not in checkpoint:
-        return None
+        return MemoryEvidenceReference(items=(), carried=carried) if carried else None
     state = checkpoint["automatic_recall"]
     if type(state) is not dict:
         raise ValueError("Automatic-recall memory-evidence checkpoint is malformed.")
@@ -881,7 +1021,40 @@ def memory_evidence_reference_from_checkpoint(
                 manifest_sha256=manifest_sha256,
             )
         )
-    return MemoryEvidenceReference(items=tuple(items))
+    return MemoryEvidenceReference(items=tuple(items), carried=carried)
+
+
+def _carried_memory_references(
+    checkpoint: dict[str, Any],
+) -> tuple[CarriedMemoryPlacement, ...]:
+    # The context policy verified this record's bindings, its durable receipts and
+    # the current eligibility of their knowledge before it placed the retained text.
+    history = checkpoint.get(AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY)
+    if history is None:
+        return ()
+    try:
+        return tuple(
+            CarriedMemoryPlacement(
+                context_user_ordinal=placement["context_user_ordinal"],
+                manifests=tuple(
+                    CarriedMemoryReference(
+                        receipt_id=item["receipt_id"],
+                        receipt_document_sha256=item["receipt_document_sha256"],
+                        receipt_manifest_binding_hmac_sha256=item[
+                            "receipt_manifest_binding_hmac_sha256"
+                        ],
+                        carried_receipt_binding_hmac_sha256=item[
+                            "carried_receipt_binding_hmac_sha256"
+                        ],
+                        manifest_sha256=item["manifest_sha256"],
+                    )
+                    for item in placement["manifest_records"]
+                ),
+            )
+            for placement in history["retained_placements"]
+        )
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Automatic-recall history checkpoint is malformed.") from exc
 
 
 def context_exposure_identity_payload(exposure: ContextExposure) -> dict[str, str]:
@@ -1091,6 +1264,8 @@ def _request_memory_manifest_locations(
 def _request_includes_exact_memory_manifests(
     request: ModelRequest,
     references: tuple[MemoryEvidenceItemReference, ...],
+    *,
+    carried: tuple[CarriedMemoryPlacement, ...] = (),
 ) -> tuple[bool, ...]:
     expected = tuple(
         item.manifest_sha256 for item in references if item.manifest_sha256 is not None
@@ -1098,6 +1273,32 @@ def _request_includes_exact_memory_manifests(
     if len(expected) != len(set(expected)):
         raise RuntimeError("Automatic memory repeats a frozen manifest identity.")
     locations = _request_memory_manifest_locations(request)
+    if carried:
+        # Each earlier interaction's manifests must lead their recorded user
+        # message, in their sent order, exactly once. Two interactions can recall
+        # byte-identical text, so placement is checked by position, not digest.
+        user_indexes = [
+            index
+            for index, message in enumerate(request.messages)
+            if message.role is MessageRole.USER
+        ]
+        claimed: set[int] = set()
+        for placement in carried:
+            if placement.context_user_ordinal >= len(user_indexes):
+                raise RuntimeError("Frozen automatic memory moved before provider dispatch.")
+            message_index = user_indexes[placement.context_user_ordinal]
+            placed = tuple(
+                (part_index, digest)
+                for location_message, part_index, digest in locations
+                if location_message == message_index
+            )
+            if placed != tuple(
+                (part_index, manifest.manifest_sha256)
+                for part_index, manifest in enumerate(placement.manifests)
+            ):
+                raise RuntimeError("Frozen automatic memory changed before provider dispatch.")
+            claimed.add(message_index)
+        locations = tuple(location for location in locations if location[0] not in claimed)
     if tuple(digest for _, _, digest in locations) != expected:
         raise RuntimeError("Frozen automatic memory changed before provider dispatch.")
     if locations:
@@ -1151,6 +1352,7 @@ __all__ = [
     "MemoryEvidenceReference",
     "active_memory_evidence_key",
     "build_recall_receipt",
+    "carried_receipt_binding_hmac_sha256",
     "close_context_exposure_without_provider_effect",
     "close_unrecoverable_context_exposure",
     "context_exposure_identity_payload",

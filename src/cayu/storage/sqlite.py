@@ -134,6 +134,7 @@ from cayu.memory.evidence import (
     recall_item_exposure_matches_receipt_item,
     require_memory_evidence_id,
     require_memory_evidence_session_id,
+    validate_context_exposure_carried_receipt_scope,
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
@@ -5434,6 +5435,17 @@ class SQLiteSessionStore(
                     receipt = _sqlite_recall_receipt(receipt_row)
                     validate_context_exposure_receipt_scope(copied, receipt)
                     receipts[receipt_id] = receipt
+                for receipt_id in copied.carried_receipt_ids:
+                    receipt_row = connection.execute(
+                        "SELECT * FROM cayu_recall_receipts WHERE receipt_id = ?",
+                        (receipt_id,),
+                    ).fetchone()
+                    if receipt_row is None:
+                        raise KeyError(f"Recall receipt not found: {receipt_id}")
+                    validate_context_exposure_carried_receipt_scope(
+                        copied,
+                        _sqlite_recall_receipt(receipt_row),
+                    )
                 for item in copied_items:
                     if not recall_item_exposure_matches_receipt_item(
                         item,

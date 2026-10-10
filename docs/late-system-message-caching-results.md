@@ -117,6 +117,33 @@ because it writes the cache. Every later turn costs about a ninth as much.
   does. Runtime-built requests also carry a per-lineage `prompt_cache_key` on
   OpenAI. On this branch the example sets the same field itself.
 
+## Recall and tool exposure (`recall_exposure`)
+
+A later investigation found three more prefix-cache breakers on the τ³ banking agent:
+automatic recall removed the previous turn's memory block from its user message,
+exposure changes rewrote the tools array, and integer bounds on `number` fields
+rendered as `100` or `100.0` depending on the upstream replica. The
+`recall_exposure` variant runs the same six questions through `CayuApp` with
+automatic recall, an exposure policy that swaps one tool at turn 3 and hides
+another from turn 5, `tool_exposure_mode="stable_catalogue"`, and `number` bounds
+in the tool schemas. The policy notes are part of turn 1's user message, behind
+that turn's memory block.
+
+These numbers are from deterministic mode, so the token counts are simulated
+from the serialized payloads, not reported by a provider. "Before" runs the same
+variant with `retain_earlier_recall=False` and the default
+`tool_exposure_mode="filtered_tools"`. Anthropic's default markers write turn 1's
+notes on turn 2, so turns 3–6 are the comparable share there.
+
+| Provider (simulated) | Before: turns 3–6 cached | After: turns 3–6 cached | Before: cost | After: cost |
+| --- | --- | --- | --- | --- |
+| OpenAI `gpt-6-luna` | 48.2% | 96.6% | $0.0055 | $0.0022 |
+| Anthropic `claude-haiku-4-5` | 48.4% | 94.3% | $0.0635 | $0.0381 |
+
+The live measurement for this variant hasn't been run yet. Run it with the live
+commands below; it passes when turns 3–6 each read at least half of their input
+from the cache.
+
 ## Reproduce
 
 Deterministic mode makes no API calls. It asserts that the serialized prefix is

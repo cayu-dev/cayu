@@ -83,7 +83,7 @@ from cayu.providers.openai import (
     OpenAITransport,
     OpenAIUnsupportedSearchSourceError,
     _copy_model_catalog,
-    _effective_openai_request_options,
+    _effective_openai_request_options_for_request,
     _openai_tool,
     _preflight_openai_hosted_tools,
     _validate_openai_tool_name,
@@ -710,13 +710,15 @@ class OpenAISubscriptionProvider(ModelProvider):
         )
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        # The request-aware options include the tool_choice the payload sends,
+        # such as allowed_tools for a stable tool catalogue.
         projected = privacy_safe_provider_option_projection(
-            _effective_openai_request_options(request.options, model=request.model)
+            _effective_openai_request_options_for_request(request)
         )
         return {"openai": projected} if projected else {}
 
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
-        effective = _effective_openai_request_options(request.options, model=request.model)
+        effective = _effective_openai_request_options_for_request(request)
         return {"openai": effective} if effective else {}
 
     async def billing_identity_for_request(self, request: ModelRequest) -> BillingIdentity:

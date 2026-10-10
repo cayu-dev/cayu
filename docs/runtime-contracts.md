@@ -3280,7 +3280,8 @@ explicit policy for a small directly exposed core. For a configured policy,
 Cayu resolves one snapshot before context construction and official provider
 counting. Context-pressure estimates and the final OpenAI, Anthropic, Chat
 Completions, Bedrock, or Vertex request see exactly that registration-ordered
-application subset. A runtime-owned structured-output submission tool remains
+application subset, unless the agent uses the stable catalogue described below.
+A runtime-owned structured-output submission tool remains
 outside application exposure and is added when the selected structured-output
 strategy needs it.
 
@@ -3303,6 +3304,26 @@ caller-authored lookalikes fail closed. Prefer a small number of stable profiles
 over arbitrary per-turn schema churn because changing the tool array can split
 or invalidate provider prompt-cache prefixes; a smaller single request is not
 proof of lower whole-task cost.
+
+`register_agent(..., tool_exposure_mode="stable_catalogue")`
+(`ToolExposureMode.STABLE_CATALOGUE`) keeps the tools array fixed instead. Every
+model request sends all tools inside the session's capability ceiling, in
+registration order, and the runtime-owned `callable_tool_names` request option
+names the exposed subset (plus a runtime structured-output tool when present).
+OpenAI Responses, including `OpenAISubscriptionProvider`, sends that subset as
+`tool_choice: {"type": "allowed_tools", ...}` with mode `auto`, or `required`
+when the caller configured `tool_choice="required"`; a named tool choice must be
+in the subset, and an empty subset sends `tool_choice="none"`. Changing the
+allowed list doesn't change the prompt prefix. Anthropic, Chat Completions,
+Gateway, Bedrock and Vertex have no per-request allow-list, so the model sees the
+whole catalogue there. On every provider the runtime still checks returned calls
+against the frozen exposure and blocks the rest as `not_exposed_in_request`. The
+mode cannot be combined with `targeted_tool_mode` or `tool_discovery_mode`, which
+project their own tools. The default `ToolExposureMode.FILTERED_TOOLS` keeps the
+behavior above. A non-default mode adds a `tool_exposure_delivery` entry to the
+execution-profile policies; request footprints count the callable subset as the
+exposed application tools, and context-pressure estimates count the whole catalogue
+that is sent.
 
 When request-footprint observation is enabled, ordinary conversational requests
 without targeted grants or discovery use `RequestFootprint.schema_version == 3`;
@@ -8800,6 +8821,28 @@ completion verifiers send their own prompts and carry no key.
 The key is a routing hint derived from session identity, like the session id,
 so it is not part of the execution profile or of the provider-neutral request
 fingerprint. A replay in a new session therefore still compares equal.
+
+### Prompt-prefix stability
+
+Provider prompt caches reuse only an exact prefix of the earlier request, so the
+runtime avoids changing anything it already sent:
+
+- Only the leading system messages become provider instructions; later system
+  messages stay where they were sent.
+- Automatic recall keeps an earlier interaction's memory on the user message it was
+  sent with (see automatic recall above).
+- `tool_exposure_mode="stable_catalogue"` keeps the tools array fixed while the
+  exposed subset changes (see tool exposure above).
+- Durable copies of tool schemas, including `ToolSpec` and `ModelRequest.tools`,
+  store an integral float such as `100.0` as `100`. OpenAI renders an integer
+  bound on a `number` field as `100` on some upstream replicas and `100.0` on
+  others, which changes the token count between identical requests. The OpenAI
+  Responses and Chat Completions adapters therefore send `minimum`, `maximum`,
+  `exclusiveMinimum`, `exclusiveMaximum` and `multipleOf` on any schema whose
+  `type` is `number` (or a list with `number` and without `integer`) as floats.
+  Only subschemas are visited, so literal data such as `default`, `const`, `enum`
+  and `examples` is sent unchanged, as are `integer` bounds and integers larger than
+  2**53, which a float can't represent exactly.
 
 ### Paired cost-and-quality comparisons
 
@@ -16379,6 +16422,74 @@ malformed or internally inconsistent frame still fails closed without recalling.
 The next real user message creates a new frame and can observe new knowledge. The
 complete redacted projection must fit `max_projection_bytes`; otherwise context
 construction fails before dispatch.
+
+A new frame doesn't edit a message that was already sent, as long as the memory on
+it may still be shown. When the interaction changes, the manifests the previous
+interaction placed (its base manifest and any frontier deltas) stay as the leading
+text parts of the user message they were sent with, and later requests carry them
+there again, so each request extends the previous one as provider prompt caching
+needs. The placements are recorded under the `automatic_recall_history` checkpoint
+root (version 1): the anchor's transcript index and digest, its position among the
+built context's user messages, and per manifest its typed projection, digest, receipt
+id, receipt-document digest, keyed receipt-to-manifest HMAC and a keyed HMAC that
+binds the receipt id to both digests.
+
+At each new interaction, a previous manifest is kept only if a request whose
+`ContextExposure` reached `dispatch_started` linked its receipt. Memory that was
+checkpointed but never dispatched was never cached and has no item-level exposure,
+so it is dropped. Every kept manifest is then rechecked once per interaction, as a
+fresh recall would be: its durable receipt must exist in the session, belong to an
+earlier interaction and match the recorded receipt-document digest, and each
+knowledge item must still be the current, active and unexpired revision visible
+through the request's knowledge access scope. Transcript items must belong to the
+session. Items from custom sources can't be rechecked, so manifests containing them
+aren't kept. A manifest that fails any check is dropped with its placement; at worst
+that costs a cache miss at that position. Within an interaction the rechecked set is
+reused, matching the frozen current frame.
+
+On every build Cayu re-renders each recorded projection and checks its digests and
+both HMACs. An unverifiable or malformed placement is dropped instead of failing
+context construction, because the record only keeps the prefix stable. A placement is
+also dropped, not moved, when the wrapped context policy removes or rewrites its
+anchor. At most 64 placements, 256 manifests and 1,000,000 manifest bytes are kept;
+the oldest go first.
+
+The wrapped context policy selects messages without recalled content. Its
+`ContextRequest.place_runtime_context` callback applies the same memory placement
+rules as dispatch to a candidate without mutating it or performing recall. Local
+pressure estimates use this projection, including the same occurrence matching and
+ambiguous-anchor suppression as final placement. Dropping an anchor therefore drops
+its memory from the estimate. Observed-usage estimates verify the projected prefix
+before reusing a previous input count. The policy's `count_input_tokens` and
+`build_cache_prefix_request` callbacks already apply this projection, so callers
+pass their unprojected candidates. A forced or bounded compaction, including
+context-overflow recovery, drops every retained manifest, so recovery cannot
+restore the memory that overflowed.
+
+Provider dispatch evidence checks each retained placement by position. The user
+message at its recorded position must lead with exactly its manifests, in order, and
+no other earlier envelope may appear; the current frame is the remaining run on one
+user message. Two interactions can recall byte-identical text, so digests alone
+can't tell placements apart.
+
+Each `ContextExposure` records everything automatic recall sent in that attempt.
+`receipt_ids` links the current frame's receipts, and their `RecallItemExposure`
+records carry the exact provider representations as before. `carried_receipt_ids`
+links the receipt of every retained manifest in the request, after both keyed
+bindings are checked again. A carried manifest is byte-identical to the one a
+dispatched earlier exposure sent, so its item-level record is that exposure's;
+carried receipts get no new item records. Stores accept a carried receipt only from
+an earlier interaction of the same session with the same evidence-key identity, and
+never one that is also linked. An attempt that sends only retained memory, for
+example after a user message with no text, still gets an exposure with empty
+`receipt_ids`. Re-anchoring and memory-delta accounting read only linked receipts and
+their items, so carried links never count as the current interaction's exposure.
+`MemoryContextExposureAttribution.carried_receipt_aliases` projects the carried
+links. The field is omitted from stored and projected documents when empty, so
+records without carried memory are unchanged. Forks do not inherit the history. Pass
+`retain_earlier_recall=False` to `AutomaticRecallContextPolicy` to drop earlier
+frames as before; this setting is part of the configuration fingerprint only when
+disabled, so existing frames keep their identity.
 
 `MemoryDeltaPolicy` optionally admits newly changed knowledge during the same
 interaction and therefore requires an automatic-recall mode that injects strong matches.

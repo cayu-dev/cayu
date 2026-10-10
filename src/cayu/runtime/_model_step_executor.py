@@ -179,6 +179,7 @@ from cayu.providers._http import (
 from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
+    CALLABLE_TOOL_NAMES_OPTION,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     InputTokenCountConfidence,
@@ -401,6 +402,7 @@ from cayu.tools.exposure import (
     AllRegisteredToolsExposurePolicy,
     ResolvedToolExposure,
     ToolExposure,
+    ToolExposureMode,
     ToolExposurePolicyRequest,
     resolve_tool_exposure,
     resolved_tool_exposure_authority,
@@ -1490,6 +1492,7 @@ class ModelStepExecutor:
         tool_discovery_projection_kind: ToolDiscoveryProjectionKind | None = None,
         tool_discovery_native_tool_names: Iterable[str] | None = None,
         model_execution_selection: ModelExecutionSelection | None = None,
+        tool_catalogue_exposure: ResolvedToolExposure | None = None,
     ) -> ModelRequest:
         effective_model = session.model
         if model_execution_selection is not None:
@@ -1509,11 +1512,20 @@ class ModelStepExecutor:
             if tool_exposure is None
             else _require_frozen_tool_exposure(tool_exposure)
         )
-        model_tools = _model_request_tools(
+        model_tools, callable_tool_names = _dispatched_model_tools(
+            registered_agent=registered_agent,
             tool_exposure=resolved_tool_exposure,
+            catalogue_exposure=(
+                tool_catalogue_exposure
+                if tool_catalogue_exposure is not None
+                or registered_agent.tool_exposure_mode is not ToolExposureMode.STABLE_CATALOGUE
+                else _tool_capability_ceiling_exposure(
+                    registered_agent,
+                    tool_capability_ceiling_from_session_metadata(session.metadata).tool_names,
+                )
+            ),
             structured_output=structured_output,
             targeted_tool_projection=targeted_tool_projection_kind,
-            tool_discovery_mode=registered_agent.tool_discovery_mode,
         )
         if targeted_tool_gateway is not None and (
             targeted_tool_projection_kind is not TargetedToolProjectionKind.CALL_TOOL
@@ -1643,6 +1655,8 @@ class ModelStepExecutor:
         }
         if thinking_payload is not None:
             request_options["thinking"] = thinking_payload
+        if callable_tool_names is not None:
+            request_options[CALLABLE_TOOL_NAMES_OPTION] = callable_tool_names
         if targeted_tool_projection_kind is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS:
             request_options[TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION] = CALL_TOOL_NAME
         if (
@@ -3695,6 +3709,7 @@ class ModelStepRun:
                     targeted_tool_native=targeted_tool_native,
                     tool_discovery_projection_kind=self._tool_discovery_projection_kind,
                     tool_discovery_native_tool_names=discovery_native_tool_names,
+                    tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
@@ -3893,6 +3908,7 @@ class ModelStepRun:
             tool_discovery_projection_kind=self._tool_discovery_projection_kind,
             tool_discovery_native_tool_names=discovery_native_tool_names,
             model_execution_selection=self._model_execution_selection,
+            tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
         )
         if self._execution_profile is None:
             raise RuntimeError("Tool exposure evidence requires an execution profile.")
@@ -5117,6 +5133,7 @@ class ModelStepRun:
                         if model_request.tool_discovery_projection is None
                         else model_request.tool_discovery_projection.loaded_tool_names
                     ),
+                    tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
@@ -5375,6 +5392,7 @@ class ModelStepRun:
                 else model_request.tool_discovery_projection.loaded_tool_names
             ),
             model_execution_selection=self._model_execution_selection,
+            tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
         )
         yield (
             await self._executor._event_writer.emit(
@@ -7483,6 +7501,7 @@ class ModelStepRun:
                 tool_discovery_projection_kind=self._tool_discovery_projection_kind,
                 tool_discovery_native_tool_names=tool_discovery_native_tool_names,
                 model_execution_selection=self._model_execution_selection,
+                tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
             )
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
@@ -7529,6 +7548,7 @@ class ModelStepRun:
                 tool_discovery_projection_kind=self._tool_discovery_projection_kind,
                 tool_discovery_native_tool_names=tool_discovery_native_tool_names,
                 model_execution_selection=self._model_execution_selection,
+                tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
             )
 
         return build_cache_prefix_request
@@ -8414,6 +8434,51 @@ def preflight_portable_model_material(
         hook_tools.clear()
 
 
+def _dispatched_model_tools(
+    *,
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_exposure: ResolvedToolExposure,
+    catalogue_exposure: ResolvedToolExposure | None,
+    structured_output: StructuredOutputSpec | None,
+    targeted_tool_projection: TargetedToolProjectionKind | None,
+) -> tuple[list[dict[str, Any]], list[str] | None]:
+    """Return the tools a request sends and, for a stable catalogue, the callable subset.
+
+    Dispatch and context-pressure estimation share this so both see the same tools.
+    """
+
+    if registered_agent.tool_exposure_mode is not ToolExposureMode.STABLE_CATALOGUE:
+        return (
+            _model_request_tools(
+                tool_exposure=tool_exposure,
+                structured_output=structured_output,
+                targeted_tool_projection=targeted_tool_projection,
+                tool_discovery_mode=registered_agent.tool_discovery_mode,
+            ),
+            None,
+        )
+    if catalogue_exposure is None:
+        raise RuntimeError("A stable tool catalogue requires the session's ceiling exposure.")
+    # Send the session's whole ceiling every step so exposure changes leave the
+    # tools array, and the provider's cached prefix, unchanged.
+    tools = _model_request_tools(
+        tool_exposure=catalogue_exposure,
+        structured_output=structured_output,
+        targeted_tool_projection=targeted_tool_projection,
+        tool_discovery_mode=registered_agent.tool_discovery_mode,
+    )
+    application_names = frozenset(catalogue_exposure.tool_names)
+    exposed_names = frozenset(tool_exposure.tool_names)
+    if not exposed_names <= application_names:
+        raise RuntimeError("Tool exposure selected a tool outside the session catalogue.")
+    callable_names = [
+        cast("str", tool["name"])
+        for tool in tools
+        if tool["name"] not in application_names or tool["name"] in exposed_names
+    ]
+    return tools, callable_names
+
+
 def _model_request_tools(
     *,
     tool_exposure: ResolvedToolExposure,
@@ -8775,15 +8840,19 @@ def _context_pressure_overhead(
     targeted_tool_native: TargetedToolProjectionRequest | None = None,
     tool_discovery_projection_kind: ToolDiscoveryProjectionKind | None = None,
     tool_discovery_native_tool_names: Iterable[str] = (),
+    tool_catalogue_exposure: ResolvedToolExposure | None = None,
 ) -> ContextPressureOverhead:
     profile = copy_model_context_pressure_profile(
         registered_provider.provider.context_pressure_profile
     )
-    tools = _model_request_tools(
+    # Estimate the tools that are actually dispatched, the whole catalogue in
+    # stable-catalogue mode.
+    tools, _ = _dispatched_model_tools(
+        registered_agent=registered_agent,
         tool_exposure=tool_exposure,
+        catalogue_exposure=tool_catalogue_exposure,
         structured_output=structured_output,
         targeted_tool_projection=targeted_tool_projection_kind,
-        tool_discovery_mode=registered_agent.tool_discovery_mode,
     )
     if targeted_tool_native is not None:
         tools.extend(copy_json_value(list(targeted_tool_native.tools), "targeted tools"))

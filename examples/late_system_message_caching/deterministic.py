@@ -2,10 +2,11 @@
 
 Real ``OpenAIProvider`` and ``AnthropicProvider`` instances serialize every turn
 through recording transports. The check asserts the serialized prefix of the
-late-system variant is append-only across turns and that the default Anthropic
-cache markers sit on the stable history. Token counts are simulated from the
-serialized payloads (about four characters per token) with each provider's
-documented prefix rule, and are labeled as such.
+late-system and runtime recall/exposure variants is append-only across turns,
+that exposure changes leave the tools array byte-identical, and that the default
+Anthropic cache markers sit on the stable history. Token counts are simulated
+from the serialized payloads (about four characters per token) with each
+provider's documented prefix rule, and are labeled as such.
 """
 
 from __future__ import annotations
@@ -17,8 +18,13 @@ from pathlib import Path
 from typing import Any, cast
 
 from examples._advanced_support import ScenarioResult
+from examples.late_system_message_caching.runtime_variant import (
+    RECALL_EXPOSURE_VARIANT,
+    run_recall_exposure_conversation,
+)
 from examples.late_system_message_caching.scenario import (
     SCENARIO,
+    TURNS,
     VARIANTS,
     run_conversation,
     summarize,
@@ -225,6 +231,48 @@ def _anthropic_prefix_is_append_only(payloads: list[dict[str, Any]]) -> bool:
     return True
 
 
+def _tools_are_byte_identical(payloads: list[dict[str, Any]]) -> bool:
+    return len({_canonical(_without_markers(payload.get("tools"))) for payload in payloads}) == 1
+
+
+def _openai_runtime_prefix_is_append_only(payloads: list[dict[str, Any]]) -> bool:
+    return all(
+        current.get("instructions") == previous.get("instructions")
+        and current["input"][: len(previous["input"])] == previous["input"]
+        for previous, current in itertools.pairwise(payloads)
+    )
+
+
+def _anthropic_runtime_prefix_is_append_only(payloads: list[dict[str, Any]]) -> bool:
+    def blocks(payload: dict[str, Any]) -> list[Any]:
+        return [
+            (message["role"], _without_markers(block))
+            for message in payload["messages"]
+            for block in message["content"]
+        ]
+
+    return all(
+        _without_markers(current.get("system")) == _without_markers(previous.get("system"))
+        and blocks(current)[: len(blocks(previous))] == blocks(previous)
+        for previous, current in itertools.pairwise(payloads)
+    )
+
+
+def _openai_exposure_changed(payloads: list[dict[str, Any]]) -> bool:
+    return len({_canonical(payload.get("tool_choice")) for payload in payloads}) >= 3
+
+
+def _number_bounds_are_floats(payload: dict[str, Any]) -> bool:
+    return all(
+        '"maximum":100.0' in _canonical(tool) and '"minimum":0.0' in _canonical(tool)
+        for tool in payload["tools"]
+    )
+
+
+def _recall_blocks(payload: dict[str, Any]) -> int:
+    return _canonical(payload).count("<cayu_automatic_memory")
+
+
 def _anthropic_markers_on_stable_history(payloads: list[dict[str, Any]]) -> bool:
     for payload in payloads:
         system = payload.get("system")
@@ -253,6 +301,7 @@ async def run(root: Path) -> ScenarioResult:
     )
     measurements: dict[str, Any] = {}
     late_payloads: dict[str, list[dict[str, Any]]] = {}
+    runtime_payloads: dict[str, list[dict[str, Any]]] = {}
     for label, provider, transport, model in (
         ("openai", openai, openai_transport, "gpt-6-luna"),
         ("anthropic", anthropic, anthropic_transport, "claude-haiku-4-5"),
@@ -272,10 +321,27 @@ async def run(root: Path) -> ScenarioResult:
             )
             if variant == "late_system":
                 late_payloads[label] = transport.payloads[start:]
+        start = len(transport.payloads)
+        runs.append(
+            await run_recall_exposure_conversation(
+                provider,
+                provider_name=label,
+                model=model,
+                options={},
+                nonce=f"fixture-{RECALL_EXPOSURE_VARIANT}",
+            )
+        )
+        runtime_payloads[label] = transport.payloads[start:]
         measurements[label] = summarize(runs)
 
     late_cached = {
         label: summary["late_system"]["turns_2_plus_cached_share"]
+        for label, summary in measurements.items()
+    }
+    # Turn 1 sends the notes in its newest message, which Anthropic's default
+    # markers leave unmarked, so they are first written on turn 2.
+    runtime_cached = {
+        label: summary[RECALL_EXPOSURE_VARIANT]["turns_3_plus_cached_share"]
         for label, summary in measurements.items()
     }
     assertions = {
@@ -295,6 +361,26 @@ async def run(root: Path) -> ScenarioResult:
         ),
         "simulated_late_system_turns_2_plus_mostly_cached": all(
             share >= 0.9 for share in late_cached.values()
+        ),
+        "openai_recall_exposure_prefix_is_append_only": _openai_runtime_prefix_is_append_only(
+            runtime_payloads["openai"]
+        ),
+        "anthropic_recall_exposure_prefix_is_append_only": (
+            _anthropic_runtime_prefix_is_append_only(runtime_payloads["anthropic"])
+        ),
+        "recall_exposure_keeps_every_turns_recall": all(
+            len(payloads) == TURNS and _recall_blocks(payloads[-1]) == TURNS
+            for payloads in runtime_payloads.values()
+        ),
+        "recall_exposure_tools_are_byte_identical": all(
+            _tools_are_byte_identical(payloads) for payloads in runtime_payloads.values()
+        ),
+        "openai_exposure_changes_only_allowed_tools": _openai_exposure_changed(
+            runtime_payloads["openai"]
+        ),
+        "openai_number_bounds_are_floats": _number_bounds_are_floats(runtime_payloads["openai"][0]),
+        "simulated_recall_exposure_turns_3_plus_mostly_cached": all(
+            share >= 0.9 for share in runtime_cached.values()
         ),
     }
     result = ScenarioResult(

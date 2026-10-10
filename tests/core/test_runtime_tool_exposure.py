@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 
 import pytest
@@ -16,7 +17,7 @@ from cayu.approvals.tools import (
 )
 from cayu.approvals.user_input import UserInputResponse
 from cayu.configuration import CayuConfig, RunDefaults
-from cayu.context.base import RecentTurnsContextPolicy
+from cayu.context.base import ContextPolicy, ContextRequest, RecentTurnsContextPolicy
 from cayu.context.counting import ContextCountingConfig, ContextCountingMode
 from cayu.context.footprints import RequestFootprintConfig
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
@@ -43,6 +44,7 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
 )
+from cayu.providers.openai import build_openai_payload
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._invocation_lifecycle import (
@@ -81,6 +83,7 @@ from cayu.tools.exposure import (
     ToolCapabilityCeiling,
     ToolExposure,
     ToolExposureDecision,
+    ToolExposureMode,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
 )
@@ -1694,3 +1697,132 @@ def test_later_model_step_receives_previous_profile_and_may_select_another() -> 
     ]
     assert alpha.calls == [{}]
     assert beta.calls == []
+
+
+def test_stable_catalogue_keeps_tools_byte_identical_and_refuses_hidden_calls() -> None:
+    provider = _ScriptedProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="alpha-call", name="alpha", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                # alpha is still in the catalogue but no longer exposed.
+                ModelStreamEvent.tool_call(id="hidden-alpha-call", name="alpha", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    alpha = _RecordingTool("alpha")
+    beta = _RecordingTool("beta")
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[alpha, beta],
+        tool_exposure_policy=_PhaseExposurePolicy(),
+        tool_exposure_mode=ToolExposureMode.STABLE_CATALOGUE,
+    )
+
+    events = _run(app, "stable-catalogue")
+
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert [_tool_names(request) for request in provider.requests] == [["alpha", "beta"]] * 3
+    assert all(request.tools == provider.requests[0].tools for request in provider.requests)
+    assert [request.options["callable_tool_names"] for request in provider.requests] == [
+        ["alpha"],
+        ["beta"],
+        ["beta"],
+    ]
+    assert alpha.calls == [{}]
+    [blocked] = [event for event in events if event.type is EventType.TOOL_CALL_BLOCKED]
+    assert blocked.tool_name == "alpha"
+    assert blocked.payload["reason"] == "not_exposed_in_request"
+    assert blocked.payload["profile_id"] == "phase-two"
+
+    payloads = [build_openai_payload(request) for request in provider.requests]
+    assert len({json.dumps(payload["tools"]) for payload in payloads}) == 1
+    assert [payload["tool_choice"] for payload in payloads] == [
+        {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": name}]}
+        for name in ("alpha", "beta", "beta")
+    ]
+
+
+def test_filtered_exposure_mode_keeps_sending_only_exposed_tools() -> None:
+    provider = _ScriptedProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
+        tool_exposure_policy=_PhaseExposurePolicy(),
+        tool_exposure_mode="filtered_tools",
+    )
+
+    _run(app, "filtered-exposure")
+
+    assert [_tool_names(request) for request in provider.requests] == [["alpha"]]
+    assert "callable_tool_names" not in provider.requests[0].options
+
+
+def test_stable_catalogue_rejects_modes_that_project_their_own_tools() -> None:
+    app = CayuApp(enable_logging=False)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha")],
+            tool_exposure_mode="stable_catalogue",
+            tool_discovery_mode="search_tools",
+        )
+    with pytest.raises(ValueError, match="tool_exposure_mode must be one of"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha")],
+            tool_exposure_mode="stable",
+        )
+
+
+class _OverheadRecordingContextPolicy(ContextPolicy):
+    def __init__(self) -> None:
+        self.tool_names: list[list[str]] = []
+
+    async def build(self, request: ContextRequest) -> list[Message]:
+        self.tool_names.append([tool["name"] for tool in request.pressure_overhead.tools])
+        return list(request.messages)
+
+
+def test_stable_catalogue_pressure_estimates_count_the_dispatched_catalogue() -> None:
+    provider = _ScriptedProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    context_policy = _OverheadRecordingContextPolicy()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
+        tool_exposure_policy=_PhaseExposurePolicy(),
+        tool_exposure_mode="stable_catalogue",
+        context_policy=context_policy,
+    )
+
+    _run(app, "stable-catalogue-pressure")
+
+    assert _tool_names(provider.requests[0]) == ["alpha", "beta"]
+    assert context_policy.tool_names == [["alpha", "beta"]]

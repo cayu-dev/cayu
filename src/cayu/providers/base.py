@@ -100,6 +100,7 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
         "structured_output",
         "targeted_tool_native_cache_anchor",
         "call_tool_core_callable",
+        "callable_tool_names",
         "thinking",
     }
 )
@@ -115,6 +116,7 @@ TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES = 1024 * 1024
 TARGETED_TOOL_PROJECTION_MARKER_TYPE = "cayu.targeted-tool-projection-marker"
 TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION = "targeted_tool_native_cache_anchor"
 CALL_TOOL_CORE_CALLABLE_OPTION = "call_tool_core_callable"
+CALLABLE_TOOL_NAMES_OPTION = "callable_tool_names"
 
 
 def call_tool_core_callable(options: Mapping[str, Any]) -> bool:
@@ -124,6 +126,28 @@ def call_tool_core_callable(options: Mapping[str, Any]) -> bool:
     if type(value) is not bool:
         raise ValueError("The call_tool core callability marker must be a bool.")
     return value
+
+
+def callable_tool_names(options: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Return the request tools callable in this step, or ``None`` when all are.
+
+    When present, ``ModelRequest.tools`` is a stable catalogue and this names
+    the subset the model may call. Adapters with a native allow-list send it
+    (OpenAI Responses uses an ``allowed_tools`` tool choice); others send the
+    catalogue unchanged and the runtime refuses calls outside the subset.
+    """
+
+    value = options.get(CALLABLE_TOOL_NAMES_OPTION)
+    if value is None:
+        return None
+    if type(value) is not list or any(type(name) is not str for name in value):
+        raise ValueError("callable_tool_names must be a list of tool names.")
+    names = tuple(
+        require_durable_clean_nonblank(name, CALLABLE_TOOL_NAMES_OPTION) for name in value
+    )
+    if len(names) != len(set(names)):
+        raise ValueError("callable_tool_names cannot repeat a tool name.")
+    return names
 
 
 def targeted_tool_native_cache_anchor_name(options: Mapping[str, Any]) -> str | None:

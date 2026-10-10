@@ -46,6 +46,7 @@ from cayu.messages import FilePart, Message, MessageRole, ToolCallPart, ToolResu
 from cayu.providers._system_messages import leading_system_count, placed_conversation_messages
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
+    CALLABLE_TOOL_NAMES_OPTION,
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
@@ -54,6 +55,7 @@ from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
     call_tool_core_callable,
+    callable_tool_names,
     copy_model_context_pressure_profile,
     targeted_tool_native_cache_anchor_name,
 )
@@ -100,6 +102,7 @@ _RUNTIME_ONLY_OPTION_KEYS = frozenset(
         "step",
         "structured_output",
         CALL_TOOL_CORE_CALLABLE_OPTION,
+        CALLABLE_TOOL_NAMES_OPTION,
         TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
         "thinking",
         RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -1321,13 +1324,23 @@ def build_request_footprint(
             and native_cache_anchor is not None
         ):
             raise ValueError("The call_tool projection cannot use a native cache anchor.")
-    if tool_exposure is not None and (
+    callable_names = callable_tool_names(model_request.options)
+    request_tool_names = [tool.get("name") for tool in model_request.tools]
+    if callable_names is not None and any(
+        name not in request_tool_names for name in callable_names
+    ):
+        raise ValueError("callable_tool_names must name tools present in the request.")
+    runtime_tool_names = {STRUCTURED_OUTPUT_TOOL_NAME, CALL_TOOL_NAME, SEARCH_TOOLS_NAME}
+    # A stable catalogue sends every ceiling tool; the exposure is its callable subset.
+    application_tool_count = (
         len(model_request.tools)
         - len(structured_output_tools)
         - len(tool_gateway_tools)
         - len(tool_discovery_tools)
-        != tool_exposure.exposed_count
-    ):
+        if callable_names is None
+        else sum(1 for name in callable_names if name not in runtime_tool_names)
+    )
+    if tool_exposure is not None and application_tool_count != tool_exposure.exposed_count:
         raise ValueError(
             "tool_exposure exposed_count must match the prepared application tool definitions."
         )

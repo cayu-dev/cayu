@@ -19,6 +19,7 @@ from pydantic import (
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_nonblank
 from cayu.memory.evidence import (
+    MAX_CONTEXT_EXPOSURE_CARRIED_RECEIPTS,
     MAX_CONTEXT_EXPOSURE_CONTRIBUTORS,
     MAX_CONTEXT_EXPOSURE_RECEIPTS,
     MAX_CONTEXT_EXPOSURE_TRANSITIONS,
@@ -310,6 +311,12 @@ class MemoryContextExposureAttribution(BaseModel):
     receipt_aliases: tuple[MemoryEvidenceAlias, ...] = Field(
         default=(), max_length=MAX_CONTEXT_EXPOSURE_RECEIPTS
     )
+    carried_receipt_aliases: tuple[MemoryEvidenceAlias, ...] = Field(
+        default=(),
+        max_length=MAX_CONTEXT_EXPOSURE_CARRIED_RECEIPTS,
+        exclude_if=lambda value: not value,
+    )
+    """Earlier interactions' receipts whose memory this attempt sent again."""
     contributor_count: StrictInt = Field(ge=0, le=MAX_CONTEXT_EXPOSURE_CONTRIBUTORS)
     transitions: tuple[MemoryExposureTransitionAttribution, ...] = Field(
         default=(), max_length=MAX_CONTEXT_EXPOSURE_TRANSITIONS
@@ -334,18 +341,25 @@ class MemoryContextExposureAttribution(BaseModel):
     def validate_structure(self) -> Self:
         if self.exposure_alias.kind != "exposure" or self.interaction_alias.kind != "interaction":
             raise ValueError("Context exposure aliases have the wrong domains.")
-        if any(alias.kind != "receipt" for alias in self.receipt_aliases):
+        if any(
+            alias.kind != "receipt"
+            for alias in (*self.receipt_aliases, *self.carried_receipt_aliases)
+        ):
             raise ValueError("Context exposure receipt aliases have the wrong domain.")
         aliases = (
             self.exposure_alias,
             self.interaction_alias,
             *self.receipt_aliases,
+            *self.carried_receipt_aliases,
             *(item.item_alias for item in self.items),
             *(item.receipt_alias for item in self.items),
         )
         if len({alias.key_id for alias in aliases}) != 1:
             raise ValueError("Context exposure aliases must use one key identity.")
-        receipt_aliases = tuple((alias.key_id, alias.digest) for alias in self.receipt_aliases)
+        receipt_aliases = tuple(
+            (alias.key_id, alias.digest)
+            for alias in (*self.receipt_aliases, *self.carried_receipt_aliases)
+        )
         if len(receipt_aliases) != len(set(receipt_aliases)):
             raise ValueError("Context exposure receipt aliases must be unique.")
         if tuple(transition.revision for transition in self.transitions) != tuple(

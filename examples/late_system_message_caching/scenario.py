@@ -214,12 +214,14 @@ async def run_conversation(
     return run
 
 
+def _cached_share(turns: list[TurnMeasurement]) -> float:
+    total = sum(turn.input_tokens for turn in turns)
+    return round(sum(turn.cache_read_tokens for turn in turns) / total, 4) if total else 0
+
+
 def summarize(runs: list[ConversationRun]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for run in runs:
-        later = run.turns[1:]
-        later_input = sum(turn.input_tokens for turn in later)
-        later_read = sum(turn.cache_read_tokens for turn in later)
         costs = [turn.cost_usd for turn in run.turns]
         summary[run.variant] = {
             "turns": [turn.as_json() for turn in run.turns],
@@ -227,7 +229,8 @@ def summarize(runs: list[ConversationRun]) -> dict[str, Any]:
             "cache_read_tokens": sum(turn.cache_read_tokens for turn in run.turns),
             "cache_write_tokens": sum(turn.cache_write_tokens for turn in run.turns),
             "uncached_input_tokens": sum(turn.uncached_input_tokens for turn in run.turns),
-            "turns_2_plus_cached_share": round(later_read / later_input, 4) if later_input else 0,
+            "turns_2_plus_cached_share": _cached_share([t for t in run.turns if t.turn >= 2]),
+            "turns_3_plus_cached_share": _cached_share([t for t in run.turns if t.turn >= 3]),
             "cost_usd": (
                 str(sum((Decimal(cost) for cost in costs if cost is not None), Decimal(0)))
                 if all(cost is not None for cost in costs)

@@ -63,6 +63,7 @@ from cayu.tools.discovery import (
     resolve_tool_discovery_projection,
     tool_discovery_execution_profile_material,
 )
+from cayu.tools.exposure import ToolExposureMode
 from cayu.tools.gateway import call_tool_gateway_execution_profile_material
 from cayu.tools.targeted_projection import (
     TargetedToolProjectionKind,
@@ -650,6 +651,18 @@ def resolve_execution_profile_identity(
                 {}
                 if tool_exposure_policy_entry is None
                 else {"tool_exposure_policy": tool_exposure_policy_entry}
+            ),
+            # Absent in the default mode so existing profiles keep their identity.
+            **(
+                {}
+                if registered_agent.tool_exposure_mode is ToolExposureMode.FILTERED_TOOLS
+                else {
+                    "tool_exposure_delivery": {
+                        "kind": "cayu:tool-exposure-delivery",
+                        "schema_version": 1,
+                        "mode": registered_agent.tool_exposure_mode.value,
+                    }
+                }
             ),
         },
         execution_policies_process_local=execution_policies_process_local,

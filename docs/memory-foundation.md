@@ -276,8 +276,9 @@ The nearby context concepts have different lifetimes and owners:
   authority. Work-context workflow fields are descriptive foreign identities,
   not control-plane commands.
 - `RecallReceipt` records retrieval and admission, while `ContextExposure`
-  records what reached a provider boundary. Neither fact can be inferred from
-  a recall checkpoint.
+  records what reached a provider boundary, including memory an earlier
+  interaction sent and the request still carries (`carried_receipt_ids`).
+  Neither fact can be inferred from a recall checkpoint.
 - A future notification consumer must keep its own delivery/consumption
   evidence. Advancing a checkpoint does not acknowledge a notification.
 

@@ -786,6 +786,17 @@ class ContextRequest(BaseModel):
         default=None,
         exclude=True,
     )
+    place_runtime_context: Callable[[list[Message]], list[Message]] | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    """Pure projection used to estimate messages with runtime-added content.
+
+    Context wrappers use the same placement rules as final request assembly.
+    The callback must not mutate its input or perform recall. Provider-count
+    and cache-prefix callbacks already include this projection.
+    """
     force_compaction: StrictBool = False
     force_bounded_compaction: StrictBool = False
     compaction_instructions: str | None = Field(
@@ -2241,16 +2252,21 @@ def _estimate_model_facing_context_pressure(
     reserved_output_tokens: int = 0,
 ) -> ContextPressureEstimate:
     estimator = ObservedDeltaContextEstimator()
+    projected = (
+        messages
+        if request.place_runtime_context is None
+        else request.place_runtime_context(messages)
+    )
     if messages == request.messages:
         return estimator.estimate_anchored_request(
             usage=request.context_usage,
-            messages=messages,
+            messages=projected,
             overhead=request.pressure_overhead,
             reserved_output_tokens=reserved_output_tokens,
         )
     return estimator.estimate_full_request(
         usage=request.context_usage,
-        messages=messages,
+        messages=projected,
         overhead=request.pressure_overhead,
         reserved_output_tokens=reserved_output_tokens,
     )

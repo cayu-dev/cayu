@@ -80,6 +80,7 @@ from cayu.providers._system_messages import (
     system_message_text,
 )
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
+from cayu.providers._tool_schemas import float_number_bounds
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProvider,
@@ -2106,7 +2107,7 @@ def _chat_completions_tool(
         "function": {
             "name": name,
             "description": description,
-            "parameters": parameters,
+            "parameters": float_number_bounds(parameters),
         },
     }
 

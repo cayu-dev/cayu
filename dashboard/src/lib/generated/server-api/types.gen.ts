@@ -10289,6 +10289,10 @@ export type MemoryCaseComparison = {
  */
 export type MemoryContextExposureAttribution = {
     /**
+     * Carried Receipt Aliases
+     */
+    carried_receipt_aliases?: Array<MemoryEvidenceAlias>;
+    /**
      * Contributor Count
      */
     contributor_count: number;

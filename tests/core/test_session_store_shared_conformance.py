@@ -30411,3 +30411,67 @@ def test_session_store_conformance_cancel_during_post_preparation_cleanup(
             await _close_store(store)
 
     asyncio.run(run())
+
+
+def test_session_store_conformance_persists_carried_recall_receipts(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            for session_id in ("memory-evidence-session", "memory-evidence-other-session"):
+                await store.create(
+                    RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                    identity=_identity(),
+                )
+            earlier = _recall_receipt(
+                "earlier",
+                interaction_id="memory-evidence-earlier-interaction",
+                created_at=datetime(2026, 8, 22, 11, 0, tzinfo=UTC),
+            )
+            current = _recall_receipt("current")
+            same_interaction = _recall_receipt("same-interaction")
+            other_session = _recall_receipt(
+                "other-session",
+                session_id="memory-evidence-other-session",
+                interaction_id="memory-evidence-earlier-interaction",
+                created_at=datetime(2026, 8, 22, 11, 0, tzinfo=UTC),
+            )
+            for receipt in (earlier, current, same_interaction, other_session):
+                await store.create_recall_receipt(receipt)
+
+            exposure, items = _planned_context_exposure("carried", current)
+            exposure = exposure.model_copy(update={"carried_receipt_ids": (earlier.receipt_id,)})
+            created = await store.create_context_exposure(exposure, items)
+            assert created.carried_receipt_ids == (earlier.receipt_id,)
+            loaded = await store.load_context_exposure(exposure.session_id, exposure.exposure_id)
+            assert loaded == created
+            page = await store.list_context_exposures(
+                RecallEvidenceQuery(session_id=exposure.session_id)
+            )
+            assert [item.carried_receipt_ids for item in page.items] == [(earlier.receipt_id,)]
+            # Re-anchoring reads item exposures, which cover only linked receipts.
+            assert {
+                item.receipt_id
+                for item in await store.load_recall_item_exposures(
+                    exposure.session_id, exposure.exposure_id
+                )
+            } == {current.receipt_id}
+
+            for label, carried_id, error in (
+                ("carried-same-interaction", same_interaction.receipt_id, ValueError),
+                ("carried-other-session", other_session.receipt_id, ValueError),
+                ("carried-missing", "receipt-missing", KeyError),
+            ):
+                rejected, rejected_items = _planned_context_exposure(label, current)
+                rejected = rejected.model_copy(update={"carried_receipt_ids": (carried_id,)})
+                with pytest.raises(error):
+                    await store.create_context_exposure(rejected, rejected_items)
+                assert (
+                    await store.load_context_exposure(rejected.session_id, rejected.exposure_id)
+                    is None
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())

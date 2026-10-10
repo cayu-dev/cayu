@@ -15,6 +15,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
+    AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
@@ -141,6 +142,7 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
         "pause_digest",
         "projection_sha256",
         "receipt_document_sha256",
+        "carried_receipt_binding_hmac_sha256",
         "receipt_manifest_binding_hmac_sha256",
         "resolution_request_digest",
         "situation_sha256",
@@ -182,6 +184,10 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "artifacts",
     "anchor_transcript_index",
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
+    AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY,
+    "current_placements",
+    "retained_placements",
+    "manifest_records",
     "as_of",
     "backoff_multiplier",
     "batch",
@@ -508,6 +514,7 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         AUTOMATIC_RECALL_CHECKPOINT_KEY,
+        AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY,
         COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
         "context_compaction",
         "durable_subagent_submission_seeds",
@@ -1551,7 +1558,10 @@ def _is_completion_result_event_publication_identity(
 
 
 def _is_automatic_recall_evidence_identity_path(path: tuple[str, ...]) -> bool:
-    return path == (AUTOMATIC_RECALL_CHECKPOINT_KEY, "receipt_id")
+    return path == (AUTOMATIC_RECALL_CHECKPOINT_KEY, "receipt_id") or path in {
+        (AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY, placements, "manifest_records", "receipt_id")
+        for placements in ("current_placements", "retained_placements")
+    }
 
 
 def _is_durable_subagent_structural_key(path: tuple[str, ...], key: str) -> bool:

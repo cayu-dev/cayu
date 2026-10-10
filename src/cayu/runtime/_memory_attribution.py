@@ -37,6 +37,7 @@ from cayu.memory.evidence import (
     RecallSourceCoverageState,
     memory_evidence_document_bytes,
     recall_item_exposure_matches_receipt_item,
+    validate_context_exposure_carried_receipt_scope,
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
@@ -199,6 +200,13 @@ async def project_memory_attribution(
                         raise ValueError("Context exposure references an absent recall receipt.")
                     continue
                 validate_context_exposure_receipt_scope(exposure, receipt)
+            for receipt_id in exposure.carried_receipt_ids:
+                receipt = receipt_by_id.get(receipt_id)
+                if receipt is None:
+                    if source.receipts_complete:
+                        raise ValueError("Context exposure carries an absent recall receipt.")
+                    continue
+                validate_context_exposure_carried_receipt_scope(exposure, receipt)
     except (TypeError, ValueError):
         return _contradictory(source)
 
@@ -208,7 +216,7 @@ async def project_memory_attribution(
         {
             receipt_id
             for exposure in source.exposures
-            for receipt_id in exposure.receipt_ids
+            for receipt_id in (*exposure.receipt_ids, *exposure.carried_receipt_ids)
             if receipt_id not in receipt_by_id
         }
     )
@@ -556,6 +564,10 @@ def _project_exposure(
         receipt_aliases=tuple(
             _alias(receipt_id, "receipt", exposure.session_id, key)
             for receipt_id in exposure.receipt_ids
+        ),
+        carried_receipt_aliases=tuple(
+            _alias(receipt_id, "receipt", exposure.session_id, key)
+            for receipt_id in exposure.carried_receipt_ids
         ),
         contributor_count=len(exposure.contributor_ids),
         transitions=tuple(

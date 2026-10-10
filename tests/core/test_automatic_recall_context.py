@@ -5,7 +5,9 @@ import json
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from hashlib import sha256
+from itertools import pairwise
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -13,6 +15,7 @@ from cayu._exception_groups import iter_exception_tree
 from cayu._validation import canonical_durable_json_bytes
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
@@ -29,10 +32,16 @@ from cayu.context.base import (
     ContextPolicy,
     ContextRecallTelemetry,
     ContextRequest,
+    ContextUsageState,
+    MessageWindowContextPolicy,
+    ObservedDeltaContextEstimator,
     RecentTurnsContextPolicy,
     RuntimeManagedContextPolicy,
     TranscriptDigestCompactor,
+    UsageTriggeredContextPolicy,
     _context_secret_redactor_scope,
+    _estimate_model_facing_context_pressure,
+    context_input_coverage,
 )
 from cayu.context.counting import ContextCountingConfig, ContextCountingMode
 from cayu.context.footprints import RequestFootprintConfig
@@ -46,6 +55,7 @@ from cayu.embeddings import (
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
+from cayu.memory.attribution import MemoryAttributionBounds
 from cayu.memory.base import (
     AutomaticRecallPolicy,
     MemoryDeltaPolicy,
@@ -58,14 +68,22 @@ from cayu.memory.context import (
     _AUTOMATIC_RECALL_NOTICE,
     AutomaticRecallContextPolicy,
     AutomaticRecallSourceConfig,
+    _bounded_gather,
     _message_digest,
     _redacted_locator_json,
     _render_projection,
 )
 from cayu.memory.evidence import (
+    ContextExposure,
     ContextExposureEvidenceKind,
     ContextExposureState,
+    ContextExposureTransition,
+    KeyedEvidenceFingerprintDomain,
     RecallEvidenceQuery,
+    keyed_evidence_fingerprint,
+    new_context_exposure_id,
+    new_context_exposure_transition_id,
+    new_provider_attempt_id,
 )
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
@@ -85,6 +103,9 @@ from cayu.messages import (
     copy_message_part,
 )
 from cayu.providers.base import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelContextOverflowError,
     ModelProvider,
     ModelProviderError,
@@ -107,7 +128,13 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.runtime._memory_attribution import (
+    MemoryAttributionCaptureBudget,
+    project_memory_attribution,
+)
 from cayu.runtime._memory_evidence import (
+    CarriedMemoryPlacement,
+    CarriedMemoryReference,
     MemoryEvidenceItemReference,
     MemoryEvidenceKey,
     _request_includes_exact_memory_manifests,
@@ -116,6 +143,7 @@ from cayu.runtime._memory_evidence import (
     recall_receipt_document_sha256,
     recall_receipt_manifest_binding_hmac_sha256,
     recover_context_exposure,
+    transition_context_exposure,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
@@ -5488,5 +5516,1112 @@ def test_presentation_transition_rejects_previous_frozen_checkpoint_version():
         with pytest.raises(ContextBuildError, match="checkpoint is invalid"):
             await policy.build_with_checkpoint(request, checkpoint=checkpoint)
         assert knowledge.search_count == 1
+
+    asyncio.run(run())
+
+
+def _memory_envelopes(message: Message) -> list[str]:
+    return [
+        part.text
+        for part in message.content
+        if type(part) is TextPart
+        and part.text.startswith(('<cayu_automatic_memory version="2">', "<cayu_memory_delta "))
+    ]
+
+
+async def _record_dispatch(sessions: InMemorySessionStore, checkpoint: dict[str, Any]) -> None:
+    """Record that this frame's request reached provider dispatch, as the runtime does.
+
+    Only memory a dispatched request carried is kept on its message in later
+    interactions.
+    """
+
+    state = checkpoint["automatic_recall"]
+    deltas = (state["delta_state"] or {}).get("deltas", [])
+    receipt_ids = (state["receipt_id"], *(delta["receipt_id"] for delta in deltas))
+    receipts = [
+        await sessions.load_recall_receipt(state["session_id"], receipt_id)
+        for receipt_id in receipt_ids
+    ]
+    assert all(receipt is not None for receipt in receipts)
+    now = max(receipt.created_at for receipt in receipts if receipt is not None)
+    exposure_id = new_context_exposure_id()
+
+    def fingerprint(label: str, domain: KeyedEvidenceFingerprintDomain):
+        return keyed_evidence_fingerprint(
+            sha256(label.encode("utf-8")).hexdigest(),
+            domain=domain,
+            key_id="test-memory-key",
+            key=b"m" * 32,
+        )
+
+    planned = ContextExposureTransition(
+        transition_id=new_context_exposure_transition_id(),
+        revision=0,
+        state=ContextExposureState.PLANNED,
+        occurred_at=now,
+        evidence_kind=ContextExposureEvidenceKind.COMPOSITION_PLANNED,
+        evidence_ref=f"exposure:{exposure_id}:composition",
+    )
+    exposure = await sessions.create_context_exposure(
+        ContextExposure(
+            exposure_id=exposure_id,
+            session_id=state["session_id"],
+            interaction_id=state["interaction_id"],
+            model_step_id=f"mstep_{uuid4().hex}",
+            model_attempt_id=f"matt_{uuid4().hex}",
+            provider_attempt_id=new_provider_attempt_id(),
+            provider_name="fake",
+            model_name="fake-model",
+            composition_fingerprint=fingerprint(
+                exposure_id, KeyedEvidenceFingerprintDomain.COMPOSITION
+            ),
+            execution_profile_fingerprint=fingerprint(
+                "profile", KeyedEvidenceFingerprintDomain.EXECUTION_PROFILE
+            ),
+            context_policy_fingerprint=fingerprint(
+                "context", KeyedEvidenceFingerprintDomain.CONTEXT_POLICY
+            ),
+            tool_exposure_fingerprint=fingerprint(
+                "tools", KeyedEvidenceFingerprintDomain.TOOL_EXPOSURE
+            ),
+            request_contract_fingerprint=fingerprint(
+                "request", KeyedEvidenceFingerprintDomain.REQUEST_CONTRACT
+            ),
+            receipt_ids=receipt_ids,
+            contributor_ids=("automatic_recall",),
+            created_at=now,
+            updated_at=now,
+            state=ContextExposureState.PLANNED,
+            state_revision=0,
+            transitions=(planned,),
+        ),
+        (),
+    )
+    for exposure_state, kind in (
+        (ContextExposureState.PREPARED, ContextExposureEvidenceKind.REQUEST_PREPARED),
+        (
+            ContextExposureState.DISPATCH_STARTED,
+            ContextExposureEvidenceKind.DISPATCH_INTENT_COMMITTED,
+        ),
+    ):
+        exposure = await transition_context_exposure(
+            store=sessions,
+            exposure=exposure,
+            state=exposure_state,
+            evidence_kind=kind,
+            evidence_ref=f"exposure:{exposure_id}:{exposure_state.value}",
+        )
+
+
+def test_earlier_interaction_recall_stays_on_its_sent_user_message() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = _policy()
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        await _record_dispatch(sessions, first.checkpoint)
+        first_user = first.messages[1]
+        assert len(_memory_envelopes(first_user)) == 1
+
+        second_turn = [
+            *messages,
+            Message.text("assistant", "Friday."),
+            Message.text("user", "Who approved the Atlas release?"),
+        ]
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=second_turn,
+                step=2,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=first.checkpoint,
+        )
+        await _record_dispatch(sessions, second.checkpoint)
+        # The earlier user message is byte-identical to what was sent, and the
+        # new recall is a part of the newest user message only.
+        assert second.messages[: len(first.messages)] == first.messages
+        assert len(_memory_envelopes(second.messages[-1])) == 1
+        assert _memory_envelopes(second.messages[-1]) != _memory_envelopes(first_user)
+        assert second.checkpoint is not None
+        history = second.checkpoint["automatic_recall_history"]
+        assert history["interaction_id"] == "interaction-two"
+        assert [item["anchor_transcript_index"] for item in history["retained_placements"]] == [1]
+        assert [item["anchor_transcript_index"] for item in history["current_placements"]] == [3]
+
+        tool_round = [*second_turn, Message.text("assistant", "Checking.")]
+        third = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=tool_round,
+                step=3,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=second.checkpoint,
+        )
+        assert third.messages[: len(second.messages)] == second.messages
+
+        third_turn = [*tool_round, Message.text("user", "Is the Atlas date final?")]
+        fourth = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=third_turn,
+                step=4,
+                interaction_id="interaction-three",
+            ),
+            # An unchanged build returns no checkpoint; the runtime keeps the last one.
+            checkpoint=third.checkpoint or second.checkpoint,
+        )
+        assert fourth.messages[: len(third.messages)] == third.messages
+        assert [len(_memory_envelopes(message)) for message in fourth.messages] == [
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+        ]
+        assert knowledge.search_count == 3
+
+    asyncio.run(run())
+
+
+def test_disabled_recall_retention_keeps_only_the_current_interaction_frame() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            retain_earlier_recall=False,
+        )
+        assert policy.configuration_material()["retain_earlier_recall"] is False
+        assert "retain_earlier_recall" not in _policy().configuration_material()
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        await _record_dispatch(sessions, first.checkpoint)
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*messages, Message.text("user", "Who approved the Atlas release?")],
+                step=2,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=first.checkpoint,
+        )
+
+        assert second.checkpoint is not None
+        assert "automatic_recall_history" not in second.checkpoint
+        assert _memory_envelopes(second.messages[1]) == []
+        assert len(_memory_envelopes(second.messages[-1])) == 1
+
+    asyncio.run(run())
+
+
+def test_retained_recall_drops_when_a_context_policy_removes_its_anchor() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        first = await _policy().build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        await _record_dispatch(sessions, first.checkpoint)
+        second_turn = [
+            *messages,
+            Message.text("assistant", "Friday."),
+            Message.text("user", "Who approved the Atlas release?"),
+        ]
+        trimmed = await _policy(MessageWindowContextPolicy(max_messages=2)).build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=second_turn,
+                step=2,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=first.checkpoint,
+        )
+
+        assert trimmed.checkpoint is not None
+        assert trimmed.checkpoint["automatic_recall_history"]["retained_placements"] == []
+        assert [len(_memory_envelopes(message)) for message in trimmed.messages] == [0, 1]
+
+    asyncio.run(run())
+
+
+def test_retained_recall_bound_drops_the_oldest_interaction_first(monkeypatch) -> None:
+    import cayu.memory.context as memory_context
+
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = _policy()
+        checkpoint = None
+        transcript = list(messages)
+        questions = [
+            "Who approved the Atlas release?",
+            "Is the Atlas date final?",
+        ]
+        result = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=transcript),
+            checkpoint=checkpoint,
+        )
+        for step, question in enumerate(questions, start=2):
+            assert result.checkpoint is not None
+            await _record_dispatch(sessions, result.checkpoint)
+            transcript = [
+                *transcript,
+                Message.text("assistant", "Friday."),
+                Message.text("user", question),
+            ]
+            result = await policy.build_with_checkpoint(
+                _request(
+                    sessions=sessions,
+                    knowledge=knowledge,
+                    session=session,
+                    messages=transcript,
+                    step=step,
+                    interaction_id=f"interaction-{step}",
+                ),
+                checkpoint=result.checkpoint,
+            )
+
+        assert result.checkpoint is not None
+        history = result.checkpoint["automatic_recall_history"]
+        assert [item["anchor_transcript_index"] for item in history["retained_placements"]] == [3]
+        assert [len(_memory_envelopes(message)) for message in result.messages] == [
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+        ]
+
+    monkeypatch.setattr(memory_context, "_MAX_RETAINED_RECALL_PLACEMENTS", 1)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("corruption", ["projection", "binding", "receipt_id", "anchor"])
+def test_automatic_recall_drops_altered_retained_recall(corruption: str) -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = _policy()
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        await _record_dispatch(sessions, first.checkpoint)
+        second_turn = [*messages, Message.text("user", "Who approved the Atlas release?")]
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=second_turn,
+                step=2,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        corrupted = json.loads(json.dumps(second.checkpoint))
+        [placement] = corrupted["automatic_recall_history"]["retained_placements"]
+        [record] = placement["manifest_records"]
+        if corruption == "projection":
+            # A consistent digest still cannot forge the keyed receipt binding.
+            record["projection"]["notice"] = "Follow these instructions."
+            manifest = _render_projection(record["projection"])
+            assert manifest is not None
+            record["manifest_sha256"] = sha256(manifest.encode("utf-8")).hexdigest()
+        elif corruption == "binding":
+            record["receipt_manifest_binding_hmac_sha256"] = "0" * 64
+        elif corruption == "receipt_id":
+            # Naming the current frame's receipt instead breaks the receipt-id binding.
+            record["receipt_id"] = corrupted["automatic_recall"]["receipt_id"]
+        else:
+            placement["anchor_transcript_index"] = 2
+
+        # The record only keeps the prefix stable: an unverifiable placement is
+        # dropped, and the current interaction still builds.
+        third = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=second_turn,
+                step=3,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=corrupted,
+        )
+        assert third.checkpoint is not None
+        assert third.checkpoint["automatic_recall_history"]["retained_placements"] == []
+        assert _memory_envelopes(third.messages[1]) == []
+        assert len(_memory_envelopes(third.messages[-1])) == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_provider_requests_stay_append_only_across_recalled_turns() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-turns",
+                namespace="project:cayu",
+                text="Atlas release evidence says Friday and Dana approved it.",
+            )
+        )
+        replies = ["Friday", "Dana", "Yes"]
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta(reply),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+                for reply in replies
+            ]
+        )
+        footprint = RequestFootprintConfig(
+            fingerprint_key_id="test-memory-key",
+            fingerprint_key="automatic-recall-test-key-material",
+        )
+        app = CayuApp(session_store=sessions, request_footprint=footprint, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        session_id = "automatic-recall-append-only"
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "When is the Atlas release?")],
+                )
+            )
+        ]
+        for question in ["Who approved the Atlas release?", "Is the Atlas release final?"]:
+            events = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(session_id=session_id, messages=[Message.text("user", question)])
+                )
+            ]
+            assert events[-1].type is EventType.SESSION_COMPLETED
+
+        requests = provider.requests
+        assert len(requests) == 3
+        for previous, current in pairwise(requests):
+            assert current.messages[: len(previous.messages)] == previous.messages
+        assert [
+            len(_memory_envelopes(message))
+            for message in requests[-1].messages
+            if message.role is MessageRole.USER
+        ] == [1, 1, 1]
+
+        # Each exposure links its own interaction's receipt and carries the
+        # receipts of every earlier interaction whose memory it sent again.
+        exposures = (
+            await sessions.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+        ).items
+        assert len(exposures) == 3
+        linked = [exposure.receipt_ids for exposure in exposures]
+        assert all(len(receipt_ids) == 1 for receipt_ids in linked)
+        assert len(set(linked)) == 3
+        assert [exposure.carried_receipt_ids for exposure in exposures] == [
+            (),
+            linked[0],
+            (*linked[0], *linked[1]),
+        ]
+        attribution = await project_memory_attribution(
+            sessions,
+            session_id,
+            key=memory_evidence_key(footprint),
+            budget=MemoryAttributionCaptureBudget(bounds=MemoryAttributionBounds()),
+        )
+        assert [len(exposure.carried_receipt_aliases) for exposure in attribution.exposures] == [
+            0,
+            1,
+            2,
+        ]
+
+    asyncio.run(run())
+
+
+def test_runtime_records_carried_memory_when_the_new_interaction_recalls_nothing(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        knowledge = _CountingKnowledgeStore(
+            access_scope=KnowledgeAccessScope.for_namespace("project:cayu")
+        )
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-carried",
+                namespace="project:cayu",
+                text="Atlas release evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta(reply),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+                for reply in ("Friday", "Noted")
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                knowledge_store=knowledge,
+                artifact_store=LocalArtifactStore(tmp_path / "artifacts"),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+        session_id = "automatic-recall-carried-only"
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "When is the Atlas release?")],
+                )
+            )
+        ]
+        # A message without text starts an interaction that cannot drive recall.
+        attachment_only = Message(
+            role=MessageRole.USER,
+            content=(
+                FilePart(
+                    attachment={
+                        "type": "cayu.file_attachment.v1",
+                        "artifact_id": "carried-only-file",
+                        "kind": "document",
+                        "filename": "notes.pdf",
+                        "content_type": "application/pdf",
+                        "size_bytes": 1,
+                    }
+                ),
+            ),
+        )
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(session_id=session_id, messages=[attachment_only])
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+
+        assert len(_memory_envelopes(provider.requests[1].messages[0])) == 1
+        first, second = (
+            await sessions.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+        ).items
+        assert second.receipt_ids == ()
+        assert second.carried_receipt_ids == first.receipt_ids
+        assert second.interaction_id != first.interaction_id
+        assert await sessions.load_recall_item_exposures(session_id, second.exposure_id) == ()
+        with pytest.raises(ValueError, match="both linked and carried"):
+            ContextExposure.model_validate(
+                {
+                    **second.model_dump(mode="python"),
+                    "receipt_ids": first.receipt_ids,
+                }
+            )
+
+    asyncio.run(run())
+
+
+def test_final_request_requires_carried_manifests_on_their_recorded_messages() -> None:
+    def envelope(label: str) -> str:
+        return (
+            f'<cayu_automatic_memory version="2">\n{{"notice":"{label}"}}\n</cayu_automatic_memory>'
+        )
+
+    first, second = envelope("first"), envelope("second")
+
+    def manifest(text: str) -> CarriedMemoryReference:
+        return CarriedMemoryReference(
+            receipt_id=f"receipt-{text[-40:-26]}",
+            receipt_document_sha256="a" * 64,
+            receipt_manifest_binding_hmac_sha256="b" * 64,
+            carried_receipt_binding_hmac_sha256="c" * 64,
+            manifest_sha256=sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+    carried = (
+        CarriedMemoryPlacement(context_user_ordinal=0, manifests=(manifest(first),)),
+        CarriedMemoryPlacement(context_user_ordinal=1, manifests=(manifest(second),)),
+    )
+
+    def request(*messages: Message) -> ModelRequest:
+        return ModelRequest(model="fake-model", messages=list(messages))
+
+    def user(*texts: str) -> Message:
+        return Message(role="user", content=tuple(TextPart(text=text) for text in texts))
+
+    exact = request(user(first, "One."), Message.text("assistant", "Ok."), user(second, "Two."))
+    assert _request_includes_exact_memory_manifests(exact, (), carried=carried) == ()
+
+    for changed in (
+        # Swapped onto each other's messages.
+        request(user(second, "One."), user(first, "Two.")),
+        # Duplicated onto another user message.
+        request(user(first, "One."), user(second, "Two."), user(first, "Three.")),
+        # Moved off its message.
+        request(user("One."), user(second, "Two."), user(first, "Three.")),
+        # Placed after the message's own text.
+        request(user("One.", first), user(second, "Two.")),
+    ):
+        with pytest.raises(RuntimeError, match="memory (changed|moved)"):
+            _request_includes_exact_memory_manifests(changed, (), carried=carried)
+
+
+async def _second_interaction(
+    policy: AutomaticRecallContextPolicy,
+    *,
+    sessions: _CountingSessionStore,
+    knowledge: KnowledgeStore,
+    session: Any,
+    messages: list[Message],
+    checkpoint: dict[str, Any] | None,
+    access_scope: KnowledgeAccessScope | None = None,
+    **request_updates: Any,
+):
+    request = _request(
+        sessions=sessions,
+        knowledge=knowledge,
+        session=session,
+        messages=[*messages, Message.text("user", "Who approved the Atlas release?")],
+        step=2,
+        interaction_id="interaction-two",
+    )
+    updates = dict(request_updates)
+    if access_scope is not None:
+        updates["knowledge_access_scope"] = access_scope
+    if updates:
+        request = request.model_copy(update=updates)
+    return await policy.build_with_checkpoint(request, checkpoint=checkpoint)
+
+
+@pytest.mark.parametrize("revocation", ["hard_delete", "tombstone", "superseded"])
+def test_retained_recall_is_not_resent_after_its_knowledge_is_revoked(revocation: str) -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = _policy()
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await _record_dispatch(sessions, first.checkpoint)
+        current = await knowledge.get_entry("atlas-release")
+        assert current is not None
+        if revocation == "hard_delete":
+            await knowledge.delete_entry("atlas-release", expected_revision=1, hard=True)
+        elif revocation == "tombstone":
+            await knowledge.delete_entry("atlas-release", expected_revision=1)
+        else:
+            await knowledge.append_entry_revision(
+                current.model_copy(update={"revision": 2, "text": "Atlas moved to Monday."}),
+                expected_revision=1,
+            )
+
+        second = await _second_interaction(
+            policy,
+            sessions=sessions,
+            knowledge=knowledge,
+            session=session,
+            messages=messages,
+            checkpoint=first.checkpoint,
+        )
+
+        assert second.checkpoint is not None
+        assert second.checkpoint["automatic_recall_history"]["retained_placements"] == []
+        assert _memory_envelopes(second.messages[1]) == []
+
+    asyncio.run(run())
+
+
+def test_retained_recall_is_not_resent_outside_the_current_access_scope() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        knowledge = InMemoryKnowledgeStore()
+        open_scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-release",
+                namespace="project:cayu",
+                text="Atlas release evidence says Friday.",
+            ),
+            access_scope=open_scope,
+        )
+        session = await sessions.create(
+            RunRequest(agent_name="assistant", session_id="automatic-recall-scope", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        messages = [Message.text("user", "When is the Atlas release?")]
+        await sessions.append_transcript_messages(
+            session.id, messages, interaction_id="interaction-one"
+        )
+        policy = _policy()
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions, knowledge=knowledge, session=session, messages=messages
+            ).model_copy(update={"knowledge_access_scope": open_scope}),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        assert len(_memory_envelopes(first.messages[0])) == 1
+        await _record_dispatch(sessions, first.checkpoint)
+
+        restricted = KnowledgeAccessScope(
+            allowed_namespaces=["project:cayu"],
+            required_labels={"team": "release"},
+        )
+        second = await _second_interaction(
+            policy,
+            sessions=sessions,
+            knowledge=knowledge,
+            session=session,
+            messages=messages,
+            checkpoint=first.checkpoint,
+            access_scope=restricted,
+        )
+
+        assert second.checkpoint is not None
+        assert second.checkpoint["automatic_recall_history"]["retained_placements"] == []
+        assert _memory_envelopes(second.messages[0]) == []
+
+    asyncio.run(run())
+
+
+def test_retained_recall_requires_a_dispatched_request() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = _policy()
+        # The recall frame is checkpointed, but its request never reaches dispatch.
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        second = await _second_interaction(
+            policy,
+            sessions=sessions,
+            knowledge=knowledge,
+            session=session,
+            messages=messages,
+            checkpoint=first.checkpoint,
+        )
+
+        assert second.checkpoint is not None
+        assert second.checkpoint["automatic_recall_history"]["retained_placements"] == []
+        assert _memory_envelopes(second.messages[1]) == []
+
+    asyncio.run(run())
+
+
+class _RecordingContextPolicy(ContextPolicy):
+    def __init__(self) -> None:
+        self.requests: list[ContextRequest] = []
+
+    async def build(self, request: ContextRequest) -> list[Message]:
+        self.requests.append(request)
+        # Ask for counts and cache prefixes of the full context and of a
+        # candidate that drops the first turn, as a compacting policy would.
+        for candidate in (request.messages, request.messages[2:]):
+            if request.count_input_tokens is not None:
+                await request.count_input_tokens(candidate)
+            if request.build_cache_prefix_request is not None:
+                await request.build_cache_prefix_request(candidate)
+        return [copy_message(message) for message in request.messages]
+
+
+def test_wrapped_policy_budgets_for_memory_only_while_its_anchor_survives() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        base = _RecordingContextPolicy()
+        policy = _policy(base)
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await _record_dispatch(sessions, first.checkpoint)
+        [sent] = _memory_envelopes(first.messages[1])
+
+        second = await _second_interaction(
+            policy,
+            sessions=sessions,
+            knowledge=knowledge,
+            session=session,
+            messages=messages,
+            checkpoint=first.checkpoint,
+        )
+        policy_request = base.requests[-1]
+        [current] = _memory_envelopes(second.messages[-1])
+        project = policy_request.place_runtime_context
+        assert project is not None
+        estimator = ObservedDeltaContextEstimator()
+
+        def bare_estimate(candidate: list[Message]) -> int:
+            return estimator.estimate_full_request(
+                usage=ContextUsageState(), messages=candidate
+            ).estimated_message_input_tokens
+
+        def estimate(candidate: list[Message]) -> int:
+            return _estimate_model_facing_context_pressure(
+                request=policy_request, messages=candidate
+            ).estimated_message_input_tokens
+
+        full = policy_request.messages
+        assert project(full) == second.messages
+        assert estimate(full) == bare_estimate(second.messages)
+        assert _memory_envelopes(second.messages[1]) == [sent]
+        # A projection without the first turn no longer carries its memory.
+        assert _memory_envelopes(project(full[2:])[0]) == [current]
+        assert estimate(full[2:]) == bare_estimate([second.messages[-1]])
+
+        usage = ContextUsageState(
+            last_input_tokens=1_234,
+            input_coverage=context_input_coverage(first.messages, transcript_cursor=len(messages)),
+        )
+        observed = _estimate_model_facing_context_pressure(
+            request=policy_request.model_copy(update={"context_usage": usage}),
+            messages=full,
+        )
+        assert observed.method == "observed_plus_estimated_delta_with_overhead"
+        assert observed.estimated_context_input_tokens == 1_234 + bare_estimate(second.messages[2:])
+
+        recovered = await _second_interaction(
+            policy,
+            sessions=sessions,
+            knowledge=knowledge,
+            session=session,
+            messages=messages,
+            checkpoint=second.checkpoint,
+            force_bounded_compaction=True,
+        )
+        project = base.requests[-1].place_runtime_context
+        assert project is not None
+        assert project(full) == recovered.messages
+        assert recovered.checkpoint is not None
+        assert recovered.checkpoint["automatic_recall_history"]["retained_placements"] == []
+        assert _memory_envelopes(recovered.messages[1]) == []
+        # Removing retained memory invalidates the previous provider usage anchor.
+        recovered_estimate = _estimate_model_facing_context_pressure(
+            request=base.requests[-1].model_copy(update={"context_usage": usage}),
+            messages=full,
+        )
+        assert recovered_estimate.method == "local_full_request_estimate"
+        assert recovered_estimate.estimated_context_input_tokens == bare_estimate(
+            recovered.messages
+        )
+
+    asyncio.run(run())
+
+
+def test_placement_hook_follows_dispatch_rules_for_repeated_user_messages() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        base = _RecordingContextPolicy()
+        policy = _policy(base)
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await _record_dispatch(sessions, first.checkpoint)
+
+        # The same question again: the new frame's anchor is ambiguous, so its
+        # memory is suppressed, and the earlier memory stays on the first copy.
+        repeated = [*messages, Message.text("assistant", "Friday."), messages[-1]]
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=repeated,
+                step=2,
+                interaction_id="interaction-two",
+            ),
+            checkpoint=first.checkpoint,
+        )
+        place = base.requests[-1].place_runtime_context
+        assert place is not None
+        assert place(base.requests[-1].messages) == second.messages
+        assert [len(_memory_envelopes(message)) for message in second.messages] == [0, 1, 0, 0]
+
+    asyncio.run(run())
+
+
+def test_wrapped_policy_counts_and_cache_prefixes_see_placed_memory() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        base = _RecordingContextPolicy()
+        policy = _policy(base)
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await _record_dispatch(sessions, first.checkpoint)
+        counted: list[list[Message]] = []
+        prefixes: list[list[Message]] = []
+
+        async def count(candidate: list[Message]) -> int:
+            counted.append(candidate)
+            return 1
+
+        async def prefix(candidate: list[Message]) -> ModelRequest:
+            prefixes.append(candidate)
+            return ModelRequest(model="fake-model", messages=candidate)
+
+        second = await _second_interaction(
+            policy,
+            sessions=sessions,
+            knowledge=knowledge,
+            session=session,
+            messages=messages,
+            checkpoint=first.checkpoint,
+            count_input_tokens=count,
+            build_cache_prefix_request=prefix,
+        )
+
+        # The full candidate is counted exactly as it is sent; the shorter one
+        # keeps only the memory whose anchor it still contains.
+        assert counted[0] == second.messages
+        assert prefixes[0] == second.messages
+        assert [len(_memory_envelopes(message)) for message in counted[1]] == [1]
+        assert counted[1] == prefixes[1]
+
+    asyncio.run(run())
+
+
+class _CountingRecallProvider(ScriptedModelProvider):
+    """Counts requests the same way for verification and for dispatch."""
+
+    def __init__(self, events) -> None:
+        super().__init__(events)
+        self.counted: list[int] = []
+
+    @staticmethod
+    def tokens(request: ModelRequest) -> int:
+        return (
+            len(json.dumps([message.model_dump(mode="json") for message in request.messages])) // 4
+        )
+
+    async def count_input_tokens(self, request: ModelRequest) -> InputTokenCountResult:
+        self.counted.append(self.tokens(request))
+        return InputTokenCountResult(
+            input_tokens=self.tokens(request),
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+        )
+
+
+async def _run_budgeted_recall_session(
+    questions: list[str],
+    *,
+    detail_repeats: int = 60,
+    wrapped_policy: ContextPolicy | None = None,
+) -> _CountingRecallProvider:
+    """Run one session under a 1,000-token compaction trigger."""
+
+    sessions = _CountingSessionStore()
+    knowledge = _CountingKnowledgeStore(
+        access_scope=KnowledgeAccessScope.for_namespace("project:cayu")
+    )
+    await knowledge.create_entry(
+        KnowledgeEntry(
+            id="atlas-budget",
+            namespace="project:cayu",
+            text="Atlas release evidence says Friday. " + "Atlas detail. " * detail_repeats,
+        )
+    )
+    provider = _CountingRecallProvider(
+        [
+            [
+                ModelStreamEvent.text_delta(f"Answer {index}."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+            for index in range(len(questions))
+        ]
+    )
+    app = CayuApp(
+        session_store=sessions,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="test-memory-key",
+            fingerprint_key="automatic-recall-test-key-material",
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=_policy(
+            wrapped_policy
+            or UsageTriggeredContextPolicy(
+                triggered_policy=RecentTurnsContextPolicy(max_user_turns=1),
+                trigger_estimated_context_tokens=1_000,
+                verify_estimate_with_provider_count=True,
+                provider_count_min_delta_tokens=1,
+            )
+        ),
+    )
+    session_id = "automatic-recall-budget"
+    for index, question in enumerate(questions):
+        stream = (
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", question)],
+                )
+            )
+            if index == 0
+            else app.resume(
+                ResumeRequest(session_id=session_id, messages=[Message.text("user", question)])
+            )
+        )
+        events = [event async for event in stream]
+        assert events[-1].type is EventType.SESSION_COMPLETED, (index, events[-1].payload)
+    return provider
+
+
+def test_runtime_compaction_budgets_for_retained_recall_across_turns() -> None:
+    async def run() -> None:
+        provider = await _run_budgeted_recall_session(
+            [f"Atlas question {index}?" for index in range(6)]
+        )
+        dispatched = [provider.tokens(request) for request in provider.requests]
+        envelopes = [
+            sum(len(_memory_envelopes(message)) for message in request.messages)
+            for request in provider.requests
+        ]
+        # Turn two carries turn one's memory, and the provider count sees it.
+        assert envelopes[:2] == [1, 2]
+        assert provider.counted[:2] == dispatched[:2]
+        # Turn three's count crosses the trigger, so the policy compacts; the
+        # compacted request drops the earlier anchors and their memory.
+        assert provider.counted[2] > 1_000
+        assert envelopes[2:] == [1, 1, 1, 1]
+        assert all(tokens < 1_000 for tokens in dispatched)
+
+    asyncio.run(run())
+
+
+def test_runtime_budget_for_repeated_questions_matches_what_is_sent() -> None:
+    async def run() -> None:
+        # The repeated question makes the new frame's anchor ambiguous, so its
+        # memory is suppressed; the budget must not count it either.
+        provider = await _run_budgeted_recall_session(
+            ["When is the Atlas release?"] * 2,
+            detail_repeats=90,
+            wrapped_policy=CheckpointCompactionContextPolicy(
+                max_user_turns=1,
+                compact_after_estimated_context_tokens=1_000,
+                max_recent_context_tokens=900,
+            ),
+        )
+        assert [
+            sum(len(_memory_envelopes(message)) for message in request.messages)
+            for request in provider.requests
+        ] == [1, 1]
+        assert all(provider.tokens(request) < 1_000 for request in provider.requests)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_bounded_recall_reads_do_not_create_later_batches_after_termination(cancel: bool) -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        created: list[int] = []
+        settled: list[int] = []
+        coroutines = []
+
+        async def read(index: int) -> int:
+            try:
+                if index == 7:
+                    started.set()
+                await release.wait()
+                if index == 0:
+                    raise RuntimeError("recall store unavailable")
+                return index
+            finally:
+                settled.append(index)
+
+        def reads():
+            for index in range(10):
+                created.append(index)
+                coroutine = read(index)
+                coroutines.append(coroutine)
+                yield coroutine
+
+        task = asyncio.create_task(_bounded_gather(reads()))
+        try:
+            await started.wait()
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                release.set()
+                with pytest.raises(ExceptionGroup):
+                    await task
+            assert created == list(range(8))
+            assert sorted(settled) == list(range(8))
+        finally:
+            for coroutine in coroutines:
+                coroutine.close()
 
     asyncio.run(run())

@@ -47,6 +47,7 @@ MAX_RECALL_LOCATOR_TEXT_PARTS = 64
 MAX_RECALL_ITEM_LOCATOR_BYTES = 4_096
 MAX_RECALL_RECEIPT_BYTES = 256_000
 MAX_CONTEXT_EXPOSURE_RECEIPTS = 32
+MAX_CONTEXT_EXPOSURE_CARRIED_RECEIPTS = 256
 MAX_CONTEXT_EXPOSURE_CONTRIBUTORS = 64
 MAX_CONTEXT_EXPOSURE_TRANSITIONS = 16
 MAX_CONTEXT_EXPOSURE_BYTES = 128_000
@@ -789,6 +790,17 @@ class ContextExposure(BaseModel):
     tool_exposure_fingerprint: KeyedEvidenceFingerprint
     request_contract_fingerprint: KeyedEvidenceFingerprint
     receipt_ids: tuple[str, ...] = ()
+    carried_receipt_ids: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
+    """Earlier interactions' receipts whose manifests this attempt sent again.
+
+    Automatic recall keeps an earlier interaction's memory on the user message
+    it was sent with, so later requests carry that exact text. The item-level
+    record of each carried manifest is in the exposure that first sent it;
+    re-anchoring and delta accounting read only ``receipt_ids``.
+    """
     contributor_ids: tuple[str, ...] = ()
     created_at: datetime
     updated_at: datetime
@@ -870,6 +882,15 @@ class ContextExposure(BaseModel):
     def copy_receipt_ids(cls, value: Any) -> tuple[str, ...]:
         return _copy_identity_tuple(value, "receipt_id", MAX_CONTEXT_EXPOSURE_RECEIPTS)
 
+    @field_validator("carried_receipt_ids", mode="before")
+    @classmethod
+    def copy_carried_receipt_ids(cls, value: Any) -> tuple[str, ...]:
+        return _copy_identity_tuple(
+            value,
+            "carried_receipt_id",
+            MAX_CONTEXT_EXPOSURE_CARRIED_RECEIPTS,
+        )
+
     @field_validator("contributor_ids", mode="before")
     @classmethod
     def copy_contributor_ids(cls, value: Any) -> tuple[str, ...]:
@@ -902,6 +923,8 @@ class ContextExposure(BaseModel):
 
     @model_validator(mode="after")
     def validate_exposure(self) -> Self:
+        if not set(self.receipt_ids).isdisjoint(self.carried_receipt_ids):
+            raise ValueError("A receipt cannot be both linked and carried by one exposure.")
         first = self.transitions[0]
         if first.revision != 0 or first.state is not ContextExposureState.PLANNED:
             raise ValueError("A context exposure must begin with revision-zero planned state.")
@@ -1418,6 +1441,22 @@ def validate_context_exposure_receipt_scope(
         raise ValueError("Context exposure and linked receipt must use one evidence-key identity.")
     if receipt.created_at > exposure.created_at:
         raise ValueError("Context exposure cannot predate its linked recall receipt.")
+
+
+def validate_context_exposure_carried_receipt_scope(
+    exposure: ContextExposure,
+    receipt: RecallReceipt,
+) -> None:
+    """Require a carried receipt to come from an earlier interaction of the session."""
+
+    if receipt.session_id != exposure.session_id:
+        raise ValueError("Context exposure carried receipt belongs to another session.")
+    if receipt.interaction_id == exposure.interaction_id:
+        raise ValueError("A receipt of the exposing interaction must be linked, not carried.")
+    if receipt.situation_fingerprint.key_id != exposure.composition_fingerprint.key_id:
+        raise ValueError("Context exposure and carried receipt must use one evidence-key identity.")
+    if receipt.created_at > exposure.created_at:
+        raise ValueError("Context exposure cannot predate its carried recall receipt.")
 
 
 def copy_recall_receipt(receipt: RecallReceipt) -> RecallReceipt:

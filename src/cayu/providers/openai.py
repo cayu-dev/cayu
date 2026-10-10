@@ -114,6 +114,7 @@ from cayu.providers._system_messages import (
     placed_conversation_messages,
 )
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
+from cayu.providers._tool_schemas import float_number_bounds
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
     MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -143,6 +144,7 @@ from cayu.providers.base import (
     _preflight_provider_portable_messages,
     _terminal_preserving_provider_stream,
     call_tool_core_callable,
+    callable_tool_names,
     privacy_safe_provider_option_projection,
     targeted_tool_native_cache_anchor_name,
 )
@@ -6044,9 +6046,21 @@ def _effective_openai_request_options_for_request(
         raise TypeError("request must be a ModelRequest.")
     effective = _effective_openai_request_options(request.options, model=request.model)
     anchor_name = targeted_tool_native_cache_anchor_name(request.options)
+    callable_names = callable_tool_names(request.options)
     if anchor_name is None:
         if request.targeted_tool_projection is not None:
             raise ValueError("OpenAI additional_tools projection requires a stable cache anchor.")
+        if callable_names is None:
+            return effective
+        if request.tool_discovery_projection is not None:
+            raise ValueError("OpenAI callable_tool_names cannot be combined with tool discovery.")
+        # The tools array stays the stable catalogue; allowed_tools carries the
+        # step's exposure without changing the cached prompt prefix.
+        configured = effective.pop("tool_choice", None)
+        effective["tool_choice"] = _openai_native_tool_choice(
+            configured,
+            available=_openai_native_allowed_tool_selectors(request, cache_anchor_name=None),
+        )
         return effective
 
     anchor_matches = [tool for tool in request.tools if tool.get("name") == anchor_name]
@@ -6069,12 +6083,19 @@ def _effective_openai_request_options_for_request(
 def _openai_native_allowed_tool_selectors(
     request: ModelRequest,
     *,
-    cache_anchor_name: str,
+    cache_anchor_name: str | None,
 ) -> tuple[dict[str, str], ...]:
     selectors: list[dict[str, str]] = []
     callable_anchor = call_tool_core_callable(request.options)
+    callable_names = callable_tool_names(request.options)
+    if callable_names is not None:
+        direct_names = {_openai_tool_name(tool) for tool in request.tools}
+        if any(name not in direct_names for name in callable_names):
+            raise ValueError("OpenAI callable_tool_names contains a tool absent from the request.")
     for tool in request.tools:
         selector = _openai_function_tool_selector(tool)
+        if callable_names is not None and selector["name"] not in callable_names:
+            continue
         if (
             request.tool_discovery_projection is not None
             and selector["name"] == _CAYU_SEARCH_TOOLS_NAME
@@ -7441,7 +7462,7 @@ def _openai_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
         "type": "function",
         "name": name,
         "description": description,
-        "parameters": copy_json_value(input_schema, "input_schema"),
+        "parameters": float_number_bounds(copy_json_value(input_schema, "input_schema")),
         "strict": False,
     }
 

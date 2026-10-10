@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Three fixes keep provider prompt-cache prefixes stable across calls.
+  Automatic recall no longer removes an earlier interaction's memory block from
+  the user message it was sent with, as long as that memory was dispatched and its
+  knowledge is still current and visible in the request's access scope; it is
+  rechecked at every new interaction, and dropped on forced compaction. The wrapped
+  context policy measures that memory through the new
+  `ContextRequest.place_runtime_context` hook, which places it on each candidate as
+  the final request will; its estimates, provider counts and cache-prefix requests
+  include it. The placements are kept under a new `automatic_recall_history`
+  checkpoint root, and `AutomaticRecallContextPolicy(retain_earlier_recall=False)`
+  restores the old behavior. Each `ContextExposure` lists the earlier receipts whose
+  memory the attempt sent again in a new `carried_receipt_ids` field, also projected
+  as `MemoryContextExposureAttribution.carried_receipt_aliases`.
+  `register_agent(..., tool_exposure_mode="stable_catalogue")` sends the session's
+  whole tool catalogue on every step and passes the exposed subset as the
+  `callable_tool_names` request option, which OpenAI Responses sends as an
+  `allowed_tools` tool choice; other providers see the full catalogue and the
+  runtime still blocks calls outside the exposure. The OpenAI Responses and Chat
+  Completions adapters send `number` schema bounds as floats, so `100.0` no longer
+  reaches OpenAI as `100`. The late-system-message caching example gains a
+  `recall_exposure` variant.
 - `cayu cloud deploy`, `cayu cloud deployment retry` and `cayu cloud rollback` take
   Cayu Cloud's choice for the serving release's unfinished sessions:
   `--session-policy {wait,block,proceed}`, `--session-wait-seconds N` (60 to 3,600)

@@ -117,6 +117,7 @@ from cayu.tools.exposure import StaticToolExposurePolicy as StaticToolExposurePo
 from cayu.tools.exposure import ToolCapabilityCeiling as ToolCapabilityCeiling
 from cayu.tools.exposure import ToolExposure as ToolExposure
 from cayu.tools.exposure import ToolExposureDecision as ToolExposureDecision
+from cayu.tools.exposure import ToolExposureMode as ToolExposureMode
 from cayu.tools.exposure import ToolExposurePolicy as ToolExposurePolicy
 from cayu.tools.exposure import ToolExposurePolicyRequest as ToolExposurePolicyRequest
 from cayu.tools.exposure import copy_resolved_tool_exposure as copy_resolved_tool_exposure

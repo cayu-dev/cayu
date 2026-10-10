@@ -732,6 +732,7 @@ from cayu.tools.discovery import (
     tool_discovery_view_inspection,
 )
 from cayu.tools.exposure import (
+    ToolExposureMode,
     ToolExposurePolicy,
     tool_capability_ceiling_from_session_metadata,
 )
@@ -5645,6 +5646,7 @@ class CayuApp:
         context_overflow_policy: ContextPolicy | None = None,
         child_session_context: ChildSessionContextContributor | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
+        tool_exposure_mode: ToolExposureMode | str | None = None,
         targeted_tool_mode: TargetedToolMode | str | None = None,
         tool_discovery_mode: ToolDiscoveryMode | str | None = None,
         tool_policy: ToolPolicy | None = None,
@@ -5665,6 +5667,7 @@ class CayuApp:
             context_overflow_policy=context_overflow_policy,
             child_session_context=child_session_context,
             tool_exposure_policy=tool_exposure_policy,
+            tool_exposure_mode=tool_exposure_mode,
             targeted_tool_mode=targeted_tool_mode,
             tool_discovery_mode=tool_discovery_mode,
             tool_policy=tool_policy,

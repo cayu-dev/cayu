@@ -61,7 +61,9 @@ from cayu.tools.exposure import (
     RegisteredToolCapability,
     ResolvedToolExposure,
     StaticToolExposurePolicy,
+    ToolExposureMode,
     ToolExposurePolicy,
+    copy_tool_exposure_mode,
 )
 from cayu.tools.policy import AllowAllToolPolicy, ToolPolicy
 from cayu.tools.targeted_projection import TargetedToolMode, copy_targeted_tool_mode
@@ -180,6 +182,7 @@ class ApplicationAgentRegistry:
         context_overflow_policy: ContextPolicy | None = None,
         child_session_context: ChildSessionContextContributor | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
+        tool_exposure_mode: ToolExposureMode | str | None = None,
         targeted_tool_mode: TargetedToolMode | str | None = None,
         tool_discovery_mode: ToolDiscoveryMode | str | None = None,
         tool_policy: ToolPolicy | None = None,
@@ -255,6 +258,18 @@ class ApplicationAgentRegistry:
         stored_targeted_tool_mode = (
             None if targeted_tool_mode is None else copy_targeted_tool_mode(targeted_tool_mode)
         )
+        stored_tool_exposure_mode = (
+            ToolExposureMode.FILTERED_TOOLS
+            if tool_exposure_mode is None
+            else copy_tool_exposure_mode(tool_exposure_mode)
+        )
+        if stored_tool_exposure_mode is ToolExposureMode.STABLE_CATALOGUE and (
+            stored_targeted_tool_mode is not None or stored_tool_discovery_mode is not None
+        ):
+            raise ValueError(
+                "tool_exposure_mode='stable_catalogue' cannot be combined with "
+                "targeted_tool_mode or tool_discovery_mode."
+            )
         if stored_targeted_tool_mode is not None and (
             not self._session_store.supports_targeted_tool_grants
             or not self._session_store.supports_public_authority_aliases
@@ -445,6 +460,7 @@ class ApplicationAgentRegistry:
             ),
             targeted_tool_mode=stored_targeted_tool_mode,
             tool_discovery_mode=stored_tool_discovery_mode,
+            tool_exposure_mode=stored_tool_exposure_mode,
             hosted_tools=stored_hosted_tools,
             context_policy=stored_context_policy,
             context_policy_execution_profile_identity=(

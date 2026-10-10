@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 
 from examples._advanced_support import ScenarioResult
+from examples.late_system_message_caching.runtime_variant import (
+    RECALL_EXPOSURE_VARIANT,
+    run_recall_exposure_conversation,
+)
 from examples.late_system_message_caching.scenario import (
     HAS_CACHE_AFFINITY_FIELD,
     LIVE_MIN_CACHED_SHARE,
@@ -51,15 +55,30 @@ async def run(root: Path, provider_name: str | None = None) -> ScenarioResult:
             )
             for variant in VARIANTS
         ]
+        runs.append(
+            await run_recall_exposure_conversation(
+                provider,
+                provider_name=selected,
+                model=model,
+                options=_OPTIONS[selected],
+            )
+        )
     finally:
         await provider.aclose()
 
     summary = summarize(runs)
     late = summary["late_system"]
     late_turns = late["turns"][1:]
+    # Anthropic's default markers first write turn 1's notes on turn 2.
+    runtime_turns = [
+        turn for turn in summary[RECALL_EXPOSURE_VARIANT]["turns"] if turn["turn"] >= 3
+    ]
     assertions = {
         "late_system_turns_2_plus_read_most_input_from_cache": all(
             turn["cached_share"] >= LIVE_MIN_CACHED_SHARE for turn in late_turns
+        ),
+        "recall_exposure_turns_3_plus_read_most_input_from_cache": all(
+            turn["cached_share"] >= LIVE_MIN_CACHED_SHARE for turn in runtime_turns
         ),
         "every_turn_reported_usage": all(
             turn["input_tokens"] > 0 for run in summary.values() for turn in run["turns"]

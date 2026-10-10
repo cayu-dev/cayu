@@ -21,6 +21,9 @@ def test_deterministic_late_system_caching_is_verified(tmp_path) -> None:
         assert late["turns"][0]["cache_read_tokens"] == 0
         assert late["turns_2_plus_cached_share"] >= 0.9
         assert late["cost_usd"] is not None
+        runtime = written["metrics"]["providers"][provider]["recall_exposure"]
+        assert sorted({turn["turn"] for turn in runtime["turns"]}) == [1, 2, 3, 4, 5, 6]
+        assert runtime["turns_3_plus_cached_share"] >= 0.9
 
 
 def test_live_mode_requires_a_supported_provider_and_key(tmp_path, monkeypatch) -> None:

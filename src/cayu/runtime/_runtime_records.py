@@ -30,6 +30,7 @@ from cayu.tools.base import (
     ToolResult,
 )
 from cayu.tools.discovery import ToolDiscoveryMode
+from cayu.tools.exposure import ToolExposureMode
 from cayu.tools.grants import (
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     RejectedTargetedToolInvocation,
@@ -90,6 +91,7 @@ class RegisteredAgentState:
     registration_source: str | None = None
     registration_symbol: str | None = None
     child_session_context_contributor: ChildSessionContextContributor | None = None
+    tool_exposure_mode: ToolExposureMode = ToolExposureMode.FILTERED_TOOLS
 
     def executable_tool(self, name: str) -> RegisteredTool | None:
         """Resolve an application or runtime-owned executable without merging catalogues."""

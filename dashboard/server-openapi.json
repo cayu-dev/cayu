@@ -20659,6 +20659,15 @@
         "additionalProperties": false,
         "description": "Secret-free structural and lifecycle facts from one context exposure.",
         "properties": {
+          "carried_receipt_aliases": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryEvidenceAlias"
+            },
+            "maxItems": 256,
+            "title": "Carried Receipt Aliases",
+            "type": "array"
+          },
           "contributor_count": {
             "maximum": 64.0,
             "minimum": 0.0,
