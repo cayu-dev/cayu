@@ -564,6 +564,7 @@ export type ApiEnvironmentSummary = {
     bound_workspace?: {
         [key: string]: unknown;
     } | null;
+    execution_snapshot_capability?: ExecutionSnapshotCapability | null;
     /**
      * Is Factory
      */
@@ -4855,6 +4856,12 @@ export type EnvironmentManifest = {
      */
     deferred?: boolean;
     /**
+     * Execution Snapshot Capability
+     */
+    execution_snapshot_capability?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Factory Backed
      */
     factory_backed: boolean;
@@ -8938,7 +8945,7 @@ export type EventSideEffectRecoveryLoop = {
 /**
  * EventType
  */
-export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.export.published' | 'session.export.released' | 'session.export.retired' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.auxiliary.attempt_started' | 'model.auxiliary.attempt_settled' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'model.failover.selected' | 'model.failover.exhausted' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'environment.deferred' | 'environment.materialization.started' | 'environment.materialization.completed' | 'environment.materialization.failed' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
+export type EventType = 'workspace.checkpoint.updated' | 'execution.snapshot.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.export.published' | 'session.export.released' | 'session.export.retired' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.auxiliary.attempt_started' | 'model.auxiliary.attempt_settled' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'model.failover.selected' | 'model.failover.exhausted' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'environment.deferred' | 'environment.materialization.started' | 'environment.materialization.completed' | 'environment.materialization.failed' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
 
 /**
  * ExecutionDeadline
@@ -9107,6 +9114,161 @@ export type ExecutionRequirements = {
      * Tool Requirements
      */
     tool_requirements?: Array<ExecutionToolRequirement>;
+};
+
+/**
+ * ExecutionSnapshotCapability
+ */
+export type ExecutionSnapshotCapability = {
+    /**
+     * Adapter
+     */
+    adapter?: string;
+    /**
+     * Adapter Version
+     */
+    adapter_version?: string;
+    /**
+     * Compatibility Sha256
+     */
+    compatibility_sha256?: string | null;
+    fidelity?: ExecutionSnapshotFidelity;
+    /**
+     * Requires Managed Launch
+     */
+    requires_managed_launch?: boolean;
+    /**
+     * Snapshot Format
+     */
+    snapshot_format?: string;
+};
+
+/**
+ * ExecutionSnapshotFidelity
+ */
+export type ExecutionSnapshotFidelity = 'unsupported' | 'filesystem' | 'selected_processes' | 'complete_substrate';
+
+/**
+ * ExecutionSnapshotInspection
+ */
+export type ExecutionSnapshotInspection = {
+    /**
+     * Binding Generation
+     */
+    binding_generation: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name: string;
+    /**
+     * Operations
+     */
+    operations: Array<ExecutionSnapshotOperation>;
+    /**
+     * Snapshots
+     */
+    snapshots: Array<ExecutionSnapshotSummary>;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+};
+
+/**
+ * ExecutionSnapshotOperation
+ */
+export type ExecutionSnapshotOperation = {
+    /**
+     * Allocation Sha256
+     */
+    allocation_sha256: string;
+    /**
+     * Binding Generation
+     */
+    binding_generation: string;
+    /**
+     * Created At
+     */
+    created_at?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind: 'capture' | 'restore' | 'delete';
+    position?: ExecutionSnapshotPosition | null;
+    /**
+     * Request Sha256
+     */
+    request_sha256: string;
+    /**
+     * Run Epoch
+     */
+    run_epoch: number;
+    /**
+     * Snapshot Id
+     */
+    snapshot_id: string;
+    /**
+     * State
+     */
+    state: 'intent' | 'submitted' | 'unknown' | 'verified' | 'succeeded';
+    /**
+     * Target Generation
+     */
+    target_generation?: string | null;
+};
+
+/**
+ * ExecutionSnapshotPosition
+ *
+ * Exact durable controller position, including effects and delivered results.
+ *
+ * Restoration never replaces this checkpoint with older controller state.
+ * An advanced/different checkpoint requires explicit reconciliation instead.
+ */
+export type ExecutionSnapshotPosition = {
+    /**
+     * Checkpoint Sha256
+     */
+    checkpoint_sha256: string;
+    /**
+     * Transcript Cursor
+     */
+    transcript_cursor: number;
+};
+
+/**
+ * ExecutionSnapshotSummary
+ */
+export type ExecutionSnapshotSummary = {
+    capability: ExecutionSnapshotCapability;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Expired
+     */
+    expired: boolean;
+    /**
+     * Expires At
+     */
+    expires_at: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Retention
+     */
+    retention: 'retained' | 'deleting' | 'deleted';
+    /**
+     * Total Bytes
+     */
+    total_bytes: number;
 };
 
 /**
@@ -16309,6 +16471,10 @@ export type SessionQueuedMessage = {
  */
 export type SessionStateResponse = {
     execution: SessionExecutionState;
+    /**
+     * Execution Snapshots
+     */
+    execution_snapshots?: Array<ExecutionSnapshotInspection>;
     /**
      * Interruption Cascade
      */

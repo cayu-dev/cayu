@@ -19,6 +19,7 @@ from cayu.environments.lifecycle import (
     EnvironmentLifecyclePolicy,
     copy_environment_lifecycle_policy,
 )
+from cayu.environments.snapshots import ExecutionSnapshotAdapter, ExecutionSnapshotCapability
 from cayu.mcp.base import McpServerSpec, copy_mcp_server_spec
 from cayu.proxies import CredentialProxy
 from cayu.runners import Runner
@@ -185,6 +186,7 @@ class Environment:
         workspace: Workspace | None = None,
         artifact_store: ArtifactStore | None = None,
         runner: Runner | None = None,
+        execution_snapshot_adapter: ExecutionSnapshotAdapter | None = None,
         vault: Vault | None = None,
         proxy: CredentialProxy | None = None,
         knowledge_store: KnowledgeStore | None = None,
@@ -209,6 +211,15 @@ class Environment:
             require_unicode_scalar_text(artifact_store_id, "artifact_store.id")
         if runner is not None and not isinstance(runner, Runner):
             raise TypeError("runner must be a Runner.")
+        if execution_snapshot_adapter is not None and not isinstance(
+            execution_snapshot_adapter, ExecutionSnapshotAdapter
+        ):
+            raise TypeError("execution_snapshot_adapter must be an ExecutionSnapshotAdapter.")
+        if (
+            execution_snapshot_adapter is not None
+            and getattr(execution_snapshot_adapter, "runner", runner) is not runner
+        ):
+            raise ValueError("Execution snapshot adapter must own this environment's runner.")
         if vault is not None and not isinstance(vault, Vault):
             raise TypeError("vault must be a Vault.")
         if proxy is not None and not isinstance(proxy, CredentialProxy):
@@ -251,6 +262,7 @@ class Environment:
         self.workspace = workspace
         self.artifact_store = artifact_store
         self.runner = runner
+        self.execution_snapshot_adapter = execution_snapshot_adapter
         self.vault = vault
         self.proxy = proxy
         self._knowledge_store = knowledge_store
@@ -263,6 +275,14 @@ class Environment:
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
         self.workspace_instructions = copy_workspace_instructions_input(
             workspace_instructions,
+        )
+
+    @property
+    def execution_snapshot_capability(self) -> ExecutionSnapshotCapability:
+        return (
+            ExecutionSnapshotCapability()
+            if self.execution_snapshot_adapter is None
+            else self.execution_snapshot_adapter.capability
         )
 
     @property
@@ -310,6 +330,11 @@ def copy_environment(environment: Environment) -> Environment:
         workspace=environment.workspace,
         artifact_store=environment.artifact_store,
         runner=environment.runner,
+        **(
+            {"execution_snapshot_adapter": environment.execution_snapshot_adapter}
+            if environment.execution_snapshot_adapter is not None
+            else {}
+        ),
         vault=environment.vault,
         proxy=environment.proxy,
         knowledge_store=environment.knowledge_store,

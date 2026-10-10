@@ -63,3 +63,10 @@ the control relay is configured again at the next admission.
 
 Durable checkpoints need a pin-capable artifact store outside the sandbox:
 `LocalArtifactStore`, or `S3ArtifactStore` with durable pins.
+
+The [execution snapshot substrate investigation](adr/0002-execution-snapshot-substrate.md)
+targets Docker and AWS Lambda MicroVM. Selected-process proofs pass with CRIU
+on Docker and DMTCP on staging AWS. AWS guest CRIU remains blocked by a missing
+syscall. The opt-in [execution snapshot adapter](execution-snapshots.md) now supports an
+unprivileged, explicitly managed process and its owned workspace on both
+maintained runners. Other workloads remain unsupported by default.

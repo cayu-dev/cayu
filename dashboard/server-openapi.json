@@ -975,6 +975,16 @@
             ],
             "title": "Bound Workspace"
           },
+          "execution_snapshot_capability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionSnapshotCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "is_factory": {
             "title": "Is Factory",
             "type": "boolean"
@@ -9727,6 +9737,18 @@
             "title": "Deferred",
             "type": "boolean"
           },
+          "execution_snapshot_capability": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Snapshot Capability"
+          },
           "factory_backed": {
             "title": "Factory Backed",
             "type": "boolean"
@@ -18087,6 +18109,7 @@
       "EventType": {
         "enum": [
           "workspace.checkpoint.updated",
+          "execution.snapshot.updated",
           "server.mutation.accepted",
           "recovery.plan.item.executed",
           "session.started",
@@ -18601,6 +18624,280 @@
           }
         },
         "title": "ExecutionRequirements",
+        "type": "object"
+      },
+      "ExecutionSnapshotCapability": {
+        "additionalProperties": false,
+        "properties": {
+          "adapter": {
+            "default": "unsupported",
+            "title": "Adapter",
+            "type": "string"
+          },
+          "adapter_version": {
+            "default": "1",
+            "title": "Adapter Version",
+            "type": "string"
+          },
+          "compatibility_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compatibility Sha256"
+          },
+          "fidelity": {
+            "$ref": "#/components/schemas/ExecutionSnapshotFidelity",
+            "default": "unsupported"
+          },
+          "requires_managed_launch": {
+            "default": false,
+            "title": "Requires Managed Launch",
+            "type": "boolean"
+          },
+          "snapshot_format": {
+            "default": "none",
+            "title": "Snapshot Format",
+            "type": "string"
+          }
+        },
+        "title": "ExecutionSnapshotCapability",
+        "type": "object"
+      },
+      "ExecutionSnapshotFidelity": {
+        "enum": [
+          "unsupported",
+          "filesystem",
+          "selected_processes",
+          "complete_substrate"
+        ],
+        "title": "ExecutionSnapshotFidelity",
+        "type": "string"
+      },
+      "ExecutionSnapshotInspection": {
+        "additionalProperties": false,
+        "properties": {
+          "binding_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Binding Generation"
+          },
+          "environment_name": {
+            "title": "Environment Name",
+            "type": "string"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionSnapshotOperation"
+            },
+            "maxItems": 100,
+            "title": "Operations",
+            "type": "array"
+          },
+          "snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionSnapshotSummary"
+            },
+            "maxItems": 100,
+            "title": "Snapshots",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "environment_name",
+          "binding_generation",
+          "operations",
+          "snapshots",
+          "truncated"
+        ],
+        "title": "ExecutionSnapshotInspection",
+        "type": "object"
+      },
+      "ExecutionSnapshotOperation": {
+        "additionalProperties": false,
+        "properties": {
+          "allocation_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Allocation Sha256",
+            "type": "string"
+          },
+          "binding_generation": {
+            "title": "Binding Generation",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "id": {
+            "pattern": "^esop_[0-9a-f]{32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "capture",
+              "restore",
+              "delete"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionSnapshotPosition"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "request_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Request Sha256",
+            "type": "string"
+          },
+          "run_epoch": {
+            "minimum": 0.0,
+            "title": "Run Epoch",
+            "type": "integer"
+          },
+          "snapshot_id": {
+            "pattern": "^esnap_[0-9a-f]{32}$",
+            "title": "Snapshot Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "intent",
+              "submitted",
+              "unknown",
+              "verified",
+              "succeeded"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "target_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Generation"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "request_sha256",
+          "run_epoch",
+          "binding_generation",
+          "snapshot_id",
+          "allocation_sha256"
+        ],
+        "title": "ExecutionSnapshotOperation",
+        "type": "object"
+      },
+      "ExecutionSnapshotPosition": {
+        "additionalProperties": false,
+        "description": "Exact durable controller position, including effects and delivered results.\n\nRestoration never replaces this checkpoint with older controller state.\nAn advanced/different checkpoint requires explicit reconciliation instead.",
+        "properties": {
+          "checkpoint_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Checkpoint Sha256",
+            "type": "string"
+          },
+          "transcript_cursor": {
+            "minimum": 0.0,
+            "title": "Transcript Cursor",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "checkpoint_sha256",
+          "transcript_cursor"
+        ],
+        "title": "ExecutionSnapshotPosition",
+        "type": "object"
+      },
+      "ExecutionSnapshotSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "capability": {
+            "$ref": "#/components/schemas/ExecutionSnapshotCapability"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expired": {
+            "title": "Expired",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "retention": {
+            "enum": [
+              "retained",
+              "deleting",
+              "deleted"
+            ],
+            "title": "Retention",
+            "type": "string"
+          },
+          "total_bytes": {
+            "minimum": 1.0,
+            "title": "Total Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "capability",
+          "created_at",
+          "expires_at",
+          "retention",
+          "expired",
+          "total_bytes"
+        ],
+        "title": "ExecutionSnapshotSummary",
         "type": "object"
       },
       "ExecutionToolRequirement": {
@@ -31307,7 +31604,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "48",
+            "default": "49",
             "title": "Contract Version",
             "type": "string"
           },
@@ -32419,6 +32716,14 @@
         "properties": {
           "execution": {
             "$ref": "#/components/schemas/SessionExecutionState"
+          },
+          "execution_snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionSnapshotInspection"
+            },
+            "maxItems": 25,
+            "title": "Execution Snapshots",
+            "type": "array"
           },
           "interruption_cascade": {
             "enum": [
@@ -37646,7 +37951,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "48",
+            "default": "49",
             "title": "Contract Version",
             "type": "string"
           }

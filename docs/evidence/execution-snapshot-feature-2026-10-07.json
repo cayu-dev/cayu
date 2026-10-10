@@ -1,0 +1,52 @@
+{
+  "aws_image_qualification": "Tools installed only in newly owned disposable staging allocations. Product requires dependencies and plugin baked into the pinned image. All workload/capture/restore commands use the agent lane.",
+  "controller": "separate CayuApp processes; SQLiteSessionStore; private LocalArtifactStore; source removed before restoration",
+  "date": "2026-10-07",
+  "dmtcp_version": "4.2.0",
+  "excluded_material": [
+    "memory contents",
+    "fixture memory-only values and hashes",
+    "artifact locations",
+    "credentials",
+    "account and allocation identities",
+    "private image handles"
+  ],
+  "managed_workload": "one cooperative pre-launched Python process with threads, memory, local listener and owned regular files/directories",
+  "qualified_fidelity": "selected_processes",
+  "reports": {
+    "aws": {
+      "agent_uid": 1000,
+      "all_owned_allocations_disposed": true,
+      "backend": "aws",
+      "bytes": 53565440,
+      "capture_seconds": 26.339723791985307,
+      "fidelity": "selected_processes",
+      "fresh_cayu_process_restore": true,
+      "restore_seconds": 29.251908750040457,
+      "same_artifact_restored_twice": true
+    },
+    "docker": {
+      "agent_uid": 1000,
+      "all_owned_allocations_disposed": true,
+      "backend": "docker",
+      "bytes": 57354240,
+      "capture_seconds": 37.78659129200969,
+      "fidelity": "selected_processes",
+      "fresh_cayu_process_restore": true,
+      "restore_seconds": 14.051214166975114,
+      "same_artifact_restored_twice": true
+    }
+  },
+  "source_archive_sha256": "043410566fd7c09f21e0ec485cf72e9481722629ea877650142b7505e0d7f2d2",
+  "source_hash_scope": "Adapter, guest, plugin, typed manifest, image recipe and live fixture sources used in qualification. Host lifecycle and native-store integration additionally validated by the repository conformance and runtime tests.",
+  "source_sha256": {
+    "examples/_execution_snapshot_guest.py": "fceb6d612d24ff30f06eae243b7bbf40e8fcdb487d0d7093f3d696eeb4628b76",
+    "examples/execution_snapshot_dmtcp/Dockerfile": "7fdaf1aa6ba72e141b32a3c0fd867b5cfdba8a00ebca78af6aa3ef5a9c4923f5",
+    "examples/execution_snapshot_dmtcp_live.py": "592777ee447a349f8f75e55c4b7f05139ec28950754b63cf93e2720d1e31bfc1",
+    "src/cayu/environments/_snapshot_barrier.c": "bdcef2f9f2353e7c86cd6f7351450e7234873b019603eb38539c1d60accc5896",
+    "src/cayu/environments/_snapshot_guest.py": "9abccd89edcdbbf368f94c0201899255fdda2ca4b2aed91d9648eadc9e42433c",
+    "src/cayu/environments/dmtcp_snapshots.py": "1416d7191d1e2a89c47735e4f0a57070ee7024fe54e11bb6747f171ee44d49fe",
+    "src/cayu/environments/snapshots.py": "db22a9f3c7775758437b6fdeb96b276ff8cdb1074dde4ca3a5534c6df11bcf89"
+  },
+  "timing_scope": "Single samples. Capture includes engine capture, bounded transfer, private artifact-store verification and durable publication. Restore includes artifact reads/verification, transfer, restart and durable activation. Allocation/image bootstrap excluded. No cross-backend speed or general workload claim."
+}

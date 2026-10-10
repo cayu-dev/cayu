@@ -3229,6 +3229,9 @@ def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
             if record.spec.workspace_checkpoint_policy is None
             else record.spec.workspace_checkpoint_policy.model_dump(mode="json")
         ),
+        "execution_snapshot_capability": environment.execution_snapshot_capability.model_dump(
+            mode="json"
+        ),
         "lifecycle_policy": (
             None
             if record.spec.lifecycle_policy is None
@@ -7321,6 +7324,9 @@ def create_router(
         interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
         provider_operation = await inspect_provider_operation(session_store, session_id)
         execution = await cayu_app.inspect_session_execution(session_id)
+        from cayu.environments.snapshot_lifecycle import inspect_execution_snapshots
+
+        execution_snapshots = await inspect_execution_snapshots(session_store, session_id)
         body = {
             "session_id": cayu_app.project_session_id_for_exposure(state.id),
             "status": state.status,
@@ -7329,6 +7335,7 @@ def create_router(
             "interruption_cascade": interruption_cascade,
             "provider_operation": provider_operation.model_dump(mode="json"),
             "execution": execution.model_dump(mode="json"),
+            "execution_snapshots": [item.model_dump(mode="json") for item in execution_snapshots],
         }
         etag = _session_state_etag(body)
         # `no-cache` lets a browser store the body but revalidate every read,

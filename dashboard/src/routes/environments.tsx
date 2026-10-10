@@ -214,6 +214,15 @@ function EnvironmentDetail({
         <DetailRow label="instructions" value={environment.workspace_instructions ?? "-"} />
         <DetailRow label="mcp servers" value={formatCount(environment.mcp_server_count)} />
         <DetailRow
+          label="execution snapshots"
+          value={
+            <PayloadViewer
+              value={environment.execution_snapshot_capability ?? { fidelity: "unsupported" }}
+              maxHeight="max-h-44"
+            />
+          }
+        />
+        <DetailRow
           label="branch support"
           value={
             <PayloadViewer value={environment.workspace_branch_capabilities} maxHeight="max-h-44" />

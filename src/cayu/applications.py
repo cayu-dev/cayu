@@ -289,6 +289,13 @@ from cayu.egress.transitions import (
 from cayu.environments.admission import ExecutionRequirements
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.factory import EnvironmentFactory
+from cayu.environments.snapshot_lifecycle import ExecutionSnapshots
+from cayu.environments.snapshots import (
+    ExecutionSnapshotError,
+    ExecutionSnapshotOperation,
+    ExecutionSnapshotPolicy,
+    ExecutionSnapshotRecord,
+)
 from cayu.events import (
     Event,
     EventType,
@@ -5748,6 +5755,159 @@ class CayuApp:
     ) -> Environment:
         return self._environment_registry.register(
             environment, default=default, registration_site=_registration_site()
+        )
+
+    def _snapshot_controller(self, snapshot_store, policy):
+        if not isinstance(snapshot_store, ArtifactStore):
+            raise TypeError("snapshot_store must be an ArtifactStore.")
+        if any(
+            record.environment.artifact_store is snapshot_store
+            or (
+                record.environment.artifact_store is not None
+                and record.environment.artifact_store.id == snapshot_store.id
+            )
+            for record in self.list_environment_registrations()
+        ):
+            raise ExecutionSnapshotError(
+                "Memory snapshots require a separate, private artifact store."
+            )
+        return ExecutionSnapshots(
+            self.session_store, snapshot_store, policy=policy, clock=self._clock
+        )
+
+    @_tracked_entrance
+    async def capture_execution_snapshot(
+        self,
+        session_id: str,
+        environment_name: str,
+        *,
+        snapshot_store: ArtifactStore,
+        expected_run_epoch: int,
+        expected_generation: str,
+        idempotency_key: str,
+        policy: ExecutionSnapshotPolicy | None = None,
+    ) -> ExecutionSnapshotRecord:
+        """Capture an idle session's managed workload without rewinding its history."""
+        registered = self.get_environment(environment_name)
+        if registered.binding_generation_id != expected_generation:
+            raise ExecutionSnapshotError("Expected capture binding generation changed.")
+        adapter = registered.environment.execution_snapshot_adapter
+        if adapter is None:
+            raise ExecutionSnapshotError("Environment does not support execution snapshots.")
+        return await self._snapshot_controller(snapshot_store, policy).capture(
+            session_id,
+            environment_name,
+            adapter,
+            expected_run_epoch=expected_run_epoch,
+            expected_generation=expected_generation,
+            idempotency_key=idempotency_key,
+        )
+
+    @_tracked_entrance
+    async def restore_execution_snapshot(
+        self,
+        session_id: str,
+        environment_name: str,
+        snapshot_id: str,
+        *,
+        snapshot_store: ArtifactStore,
+        expected_run_epoch: int,
+        expected_generation: str,
+        idempotency_key: str,
+        policy: ExecutionSnapshotPolicy | None = None,
+    ) -> ExecutionSnapshotOperation:
+        """Restore to this process's fresh registered allocation before exposure."""
+        registered = self.get_environment(environment_name)
+        adapter = registered.environment.execution_snapshot_adapter
+        if adapter is None:
+            raise ExecutionSnapshotError("Environment does not support execution snapshots.")
+        return await self._snapshot_controller(snapshot_store, policy).restore(
+            session_id,
+            environment_name,
+            snapshot_id,
+            adapter,
+            expected_run_epoch=expected_run_epoch,
+            expected_generation=expected_generation,
+            target_generation=registered.binding_generation_id,
+            idempotency_key=idempotency_key,
+        )
+
+    @_tracked_entrance
+    async def delete_execution_snapshot(
+        self,
+        session_id: str,
+        environment_name: str,
+        snapshot_id: str,
+        *,
+        snapshot_store: ArtifactStore,
+        expected_run_epoch: int,
+        expected_generation: str,
+        idempotency_key: str,
+        policy: ExecutionSnapshotPolicy | None = None,
+    ) -> None:
+        """Retire snapshot authority before releasing its private artifact pins."""
+        await self._snapshot_controller(snapshot_store, policy).delete(
+            session_id,
+            environment_name,
+            snapshot_id,
+            expected_run_epoch=expected_run_epoch,
+            expected_generation=expected_generation,
+            idempotency_key=idempotency_key,
+        )
+
+    @_tracked_entrance
+    async def reconcile_execution_snapshot(
+        self,
+        session_id: str,
+        environment_name: str,
+        operation_id: str,
+        *,
+        snapshot_store: ArtifactStore,
+        expected_run_epoch: int,
+        expected_generation: str,
+        idempotency_key: str,
+        policy: ExecutionSnapshotPolicy | None = None,
+    ) -> ExecutionSnapshotOperation:
+        """Fence a crashed owner and prove its already-submitted snapshot operation."""
+        registered = self.get_environment(environment_name)
+        adapter = registered.environment.execution_snapshot_adapter
+        if adapter is None:
+            raise ExecutionSnapshotError("Environment does not support snapshot reconciliation.")
+        return await self._snapshot_controller(snapshot_store, policy).reconcile(
+            session_id,
+            environment_name,
+            operation_id,
+            adapter,
+            expected_run_epoch=expected_run_epoch,
+            expected_generation=expected_generation,
+            target_generation=registered.binding_generation_id,
+            idempotency_key=idempotency_key,
+        )
+
+    @_tracked_entrance
+    async def release_execution_snapshot_binding(
+        self,
+        session_id: str,
+        environment_name: str,
+        *,
+        snapshot_store: ArtifactStore,
+        expected_run_epoch: int,
+        expected_generation: str,
+        policy: ExecutionSnapshotPolicy | None = None,
+    ) -> None:
+        """Expose this process's registered allocation without restoring a snapshot.
+
+        The previously bound workload's process state is abandoned. Retained
+        snapshots stay restorable while their execution position still matches.
+        """
+        registered = self.get_environment(environment_name)
+        await self._snapshot_controller(snapshot_store, policy).release_binding(
+            session_id,
+            environment_name,
+            registered.environment.execution_snapshot_adapter,
+            expected_run_epoch=expected_run_epoch,
+            expected_generation=expected_generation,
+            target_generation=registered.binding_generation_id,
         )
 
     def register_environment_factory(

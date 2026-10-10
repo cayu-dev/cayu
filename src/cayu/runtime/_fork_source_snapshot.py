@@ -45,6 +45,7 @@ _SOURCE_OWNED_CHECKPOINT_KEYS = frozenset(
         "environment_factory_retired_disposals",
         "environment_factory_allocation_generations",
         "session_continuations",
+        "execution_snapshots",
     }
 )
 

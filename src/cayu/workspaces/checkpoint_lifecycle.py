@@ -383,6 +383,9 @@ async def ensure_workspace_checkpoint(
     session: Session,
     registered: RegisteredEnvironment,
 ) -> None:
+    from cayu.environments.snapshot_lifecycle import ensure_execution_snapshot_binding
+
+    await ensure_execution_snapshot_binding(store, session, registered)
     await _bounded_checkpoint_operation(
         registered, lambda: _ensure_workspace_checkpoint(store, session, registered)
     )

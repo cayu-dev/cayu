@@ -11754,6 +11754,22 @@ class SessionStore(ABC):
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         """Load the latest checkpoint for a session."""
 
+    async def load_execution_snapshot_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        """Operator inspection of snapshot metadata only, without other checkpoint roots.
+
+        Custom stores may override this fallback with a native bounded projection.
+        """
+        checkpoint = await self.load_checkpoint(session_id)
+        return (
+            None
+            if checkpoint is None
+            else {
+                key: value
+                for key, value in checkpoint.items()
+                if key in {"checkpoint_schema_version", "execution_snapshots"}
+            }
+        )
+
     @abstractmethod
     async def load_interruption_cascade_marker(
         self,
@@ -23198,6 +23214,22 @@ class InMemorySessionStore(
             if checkpoint is None:
                 return None
             return deepcopy(checkpoint)
+
+    async def load_execution_snapshot_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            checkpoint = self._checkpoints.get(session_id)
+            return (
+                None
+                if checkpoint is None
+                else deepcopy(
+                    {
+                        key: value
+                        for key, value in checkpoint.items()
+                        if key in {"checkpoint_schema_version", "execution_snapshots"}
+                    }
+                )
+            )
 
     async def load_interruption_cascade_marker(
         self,

@@ -1,0 +1,142 @@
+{
+  "aws_lambda_microvm": {
+    "backend": "aws-lambda-microvm",
+    "capture_attempt_s": 1.2002444170066155,
+    "capture_exit_code": 1,
+    "criu_binary_sha256": "736cd012f6a5a0a1c2b2c86e28c94085a51a34b23601a2eacf7bf3f4a09ce67d",
+    "environment": {
+      "architecture": "aarch64",
+      "criu": "Version: 4.2",
+      "kcmp_errno": "ENOSYS",
+      "kcmp_self_result": -1,
+      "kernel": "6.1.166-24.303.amzn2023.aarch64",
+      "packages": "criu-3.17.1-1.amzn2023.0.3.aarch64\ngnutls-3.8.10-4.amzn2023.0.2.aarch64\nglibc-2.34-231.amzn2023.0.4.aarch64\npython3.11-3.11.15-1.amzn2023.0.2.aarch64",
+      "process_status": [
+        "CapEff:\t000001ffffffffff",
+        "NoNewPrivs:\t1",
+        "Seccomp:\t0"
+      ],
+      "uid": 0
+    },
+    "image_configuration": {
+      "additionalOsCapabilities": [
+        "ALL"
+      ],
+      "cpuConfigurations": [
+        {
+          "architecture": "ARM_64"
+        }
+      ],
+      "resources": [
+        {
+          "minimumMemoryInMiB": 2048
+        }
+      ]
+    },
+    "maximum_allocation_duration_s": 600,
+    "partial_capture_unpublished": true,
+    "probe_sha256": "6ba38a642daceac73f3a045e2990b6667e7d084c91d26931e44925f7101a06e1",
+    "qualified": false,
+    "region": "us-east-1",
+    "scoped_cleanup_confirmed": true,
+    "status": "blocked_kcmp_ENOSYS",
+    "total_s": 50.300664749986026
+  },
+  "aws_lambda_microvm_dmtcp": {
+    "backend": "aws-lambda-microvm-dmtcp",
+    "built_in_probe": false,
+    "capture_and_copy_s": 26.367350374988746,
+    "checks": {
+      "completed_action_reused": true,
+      "external_unknown_effect_not_repeated": true,
+      "fresh_controller_memory_and_files_restored": true,
+      "same_artifact_restored_twice": true,
+      "scoped_cleanup_confirmed": true,
+      "source_termination_confirmed": true
+    },
+    "configured_source_archive_sha256": "043410566fd7c09f21e0ec485cf72e9481722629ea877650142b7505e0d7f2d2",
+    "environment": {
+      "architecture": "aarch64",
+      "dmtcp": "dmtcp_launch (DMTCP) 4.2.0\nLicense LGPLv3+: GNU LGPL version 3 or later\n    <http://gnu.org/licenses/lgpl.html>.\nThis program comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it\nunder certain conditions; see COPYING file for details.",
+      "glibc": "glibc-2.34-231.amzn2023.0.4.aarch64",
+      "image_version": "1.0",
+      "kernel": "6.1.166-24.303.amzn2023.aarch64",
+      "runtime_libraries": "libatomic-14.2.1-7.amzn2023.0.2.aarch64\nlibstdc++-14.2.1-7.amzn2023.0.2.aarch64"
+    },
+    "fidelity": "selected-process",
+    "files_bytes": 4194356,
+    "fresh_controller_restore_and_verify_s": 1.6978575420216657,
+    "guest_sha256": "fceb6d612d24ff30f06eae243b7bbf40e8fcdb487d0d7093f3d696eeb4628b76",
+    "probe_sha256": "0ff5409115ec2d0109b32d82cb1af1e5fe1620192d987e8b587dc1e542cc0eef",
+    "process_checkpoint_bytes": 49100413,
+    "quiescence_to_resume_s": 28.1732237500255,
+    "tool_archive_bytes": 1342769,
+    "tool_archive_sha256": "3c1dd2f462be790b1586bd0dfa0e93530297c47f62bf9041257d0c7855ebacaa",
+    "total_s": 186.57691150001483
+  },
+  "docker": {
+    "backend": "docker-criu",
+    "capture_and_private_copy_s": 0.9264786670100875,
+    "checks": {
+      "background_writer_advanced": true,
+      "capture-after-accept_artifact_discovery": true,
+      "capture-after-accept_unpublished": true,
+      "capture-before-submit_artifact_discovery": true,
+      "capture-before-submit_unpublished": true,
+      "completed_action_reused": true,
+      "corruption_rejected_before_allocation": true,
+      "deleted_artifact_restore_refused": true,
+      "external_unknown_effect_not_repeated": true,
+      "files_only_integrity": true,
+      "files_only_process_absent": true,
+      "immutable_snapshot_reusable": true,
+      "memory_files_and_boundary_verified": true,
+      "published_snapshot_integrity": true,
+      "restore-after-accept_allocation_discovery": true,
+      "restore-after-accept_inactive": true,
+      "restore-before-submit_allocation_discovery": true,
+      "restore-before-submit_inactive": true,
+      "scoped_cleanup_confirmed": true,
+      "source_advanced_after_capture": true,
+      "source_allocation_removed": true
+    },
+    "docker_engine_checkpoint": "experimental_disabled",
+    "environment": {
+      "architecture": "aarch64",
+      "criu": "Version: 4.2",
+      "image": "sha256:b71d49cdc91a72dd801f4827cc0daab209d5303b12a608c3b62cb2d784954e30",
+      "kernel": "7.0.14-linuxkit"
+    },
+    "fidelity": "selected-process",
+    "files_only_bytes": 4194356,
+    "files_only_capture_s": 0.3387249580118805,
+    "files_only_restore_and_verify_s": 5.449397000018507,
+    "fresh_controller_restore_and_verify_s": 2.123232875019312,
+    "guest_sha256": "fceb6d612d24ff30f06eae243b7bbf40e8fcdb487d0d7093f3d696eeb4628b76",
+    "probe_sha256": "4cb820249d9cdd03912c846bd17100c271370766feb2a6da3eabc9d6ee1c68c0",
+    "process_checkpoint_bytes": 13723771,
+    "total_s": 20.088998958002776
+  },
+  "limitations": [
+    "trusted synthetic process and bounded fixture files; not a production Cayu snapshot adapter",
+    "Docker proof runs as root with privileged checkpoint control, detached stdio, and no external network",
+    "actual unprivileged agent profile, PTYs, browser state, live external connections, whole container/VM state and cross-host portability remain unqualified",
+    "controller exits at deterministic boundaries are not provider-storage crashes or network partitions",
+    "process image bytes exclude separately copied fixture files; provider/internal writes and exact billing are unmeasured",
+    "single-run Docker timings; agent-visible quiescence duration was not measured separately across injected faults",
+    "all disposable probe allocations/containers terminated; private artifact journals remain local",
+    "AWS CRIU remains blocked at kcmp ENOSYS; DMTCP qualifies only a pre-launched cooperating trusted root process",
+    "DMTCP interruption/fault injection, actual restricted agent processes and durable artifact-store integration remain unqualified",
+    "DMTCP requires a complete memory-image and support-file set, compatible tool/runtime bytes and fresh coordinator"
+  ],
+  "recorded_at_utc": "2026-10-07T08:29:14.825325+00:00",
+  "result": "docker_criu_and_aws_dmtcp_selected_process_proven",
+  "schema": 3,
+  "shared_guest_sha256": "fceb6d612d24ff30f06eae243b7bbf40e8fcdb487d0d7093f3d696eeb4628b76",
+  "source_revision": "8d9ac8be4099ee323bcf6ac15244ea93b34f0ad4",
+  "timing_scopes": {
+    "aws_dmtcp_capture": "capture_and_copy_s includes completion wait and private host transfer; quiescence_to_resume_s includes that transfer",
+    "aws_dmtcp_restore": "fresh_controller_restore_and_verify_s starts after allocation setup and artifact upload; it measures process restart and verification only",
+    "comparability": "Docker and AWS transport, operating system and timing boundaries differ; no cross-backend speed claim"
+  }
+}

@@ -3039,6 +3039,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               )}
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
+            {state?.execution_snapshots && state.execution_snapshots.length > 0 && (
+              <details className="w-full rounded-md border border-border p-3">
+                <summary className="cursor-pointer text-sm">Execution snapshots</summary>
+                <PayloadViewer value={state.execution_snapshots} maxHeight="max-h-64" />
+              </details>
+            )}
             {workflowCapability.enabled && (
               <Link
                 to="/sessions/$sessionId/workflow"

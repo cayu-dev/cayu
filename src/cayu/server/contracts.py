@@ -52,6 +52,7 @@ from cayu.budgets.usage import (
 )
 from cayu.configuration import MAX_STEPS
 from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
+from cayu.environments.snapshots import ExecutionSnapshotCapability, ExecutionSnapshotInspection
 from cayu.evals.calibration import (
     EvalJudgeCalibrationDefinitionV1,
     EvalJudgeCalibrationDraftV1,
@@ -2530,6 +2531,7 @@ class ApiEnvironmentSummary(ApiBaseModel):
     knowledge_store_type: str | None
     mcp_server_count: StrictInt = Field(ge=0)
     workspace_checkpoint_policy: dict[str, Any] | None = None
+    execution_snapshot_capability: ExecutionSnapshotCapability | None = None
     lifecycle_policy: EnvironmentLifecyclePolicy | None
     workspace_instructions: str | None
     bound_workspace: dict[str, Any] | None = None
@@ -2640,6 +2642,9 @@ class SessionStateResponse(ApiBaseModel):
     interruption_cascade: Literal["none", "pending", "failed"]
     provider_operation: ApiProviderOperationInspection
     execution: SessionExecutionState
+    execution_snapshots: list[ExecutionSnapshotInspection] = Field(
+        default_factory=list, max_length=25
+    )
 
 
 class CausalBudgetSummaryResponse(ApiBaseModel):

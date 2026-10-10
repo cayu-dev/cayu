@@ -158,6 +158,20 @@ _WORKSPACE_OBSERVATION_AUTHORITY_MUTATION_ALLOWED: ContextVar[bool] = ContextVar
     default=False,
 )
 
+_EXECUTION_SNAPSHOT_AUTHORITY_MUTATION_ALLOWED: ContextVar[bool] = ContextVar(
+    "cayu_execution_snapshot_authority_mutation_allowed", default=False
+)
+
+
+@contextmanager
+def _execution_snapshot_authority_mutation_scope():
+    """Allow the snapshot owner to compare full state and mutate only its root."""
+    token = _EXECUTION_SNAPSHOT_AUTHORITY_MUTATION_ALLOWED.set(True)
+    try:
+        yield
+    finally:
+        _EXECUTION_SNAPSHOT_AUTHORITY_MUTATION_ALLOWED.reset(token)
+
 
 @contextmanager
 def _invocation_lifecycle_authority_mutation_scope():
@@ -229,6 +243,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
         authoritative_current = decode_runtime_checkpoint(current, session_id=session_id)
     lifecycle_mutation_allowed = _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get()
     workspace_mutation_allowed = _WORKSPACE_OBSERVATION_AUTHORITY_MUTATION_ALLOWED.get()
+    snapshot_mutation_allowed = _EXECUTION_SNAPSHOT_AUTHORITY_MUTATION_ALLOWED.get()
     if decoded_replacement:
         # The runtime adapter owns this freshly decoded result. Projection below
         # still enforces private-root authority and the final document ceiling.
@@ -250,6 +265,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
                 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
                 BROWSER_CONTROLS_CHECKPOINT_KEY,
                 MODEL_FAILOVER_CHECKPOINT_KEY,
+                "execution_snapshots",
             )
         )
     ):
@@ -302,6 +318,13 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
                 authoritative_current[WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY],
                 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
             )
+    if not snapshot_mutation_allowed:
+        updated.pop("execution_snapshots", None)
+        if authoritative_current is not None and "execution_snapshots" in authoritative_current:
+            updated["execution_snapshots"] = copy_durable_json_object(
+                authoritative_current["execution_snapshots"], "execution_snapshots"
+            )
+            updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
     if not lifecycle_mutation_allowed:
         preserved_lifecycle_authority = False
         for authority_key in (
@@ -351,6 +374,12 @@ def _copy_checkpoint_for_transform(
 
     if checkpoint is None:
         return None
+    if _EXECUTION_SNAPSHOT_AUTHORITY_MUTATION_ALLOWED.get():
+        # Exact controller-position comparison includes all private domain
+        # roots. Their independent projectors still preserve mutation authority.
+        return (
+            deepcopy(checkpoint) if decoded else copy_durable_json_object(checkpoint, "checkpoint")
+        )
     lifecycle_authority_allowed = (
         _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get()
         or _INVOCATION_LIFECYCLE_AUTHORITY_READ_ALLOWED.get()
@@ -384,6 +413,8 @@ def _copy_checkpoint_for_transform(
         copied.pop(continuations.ROOT_KEY, None)
     if not producers.checkpoint_visible(session_id=session_id) and not lifecycle_authority_allowed:
         copied.pop(producers.ROOT_KEY, None)
+    if not lifecycle_authority_allowed:
+        copied.pop("execution_snapshots", None)
     return deepcopy(copied) if decoded else copied
 
 

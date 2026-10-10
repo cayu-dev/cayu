@@ -20534,6 +20534,20 @@ class SessionEngine:
             loaded_session.environment_name
         )
 
+        from cayu.environments.snapshot_lifecycle import (
+            _registry as execution_snapshot_registry,
+        )
+        from cayu.environments.snapshot_lifecycle import (
+            _require_execution_snapshot_binding,
+            ensure_execution_snapshot_binding,
+        )
+
+        if registered_environment is not None:
+            # Reject before resume mutates controller position or appends input.
+            await ensure_execution_snapshot_binding(
+                self.session_store, loaded_session, registered_environment
+            )
+
         def current_resume_profile(
             max_steps: int,
             candidate_provider: runtime_records.RegisteredProvider,
@@ -21607,6 +21621,12 @@ class SessionEngine:
             checkpoint
         )
         require_foreground_checkpoint(loaded_session, checkpoint)
+        if registered_environment is not None:
+            # Admission below binds this checkpoint digest, closing the race
+            # with a snapshot reservation after the initial read-only check.
+            _require_execution_snapshot_binding(
+                execution_snapshot_registry(checkpoint), registered_environment
+            )
         claimed_checkpoint = claim_resumable_checkpoint(loaded_session, checkpoint)
         if required_foreground_terminal is not None and required_foreground_continuation is None:
             existing_terminal = claimed_checkpoint.get(FOREGROUND_CHILD_TERMINAL_KEY)

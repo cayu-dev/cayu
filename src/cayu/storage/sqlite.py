@@ -17172,6 +17172,27 @@ class SQLiteSessionStore(
             return None
         return await asyncio.to_thread(_checkpoint_from_json, value)
 
+    async def load_execution_snapshot_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection):
+            row = connection.execute(
+                "SELECT json_extract(state_json, '$.checkpoint_schema_version') AS version, "
+                "json_extract(state_json, '$.execution_snapshots') AS snapshots "
+                "FROM cayu_checkpoints WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            projection = {}
+            if row["version"] is not None:
+                projection["checkpoint_schema_version"] = row["version"]
+            if row["snapshots"] is not None:
+                projection["execution_snapshots"] = json.loads(row["snapshots"])
+            return projection
+
+        return await self._run_read(query)
+
     async def load_interruption_cascade_marker(
         self,
         session_id: str,

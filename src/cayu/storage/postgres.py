@@ -16457,6 +16457,25 @@ class PostgresSessionStore(
                 access_bounds.require_action(await self._load(cur, session_id), "inspect_state")
             return await self._load_checkpoint(cur, session_id)
 
+    async def load_execution_snapshot_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT state -> 'checkpoint_schema_version', state -> 'execution_snapshots' "
+                "FROM cayu_checkpoints WHERE session_id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            projection = {}
+            if row[0] is not None:
+                projection["checkpoint_schema_version"] = row[0]
+            if row[1] is not None:
+                projection["execution_snapshots"] = row[1]
+            return projection
+
     async def load_interruption_cascade_marker(
         self,
         session_id: str,

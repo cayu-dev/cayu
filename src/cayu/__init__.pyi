@@ -6674,6 +6674,7 @@ __all__ = [
     "DispatchRuntime",
     "DispatchStatus",
     "Dispatcher",
+    "DmtcpExecutionSnapshotAdapter",
     "DockerCloseAction",
     "DockerCodingAdmissionProbe",
     "DockerCodingCommandAuthority",
@@ -6979,6 +6980,20 @@ __all__ = [
     "ExecutionProfilePolicyResult",
     "ExecutionProfileRejectionResult",
     "ExecutionRequirements",
+    "ExecutionSnapshotAdapter",
+    "ExecutionSnapshotArtifact",
+    "ExecutionSnapshotCapability",
+    "ExecutionSnapshotConflict",
+    "ExecutionSnapshotError",
+    "ExecutionSnapshotFidelity",
+    "ExecutionSnapshotInspection",
+    "ExecutionSnapshotOperation",
+    "ExecutionSnapshotOutcomeUnknown",
+    "ExecutionSnapshotPolicy",
+    "ExecutionSnapshotPosition",
+    "ExecutionSnapshotRecord",
+    "ExecutionSnapshotSummary",
+    "ExecutionSnapshots",
     "ExecutionToolRequirement",
     "ExecutionToolRequirementEvidence",
     "ExportLimits",
@@ -8952,6 +8967,7 @@ __all__ = [
     "inspect_eval_corpus",
     "inspect_eval_scenario",
     "inspect_eval_sessions",
+    "inspect_execution_snapshots",
     "inspect_local_immutable_input",
     "inspect_process_eval_run",
     "interrupted_task_handoff_request",
@@ -9127,3 +9143,26 @@ __all__ = [
     "write_html_report",
     "write_trajectory_json",
 ]
+
+from cayu.environments.dmtcp_snapshots import (
+    DmtcpExecutionSnapshotAdapter as DmtcpExecutionSnapshotAdapter,
+)
+from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
+from cayu.environments.snapshot_lifecycle import (
+    inspect_execution_snapshots as inspect_execution_snapshots,
+)
+from cayu.environments.snapshots import ExecutionSnapshotAdapter as ExecutionSnapshotAdapter
+from cayu.environments.snapshots import ExecutionSnapshotArtifact as ExecutionSnapshotArtifact
+from cayu.environments.snapshots import ExecutionSnapshotCapability as ExecutionSnapshotCapability
+from cayu.environments.snapshots import ExecutionSnapshotConflict as ExecutionSnapshotConflict
+from cayu.environments.snapshots import ExecutionSnapshotError as ExecutionSnapshotError
+from cayu.environments.snapshots import ExecutionSnapshotFidelity as ExecutionSnapshotFidelity
+from cayu.environments.snapshots import ExecutionSnapshotInspection as ExecutionSnapshotInspection
+from cayu.environments.snapshots import ExecutionSnapshotOperation as ExecutionSnapshotOperation
+from cayu.environments.snapshots import (
+    ExecutionSnapshotOutcomeUnknown as ExecutionSnapshotOutcomeUnknown,
+)
+from cayu.environments.snapshots import ExecutionSnapshotPolicy as ExecutionSnapshotPolicy
+from cayu.environments.snapshots import ExecutionSnapshotPosition as ExecutionSnapshotPosition
+from cayu.environments.snapshots import ExecutionSnapshotRecord as ExecutionSnapshotRecord
+from cayu.environments.snapshots import ExecutionSnapshotSummary as ExecutionSnapshotSummary

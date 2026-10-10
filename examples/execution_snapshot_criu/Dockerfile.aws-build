@@ -1,0 +1,11 @@
+# Disposable trusted-controller probe only; never an agent runtime image.
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+RUN dnf install -y criu gcc make perl pkgconf protobuf-compiler protobuf-c-devel protobuf-devel git libuuid-devel protobuf-c-compiler \
+        libnl3-devel libcap-devel libaio-devel libnet-devel gnutls-devel tar gzip python3-PyYAML
+
+RUN curl -fsSL https://github.com/checkpoint-restore/criu/archive/refs/tags/v4.2.tar.gz -o /tmp/criu.tar.gz \
+    && echo "0c6e51af878e63df7391e6dffbbe5f0ced429bc9f1e5a603020bfd2503065c39  /tmp/criu.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/criu.tar.gz -C /tmp \
+    && make -C /tmp/criu-4.2 -j2 criu CONFIG_NFTABLES=n \
+    && install -m 0755 /tmp/criu-4.2/criu/criu /usr/local/sbin/criu \
+    && rm -rf /tmp/criu-4.2 /tmp/criu.tar.gz && dnf clean all

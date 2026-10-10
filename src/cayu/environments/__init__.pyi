@@ -78,6 +78,9 @@ from cayu.environments.deferred import DeferredWorkspaceBinding as DeferredWorks
 from cayu.environments.deferred import (
     EnvironmentMaterializationError as EnvironmentMaterializationError,
 )
+from cayu.environments.dmtcp_snapshots import (
+    DmtcpExecutionSnapshotAdapter as DmtcpExecutionSnapshotAdapter,
+)
 from cayu.environments.docker_coding import (
     DOCKER_CODING_PROTECTED_DIRECTORY_NAMES as DOCKER_CODING_PROTECTED_DIRECTORY_NAMES,
 )
@@ -204,6 +207,25 @@ from cayu.environments.lifecycle import (
 from cayu.environments.lifecycle import (
     environment_lifecycle_transition_from_event as environment_lifecycle_transition_from_event,
 )
+from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
+from cayu.environments.snapshot_lifecycle import (
+    inspect_execution_snapshots as inspect_execution_snapshots,
+)
+from cayu.environments.snapshots import ExecutionSnapshotAdapter as ExecutionSnapshotAdapter
+from cayu.environments.snapshots import ExecutionSnapshotArtifact as ExecutionSnapshotArtifact
+from cayu.environments.snapshots import ExecutionSnapshotCapability as ExecutionSnapshotCapability
+from cayu.environments.snapshots import ExecutionSnapshotConflict as ExecutionSnapshotConflict
+from cayu.environments.snapshots import ExecutionSnapshotError as ExecutionSnapshotError
+from cayu.environments.snapshots import ExecutionSnapshotFidelity as ExecutionSnapshotFidelity
+from cayu.environments.snapshots import ExecutionSnapshotInspection as ExecutionSnapshotInspection
+from cayu.environments.snapshots import ExecutionSnapshotOperation as ExecutionSnapshotOperation
+from cayu.environments.snapshots import (
+    ExecutionSnapshotOutcomeUnknown as ExecutionSnapshotOutcomeUnknown,
+)
+from cayu.environments.snapshots import ExecutionSnapshotPolicy as ExecutionSnapshotPolicy
+from cayu.environments.snapshots import ExecutionSnapshotPosition as ExecutionSnapshotPosition
+from cayu.environments.snapshots import ExecutionSnapshotRecord as ExecutionSnapshotRecord
+from cayu.environments.snapshots import ExecutionSnapshotSummary as ExecutionSnapshotSummary
 from cayu.environments.warm_spares import WarmSpareBackend as WarmSpareBackend
 from cayu.environments.warm_spares import WarmSparePool as WarmSparePool
 from cayu.environments.warm_spares import (

@@ -1,6 +1,31 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "DmtcpExecutionSnapshotAdapter": (
+        "cayu.environments.dmtcp_snapshots",
+        "DmtcpExecutionSnapshotAdapter",
+    ),
+    "ExecutionSnapshotAdapter": ("cayu.environments.snapshots", "ExecutionSnapshotAdapter"),
+    "ExecutionSnapshotArtifact": ("cayu.environments.snapshots", "ExecutionSnapshotArtifact"),
+    "ExecutionSnapshotCapability": ("cayu.environments.snapshots", "ExecutionSnapshotCapability"),
+    "ExecutionSnapshotConflict": ("cayu.environments.snapshots", "ExecutionSnapshotConflict"),
+    "ExecutionSnapshotError": ("cayu.environments.snapshots", "ExecutionSnapshotError"),
+    "ExecutionSnapshotFidelity": ("cayu.environments.snapshots", "ExecutionSnapshotFidelity"),
+    "ExecutionSnapshotInspection": ("cayu.environments.snapshots", "ExecutionSnapshotInspection"),
+    "ExecutionSnapshotOperation": ("cayu.environments.snapshots", "ExecutionSnapshotOperation"),
+    "ExecutionSnapshotOutcomeUnknown": (
+        "cayu.environments.snapshots",
+        "ExecutionSnapshotOutcomeUnknown",
+    ),
+    "ExecutionSnapshotPolicy": ("cayu.environments.snapshots", "ExecutionSnapshotPolicy"),
+    "ExecutionSnapshotPosition": ("cayu.environments.snapshots", "ExecutionSnapshotPosition"),
+    "ExecutionSnapshotRecord": ("cayu.environments.snapshots", "ExecutionSnapshotRecord"),
+    "ExecutionSnapshotSummary": ("cayu.environments.snapshots", "ExecutionSnapshotSummary"),
+    "ExecutionSnapshots": ("cayu.environments.snapshot_lifecycle", "ExecutionSnapshots"),
+    "inspect_execution_snapshots": (
+        "cayu.environments.snapshot_lifecycle",
+        "inspect_execution_snapshots",
+    ),
     "ExternalWaitTimer": ("cayu.sessions.external_waits", "ExternalWaitTimer"),
     "ExternalEventWaits": ("cayu.external_waits", "ExternalEventWaits"),
     "ExternalWaitAccessPolicy": ("cayu.external_waits", "ExternalWaitAccessPolicy"),
@@ -6700,6 +6725,22 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "DmtcpExecutionSnapshotAdapter",
+    "ExecutionSnapshotAdapter",
+    "ExecutionSnapshotArtifact",
+    "ExecutionSnapshotCapability",
+    "ExecutionSnapshotConflict",
+    "ExecutionSnapshotError",
+    "ExecutionSnapshotFidelity",
+    "ExecutionSnapshotInspection",
+    "ExecutionSnapshotOperation",
+    "ExecutionSnapshotOutcomeUnknown",
+    "ExecutionSnapshotPolicy",
+    "ExecutionSnapshotPosition",
+    "ExecutionSnapshotRecord",
+    "ExecutionSnapshotSummary",
+    "ExecutionSnapshots",
+    "inspect_execution_snapshots",
     "ExternalWaitTimer",
     "ExternalEventWaits",
     "ExternalWaitAccessPolicy",

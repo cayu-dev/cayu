@@ -70,6 +70,7 @@ def validate_public_custom_event_type(event_type: object) -> str:
 
 class EventType(StrEnum):
     WORKSPACE_CHECKPOINT_UPDATED = "workspace.checkpoint.updated"
+    EXECUTION_SNAPSHOT_UPDATED = "execution.snapshot.updated"
     SERVER_MUTATION_ACCEPTED = "server.mutation.accepted"
 
     RECOVERY_PLAN_ITEM_EXECUTED = "recovery.plan.item.executed"

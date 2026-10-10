@@ -370,6 +370,9 @@ class EnvironmentManifest(_ManifestModel):
     knowledge_store: str | None
     mcp_servers: tuple[str, ...]
     workspace_checkpoint_policy: FrozenJsonObject | None = None
+    execution_snapshot_capability: FrozenJsonObject | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     lifecycle_policy: FrozenJsonObject | None
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
@@ -848,6 +851,11 @@ def _describe_environment(
             None
             if registration.spec.workspace_checkpoint_policy is None
             else registration.spec.workspace_checkpoint_policy.model_dump(mode="json")
+        ),
+        execution_snapshot_capability=(
+            None
+            if environment.execution_snapshot_adapter is None
+            else environment.execution_snapshot_capability.model_dump(mode="json")
         ),
         lifecycle_policy=(
             None

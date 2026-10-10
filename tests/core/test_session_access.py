@@ -209,6 +209,9 @@ async def conformance(store):
             with pytest.raises(SessionAccessDenied):
                 await operation(prefix + "b")
             await operation(prefix + "a")
+        # Snapshot metadata is operator-only, so it never needs owner bounds.
+        with pytest.raises(NotImplementedError):
+            await store.load_execution_snapshot_checkpoint(prefix + "a")
         with pytest.raises(SessionAccessDenied):
             await store.query_transcript(TranscriptQuery(session_id=prefix + "b"))
         assert not (await store.query_transcript(TranscriptQuery(session_id=prefix + "a"))).records

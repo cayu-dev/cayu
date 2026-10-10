@@ -29,7 +29,7 @@ RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY = "runtime_authored_user_message"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION = 1
 AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY = "ambiguous_pending_user_input"
 BROWSER_CONTROLS_CHECKPOINT_KEY = "browser_controls"
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 10
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 11
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -401,9 +401,20 @@ def _migrate_checkpoint_v9_to_v10(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_checkpoint_v10_to_v11(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Old application JSON must never become execution restoration authority."""
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    migrated.pop("execution_snapshots", None)
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 11
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
     migrations=(
+        CheckpointMigration(
+            source_version=10, target_version=11, migrate=_migrate_checkpoint_v10_to_v11
+        ),
         CheckpointMigration(
             source_version=9, target_version=10, migrate=_migrate_checkpoint_v9_to_v10
         ),
@@ -570,12 +581,17 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return current
-    if writer_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
+    if writer_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     # Decoding already admitted and detached this private snapshot. Projection
     # only consumes it locally; copying and validating it again adds no boundary.
     projected: dict[str, Any] = current
+    if "execution_snapshots" in projected:
+        raise ValueError("Execution snapshot authority cannot be represented by an older writer.")
+    if writer_version == 10:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 10
+        return projected
     if "session_exports" in projected:
         raise ValueError("Session export authority cannot be represented by an older writer.")
     if MODEL_FAILOVER_CHECKPOINT_KEY in projected:

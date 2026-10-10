@@ -114,6 +114,20 @@ def add_session_parser(subparsers: Any) -> None:
     _add_target_options(show_parser)
     add_output_options(show_parser, formats=FORMAT_CHOICES)
 
+    snapshot_parser = commands.add_parser(
+        "snapshots",
+        help="Inspect execution snapshots and unresolved operations.",
+        description=(
+            "Inspect execution snapshots and unresolved operations. Use the execution "
+            "snapshot APIs to reconcile an unresolved operation before continuing the session."
+        ),
+    )
+    snapshot_parser.add_argument("session_id")
+    snapshot_parser.add_argument("--environment")
+    snapshot_parser.add_argument("--limit", type=_positive_limit, default=25)
+    _add_target_options(snapshot_parser)
+    add_output_options(snapshot_parser, formats=FORMAT_CHOICES)
+
     interactions_parser = commands.add_parser(
         "interactions",
         help="Page response-scoped interaction summaries.",
@@ -462,6 +476,20 @@ async def _run_session_command(
             return await _list_sessions(args, store)
         if args.session_command == "show":
             return await _show_session(args, store)
+        if args.session_command == "snapshots":
+            from cayu.environments.snapshot_lifecycle import inspect_execution_snapshots
+
+            records = await inspect_execution_snapshots(
+                store, args.session_id, environment_name=args.environment, limit=args.limit
+            )
+            _render_detail(
+                args.output_format,
+                {
+                    "schema_version": CLI_SCHEMA_VERSION,
+                    "execution_snapshots": [record.model_dump(mode="json") for record in records],
+                },
+            )
+            return 0
         if args.session_command == "interactions":
             return await _session_interactions(args, store)
         if args.session_command == "usage":
