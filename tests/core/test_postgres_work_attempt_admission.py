@@ -25,9 +25,10 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY, RunRequest
+from cayu.sessions.base import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.tasks_postgres import PostgresTaskStore

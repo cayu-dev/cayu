@@ -60,12 +60,12 @@ from cayu.collaboration.requests import RequestAdmissionCommand
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
-from cayu.sessions.base import RunRequest
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.requests import RunRequest
 from cayu.vaults.redaction import SecretRedactor
 
 

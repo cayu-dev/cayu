@@ -28,7 +28,8 @@ from cayu.sessions._argument_continuity import (
     private_read_scope,
     require_private_key_access,
 )
-from cayu.sessions.base import ForkSessionRequest, InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.knowledge import RememberKnowledgeTool

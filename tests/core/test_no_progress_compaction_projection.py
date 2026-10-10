@@ -22,8 +22,9 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelRequest, ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.requests import ResumeRequest, RunRequest
 
 OVERSIZED_SOURCE = "OVERSIZED_SOURCE " + "x" * 1_000
 

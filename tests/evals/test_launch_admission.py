@@ -11,7 +11,7 @@ from cayu.evals._admission import LaunchAdmission, admission_scope
 from cayu.evals.models import EvalStatus, EvalTrialResult
 from cayu.evals.runner import EvalCase, EvalSuite, _schedule_suite_trials
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 class Clock:

@@ -38,7 +38,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
-    RunRequest,
     RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
     SessionStatusConflict,
@@ -47,6 +46,7 @@ from cayu.sessions.base import (
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import ToolCapabilityCeiling
 

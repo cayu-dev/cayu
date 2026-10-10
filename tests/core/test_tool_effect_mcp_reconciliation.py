@@ -25,7 +25,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

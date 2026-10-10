@@ -5,8 +5,9 @@ import asyncio
 import pytest
 
 from cayu.events import Event, EventType
-from cayu.sessions.base import InMemorySessionStore, RunRequest, ToolRoundIdentity
+from cayu.sessions.base import InMemorySessionStore, ToolRoundIdentity
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 
@@ -281,8 +282,8 @@ def test_native_large_round_cancellation_recovers_every_admitted_call(tmp_path):
     from cayu.messages import Message, ToolResultPart
     from cayu.providers.base import ModelStreamEvent
     from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-    from cayu.sessions.base import ResumeRequest
     from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+    from cayu.sessions.requests import ResumeRequest
     from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 
     class Echo(Tool):

@@ -22,9 +22,10 @@ from cayu.messages import Message
 from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_event_id
 from cayu.server import ServerConfig, ServerLifecycleConfig, create_server
 from cayu.server.sse import SSE_REPLAY_PAGE_EVENTS
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStateSnapshot, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor
 

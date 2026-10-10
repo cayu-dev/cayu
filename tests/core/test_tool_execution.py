@@ -31,8 +31,9 @@ from cayu.observability.hooks import (
 )
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.sessions.base import InMemorySessionStore, InterruptSessionRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
+from cayu.sessions.requests import InterruptSessionRequest, RunRequest
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,

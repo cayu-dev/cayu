@@ -12,7 +12,7 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._zero_work_interruption import ZeroWorkInterruptionRequest
-from cayu.sessions.base import InMemorySessionStore, InterruptSessionRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
@@ -23,6 +23,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.sessions.requests import InterruptSessionRequest
 
 
 async def _orphan(store):
@@ -243,7 +244,7 @@ def test_public_recovery_reconciles_commit_acknowledgement_loss(store, monkeypat
 
 def test_terminalization_preserves_ordinary_resume_admission(store):
     from cayu.messages import Message
-    from cayu.sessions.base import ResumeRequest
+    from cayu.sessions.requests import ResumeRequest
 
     async def exercise():
         await _orphan(store)

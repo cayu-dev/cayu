@@ -23,7 +23,7 @@ from cayu.runners.base import ExecCommand
 from cayu.runners.docker import DockerRunner
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.microsandbox import MicrosandboxRunner
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolExecutableRequirement
 from cayu.tools.search import SearchTextTool
 

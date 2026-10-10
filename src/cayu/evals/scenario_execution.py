@@ -101,10 +101,10 @@ from cayu.messages import FilePart, Message, MessageRole, TextPart
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
-from cayu.sessions.base import ResumeRequest, RunRequest, copy_run_request
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionRecord
 from cayu.sessions.records import PendingActionKind, SessionStatus
+from cayu.sessions.requests import ResumeRequest, RunRequest, copy_run_request
 
 
 class ScenarioExecutionError(RuntimeError):

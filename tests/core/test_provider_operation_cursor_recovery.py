@@ -55,13 +55,13 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ModelCompletionStage,
     ModelCompletionStageRequest,
-    RunRequest,
     SessionOperationTransform,
     SessionRunFenced,
     SessionStore,
 )
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling, resolved_tool_exposure_authority
 from cayu.tools.policy import AllowAllToolPolicy

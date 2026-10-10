@@ -10,8 +10,9 @@ import pytest
 from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 class _ClosableSessionStore(InMemorySessionStore):
@@ -126,7 +127,7 @@ def test_shutdown_waits_for_a_detached_provider_cancellation_renewal(
 
     import cayu.runtime._provider_operation_cancellation_owner as cancellation_owner
     from cayu.agents import AgentSpec
-    from cayu.sessions.base import InterruptSessionRequest
+    from cayu.sessions.requests import InterruptSessionRequest
 
     monkeypatch.setattr(
         cancellation_owner,
@@ -364,7 +365,7 @@ def test_a_failed_provider_cancellation_stops_its_heartbeat_for_shutdown() -> No
     )
 
     from cayu.agents import AgentSpec
-    from cayu.sessions.base import InterruptSessionRequest
+    from cayu.sessions.requests import InterruptSessionRequest
 
     class FailingResolutionStore(_ClosableSessionStore):
         invocation_lifecycle_command_version = 1
@@ -526,7 +527,7 @@ def test_a_failed_claim_release_after_a_won_completion_does_not_stall_shutdown()
     )
 
     from cayu.agents import AgentSpec
-    from cayu.sessions.base import InterruptSessionRequest
+    from cayu.sessions.requests import InterruptSessionRequest
 
     class FailingReleaseStore(_ClosableSessionStore):
         invocation_lifecycle_command_version = 1
@@ -894,7 +895,7 @@ def test_a_failed_claim_release_is_not_replaced_by_its_heartbeat_cancelling_the_
 
     from cayu.agents import AgentSpec
     from cayu.runtime import _provider_operation_cancellation_owner as owner_module
-    from cayu.sessions.base import InterruptSessionRequest
+    from cayu.sessions.requests import InterruptSessionRequest
 
     monkeypatch.setattr(
         owner_module, "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS", 0.01

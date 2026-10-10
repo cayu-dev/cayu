@@ -21,8 +21,9 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.workflow import StepRunOptions, WorkflowBase, parallel, step
@@ -348,7 +349,7 @@ def test_process_roundtrip_uses_absolute_expiry():
 
 @pytest.mark.parametrize("kind", ["run", "resume", "fork"])
 def test_deadline_metadata_cannot_be_forged_in_request(kind):
-    from cayu.sessions.base import ForkSessionRequest
+    from cayu.sessions.requests import ForkSessionRequest
 
     metadata = {"cayu:execution_deadline": {}}
     with pytest.raises(ValueError, match="deadline"):
@@ -809,7 +810,7 @@ def test_postgres_deadline_parent_composition_and_reopen(postgres_dsn):
 
 
 def test_fork_inherits_tighter_scope_and_replays_committed_result_after_expiry(clock):
-    from cayu.sessions.base import ForkSessionRequest
+    from cayu.sessions.requests import ForkSessionRequest
 
     async def run():
         app, provider = _app()

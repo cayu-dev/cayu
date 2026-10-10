@@ -39,7 +39,8 @@ from cayu.messages import Message, MessageRole, ToolCallPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import ModelTarget, RunRequest
+from cayu.sessions.base import ModelTarget
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import StaticToolPolicy
 

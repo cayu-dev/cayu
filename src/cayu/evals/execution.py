@@ -98,7 +98,7 @@ from cayu.execution_profiles import (
 )
 from cayu.messages import Message, MessageRole, TextPart, detach_message
 from cayu.runtime.manifest import AppManifest, _app_manifest_fingerprint
-from cayu.sessions.base import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.workflows.base import WorkflowSpec, copy_workflow_spec
 
 CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES = 128

@@ -37,7 +37,6 @@ from cayu.sessions._pending_tool_round import (
 )
 from cayu.sessions.base import (
     InMemorySessionStore,
-    RunRequest,
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
@@ -45,6 +44,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolResult
 
 _INTERACTION_ID = "interaction-tool-round-publication"

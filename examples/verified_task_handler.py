@@ -19,7 +19,7 @@ from cayu.runtime.verified_task_worker import (
     VerifiedTaskPreparationContext,
     VerifiedTaskProposalContext,
 )
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tasks.contracts import CompletionProposalCreate, CompletionResultReference
 
 

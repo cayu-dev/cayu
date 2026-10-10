@@ -19,7 +19,7 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.local import LocalRunner
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import (
     Tool,
     ToolExecutableRequirement,

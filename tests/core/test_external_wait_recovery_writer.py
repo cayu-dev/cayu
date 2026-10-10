@@ -26,7 +26,8 @@ from cayu.sessions._session_continuation import (
     ContinuationWait,
     continuation_writer_frontier,
 )
-from cayu.sessions.base import _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, RunRequest
+from cayu.sessions.base import _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY
+from cayu.sessions.requests import RunRequest
 from cayu.vaults.redaction import SecretRedactor
 
 

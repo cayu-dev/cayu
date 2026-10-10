@@ -30,9 +30,10 @@ from cayu.runtime.session_steering import (
     StopAfterCurrentToolRoundRequest,
     copy_stop_after_current_tool_round_request,
 )
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.messaging import EnqueueSessionMessageRequest
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

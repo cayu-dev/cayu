@@ -15,7 +15,6 @@ from cayu.external_waits import (
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._external_wait_binding import load_prepared_continuation
 from cayu.runtime._external_wait_observation import external_wait_entrance
-from cayu.sessions.base import ResumeRequest, RunRequest, copy_resume_request, copy_run_request
 from cayu.sessions.external_waits import (
     ExternalWaitConflict,
     ExternalWaitRegistration,
@@ -24,6 +23,7 @@ from cayu.sessions.external_waits import (
     _Value,
     external_wait_digest,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest, copy_resume_request, copy_run_request
 
 if TYPE_CHECKING:
     from collections.abc import Iterable

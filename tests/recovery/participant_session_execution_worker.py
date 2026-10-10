@@ -12,11 +12,12 @@ from cayu.agents import AgentSpec
 from cayu.collaboration.participants import ParticipantRef
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import Message, RunRequest
+from cayu.sessions.base import Message
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.storage.migrations import SchemaMode

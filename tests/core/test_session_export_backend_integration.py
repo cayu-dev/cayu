@@ -30,8 +30,9 @@ from cayu.runtime._checkpoint_store import (
     _RuntimeCheckpointSessionStore,
     runtime_checkpoint_session_store,
 )
-from cayu.sessions.base import _SESSION_EXPORT_OWNER_METHODS, InMemorySessionStore, RunRequest
+from cayu.sessions.base import _SESSION_EXPORT_OWNER_METHODS, InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

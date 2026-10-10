@@ -43,13 +43,14 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.sessions.base import CheckpointTransform, InMemorySessionStore, RunRequest
+from cayu.sessions.base import CheckpointTransform, InMemorySessionStore
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     Session,
     SessionIdentity,
     SessionStatus,
 )
+from cayu.sessions.requests import RunRequest
 
 
 def _pending_approval(**kwargs) -> PendingToolApproval:

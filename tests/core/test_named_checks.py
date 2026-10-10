@@ -28,7 +28,8 @@ from cayu.runners.local import LocalRunner
 from cayu.runtime.checks import check_manifest
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.base import (

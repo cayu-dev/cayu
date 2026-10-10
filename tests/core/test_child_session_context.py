@@ -31,8 +31,6 @@ from cayu.sessions.base import (
     ChildSessionLifecycleQuery,
     InMemorySessionStore,
     ModelCompletionStageRequest,
-    ResumeRequest,
-    RunRequest,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
@@ -54,6 +52,7 @@ from cayu.sessions.child_results import (
     project_terminal_child_session_result,
 )
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.sessions.transcript_queries import (
     LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
     TranscriptTextReadLimitExceeded,

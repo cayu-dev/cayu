@@ -29,7 +29,7 @@ from cayu.sessions._session_continuation import (
     ContinuationWait,
 )
 from cayu.sessions._session_continuation_store import ROOT_KEY, digest
-from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

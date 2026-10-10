@@ -35,7 +35,7 @@ from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.sessions.base import InMemorySessionStore, ModelCompletionStageDisposition, RunRequest
+from cayu.sessions.base import InMemorySessionStore, ModelCompletionStageDisposition
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
@@ -44,6 +44,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanSelection,
     RecoveryRegistrationStatus,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tasks.contracts import TaskCompletionDecisionRequired

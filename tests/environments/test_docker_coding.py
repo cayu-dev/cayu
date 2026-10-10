@@ -70,7 +70,7 @@ from cayu.runners.docker import (
 )
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.local import LocalRunner
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement
 from cayu.tools.search import SearchTextTool

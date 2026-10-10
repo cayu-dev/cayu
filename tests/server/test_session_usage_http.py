@@ -14,8 +14,9 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime._usage_accounting import UsageAccountingReducer
 from cayu.server import ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 
 
 def _completed(session_id: str, tokens: int) -> Event:

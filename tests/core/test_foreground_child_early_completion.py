@@ -16,7 +16,8 @@ from cayu.runtime import _foreground_child_wait as child_wait
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool

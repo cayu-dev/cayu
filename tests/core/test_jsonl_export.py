@@ -15,13 +15,14 @@ from cayu._validation import (
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage import SQLiteSessionStore
 from cayu.storage.jsonl_export import (
     ImportedSession,

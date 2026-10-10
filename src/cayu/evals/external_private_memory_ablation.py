@@ -131,7 +131,7 @@ from cayu.memory.execution import (
     MemoryInterventionTrialRequest,
 )
 from cayu.memory.interventions import MemoryInterventionKind
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.snapshots.base import AgentSnapshot
 
 EXTERNAL_PRIVATE_MEMORY_ABLATION_SCHEMA_VERSION = 1

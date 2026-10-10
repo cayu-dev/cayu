@@ -117,8 +117,6 @@ from cayu.runtime._durable_operation_ownership import (
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions.base import (
-    InterruptSessionRequest,
-    RunRequest,
     RuntimeSessionCreateClaimReference,
     SessionStore,
     run_request_with_runtime_invocation,
@@ -129,6 +127,7 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import InterruptSessionRequest, RunRequest
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,

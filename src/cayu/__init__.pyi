@@ -3924,15 +3924,12 @@ from cayu.sessions.base import SESSION_RUNTIME_METADATA_KEYS as SESSION_RUNTIME_
 from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX as SESSION_RUNTIME_METADATA_PREFIX
 from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGuard
 from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
-from cayu.sessions.base import CompactSessionRequest as CompactSessionRequest
-from cayu.sessions.base import ForkSessionRequest as ForkSessionRequest
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import (
     InteractionTransitionReceiptResult as InteractionTransitionReceiptResult,
 )
 from cayu.sessions.base import InteractionTransitionResult as InteractionTransitionResult
 from cayu.sessions.base import InteractionTransitionSpec as InteractionTransitionSpec
-from cayu.sessions.base import InterruptSessionRequest as InterruptSessionRequest
 from cayu.sessions.base import (
     ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
 )
@@ -3941,8 +3938,6 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
-from cayu.sessions.base import ResumeRequest as ResumeRequest
-from cayu.sessions.base import RunRequest as RunRequest
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
 from cayu.sessions.base import SessionModelTransition as SessionModelTransition
@@ -4246,6 +4241,11 @@ from cayu.sessions.recovery import RecoveryTaskClaimEvidence as RecoveryTaskClai
 from cayu.sessions.recovery import StaleRecoveryPlanError as StaleRecoveryPlanError
 from cayu.sessions.recovery import StartupRecoveryBlockedSession as StartupRecoveryBlockedSession
 from cayu.sessions.recovery import StartupRecoveryResult as StartupRecoveryResult
+from cayu.sessions.requests import CompactSessionRequest as CompactSessionRequest
+from cayu.sessions.requests import ForkSessionRequest as ForkSessionRequest
+from cayu.sessions.requests import InterruptSessionRequest as InterruptSessionRequest
+from cayu.sessions.requests import ResumeRequest as ResumeRequest
+from cayu.sessions.requests import RunRequest as RunRequest
 from cayu.sessions.summaries import EventSummary as EventSummary
 from cayu.sessions.summaries import SessionOperationalSnapshot as SessionOperationalSnapshot
 from cayu.sessions.summaries import SessionOutcome as SessionOutcome

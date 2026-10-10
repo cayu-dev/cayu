@@ -214,7 +214,6 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     QueuedInteractionProfileHandoff,
-    RunRequest,
     RuntimePublicationMutation,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
@@ -254,7 +253,6 @@ from cayu.sessions.base import (
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
-    _copy_optional_tool_capability_ceiling,
     _copy_profiled_fork_authority,
     _copy_queued_interaction_profile_handoff,
     _copy_queued_interaction_started_event,
@@ -374,7 +372,6 @@ from cayu.sessions.base import (
     _validate_tool_round_publication,
     _validate_user_input_checkpoint_mutation,
     checkpoint_root_field_projection_from_storage,
-    copy_run_request,
     copy_session_user_metadata,
     deferred_interaction_input_for_run_request,
     replace_session_user_metadata,
@@ -461,6 +458,11 @@ from cayu.sessions.records import (
     TranscriptRecord,
     copy_session_identity,
     copy_session_runtime_identity,
+)
+from cayu.sessions.requests import (
+    RunRequest,
+    _copy_optional_tool_capability_ceiling,
+    copy_run_request,
 )
 from cayu.sessions.summaries import (
     EventSummary,

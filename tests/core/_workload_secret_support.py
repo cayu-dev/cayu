@@ -12,7 +12,7 @@ from cayu.approvals.tools import ToolApprovalRecoveryRequest, ToolApprovalReques
 from cayu.events import Event
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import ForkSessionRequest, ResumeRequest, RunRequest
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 

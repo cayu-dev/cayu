@@ -37,7 +37,7 @@ from cayu.providers.openai_subscription import (
     OpenAISubscriptionProvider,
 )
 from cayu.providers.operations import ProviderOperationState
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 

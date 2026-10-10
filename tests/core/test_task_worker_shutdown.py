@@ -12,7 +12,7 @@ from cayu.applications import CayuApp
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks import TaskCreate, TaskStatus
 from cayu.tasks.memory import InMemoryTaskStore
@@ -104,7 +104,7 @@ def test_a_task_claimed_as_the_app_seals_returns_to_pending(backend: str, tmp_pa
 def test_a_continuation_refused_by_shutdown_is_left_for_recovery() -> None:
     from tests.core.test_task_worker import _seed_receipt_backed_continuation
 
-    from cayu.sessions.base import ResumeRequest
+    from cayu.sessions.requests import ResumeRequest
     from cayu.tasks.queries import TaskQuery
 
     async def scenario() -> None:

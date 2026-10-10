@@ -20,7 +20,6 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.sessions.base import (
     InMemorySessionStore,
-    RunRequest,
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
 )
@@ -28,6 +27,7 @@ from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

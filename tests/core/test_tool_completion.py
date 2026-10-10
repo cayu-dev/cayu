@@ -759,7 +759,7 @@ def test_retry_retains_policy_and_success_has_no_followup_request():
 
 
 def test_unchecked_configuration_is_revalidated_and_detached():
-    from cayu.sessions.base import copy_run_request
+    from cayu.sessions.requests import copy_run_request
 
     malformed = ToolCompletionPolicy.model_construct(tool_names=("ask_customer", "ask_customer"))
     with pytest.raises(ValueError):
@@ -895,7 +895,7 @@ def test_unconfigured_approval_keeps_checkpoint_read_budget():
 @pytest.mark.parametrize("kind", ["initial", "continuation"])
 @pytest.mark.parametrize("policy_state", ["implicit", "none", "configured"])
 def test_portable_work_attempt_source_preserves_completion_controls(kind, policy_state):
-    from cayu.sessions.base import copy_resume_request, copy_run_request
+    from cayu.sessions.requests import copy_resume_request, copy_run_request
 
     engine = CayuApp(enable_logging=False)._session_engine
     model = RunRequest if kind == "initial" else ResumeRequest

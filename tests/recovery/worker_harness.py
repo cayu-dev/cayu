@@ -39,7 +39,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
@@ -51,6 +50,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.queries import TaskQuery

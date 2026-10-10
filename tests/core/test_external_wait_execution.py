@@ -27,8 +27,8 @@ def test_real_initial_execution_parks_the_exact_external_binding(
     from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
     from cayu.session_external_waits import SessionExternalWaitAdapter
     from cayu.sessions._session_continuation import ContinuationConflict
-    from cayu.sessions.base import ResumeRequest, RunRequest
     from cayu.sessions.external_waits import ExternalEventDelivery
+    from cayu.sessions.requests import ResumeRequest, RunRequest
 
     async def scenario():
         async with stores(backend, tmp_path, request, [datetime.now(UTC)]) as (store, reopen):

@@ -11,8 +11,9 @@ import pytest
 
 from cayu import SQLiteSessionStore, TranscriptQuery
 from cayu.messages import Message, ThinkingPart
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_queries import TranscriptSnapshot
 
 

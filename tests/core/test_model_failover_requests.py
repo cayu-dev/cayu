@@ -26,7 +26,8 @@ from cayu.runtime.work_attempt_semantics import (
     copy_work_attempt_run_semantics,
 )
 from cayu.server.routes import ResumeBody, RunBody
-from cayu.sessions.base import InMemorySessionStore, copy_resume_request, copy_run_request
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import copy_resume_request, copy_run_request
 from cayu.tasks.dispatch import (
     DispatchRequest,
     _queued_dispatch_request_payload,
@@ -284,7 +285,7 @@ def test_native_postgres_public_run_and_resume(postgres_dsn):
 def test_inherited_route_rejects_unattested_store_before_mutation(tmp_path, entrance):
     from tests.core.test_model_failover_recovery import _RecoveryProvider
 
-    from cayu.sessions.base import ForkSessionRequest
+    from cayu.sessions.requests import ForkSessionRequest
     from cayu.storage.sqlite import SQLiteSessionStore
 
     class UnattestedStore(SQLiteSessionStore):

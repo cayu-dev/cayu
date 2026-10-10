@@ -51,7 +51,7 @@ from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
 )
-from cayu.sessions.base import InMemorySessionStore, Message, RunRequest
+from cayu.sessions.base import InMemorySessionStore, Message
 from cayu.sessions.context_views import (
     ContextViewExtensionProjection,
     ContextViewExtensionRegistration,
@@ -61,6 +61,7 @@ from cayu.sessions.context_views import (
     ContextViewSelectionRequest,
     ParticipantSessionCreationRequest,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

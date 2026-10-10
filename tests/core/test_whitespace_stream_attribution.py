@@ -196,7 +196,7 @@ async def test_semantic_timing_survives_sqlite_readback(tmp_path):
     from cayu.events import EventType
     from cayu.providers.base import ModelProvider
     from cayu.providers.retry_policy import RetryPolicy
-    from cayu.sessions.base import RunRequest
+    from cayu.sessions.requests import RunRequest
     from cayu.storage.sqlite import SQLiteSessionStore
 
     class Provider(ModelProvider):

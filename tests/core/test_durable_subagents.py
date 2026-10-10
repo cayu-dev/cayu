@@ -56,12 +56,7 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenanceOrigin,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
@@ -69,6 +64,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
 )
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

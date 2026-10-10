@@ -9,7 +9,7 @@ import pytest
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -17,6 +17,7 @@ from cayu.sessions.checkpoints import (
 from cayu.sessions.exports import SessionExportBuilder, SessionExportLimits, SessionExportTooLarge
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.migrations import SchemaMode

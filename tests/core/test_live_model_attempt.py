@@ -18,7 +18,7 @@ from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 def test_live_attempt_imports_without_execution_controllers() -> None:

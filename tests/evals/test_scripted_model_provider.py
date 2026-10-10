@@ -22,7 +22,8 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.providers.operations import ProviderOperationStartRequest
-from cayu.sessions.base import ModelTarget, RunRequest
+from cayu.sessions.base import ModelTarget
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 from cayu.tools.subagents import (
     BackgroundSubagentTaskRegistry,

@@ -30,7 +30,7 @@ from cayu.runners.workloads import (
     PINNED_BROWSER_SESSION_WORKLOAD,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.browser import (

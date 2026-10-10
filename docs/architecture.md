@@ -536,6 +536,16 @@ contracts without loading concrete stores or runtime execution. Fork admission,
 checkpoint authorization and atomic child creation remain with their existing
 runtime and backend owners.
 
+### Session request contracts
+
+`sessions/requests.py` owns run, resume, compact, interrupt and fork requests with
+their validation, input-evidence composition and detached copy rules. It uses
+existing message, budget, profile, loop-policy and tool-completion contracts
+without loading session stores or execution orchestration. The private authority
+values checked during copying share this owner, preserving exact token identity
+and rejecting forged or mismatched handoffs. Authority issuance and authentication,
+runtime admission and native operations retain their existing owners.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

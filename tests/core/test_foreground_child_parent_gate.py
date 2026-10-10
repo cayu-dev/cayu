@@ -23,12 +23,12 @@ from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
 from cayu.sessions.base import (
     InMemorySessionStore,
-    RunRequest,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
 )
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool
@@ -206,7 +206,7 @@ def _run_case(
                     child.id for child in children
                 }
             if stop_parent:
-                from cayu.sessions.base import InterruptSessionRequest
+                from cayu.sessions.requests import InterruptSessionRequest
 
                 owner = app._recovery_coordinator._foreground_gate_policy_owner
                 assert owner._wait_policies if parent_gate == "none" else owner._policies

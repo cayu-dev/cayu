@@ -236,7 +236,7 @@ def test_limit_correlation_does_not_adopt_unresolved_or_newer_terminal(tmp_path,
         ExecutionProfilePolicyAction,
         ExecutionProfilePolicyResult,
     )
-    from cayu.sessions.base import ResumeRequest
+    from cayu.sessions.requests import ResumeRequest
 
     class AllowExplicitResume(ExecutionProfilePolicy):
         identity = "test:limit-race-resume:v1"

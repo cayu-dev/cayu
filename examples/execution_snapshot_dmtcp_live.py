@@ -42,8 +42,8 @@ from cayu.runners.docker_workload import (
     DockerTmpfsMount,
     DockerWorkloadRestrictions,
 )
-from cayu.sessions.base import RunRequest
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workspaces import RunnerWorkspace
 

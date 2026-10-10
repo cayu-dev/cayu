@@ -15,12 +15,13 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
-from cayu.sessions.base import InMemorySessionStore, Message, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore, Message
 from cayu.sessions.context_views import (
     ContextViewPublicationRequest,
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

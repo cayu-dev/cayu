@@ -271,13 +271,9 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions.base import (
-    ForkSessionRequest,
     InMemorySessionStore,
-    InterruptSessionRequest,
     ModelCompletionManualRecoveryRequest,
     ModelTarget,
-    ResumeRequest,
-    RunRequest,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
@@ -316,6 +312,12 @@ from cayu.sessions.recovery import (
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
+)
+from cayu.sessions.requests import (
+    ForkSessionRequest,
+    InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
 )
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptQuery

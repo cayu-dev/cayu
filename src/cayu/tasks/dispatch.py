@@ -94,7 +94,6 @@ from cayu.sessions.base import (
     ModelTarget,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
-    ResumeRequest,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -104,6 +103,7 @@ from cayu.sessions.invocation import (
     copy_session_invocation_binding,
 )
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import (
     TaskExecutionSettlement,

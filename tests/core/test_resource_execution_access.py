@@ -12,7 +12,7 @@ from cayu.sessions.access import (
     SessionAccessScope,
     SessionAccessSelector,
 )
-from cayu.sessions.base import ResumeRequest
+from cayu.sessions.requests import ResumeRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 
@@ -268,8 +268,8 @@ def test_decision_revision_expiry_outage_and_family_separation(tmp_path):
     from datetime import UTC, datetime, timedelta
 
     from cayu.resource_access import ResourceAccessDecision, ResourceAccessGrant
-    from cayu.sessions.base import RunRequest
     from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
 
     async def run():
         store = SQLiteSessionStore(tmp_path / "decisions.db")

@@ -27,12 +27,12 @@ from cayu.collaboration.exports import ExportLimits, SessionExportRegistration
 from cayu.collaboration.peer_content import PeerContentAppendRequest, PeerContentConflict
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import RunRequest
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     RecipientSessionCreationRequest,
 )
 from cayu.sessions.creation_fence import SessionCreationConflict
+from cayu.sessions.requests import RunRequest
 
 
 def future_delivery(source, sender, consumer, target, suffix):

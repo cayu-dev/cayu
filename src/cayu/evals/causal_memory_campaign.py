@@ -133,7 +133,8 @@ from cayu.messages import Message
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.manifest import AppManifest
-from cayu.sessions.base import RunRequest, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.snapshots.base import (
     AgentSnapshot,
     AgentSnapshotAuthorityRef,

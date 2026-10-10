@@ -18,7 +18,6 @@ from cayu.sessions._model_failover import (
 )
 from cayu.sessions.base import (
     InMemorySessionStore,
-    RunRequest,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     apply_runtime_publication_checkpoint_mutation,
@@ -30,6 +29,7 @@ from cayu.sessions.checkpoints import (
     runtime_checkpoint_writer_view,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

@@ -26,16 +26,12 @@ from cayu.evals.runner import EvalCase
 from cayu.messages import Message
 from cayu.proxies.base import ProxyAuthorizationResult
 from cayu.runtime.loop_policies import BeforeStopDecision
-from cayu.sessions.base import (
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
-    replace_session_user_metadata,
-)
+from cayu.sessions.base import replace_session_user_metadata
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
 )
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.knowledge_indexer import KnowledgeIndexRequest
 from cayu.storage.memory import KnowledgeChunk, KnowledgeEntry
 from cayu.tasks.creation import TaskCreate

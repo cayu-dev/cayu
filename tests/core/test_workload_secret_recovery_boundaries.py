@@ -30,12 +30,13 @@ from cayu.providers import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

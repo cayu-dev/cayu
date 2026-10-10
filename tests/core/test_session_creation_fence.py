@@ -22,7 +22,7 @@ from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import (
     ContextViewLimits,
     ContextViewOwnershipRequest,
@@ -39,6 +39,7 @@ from cayu.sessions.creation_fence import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 
 
 def _store_factory(backend, tmp_path, request):

@@ -15,7 +15,7 @@ from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.providers.bedrock import build_bedrock_converse_payload
 from cayu.providers.chat_completions import build_chat_completions_payload
 from cayu.providers.openai import build_openai_payload
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.jsonl_export import export_sessions
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec

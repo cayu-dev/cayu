@@ -40,9 +40,6 @@ from cayu.sessions.base import (
     InteractionTransitionReceiptResult,
     InteractionTransitionResult,
     InteractionTransitionSpec,
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -59,6 +56,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
 )
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus

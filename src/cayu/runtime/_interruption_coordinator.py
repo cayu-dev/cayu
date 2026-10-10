@@ -24,9 +24,10 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import InterruptSessionRequest, SessionStore, _deactivate_session_run_fence
+from cayu.sessions.base import SessionStore, _deactivate_session_run_fence
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.requests import InterruptSessionRequest
 from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)

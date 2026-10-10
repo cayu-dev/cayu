@@ -12,7 +12,7 @@ from tests.core.test_peer_content_lifecycle import LifecyclePolicy, journey, pee
 from cayu.collaboration.exports import SessionExportDenied, SessionExportPolicy
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 
 
 @pytest.mark.anyio

@@ -42,7 +42,8 @@ from cayu.runtime._session_continuation import (
     continuation_namespace_id,
 )
 from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.vaults.redaction import SecretRedactor
 

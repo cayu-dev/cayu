@@ -52,19 +52,19 @@ from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import (
-    ForkSessionRequest,
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.requests import (
+    ForkSessionRequest,
+    InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
+)
 from cayu.storage.knowledge_indexer import KnowledgeIndexer, KnowledgeIndexRequest
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -4985,7 +4985,7 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
     None
 ):
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.sessions.base import CompactSessionRequest
+    from cayu.sessions.requests import CompactSessionRequest
     from cayu.vaults.redaction import SecretRedactor
 
     async def run() -> None:

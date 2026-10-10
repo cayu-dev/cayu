@@ -11,7 +11,6 @@ from uuid import uuid4
 from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.events import Event
 from cayu.sessions.base import (
-    RunRequest,
     restore_persisted_event_authority,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
@@ -28,6 +27,7 @@ from cayu.sessions.records import (
     SessionStatus,
     runtime_build_provenance_from_session_metadata,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage._validated_cache import validated_row_cache
 from cayu.tasks.contracts import WorkContractRef

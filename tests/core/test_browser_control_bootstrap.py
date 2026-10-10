@@ -51,8 +51,8 @@ def _run_runtime_allocation(
     from cayu.providers.base import ModelStreamEvent
     from cayu.runners.local import LocalRunner
     from cayu.runtime._browser_control_service import BrowserControlService
-    from cayu.sessions.base import RunRequest
     from cayu.sessions.outcomes import run_to_completion
+    from cayu.sessions.requests import RunRequest
     from cayu.storage.sqlite import SQLiteSessionStore
     from cayu.tools.base import ToolContext
     from cayu.tools.browser_control_config import BrowserControlConfig

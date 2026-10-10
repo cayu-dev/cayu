@@ -11,7 +11,7 @@ from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.events import EventType
 from cayu.runtime._session_continuation import ContinuationConflict
 from cayu.runtime._session_continuation_owner import SessionContinuationOwner
-from cayu.sessions.base import CompactSessionRequest
+from cayu.sessions.requests import CompactSessionRequest
 
 
 async def arbitrate_latch(

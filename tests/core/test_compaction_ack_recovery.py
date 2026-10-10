@@ -17,8 +17,9 @@ from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import CompactSessionRequest, InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import CompactSessionRequest, RunRequest
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 

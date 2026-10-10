@@ -51,7 +51,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     execution_profile_session_metadata,
 )
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore, ModelTarget
 from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -60,6 +60,7 @@ from cayu.sessions.invocation import (
     SessionInvocation,
 )
 from cayu.sessions.records import Session
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 

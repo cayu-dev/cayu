@@ -16,11 +16,8 @@ from cayu.events import Event, EventType
 from cayu.messages import ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.base import (
-    CompactSessionRequest,
     InMemorySessionStore,
     Message,
-    ResumeRequest,
-    RunRequest,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -44,6 +41,7 @@ from cayu.sessions.context_views import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import CompactSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

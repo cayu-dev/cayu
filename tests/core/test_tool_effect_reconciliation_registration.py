@@ -240,7 +240,7 @@ def test_reconciler_contract_participates_in_public_profile_inspection():
     from cayu.messages import Message
     from cayu.providers.base import ModelStreamEvent
     from cayu.runtime.execution_profiles import ExecutionProfileComponentClass
-    from cayu.sessions.base import RunRequest
+    from cayu.sessions.requests import RunRequest
 
     class VersionedTool(_Deployment):
         spec = ToolSpec(

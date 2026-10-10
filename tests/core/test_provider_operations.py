@@ -58,17 +58,15 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.sessions.base import (
     InMemorySessionStore,
-    InterruptSessionRequest,
     ModelCompletionStageRequest,
     ModelCompletionStageResult,
-    ResumeRequest,
-    RunRequest,
     SessionRunFenced,
 )
 from cayu.sessions.event_delivery import PersistedEventSideEffectClaim
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor
 

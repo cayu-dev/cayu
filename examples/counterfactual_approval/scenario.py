@@ -26,7 +26,8 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider
 from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStore
+from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 
 ANALYSIS_SCHEMA: dict[str, Any] = {

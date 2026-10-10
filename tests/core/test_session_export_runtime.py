@@ -15,8 +15,8 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import RunRequest
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 

@@ -46029,5 +46029,22 @@
     "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[parse_session_input_contract_evidence]": 0.0002603329485282302,
     "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[session_input_messages_sha256]": 0.00021341798128560185,
     "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[session_messages_input_contract_evidence]": 0.00020845799008384347,
-    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[system_prompt_messages_sha256]": 0.00021808402379974723
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[system_prompt_messages_sha256]": 0.00021808402379974723,
+    "tests/core/test_session_request_package_layout.py::test_authenticated_request_copy_without_implementations": 1.905840958992485,
+    "tests/core/test_session_request_package_layout.py::test_private_request_values_have_one_owner": 0.000501957954838872,
+    "tests/core/test_session_request_package_layout.py::test_request_construction_and_copy_without_implementations[cayu.runtime]": 2.5114354580291547,
+    "tests/core/test_session_request_package_layout.py::test_request_construction_and_copy_without_implementations[cayu.sessions.requests]": 2.459397623955738,
+    "tests/core/test_session_request_package_layout.py::test_request_construction_and_copy_without_implementations[cayu.sessions]": 2.9014343330054544,
+    "tests/core/test_session_request_package_layout.py::test_request_construction_and_copy_without_implementations[cayu]": 3.0968566249939613,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[CompactSessionRequest]": 0.0005788749549537897,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[ForkSessionRequest]": 0.0002837090869434178,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[InterruptSessionRequest]": 0.00045229296665638685,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[ResumeRequest]": 0.0006574989529326558,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[RunRequest]": 4.254977251053788,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_compact_session_request]": 0.00026174995582550764,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_fork_session_request]": 0.00022112397709861398,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_interrupt_session_request]": 0.0003504169872030616,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_resume_request]": 0.0003754170029424131,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_run_request]": 0.00028899998869746923,
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[session_input_contract_evidence]": 0.0003869579522870481
 }

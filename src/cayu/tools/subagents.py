@@ -51,8 +51,6 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions.base import (
-    InterruptSessionRequest,
-    RunRequest,
     SessionStore,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
@@ -65,6 +63,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.requests import InterruptSessionRequest, RunRequest
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.store import TaskStore

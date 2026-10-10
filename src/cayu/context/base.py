@@ -113,7 +113,6 @@ from cayu.runtime.retry_policy import (
     retry_diagnostic_payload,
 )
 from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
-from cayu.sessions.base import COMPACTION_INSTRUCTIONS_MAX_CHARS
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -124,6 +123,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.sessions.records import Session, copy_session
+from cayu.sessions.requests import COMPACTION_INSTRUCTIONS_MAX_CHARS
 from cayu.tools.base import ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 

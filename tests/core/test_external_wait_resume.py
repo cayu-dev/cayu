@@ -14,8 +14,8 @@ from cayu.external_waits import ExternalEventWaits
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.session_external_waits import SessionExternalWaitAdapter
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitConflict
+from cayu.sessions.requests import ResumeRequest, RunRequest
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

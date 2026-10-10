@@ -19,7 +19,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners._cleanup import cleanup_runner_command_with_diagnostic
 from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, ExecResult, Runner
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.commands import ExecCommandTool
 
 

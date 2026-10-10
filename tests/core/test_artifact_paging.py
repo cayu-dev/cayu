@@ -13,7 +13,7 @@ from cayu.artifacts import ArtifactStore, LocalArtifactStore
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.files import ReadFileTool
 from cayu.tools.result_projection import ArtifactExternalizingToolResultPolicy

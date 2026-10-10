@@ -35,7 +35,7 @@ from cayu.artifacts.resources import (
 from cayu.collaboration._contracts import ContractValue, Generation, Identifier, OwnerRef
 from cayu.collaboration.participants import ParticipantRef
 from cayu.messages import FilePart, Message, ToolResultPart
-from cayu.sessions.base import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request
 
 CONTEXT_VIEW_CONTRACT_VERSION = 1
 CONTEXT_VIEW_STORE_VERSION = 1

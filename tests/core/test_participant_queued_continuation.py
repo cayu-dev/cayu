@@ -23,10 +23,11 @@ from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import Message, ResumeRequest, RunRequest
+from cayu.sessions.base import Message
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

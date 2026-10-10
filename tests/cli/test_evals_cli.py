@@ -18,7 +18,7 @@ from cayu.evals.reporting import load_eval_run
 from cayu.evals.runner import EvalCase, EvalPlan, EvalSuite
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 def _captured_eval_error(capsys: pytest.CaptureFixture[str]) -> str:

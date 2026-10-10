@@ -35,7 +35,7 @@ from cayu.sessions._session_continuation import (
     require_latch_identity,
     require_ticket_identity,
 )
-from cayu.sessions.base import ResumeRequest, copy_resume_request
+from cayu.sessions.requests import ResumeRequest, copy_resume_request
 
 
 @dataclass(frozen=True, slots=True)

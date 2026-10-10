@@ -255,7 +255,7 @@ class _ExternalExecutionToWait:
         from cayu.runtime._model_completion_contracts import (
             model_completion_recovery_context_from_stage,
         )
-        from cayu.sessions.base import ResumeRequest
+        from cayu.sessions.requests import ResumeRequest
 
         if retained.execution is None or retained.projection_json is None or stage_id is None:
             raise ExternalWaitUnavailable("External service has no retained execution controls.")

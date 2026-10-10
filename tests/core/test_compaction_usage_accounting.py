@@ -15,7 +15,7 @@ from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 class FakeProvider(ModelProvider):

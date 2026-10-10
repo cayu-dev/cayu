@@ -29,13 +29,14 @@ from cayu.environments.snapshots import (
     ExecutionSnapshotPolicy,
 )
 from cayu.runtime._runtime_records import RegisteredEnvironment
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, SessionStatus
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 
 
 class FakeAdapter(ExecutionSnapshotAdapter):
@@ -1258,7 +1259,8 @@ def test_snapshot_restore_reuses_real_runtime_tool_result(tmp_path):
     from cayu.events import EventType
     from cayu.messages import Message
     from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-    from cayu.sessions.base import EventQuery, ResumeRequest
+    from cayu.sessions.base import EventQuery
+    from cayu.sessions.requests import ResumeRequest
     from cayu.storage.sqlite import SQLiteSessionStore
     from cayu.workspaces import LocalWorkspace
 

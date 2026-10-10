@@ -16,9 +16,10 @@ from weakref import WeakKeyDictionary
 
 from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
 from cayu.events import Event, EventType, event_with_runtime_generated_id
-from cayu.sessions.base import RunRequest, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.workflows._step_identity import replay_eligible_completed_step_id
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 

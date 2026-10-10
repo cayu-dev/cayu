@@ -35,7 +35,6 @@ from cayu.sessions.base import (
     ActiveModelCompletionStage,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
-    RunRequest,
     SessionRunFenced,
     SessionStore,
     _checkpoint_after_queued_dispatch_acknowledgement,
@@ -48,6 +47,7 @@ from cayu.sessions.records import (
     SessionStatus,
     _queued_dispatch_session_instance_fingerprint,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.tasks.contracts import TaskCompletionDecisionRequired
 from cayu.tasks.dispatch import (
     DispatchRequest,

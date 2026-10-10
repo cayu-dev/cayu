@@ -16,7 +16,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     InMemorySessionStore,
-    RunRequest,
     SessionRunFenced,
     _checkpoint_with_session_run_operation,
 )
@@ -27,6 +26,7 @@ from cayu.sessions.checkpoints import (
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

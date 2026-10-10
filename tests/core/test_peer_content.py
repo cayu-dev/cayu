@@ -571,12 +571,13 @@ def test_public_participant_peer_delivery_uses_registered_policy(
     from cayu.events import EventType
     from cayu.messages import Message
     from cayu.providers.base import ModelStreamEvent
-    from cayu.sessions.base import InMemorySessionStore, RunRequest
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.context_views import (
         ParticipantSessionCreationRequest,
         ParticipantSessionExecutionRequest,
     )
     from cayu.sessions.invocation import InvocationOriginClaim
+    from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.collaboration_postgres import PostgresCollaborationStore
     from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
@@ -1327,13 +1328,11 @@ def test_peer_attempt_generation_bounds(generation):
 def test_store_append_replay_and_conflict(tmp_path, backend, request):
     from cayu.collaboration._contracts import OwnerRef
     from cayu.collaboration.participants import ParticipantRef
-    from cayu.sessions.base import (
-        InMemorySessionStore,
-        RunRequest,
-    )
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.context_views import ParticipantSessionBinding
     from cayu.sessions.messaging import SessionMessageQuery
     from cayu.sessions.records import SessionIdentity, SessionStatus
+    from cayu.sessions.requests import RunRequest
 
     async def run():
         store = InMemorySessionStore()

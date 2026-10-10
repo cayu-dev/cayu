@@ -21,9 +21,10 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.server import ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 

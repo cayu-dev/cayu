@@ -21,9 +21,9 @@ from cayu.applications import CayuApp
 from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.knowledge.search import KnowledgeListQuery, KnowledgeQuery
 from cayu.resource_access import ScopedCayuAccess
-from cayu.sessions.base import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.queries import TaskQuery
 

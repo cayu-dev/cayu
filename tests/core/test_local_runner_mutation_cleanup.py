@@ -18,8 +18,9 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runners import _subprocess as subprocess_module
 from cayu.runners.base import ExecCommand
 from cayu.runners.local import LocalRunner
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.workspaces.local import LocalWorkspace
 

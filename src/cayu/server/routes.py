@@ -287,13 +287,8 @@ from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles,
 )
 from cayu.sessions.base import (
-    COMPACTION_INSTRUCTIONS_MAX_CHARS,
-    CompactSessionRequest,
-    InterruptSessionRequest,
     ModelFailoverPolicy,
     ModelTarget,
-    ResumeRequest,
-    RunRequest,
     SessionStore,
     _with_runtime_resume_transport_metadata,
     run_request_with_runtime_generated_authority,
@@ -352,6 +347,13 @@ from cayu.sessions.records import (
     SessionStatus,
 )
 from cayu.sessions.recovery import StartupRecoveryResult
+from cayu.sessions.requests import (
+    COMPACTION_INSTRUCTIONS_MAX_CHARS,
+    CompactSessionRequest,
+    InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
+)
 from cayu.sessions.summaries import SessionOutcome
 from cayu.sessions.topology import (
     SessionTopologyCycle,

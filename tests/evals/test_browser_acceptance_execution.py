@@ -83,7 +83,7 @@ from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerWorkloadAuthority
 from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime._event_projection import public_event_id, public_event_sequence
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import (
     Tool,
     ToolExecutableRequirement,

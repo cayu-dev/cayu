@@ -23,9 +23,10 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._environment_exposure import require_environment_exposed
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionRunFenced
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
 from cayu.workspaces.local import LocalWorkspace

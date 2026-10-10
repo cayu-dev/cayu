@@ -31,7 +31,7 @@ from cayu.evals.runner import EvalPlan
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 def _source() -> EvaluationSourceIdentityV1:

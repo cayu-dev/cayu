@@ -15,12 +15,13 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._session_continuation import continuation_digest
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

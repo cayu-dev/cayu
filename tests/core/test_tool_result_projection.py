@@ -52,13 +52,11 @@ from cayu.runtime.public_authority import (
 )
 from cayu.sessions.base import (
     InMemorySessionStore,
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
     RuntimePublicationRequest,
     RuntimePublicationResult,
 )
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.files import ReadFileTool

@@ -25,8 +25,8 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 
 

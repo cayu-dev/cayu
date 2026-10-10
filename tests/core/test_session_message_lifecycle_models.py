@@ -8,7 +8,7 @@ import pytest
 
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
     SessionMessageActionRequest,
@@ -23,6 +23,7 @@ from cayu.sessions.messaging import (
     session_message_rejection,
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 @pytest.mark.parametrize(

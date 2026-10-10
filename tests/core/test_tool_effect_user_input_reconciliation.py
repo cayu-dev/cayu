@@ -31,7 +31,8 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.sessions.base import ResumeRequest, RunRequest, SessionRuntimePublicationConflict
+from cayu.sessions.base import SessionRuntimePublicationConflict
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.user_input import UserInputTool

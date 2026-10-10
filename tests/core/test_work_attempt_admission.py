@@ -61,11 +61,8 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions.base import (
     CheckpointTransform,
-    ForkSessionRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
-    ResumeRequest,
-    RunRequest,
     SessionStore,
 )
 from cayu.sessions.checkpoints import (
@@ -75,6 +72,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, Session, SessionIdentity, SessionStatus
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage.migrations import SchemaMode

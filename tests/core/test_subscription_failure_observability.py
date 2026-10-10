@@ -20,7 +20,7 @@ from cayu.providers.openai_subscription import (
     _safe_subscription_error_event,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 CANARY = "secret-credential-response-url-canary"

@@ -11,7 +11,7 @@ from cayu.collaboration._request_coordinator import _initiator
 from cayu.collaboration.peer_content import PeerContentExposureRequest, PeerContentPayload
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import ResumeRequest
+from cayu.sessions.requests import ResumeRequest
 
 
 async def continue_with_reply(

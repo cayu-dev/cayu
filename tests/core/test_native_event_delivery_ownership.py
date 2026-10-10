@@ -15,13 +15,13 @@ import pytest
 
 import cayu
 from cayu.events import Event, EventType
-from cayu.sessions.base import RunRequest
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectQuery,
     PersistedEventSideEffectStatus,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 
 
 def _assert_import_without_adapters(backend):

@@ -42,7 +42,6 @@ from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.messages import Message
 from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import RunRequest
 from cayu.sessions.recovery import (
     RecoveryDecision,
     RecoveryExecutionRequest,
@@ -51,6 +50,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,

@@ -10,8 +10,8 @@ from tests.core.test_browser_session import _context, _durable_context, _FakeBro
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.browser_session import (
     BrowserArtifactPayload,

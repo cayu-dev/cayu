@@ -26,12 +26,12 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent, record_peer_serialization
 from cayu.providers.openai import build_openai_payload
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import RunRequest
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.requests import RunRequest
 from cayu.tools.user_input import UserInputTool
 
 

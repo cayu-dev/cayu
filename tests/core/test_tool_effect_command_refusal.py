@@ -14,7 +14,8 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecResult, Runner
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 from cayu.tools.command_policy import CommandPolicy, CommandPolicyDecision, CommandPolicyResult

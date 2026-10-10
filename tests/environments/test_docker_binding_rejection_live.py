@@ -18,7 +18,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workspaces.local import LocalWorkspace
 

@@ -21,9 +21,9 @@ from cayu.runtime import _tool_round_recovery as recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import RunRequest
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import DurableToolRecoveryEvidence, Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult

@@ -12,13 +12,13 @@ from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
 from cayu.sessions.base import (
     InMemorySessionStore,
     ModelTarget,
-    RunRequest,
     SessionModelTransition,
     SessionStatusConflict,
     SessionStore,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
 
 

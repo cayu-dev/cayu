@@ -23,7 +23,7 @@ from cayu.execution_profiles import (
 from cayu.messages import Message
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
-from cayu.sessions.base import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.vaults import SecretRedactor
 
 DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY = "durable_subagent_submissions"

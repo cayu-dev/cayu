@@ -24,7 +24,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import InterruptSessionRequest, ResumeRequest, SessionMessageQueueStatus
+from cayu.sessions.base import SessionMessageQueueStatus
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
@@ -32,6 +32,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
 )
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 

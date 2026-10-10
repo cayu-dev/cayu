@@ -32,8 +32,9 @@ from cayu.collaboration.exports import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionOperationPublication
+from cayu.sessions.base import InMemorySessionStore, SessionOperationPublication
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor

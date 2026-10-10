@@ -21,12 +21,12 @@ from cayu.runtime.execution_profiles import active_invocation_execution_profile_
 from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_CHECKPOINT_KEY
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    RunRequest,
     _interaction_transition_storage_key,
 )
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageConditions
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 _SESSION = "rejected-only-process-completion"

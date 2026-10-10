@@ -7,13 +7,14 @@ from uuid import uuid4
 import pytest
 from tests.core.test_context_views import _manifest_for_store, _replace_manifest
 
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import (
     ContextViewLimits,
     ContextViewOwnershipRequest,
     ContextViewSelectionRequest,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

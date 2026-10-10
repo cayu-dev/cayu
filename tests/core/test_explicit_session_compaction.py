@@ -65,20 +65,19 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
-from cayu.sessions.base import (
-    CompactSessionRequest,
-    ForkSessionRequest,
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-    SessionRunFenced,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import (
+    CompactSessionRequest,
+    ForkSessionRequest,
+    ResumeRequest,
+    RunRequest,
+)
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

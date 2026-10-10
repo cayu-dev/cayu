@@ -21,11 +21,11 @@ from cayu.runtime.tool_effects import ToolEffectReceipt, ToolEffectReconciliatio
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     InMemorySessionStore,
-    RunRequest,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

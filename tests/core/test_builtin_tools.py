@@ -56,13 +56,13 @@ from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
 )
-from cayu.sessions.base import RunRequest
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import InvocationArtifactStoreHandle, InvocationWorkspaceHandle
 from cayu.tools._runner import InvocationRunnerHandle

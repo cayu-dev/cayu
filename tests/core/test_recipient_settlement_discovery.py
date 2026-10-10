@@ -16,9 +16,9 @@ from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.messages import Message
 from cayu.sessions._recipient_admission import settle_recipient_creation
-from cayu.sessions.base import RunRequest
 from cayu.sessions.context_views import RecipientSessionCreationRequest
 from cayu.sessions.creation_fence import _SESSION_CREATION_AUTHORITY
+from cayu.sessions.requests import RunRequest
 
 
 @pytest.mark.anyio

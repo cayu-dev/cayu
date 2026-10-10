@@ -28,11 +28,11 @@ from cayu.sessions.base import (
     INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
-    RunRequest,
     SessionOperationPublication,
     SessionStore,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import DurableToolOperationConflict
 
 

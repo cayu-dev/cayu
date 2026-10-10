@@ -48,12 +48,8 @@ from cayu.providers.base import (
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
 from cayu.proxies.passthrough import PassthroughProxy
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.tools.base import (
     Tool,
     ToolContext,

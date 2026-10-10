@@ -20,7 +20,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 def test_start_owner_imports_without_execution_controllers() -> None:

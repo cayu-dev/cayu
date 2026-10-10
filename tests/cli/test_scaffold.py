@@ -32,8 +32,9 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.providers.chat_completions import ChatCompletionsProvider
 from cayu.runners.docker_workload import DockerImageIdentity
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.outcomes import run_to_completion
+from cayu.sessions.requests import RunRequest
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.structured_commands import StructuredCommandToolPolicy

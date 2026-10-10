@@ -27,12 +27,13 @@ from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import FilePart, Message, TextPart, ToolResultPart
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     RecipientSessionCreationReceipt,
     RecipientSessionCreationRequest,
 )
+from cayu.sessions.requests import RunRequest
 
 
 class _BlockingRecipientStore(InMemorySessionStore):

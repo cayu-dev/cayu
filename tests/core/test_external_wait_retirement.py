@@ -88,8 +88,8 @@ def test_retirement_preserves_selected_but_unconsumed_session_outcome(backend, t
     from cayu.messages import Message
     from cayu.providers.base import ModelStreamEvent
     from cayu.session_external_waits import SessionExternalWaitAdapter
-    from cayu.sessions.base import RunRequest
     from cayu.sessions.external_waits import ExternalEventDelivery
+    from cayu.sessions.requests import RunRequest
 
     async def scenario():
         async with stores(backend, tmp_path, request, [datetime.now(UTC)]) as (store, reopen):

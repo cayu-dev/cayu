@@ -31,13 +31,14 @@ from cayu.sessions._session_continuation import (
     ContinuationRetirement,
     continuation_digest,
 )
-from cayu.sessions.base import RunRequest, SessionRunFenced
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.external_waits import (
     ExternalEventDelivery,
     ExternalWaitConflict,
     ExternalWaitUnavailable,
     external_wait_digest,
 )
+from cayu.sessions.requests import RunRequest
 from cayu.vaults.redaction import SecretRedactor
 
 

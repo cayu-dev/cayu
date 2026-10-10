@@ -70,7 +70,6 @@ from cayu.server.config import (
     normalize_api_path,
 )
 from cayu.server.contracts import SystemDiagnosticsResponse
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -79,6 +78,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.sessions.terminal_evidence import TerminalSessionEvidence, TerminalSessionEvidenceError
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.records import Task, TaskStatus

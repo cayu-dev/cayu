@@ -10,7 +10,7 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 class _ScriptedStructuredOutputProvider(ModelProvider):

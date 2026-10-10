@@ -95,12 +95,9 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions.base import (
-    ForkSessionRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
     ModelTarget,
-    ResumeRequest,
-    RunRequest,
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
@@ -125,6 +122,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
 )
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

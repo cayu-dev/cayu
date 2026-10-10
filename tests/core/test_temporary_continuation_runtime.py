@@ -39,11 +39,12 @@ from cayu.runtime._temporary_continuation import (
 )
 from cayu.runtime._temporary_continuation_permits import TemporaryServicePermitAuthority
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

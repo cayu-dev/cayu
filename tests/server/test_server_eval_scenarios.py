@@ -47,7 +47,7 @@ from cayu.server import (
 )
 from cayu.server import routes as routes_module
 from cayu.server.evals_registry import EvalTargetRegistration
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

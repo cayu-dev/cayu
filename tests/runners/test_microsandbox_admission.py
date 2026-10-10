@@ -21,7 +21,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecCommand
 from cayu.runners.microsandbox import MicrosandboxRunner
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
 from cayu.tools.search import SearchTextTool
 

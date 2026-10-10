@@ -33,8 +33,8 @@ from cayu.providers import (
 )
 from cayu.proxies import AllowlistProxy
 from cayu.runners import ExecCommand
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.records import Session
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage import (
     InMemoryEmbeddingKnowledgeStore,
     KnowledgeAccessScope,

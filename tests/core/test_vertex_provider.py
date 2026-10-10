@@ -37,7 +37,7 @@ from cayu.providers.vertex import (
     _resolve_credentials,
     _safe_gcp_error,
 )
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 class RecordingTransport:

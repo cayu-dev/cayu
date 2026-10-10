@@ -66,8 +66,6 @@ from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
-    ResumeRequest,
-    RunRequest,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
     runtime_publication_checkpoint_mutation,
@@ -89,6 +87,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

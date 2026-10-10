@@ -14,7 +14,7 @@ from cayu.external_waits import ExternalEventWaits
 from cayu.messages import Message
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.session_external_waits import SessionExternalWaitAdapter
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

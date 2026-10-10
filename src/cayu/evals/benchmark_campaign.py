@@ -78,7 +78,8 @@ from cayu.evals.suite_preflight import (
     allocate_authored_suite_launch_concurrency,
     compile_authored_suite_run_exposure,
 )
-from cayu.sessions.base import ModelTarget, copy_run_request
+from cayu.sessions.base import ModelTarget
+from cayu.sessions.requests import copy_run_request
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 if TYPE_CHECKING:

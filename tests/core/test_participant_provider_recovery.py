@@ -28,13 +28,14 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
     load_pending_provider_operation_disposition,
 )
-from cayu.sessions.base import Message, RunRequest
+from cayu.sessions.base import Message
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import interrupted_task_handoff_request
 from cayu.tasks.memory import InMemoryTaskStore

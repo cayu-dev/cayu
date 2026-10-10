@@ -14,13 +14,14 @@ from tests.core.test_verified_work_contracts import _assert_secret_absent_from_c
 import cayu
 from cayu import _application_task_creation as task_creation
 from cayu.applications import CayuApp
-from cayu.sessions.base import InMemorySessionStore, RunRequest, run_request_with_runtime_invocation
+from cayu.sessions.base import InMemorySessionStore, run_request_with_runtime_invocation
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionExecutionSource,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.storage.tasks_postgres import PostgresTaskStore

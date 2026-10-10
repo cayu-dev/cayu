@@ -13,8 +13,8 @@ from cayu.events import EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 

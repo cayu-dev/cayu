@@ -25,9 +25,10 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectStateOwner,
 )
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.rounds import ToolRoundRecoveryRequest

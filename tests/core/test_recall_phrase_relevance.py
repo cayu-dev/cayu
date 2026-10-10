@@ -320,7 +320,7 @@ def test_runtime_delivers_phrase_supported_record_and_persists_its_reason(versio
     from cayu.memory.evidence import RecallEvidenceQuery
     from cayu.messages import Message
     from cayu.providers.base import ModelStreamEvent
-    from cayu.sessions.base import RunRequest
+    from cayu.sessions.requests import RunRequest
 
     async def check():
         sessions = _CountingSessionStore()

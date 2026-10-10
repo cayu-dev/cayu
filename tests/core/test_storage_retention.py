@@ -29,8 +29,8 @@ from cayu.runtime.storage_retention import (
     apply_workspace_retention,
     run_storage_retention_worker,
 )
-from cayu.sessions.base import RunRequest
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage.retention import (
     RetentionAuditState,
     RetentionMode,

@@ -26,7 +26,7 @@ from cayu.runtime._model_errors import (
     copy_model_provider_error_control,
     model_provider_error_from_payload,
 )
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.models import StepError

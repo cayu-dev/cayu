@@ -15,8 +15,8 @@ from cayu.environments.factory import (
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import RunRequest
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
+from cayu.sessions.requests import RunRequest
 
 
 class _QueuedProvider(ModelProvider):
@@ -186,7 +186,8 @@ def test_queued_search_tool_preserves_exact_admission(
     from cayu.runtime._environment_exposure import require_environment_exposed
     from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
     from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
-    from cayu.sessions.base import InMemorySessionStore, ResumeRequest
+    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.requests import ResumeRequest
     from cayu.storage.sqlite import SQLiteSessionStore
     from cayu.tools.base import ToolExecutableRequirement
     from cayu.tools.search import SearchTextTool

@@ -110,7 +110,7 @@ from cayu.runtime.local_execution_attempts import (
     local_execution_attempt_list_cursor,
     local_execution_attempt_receipt_sha256,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
@@ -119,6 +119,7 @@ from cayu.sessions.invocation import (
     TaskInvocation,
 )
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks._terminalization import terminalize_task_with_retry
 from cayu.tasks.cancellation import (

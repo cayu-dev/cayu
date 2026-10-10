@@ -28,7 +28,8 @@ from cayu.providers import (
     UsageDialect,
     bedrock_billing_identity,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.storage import SQLiteSessionStore
 
 

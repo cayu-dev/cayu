@@ -23,7 +23,7 @@ from cayu.sessions._temporary_service_target import (
     exclude_side_target,
     return_side_target,
 )
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 def side_admission(*, session=None):

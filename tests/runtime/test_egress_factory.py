@@ -88,7 +88,8 @@ from cayu.runtime._environment_lifecycle import (
     _reconcile_binding_finalize_failure_event,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

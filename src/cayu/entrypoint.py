@@ -14,8 +14,8 @@ from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.diagnostics import capture_provider_errors
-from cayu.sessions.base import RunRequest
 from cayu.sessions.outcomes import run_to_completion
+from cayu.sessions.requests import RunRequest
 
 
 def run_project_entrypoint(

@@ -75,7 +75,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions.base import (
-    RunRequest,
     SessionOperationPublication,
     SessionRunFenced,
     fork_session_invocation,
@@ -93,6 +92,7 @@ from cayu.sessions.mcp_manifest_history import (
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, Session, SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.topology import SessionTopologyCycle, SessionTopologyQuery
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.support_bundles import (

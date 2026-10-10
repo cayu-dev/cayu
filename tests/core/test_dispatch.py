@@ -66,12 +66,9 @@ from cayu.runtime.public_authority import (
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions.base import (
-    ForkSessionRequest,
     InMemorySessionStore,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
-    ResumeRequest,
-    RunRequest,
     SessionModelTransition,
     SessionRunFenced,
     SessionStatusConflict,
@@ -95,6 +92,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.sessions.transcript_queries import fork_source_transcript_sha256
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

@@ -25,7 +25,7 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
-from cayu.sessions.base import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request
 
 
 def test_zero_configuration_uses_canonical_runtime_defaults() -> None:

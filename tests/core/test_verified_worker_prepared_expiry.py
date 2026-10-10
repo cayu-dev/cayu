@@ -29,7 +29,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.messages import Message
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
-from cayu.sessions.base import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.tasks.admission import (
     WorkAttemptAdmissionState,
     WorkAttemptExecutionEntryDisposition,

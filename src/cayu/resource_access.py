@@ -333,7 +333,7 @@ class ScopedCayuAccess:
         from contextlib import aclosing
         from uuid import uuid4
 
-        from cayu.sessions.base import RunRequest
+        from cayu.sessions.requests import RunRequest
 
         if type(request) is not RunRequest:
             raise TypeError("Scoped runs require RunRequest.")
@@ -354,7 +354,7 @@ class ScopedCayuAccess:
     async def resume(self, request):
         from contextlib import aclosing
 
-        from cayu.sessions.base import ResumeRequest
+        from cayu.sessions.requests import ResumeRequest
 
         if type(request) is not ResumeRequest:
             raise TypeError("Scoped resume requires ResumeRequest.")
@@ -448,7 +448,7 @@ class ScopedCayuAccess:
     async def fork(self, request):
         from contextlib import aclosing
 
-        from cayu.sessions.base import ForkSessionRequest
+        from cayu.sessions.requests import ForkSessionRequest
 
         if type(request) is not ForkSessionRequest:
             raise TypeError("Scoped forks require ForkSessionRequest.")

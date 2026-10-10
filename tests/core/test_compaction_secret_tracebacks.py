@@ -17,7 +17,8 @@ from cayu.context.base import CheckpointCompactionContextPolicy, ContextBuildErr
 from cayu.context.footprints import RequestFootprintConfig
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import CompactSessionRequest, InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import CompactSessionRequest, RunRequest
 from cayu.vaults.redaction import SecretRedactor
 
 _CANARY = "fictional-rejected-compaction-result-secret-1710"

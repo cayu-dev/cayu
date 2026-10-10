@@ -10,15 +10,11 @@ import cayu.sessions.base as sessions_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.events import Event
 from cayu.messages import Message
-from cayu.sessions.base import (
-    RunRequest,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import SessionOperationPublication, SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 async def assert_session_store_time_conformance(

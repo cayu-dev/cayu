@@ -38,9 +38,10 @@ from cayu.budgets.usage import HostedToolUsageMetrics, UsageMetrics, build_aggre
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStore
+from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.sessions.queries import SessionAggregateFilter, SessionStatusCounts
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.summaries import SessionOperationalSnapshot
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

@@ -31,9 +31,9 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
 )
 from cayu.runtime.stop_policy import RunLimits
-from cayu.sessions.base import ForkSessionRequest
 from cayu.sessions.forks import ForkExecutionProfileSelection
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import ForkSessionRequest
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 

@@ -19,10 +19,10 @@ import cayu
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime._usage_accounting import SessionUsageCache
-from cayu.sessions.base import RunRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

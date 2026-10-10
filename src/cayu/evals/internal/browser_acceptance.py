@@ -90,10 +90,11 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
-from cayu.sessions.base import RunRequest, SessionOperationPublication
+from cayu.sessions.base import SessionOperationPublication
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import RunnerObservedEventIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.terminal_evidence import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,

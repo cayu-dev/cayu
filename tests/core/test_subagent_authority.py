@@ -11,8 +11,8 @@ from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import RunRequest
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.requests import RunRequest
 from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.vaults.redaction import SecretRedactor
 

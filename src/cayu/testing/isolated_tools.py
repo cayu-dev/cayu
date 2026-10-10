@@ -35,7 +35,7 @@ class _DeterministicIsolatedToolHandler:
                 },
             )
         if mode == "execution_deadline":
-            from cayu.sessions.base import RunRequest
+            from cayu.sessions.requests import RunRequest
 
             return ToolResult(
                 content="execution deadline observed",

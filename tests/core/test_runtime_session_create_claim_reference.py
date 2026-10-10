@@ -14,20 +14,19 @@ from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.sessions.base import (
     SESSION_CREATE_CLAIM_METADATA_KEY,
     InMemorySessionStore,
-    RunRequest,
     RuntimeSessionCreateClaimAuthenticationDisposition,
     RuntimeSessionCreateClaimReference,
     RuntimeSessionCreateClaimReferenceKey,
     SessionExecutionSource,
     authenticate_runtime_session_create_claim_reference,
     bind_runtime_session_create_claim,
-    copy_run_request,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
     run_request_with_runtime_session_create_claim_reference,
     runtime_session_create_claim_reference,
 )
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.vaults import SecretRedactor
 

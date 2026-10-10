@@ -16,7 +16,7 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundChildWait,
     foreground_child_state_from_checkpoint,
 )
-from cayu.sessions.base import ResumeRequest
+from cayu.sessions.requests import ResumeRequest
 from cayu.vaults.redaction import SecretRedactor
 
 

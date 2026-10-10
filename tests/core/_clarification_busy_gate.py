@@ -7,7 +7,7 @@ from tests.core.test_participant_identity import CONTEXT
 
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.messages import Message
-from cayu.sessions.base import ResumeRequest
+from cayu.sessions.requests import ResumeRequest
 
 
 async def reject_busy_target(

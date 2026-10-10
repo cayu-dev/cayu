@@ -12,7 +12,7 @@ from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, Message, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore, Message
 from cayu.sessions.context_views import (
     ContextViewLimits,
     ContextViewManifest,
@@ -22,6 +22,7 @@ from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

@@ -30,8 +30,6 @@ from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     InMemorySessionStore,
     ModelCompletionStageRequest,
-    ResumeRequest,
-    RunRequest,
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
@@ -39,6 +37,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

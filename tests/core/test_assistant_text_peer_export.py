@@ -31,12 +31,12 @@ from cayu.collaboration.peer_content import PeerContentPayload
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
-from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.requests import ResumeRequest, RunRequest
 
 PRIVATE = "private-provider-state-canary"
 HIDDEN = "hidden-thinking-canary"

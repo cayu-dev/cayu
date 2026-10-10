@@ -13,7 +13,8 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import ModelTarget, ResumeRequest, RunRequest, copy_run_request
+from cayu.sessions.base import ModelTarget
+from cayu.sessions.requests import ResumeRequest, RunRequest, copy_run_request
 
 
 class NamedFakeProvider(ModelProvider):

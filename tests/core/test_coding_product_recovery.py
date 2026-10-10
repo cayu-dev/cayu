@@ -22,7 +22,7 @@ from cayu.coding_products import (
     CodingTaskAuthority,
 )
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
@@ -665,7 +665,8 @@ def test_recover_settled_execution_without_provider_redispatch(
     from cayu.agents import AgentSpec
     from cayu.environments.base import Environment, EnvironmentSpec
     from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-    from cayu.sessions.base import InMemorySessionStore, ResumeRequest
+    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.requests import ResumeRequest
     from cayu.storage.sqlite import SQLiteSessionStore
 
     old_runner, request, run_request, _ = product

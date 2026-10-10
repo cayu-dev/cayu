@@ -19,7 +19,7 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import Runner
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
 from cayu.tools.git import GitChangesTool
 from cayu.tools.search import SearchTextTool

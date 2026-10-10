@@ -4,13 +4,14 @@ from typing import Any
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PendingActionQuery,
 )
 from cayu.sessions.records import PendingActionKind, SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 _MODEL_STEP_ID = f"mstep_{'1' * 32}"
 _MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"

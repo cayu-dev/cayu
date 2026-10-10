@@ -39,7 +39,7 @@ from cayu.providers.openai_subscription import (
     OpenAISubscriptionProvider,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 _MISSING = object()
 

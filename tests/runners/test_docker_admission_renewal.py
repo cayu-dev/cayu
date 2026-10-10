@@ -702,7 +702,7 @@ def test_live_native_admission_through_owned_container_wrapper():
     from cayu.events import EventType
     from cayu.messages import Message
     from cayu.providers.base import ModelStreamEvent
-    from cayu.sessions.base import RunRequest
+    from cayu.sessions.requests import RunRequest
     from cayu.tools.commands import ExecCommandTool
 
     class OwnedContainerWrapper(DockerRunner):

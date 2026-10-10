@@ -18,7 +18,8 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._event_projection import project_runtime_event
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec

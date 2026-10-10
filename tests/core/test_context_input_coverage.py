@@ -21,8 +21,9 @@ from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._model_step_executor import _context_usage_state_for_session
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 

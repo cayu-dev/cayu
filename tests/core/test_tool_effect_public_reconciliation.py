@@ -44,7 +44,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationResult,
     tool_effect_receipt_digest,
 )
-from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import DurableToolRecoveryEvidence, Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor

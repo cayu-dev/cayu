@@ -141,7 +141,7 @@ async def service_clarification(
     from cayu.sessions._execution_profile_checkpoint import (
         active_invocation_execution_profile_from_checkpoint,
     )
-    from cayu.sessions.base import ResumeRequest
+    from cayu.sessions.requests import ResumeRequest
 
     requests = coordinator.requests
     redactor = requests._redactor

@@ -11,7 +11,7 @@ from cayu.budgets.base import BudgetLimit, BudgetPolicy
 from cayu.budgets.pricing import default_price_book
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 
 
 def _policy(maximum: str = "10") -> BudgetPolicy:

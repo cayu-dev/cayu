@@ -24,12 +24,13 @@ from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
-from cayu.sessions.base import CompactSessionRequest, Message, ResumeRequest, RunRequest
+from cayu.sessions.base import Message
 from cayu.sessions.context_views import (
     ContextViewPublicationRequest,
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.requests import CompactSessionRequest, ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 from cayu.tools.user_input import UserInputTool
 

@@ -13,7 +13,7 @@ from cayu.evals.runner import run_workflow_eval_suite
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.workflow import WorkflowBase

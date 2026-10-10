@@ -8,12 +8,12 @@ from tests.core.test_participant_identity import CONTEXT
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.runtime._session_continuation import continuation_digest
-from cayu.sessions.base import RunRequest
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.requests import RunRequest
 
 
 async def create_target(app, accepted, initialized, participant, wait_context, *, park):

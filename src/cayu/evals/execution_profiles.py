@@ -41,7 +41,7 @@ from cayu.evals.execution import (
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
-from cayu.sessions.base import copy_run_request
+from cayu.sessions.requests import copy_run_request
 
 EVAL_EXECUTION_PROFILE_MAX_TEXT_CHARS = 256
 _EVAL_EXECUTION_PROFILE_REVISION_DOMAIN = "eval_execution_profile_v1"

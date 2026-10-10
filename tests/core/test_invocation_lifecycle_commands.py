@@ -80,8 +80,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     InteractionTransitionSpec,
     ModelTarget,
-    ResumeRequest,
-    RunRequest,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     SessionInvocationAdmission,
@@ -100,6 +98,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY, ToolCapabilityCeiling
 from cayu.vaults.redaction import SecretRedactor

@@ -18,8 +18,8 @@ from cayu.environments.factory import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workspaces.local import LocalWorkspace
 

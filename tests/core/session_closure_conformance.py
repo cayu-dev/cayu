@@ -11,7 +11,6 @@ from cayu.memory.evidence import RecallReceipt
 from cayu.messages import Message
 from cayu.runtime.session_closure import SessionClosureRecord
 from cayu.sessions.base import (
-    RunRequest,
     RuntimePublicationRequest,
     SessionOperationPublication,
     _checkpoint_with_session_run_operation,
@@ -23,6 +22,7 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 async def create_closure_session(store, session_id, parent=None):

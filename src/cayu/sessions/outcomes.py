@@ -20,13 +20,13 @@ from cayu.runtime._exception_detail import (
     exception_detail,
 )
 from cayu.runtime.tool_completion import ToolCompletionResult
-from cayu.sessions.base import ResumeRequest
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import ResumeRequest
 from cayu.vaults import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
-    from cayu.sessions.base import RunRequest
+    from cayu.sessions.requests import RunRequest
 
 
 @dataclass(frozen=True)

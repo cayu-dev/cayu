@@ -42,7 +42,7 @@ from cayu.providers.cache import CacheBreakpoint, CachePolicy, resolve_cache_pol
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.proxies.passthrough import AllowlistProxy
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults.base import SecretRef
 from cayu.vaults.static import StaticVault

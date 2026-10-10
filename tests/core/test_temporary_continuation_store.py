@@ -23,7 +23,8 @@ from cayu.runtime._session_continuation import (
 from cayu.runtime._session_continuation_scope import authenticated_latch_scope
 from cayu.runtime._temporary_continuation import TemporaryServiceRecord, temporary_service_key
 from cayu.sessions._temporary_continuation_store import require_service_deadline
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
 
 
 @pytest.fixture(params=("memory", "sqlite", "postgres"))

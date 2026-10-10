@@ -27,7 +27,7 @@ from cayu.runtime._session_continuation import (
     ContinuationUnavailable,
 )
 from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
-from cayu.sessions.base import ResumeRequest
+from cayu.sessions.requests import ResumeRequest
 from cayu.vaults.redaction import SecretRedactor
 
 

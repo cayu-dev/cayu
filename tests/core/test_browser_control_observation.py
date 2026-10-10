@@ -32,9 +32,10 @@ from cayu.sessions._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     browser_control_checkpoint_read_scope,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.outcomes import run_to_completion
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.browser_control import (
     BrowserControlCheckpoint,

@@ -20,7 +20,7 @@ from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     RecoveryBlockerCode,
@@ -30,6 +30,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 from cayu.tools.exposure import StaticToolExposurePolicy

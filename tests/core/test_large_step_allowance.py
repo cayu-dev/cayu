@@ -13,7 +13,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workflows.workflow import StepRunOptions

@@ -44,7 +44,7 @@ async def native_command(store, *, template=None, side_session=False, require_pe
         )
 
         from cayu.messages import Message
-        from cayu.sessions.base import RunRequest
+        from cayu.sessions.requests import RunRequest
 
         created = await create_admitted_session(
             store,

@@ -76,9 +76,10 @@ from cayu.runtime.verified_task_worker import (
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (
     WorkAttemptAdmissionConflict,
@@ -567,8 +568,8 @@ def test_worker_fences_queued_steering_before_input_or_interaction_publication(
 def test_worker_retirement_restores_ordinary_queued_steering(
     backend, delivery_mode, verified_worker_store_factory, monkeypatch
 ):
-    from cayu.sessions.base import ResumeRequest
     from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageQuery
+    from cayu.sessions.requests import ResumeRequest
 
     async def scenario():
         sessions, tasks = verified_worker_store_factory()

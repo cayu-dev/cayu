@@ -179,8 +179,9 @@ def test_native_cost_snapshot_matches_reference(backend, auxiliary, tmp_path, re
 
     from cayu.messages import Message
     from cayu.runtime import CayuApp
-    from cayu.sessions.base import InMemorySessionStore, RunRequest
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.migrations import SchemaMode
 
@@ -285,8 +286,9 @@ def test_incremental_cost_reprices_only_changed_groups_and_expires_windows(
 
     from cayu.messages import Message
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-    from cayu.sessions.base import InMemorySessionStore, RunRequest
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
 
     async def run():
         from uuid import uuid4
@@ -421,8 +423,9 @@ def test_cost_cursor_rejects_modified_totals_and_invalidates_after_deletion(
     from uuid import uuid4
 
     from cayu.messages import Message
-    from cayu.sessions.base import InMemorySessionStore, RunRequest
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity, SessionStatus
+    from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.migrations import SchemaMode
 
@@ -491,8 +494,8 @@ def test_cost_group_lookup_uses_index_and_keeps_full_attempt_identity(backend, t
 
     from cayu.messages import Message
     from cayu.runtime._cost_accounting import cost_accounting_query
-    from cayu.sessions.base import RunRequest
     from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage import _postgres_session_queries as postgres_queries
     from cayu.storage import _session_store_sql as sql
@@ -578,8 +581,8 @@ def test_cost_snapshot_race_keeps_pending_out_of_next_durable_baseline(
 
     from cayu.messages import Message
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-    from cayu.sessions.base import RunRequest
     from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.migrations import SchemaMode
 
@@ -736,8 +739,9 @@ def test_active_cost_refresh_serializes_and_drops_removed_scopes():
     from cayu.budgets.run_limits import RunLimits
     from cayu.messages import Message
     from cayu.runtime._run_limits import SessionUsageTracker
-    from cayu.sessions.base import InMemorySessionStore, RunRequest
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
 
     async def run():
         store = InMemorySessionStore()

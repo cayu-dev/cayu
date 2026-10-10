@@ -17,7 +17,7 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._approval_support import public_policy_denial_result
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.tools.structured_commands import RunCommandTool, StructuredCommandToolPolicy

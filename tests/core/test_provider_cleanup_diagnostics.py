@@ -18,9 +18,9 @@ from cayu.providers._credential_boundary import (
     provider_cancellation_failures,
 )
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import RunRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 CANARY = "secret-url-header-prompt-credential"

@@ -14,7 +14,6 @@ from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     SESSION_CREATE_CLAIM_METADATA_KEY,
     InMemorySessionStore,
-    RunRequest,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_session_create_claim,
 )
@@ -23,6 +22,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 def test_create_admitted_session_builds_complete_runtime_creation_authority() -> None:

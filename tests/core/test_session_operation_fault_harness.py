@@ -30,13 +30,9 @@ from tests.core.session_operation_fault_conformance import (
 )
 
 from cayu.events import Event, EventType
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RunRequest,
-    SessionOperationPublication,
-    SessionStore,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionOperationPublication, SessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

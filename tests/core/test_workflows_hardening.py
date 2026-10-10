@@ -61,16 +61,12 @@ from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ModelCompletionStageDisposition,
-    ModelTarget,
-    RunRequest,
-)
+from cayu.sessions.base import InMemorySessionStore, ModelCompletionStageDisposition, ModelTarget
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionsRecoveryRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult

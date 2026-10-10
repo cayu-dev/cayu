@@ -23,9 +23,9 @@ from cayu.messages import (
     ThinkingPart,
     ToolCallPart,
 )
-from cayu.sessions.base import RunRequest
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 def _budget_limit_id(value: int) -> str:

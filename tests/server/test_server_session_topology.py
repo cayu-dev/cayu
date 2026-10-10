@@ -22,8 +22,9 @@ from cayu.events import Event, EventType
 from cayu.server import ServerConfig, create_server
 from cayu.server import routes as server_routes
 from cayu.server.contracts import MAX_SESSION_TOPOLOGY_REQUEST_BYTES
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.sessions.topology import SessionTopologyQuery
 
 

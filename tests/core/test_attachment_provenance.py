@@ -19,7 +19,7 @@ from cayu.messages import FilePart, Message
 from cayu.providers import ModelStreamEvent
 from cayu.runtime._model_step_executor import _file_attachment_refs
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import ToolContext
 from cayu.tools.files import ReadFileTool

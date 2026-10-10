@@ -19,9 +19,10 @@ from cayu.observability.watchers import (
     EventWatcherStore,
     InMemoryEventWatcherStore,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, SessionIdentity
+from cayu.sessions.requests import RunRequest
 from cayu.storage import SQLiteEventWatcherStore
 from cayu.storage.migrations import SchemaMode
 

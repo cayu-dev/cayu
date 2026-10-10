@@ -13,7 +13,7 @@ from cayu.observability import TRACE_LEVEL, LoggingEventSink
 from cayu.observability.events import EventSink
 from cayu.observability.logging import _level_for, _register_trace_level
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 if TYPE_CHECKING:

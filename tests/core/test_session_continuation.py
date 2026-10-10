@@ -75,15 +75,9 @@ from cayu.sessions._session_continuation import (
     continuation_registration_operation,
 )
 from cayu.sessions._session_continuation_scope import consumption_scope
-from cayu.sessions.base import (
-    ForkSessionRequest,
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-    SessionOperationPublication,
-    SessionStore,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionOperationPublication, SessionStore
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 from cayu.tools.user_input import UserInputTool

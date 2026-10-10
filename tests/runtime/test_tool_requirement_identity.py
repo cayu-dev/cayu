@@ -30,7 +30,8 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
 )
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import (
     Tool,

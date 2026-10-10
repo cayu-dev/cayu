@@ -46,7 +46,7 @@ from cayu.evals.workflow_target import (
     WorkflowEvalResult,
 )
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from tests.qualification.repository_maintenance_deployment import build_maintenance_deployment
 from tests.qualification.repository_maintenance_identity import MaintenanceRunIntent
 from tests.qualification.repository_maintenance_lifetime import (

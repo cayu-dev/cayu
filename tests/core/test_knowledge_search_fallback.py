@@ -27,7 +27,7 @@ from cayu.memory.relevance import query_concept_eligibility
 from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import RunRequest
+from cayu.sessions.requests import RunRequest
 from cayu.storage.knowledge_indexer import KnowledgeIndexer, KnowledgeIndexRequest
 from cayu.storage.memory import (
     InMemoryEmbeddingKnowledgeStore,

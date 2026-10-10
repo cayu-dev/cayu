@@ -104,15 +104,9 @@ from cayu.runtime._model_errors import (
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryReason, retry_decision
-from cayu.sessions.base import (
-    ModelTarget,
-    ResumeRequest,
-    RunRequest,
-    SessionStore,
-    copy_resume_request,
-    copy_run_request,
-)
+from cayu.sessions.base import ModelTarget, SessionStore
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.requests import ResumeRequest, RunRequest, copy_resume_request, copy_run_request
 from cayu.storage import KnowledgeEntry, KnowledgeHit
 from cayu.storage.memory import copy_knowledge_entry
 from cayu.tasks.dispatch import (

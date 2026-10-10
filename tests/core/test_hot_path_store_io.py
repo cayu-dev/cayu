@@ -14,8 +14,9 @@ from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_control as session_control
 from cayu.runtime._run_limits import SessionUsageTracker
-from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.requests import RunRequest
 
 
 class _FakeProvider(ModelProvider):
