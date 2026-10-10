@@ -972,6 +972,13 @@ closure-lock and database-clock capabilities where needed. Enqueue helpers use
 the publication caller's connection or cursor, preserving atomic event and outbox
 writes. Runtime delivery policy remains in the runtime event writer.
 
+SQLite peer-content persistence lives in `storage/_sqlite_peer_content.py`.
+Complete append, replay, exposure, exclusion and retry operations receive native
+execution, session-loading, clock and creation-decision capabilities. Admission
+and queue/event/receipt writes share one transaction; retry releases its read
+scope before asking the caller for fresh export authorization. Peer contracts,
+attempt rules and creation-fence rules retain their existing owners.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and
