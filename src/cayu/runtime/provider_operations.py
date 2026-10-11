@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+import cayu.sessions as sessions
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
@@ -55,7 +56,7 @@ from cayu.sessions._operation_records import (
     ModelCompletionStageRelease,
     SessionOperationPublication,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
@@ -984,7 +985,7 @@ def _parse_progress_envelope(event: Event) -> ProviderOperationProgressEnvelope:
 
 
 async def commit_provider_operation_progress(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     *,
     stage: ModelCompletionStage,
     model_attempt_identity: ModelAttemptIdentity,
@@ -1222,7 +1223,7 @@ def _progress_event_matches_stream_type(
 
 
 async def _load_accepted_provider_operation_progress(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     *,
     stage: ModelCompletionStage,
     operation: RecoverableProviderOperation,
@@ -1366,7 +1367,7 @@ async def _load_accepted_provider_operation_progress(
 
 
 async def load_recoverable_provider_operation(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     stage: ModelCompletionStage,
 ) -> RecoverableProviderOperation | None:
     """Load one bounded operation identity that exactly matches an active stage."""
@@ -1518,7 +1519,7 @@ async def load_recoverable_provider_operation(
 
 
 async def load_provider_operation_cancellation_resolution(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     stage: ModelCompletionStage,
     operation: RecoverableProviderOperation,
 ) -> ProviderOperationCancellationResolution | None:
@@ -1703,7 +1704,7 @@ async def load_provider_operation_cancellation_resolution(
 
 
 async def load_recoverable_provider_operation_start(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     stage: ModelCompletionStage,
 ) -> RecoverableProviderOperationStart | None:
     """Load one start-only attempt as exact-recovery or ambiguous evidence."""
@@ -2063,7 +2064,7 @@ def _parse_provider_operation_resolution_record(
 
 
 async def _load_provider_operation_resolution_event(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     record: ProviderOperationResolutionRecord,
 ) -> Event:
     records = await session_store.query_events(
@@ -2122,7 +2123,7 @@ async def _load_provider_operation_resolution_event(
 
 
 async def load_provider_operation_resolution(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     session_id: str,
     stage_id: str,
 ) -> ProviderOperationResolutionResult | None:
@@ -2160,7 +2161,7 @@ def pending_provider_operation_disposition_from_checkpoint(
 
 
 async def load_pending_provider_operation_disposition(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     session_id: str,
     *,
     checkpoint: dict[str, Any] | None = None,
@@ -2227,7 +2228,7 @@ async def load_pending_provider_operation_disposition(
 
 
 async def clear_pending_provider_operation_disposition(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     pending: ProviderOperationPendingDisposition,
 ) -> None:
     """Retire exact disposition ownership after its durable effect is reconstructable."""
@@ -2300,7 +2301,7 @@ def validate_provider_operation_retry_preparation(
 
 
 async def resolve_provider_operation_stage(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     request: ProviderOperationResolutionRequest,
     *,
     redactor: SecretRedactor,
@@ -2583,7 +2584,7 @@ async def resolve_provider_operation_stage(
 
 
 async def inspect_provider_operation(
-    session_store: SessionStore,
+    session_store: sessions.SessionStore,
     session_id: str,
 ) -> ProviderOperationInspection:
     """Inspect at most one latest model attempt without hydrating stream deltas."""

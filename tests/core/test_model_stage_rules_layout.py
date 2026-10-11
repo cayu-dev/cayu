@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import pickle
 import subprocess
 import sys
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -32,6 +34,34 @@ def test_model_stage_public_imports_and_historical_pickles(module, name):
     assert getattr(importlib.import_module("cayu.sessions.base"), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
     assert pickle.loads(pickle.dumps(canonical)) is canonical
+
+
+@pytest.mark.parametrize(
+    ("module", "name", "parameter", "type_module", "type_name"),
+    (
+        (
+            "cayu.runtime",
+            "inspect_provider_operation",
+            "session_store",
+            "cayu.sessions.base",
+            "SessionStore",
+        ),
+        (
+            "cayu.runtime._model_failover_stage",
+            "ModelFailoverStageAdmission",
+            "invocation_context",
+            "cayu.runtime._invocation_lifecycle",
+            "InvocationContext",
+        ),
+    ),
+)
+def test_model_stage_runtime_annotations_resolve(module, name, parameter, type_module, type_name):
+    target = getattr(importlib.import_module(module), name)
+    hints = get_type_hints(target)
+    signature = inspect.signature(target, eval_str=True)
+    expected = getattr(importlib.import_module(type_module), type_name)
+    assert hints[parameter] is expected
+    assert signature.parameters[parameter].annotation is expected
 
 
 def _without_stores(code: str) -> None:
@@ -191,5 +221,43 @@ rejected(lambda: rules._reconstruct_model_completion_stage(record, terminal, **k
     SessionModelCompletionStageConflict)
 rejected(lambda: rules._reconstruct_model_completion_stage(None, terminal, **keys),
     SessionModelCompletionStageConflict)
+"""
+    )
+
+
+def test_model_failover_requires_matching_predecessor_evidence_without_stores():
+    _without_stores(
+        _PREPARED_STAGE
+        + """
+from cayu.sessions import _model_failover_rules as failover
+from cayu.sessions._model_failover import ModelFailoverProgress
+
+progress = ModelFailoverProgress.model_validate({
+    "session_id": session.id, "session_instance_id": session.instance_id,
+    "interaction_id": "interaction", "execution_profile_fingerprint": "a" * 64,
+    "plan": {"candidates": [{"provider_name": "fake", "model": "fake",
+        "execution_profile_fingerprint": "b" * 64, "execution_mode": "synchronous"},
+        {"provider_name": "backup", "model": "backup", "execution_profile_fingerprint": "c" * 64,
+        "execution_mode": "synchronous"}],
+        "max_total_attempts": 2},
+    "generation": 1, "candidate_index": 0, "logical_step_id": "step", "stage_id": "stage",
+    "request_fingerprint": "a" * 64, "source_run_epoch": 3, "source_transcript_cursor": 0,
+    "projection_cursor": 0, "dispatch_ordinal": 0, "attempts_used": 1,
+    "candidate_attempt": 1, "provider_effect_observed": False,
+})
+keys = failover._model_failover_progress_storage_keys(progress)
+assert len(keys) == len(set(keys)) == 8
+assert prepared.preparation_storage_key in keys and prepared.terminal_storage_key in keys
+rejected(lambda: failover._require_settled_model_failover_predecessor(
+    session=session, expected=progress, records={}, new_interaction=True,
+    active_present=False, target_run_epoch=3),
+    SessionModelCompletionStageConflict)
+assert failover._model_failover_selection_event(prepared, session=session, prepared_at=now) is None
+assert failover._model_failover_preparation_checkpoint(prepared, session=session,
+    checkpoint=None, current_transcript_cursor=0, active=None, records={}, replayed=False) is None
+active = rules._active_model_completion_stage_record(stage, activated_at=now)
+rules._validate_model_completion_stage_for_dispatch(session=session, checkpoint=None,
+    current_transcript_cursor=0, stage=stage, active_record=active,
+    preparation_record=record, terminal_record=None, settlement_record=None)
 """
     )

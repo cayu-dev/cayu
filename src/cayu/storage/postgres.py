@@ -212,6 +212,14 @@ from cayu.sessions._invocation_scope import (
 )
 from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.sessions._model_completion_publication import ModelCompletionStageSettlementRequest
+from cayu.sessions._model_failover_rules import (
+    _model_failover_admission_storage_keys,
+    _model_failover_checkpoint_after_profile_admission,
+    _model_failover_predecessor_storage_keys,
+    _model_failover_preparation_checkpoint,
+    _model_failover_selection_event,
+    _validate_model_failover_selection_replay,
+)
 from cayu.sessions._model_stage import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     ModelCompletionStage,
@@ -325,11 +333,6 @@ from cayu.sessions.base import (
     _completion_result_event_publication_delete_block_reason,
     _copy_optional_event_id,
     _durable_subagent_parent_delete_block_reason,
-    _model_failover_admission_storage_keys,
-    _model_failover_checkpoint_after_profile_admission,
-    _model_failover_predecessor_storage_keys,
-    _model_failover_preparation_checkpoint,
-    _model_failover_selection_event,
     _prepare_queue_completion_checkpoint_mutation,
     _project_interruption_cascade_marker_fields,
     _public_authority_alias_store_key,
@@ -338,7 +341,6 @@ from cayu.sessions.base import (
     _run_session_commit_guard_owned,
     _terminal_publication_delete_block_reason,
     _validate_inactive_for_seconds,
-    _validate_model_failover_selection_replay,
 )
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,

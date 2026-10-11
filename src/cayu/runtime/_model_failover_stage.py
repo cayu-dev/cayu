@@ -10,14 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+import cayu.runtime as runtime
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.providers.base import ModelProviderError
-from cayu.runtime._execution_profile_admission import bind_model_failover_execution_profile
-from cayu.runtime._invocation_lifecycle import (
-    InvocationContext,
-)
 from cayu.runtime._model_failover import (
     FailoverDisposition,
     FailoverObservation,
@@ -40,7 +37,7 @@ from cayu.sessions._model_failover import (
     validate_model_failover_successor,
 )
 from cayu.sessions._model_stage import ModelCompletionStage, SessionModelCompletionStageConflict
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -53,7 +50,7 @@ from cayu.sessions.records import Session
 class ModelFailoverStageAdmission:
     """In-process proof, intentionally not accepted by public JSON entrances."""
 
-    invocation_context: InvocationContext
+    invocation_context: runtime.InvocationContext
     candidate_profiles: tuple[ExecutionProfileIdentity, ...]
     expected: ModelFailoverProgress | ModelFailoverSelection | None
     successor: ModelFailoverProgress
@@ -64,6 +61,9 @@ class ModelFailoverStageAdmission:
     observation: FailoverObservation | None = None
 
     def __post_init__(self) -> None:
+        from cayu.runtime._execution_profile_admission import bind_model_failover_execution_profile
+        from cayu.runtime._invocation_lifecycle import InvocationContext
+
         if type(self.invocation_context) is not InvocationContext:
             raise TypeError("Model failover requires an authenticated InvocationContext.")
         self.invocation_context._validate()

@@ -1,4 +1,7 @@
 {
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime-inspect_provider_operation-session_store-cayu.sessions.base-SessionStore]": 0.02617462503258139,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime._model_failover_stage-ModelFailoverStageAdmission-invocation_context-cayu.runtime._invocation_lifecycle-InvocationContext]": 0.16546170803485438,
+  "tests/core/test_model_stage_rules_layout.py::test_model_failover_requires_matching_predecessor_evidence_without_stores": 0.6510339579544961,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_preparation_dispatch_and_settlement_reconcile_without_stores": 0.6114372499287128,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_terminal_material_replays_and_rejects_tampering_without_stores": 0.6123620820580982,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionManualRecoveryRequest]": 0.00018195802113041282,
