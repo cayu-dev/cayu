@@ -14,10 +14,6 @@ from cayu.runtime._child_session_notifications import (
 )
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
-from cayu.sessions._interaction_receipts import (
-    INTERACTION_TRANSITION_OPERATION_KEY_PREFIX,
-    INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
-)
 
 RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX = "__cayu_runtime_publication_v1__:"
 
@@ -227,3 +223,9 @@ class SessionOperationPublication(BaseModel):
             if type(record) is not dict:
                 raise ValueError("Session operation records must be objects.")
         return copied
+
+
+INTERACTION_TRANSITION_OPERATION_KEY_PREFIX = "__cayu_interaction_transition_v1__:"
+
+
+INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX = "__cayu_invocation_terminal_event_v1__:"

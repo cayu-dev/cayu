@@ -1005,7 +1005,7 @@ def test_rejection_yield_rechecks_queue_and_epoch(takeover: bool) -> None:
 
 
 def test_running_handoff_requires_exact_finalization_mutation(tmp_path, monkeypatch) -> None:
-    original = session_module._checkpoint_after_queued_interaction_profile_handoff
+    original = interaction_receipts._checkpoint_after_queued_interaction_profile_handoff
     checked = 0
 
     def check_handoff(session, checkpoint, handoff, **kwargs):
@@ -1058,7 +1058,7 @@ def test_running_handoff_requires_exact_finalization_mutation(tmp_path, monkeypa
         return original(session, checkpoint, handoff, **kwargs)
 
     monkeypatch.setattr(
-        session_module, "_checkpoint_after_queued_interaction_profile_handoff", check_handoff
+        interaction_receipts, "_checkpoint_after_queued_interaction_profile_handoff", check_handoff
     )
     # Capture real runtime-produced receipt/profile authority at the actual
     # delivery boundary, then allow the authentic mutation to complete normally.

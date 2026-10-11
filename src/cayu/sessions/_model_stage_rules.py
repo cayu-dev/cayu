@@ -20,6 +20,7 @@ from cayu.sessions import _runtime_publication_rules as publication_rules
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import records as session_record_rules
 from cayu.sessions import recovery as session_recovery_rules
+from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -389,8 +390,6 @@ def _validate_model_completion_stage_recovery_fence(
     now: datetime,
 ) -> None:
     """Admit a new synthetic terminal inside the store's existing transaction."""
-    from cayu.runtime._durable_model_terminalization import require_terminalization_plan_owner
-
     if (
         session.instance_id != fence.expected_session_instance_id
         or session.run_epoch != fence.expected_run_epoch
@@ -1961,3 +1960,28 @@ def _replay_promoted_model_completion_stage(
         receipt=receipt,
         replayed=True,
     )
+
+
+def require_terminalization_plan_owner(
+    checkpoint: dict[str, Any] | None,
+    expected: DurableOperationOwnership | None,
+    now: datetime,
+) -> None:
+    marker = None if checkpoint is None else checkpoint.get("recovery_plan_execution")
+    if marker is None:
+        if expected is not None:
+            raise SessionRunFenced("Model terminalization lost its plan owner.")
+        return
+    if type(marker) is not dict or expected is None:
+        raise SessionRunFenced("Model terminalization is owned by another recovery plan.")
+    current = DurableOperationOwnership.model_validate(marker.get("ownership"))
+    if (
+        current.claim_id != expected.claim_id
+        or current.generation != expected.generation
+        or current.owner_id != expected.owner_id
+        or current.operation_id != expected.operation_id
+        or current.state.value != "active"
+        or current.lease_expires_at is None
+        or current.lease_expires_at <= now
+    ):
+        raise SessionRunFenced("Model terminalization recovery plan expired or changed.")

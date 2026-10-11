@@ -261,3 +261,52 @@ rules._validate_model_completion_stage_for_dispatch(session=session, checkpoint=
     preparation_record=record, terminal_record=None, settlement_record=None)
 """
     )
+
+
+def test_queued_handoff_reconstructs_exact_active_stage_and_dispatch_without_stores():
+    _without_stores(
+        _PREPARED_STAGE
+        + """
+from cayu.sessions import _interaction_receipts as handoffs
+from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+
+dispatch_key = rules._model_completion_stage_dispatch_storage_key(stage.stage_id)
+records = {
+    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY:
+        rules._active_model_completion_stage_record(stage, activated_at=now),
+    prepared.preparation_storage_key: record,
+    dispatch_key: rules._model_completion_stage_dispatch_record(stage, dispatched_at=now),
+}
+active, dispatch = handoffs._historical_queued_handoff_stage_from_records(session.id, records)
+assert active is not None and active.stage == stage
+assert dispatch is not None and dispatch.preparation_digest == stage.preparation_digest
+records[dispatch_key]["interaction_id"] = "another-interaction"
+rejected(lambda: handoffs._historical_queued_handoff_stage_from_records(session.id, records),
+    SessionModelCompletionStageConflict)
+assert handoffs._historical_queued_handoff_stage_from_records(session.id, {}) == (None, None)
+"""
+    )
+
+
+def test_model_terminalization_plan_checks_exact_live_ownership_without_stores():
+    _without_stores(
+        """
+from datetime import UTC, datetime, timedelta
+from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
+from cayu.sessions._model_stage_rules import require_terminalization_plan_owner
+from cayu.sessions.authority import SessionRunFenced
+
+now = datetime(2026, 1, 1, tzinfo=UTC)
+owner = DurableOperationOwnership(operation_id="operation", claim_id="claim", owner_id="owner",
+    generation=1, acquired_at=now, renewed_at=now, lease_expires_at=now + timedelta(seconds=30))
+checkpoint = {"recovery_plan_execution": {"ownership": owner.model_dump(mode="json")}}
+require_terminalization_plan_owner(checkpoint, owner, now)
+require_terminalization_plan_owner(None, None, now)
+rejected(lambda: require_terminalization_plan_owner(checkpoint, None, now), SessionRunFenced)
+rejected(lambda: require_terminalization_plan_owner(None, owner, now), SessionRunFenced)
+rejected(lambda: require_terminalization_plan_owner(checkpoint, owner,
+    now + timedelta(seconds=30)), SessionRunFenced)
+checkpoint["recovery_plan_execution"]["ownership"]["generation"] = 2
+rejected(lambda: require_terminalization_plan_owner(checkpoint, owner, now), SessionRunFenced)
+"""
+    )

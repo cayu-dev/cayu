@@ -23,11 +23,9 @@ from tests.core._session_operation_fault_harness import (
 )
 
 from cayu.events import Event, EventType
-from cayu.sessions._interaction_receipts import (
+from cayu.sessions._operation_records import (
     INTERACTION_TRANSITION_OPERATION_KEY_PREFIX,
     INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
-)
-from cayu.sessions._operation_records import (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SessionOperationPublication,

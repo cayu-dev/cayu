@@ -18,7 +18,11 @@ from cayu.messages import Message
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.sessions._access_rules import require_resource_session
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
-from cayu.sessions._interaction_receipts import _interaction_transition_storage_key
+from cayu.sessions._interaction_receipts import (
+    _checkpoint_after_queued_interaction_profile_handoff,
+    _historical_queued_handoff_stage_from_records,
+    _interaction_transition_storage_key,
+)
 from cayu.sessions._interaction_transitions import (
     QueuedInteractionProfileHandoff,
     _copy_historical_queued_interaction_profile_handoff,
@@ -38,8 +42,6 @@ from cayu.sessions.base import (
     SessionMessageQueueStatus,
     SessionRunFenced,
     _check_closure_lineage_owner,
-    _checkpoint_after_queued_interaction_profile_handoff,
-    _historical_queued_handoff_stage_from_records,
     _validate_message_delivery_eligible_through,
 )
 from cayu.sessions.messaging import (

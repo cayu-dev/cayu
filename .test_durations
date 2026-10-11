@@ -1,6 +1,8 @@
 {
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime-inspect_provider_operation-session_store-cayu.sessions.base-SessionStore]": 0.02617462503258139,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime._model_failover_stage-ModelFailoverStageAdmission-invocation_context-cayu.runtime._invocation_lifecycle-InvocationContext]": 0.16546170803485438,
+  "tests/core/test_model_stage_rules_layout.py::test_model_terminalization_plan_checks_exact_live_ownership_without_stores": 1.2019811679492705,
+  "tests/core/test_model_stage_rules_layout.py::test_queued_handoff_reconstructs_exact_active_stage_and_dispatch_without_stores": 1.1745869999867864,
   "tests/core/test_model_stage_rules_layout.py::test_model_failover_requires_matching_predecessor_evidence_without_stores": 0.6510339579544961,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_preparation_dispatch_and_settlement_reconcile_without_stores": 0.6114372499287128,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_terminal_material_replays_and_rejects_tampering_without_stores": 0.6123620820580982,

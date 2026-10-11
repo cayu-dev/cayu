@@ -4734,8 +4734,8 @@ class SQLiteSessionStore(
                 if terminalization_only:
                     from cayu.runtime._durable_model_terminalization import (
                         require_terminalization_checkpoint,
-                        require_terminalization_plan_owner,
                     )
+                    from cayu.sessions._model_stage_rules import require_terminalization_plan_owner
 
                     require_terminalization_checkpoint(loaded, current_checkpoint)
 

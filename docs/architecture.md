@@ -720,6 +720,26 @@ session store. Runtime callers retain sequencing, while each store keeps the
 complete authorization, snapshot, validation and publication operation inside
 its existing lock or transaction.
 
+### Model-completion stage contracts and rules
+
+`sessions/_model_stage.py` owns stage requests, dispatch and settlement records,
+recovery fences and outcomes. `sessions/_model_stage_rules.py` owns preparation,
+durable record reconstruction, dispatch and settlement validation, abandonment,
+promotion and exact replay. `sessions/_model_stage_publication.py` validates the
+completion material, including assistant-turn and compaction evidence.
+
+`sessions/_model_failover_rules.py` reconciles predecessor evidence and validates
+admission and preparation checkpoints. Live admission construction and provider
+execution remain in runtime. Stage-dependent queued handoff reconciliation lives
+with interaction receipts in `sessions/_interaction_receipts.py`. Protected
+operation namespaces, exact stage-release values and atomic session-operation
+publication values use `sessions/_operation_records.py`.
+
+These parts accept explicit records and snapshots and can be used without a
+concrete session store. Each backend retains authorization, locking, transactions
+and the complete prepare/apply operation. Public imports continue to resolve to
+the canonical records and rules.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

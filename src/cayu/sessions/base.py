@@ -94,12 +94,6 @@ from cayu.sessions._execution_profile_rules import (
     session_model_projection_cursor as session_model_projection_cursor,
 )
 from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
-from cayu.sessions._interaction_receipts import (
-    INTERACTION_TRANSITION_OPERATION_KEY_PREFIX as INTERACTION_TRANSITION_OPERATION_KEY_PREFIX,
-)
-from cayu.sessions._interaction_receipts import (
-    INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX as INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
-)
 from cayu.sessions._interaction_transitions import (
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY as QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
 )
@@ -230,6 +224,12 @@ from cayu.sessions._model_stage import (
 )
 from cayu.sessions._model_stage_rules import (
     model_completion_stage_settlement_request as model_completion_stage_settlement_request,
+)
+from cayu.sessions._operation_records import (
+    INTERACTION_TRANSITION_OPERATION_KEY_PREFIX as INTERACTION_TRANSITION_OPERATION_KEY_PREFIX,
+)
+from cayu.sessions._operation_records import (
+    INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX as INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
 )
 from cayu.sessions._operation_records import (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX as MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
@@ -11965,8 +11965,8 @@ class InMemorySessionStore(
             if terminalization_only:
                 from cayu.runtime._durable_model_terminalization import (
                     require_terminalization_checkpoint,
-                    require_terminalization_plan_owner,
                 )
+                from cayu.sessions._model_stage_rules import require_terminalization_plan_owner
 
                 require_terminalization_checkpoint(session, current_checkpoint)
 
@@ -14623,14 +14623,16 @@ class InMemorySessionStore(
                                     marker.stage_id
                                 ),
                             )
-                    repaired_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
-                        session,
-                        self._checkpoints.get(session_id),
-                        profile_handoff,
-                        settlement_record=receipt_record,
-                        replayed_delivery=True,
-                        active_model_stage=active_model_stage,
-                        stage_dispatch=stage_dispatch,
+                    repaired_checkpoint = (
+                        interaction_receipts._checkpoint_after_queued_interaction_profile_handoff(
+                            session,
+                            self._checkpoints.get(session_id),
+                            profile_handoff,
+                            settlement_record=receipt_record,
+                            replayed_delivery=True,
+                            active_model_stage=active_model_stage,
+                            stage_dispatch=stage_dispatch,
+                        )
                     )
                     self._store_checkpoint_unlocked(session_id, repaired_checkpoint)
                 return replayed_batch
@@ -14789,12 +14791,14 @@ class InMemorySessionStore(
                     raise SessionRunFenced(
                         "Queued interaction handoff lost its predecessor settlement receipt."
                     )
-                rebound_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
-                    session,
-                    self._checkpoints.get(session_id),
-                    profile_handoff,
-                    settlement_record=receipt_record,
-                    replayed_delivery=False,
+                rebound_checkpoint = (
+                    interaction_receipts._checkpoint_after_queued_interaction_profile_handoff(
+                        session,
+                        self._checkpoints.get(session_id),
+                        profile_handoff,
+                        settlement_record=receipt_record,
+                        replayed_delivery=False,
+                    )
                 )
 
             updated_messages: list[SessionQueuedMessage] = []
@@ -14961,18 +14965,22 @@ class InMemorySessionStore(
                 raise SessionRunFenced(
                     "Historical queued interaction handoff lost its predecessor settlement."
                 )
-            active_model_stage, stage_dispatch = _historical_queued_handoff_stage_from_records(
-                session_id,
-                operation_records,
+            active_model_stage, stage_dispatch = (
+                interaction_receipts._historical_queued_handoff_stage_from_records(
+                    session_id,
+                    operation_records,
+                )
             )
-            repaired_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
-                session,
-                self._checkpoints.get(session_id),
-                profile_handoff,
-                settlement_record=settlement_record,
-                replayed_delivery=True,
-                active_model_stage=active_model_stage,
-                stage_dispatch=stage_dispatch,
+            repaired_checkpoint = (
+                interaction_receipts._checkpoint_after_queued_interaction_profile_handoff(
+                    session,
+                    self._checkpoints.get(session_id),
+                    profile_handoff,
+                    settlement_record=settlement_record,
+                    replayed_delivery=True,
+                    active_model_stage=active_model_stage,
+                    stage_dispatch=stage_dispatch,
+                )
             )
             self._store_checkpoint_unlocked(session_id, repaired_checkpoint)
             return target.model_copy(deep=True)
@@ -19308,167 +19316,6 @@ def _validate_equivalent_message_delivery(
         or existing.reject_only != reject_only
     ):
         raise ValueError("delivery_id was already used for a different queue delivery.")
-
-
-def _checkpoint_after_queued_interaction_profile_handoff(
-    session: Session,
-    checkpoint: dict[str, Any] | None,
-    handoff: QueuedInteractionProfileHandoff,
-    *,
-    settlement_record: object,
-    replayed_delivery: bool,
-    active_model_stage: ActiveModelCompletionStage | None = None,
-    stage_dispatch: ModelCompletionStageDispatch | None = None,
-) -> dict[str, Any]:
-    """CAS A to B only from the exact queue-conditional settlement receipt."""
-
-    from cayu.runtime._producer_output_store import producer_owns_invocation
-
-    if producer_owns_invocation(checkpoint):
-        raise SessionRunFenced("Queued successor requires settled producer responsibility.")
-
-    expected = handoff.expected_active_profile
-    target = handoff.target_active_profile
-    if (
-        session.id != expected.session_id
-        or session.instance_id != handoff.expected_session_instance_id
-        or session.run_epoch != expected.run_epoch
-    ):
-        raise SessionRunFenced("Queued interaction handoff lost its session run authority.")
-    receipt = interaction_receipts._load_interaction_transition_receipt(settlement_record)
-    interaction_receipts._validate_interaction_transition_receipt_authority(
-        receipt,
-        current_session=session,
-        current_checkpoint=checkpoint,
-        expected_session_instance_id=handoff.expected_session_instance_id,
-        expected_active_invocation_profile=expected,
-    )
-    if (
-        receipt.event.id != handoff.predecessor_settlement_event_id
-        or receipt.event.type is not EventType.INTERACTION_COMPLETED
-        or receipt.event.interaction_id != expected.interaction_id
-        or not receipt.only_if_no_queued_messages
-        or receipt.to_status not in {SessionStatus.COMPLETED, SessionStatus.RUNNING}
-        or receipt.status_changed
-        or receipt.terminal_event is not None
-    ):
-        raise SessionRunFenced(
-            "Queued interaction handoff lacks the exact predecessor settlement receipt."
-        )
-    if receipt.to_status is SessionStatus.RUNNING:
-        # A completion-critical predecessor remains RUNNING only to install
-        # its finalization marker at an empty-queue boundary. Reconstruct the
-        # full transition contract: it requires exactly one unconditional set
-        # of pending_completion_finalization, not an arbitrary checkpoint write.
-        # status_changed=False above proves that this mutation was not applied.
-        try:
-            transition = interaction_receipts._interaction_transition_spec_from_receipt(receipt)
-            if transition.checkpoint_mutation is None:
-                raise ValueError
-            RuntimePublicationMutation.model_validate(transition.checkpoint_mutation)
-        except (TypeError, ValueError):
-            raise SessionRunFenced(
-                "Queued interaction handoff lacks a completion-finalization transition."
-            ) from None
-    current = active_invocation_execution_profile_from_checkpoint(checkpoint)
-    if current == target:
-        if not replayed_delivery:
-            raise SessionRunFenced("Queued interaction handoff was already committed elsewhere.")
-        assert checkpoint is not None
-        return copy_durable_json_object(checkpoint, "checkpoint")
-    if session.status is not SessionStatus.RUNNING:
-        raise SessionRunFenced("Queued interaction handoff lost its running session authority.")
-    if current != expected:
-        raise SessionRunFenced("Queued interaction handoff lost its active-profile CAS.")
-    if replayed_delivery:
-        _validate_historical_queued_interaction_profile_handoff_stage(
-            handoff,
-            active_model_stage=active_model_stage,
-            stage_dispatch=stage_dispatch,
-        )
-    return checkpoint_with_active_invocation_execution_profile(
-        checkpoint,
-        session_id=session.id,
-        interaction_id=target.interaction_id,
-        run_epoch=target.run_epoch,
-        profile=target.profile,
-        expected=expected,
-    )
-
-
-def _validate_historical_queued_interaction_profile_handoff_stage(
-    handoff: QueuedInteractionProfileHandoff,
-    *,
-    active_model_stage: ActiveModelCompletionStage | None,
-    stage_dispatch: ModelCompletionStageDispatch | None,
-) -> None:
-    """Require exact dispatched B authority before repairing a historical split."""
-
-    target = handoff.target_active_profile
-    if active_model_stage is None or stage_dispatch is None:
-        raise SessionRunFenced(
-            "Historical queued interaction handoff lacks an active dispatched target stage."
-        )
-    stage = active_model_stage.stage
-    try:
-        model_stage_rules._validate_model_completion_stage_dispatch(stage_dispatch, stage)
-    except SessionModelCompletionStageConflict as exc:
-        raise SessionRunFenced(
-            "Historical queued interaction handoff has conflicting target dispatch evidence."
-        ) from exc
-    if (
-        stage.session_id != target.session_id
-        or stage.source_run_epoch != target.run_epoch
-        or stage.intent.get("interaction_id") != target.interaction_id
-        or model_stage_rules._model_completion_stage_execution_profile_fingerprint(stage)
-        != target.profile.fingerprint
-        or stage_dispatch.interaction_id != target.interaction_id
-        or stage_dispatch.source_run_epoch != target.run_epoch
-        or stage_dispatch.execution_profile_fingerprint != target.profile.fingerprint
-    ):
-        raise SessionRunFenced(
-            "Historical queued interaction handoff target stage lacks exact profile authority."
-        )
-
-
-def _historical_queued_handoff_stage_from_records(
-    session_id: str,
-    operation_records: Mapping[str, Any],
-) -> tuple[ActiveModelCompletionStage | None, ModelCompletionStageDispatch | None]:
-    """Reconstruct one active stage and dispatch from a store-atomic record snapshot."""
-
-    active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
-    if active_record is None:
-        return None, None
-    marker = model_stage_rules._reconstruct_active_model_completion_stage_record(
-        active_record,
-        session_id=session_id,
-    )
-    _, _, preparation_key, terminal_key = (
-        model_stage_rules._model_completion_stage_storage_identity(
-            session_id,
-            marker.stage_id,
-        )
-    )
-    active = model_stage_rules._reconstruct_active_model_completion_stage(
-        active_record,
-        operation_records.get(preparation_key),
-        operation_records.get(terminal_key),
-        session_id=session_id,
-    )
-    dispatch_key = model_stage_rules._model_completion_stage_dispatch_storage_key(marker.stage_id)
-    dispatch_record = operation_records.get(dispatch_key)
-    dispatch = (
-        None
-        if dispatch_record is None
-        else model_stage_rules._reconstruct_model_completion_stage_dispatch(
-            dispatch_record,
-            session_id=session_id,
-            stage_id=marker.stage_id,
-            storage_key=dispatch_key,
-        )
-    )
-    return active, dispatch
 
 
 def _validate_message_delivery_eligible_through(value: int | None) -> int | None:

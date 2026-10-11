@@ -38,7 +38,10 @@ from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
 )
-from cayu.sessions._model_stage_rules import _validate_model_completion_stage_dispatch
+from cayu.sessions._model_stage_rules import (
+    _validate_model_completion_stage_dispatch,
+    require_terminalization_plan_owner,
+)
 from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionQuery
@@ -63,31 +66,6 @@ def terminalization_plan_scope(ownership: DurableOperationOwnership) -> Iterator
 
 def terminalization_plan_owner() -> DurableOperationOwnership | None:
     return _PLAN_OWNER.get()
-
-
-def require_terminalization_plan_owner(
-    checkpoint: dict[str, Any] | None,
-    expected: DurableOperationOwnership | None,
-    now: datetime,
-) -> None:
-    marker = None if checkpoint is None else checkpoint.get("recovery_plan_execution")
-    if marker is None:
-        if expected is not None:
-            raise SessionRunFenced("Model terminalization lost its plan owner.")
-        return
-    if type(marker) is not dict or expected is None:
-        raise SessionRunFenced("Model terminalization is owned by another recovery plan.")
-    current = DurableOperationOwnership.model_validate(marker.get("ownership"))
-    if (
-        current.claim_id != expected.claim_id
-        or current.generation != expected.generation
-        or current.owner_id != expected.owner_id
-        or current.operation_id != expected.operation_id
-        or current.state.value != "active"
-        or current.lease_expires_at is None
-        or current.lease_expires_at <= now
-    ):
-        raise SessionRunFenced("Model terminalization recovery plan expired or changed.")
 
 
 _TERMINALIZATION_DEADLINE_SECONDS = 30
