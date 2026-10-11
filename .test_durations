@@ -1,4 +1,7 @@
 {
+  "tests/core/test_native_memory_evidence_ownership.py::test_sqlite_memory_evidence_imports_without_adapters_or_driver": 1.022,
+  "tests/core/test_native_memory_evidence_ownership.py::test_sqlite_memory_evidence_composes_with_native_runners[RuntimeError]": 0.294,
+  "tests/core/test_native_memory_evidence_ownership.py::test_sqlite_memory_evidence_composes_with_native_runners[CancelledError]": 0.304,
   "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[factory-RuntimeError]": 1.991159,
   "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[factory-CancelledError]": 0.661463,
   "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[iteration-RuntimeError]": 0.26267,
