@@ -28,9 +28,7 @@ from cayu.runtime._tool_invocation.context import (
 )
 from cayu.runtime._tool_invocation.resources import ToolInvocationCall
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
-from cayu.sessions.base import (
-    SessionStore,
-)
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import (
     ToolContext,
     ToolEffect,

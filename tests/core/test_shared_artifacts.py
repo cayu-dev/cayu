@@ -31,10 +31,11 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runners.local import LocalRunner
 from cayu.runtime._tool_round_staging import _project_staged_terminal_event
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest, run_request_with_runtime_invocation
+from cayu.sessions.store import SessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import _shared_artifact_result_schema as shared_artifact_result_schema
 from cayu.tools import _shared_artifact_results as shared_artifact_results

@@ -71,7 +71,6 @@ from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryResult,
 )
 from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
@@ -118,6 +117,7 @@ from cayu.sessions.recovery import (
     StaleRecoveryPlanError,
     _incomplete_recovery_claim_from_checkpoint,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tasks.handoff import TaskInterruptedHandoffReceipt, interrupted_task_handoff_request
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus

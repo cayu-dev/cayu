@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from cayu.events import Event
 from cayu.runtime._event_projection import public_event_sequence
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.store import SessionStore
 
 
 async def private_event_for_public_event(store: SessionStore, event: Event) -> Event:

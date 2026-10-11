@@ -96,7 +96,6 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
 )
 from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import (
@@ -110,6 +109,7 @@ from cayu.sessions.recovery import (
 from cayu.sessions.requests import (
     ResumeRequest,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.creation import (
     _task_invocation_for_attachment,

@@ -42,7 +42,7 @@ from cayu.memory.evidence import (
     validate_new_context_exposure,
 )
 from cayu.runtime._memory_evidence import MemoryEvidenceKey
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 
 _ALIAS_CONTEXT = b"cayu.memory-attribution.alias.v1"
 _AliasKind = Literal["receipt", "exposure", "item", "interaction"]

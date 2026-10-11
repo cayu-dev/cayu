@@ -18,10 +18,10 @@ from cayu.approvals.user_input import (
     USER_INPUT_SUPERSESSION_INTENT_KEY,
     UserInputSupersessionIntent,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionRecord
 from cayu.sessions.records import PendingActionKind
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import ToolResult
 
 AttentionKind = Literal["user_input", "tool_approval", "manual_recovery"]

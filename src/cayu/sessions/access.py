@@ -21,7 +21,6 @@ from cayu.sessions._access_rules import require_resource_session as require_reso
 from cayu.sessions._access_rules import runtime_session_mutation as runtime_session_mutation
 from cayu.sessions._access_rules import runtime_session_query as runtime_session_query
 from cayu.sessions._access_rules import scoped_creation_binding as scoped_creation_binding
-from cayu.sessions.base import SessionStore
 from cayu.sessions.queries import (
     SessionListResult,
     SessionQuery,
@@ -29,6 +28,7 @@ from cayu.sessions.queries import (
 )
 from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 
 
 class ScopedSessionAccess:

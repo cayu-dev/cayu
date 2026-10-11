@@ -138,10 +138,8 @@ from cayu.runtime._tool_round_staging import (
     _prepare_tool_result_event,
     _redactor_for_tool_calls,
 )
-from cayu.sessions.base import (
-    SessionStore,
-)
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,

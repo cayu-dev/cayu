@@ -45,8 +45,8 @@ from cayu.runtime.application_lifecycle import (
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.mcp_manifest_policy import McpManifestPolicy, McpManifestPolicyAction
 from cayu.runtime.tool_effects import ToolEffectReconciliationRegistration
-from cayu.sessions.base import SessionStore
 from cayu.sessions.child_context import ChildSessionContextContributor
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import Tool, ToolEffect
 from cayu.tools.catalogue import build_tool_catalog_snapshot
 from cayu.tools.discovery import (

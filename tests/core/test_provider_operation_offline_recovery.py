@@ -123,7 +123,7 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_stage import ModelCompletionStageRequest
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced, SessionStore
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
@@ -137,6 +137,7 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
 )
+from cayu.sessions.store import SessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate

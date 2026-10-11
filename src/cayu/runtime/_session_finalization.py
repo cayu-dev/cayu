@@ -288,7 +288,7 @@ from cayu.sessions._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
 )
@@ -310,6 +310,7 @@ from cayu.sessions.records import (
     SessionStatusConflict,
 )
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import (
     TranscriptQuery,
 )

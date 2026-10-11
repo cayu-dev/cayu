@@ -49,7 +49,7 @@ from cayu.providers.base import (
 )
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 

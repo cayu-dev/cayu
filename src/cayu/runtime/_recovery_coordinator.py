@@ -325,7 +325,7 @@ from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.cleanup import (
     RecoveryCleanupStep,
 )
@@ -343,6 +343,7 @@ from cayu.sessions.recovery import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _incomplete_recovery_claim_from_checkpoint,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.store import TaskStore
 from cayu.tools import _argument_publication as tool_argument_publication

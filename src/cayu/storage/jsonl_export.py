@@ -50,7 +50,6 @@ from cayu.messages import Message
 from cayu.sessions._session_continuation_store import (
     import_history_checkpoint as import_continuation_history_checkpoint,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.exports import (
@@ -62,6 +61,7 @@ from cayu.sessions.exports import (
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, TranscriptRecord
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task

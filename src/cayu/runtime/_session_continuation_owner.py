@@ -85,8 +85,8 @@ from cayu.sessions._temporary_continuation import (
     temporary_admission_payload_sha256,
     temporary_service_key,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.requests import ResumeRequest, copy_resume_request
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:

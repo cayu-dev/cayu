@@ -567,7 +567,7 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
 )
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
 from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.cleanup import (
     RecoveryCleanupOwner,
@@ -654,6 +654,7 @@ from cayu.sessions.requests import (
     copy_interrupt_session_request,
     copy_resume_request,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptSnapshot, fork_source_transcript_sha256
 from cayu.tasks.admission import (

@@ -28,7 +28,7 @@ from cayu.collaboration.peer_content import PeerContentReceipt
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
 DELIVERY_SETTLEMENT_BYTES = 2 * MAX_ENVELOPE_BYTES
 

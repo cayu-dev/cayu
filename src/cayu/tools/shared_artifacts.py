@@ -61,7 +61,7 @@ from cayu.workspaces.base import Workspace, WorkspaceRevisionMismatchError
 
 if TYPE_CHECKING:
     from cayu.sessions._operation_records import SessionOperationPublication
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
 SHARED_ARTIFACT_SCHEMA_VERSION = 1
 SHARED_ARTIFACT_REFERENCE_PREFIX = "cayu-shared-artifact-v1."

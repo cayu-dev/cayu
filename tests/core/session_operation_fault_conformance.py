@@ -30,9 +30,9 @@ from cayu.sessions._operation_records import (
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SessionOperationPublication,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import DurableToolOperationConflict
 
 

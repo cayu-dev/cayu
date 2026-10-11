@@ -77,7 +77,7 @@ from cayu.providers import (
 from cayu.providers.base import _preflight_provider_portable_messages
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 
 
 def _fork_profile_adoption(key: str) -> ExecutionProfileAdoptionIntent:

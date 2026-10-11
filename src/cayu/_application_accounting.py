@@ -10,9 +10,9 @@ from cayu.budgets.pricing import CausalBudgetCostSummary, PriceBook, SessionCost
 from cayu.budgets.usage import CausalBudgetUsageSummary, SessionUsageSummary
 from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
+from cayu.sessions.store import SessionStore
 
 
 class _CausalBudgetIdProjector(Protocol):

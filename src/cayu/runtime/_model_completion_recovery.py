@@ -100,9 +100,9 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.gateway import gateway_lifecycle_matches_outer_call

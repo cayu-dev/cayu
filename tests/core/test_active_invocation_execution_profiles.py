@@ -99,7 +99,7 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions._interaction_transitions import InteractionTransitionSpec
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -121,6 +121,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionsRecoveryRequest,
 )
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

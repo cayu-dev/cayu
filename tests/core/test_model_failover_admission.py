@@ -50,7 +50,7 @@ from cayu.runtime.provider_operations import (
     ProviderOperationResolutionConflict,
     inspect_provider_operation,
 )
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

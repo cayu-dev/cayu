@@ -67,6 +67,40 @@ def test_report_reads_commit_blobs_despite_dirty_untracked_and_export_ignored_fi
     assert after["committed_duration_snapshot"] == {"entries": 1, "seconds": 1.25}
 
 
+def test_report_follows_session_store_owner_without_losing_historical_revisions(repository):
+    root, before_revision = repository
+    old_owner = root / "src/cayu/sessions/base.py"
+    old_owner.rename(root / "src/cayu/sessions/store.py")
+    old_owner.write_text("from .store import SessionStore as SessionStore\n")
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "Separate store owner",
+        ],
+        check=True,
+    )
+
+    after = build_report(root, "HEAD")
+    before = build_report(root, before_revision)
+    assert after["metrics"]["session_store_public_methods"] == 1
+    assert before["metrics"]["session_store_public_methods"] == 1
+    assert "src/cayu/sessions/store.py" in after["source_module_lines"]
+    assert "src/cayu/sessions/store.py" not in before["source_module_lines"]
+
+
 def test_import_aliases_relative_modules_and_unique_dependency_counts():
     inventory = SourceInventory({"cayu.runtime._round", "cayu.runtime.execution_units"})
     inventory.observe(

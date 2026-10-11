@@ -276,7 +276,10 @@ class SourceInventory:
                 and any(_qualified(base, bindings) in _PROVIDER_NAMES for base in node.bases)
             ):
                 self.provider_subclasses.append(f"{path}:{node.lineno}:{node.name}")
-            if path == "src/cayu/sessions/base.py" and node.name == "SessionStore":
+            if (
+                path in {"src/cayu/sessions/base.py", "src/cayu/sessions/store.py"}
+                and node.name == "SessionStore"
+            ):
                 self.metrics["session_store_public_methods"] = len(
                     {method.name for method in methods if not method.name.startswith("_")}
                 )

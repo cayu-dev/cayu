@@ -978,7 +978,6 @@ from cayu.sessions.authority import (
 )
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import ModelTarget as ModelTarget
-from cayu.sessions.base import SessionStore as SessionStore
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION as CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -1272,6 +1271,7 @@ from cayu.sessions.requests import ForkSessionRequest as ForkSessionRequest
 from cayu.sessions.requests import InterruptSessionRequest as InterruptSessionRequest
 from cayu.sessions.requests import ResumeRequest as ResumeRequest
 from cayu.sessions.requests import RunRequest as RunRequest
+from cayu.sessions.store import SessionStore as SessionStore
 from cayu.sessions.summaries import EventSummary as EventSummary
 from cayu.sessions.summaries import SessionOperationalSnapshot as SessionOperationalSnapshot
 from cayu.sessions.summaries import SessionOutcome as SessionOutcome

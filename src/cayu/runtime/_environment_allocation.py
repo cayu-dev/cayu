@@ -31,9 +31,9 @@ from cayu.runtime._diagnostics import (
     _runtime_exception_payload,
 )
 from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
-from cayu.sessions.base import SessionStore
 from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import CheckpointTransform, Session
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"

@@ -89,9 +89,9 @@ from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_v
 from cayu.sessions._checkpoint_secret_validation import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import (
     ToolEffect,
 )

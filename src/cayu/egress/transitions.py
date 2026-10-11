@@ -59,8 +59,8 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.execution_profiles import (
     _has_runtime_execution_profile_decision_authority,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY = "cayu:egress_authority_transition"

@@ -12,7 +12,7 @@ from cayu.workspaces.branches import WorkspaceBranchStoreDurability
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
     from cayu.workspaces.branches import WorkspaceBranchRecordTransform
 
 

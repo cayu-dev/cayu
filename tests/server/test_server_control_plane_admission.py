@@ -24,7 +24,8 @@ from cayu.server.routes import (
     UserInputRecoveryBody,
     UserInputResolveBody,
 )
-from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.store import SessionStore
 from cayu.storage.migrations import SchemaMode
 
 CONTROL_PLANE_PROMPT_MAX_BYTES = 960 * 1024

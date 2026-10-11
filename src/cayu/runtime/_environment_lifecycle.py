@@ -231,11 +231,12 @@ from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
     classify_current_terminal_evidence,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
+from cayu.sessions.store import SessionStore
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (

@@ -31,13 +31,13 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     EventRecord,
     Session,
     SessionStatus,
 )
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -278,12 +278,7 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceiptQuery,
     _checkpoint_with_session_run_operation,
 )
-from cayu.sessions.base import (
-    BudgetReservationIdentityConflict,
-    InMemorySessionStore,
-    ModelTarget,
-    SessionStore,
-)
+from cayu.sessions.base import BudgetReservationIdentityConflict, InMemorySessionStore, ModelTarget
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -330,6 +325,7 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,

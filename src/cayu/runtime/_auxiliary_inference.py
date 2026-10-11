@@ -101,8 +101,8 @@ from cayu.sessions._model_stage import (
     SessionModelCompletionStageConflict,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools.inference import InferenceLimits, copy_inference_limits, validate_inference_purpose
 from cayu.vaults.redaction import SecretRedactor
 

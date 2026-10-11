@@ -153,8 +153,8 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.retry_policy import RetryDecision, RetrySuppression, retry_decision
 from cayu.sessions._operation_records import RuntimePublicationOperationRecordMutation
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tools.exposure import ResolvedToolExposure, resolved_tool_exposure_authority
 from cayu.tools.gateway import TargetedToolGatewayProjection
 from cayu.vaults.redaction import SecretRedactor

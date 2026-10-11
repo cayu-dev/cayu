@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import cayu
 
 
@@ -95,5 +97,40 @@ assert _project_interruption_cascade_marker(None) is None
 assert _project_interruption_cascade_marker([]) == {}
 assert _project_interruption_cascade_marker_fields("null", {}, {}) is None
 assert _project_interruption_cascade_marker({"attempt_id": "x" * 129})["attempt_id"] is None
+"""
+    )
+
+
+@pytest.mark.parametrize(
+    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.store")
+)
+def test_store_interface_and_custom_checkpoint_reader_compose_without_memory(public_module):
+    _isolated(
+        f"""
+import asyncio
+import importlib
+from cayu.sessions.store import SessionStore
+
+assert importlib.import_module({public_module!r}).SessionStore is SessionStore
+async def unsupported(self, *args, **kwargs):
+    raise NotImplementedError("Test backend only supplies checkpoint reads")
+checkpoint = {{"checkpoint_schema_version": 13, "execution_snapshots": {{"cursor": 4}},
+              "customer_state": {{"private": True}}}}
+async def load_checkpoint(self, session_id):
+    assert session_id == "session"
+    return checkpoint
+# Implement the existing abstract storage obligations without importing a
+# concrete Cayu backend. The inherited derived read must use this backend.
+methods = {{name: unsupported for name in SessionStore.__abstractmethods__}}
+methods["load_checkpoint"] = load_checkpoint
+CheckpointReader = type("CheckpointReader", (SessionStore,), methods)
+store = CheckpointReader()
+async def scenario():
+    projected = await store.load_execution_snapshot_checkpoint("session")
+    assert projected == {{"checkpoint_schema_version": 13, "execution_snapshots": {{"cursor": 4}}}}
+    assert "customer_state" in checkpoint
+    assert not store._supports_session_export_protocol()
+    assert not store._supports_session_continuation_protocol()
+asyncio.run(scenario())
 """
     )

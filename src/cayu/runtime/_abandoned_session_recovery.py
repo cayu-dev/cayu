@@ -8,13 +8,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 
 from cayu.events import Event
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     SessionExecutionInProgress,
 )
+from cayu.sessions.store import SessionStore
 
 
 @dataclass(frozen=True)

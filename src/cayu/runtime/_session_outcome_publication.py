@@ -157,10 +157,7 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
@@ -172,6 +169,7 @@ from cayu.sessions.records import (
     SessionStatus,
     SessionStatusConflict,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 

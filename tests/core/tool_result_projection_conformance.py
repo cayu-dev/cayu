@@ -34,8 +34,8 @@ from cayu import (
     record_artifact_write_settlement,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationRequest, RuntimePublicationResult
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.store import SessionStore
 
 
 class _ConformanceProvider(ModelProvider):

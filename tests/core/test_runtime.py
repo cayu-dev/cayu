@@ -281,7 +281,7 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
 from cayu.sessions._terminal_evidence import _checkpoint_with_session_run_operation
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
@@ -326,6 +326,7 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage.budget_ledger import SQLiteBudgetLedger

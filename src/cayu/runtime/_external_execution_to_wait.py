@@ -102,7 +102,7 @@ class _ExternalExecutionToWait:
             continuation_writer_frontier,
         )
         from cayu.sessions._session_continuation_store import require_released_wait_invocation
-        from cayu.sessions.base import _continuation_writer_was_released
+        from cayu.sessions.store import _continuation_writer_was_released
 
         if retained.continuation is None:
             return False

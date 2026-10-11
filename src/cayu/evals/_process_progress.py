@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from cayu.evals.models import EvalTrialResult
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
 _ACTIVE: ContextVar[ProcessEvalProgress | None] = ContextVar("eval_process_progress", default=None)
 _TRIAL: ContextVar[tuple[str, int] | None] = ContextVar("eval_observed_trial", default=None)

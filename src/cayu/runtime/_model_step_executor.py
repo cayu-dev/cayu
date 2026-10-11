@@ -336,10 +336,10 @@ from cayu.sessions._provider_operation_cancellation_claim import (
 )
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.base import SessionStore
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
+from cayu.sessions.store import SessionStore
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,

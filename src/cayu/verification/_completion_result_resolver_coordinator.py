@@ -43,8 +43,8 @@ from cayu.sessions._checkpoint_preservation import (
     _renew_completion_result_event_publication,
     _reserve_completion_result_event_publication,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,

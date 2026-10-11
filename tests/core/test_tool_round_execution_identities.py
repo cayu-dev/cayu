@@ -19,9 +19,10 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,

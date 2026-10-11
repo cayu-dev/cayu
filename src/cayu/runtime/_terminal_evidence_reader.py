@@ -55,12 +55,12 @@ from cayu.sessions._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import (
     Session,
     SessionStatus,
 )
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 _TERMINAL_EVENT_TYPE_BY_STATUS = {

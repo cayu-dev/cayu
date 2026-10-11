@@ -159,7 +159,6 @@ from cayu.sessions._invocation_scope import (
     attribute_events_to_current_interaction,
 )
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,
@@ -169,6 +168,7 @@ from cayu.sessions.requests import (
     CompactSessionRequest,
     copy_compact_session_request,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tasks.contracts import TaskCompletionDecisionRequired
 from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor

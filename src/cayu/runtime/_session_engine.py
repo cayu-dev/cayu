@@ -489,7 +489,7 @@ from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _checkpoint_with_session_run_operation,
 )
-from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced, SessionStore
+from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -535,6 +535,7 @@ from cayu.sessions.requests import (
     runtime_prepared_session_authority,
     session_input_contract_evidence,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     session_input_messages_sha256,

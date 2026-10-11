@@ -9,7 +9,7 @@ from cayu.collaboration._native_output import (
     validate_output_selection,
 )
 from cayu.sessions._temporary_continuation import TemporaryServiceRecord
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 
 
 async def authenticate_reply_production(

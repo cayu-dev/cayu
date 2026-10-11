@@ -307,7 +307,7 @@ def test_pending_evidence_never_uses_profile_independent_terminalization(store, 
 
 
 def test_custom_store_without_atomic_protocol_retains_profile_admission(monkeypatch):
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
     store = InMemorySessionStore()
 

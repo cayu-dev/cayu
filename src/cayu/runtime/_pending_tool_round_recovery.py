@@ -124,13 +124,14 @@ from cayu.sessions._runtime_publication import RuntimePublicationReceipt
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (
     Session,
     SessionStatus,
     _queued_dispatch_session_instance_fingerprint,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools._runner import durable_runner_receipt_observer, durable_runner_recovery_authority
 from cayu.tools.base import (

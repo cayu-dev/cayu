@@ -74,12 +74,12 @@ from cayu.sessions._terminal_evidence import (
     _event_with_session_run_operation,
     _session_run_operation_from_checkpoint,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,
     SessionStatus,
 )
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,

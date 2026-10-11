@@ -473,7 +473,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionExecutionInProgress": ("cayu.sessions.recovery", "SessionExecutionInProgress"),
     "SessionStatusConflict": ("cayu.sessions.records", "SessionStatusConflict"),
     "SessionStatusCounts": ("cayu.sessions.queries", "SessionStatusCounts"),
-    "SessionStore": ("cayu.sessions.base", "SessionStore"),
+    "SessionStore": ("cayu.sessions.store", "SessionStore"),
     "SessionTopologyBranch": ("cayu.sessions.topology", "SessionTopologyBranch"),
     "SessionTopologyCycle": ("cayu.sessions.topology", "SessionTopologyCycle"),
     "SessionTopologyDepthExceeded": ("cayu.sessions.topology", "SessionTopologyDepthExceeded"),

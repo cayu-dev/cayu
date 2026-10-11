@@ -35,7 +35,6 @@ from cayu.sessions._invocation_scope import (
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_delivery import (
     PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS as _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS,
 )
@@ -50,6 +49,7 @@ from cayu.sessions.event_delivery import (
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.execution import note_execution_progress
 from cayu.sessions.records import EventRecord
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0

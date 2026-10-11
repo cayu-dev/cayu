@@ -168,7 +168,6 @@ from cayu.sessions._checkpoint_secret_validation import (
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.mcp_manifest_history import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     McpManifestBaseline,
@@ -180,6 +179,7 @@ from cayu.sessions.mcp_manifest_history import (
     _McpManifestBaselineEvidenceInvalid,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (

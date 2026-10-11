@@ -120,7 +120,7 @@ from cayu.sessions._execution_profile_rules import (
     _session_metadata_with_model_projection,
     session_model_projection_cursor,
 )
-from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced, SessionStore
+from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
@@ -160,6 +160,7 @@ from cayu.sessions.requests import (
     _fork_initial_invocation_request_sha256,
     copy_fork_session_request,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptSnapshot, fork_source_transcript_sha256
 from cayu.tasks.store import TaskStore

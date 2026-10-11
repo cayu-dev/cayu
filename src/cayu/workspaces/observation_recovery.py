@@ -60,7 +60,7 @@ from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.runtime._event_writer import RuntimeEventWriter
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
 WORKSPACE_OBSERVATION_RECORD_TYPE = "cayu.workspace-observation"
 WORKSPACE_OBSERVATION_SCHEMA_VERSION = 1

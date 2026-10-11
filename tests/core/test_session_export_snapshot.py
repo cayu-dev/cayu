@@ -490,7 +490,7 @@ def test_deferred_input_materialization_cannot_disappear_between_export_componen
 
 
 def test_custom_store_without_snapshot_support_fails_closed():
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
     class LegacyStore(InMemorySessionStore):
         load_session_export_snapshot = SessionStore.load_session_export_snapshot

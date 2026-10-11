@@ -16,7 +16,7 @@ from cayu._resource_access_errors import ResourceAccessDenied
 
 if TYPE_CHECKING:
     from cayu.sessions._access_rules import SessionAccessScope, _SessionAccessBounds
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
 
 def encode_scope(scope) -> str:

@@ -26,12 +26,13 @@ from cayu.runtime.evidence import (
     RuntimeEvidenceWarningCode,
     runtime_evidence,
 )
-from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQueryResultTooLarge
 from cayu.sessions.lineage import SessionLineageNode, SessionLineageResult
 from cayu.sessions.queries import SessionListResult, SessionQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

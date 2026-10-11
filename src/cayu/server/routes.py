@@ -286,7 +286,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     SessionExecutionProfiles,
     session_execution_profiles,
 )
-from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionStore
+from cayu.sessions.base import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
 from cayu.sessions.event_delivery import PersistedEventSideEffectPage, PersistedEventSideEffectQuery
 from cayu.sessions.event_delivery import Status as EventSideEffectStatus
@@ -350,6 +350,7 @@ from cayu.sessions.requests import (
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.summaries import SessionOutcome
 from cayu.sessions.topology import (
     SessionTopologyCycle,

@@ -60,13 +60,11 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import (
-    SessionStore,
-)
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (

@@ -27,7 +27,7 @@ from cayu.runtime.session_closure import (
     SessionClosureCoordinator,
     SessionClosureStore,
 )
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

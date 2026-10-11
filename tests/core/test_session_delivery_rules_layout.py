@@ -379,6 +379,6 @@ def test_effect_owner_store_annotation_resolves_without_custom_namespace():
     from typing import get_type_hints
 
     from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
     assert get_type_hints(ToolEffectStateOwner.__init__)["store"] is SessionStore

@@ -67,8 +67,9 @@ from cayu.sessions._provider_operation_cancellation_claim import (
     checkpoint_without_provider_operation_cancellation_claim,
     provider_operation_cancellation_claim_from_checkpoint,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 
 _PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0
 

@@ -35,7 +35,7 @@ from cayu.sessions._temporary_continuation import (
     TemporaryServiceIntent,
     TemporaryServicePreparation,
 )
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

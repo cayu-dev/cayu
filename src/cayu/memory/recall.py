@@ -69,8 +69,8 @@ from cayu.memory.retrieval import (
     WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import MAX_SESSION_ID_BYTES
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_INDEX_VERSION,
     TRANSCRIPT_SEARCH_MAX_BYTES,

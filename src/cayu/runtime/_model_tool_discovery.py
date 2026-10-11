@@ -24,8 +24,8 @@ from cayu.sessions._operation_records import (
     RuntimePublicationOperationRecordMutation,
     runtime_publication_operation_record_value_digest,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tools.catalogue import ToolDescriptor
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,

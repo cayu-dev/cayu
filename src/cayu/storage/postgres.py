@@ -299,7 +299,7 @@ from cayu.sessions.authority import (
     _runtime_publication_json_equal,
     checkpoint_root_field_projection_from_storage,
 )
-from cayu.sessions.base import BudgetReservationIdentityConflict, SessionRunFenced, SessionStore
+from cayu.sessions.base import BudgetReservationIdentityConflict, SessionRunFenced
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -388,6 +388,7 @@ from cayu.sessions.requests import (
     RunRequest,
     _copy_optional_tool_capability_ceiling,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.summaries import (
     EventSummary,
     SessionOperationalSnapshot,

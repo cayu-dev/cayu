@@ -18,7 +18,6 @@ from cayu._validation import require_durable_clean_nonblank, revalidate_model_in
 from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration.participants import CollaborationCapacityExceeded, CollaborationUnavailable
 from cayu.sessions._external_wait_transition import ExternalWaitMutation
-from cayu.sessions.base import SessionStore
 from cayu.sessions.external_waits import (
     EXTERNAL_WAIT_PAGE_LIMIT,
     EXTERNAL_WAIT_PAGE_SIZE,
@@ -42,6 +41,7 @@ from cayu.sessions.external_waits import (
     canonical_payload,
     external_wait_digest,
 )
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 ExternalWaitAction = Literal[

@@ -70,7 +70,7 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_run_fence,
 )
 from cayu.sessions._terminal_evidence import _checkpoint_with_session_run_operation
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.cleanup import (
     RecoveryCleanup,
 )
@@ -85,6 +85,7 @@ from cayu.sessions.records import (
     SessionStatus,
 )
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
+from cayu.sessions.store import SessionStore
 from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     ResolvedToolExposureAuthority,

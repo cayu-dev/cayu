@@ -80,7 +80,7 @@ from cayu.runtime.provider_operations import (
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     InteractionStatus,
@@ -91,6 +91,7 @@ from cayu.sessions.records import (
     SessionStatus,
     SessionStatusConflict,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
     tool_capability_ceiling_from_session_metadata,

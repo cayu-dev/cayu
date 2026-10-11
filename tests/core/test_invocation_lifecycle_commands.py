@@ -84,7 +84,7 @@ from cayu.sessions._interaction_transitions import (
     SessionInvocationAdmission,
 )
 from cayu.sessions._invocation_scope import _current_session_run_epoch
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -103,6 +103,7 @@ from cayu.sessions.requests import (
     RunRequest,
     run_request_with_runtime_session_instance_authority,
 )
+from cayu.sessions.store import SessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY, ToolCapabilityCeiling
 from cayu.vaults.redaction import SecretRedactor

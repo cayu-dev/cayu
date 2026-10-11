@@ -18,7 +18,7 @@ from tests.core.session_retention_conformance import (
     policy,
 )
 
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.snapshots.base import SQLiteAgentSnapshotStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.retention import (

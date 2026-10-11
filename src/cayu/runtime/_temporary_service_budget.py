@@ -30,7 +30,7 @@ from cayu.sessions._temporary_continuation import (
 )
 from cayu.sessions._temporary_continuation_store import native_service_execution
 from cayu.sessions._temporary_service_target import TARGET_PREFIX, TemporaryServiceTarget
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

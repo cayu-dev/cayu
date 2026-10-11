@@ -57,10 +57,10 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import InterruptSessionRequest
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)

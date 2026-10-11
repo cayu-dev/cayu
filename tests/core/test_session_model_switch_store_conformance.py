@@ -10,10 +10,11 @@ from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart
 from cayu.sessions._execution_profile_rules import SessionModelTransition
 from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionStore
+from cayu.sessions.base import InMemorySessionStore, ModelTarget
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import session_input_messages_sha256
 
 

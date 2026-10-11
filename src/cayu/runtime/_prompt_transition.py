@@ -23,9 +23,6 @@ from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
 )
-from cayu.sessions.base import (
-    SessionStore,
-)
 from cayu.sessions.forks import (
     PromptAnatomyTransitionReceipt,
     session_prompt_anatomy_transition,
@@ -33,6 +30,7 @@ from cayu.sessions.forks import (
 from cayu.sessions.records import (
     Session,
 )
+from cayu.sessions.store import SessionStore
 
 _PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY = "prompt_anatomy_transition_intents"
 

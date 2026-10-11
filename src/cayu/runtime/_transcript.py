@@ -31,7 +31,7 @@ from cayu.messages import (
 from cayu.runtime import _message_redaction as message_redaction
 from cayu.runtime import _model_target as model_target
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import TranscriptSnapshot
 from cayu.vaults import SecretRedactor
 

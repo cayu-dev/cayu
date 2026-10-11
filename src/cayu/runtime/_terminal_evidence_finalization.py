@@ -91,7 +91,6 @@ from cayu.sessions._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,
@@ -103,6 +102,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryResult,
     _incomplete_recovery_claim_from_checkpoint,
 )
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 _INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS = 100

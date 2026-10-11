@@ -22,8 +22,8 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._tool_invocation.invocation import ToolInvocation
 from cayu.runtime._tool_round_staging import _tool_terminal_payload_limits
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.exposure import ResolvedToolExposureAuthority
 from cayu.tools.policy import ToolPolicyResult

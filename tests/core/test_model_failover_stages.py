@@ -42,9 +42,10 @@ from cayu.sessions._model_stage import (
 )
 from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import ToolCapabilityCeiling
 

@@ -6,7 +6,7 @@ from datetime import datetime
 
 from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
 from cayu.runtime._browser_control_service import BrowserControlService
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.vaults.redaction import SecretRedactor
 

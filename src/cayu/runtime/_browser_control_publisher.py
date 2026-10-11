@@ -23,7 +23,7 @@ from cayu.runtime._browser_control_publication import (
     BrowserControlFencePublication,
     BrowserControlPublication,
 )
-from cayu.sessions.base import SessionStore
+from cayu.sessions.store import SessionStore
 from cayu.tools.browser_control import BrowserControlConflict, BrowserControlRecord
 
 

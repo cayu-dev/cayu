@@ -112,7 +112,6 @@ from cayu.sessions._durable_operation_ownership import (
     DurableOperationOwnershipTransition,
     transition_durable_operation_ownership,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.creation_claims import (
     RuntimeSessionCreateClaimAuthenticationDisposition,
     RuntimeSessionCreateClaimReference,
@@ -130,6 +129,7 @@ from cayu.sessions.requests import (
     copy_run_request,
     run_request_with_runtime_generated_authority,
 )
+from cayu.sessions.store import SessionStore
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,

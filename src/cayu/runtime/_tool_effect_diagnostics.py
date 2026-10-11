@@ -11,8 +11,8 @@ from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_effect_state import ToolEffectRecord
 from cayu.runtime.tool_effects import ToolEffectConflict
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

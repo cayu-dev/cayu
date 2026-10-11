@@ -135,9 +135,9 @@ from cayu.sessions._model_failover import (
 )
 from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageRequest
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

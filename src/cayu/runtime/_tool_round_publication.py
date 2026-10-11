@@ -59,8 +59,8 @@ from cayu.sessions._runtime_publication import (
     RuntimePublicationResult,
     runtime_publication_event_reference,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(

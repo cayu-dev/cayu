@@ -50,8 +50,8 @@ from cayu.memory.recall import RecallResult, RecallSituation, RecallSourceStatus
 from cayu.messages import MessageRole
 from cayu.providers.base import ModelRequest
 from cayu.runtime._session_control import SessionInterruptedByRequest
-from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY
+from cayu.sessions.store import SessionStore
 from cayu.tools.exposure import ResolvedToolExposure
 
 _CARRIED_RECEIPT_BINDING_CONTEXT = b"cayu.automatic-recall-carried-receipt.v1"

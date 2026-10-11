@@ -36,8 +36,8 @@ from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._invocation_scope import _mark_session_invocation_terminal_event
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,

@@ -13,7 +13,6 @@ from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.participants import ParticipantRef
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._runtime_records import RegisteredAgentState, RegisteredEnvironment
-from cayu.sessions.base import SessionStore
 from cayu.sessions.context_views import (
     ContextViewExtensionRecord,
     ContextViewExtensionRegistration,
@@ -28,6 +27,7 @@ from cayu.sessions.context_views import (
     json_commitment,
     project_context_view_extensions,
 )
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

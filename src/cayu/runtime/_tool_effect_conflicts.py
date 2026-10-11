@@ -21,8 +21,8 @@ from cayu.runtime._tool_effect_state import (
     effect_storage_key,
 )
 from cayu.runtime.tool_effects import ToolEffectConflict
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 
 
 @dataclass(frozen=True, slots=True)

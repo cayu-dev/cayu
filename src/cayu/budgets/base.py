@@ -2381,7 +2381,7 @@ class SessionBudgetStore(BudgetStore):
     """Budget store backed by the existing durable session event stream."""
 
     def __init__(self, session_store: Any) -> None:
-        from cayu.sessions.base import SessionStore
+        from cayu.sessions.store import SessionStore
 
         if not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")

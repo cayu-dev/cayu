@@ -38,10 +38,10 @@ from cayu.collaboration.requests import (
     RequestControlCommand,
     RequestSnapshot,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.context_views import ParticipantSessionCreationReceipt, json_commitment
 from cayu.sessions.creation_fence import SessionCreationDecision, validate_binding
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

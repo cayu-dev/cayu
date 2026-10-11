@@ -18,8 +18,8 @@ from cayu.runtime._run_limits import (
     RunLimitController,
 )
 from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageAbandonmentResult
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 
 
 async def abandon_pre_dispatch_model_stage(

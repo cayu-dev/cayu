@@ -124,9 +124,10 @@ from cayu.runtime.stop_policy import (
 )
 from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools.inference import InferenceLimits
 
 _TRUSTED_BINDING_PROVENANCE = object()

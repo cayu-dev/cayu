@@ -71,13 +71,14 @@ from cayu.sessions._interaction_transitions import (
 )
 from cayu.sessions._invocation_lifecycle import RejectInvocationCommand
 from cayu.sessions._model_stage import ActiveModelCompletionStage
-from cayu.sessions.base import ModelFailoverPolicy, SessionRunFenced, SessionStore
+from cayu.sessions.base import ModelFailoverPolicy, SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 from cayu.vaults.redaction import SecretRedactor
 

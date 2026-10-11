@@ -98,11 +98,12 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_run_fence,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationReceipt
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.records import (
     Session,
     SessionStatus,
 )
+from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools._redaction import InvocationRedactorSnapshot

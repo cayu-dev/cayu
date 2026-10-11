@@ -33,12 +33,13 @@ from cayu.environments.snapshots import (
 from cayu.events import Event, EventType
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.sessions._checkpoint_preservation import _execution_snapshot_authority_mutation_scope
-from cayu.sessions.base import Session, SessionStatus, SessionStore
+from cayu.sessions.base import Session, SessionStatus
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
+from cayu.sessions.store import SessionStore
 
 EXECUTION_SNAPSHOTS_KEY = "execution_snapshots"
 # A continuation rejected by the snapshot gate may leave the session failed.

@@ -53,10 +53,11 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageRequest
 from cayu.sessions._runtime_publication import SessionOperationTransform
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced, SessionStore
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling, resolved_tool_exposure_authority
 from cayu.tools.policy import AllowAllToolPolicy

@@ -115,7 +115,7 @@ from cayu.sessions._session_continuation import ticket_identity as ticket_identi
 
 if TYPE_CHECKING:
     from cayu.sessions._invocation_lifecycle import AdmitInvocationCommand, InvocationMutationResult
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
 
 async def admit_continuation(

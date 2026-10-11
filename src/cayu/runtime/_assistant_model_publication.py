@@ -29,8 +29,8 @@ from cayu.runtime._tool_round_staging import _redactor_for_tool_calls
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
+from cayu.sessions.store import SessionStore
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import validate_resolved_tool_exposure_authority
 from cayu.vaults.redaction import SecretRedactor

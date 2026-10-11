@@ -200,13 +200,14 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
 )
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.records import Session, SessionStatus, copy_session
+from cayu.sessions.store import SessionStore
 from cayu.tools.discovery import (
     initial_tool_discovery_operation_records_from_initialization,
 )

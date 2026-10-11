@@ -21,10 +21,11 @@ from cayu.runtime import _run_limits as run_limits
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._runtime_publication import RuntimePublicationRequest, RuntimePublicationResult
-from cayu.sessions.base import InMemorySessionStore, SessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import InterruptSessionRequest, RunRequest
+from cayu.sessions.store import SessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

@@ -16,8 +16,8 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.invocation import InvocationOrigin, InvocationOriginTrust, TaskExecutionSource
+from cayu.sessions.store import SessionStore
 from cayu.tasks._scheduling import schedule_creation_digest
 from cayu.tasks._verified_work_authority import invocation_contains_secret_public_identity
 from cayu.tasks.contracts import (

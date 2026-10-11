@@ -27,9 +27,7 @@ from cayu.runtime._tool_invocation.resources import ToolInvocationCall
 from cayu.runtime._tool_round_staging import (
     _event_with_tool_round_authority,
 )
-from cayu.sessions.base import (
-    SessionStore,
-)
+from cayu.sessions.store import SessionStore
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.vaults.redaction import SecretRedactor
 

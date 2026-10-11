@@ -35,10 +35,10 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 from cayu.tools.base import ToolResult
 
 

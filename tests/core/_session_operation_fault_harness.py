@@ -28,8 +28,8 @@ from cayu.sessions._runtime_publication import (
     SessionOperationTransform,
     _OwnedOffThreadSessionCommitGuard,
 )
-from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.store import SessionStore
 
 _MAX_SAFE_ID_BYTES = 64
 _MAX_SELECTOR_BYTES = 8_192

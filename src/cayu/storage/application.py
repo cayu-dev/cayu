@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from cayu.runtime._policy_storage import ModelPolicyStore
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
     from cayu.server import ProductOperationStore
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
     from cayu.tasks.store import TaskStore
 
 

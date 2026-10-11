@@ -11,11 +11,12 @@ from cayu.events import Event
 from cayu.messages import Message
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
 
 
 async def assert_session_store_time_conformance(

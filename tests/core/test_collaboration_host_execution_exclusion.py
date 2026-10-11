@@ -190,7 +190,7 @@ async def test_excluded_continuation_frees_one_slot(native_stores, monkeypatch, 
     first = parked[0][0].id
     primary = RuntimeError("native admission refused before claim")
     refused = asyncio.Event()
-    from cayu.sessions.base import SessionStore
+    from cayu.sessions.store import SessionStore
 
     claim = SessionStore._claim_continuation_admission
 
