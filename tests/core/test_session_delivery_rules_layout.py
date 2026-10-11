@@ -192,3 +192,76 @@ rejected(lambda: completion._apply_queue_completion_checkpoint_mutation(session,
     SessionRunFenced)
 """
     )
+
+
+def test_child_lifecycle_requires_current_durable_occurrence_without_stores():
+    _without_implementations(
+        """
+from tests._session_provenance import session_fixture
+from cayu.events import Event, EventType
+from cayu.sessions import _child_lifecycle_rules as rules
+from cayu.sessions.records import EventRecord, SessionStatus
+
+parent = session_fixture(id="parent", agent_name="agent", provider_name="fake", model="fake")
+child = session_fixture(id="child", parent_session_id=parent.id, agent_name="agent",
+    provider_name="fake", model="fake", status=SessionStatus.COMPLETED)
+def entry(records):
+    return rules._child_session_lifecycle_entry(parent=parent, child=child,
+        records_by_type=records, consumption_record=None)
+terminal = EventRecord(sequence=2, event=Event(type=EventType.SESSION_COMPLETED, session_id=child.id))
+assert entry({}) is None
+fresh = entry({EventType.SESSION_COMPLETED: terminal})
+assert fresh.freshness.value == "fresh" and fresh.occurrence.source_id == terminal.event.id
+resumed = EventRecord(sequence=3, event=Event(type=EventType.SESSION_RESUMED, session_id=child.id))
+assert entry({EventType.SESSION_COMPLETED: terminal, EventType.SESSION_RESUMED: resumed}) is None
+rejected(lambda: rules._child_session_lifecycle_entry(parent=parent,
+    child=child.model_copy(update={"parent_session_id": "other"}),
+    records_by_type={}, consumption_record=None), RuntimeError)
+"""
+    )
+
+
+def test_child_consumption_replays_only_exact_occurrence_and_logical_step_without_stores():
+    _without_implementations(
+        """
+from datetime import UTC, datetime
+from tests._session_provenance import session_fixture
+from cayu.events import Event, EventType
+from cayu.runtime._child_session_notifications import CHILD_SESSION_NOTIFICATION_INTENT_KEY
+from cayu.sessions import _child_lifecycle_rules as rules
+from cayu.sessions._model_stage import ModelCompletionStage, SessionModelCompletionStageConflict
+from cayu.sessions.records import EventRecord, SessionStatus
+
+now = datetime(2026, 1, 1, tzinfo=UTC)
+parent = session_fixture(id="parent", agent_name="agent", provider_name="fake", model="fake")
+child = session_fixture(id="child", parent_session_id=parent.id, agent_name="agent",
+    provider_name="fake", model="fake", status=SessionStatus.COMPLETED)
+event = EventRecord(sequence=2, event=Event(type=EventType.SESSION_COMPLETED, session_id=child.id))
+_, occurrence = rules._child_session_lifecycle_occurrence(child, {EventType.SESSION_COMPLETED: event})
+binding = dict(parent_session_id=parent.id, parent_session_instance_id=parent.instance_id,
+    claims=[dict(child_session_id=child.id, child_session_instance_id=child.instance_id,
+                 occurrence=occurrence.model_dump(mode="json"))])
+stage = ModelCompletionStage(session_id=parent.id, stage_id="stage", logical_step_id="step",
+    dispatch_ordinal=0, purpose="assistant-turn", state="in_flight",
+    intent={CHILD_SESSION_NOTIFICATION_INTENT_KEY: binding,
+            "model_step_id": "step", "model_attempt_id": "attempt"}, reservation_ids=(),
+    preparation_request_digest="a"*64, preparation_digest="b"*64,
+    source_status=SessionStatus.RUNNING, source_run_epoch=1, source_transcript_cursor=0,
+    prepared_at=now)
+record = rules._child_session_notification_consumption_record(parent=parent, child=child,
+    occurrence=occurrence, stage=stage, consumed_at=now)
+raw = record.model_dump(mode="json")
+retry = record.model_copy(update={"stage_id": "retry", "model_attempt_id": "retry"})
+assert rules._child_session_notification_consumption_replays(raw, retry)
+assert not rules._child_session_notification_consumption_replays(raw,
+    retry.model_copy(update={"model_step_id": "next-step"}))
+rejected(lambda: rules._child_session_notification_consumption_record(parent=parent,
+    child=child.model_copy(update={"instance_id": "replacement"}), occurrence=occurrence,
+    stage=stage, consumed_at=now), SessionModelCompletionStageConflict)
+consumed = rules._child_session_lifecycle_entry(parent=parent, child=child,
+    records_by_type={EventType.SESSION_COMPLETED: event}, consumption_record=raw)
+assert consumed.freshness.value == "consumed" and consumed.consumed_by_stage_id == "stage"
+rejected(lambda: rules._child_session_notification_consumption(raw, parent=parent, child=child,
+    occurrence=occurrence.model_copy(update={"source_id": "different"})), RuntimeError)
+"""
+    )

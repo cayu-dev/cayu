@@ -16,6 +16,8 @@
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[RuntimeError]": 0.166,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[CancelledError]": 0.204,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_cancellation_retains_writer_until_commit": 0.201,
+  "tests/core/test_session_delivery_rules_layout.py::test_child_consumption_replays_only_exact_occurrence_and_logical_step_without_stores": 0.21595841698581353,
+  "tests/core/test_session_delivery_rules_layout.py::test_child_lifecycle_requires_current_durable_occurrence_without_stores": 0.21115754096535966,
   "tests/core/test_session_delivery_rules_layout.py::test_queued_dispatch_public_types_keep_identity_and_historical_pickles[QueuedDispatchTerminalReceiptQuery]": 0.00019687600433826447,
   "tests/core/test_session_delivery_rules_layout.py::test_queued_dispatch_public_types_keep_identity_and_historical_pickles[QueuedDispatchTerminalReceipt]": 0.0012782489648088813,
   "tests/core/test_session_delivery_rules_layout.py::test_queued_run_receipts_transfer_and_release_exact_retention_without_stores": 0.17697366699576378,

@@ -132,6 +132,10 @@ from cayu.sessions._checkpoint_preservation import (
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
+from cayu.sessions._child_lifecycle_rules import (
+    _child_session_notification_consumption_record,
+    _child_session_notification_consumption_replays,
+)
 from cayu.sessions._completion_finalization import (
     _apply_queue_completion_checkpoint_mutation,
     _prepare_queue_completion_checkpoint_mutation,
@@ -310,8 +314,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     StoreTimeSessionOperationTransform,
-    _child_session_notification_consumption_record,
-    _child_session_notification_consumption_replays,
     _durable_subagent_parent_delete_block_reason,
     _project_interruption_cascade_marker_fields,
     _require_session_export_target,
