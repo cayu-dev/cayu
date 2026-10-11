@@ -1,4 +1,6 @@
 {
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_preparation_dispatch_and_settlement_reconcile_without_stores": 0.6114372499287128,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_terminal_material_replays_and_rejects_tampering_without_stores": 0.6123620820580982,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionManualRecoveryRequest]": 0.00018195802113041282,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStageDispatch]": 0.00018841703422367573,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStageRecoveryFence]": 0.0001775839482434094,

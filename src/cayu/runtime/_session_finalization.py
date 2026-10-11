@@ -278,6 +278,7 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageSettlementRequest,
 )
 from cayu.sessions._model_stage import SessionModelCompletionStageConflict
+from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -290,7 +291,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     _event_with_session_run_operation,
-    model_completion_stage_settlement_request,
 )
 from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,

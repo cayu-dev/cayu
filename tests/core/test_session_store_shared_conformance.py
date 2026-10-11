@@ -227,6 +227,7 @@ from cayu.runtime.provider_operations import (
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _interaction_receipts as interaction_receipts
+from cayu.sessions import _model_stage_rules as model_stage_rules
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -19774,7 +19775,7 @@ def test_session_store_conformance_records_exact_model_stage_dispatch(
                 expected_transcript_cursor=0,
             )
 
-            dispatch_key = sessions_module._model_completion_stage_dispatch_storage_key(stage_id)
+            dispatch_key = model_stage_rules._model_completion_stage_dispatch_storage_key(stage_id)
             with pytest.raises(ValueError, match="reserved model-completion stage namespace"):
                 await store.load_session_operation(session_id, dispatch_key)
             with pytest.raises(ValueError, match="reserved model-completion stage namespace"):

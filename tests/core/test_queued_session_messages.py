@@ -48,12 +48,9 @@ from cayu.sessions._model_stage import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     SessionModelCompletionStageConflict,
 )
+from cayu.sessions._model_stage_rules import _model_completion_stage_dispatch_storage_key
 from cayu.sessions.authority import _canonical_runtime_publication_digest
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    SessionRunFenced,
-    _model_completion_stage_dispatch_storage_key,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,

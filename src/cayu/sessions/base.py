@@ -37,7 +37,8 @@ from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
-from cayu.sessions import _model_stage as model_stage_contracts
+from cayu.sessions import _model_stage_publication as model_stage_publication
+from cayu.sessions import _model_stage_rules as model_stage_rules
 from cayu.sessions import _operation_records as operation_record_rules
 from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _runtime_publication_rules as publication_rules
@@ -225,6 +226,9 @@ from cayu.sessions._model_stage import (
 )
 from cayu.sessions._model_stage import (
     copy_model_completion_manual_recovery_request as copy_model_completion_manual_recovery_request,
+)
+from cayu.sessions._model_stage_rules import (
+    model_completion_stage_settlement_request as model_completion_stage_settlement_request,
 )
 from cayu.sessions._operation_records import (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX as MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
@@ -1019,9 +1023,7 @@ from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
 from cayu.approvals.tools import (
-    PendingToolCallApproval,
     ResolutionActor,
-    ToolPolicyEvidence,
 )
 from cayu.budgets.aggregates import (
     _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
@@ -1034,17 +1036,11 @@ from cayu.budgets.base import (
     BudgetReservationIdentityConflict,
     is_budget_inspection_event,
     is_budget_model_attempt_terminal_event,
-    model_completion_budget_settlements,
     project_budget_inspection_event,
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
 from cayu.budgets.pricing import PriceBook
-from cayu.context.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputSpec,
-    StructuredOutputStrategy,
-)
 from cayu.events import (
     EVENT_ID_MAX_CHARS,
     Event,
@@ -1060,7 +1056,6 @@ from cayu.execution_profiles import (
     ExecutionProfileRejectionResult,
 )
 from cayu.execution_units import (
-    ModelAttemptIdentity,
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
@@ -1093,7 +1088,6 @@ from cayu.memory.evidence import (
 from cayu.messages import (
     Message,
     MessageRole,
-    ToolCallPart,
     copy_message,
     detach_message,
 )
@@ -1128,10 +1122,6 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
-)
-from cayu.sessions._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    ModelStepPublicationCheckpoint,
 )
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
@@ -1183,7 +1173,6 @@ from cayu.sessions.messaging import (
     session_message_checkpoint_sha256,
     session_message_rejection,
 )
-from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import (
     ToolCapabilityCeiling,
 )
@@ -1725,60 +1714,6 @@ def transform_fork_checkpoint(
 
 # Must hold everything an admitted RunRequest carries into recovery: up to
 # 256 KiB of request metadata plus budget limits and run settings.
-_NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
-_MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
-    "continue"
-}
-
-
-@dataclass(frozen=True)
-class _PreparedModelCompletionStage:
-    session_id: str
-    preparation_storage_key: str
-    terminal_storage_key: str
-    abandonment_storage_key: str
-    winner_storage_key: str
-    publication_storage_key: str
-    request: ModelCompletionStageRequest
-    request_digest: str
-    expected_statuses: frozenset[SessionStatus]
-    expected_run_epoch: int
-    expected_transcript_cursor: int
-    failover_admission: ModelFailoverStageAdmission | None = None
-
-
-@dataclass(frozen=True)
-class _PreparedModelCompletionStageTerminal:
-    session_id: str
-    stage_id: str
-    preparation_storage_key: str
-    terminal_storage_key: str
-    settlement_storage_key: str
-    publication: RuntimePublicationRequest
-    publication_material_digest: str
-    recovery_fence: ModelCompletionStageRecoveryFence | None = None
-
-
-@dataclass(frozen=True)
-class _PreparedModelCompletionStageAbandonment:
-    session_id: str
-    stage_id: str
-    preparation_storage_key: str
-    terminal_storage_key: str
-    abandonment_storage_key: str
-    preparation_digest: str
-    expected_run_epoch: int
-    stage_source_run_epoch: int
-
-
-@dataclass(frozen=True)
-class _ModelCompletionStagePromotionContext:
-    stage_id: str
-    preparation_storage_key: str
-    terminal_storage_key: str
-    active_storage_key: str
-    winner_storage_key: str
-    completion_digest: str
 
 
 SessionOperationTransform = Callable[
@@ -5738,14 +5673,14 @@ class SessionStore(ABC):
         """Load and verify append-only pre-dispatch and terminal completion evidence."""
 
         session_id, stage_id, preparation_key, terminal_key = (
-            _model_completion_stage_storage_identity(session_id, stage_id)
+            model_stage_rules._model_completion_stage_storage_identity(session_id, stage_id)
         )
         preparation_record, terminal_record = await self._load_model_completion_stage_records(
             session_id,
             preparation_key,
             terminal_key,
         )
-        return _reconstruct_model_completion_stage(
+        return model_stage_rules._reconstruct_model_completion_stage(
             preparation_record,
             terminal_record,
             session_id=session_id,
@@ -5761,18 +5696,18 @@ class SessionStore(ABC):
     ) -> ModelCompletionStageSettlement | None:
         """Load verified terminal non-success evidence for one exact stage."""
 
-        session_id, stage_id, _, _ = _model_completion_stage_storage_identity(
+        session_id, stage_id, _, _ = model_stage_rules._model_completion_stage_storage_identity(
             session_id,
             stage_id,
         )
-        storage_key = _model_completion_stage_settlement_storage_key(stage_id)
+        storage_key = model_stage_rules._model_completion_stage_settlement_storage_key(stage_id)
         record = await self._load_model_completion_stage_settlement_record(
             session_id,
             storage_key,
         )
         if record is None:
             return None
-        return _reconstruct_model_completion_stage_settlement(
+        return model_stage_rules._reconstruct_model_completion_stage_settlement(
             record,
             session_id=session_id,
             stage_id=stage_id,
@@ -5792,12 +5727,14 @@ class SessionStore(ABC):
         their existing read owner; no second route cache is needed after restart.
         """
 
-        session_id, stage_id, _, _ = _model_completion_stage_storage_identity(session_id, stage_id)
-        storage_key = _model_completion_stage_abandonment_storage_key(stage_id)
+        session_id, stage_id, _, _ = model_stage_rules._model_completion_stage_storage_identity(
+            session_id, stage_id
+        )
+        storage_key = model_stage_rules._model_completion_stage_abandonment_storage_key(stage_id)
         record = await self._load_model_completion_stage_settlement_record(session_id, storage_key)
         if record is None:
             return None
-        return _reconstruct_model_completion_stage_abandonment(
+        return model_stage_rules._reconstruct_model_completion_stage_abandonment(
             record, session_id=session_id, stage_id=stage_id, storage_key=storage_key
         )
 
@@ -5813,7 +5750,7 @@ class SessionStore(ABC):
             preparation_record,
             terminal_record,
         ) = await self._load_active_model_completion_stage_records(session_id)
-        return _reconstruct_active_model_completion_stage(
+        return model_stage_rules._reconstruct_active_model_completion_stage(
             active_record,
             preparation_record,
             terminal_record,
@@ -5828,14 +5765,14 @@ class SessionStore(ABC):
         """Load exact evidence that a prepared stage crossed the dispatch fence."""
 
         session_id = require_clean_nonblank(session_id, "session_id")
-        storage_key = _model_completion_stage_dispatch_storage_key(stage_id)
+        storage_key = model_stage_rules._model_completion_stage_dispatch_storage_key(stage_id)
         record = await self._load_model_completion_stage_dispatch_record(
             session_id,
             storage_key,
         )
         if record is None:
             return None
-        return _reconstruct_model_completion_stage_dispatch(
+        return model_stage_rules._reconstruct_model_completion_stage_dispatch(
             record,
             session_id=session_id,
             stage_id=stage_id,
@@ -5877,7 +5814,7 @@ class SessionStore(ABC):
             active = await self.load_active_model_completion_stage(session_id)
             if active is None or active.stage != copied_stage:
                 raise
-            _validate_model_completion_stage_dispatch(reconciled, copied_stage)
+            model_stage_rules._validate_model_completion_stage_dispatch(reconciled, copied_stage)
             if (
                 consume_child_session_notifications
                 and child_session_notification_stage_binding(copied_stage.intent) is not None
@@ -5900,7 +5837,7 @@ class SessionStore(ABC):
     ) -> ModelCompletionStageResult:
         """Insert or replay a stage; dispatch only when the result explicitly authorizes it."""
 
-        prepared = _prepare_model_completion_stage(
+        prepared = model_stage_rules._prepare_model_completion_stage(
             session_id,
             request,
             expected_statuses=expected_statuses,
@@ -5956,7 +5893,7 @@ class SessionStore(ABC):
         """Private live-authority entrance; raw public intents cannot select a route."""
 
         self._require_model_failover_stage_protocol()
-        prepared = _prepare_model_completion_stage(
+        prepared = model_stage_rules._prepare_model_completion_stage(
             session_id,
             request,
             expected_statuses=expected_statuses,
@@ -6013,7 +5950,7 @@ class SessionStore(ABC):
             or fence.expected_active_profile.run_epoch != fence.expected_run_epoch
         ):
             raise ValueError("Recovery fence conflicts with its session or epoch.")
-        prepared = _prepare_model_completion_stage_terminal(
+        prepared = model_stage_rules._prepare_model_completion_stage_terminal(
             session_id,
             stage_id=stage_id,
             publication=publication,
@@ -6036,7 +5973,7 @@ class SessionStore(ABC):
         outcome and accounting; it does not imply a successful model response.
         """
 
-        prepared = _prepare_model_completion_stage_terminal(
+        prepared = model_stage_rules._prepare_model_completion_stage_terminal(
             session_id,
             stage_id=stage_id,
             publication=publication,
@@ -6059,7 +5996,7 @@ class SessionStore(ABC):
         delayed retry of an older abandonment can never clear it.
         """
 
-        prepared = _prepare_model_completion_stage_abandonment(
+        prepared = model_stage_rules._prepare_model_completion_stage_abandonment(
             session_id,
             stage_id=stage_id,
             preparation_digest=preparation_digest,
@@ -6082,7 +6019,7 @@ class SessionStore(ABC):
             "expected_run_epoch",
         )
         session_id, stage_id, preparation_key, terminal_key = (
-            _model_completion_stage_storage_identity(session_id, stage_id)
+            model_stage_rules._model_completion_stage_storage_identity(session_id, stage_id)
         )
         return await self._promote_model_completion_stage_atomic(
             session_id=session_id,
@@ -6151,7 +6088,7 @@ class SessionStore(ABC):
 
     async def _prepare_model_completion_stage_atomic(
         self,
-        prepared: _PreparedModelCompletionStage,
+        prepared: model_stage_rules._PreparedModelCompletionStage,
     ) -> ModelCompletionStageResult:
         """Backend hook for an insert-only, fenced preparation record."""
 
@@ -6161,7 +6098,7 @@ class SessionStore(ABC):
 
     async def _complete_model_completion_stage_atomic(
         self,
-        prepared: _PreparedModelCompletionStageTerminal,
+        prepared: model_stage_rules._PreparedModelCompletionStageTerminal,
     ) -> ModelCompletionStageResult:
         """Backend hook for an insert-only terminal provider-response record."""
 
@@ -6171,7 +6108,7 @@ class SessionStore(ABC):
 
     async def _abandon_model_completion_stage_atomic(
         self,
-        prepared: _PreparedModelCompletionStageAbandonment,
+        prepared: model_stage_rules._PreparedModelCompletionStageAbandonment,
     ) -> ModelCompletionStageAbandonmentResult:
         """Backend hook for an exact, fenced pre-dispatch abandonment."""
 
@@ -11626,11 +11563,13 @@ class InMemorySessionStore(
                 operation_records = self._session_operation_records.get(session_id, {})
                 active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
                 if active_record is not None:
-                    active_marker = _reconstruct_active_model_completion_stage_record(
-                        active_record,
-                        session_id=session_id,
+                    active_marker = (
+                        model_stage_rules._reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
                     )
-                    dispatch_key = _model_completion_stage_dispatch_storage_key(
+                    dispatch_key = model_stage_rules._model_completion_stage_dispatch_storage_key(
                         active_marker.stage_id
                     )
                     if operation_records.get(dispatch_key) is not None:
@@ -12135,7 +12074,7 @@ class InMemorySessionStore(
             settlement_record = None
             settlement_storage_key = None
             if settlement_request is not None:
-                active = _reconstruct_active_model_completion_stage_from_records(
+                active = model_stage_rules._reconstruct_active_model_completion_stage_from_records(
                     operation_records,
                     session_id=session_id,
                 )
@@ -12144,10 +12083,10 @@ class InMemorySessionStore(
                         "The interaction transition has no active model-completion stage to settle."
                     )
                 stage = active.stage
-                settlement_storage_key = _model_completion_stage_settlement_storage_key(
-                    stage.stage_id
+                settlement_storage_key = (
+                    model_stage_rules._model_completion_stage_settlement_storage_key(stage.stage_id)
                 )
-                _validate_model_completion_stage_for_settlement(
+                model_stage_rules._validate_model_completion_stage_for_settlement(
                     session=session,
                     stage=stage,
                     active=active,
@@ -12155,7 +12094,9 @@ class InMemorySessionStore(
                     settlement_record=operation_records.get(settlement_storage_key),
                     winner_exists=(
                         operation_records.get(
-                            _model_completion_stage_winner_storage_key(stage.logical_step_id)
+                            model_stage_rules._model_completion_stage_winner_storage_key(
+                                stage.logical_step_id
+                            )
                         )
                         is not None
                     ),
@@ -12168,7 +12109,7 @@ class InMemorySessionStore(
                         is not None
                     ),
                 )
-                settlement_record = _model_completion_stage_settlement_record(
+                settlement_record = model_stage_rules._model_completion_stage_settlement_record(
                     stage,
                     request=settlement_request,
                     settled_at=now,
@@ -14655,31 +14596,37 @@ class InMemorySessionStore(
                     stage_dispatch: ModelCompletionStageDispatch | None = None
                     active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
                     if active_record is not None:
-                        marker = _reconstruct_active_model_completion_stage_record(
-                            active_record,
-                            session_id=session_id,
+                        marker = (
+                            model_stage_rules._reconstruct_active_model_completion_stage_record(
+                                active_record,
+                                session_id=session_id,
+                            )
                         )
                         _, _, preparation_key, terminal_key = (
-                            _model_completion_stage_storage_identity(
+                            model_stage_rules._model_completion_stage_storage_identity(
                                 session_id,
                                 marker.stage_id,
                             )
                         )
-                        active_model_stage = _reconstruct_active_model_completion_stage(
-                            active_record,
-                            operation_records.get(preparation_key),
-                            operation_records.get(terminal_key),
-                            session_id=session_id,
+                        active_model_stage = (
+                            model_stage_rules._reconstruct_active_model_completion_stage(
+                                active_record,
+                                operation_records.get(preparation_key),
+                                operation_records.get(terminal_key),
+                                session_id=session_id,
+                            )
                         )
                         dispatch_record = operation_records.get(
-                            _model_completion_stage_dispatch_storage_key(marker.stage_id)
+                            model_stage_rules._model_completion_stage_dispatch_storage_key(
+                                marker.stage_id
+                            )
                         )
                         if dispatch_record is not None:
-                            stage_dispatch = _reconstruct_model_completion_stage_dispatch(
+                            stage_dispatch = model_stage_rules._reconstruct_model_completion_stage_dispatch(
                                 dispatch_record,
                                 session_id=session_id,
                                 stage_id=marker.stage_id,
-                                storage_key=_model_completion_stage_dispatch_storage_key(
+                                storage_key=model_stage_rules._model_completion_stage_dispatch_storage_key(
                                     marker.stage_id
                                 ),
                             )
@@ -15532,10 +15479,12 @@ class InMemorySessionStore(
             release = publication.model_completion_stage_release
             if release is not None:
                 operation_records = self._session_operation_records.get(session_id, {})
-                _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-                    session_id, release.stage_id
+                _, _, preparation_key, terminal_key = (
+                    model_stage_rules._model_completion_stage_storage_identity(
+                        session_id, release.stage_id
+                    )
                 )
-                _validate_model_completion_stage_release(
+                model_stage_rules._validate_model_completion_stage_release(
                     session=session,
                     active_record=operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
                     preparation_record=operation_records.get(preparation_key),
@@ -15613,13 +15562,15 @@ class InMemorySessionStore(
             active_record = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
             if active_record is None:
                 return None, None, None
-            marker = _reconstruct_active_model_completion_stage_record(
+            marker = model_stage_rules._reconstruct_active_model_completion_stage_record(
                 active_record,
                 session_id=session_id,
             )
-            _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-                session_id,
-                marker.stage_id,
+            _, _, preparation_key, terminal_key = (
+                model_stage_rules._model_completion_stage_storage_identity(
+                    session_id,
+                    marker.stage_id,
+                )
             )
             preparation = records.get(preparation_key)
             terminal = records.get(terminal_key)
@@ -15641,13 +15592,19 @@ class InMemorySessionStore(
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             records = self._session_operation_records[session_id]
-            _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-                session_id,
-                stage.stage_id,
+            _, _, preparation_key, terminal_key = (
+                model_stage_rules._model_completion_stage_storage_identity(
+                    session_id,
+                    stage.stage_id,
+                )
             )
-            settlement_key = _model_completion_stage_settlement_storage_key(stage.stage_id)
-            dispatch_key = _model_completion_stage_dispatch_storage_key(stage.stage_id)
-            _validate_model_completion_stage_for_dispatch(
+            settlement_key = model_stage_rules._model_completion_stage_settlement_storage_key(
+                stage.stage_id
+            )
+            dispatch_key = model_stage_rules._model_completion_stage_dispatch_storage_key(
+                stage.stage_id
+            )
+            model_stage_rules._validate_model_completion_stage_for_dispatch(
                 session=session,
                 checkpoint=self._checkpoints.get(session_id),
                 current_transcript_cursor=len(self._transcripts.get(session_id, [])),
@@ -15661,20 +15618,20 @@ class InMemorySessionStore(
             dispatch_is_new = dispatch_record is None
             if dispatch_is_new:
                 published_at = publication_rules._next_runtime_publication_timestamp(session)
-                dispatch_record = _model_completion_stage_dispatch_record(
+                dispatch_record = model_stage_rules._model_completion_stage_dispatch_record(
                     stage,
                     dispatched_at=published_at,
                 )
             else:
                 published_at = publication_rules._next_runtime_publication_timestamp(session)
             assert dispatch_record is not None
-            dispatch = _reconstruct_model_completion_stage_dispatch(
+            dispatch = model_stage_rules._reconstruct_model_completion_stage_dispatch(
                 dispatch_record,
                 session_id=session_id,
                 stage_id=stage.stage_id,
                 storage_key=dispatch_key,
             )
-            _validate_model_completion_stage_dispatch(dispatch, stage)
+            model_stage_rules._validate_model_completion_stage_dispatch(dispatch, stage)
             binding = child_session_notification_stage_binding(stage.intent)
             prepared_consumptions: list[tuple[str, dict[str, Any], str, str]] = []
             if binding is not None:
@@ -15754,7 +15711,7 @@ class InMemorySessionStore(
 
     async def _prepare_model_completion_stage_atomic(
         self,
-        prepared: _PreparedModelCompletionStage,
+        prepared: model_stage_rules._PreparedModelCompletionStage,
     ) -> ModelCompletionStageResult:
         session_id = prepared.session_id
         async with self._lock:
@@ -15762,7 +15719,7 @@ class InMemorySessionStore(
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             records = self._session_operation_records[session_id]
-            stage = _reconstruct_model_completion_stage(
+            stage = model_stage_rules._reconstruct_model_completion_stage(
                 records.get(prepared.preparation_storage_key),
                 records.get(prepared.terminal_storage_key),
                 session_id=session_id,
@@ -15770,18 +15727,20 @@ class InMemorySessionStore(
                 preparation_storage_key=prepared.preparation_storage_key,
                 terminal_storage_key=prepared.terminal_storage_key,
             )
-            _validate_model_completion_stage_repreparation(
+            model_stage_rules._validate_model_completion_stage_repreparation(
                 records.get(prepared.abandonment_storage_key),
                 prepared,
                 source_status=session.status if stage is None else stage.source_status,
             )
             if stage is not None:
-                _validate_model_completion_stage_preparation_replay(stage, prepared)
-                active = _reconstruct_active_model_completion_stage_from_records(
+                model_stage_rules._validate_model_completion_stage_preparation_replay(
+                    stage, prepared
+                )
+                active = model_stage_rules._reconstruct_active_model_completion_stage_from_records(
                     records,
                     session_id=session_id,
                 )
-                _validate_model_completion_preparation_replay_state(
+                model_stage_rules._validate_model_completion_preparation_replay_state(
                     stage,
                     active=active,
                     winner_exists=records.get(prepared.winner_storage_key) is not None,
@@ -15812,16 +15771,16 @@ class InMemorySessionStore(
                     dispatch_authorized=False,
                 )
 
-            active = _reconstruct_active_model_completion_stage_from_records(
+            active = model_stage_rules._reconstruct_active_model_completion_stage_from_records(
                 records,
                 session_id=session_id,
             )
-            _validate_model_completion_active_marker_for_preparation(
+            model_stage_rules._validate_model_completion_active_marker_for_preparation(
                 active,
                 prepared,
                 source_status=session.status,
             )
-            retry_settlement_request = _model_completion_retry_settlement_request(
+            retry_settlement_request = model_stage_rules._model_completion_retry_settlement_request(
                 active,
                 prepared,
             )
@@ -15863,7 +15822,7 @@ class InMemorySessionStore(
                 replayed=False,
             )
             prepared_at = publication_rules._next_runtime_publication_timestamp(session)
-            preparation_record = _model_completion_stage_preparation_record(
+            preparation_record = model_stage_rules._model_completion_stage_preparation_record(
                 prepared,
                 source_session=session,
                 prepared_at=prepared_at,
@@ -15876,7 +15835,7 @@ class InMemorySessionStore(
                 if selection_event is None
                 else self._prepare_event_append_unlocked(session, (selection_event,))
             )
-            stage = _reconstruct_model_completion_stage(
+            stage = model_stage_rules._reconstruct_model_completion_stage(
                 preparation_record,
                 None,
                 session_id=session_id,
@@ -15885,7 +15844,7 @@ class InMemorySessionStore(
                 terminal_storage_key=prepared.terminal_storage_key,
             )
             assert stage is not None
-            active_record = _active_model_completion_stage_record(
+            active_record = model_stage_rules._active_model_completion_stage_record(
                 stage,
                 activated_at=prepared_at,
             )
@@ -15893,10 +15852,12 @@ class InMemorySessionStore(
             retry_settlement_record = None
             if retry_settlement_request is not None:
                 assert active is not None
-                retry_settlement_storage_key = _model_completion_stage_settlement_storage_key(
-                    active.stage.stage_id
+                retry_settlement_storage_key = (
+                    model_stage_rules._model_completion_stage_settlement_storage_key(
+                        active.stage.stage_id
+                    )
                 )
-                _validate_model_completion_stage_for_settlement(
+                model_stage_rules._validate_model_completion_stage_for_settlement(
                     session=session,
                     stage=active.stage,
                     active=active,
@@ -15904,7 +15865,9 @@ class InMemorySessionStore(
                     settlement_record=records.get(retry_settlement_storage_key),
                     winner_exists=(
                         records.get(
-                            _model_completion_stage_winner_storage_key(active.stage.logical_step_id)
+                            model_stage_rules._model_completion_stage_winner_storage_key(
+                                active.stage.logical_step_id
+                            )
                         )
                         is not None
                     ),
@@ -15917,10 +15880,12 @@ class InMemorySessionStore(
                         is not None
                     ),
                 )
-                retry_settlement_record = _model_completion_stage_settlement_record(
-                    active.stage,
-                    request=retry_settlement_request,
-                    settled_at=prepared_at,
+                retry_settlement_record = (
+                    model_stage_rules._model_completion_stage_settlement_record(
+                        active.stage,
+                        request=retry_settlement_request,
+                        settled_at=prepared_at,
+                    )
                 )
             updated_session = session.model_copy(
                 update={"updated_at": prepared_at, "last_activity_at": prepared_at},
@@ -15948,7 +15913,7 @@ class InMemorySessionStore(
 
     async def _complete_model_completion_stage_atomic(
         self,
-        prepared: _PreparedModelCompletionStageTerminal,
+        prepared: model_stage_rules._PreparedModelCompletionStageTerminal,
     ) -> ModelCompletionStageResult:
         session_id = prepared.session_id
         async with self._lock:
@@ -15956,7 +15921,7 @@ class InMemorySessionStore(
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             records = self._session_operation_records[session_id]
-            stage = _reconstruct_model_completion_stage(
+            stage = model_stage_rules._reconstruct_model_completion_stage(
                 records.get(prepared.preparation_storage_key),
                 records.get(prepared.terminal_storage_key),
                 session_id=session_id,
@@ -15966,32 +15931,34 @@ class InMemorySessionStore(
             )
             if stage is None:
                 raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
-            _reject_settled_model_completion_stage(
+            model_stage_rules._reject_settled_model_completion_stage(
                 records.get(prepared.settlement_storage_key),
                 session_id=session_id,
                 stage_id=prepared.stage_id,
                 settlement_storage_key=prepared.settlement_storage_key,
             )
             if stage.state == "completed":
-                _validate_model_completion_stage_terminal_replay(stage, prepared)
+                model_stage_rules._validate_model_completion_stage_terminal_replay(stage, prepared)
                 return ModelCompletionStageResult(
                     stage=stage,
                     replayed=True,
                     dispatch_authorized=False,
                 )
             if prepared.recovery_fence is not None:
-                _validate_model_completion_stage_recovery_fence(
+                model_stage_rules._validate_model_completion_stage_recovery_fence(
                     prepared.recovery_fence,
                     session=session,
                     checkpoint=self._checkpoints.get(session_id),
                     stage=stage,
                     active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
                     dispatch_record=records.get(
-                        _model_completion_stage_dispatch_storage_key(stage.stage_id)
+                        model_stage_rules._model_completion_stage_dispatch_storage_key(
+                            stage.stage_id
+                        )
                     ),
                     now=self._ownership_clock(),
                 )
-            _validate_model_completion_stage_publication(
+            model_stage_publication._validate_model_completion_stage_publication(
                 prepared.publication,
                 session_id=session_id,
                 stage=stage,
@@ -16003,12 +15970,12 @@ class InMemorySessionStore(
                     "The terminal model completion intent conflicts with its preparation."
                 )
             completed_at = publication_rules._next_runtime_publication_timestamp(session)
-            terminal_record = _model_completion_stage_terminal_record(
+            terminal_record = model_stage_rules._model_completion_stage_terminal_record(
                 prepared,
                 stage=stage,
                 completed_at=completed_at,
             )
-            completed_stage = _reconstruct_model_completion_stage(
+            completed_stage = model_stage_rules._reconstruct_model_completion_stage(
                 records[prepared.preparation_storage_key],
                 terminal_record,
                 session_id=session_id,
@@ -16017,10 +15984,12 @@ class InMemorySessionStore(
                 terminal_storage_key=prepared.terminal_storage_key,
             )
             assert completed_stage is not None
-            advances_last_activity = _model_completion_terminal_advances_last_activity(
-                records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                stage=stage,
-                current_run_epoch=session.run_epoch,
+            advances_last_activity = (
+                model_stage_rules._model_completion_terminal_advances_last_activity(
+                    records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    stage=stage,
+                    current_run_epoch=session.run_epoch,
+                )
             )
             records[prepared.terminal_storage_key] = terminal_record
             self._sessions[session_id] = session.model_copy(
@@ -16040,7 +16009,7 @@ class InMemorySessionStore(
 
     async def _abandon_model_completion_stage_atomic(
         self,
-        prepared: _PreparedModelCompletionStageAbandonment,
+        prepared: model_stage_rules._PreparedModelCompletionStageAbandonment,
     ) -> ModelCompletionStageAbandonmentResult:
         session_id = prepared.session_id
         async with self._lock:
@@ -16048,7 +16017,7 @@ class InMemorySessionStore(
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             records = self._session_operation_records[session_id]
-            stage = _reconstruct_model_completion_stage(
+            stage = model_stage_rules._reconstruct_model_completion_stage(
                 records.get(prepared.preparation_storage_key),
                 records.get(prepared.terminal_storage_key),
                 session_id=session_id,
@@ -16059,21 +16028,27 @@ class InMemorySessionStore(
             if stage is None:
                 active_record = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
                 if active_record is not None:
-                    active_marker = _reconstruct_active_model_completion_stage_record(
-                        active_record,
-                        session_id=session_id,
+                    active_marker = (
+                        model_stage_rules._reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
                     )
                     if active_marker.stage_id == prepared.stage_id:
                         raise SessionModelCompletionStageConflict(
                             "The active model-completion marker references a missing stage."
                         )
-                replayed = _replay_model_completion_stage_abandonment(
+                replayed = model_stage_rules._replay_model_completion_stage_abandonment(
                     prepared,
                     records.get(prepared.abandonment_storage_key),
                 )
                 logical_step_id = replayed.abandonment.logical_step_id
                 if (
-                    records.get(_model_completion_stage_winner_storage_key(logical_step_id))
+                    records.get(
+                        model_stage_rules._model_completion_stage_winner_storage_key(
+                            logical_step_id
+                        )
+                    )
                     is not None
                     or records.get(
                         publication_contracts._runtime_publication_storage_key(logical_step_id)
@@ -16085,22 +16060,28 @@ class InMemorySessionStore(
                     )
                 return replayed
 
-            active = _reconstruct_active_model_completion_stage_from_records(
+            active = model_stage_rules._reconstruct_active_model_completion_stage_from_records(
                 records,
                 session_id=session_id,
             )
-            winner_storage_key = _model_completion_stage_winner_storage_key(stage.logical_step_id)
+            winner_storage_key = model_stage_rules._model_completion_stage_winner_storage_key(
+                stage.logical_step_id
+            )
             publication_storage_key = publication_contracts._runtime_publication_storage_key(
                 stage.logical_step_id
             )
-            _validate_model_completion_stage_for_abandonment(
+            model_stage_rules._validate_model_completion_stage_for_abandonment(
                 session=session,
                 stage=stage,
                 active=active,
                 prepared=prepared,
                 abandonment_record=records.get(prepared.abandonment_storage_key),
                 dispatch_exists=(
-                    records.get(_model_completion_stage_dispatch_storage_key(stage.stage_id))
+                    records.get(
+                        model_stage_rules._model_completion_stage_dispatch_storage_key(
+                            stage.stage_id
+                        )
+                    )
                     is not None
                 ),
                 winner_exists=records.get(winner_storage_key) is not None,
@@ -16108,12 +16089,12 @@ class InMemorySessionStore(
             )
             assert active is not None
             abandoned_at = publication_rules._next_runtime_publication_timestamp(session)
-            abandonment_record = _model_completion_stage_abandonment_record(
+            abandonment_record = model_stage_rules._model_completion_stage_abandonment_record(
                 stage,
                 active=active,
                 abandoned_at=abandoned_at,
             )
-            abandonment = _reconstruct_model_completion_stage_abandonment(
+            abandonment = model_stage_rules._reconstruct_model_completion_stage_abandonment(
                 abandonment_record,
                 session_id=session_id,
                 stage_id=prepared.stage_id,
@@ -16146,7 +16127,7 @@ class InMemorySessionStore(
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             records = self._session_operation_records[session_id]
-            stage = _reconstruct_model_completion_stage(
+            stage = model_stage_rules._reconstruct_model_completion_stage(
                 records.get(preparation_storage_key),
                 records.get(terminal_storage_key),
                 session_id=session_id,
@@ -16160,14 +16141,18 @@ class InMemorySessionStore(
             publication_storage_key = publication_contracts._runtime_publication_storage_key(
                 stage.logical_step_id
             )
-            winner_storage_key = _model_completion_stage_winner_storage_key(stage.logical_step_id)
+            winner_storage_key = model_stage_rules._model_completion_stage_winner_storage_key(
+                stage.logical_step_id
+            )
             receipt_record = records.get(publication_storage_key)
             if receipt_record is not None:
-                active = _reconstruct_active_model_completion_stage_from_records(
+                active = model_stage_rules._reconstruct_active_model_completion_stage_from_records(
                     records,
                     session_id=session_id,
                 )
-                _validate_model_completion_promotion_replay_active_marker(active, stage)
+                model_stage_rules._validate_model_completion_promotion_replay_active_marker(
+                    active, stage
+                )
                 receipt = publication_rules._reconstruct_runtime_publication_receipt(
                     deepcopy(receipt_record),
                     storage_key=publication_storage_key,
@@ -16175,7 +16160,7 @@ class InMemorySessionStore(
                     publication_id=stage.logical_step_id,
                 )
                 self._validate_runtime_publication_material_unlocked(receipt)
-                return _replay_promoted_model_completion_stage(
+                return model_stage_rules._replay_promoted_model_completion_stage(
                     session=session,
                     stage=stage,
                     receipt_record=deepcopy(receipt_record),
@@ -16185,12 +16170,12 @@ class InMemorySessionStore(
                 raise SessionModelCompletionStageConflict(
                     "A model-completion winner exists without its runtime publication receipt."
                 )
-            active = _reconstruct_active_model_completion_stage_from_records(
+            active = model_stage_rules._reconstruct_active_model_completion_stage_from_records(
                 records,
                 session_id=session_id,
             )
-            _validate_model_completion_active_marker_for_promotion(active, stage)
-            prepared = _prepare_model_completion_stage_promotion(
+            model_stage_rules._validate_model_completion_active_marker_for_promotion(active, stage)
+            prepared = model_stage_rules._prepare_model_completion_stage_promotion(
                 stage,
                 expected_run_epoch=expected_run_epoch,
             )
@@ -16404,7 +16389,7 @@ class InMemorySessionStore(
         winner_record = (
             None
             if model_completion_stage is None
-            else _model_completion_stage_winner_record(
+            else model_stage_rules._model_completion_stage_winner_record(
                 model_completion_stage,
                 receipt=receipt,
             )
@@ -16432,7 +16417,7 @@ class InMemorySessionStore(
         mutated_operation_records[prepared.storage_key] = receipt_record
         if model_completion_stage is not None:
             assert winner_record is not None
-            winner_storage_key = _model_completion_stage_winner_storage_key(
+            winner_storage_key = model_stage_rules._model_completion_stage_winner_storage_key(
                 model_completion_stage.logical_step_id
             )
             mutated_operation_records[winner_storage_key] = winner_record
@@ -18913,66 +18898,6 @@ def _prepare_initial_session_operation_records(
     return copied
 
 
-def _model_completion_stage_storage_identity(
-    session_id: str,
-    stage_id: str,
-) -> tuple[str, str, str, str]:
-    session_id = require_clean_nonblank(session_id, "session_id")
-    stage_id = require_clean_nonblank(stage_id, "stage_id")
-    if len(stage_id) > 256:
-        raise ValueError("stage_id must contain at most 256 characters.")
-    identity_hash = sha256(stage_id.encode("utf-8")).hexdigest()
-    return (
-        session_id,
-        stage_id,
-        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "prepared:" + identity_hash,
-        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "completed:" + identity_hash,
-    )
-
-
-def _model_completion_stage_winner_storage_key(logical_step_id: str) -> str:
-    logical_step_id = require_clean_nonblank(logical_step_id, "logical_step_id")
-    if len(logical_step_id) > 256:
-        raise ValueError("logical_step_id must contain at most 256 characters.")
-    return (
-        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX
-        + "winner:"
-        + sha256(logical_step_id.encode("utf-8")).hexdigest()
-    )
-
-
-def _model_completion_stage_abandonment_storage_key(stage_id: str) -> str:
-    stage_id = require_clean_nonblank(stage_id, "stage_id")
-    if len(stage_id) > 256:
-        raise ValueError("stage_id must contain at most 256 characters.")
-    return (
-        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX
-        + "abandoned:"
-        + sha256(stage_id.encode("utf-8")).hexdigest()
-    )
-
-
-def _model_completion_stage_settlement_storage_key(stage_id: str) -> str:
-    stage_id = require_clean_nonblank(stage_id, "stage_id")
-    if len(stage_id) > 256:
-        raise ValueError("stage_id must contain at most 256 characters.")
-    return (
-        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX
-        + "settled:"
-        + sha256(stage_id.encode("utf-8")).hexdigest()
-    )
-
-
-def _model_completion_stage_dispatch_storage_key(stage_id: str) -> str:
-    stage_id = require_clean_nonblank(stage_id, "stage_id")
-    if len(stage_id) > 256:
-        raise ValueError("stage_id must contain at most 256 characters.")
-    return (
-        MODEL_COMPLETION_STAGE_DISPATCH_OPERATION_KEY_PREFIX
-        + sha256(stage_id.encode("utf-8")).hexdigest()
-    )
-
-
 def _prepare_queue_completion_checkpoint_mutation(
     value: dict[str, Any] | None,
     to_status: SessionStatus,
@@ -19015,129 +18940,8 @@ def _apply_queue_completion_checkpoint_mutation(
     return updated
 
 
-def _prepare_model_completion_stage(
-    session_id: str,
-    request: ModelCompletionStageRequest,
-    *,
-    expected_statuses: set[SessionStatus],
-    expected_run_epoch: int,
-    expected_transcript_cursor: int,
-    failover_admission: ModelFailoverStageAdmission | None = None,
-) -> _PreparedModelCompletionStage:
-    session_id = require_clean_nonblank(session_id, "session_id")
-    if type(request) is not ModelCompletionStageRequest:
-        raise TypeError("Model completion staging requires a ModelCompletionStageRequest.")
-    try:
-        copied_request = ModelCompletionStageRequest(
-            stage_id=request.stage_id,
-            logical_step_id=request.logical_step_id,
-            dispatch_ordinal=request.dispatch_ordinal,
-            purpose=request.purpose,
-            intent=request.intent,
-            reservation_ids=request.reservation_ids,
-        )
-    except AttributeError as exc:
-        raise ValueError("Model completion stage request is malformed.") from exc
-    if MODEL_FAILOVER_CHECKPOINT_KEY in copied_request.intent:
-        raise ValueError("Public model-stage intents cannot supply model failover authority.")
-    if failover_admission is not None:
-        from dataclasses import replace
-
-        from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
-
-        if type(failover_admission) is not ModelFailoverStageAdmission:
-            raise TypeError("Model failover requires authenticated stage admission.")
-        failover_admission = replace(failover_admission)
-        progress = failover_admission.successor
-        candidate = progress.plan.candidates[progress.candidate_index]
-        recovery_context = copied_request.intent.get("recovery_context")
-        if (
-            copied_request.purpose != "assistant-turn"
-            or progress.session_id != session_id
-            or progress.stage_id != copied_request.stage_id
-            or progress.logical_step_id != copied_request.logical_step_id
-            or progress.dispatch_ordinal != copied_request.dispatch_ordinal
-            or progress.source_run_epoch != expected_run_epoch
-            or progress.source_transcript_cursor != expected_transcript_cursor
-            or copied_request.intent.get("request_fingerprint") != progress.request_fingerprint
-            or copied_request.intent.get("provider_name") != candidate.provider_name
-            or copied_request.intent.get("requested_model") != candidate.model
-            or copied_request.intent.get("model_step_id") != progress.logical_step_id
-            or copied_request.intent.get("interaction_id") != progress.interaction_id
-            or type(recovery_context) is not dict
-            or recovery_context.get("execution_profile_fingerprint")
-            != progress.execution_profile_fingerprint
-        ):
-            raise ValueError("Model failover conflicts with its exact prepared request.")
-        ModelAttemptIdentity.model_validate(
-            {
-                "model_step_id": copied_request.intent.get("model_step_id"),
-                "model_attempt_id": copied_request.intent.get("model_attempt_id"),
-            }
-        )
-        copied_request = ModelCompletionStageRequest(
-            stage_id=copied_request.stage_id,
-            logical_step_id=copied_request.logical_step_id,
-            dispatch_ordinal=copied_request.dispatch_ordinal,
-            purpose=copied_request.purpose,
-            reservation_ids=copied_request.reservation_ids,
-            intent={
-                **copied_request.intent,
-                MODEL_FAILOVER_CHECKPOINT_KEY: failover_admission.intent_payload(),
-            },
-        )
-    allowed_statuses = frozenset(
-        session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
-    )
-    expected_run_epoch = session_authority_rules._validate_required_runtime_fence(
-        expected_run_epoch,
-        "expected_run_epoch",
-    )
-    expected_transcript_cursor = session_authority_rules._validate_required_runtime_fence(
-        expected_transcript_cursor,
-        "expected_transcript_cursor",
-    )
-    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session_id,
-        copied_request.stage_id,
-    )
-    winner_key = _model_completion_stage_winner_storage_key(copied_request.logical_step_id)
-    request_digest = session_authority_rules._canonical_runtime_publication_digest(
-        {
-            "session_id": session_id,
-            "stage_id": copied_request.stage_id,
-            "logical_step_id": copied_request.logical_step_id,
-            "dispatch_ordinal": copied_request.dispatch_ordinal,
-            "purpose": copied_request.purpose,
-            "intent": copied_request.intent,
-            "reservation_ids": list(copied_request.reservation_ids),
-            "expected_statuses": sorted(str(status) for status in allowed_statuses),
-            "expected_run_epoch": expected_run_epoch,
-            "expected_transcript_cursor": expected_transcript_cursor,
-        }
-    )
-    return _PreparedModelCompletionStage(
-        session_id=session_id,
-        preparation_storage_key=preparation_key,
-        terminal_storage_key=terminal_key,
-        abandonment_storage_key=_model_completion_stage_abandonment_storage_key(
-            copied_request.stage_id
-        ),
-        winner_storage_key=winner_key,
-        publication_storage_key=publication_contracts._runtime_publication_storage_key(
-            copied_request.logical_step_id
-        ),
-        request=copied_request,
-        request_digest=request_digest,
-        expected_statuses=allowed_statuses,
-        expected_run_epoch=expected_run_epoch,
-        expected_transcript_cursor=expected_transcript_cursor,
-        failover_admission=failover_admission,
-    )
-
-
 def _model_failover_selection_event(
-    prepared: _PreparedModelCompletionStage,
+    prepared: model_stage_rules._PreparedModelCompletionStage,
     *,
     session: Session,
     prepared_at: datetime,
@@ -19207,7 +19011,7 @@ def _validate_model_failover_selection_replay(expected: Event, observed: Event |
 
 
 def _model_failover_predecessor_storage_keys(
-    prepared: _PreparedModelCompletionStage,
+    prepared: model_stage_rules._PreparedModelCompletionStage,
 ) -> tuple[str, ...]:
     admission = prepared.failover_admission
     if admission is None or not isinstance(admission.expected, ModelFailoverProgress):
@@ -19218,17 +19022,19 @@ def _model_failover_predecessor_storage_keys(
 def _model_failover_progress_storage_keys(expected: ModelFailoverProgress) -> tuple[str, ...]:
     from cayu.runtime.provider_operations import provider_operation_resolution_storage_key
 
-    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        expected.session_id, expected.stage_id
+    _, _, preparation_key, terminal_key = (
+        model_stage_rules._model_completion_stage_storage_identity(
+            expected.session_id, expected.stage_id
+        )
     )
     return (
         preparation_key,
         terminal_key,
-        _model_completion_stage_winner_storage_key(expected.logical_step_id),
+        model_stage_rules._model_completion_stage_winner_storage_key(expected.logical_step_id),
         publication_contracts._runtime_publication_storage_key(expected.logical_step_id),
-        _model_completion_stage_abandonment_storage_key(expected.stage_id),
-        _model_completion_stage_dispatch_storage_key(expected.stage_id),
-        _model_completion_stage_settlement_storage_key(expected.stage_id),
+        model_stage_rules._model_completion_stage_abandonment_storage_key(expected.stage_id),
+        model_stage_rules._model_completion_stage_dispatch_storage_key(expected.stage_id),
+        model_stage_rules._model_completion_stage_settlement_storage_key(expected.stage_id),
         provider_operation_resolution_storage_key(expected.stage_id),
     )
 
@@ -19273,7 +19079,7 @@ def _require_settled_model_failover_predecessor(
             raise SessionModelCompletionStageConflict(
                 "Abandoned model stage has competing evidence."
             )
-        abandonment = _reconstruct_model_completion_stage_abandonment(
+        abandonment = model_stage_rules._reconstruct_model_completion_stage_abandonment(
             records[abandonment_key],
             session_id=session.id,
             stage_id=expected.stage_id,
@@ -19293,7 +19099,7 @@ def _require_settled_model_failover_predecessor(
         ):
             raise SessionModelCompletionStageConflict("Model abandonment authority changed.")
         return
-    source = _reconstruct_model_completion_stage(
+    source = model_stage_rules._reconstruct_model_completion_stage(
         records.get(preparation_key),
         records.get(terminal_key),
         session_id=session.id,
@@ -19315,7 +19121,7 @@ def _require_settled_model_failover_predecessor(
     receipt_record = records.get(receipt_key)
     settlement_record = records.get(settlement_key)
     if new_interaction and source.state == "in_flight" and settlement_record is not None:
-        settlement = _reconstruct_model_completion_stage_settlement(
+        settlement = model_stage_rules._reconstruct_model_completion_stage_settlement(
             settlement_record,
             session_id=session.id,
             stage_id=expected.stage_id,
@@ -19355,7 +19161,7 @@ def _require_settled_model_failover_predecessor(
         session_id=session.id,
         publication_id=expected.logical_step_id,
     )
-    _validate_model_completion_stage_winner(
+    model_stage_rules._validate_model_completion_stage_winner(
         records.get(winner_key), stage=source, receipt=receipt, winner_storage_key=winner_key
     )
 
@@ -19501,7 +19307,7 @@ def _model_failover_checkpoint_after_profile_admission(
 
 
 def _model_failover_preparation_checkpoint(
-    prepared: _PreparedModelCompletionStage,
+    prepared: model_stage_rules._PreparedModelCompletionStage,
     *,
     session: Session,
     checkpoint: dict[str, Any] | None,
@@ -19598,7 +19404,7 @@ def _model_failover_preparation_checkpoint(
             raise SessionModelCompletionStageConflict(
                 "Model failover lost its abandonment receipt."
             )
-        abandonment = _reconstruct_model_completion_stage_abandonment(
+        abandonment = model_stage_rules._reconstruct_model_completion_stage_abandonment(
             abandonment_record,
             session_id=session.id,
             stage_id=expected.stage_id,
@@ -19616,7 +19422,7 @@ def _model_failover_preparation_checkpoint(
                 "Model failover abandonment authority changed."
             )
         return updated
-    source = _reconstruct_model_completion_stage(
+    source = model_stage_rules._reconstruct_model_completion_stage(
         records.get(preparation_key),
         records.get(terminal_key),
         session_id=session.id,
@@ -19654,792 +19460,6 @@ def _model_failover_preparation_checkpoint(
             "A failover retry requires its exact active predecessor."
         )
     return updated
-
-
-def _prepare_model_completion_stage_abandonment(
-    session_id: str,
-    *,
-    stage_id: str,
-    preparation_digest: str,
-    expected_run_epoch: int,
-    stage_source_run_epoch: int | None,
-) -> _PreparedModelCompletionStageAbandonment:
-    session_id, stage_id, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session_id, stage_id
-    )
-    try:
-        session_authority_rules._require_raw_sha256_digest(preparation_digest)
-    except ValueError as exc:
-        raise ValueError("preparation_digest must be a lowercase SHA-256 digest.") from exc
-    expected_run_epoch = session_authority_rules._validate_required_runtime_fence(
-        expected_run_epoch,
-        "expected_run_epoch",
-    )
-    if stage_source_run_epoch is None:
-        stage_source_run_epoch = expected_run_epoch
-    stage_source_run_epoch = session_authority_rules._validate_required_runtime_fence(
-        stage_source_run_epoch,
-        "stage_source_run_epoch",
-    )
-    if stage_source_run_epoch > expected_run_epoch:
-        raise ValueError("stage_source_run_epoch cannot exceed expected_run_epoch.")
-    return _PreparedModelCompletionStageAbandonment(
-        session_id=session_id,
-        stage_id=stage_id,
-        preparation_storage_key=preparation_key,
-        terminal_storage_key=terminal_key,
-        abandonment_storage_key=_model_completion_stage_abandonment_storage_key(stage_id),
-        preparation_digest=preparation_digest,
-        expected_run_epoch=expected_run_epoch,
-        stage_source_run_epoch=stage_source_run_epoch,
-    )
-
-
-def _prepare_model_completion_stage_terminal(
-    session_id: str,
-    *,
-    stage_id: str,
-    publication: RuntimePublicationRequest,
-    recovery_fence: ModelCompletionStageRecoveryFence | None = None,
-) -> _PreparedModelCompletionStageTerminal:
-    session_id, stage_id, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session_id, stage_id
-    )
-    if type(publication) is not RuntimePublicationRequest:
-        raise TypeError("publication must be a RuntimePublicationRequest.")
-    try:
-        copied_publication = RuntimePublicationRequest(
-            publication_id=publication.publication_id,
-            kind=publication.kind,
-            interaction_id=publication.interaction_id,
-            intent=publication.intent,
-            mutation=publication.mutation,
-            transcript_messages=publication.transcript_messages,
-            events=publication.events,
-            operation_record_mutations=publication.operation_record_mutations,
-            referenced_events=publication.referenced_events,
-        )
-    except AttributeError as exc:
-        raise ValueError("Model completion publication is malformed.") from exc
-    publication_payload = copied_publication.model_dump(mode="json")
-    return _PreparedModelCompletionStageTerminal(
-        session_id=session_id,
-        stage_id=stage_id,
-        preparation_storage_key=preparation_key,
-        terminal_storage_key=terminal_key,
-        settlement_storage_key=_model_completion_stage_settlement_storage_key(stage_id),
-        publication=copied_publication,
-        publication_material_digest=session_authority_rules._canonical_runtime_publication_digest(
-            publication_payload
-        ),
-        recovery_fence=recovery_fence,
-    )
-
-
-def _validate_model_completion_stage_recovery_fence(
-    fence: ModelCompletionStageRecoveryFence,
-    *,
-    session: Session,
-    checkpoint: dict[str, Any] | None,
-    stage: ModelCompletionStage,
-    active_record: dict[str, Any] | None,
-    dispatch_record: dict[str, Any] | None,
-    now: datetime,
-) -> None:
-    """Admit a new synthetic terminal inside the store's existing transaction."""
-    from cayu.runtime._durable_model_terminalization import require_terminalization_plan_owner
-
-    if (
-        session.instance_id != fence.expected_session_instance_id
-        or session.run_epoch != fence.expected_run_epoch
-        or active_invocation_execution_profile_from_checkpoint(checkpoint)
-        != fence.expected_active_profile
-        or session_recovery_rules._active_unexpired_incomplete_recovery_claim_id(
-            checkpoint, now=now
-        )
-        != fence.recovery_claim_id
-    ):
-        raise SessionRunFenced("Auxiliary recovery lost its invocation or recovery claim.")
-    require_terminalization_plan_owner(checkpoint, fence.recovery_plan_ownership, now)
-    if active_record is None:
-        raise SessionModelCompletionStageConflict("Auxiliary recovery lost its active stage.")
-    active = _reconstruct_active_model_completion_stage_record(active_record, session_id=session.id)
-    if (
-        stage.purpose != "auxiliary-inference"
-        or stage.preparation_digest != fence.preparation_digest
-        or active.stage_id != stage.stage_id
-        or active.preparation_digest != stage.preparation_digest
-    ):
-        raise SessionModelCompletionStageConflict("Auxiliary recovery stage authority changed.")
-    if dispatch_record is None:
-        raise SessionModelCompletionStageConflict("Auxiliary recovery requires a dispatch receipt.")
-    dispatch = _reconstruct_model_completion_stage_dispatch(
-        dispatch_record,
-        session_id=session.id,
-        stage_id=stage.stage_id,
-        storage_key=_model_completion_stage_dispatch_storage_key(stage.stage_id),
-    )
-    _validate_model_completion_stage_dispatch(dispatch, stage)
-
-
-def _validate_model_completion_stage_publication(
-    publication: RuntimePublicationRequest,
-    *,
-    session_id: str,
-    stage: ModelCompletionStage | model_stage_contracts._ModelCompletionStagePreparationRecord,
-) -> None:
-    if publication.publication_id != stage.logical_step_id:
-        raise ValueError("Model completion publication_id must equal logical_step_id.")
-    if not session_authority_rules._runtime_publication_json_equal(
-        publication.intent, stage.intent
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The terminal model completion intent conflicts with its preparation."
-        )
-    if stage.purpose == "auxiliary-inference":
-        from cayu.runtime._auxiliary_inference_contract import validate_auxiliary_publication
-
-        validate_auxiliary_publication(publication, session_id=session_id, stage=stage)
-        return
-    if stage.purpose == "assistant-turn":
-        if publication.kind != "model-step":
-            raise ValueError("Assistant-turn publication kind must be 'model-step'.")
-        if len(publication.transcript_messages) > 1 or any(
-            message.role != MessageRole.ASSISTANT for message in publication.transcript_messages
-        ):
-            raise ValueError(
-                "An assistant-turn publication may contain at most one assistant message."
-            )
-    else:
-        if publication.kind != "context-compaction":
-            raise ValueError("Context-compaction publication kind must be 'context-compaction'.")
-        if publication.transcript_messages:
-            raise ValueError("A context-compaction publication cannot append transcript messages.")
-    completed_events = [
-        event for event in publication.events if event.type == EventType.MODEL_COMPLETED
-    ]
-    if len(completed_events) != 1:
-        raise ValueError(
-            "A model completion publication must append exactly one model.completed event."
-        )
-    if stage.purpose == "assistant-turn" and (
-        len(publication.events) != 1 or publication.referenced_events
-    ):
-        raise ValueError(
-            "An assistant-turn publication must bind exactly its model.completed event."
-        )
-    completed_event = completed_events[0]
-    if stage.purpose == "assistant-turn" and (
-        stage.reservation_ids or "budget_settlements" in completed_event.payload
-    ):
-        model_completion_budget_settlements(
-            completed_event,
-            reservation_ids=stage.reservation_ids,
-        )
-    classification = completed_event.payload.get("step_classification")
-    if (
-        stage.purpose == "assistant-turn"
-        and not publication.transcript_messages
-        and (
-            type(classification) is not dict
-            or classification.get("type") not in _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS
-        )
-    ):
-        raise ValueError(
-            "A model completion publication without an assistant message requires "
-            "a non-turn or continue model.completed step classification."
-        )
-    if (
-        stage.purpose == "assistant-turn"
-        and completed_event.payload.get("purpose") == "context_compaction"
-    ):
-        raise ValueError("An assistant-turn publication cannot carry context-compaction evidence.")
-    if (
-        stage.purpose == "context-compaction"
-        and completed_event.payload.get("purpose") != "context_compaction"
-    ):
-        raise ValueError(
-            "A context-compaction publication requires matching model completion evidence."
-        )
-    for event in publication.events:
-        if event.session_id != session_id:
-            raise ValueError("Model completion event session_id does not match target session.")
-    appended_event_ids = {event.id for event in publication.events}
-    overlap = appended_event_ids & set(
-        publication_contracts._runtime_publication_referenced_event_ids(
-            publication.referenced_events
-        )
-    )
-    if overlap:
-        raise ValueError(
-            f"Model completion cannot both append and reference event id {min(overlap)}."
-        )
-    if stage.purpose == "assistant-turn":
-        _validate_assistant_model_completion_publication(
-            publication,
-            stage=stage,
-            completed_event=completed_event,
-            classification=classification,
-        )
-
-
-def _validate_assistant_model_completion_publication(
-    publication: RuntimePublicationRequest,
-    *,
-    stage: ModelCompletionStage | model_stage_contracts._ModelCompletionStagePreparationRecord,
-    completed_event: Event,
-    classification: Any,
-) -> None:
-    if type(classification) is not dict:
-        raise ValueError("An assistant-turn publication requires a model step classification.")
-    raw_model_step_id = stage.intent.get("model_step_id")
-    raw_model_attempt_id = stage.intent.get("model_attempt_id")
-    model_attempt_identity = None
-    if raw_model_step_id is not None or raw_model_attempt_id is not None:
-        if type(raw_model_step_id) is not str or type(raw_model_attempt_id) is not str:
-            raise ValueError(
-                "An assistant-turn completion stage has a malformed model-attempt identity."
-            )
-        try:
-            model_attempt_identity = ModelAttemptIdentity(
-                model_step_id=raw_model_step_id,
-                model_attempt_id=raw_model_attempt_id,
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "An assistant-turn completion stage has a malformed model-attempt identity."
-            ) from exc
-        if (
-            model_attempt_identity.model_step_id != stage.logical_step_id
-            or completed_event.payload.get("model_step_id") != model_attempt_identity.model_step_id
-            or completed_event.payload.get("model_attempt_id")
-            != model_attempt_identity.model_attempt_id
-        ):
-            raise ValueError(
-                "The model.completed identity conflicts with its staged model attempt."
-            )
-    published_assistant_message = (
-        publication.transcript_messages[0] if publication.transcript_messages else None
-    )
-    operations_by_key = {operation.key: operation for operation in publication.mutation.operations}
-    schema_operation = operations_by_key.get(CHECKPOINT_SCHEMA_VERSION_KEY)
-    pending_operation = operations_by_key.get(
-        tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY
-    )
-    pending_marker = None if pending_operation is None else pending_operation.value
-    assistant_message = published_assistant_message
-    assistant_message_deferred = False
-    if (
-        assistant_message is None
-        and type(pending_marker) is dict
-        and pending_marker.get("assistant_message_state") == "quarantined"
-    ):
-        raw_quarantined_message = pending_marker.get("quarantined_assistant_message")
-        try:
-            assistant_message = Message.model_validate(raw_quarantined_message)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "A deferred model completion requires a valid private assistant message."
-            ) from exc
-        assistant_message_deferred = True
-    tool_calls = (
-        tuple(part for part in assistant_message.content if isinstance(part, ToolCallPart))
-        if assistant_message is not None
-        else ()
-    )
-    classification_type = classification.get("type")
-    if tool_calls and classification_type != "continue":
-        raise ValueError(
-            "An assistant model completion with tool calls must be classified as continue."
-        )
-
-    tool_round_identity = None
-    if tool_calls:
-        if model_attempt_identity is None:
-            raise ValueError("Assistant tool calls require a staged model-attempt identity.")
-        raw_identities = {
-            (call.model_step_id, call.model_attempt_id, call.tool_round_id) for call in tool_calls
-        }
-        if len(raw_identities) != 1:
-            raise ValueError("Assistant tool calls must share one complete tool-round identity.")
-        model_step_id, model_attempt_id, tool_round_id = next(iter(raw_identities))
-        if model_step_id is None or model_attempt_id is None or tool_round_id is None:
-            raise ValueError("Assistant tool calls must carry a complete tool-round identity.")
-        try:
-            tool_round_identity = ToolRoundIdentity(
-                model_step_id=model_step_id,
-                model_attempt_id=model_attempt_id,
-                tool_round_id=tool_round_id,
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Assistant tool calls must carry a valid tool-round identity."
-            ) from exc
-        if (
-            tool_round_identity.model_step_id != model_attempt_identity.model_step_id
-            or tool_round_identity.model_attempt_id != model_attempt_identity.model_attempt_id
-        ):
-            raise ValueError(
-                "Assistant tool-round identity conflicts with its staged model completion."
-            )
-    expected_tool_round_id = (
-        None if tool_round_identity is None else tool_round_identity.tool_round_id
-    )
-    expected_operation_keys = {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
-    if tool_calls:
-        expected_operation_keys.add(tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY)
-    actual_operation_keys = frozenset(operations_by_key)
-    if actual_operation_keys not in {
-        frozenset(expected_operation_keys),
-        frozenset(expected_operation_keys | {CHECKPOINT_SCHEMA_VERSION_KEY}),
-    }:
-        raise ValueError(
-            "An assistant model completion must atomically publish exactly its model-step "
-            "pointer, optional pending tool-round marker, and optional root checkpoint "
-            "schema stamp."
-        )
-    if schema_operation is not None:
-        if (
-            type(schema_operation.value) is not int
-            or not 1 <= schema_operation.value <= CURRENT_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                "A model completion root checkpoint schema stamp must target a supported version."
-            )
-        supported_schema_digests = {
-            runtime_publication_checkpoint_value_digest(version)
-            for version in range(1, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1)
-        }
-        if (
-            schema_operation.action != "set"
-            or schema_operation.expected_value_digest not in supported_schema_digests | {None}
-        ):
-            raise ValueError(
-                "A model completion root checkpoint schema stamp must fence a supported version."
-            )
-
-    pointer_operation = operations_by_key[LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
-    if pointer_operation.action != "set":
-        raise ValueError("A model-step publication pointer must use a set operation.")
-    try:
-        if type(pointer_operation.value) is not dict:
-            raise TypeError("The model-step publication pointer must be an object.")
-        raw_pointer_schema_version = pointer_operation.value.get("schema_version")
-        if (
-            type(raw_pointer_schema_version) is not int
-            or not 1 <= raw_pointer_schema_version <= CURRENT_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                "The model-step publication pointer has an unsupported schema version."
-            )
-        root_schema_version = (
-            raw_pointer_schema_version if schema_operation is None else schema_operation.value
-        )
-        staged_checkpoint = {
-            CHECKPOINT_SCHEMA_VERSION_KEY: root_schema_version,
-            LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY: pointer_operation.value,
-        }
-        if type(pending_marker) is dict:
-            staged_checkpoint[tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
-                pending_marker
-            )
-        normalized_pointer_checkpoint = decode_runtime_checkpoint(
-            staged_checkpoint,
-            session_id=completed_event.session_id,
-        )
-        if normalized_pointer_checkpoint is None:
-            raise TypeError("The model-step publication pointer is missing.")
-        pointer = ModelStepPublicationCheckpoint.model_validate(
-            normalized_pointer_checkpoint[LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
-        )
-        if type(pending_marker) is dict:
-            pending_marker = normalized_pointer_checkpoint.get(
-                tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY
-            )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("The model-step publication pointer is malformed.") from exc
-    expected_transcript_end = stage.source_transcript_cursor + int(
-        published_assistant_message is not None
-    )
-    expected_pointer = ModelStepPublicationCheckpoint(
-        logical_step_id=stage.logical_step_id,
-        stage_id=stage.stage_id,
-        source_transcript_cursor=stage.source_transcript_cursor,
-        transcript_end_cursor=expected_transcript_end,
-        completion_event_id=completed_event.id,
-        classification=classification,
-        assistant_message_published=published_assistant_message is not None,
-        assistant_message_deferred=assistant_message_deferred,
-        tool_round_id=expected_tool_round_id,
-    )
-    if pointer != expected_pointer:
-        raise ValueError("The model-step publication pointer conflicts with its staged completion.")
-    transcript_cursor = completed_event.payload.get("transcript_cursor")
-    if type(transcript_cursor) is not int or transcript_cursor != expected_transcript_end:
-        raise ValueError(
-            "The model.completed transcript cursor conflicts with its staged completion."
-        )
-
-    if not tool_calls:
-        return
-    pending_operation = operations_by_key[tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY]
-    if pending_operation.action != "set" or type(pending_operation.value) is not dict:
-        raise ValueError("A model-step pending tool-round marker must use an object set operation.")
-    marker = pending_marker
-    if type(marker) is not dict:
-        raise ValueError("A model-step pending tool-round marker must be an object.")
-    required_marker_keys = {
-        "tool_round_id",
-        "model_step_id",
-        "model_attempt_id",
-        "agent_name",
-        "interaction_id",
-        "environment_name",
-        "task_id",
-        "source_run_epoch",
-        "execution_profile_fingerprint",
-        "tool_calls",
-        "policy_state",
-        "policy_context_version",
-        "request_metadata",
-        "deferred_messages",
-        "assistant_message_state",
-        "quarantined_assistant_message",
-        "staged_terminals",
-        "structured_output",
-        "thinking",
-        "max_steps",
-        "limits",
-        "run_limit_accounting",
-        "budget_limits",
-        "retry_policy",
-        "source_model_step_id",
-        "source_transcript_cursor",
-        "model_step",
-        "structured_output_attempt",
-        "structured_output_retries",
-        "structured_output_validation",
-    }
-    marker_keys = set(marker)
-    if not required_marker_keys <= marker_keys or not marker_keys <= (
-        required_marker_keys | {"assistant_publication", "tool_exposure"}
-    ):
-        raise ValueError("The model-step pending tool-round marker has invalid fields.")
-    raw_run_limit_accounting = marker.get("run_limit_accounting")
-    if raw_run_limit_accounting is not None and (
-        type(raw_run_limit_accounting) is not dict
-        or type(raw_run_limit_accounting.get("baseline")) is not dict
-        or raw_run_limit_accounting["baseline"].get("session_id") != completed_event.session_id
-    ):
-        raise ValueError("The pending tool-round run-limit accounting owner is invalid.")
-    if assistant_message_deferred:
-        if assistant_message is None:
-            raise AssertionError("Deferred assistant publication lost its private message.")
-        if marker.get("quarantined_assistant_message") != assistant_message.model_dump(mode="json"):
-            raise ValueError(
-                "The quarantined assistant message conflicts with its model completion."
-            )
-    elif (
-        marker.get("assistant_message_state") != "published"
-        or marker.get("quarantined_assistant_message") is not None
-    ):
-        raise ValueError("A published assistant message cannot remain quarantined.")
-    if tool_round_identity is None:
-        raise ValueError("The model-step pending tool round lost its identity.")
-    if (
-        marker.get("tool_round_id") != tool_round_identity.tool_round_id
-        or marker.get("model_step_id") != tool_round_identity.model_step_id
-        or marker.get("model_attempt_id") != tool_round_identity.model_attempt_id
-    ):
-        raise ValueError("The pending tool-round identity conflicts with its model step.")
-    if marker.get("source_model_step_id") != tool_round_identity.model_step_id:
-        raise ValueError("The pending tool round has a conflicting source model-step identity.")
-    if marker.get("source_transcript_cursor") != stage.source_transcript_cursor:
-        raise ValueError("The pending tool round has a conflicting source transcript cursor.")
-    marker_source_run_epoch = marker.get("source_run_epoch")
-    if (
-        type(marker_source_run_epoch) is not int
-        or marker_source_run_epoch != stage.source_run_epoch
-    ):
-        raise ValueError("The pending tool round has a conflicting source run epoch.")
-    try:
-        require_clean_nonblank(marker.get("agent_name"), "pending tool-round agent_name")
-        marker_interaction_id = marker.get("interaction_id")
-        if marker_interaction_id is not None:
-            require_clean_nonblank(
-                marker_interaction_id,
-                "pending tool-round interaction_id",
-            )
-            if marker_interaction_id != completed_event.interaction_id:
-                raise ValueError("pending tool-round interaction_id conflicts with the model step")
-        for field_name in ("environment_name", "task_id"):
-            value = marker.get(field_name)
-            if value is not None:
-                require_clean_nonblank(value, f"pending tool-round {field_name}")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("The pending tool-round runtime identity is malformed.") from exc
-    marker_model_step = marker.get("model_step")
-    if type(marker_model_step) is not int or marker_model_step < 1:
-        raise ValueError("The pending tool round has an invalid model step.")
-    completed_model_step = completed_event.payload.get("step")
-    if completed_model_step is not None and (
-        type(completed_model_step) is not int or completed_model_step != marker_model_step
-    ):
-        raise ValueError("The pending tool round has a conflicting model step.")
-
-    raw_calls = marker.get("tool_calls")
-    if type(raw_calls) is not list or len(raw_calls) != len(tool_calls):
-        raise ValueError("The pending tool-round calls conflict with the assistant message.")
-    try:
-        pending_calls = tuple(
-            PendingToolCallApproval.model_validate(raw_call) for raw_call in raw_calls
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("The pending tool-round call records are malformed.") from exc
-    for pending_call, tool_call in zip(pending_calls, tool_calls, strict=True):
-        if (
-            pending_call.tool_call_id != tool_call.tool_call_id
-            or pending_call.tool_name != tool_call.tool_name
-            or not session_authority_rules._runtime_publication_json_equal(
-                pending_call.transcript_arguments,
-                tool_call.arguments,
-            )
-        ):
-            raise ValueError("The pending tool-round calls conflict with the assistant message.")
-        if (
-            pending_call.policy_evidence != ToolPolicyEvidence.UNPLANNED
-            or pending_call.policy_decision is not None
-            or pending_call.reason is not None
-            or pending_call.metadata
-            or pending_call.active_taint_labels
-        ):
-            raise ValueError("A newly published pending tool round cannot contain policy outcomes.")
-    if (
-        any(tool_call.tool_name == CALL_TOOL_NAME for tool_call in tool_calls)
-        and marker.get("interaction_id") != completed_event.interaction_id
-    ):
-        raise ValueError("A pending call_tool round requires its interaction identity.")
-
-    raw_structured_output = marker.get("structured_output")
-    structured_output = None
-    if raw_structured_output is not None:
-        if type(raw_structured_output) is not dict:
-            raise ValueError("The pending tool-round structured-output config is malformed.")
-        try:
-            structured_output = StructuredOutputSpec.model_validate(raw_structured_output)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "The pending tool-round structured-output config is malformed."
-            ) from exc
-    has_structured_finalizer = any(
-        tool_call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for tool_call in tool_calls
-    )
-    structured_output_attempt = marker.get("structured_output_attempt")
-    raw_structured_output_validation = marker.get("structured_output_validation")
-    if has_structured_finalizer:
-        if structured_output is None or structured_output.strategy != StructuredOutputStrategy.TOOL:
-            raise ValueError(
-                "The reserved structured-output call requires matching durable config."
-            )
-        if (
-            type(structured_output_attempt) is not int
-            or not 1 <= structured_output_attempt <= structured_output.max_retries + 1
-        ):
-            raise ValueError("The pending structured-output round requires a valid attempt number.")
-        try:
-            tool_publication_rules._validate_durable_structured_output_validation(
-                raw_structured_output_validation,
-                "pending_tool_round.structured_output_validation",
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "The pending structured-output round requires authoritative validation."
-            ) from exc
-    elif structured_output_attempt is not None or raw_structured_output_validation is not None:
-        raise ValueError(
-            "An ordinary pending tool round cannot carry structured-output attempt evidence."
-        )
-
-
-def _model_completion_stage_preparation_record(
-    prepared: _PreparedModelCompletionStage,
-    *,
-    source_session: Session,
-    prepared_at: datetime,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "record_type": MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": prepared.session_id,
-        "stage_id": prepared.request.stage_id,
-        "logical_step_id": prepared.request.logical_step_id,
-        "dispatch_ordinal": prepared.request.dispatch_ordinal,
-        "purpose": prepared.request.purpose,
-        "intent": prepared.request.intent,
-        "reservation_ids": list(prepared.request.reservation_ids),
-        "request_digest": prepared.request_digest,
-        "source_status": str(source_session.status),
-        "source_run_epoch": source_session.run_epoch,
-        "source_transcript_cursor": prepared.expected_transcript_cursor,
-        "prepared_at": prepared_at.isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "model_completion_stage_preparation")
-
-
-def _model_completion_stage_terminal_record(
-    prepared: _PreparedModelCompletionStageTerminal,
-    *,
-    stage: ModelCompletionStage,
-    completed_at: datetime,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "record_type": MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": prepared.session_id,
-        "stage_id": prepared.stage_id,
-        "logical_step_id": stage.logical_step_id,
-        "dispatch_ordinal": stage.dispatch_ordinal,
-        "purpose": stage.purpose,
-        "preparation_digest": stage.preparation_digest,
-        "publication": prepared.publication.model_dump(mode="json"),
-        "publication_material_digest": prepared.publication_material_digest,
-        "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "model_completion_stage_terminal")
-
-
-def _active_model_completion_stage_record(
-    stage: ModelCompletionStage,
-    *,
-    activated_at: datetime,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "record_type": MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": stage.session_id,
-        "stage_id": stage.stage_id,
-        "logical_step_id": stage.logical_step_id,
-        "dispatch_ordinal": stage.dispatch_ordinal,
-        "purpose": stage.purpose,
-        "preparation_digest": stage.preparation_digest,
-        "source_status": str(stage.source_status),
-        "source_run_epoch": stage.source_run_epoch,
-        "source_transcript_cursor": stage.source_transcript_cursor,
-        "activated_at": activated_at.isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "active_model_completion_stage")
-
-
-def _validate_model_completion_stage_release(
-    *,
-    session: Session,
-    active_record: dict[str, Any] | None,
-    preparation_record: dict[str, Any] | None,
-    terminal_record: dict[str, Any] | None,
-    release: ModelCompletionStageRelease,
-) -> model_stage_contracts._ActiveModelCompletionStageRecord:
-    """Validate exact in-flight stage ownership before a disposition clears it."""
-
-    if type(release) is not ModelCompletionStageRelease:
-        raise TypeError("model_completion_stage_release is invalid.")
-    if active_record is None:
-        raise SessionModelCompletionStageConflict("The model-completion stage is no longer active.")
-    marker = _reconstruct_active_model_completion_stage_record(
-        active_record,
-        session_id=session.id,
-    )
-    if (
-        marker.stage_id != release.stage_id
-        or marker.preparation_digest != release.preparation_digest
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The active model-completion stage changed before external disposition."
-        )
-    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session.id,
-        release.stage_id,
-    )
-    stage = _reconstruct_model_completion_stage(
-        preparation_record,
-        terminal_record,
-        session_id=session.id,
-        stage_id=release.stage_id,
-        preparation_storage_key=preparation_key,
-        terminal_storage_key=terminal_key,
-    )
-    if (
-        stage is None
-        or stage.state != "in_flight"
-        or stage.preparation_digest != release.preparation_digest
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The model-completion stage became terminal before external disposition."
-        )
-    return marker
-
-
-def _model_completion_stage_abandonment_record(
-    stage: ModelCompletionStage,
-    *,
-    active: ActiveModelCompletionStage,
-    abandoned_at: datetime,
-) -> dict[str, Any]:
-    if stage.state != "in_flight" or active.stage != stage:
-        raise SessionModelCompletionStageConflict(
-            "Only the exact active in-flight model-completion stage can be abandoned."
-        )
-    payload: dict[str, Any] = {
-        "record_type": MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": stage.session_id,
-        "stage_id": stage.stage_id,
-        "logical_step_id": stage.logical_step_id,
-        "dispatch_ordinal": stage.dispatch_ordinal,
-        "purpose": stage.purpose,
-        "preparation_request_digest": stage.preparation_request_digest,
-        "preparation_digest": stage.preparation_digest,
-        "active_marker_digest": active.marker_digest,
-        "source_status": str(stage.source_status),
-        "source_run_epoch": stage.source_run_epoch,
-        "source_transcript_cursor": stage.source_transcript_cursor,
-        "abandoned_at": abandoned_at.isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "model_completion_stage_abandonment")
-
-
-def _model_completion_stage_provider_effect_id(stage: ModelCompletionStage) -> str:
-    provider_start = stage.intent.get("provider_operation_start")
-    if type(provider_start) is dict:
-        idempotency_key = provider_start.get("idempotency_key")
-        if type(idempotency_key) is str:
-            return require_clean_nonblank(
-                idempotency_key,
-                "intent.provider_operation_start.idempotency_key",
-            )
-    request_fingerprint = stage.intent.get("request_fingerprint")
-    if type(request_fingerprint) is not str:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage has no provider effect identity."
-        )
-    try:
-        session_authority_rules._require_raw_sha256_digest(request_fingerprint)
-    except ValueError as exc:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage request fingerprint is malformed."
-        ) from exc
-    return f"request:{request_fingerprint}"
 
 
 _CHILD_LIFECYCLE_EVENT_TYPE_BY_TERMINAL_STATUS = {
@@ -20687,1364 +19707,6 @@ def _child_session_notification_consumption_replays(
     )
 
 
-def _model_completion_stage_execution_profile_fingerprint(
-    stage: ModelCompletionStage,
-) -> str | None:
-    recovery_context = stage.intent.get("recovery_context")
-    if recovery_context is None:
-        return None
-    if type(recovery_context) is not dict:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage recovery context is malformed."
-        )
-    fingerprint = recovery_context.get("execution_profile_fingerprint")
-    if fingerprint is None:
-        return None
-    if type(fingerprint) is not str:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage execution profile identity is malformed."
-        )
-    try:
-        session_authority_rules._require_raw_sha256_digest(fingerprint)
-    except ValueError as exc:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage execution profile identity is malformed."
-        ) from exc
-    return fingerprint
-
-
-def _model_completion_stage_dispatch_record(
-    stage: ModelCompletionStage,
-    *,
-    dispatched_at: datetime,
-) -> dict[str, Any]:
-    if type(stage) is not ModelCompletionStage or stage.state != "in_flight":
-        raise SessionModelCompletionStageConflict(
-            "Only an exact in-flight model-completion stage can be dispatched."
-        )
-    model_attempt_id = stage.intent.get("model_attempt_id")
-    interaction_id = stage.intent.get("interaction_id")
-    request_fingerprint = stage.intent.get("request_fingerprint")
-    if not all(
-        type(value) is str for value in (model_attempt_id, interaction_id, request_fingerprint)
-    ):
-        raise SessionModelCompletionStageConflict(
-            "Model-completion dispatch lost its exact interaction, attempt, or request identity."
-        )
-    payload = {
-        "record_type": MODEL_COMPLETION_STAGE_DISPATCH_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": stage.session_id,
-        "stage_id": stage.stage_id,
-        "logical_step_id": stage.logical_step_id,
-        "model_attempt_id": model_attempt_id,
-        "interaction_id": interaction_id,
-        "request_fingerprint": request_fingerprint,
-        "provider_effect_id": _model_completion_stage_provider_effect_id(stage),
-        "execution_profile_fingerprint": (
-            _model_completion_stage_execution_profile_fingerprint(stage)
-        ),
-        "preparation_digest": stage.preparation_digest,
-        "source_status": str(stage.source_status),
-        "source_run_epoch": stage.source_run_epoch,
-        "source_transcript_cursor": stage.source_transcript_cursor,
-        "dispatched_at": dispatched_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "model_completion_stage_dispatch")
-
-
-def _reconstruct_model_completion_stage_dispatch(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    stage_id: str,
-    storage_key: str,
-) -> ModelCompletionStageDispatch:
-    try:
-        dispatch = ModelCompletionStageDispatch.model_validate(record)
-        if (
-            dispatch.record_type != MODEL_COMPLETION_STAGE_DISPATCH_RECORD_TYPE
-            or dispatch.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION
-            or dispatch.session_id != session_id
-            or dispatch.stage_id != stage_id
-            or storage_key != _model_completion_stage_dispatch_storage_key(stage_id)
-        ):
-            raise ValueError
-        digest_payload = dispatch.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != dispatch.record_digest
-        ):
-            raise ValueError
-    except (TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion dispatch record is malformed."
-        ) from exc
-    return dispatch
-
-
-def _validate_model_completion_stage_dispatch(
-    dispatch: ModelCompletionStageDispatch,
-    stage: ModelCompletionStage,
-) -> None:
-    expected = _reconstruct_model_completion_stage_dispatch(
-        _model_completion_stage_dispatch_record(
-            stage,
-            dispatched_at=dispatch.dispatched_at,
-        ),
-        session_id=stage.session_id,
-        stage_id=stage.stage_id,
-        storage_key=_model_completion_stage_dispatch_storage_key(stage.stage_id),
-    )
-    if dispatch != expected:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion dispatch record conflicts with its stage."
-        )
-
-
-def _validate_model_completion_stage_for_dispatch(
-    *,
-    session: Session,
-    checkpoint: dict[str, Any] | None,
-    current_transcript_cursor: int,
-    stage: ModelCompletionStage,
-    active_record: dict[str, Any] | None,
-    preparation_record: dict[str, Any] | None,
-    terminal_record: dict[str, Any] | None,
-    settlement_record: dict[str, Any] | None,
-) -> None:
-    """Validate the complete dispatch fence from one backend-atomic snapshot."""
-
-    invocation_scope._assert_session_run_epoch(session.id, session)
-    if (
-        session.id != stage.session_id
-        or session.status is not stage.source_status
-        or session.run_epoch != stage.source_run_epoch
-    ):
-        raise SessionRunFenced("Model-completion dispatch lost its exact session epoch.")
-    if current_transcript_cursor != stage.source_transcript_cursor:
-        raise ValueError(
-            "Session source transcript cursor is stale: expected "
-            f"{stage.source_transcript_cursor}, current {current_transcript_cursor}."
-        )
-    active = _reconstruct_active_model_completion_stage(
-        active_record,
-        preparation_record,
-        terminal_record,
-        session_id=session.id,
-    )
-    if active is None or active.stage != stage:
-        raise SessionModelCompletionStageConflict(
-            "Only the exact active model-completion stage can cross the dispatch fence."
-        )
-    from cayu.runtime._model_failover_stage import validate_model_failover_dispatch
-
-    validate_model_failover_dispatch(session=session, checkpoint=checkpoint, stage=stage)
-    settlement_storage_key = _model_completion_stage_settlement_storage_key(stage.stage_id)
-    _reject_settled_model_completion_stage(
-        settlement_record,
-        session_id=session.id,
-        stage_id=stage.stage_id,
-        settlement_storage_key=settlement_storage_key,
-    )
-
-
-def model_completion_stage_settlement_request(
-    stage: ModelCompletionStage,
-    *,
-    interaction_id: str,
-    disposition: ModelCompletionStageDisposition,
-    reason_code: str,
-    execution_profile_fingerprint: str | None,
-    settlement_run_epoch: int,
-    settled_reservation_ids: tuple[str, ...],
-    superseding_stage_id: str | None = None,
-) -> ModelCompletionStageSettlementRequest:
-    """Bind one requested disposition to every durable model-effect identity."""
-
-    if type(stage) is not ModelCompletionStage:
-        raise TypeError("stage must be a ModelCompletionStage.")
-    if stage.state != "in_flight":
-        raise SessionModelCompletionStageConflict(
-            "Only an in-flight model-completion stage can be settled."
-        )
-    model_attempt_id = stage.intent.get("model_attempt_id")
-    request_fingerprint = stage.intent.get("request_fingerprint")
-    staged_interaction_id = stage.intent.get("interaction_id")
-    if type(model_attempt_id) is not str or type(request_fingerprint) is not str:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage lost its exact attempt or request identity."
-        )
-    if staged_interaction_id != interaction_id:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage belongs to a different interaction."
-        )
-    staged_profile = _model_completion_stage_execution_profile_fingerprint(stage)
-    if staged_profile != execution_profile_fingerprint:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion stage belongs to a different execution profile."
-        )
-    settlement_run_epoch = session_authority_rules._validate_required_runtime_fence(
-        settlement_run_epoch,
-        "settlement_run_epoch",
-    )
-    if settlement_run_epoch < stage.source_run_epoch:
-        raise SessionRunFenced(
-            "Model-completion settlement run epoch cannot precede its source epoch: "
-            f"source {stage.source_run_epoch}, settlement {settlement_run_epoch}."
-        )
-    return ModelCompletionStageSettlementRequest(
-        stage_id=stage.stage_id,
-        logical_step_id=stage.logical_step_id,
-        model_attempt_id=model_attempt_id,
-        interaction_id=interaction_id,
-        request_fingerprint=request_fingerprint,
-        provider_effect_id=_model_completion_stage_provider_effect_id(stage),
-        execution_profile_fingerprint=execution_profile_fingerprint,
-        preparation_digest=stage.preparation_digest,
-        settlement_run_epoch=settlement_run_epoch,
-        settled_reservation_ids=settled_reservation_ids,
-        disposition=disposition,
-        reason_code=reason_code,
-        superseding_stage_id=superseding_stage_id,
-    )
-
-
-def _model_completion_retry_settlement_request(
-    active: ActiveModelCompletionStage | None,
-    prepared: _PreparedModelCompletionStage,
-) -> ModelCompletionStageSettlementRequest | None:
-    """Create exact supersession evidence for current-contract retry stages.
-
-    Older direct store callers could use opaque intents without an interaction,
-    attempt, or request identity. Preserve those stored contracts, while every
-    runtime-authored stage now carries enough identity to settle durably.
-    """
-
-    if active is None:
-        return None
-    stage = active.stage
-    if not all(
-        type(stage.intent.get(field)) is str
-        for field in ("interaction_id", "model_attempt_id", "request_fingerprint")
-    ):
-        return None
-    return model_completion_stage_settlement_request(
-        stage,
-        interaction_id=stage.intent["interaction_id"],
-        disposition=ModelCompletionStageDisposition.SUPERSEDED,
-        reason_code="retry_superseded",
-        execution_profile_fingerprint=(
-            _model_completion_stage_execution_profile_fingerprint(stage)
-        ),
-        settlement_run_epoch=prepared.expected_run_epoch,
-        settled_reservation_ids=stage.reservation_ids,
-        superseding_stage_id=prepared.request.stage_id,
-    )
-
-
-def _model_completion_stage_settlement_record(
-    stage: ModelCompletionStage,
-    *,
-    request: ModelCompletionStageSettlementRequest,
-    settled_at: datetime,
-) -> dict[str, Any]:
-    expected = model_completion_stage_settlement_request(
-        stage,
-        interaction_id=request.interaction_id,
-        disposition=request.disposition,
-        reason_code=request.reason_code,
-        execution_profile_fingerprint=request.execution_profile_fingerprint,
-        settlement_run_epoch=request.settlement_run_epoch,
-        settled_reservation_ids=request.settled_reservation_ids,
-        superseding_stage_id=request.superseding_stage_id,
-    )
-    if expected != request:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion settlement authority conflicts with its active stage."
-        )
-    payload = {
-        "record_type": MODEL_COMPLETION_STAGE_SETTLEMENT_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": stage.session_id,
-        **request.model_dump(mode="json"),
-        "source_status": str(stage.source_status),
-        "source_run_epoch": stage.source_run_epoch,
-        "source_transcript_cursor": stage.source_transcript_cursor,
-        "settled_at": settled_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "model_completion_stage_settlement")
-
-
-def _reconstruct_model_completion_stage_settlement(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    stage_id: str,
-    storage_key: str,
-) -> ModelCompletionStageSettlement:
-    try:
-        settlement = ModelCompletionStageSettlement.model_validate(record)
-        if (
-            settlement.record_type != MODEL_COMPLETION_STAGE_SETTLEMENT_RECORD_TYPE
-            or settlement.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION
-            or settlement.session_id != session_id
-            or settlement.stage_id != stage_id
-            or storage_key != _model_completion_stage_settlement_storage_key(stage_id)
-        ):
-            raise ValueError
-        digest_payload = settlement.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != settlement.record_digest
-        ):
-            raise ValueError
-    except (TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion settlement record is malformed."
-        ) from exc
-    return settlement
-
-
-def _validate_model_completion_stage_for_settlement(
-    *,
-    session: Session,
-    stage: ModelCompletionStage,
-    active: ActiveModelCompletionStage | None,
-    request: ModelCompletionStageSettlementRequest,
-    settlement_record: dict[str, Any] | None,
-    winner_exists: bool,
-    receipt_exists: bool,
-) -> None:
-    if stage.state != "in_flight":
-        raise SessionModelCompletionStageConflict(
-            "A completed model-completion stage cannot receive a failure disposition."
-        )
-    if active is None or active.stage != stage:
-        raise SessionModelCompletionStageConflict(
-            "Only the exact active model-completion stage can be settled."
-        )
-    if winner_exists or receipt_exists:
-        raise SessionModelCompletionStageConflict(
-            "A published model-completion stage cannot receive a failure disposition."
-        )
-    expected = model_completion_stage_settlement_request(
-        stage,
-        interaction_id=request.interaction_id,
-        disposition=request.disposition,
-        reason_code=request.reason_code,
-        execution_profile_fingerprint=request.execution_profile_fingerprint,
-        settlement_run_epoch=request.settlement_run_epoch,
-        settled_reservation_ids=request.settled_reservation_ids,
-        superseding_stage_id=request.superseding_stage_id,
-    )
-    if expected != request:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion settlement authority conflicts with its active stage."
-        )
-    if request.settled_reservation_ids != stage.reservation_ids:
-        raise SessionModelCompletionStageConflict(
-            "Model-completion settlement does not cover every linked budget reservation."
-        )
-    if session.run_epoch != request.settlement_run_epoch:
-        raise SessionRunFenced(
-            "Model-completion settlement run epoch is stale: expected "
-            f"{request.settlement_run_epoch}, current {session.run_epoch}."
-        )
-    if settlement_record is not None:
-        prior = _reconstruct_model_completion_stage_settlement(
-            settlement_record,
-            session_id=session.id,
-            stage_id=stage.stage_id,
-            storage_key=_model_completion_stage_settlement_storage_key(stage.stage_id),
-        )
-        raise SessionModelCompletionStageConflict(
-            "The active model-completion stage already has terminal settlement: "
-            f"{prior.disposition.value}."
-        )
-
-
-def _model_completion_stage_winner_record(
-    stage: ModelCompletionStage,
-    *,
-    receipt: RuntimePublicationReceipt,
-) -> dict[str, Any]:
-    if (
-        stage.state != "completed"
-        or stage.completion_digest is None
-        or stage.publication_material_digest is None
-    ):
-        raise SessionModelCompletionStageIncomplete(
-            f"Model-completion stage is still in flight: {stage.stage_id}"
-        )
-    payload: dict[str, Any] = {
-        "record_type": MODEL_COMPLETION_WINNER_RECORD_TYPE,
-        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
-        "session_id": stage.session_id,
-        "stage_id": stage.stage_id,
-        "logical_step_id": stage.logical_step_id,
-        "dispatch_ordinal": stage.dispatch_ordinal,
-        "purpose": stage.purpose,
-        "preparation_digest": stage.preparation_digest,
-        "completion_digest": stage.completion_digest,
-        "publication_material_digest": stage.publication_material_digest,
-        "receipt_request_digest": receipt.request_digest,
-        "publication_digest": receipt.publication_digest,
-        "published_at": receipt.published_at.isoformat().replace("+00:00", "Z"),
-    }
-    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
-    )
-    return copy_durable_json_object(payload, "model_completion_stage_winner")
-
-
-def _reconstruct_active_model_completion_stage_record(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    storage_key: str = MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-) -> model_stage_contracts._ActiveModelCompletionStageRecord:
-    try:
-        if type(record) is not dict:
-            raise TypeError
-        if set(record) != set(model_stage_contracts._ActiveModelCompletionStageRecord.model_fields):
-            raise ValueError
-        for field in (
-            "record_type",
-            "session_id",
-            "stage_id",
-            "logical_step_id",
-            "purpose",
-            "preparation_digest",
-            "source_status",
-            "activated_at",
-            "record_digest",
-        ):
-            if type(record[field]) is not str:
-                raise TypeError
-        for field in (
-            "schema_version",
-            "dispatch_ordinal",
-            "source_run_epoch",
-            "source_transcript_cursor",
-        ):
-            if type(record[field]) is not int:
-                raise TypeError
-        session_authority_rules._require_raw_sha256_digest(record["preparation_digest"])
-        session_authority_rules._require_raw_sha256_digest(record["record_digest"])
-        reconstructed = model_stage_contracts._ActiveModelCompletionStageRecord.model_validate(
-            record
-        )
-        if reconstructed.record_type != MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE:
-            raise ValueError
-        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
-            raise ValueError
-        if reconstructed.session_id != session_id:
-            raise ValueError
-        if storage_key != MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY:
-            raise ValueError
-        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != reconstructed.record_digest
-        ):
-            raise ValueError
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable active model-completion marker is malformed."
-        ) from exc
-    return reconstructed
-
-
-def _reconstruct_model_completion_stage_abandonment(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    stage_id: str,
-    storage_key: str,
-) -> ModelCompletionStageAbandonment:
-    try:
-        if type(record) is not dict:
-            raise TypeError
-        if set(record) != set(
-            model_stage_contracts._ModelCompletionStageAbandonmentRecord.model_fields
-        ):
-            raise ValueError
-        for field in (
-            "record_type",
-            "session_id",
-            "stage_id",
-            "logical_step_id",
-            "purpose",
-            "preparation_request_digest",
-            "preparation_digest",
-            "active_marker_digest",
-            "source_status",
-            "abandoned_at",
-            "record_digest",
-        ):
-            if type(record[field]) is not str:
-                raise TypeError
-        for field in (
-            "schema_version",
-            "dispatch_ordinal",
-            "source_run_epoch",
-            "source_transcript_cursor",
-        ):
-            if type(record[field]) is not int:
-                raise TypeError
-        for field in (
-            "preparation_request_digest",
-            "preparation_digest",
-            "active_marker_digest",
-            "record_digest",
-        ):
-            session_authority_rules._require_raw_sha256_digest(record[field])
-        reconstructed = model_stage_contracts._ModelCompletionStageAbandonmentRecord.model_validate(
-            record
-        )
-        if reconstructed.record_type != MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE:
-            raise ValueError
-        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
-            raise ValueError
-        if reconstructed.session_id != session_id or reconstructed.stage_id != stage_id:
-            raise ValueError
-        if storage_key != _model_completion_stage_abandonment_storage_key(stage_id):
-            raise ValueError
-        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != reconstructed.record_digest
-        ):
-            raise ValueError
-        return ModelCompletionStageAbandonment(
-            session_id=reconstructed.session_id,
-            stage_id=reconstructed.stage_id,
-            logical_step_id=reconstructed.logical_step_id,
-            dispatch_ordinal=reconstructed.dispatch_ordinal,
-            purpose=reconstructed.purpose,
-            preparation_request_digest=reconstructed.preparation_request_digest,
-            preparation_digest=reconstructed.preparation_digest,
-            active_marker_digest=reconstructed.active_marker_digest,
-            source_status=reconstructed.source_status,
-            source_run_epoch=reconstructed.source_run_epoch,
-            source_transcript_cursor=reconstructed.source_transcript_cursor,
-            abandoned_at=reconstructed.abandoned_at,
-            abandonment_digest=reconstructed.record_digest,
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion abandonment is malformed or conflicts with its key."
-        ) from exc
-
-
-def _reconstruct_model_completion_stage_winner_record(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    logical_step_id: str,
-    storage_key: str,
-) -> model_stage_contracts._ModelCompletionStageWinnerRecord:
-    try:
-        if type(record) is not dict:
-            raise TypeError
-        if set(record) != set(model_stage_contracts._ModelCompletionStageWinnerRecord.model_fields):
-            raise ValueError
-        for field in (
-            "record_type",
-            "session_id",
-            "stage_id",
-            "logical_step_id",
-            "purpose",
-            "preparation_digest",
-            "completion_digest",
-            "publication_material_digest",
-            "receipt_request_digest",
-            "publication_digest",
-            "published_at",
-            "record_digest",
-        ):
-            if type(record[field]) is not str:
-                raise TypeError
-        if type(record["schema_version"]) is not int:
-            raise TypeError
-        if type(record["dispatch_ordinal"]) is not int:
-            raise TypeError
-        for field in (
-            "preparation_digest",
-            "completion_digest",
-            "publication_material_digest",
-            "receipt_request_digest",
-            "publication_digest",
-            "record_digest",
-        ):
-            session_authority_rules._require_raw_sha256_digest(record[field])
-        reconstructed = model_stage_contracts._ModelCompletionStageWinnerRecord.model_validate(
-            record
-        )
-        if reconstructed.record_type != MODEL_COMPLETION_WINNER_RECORD_TYPE:
-            raise ValueError
-        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
-            raise ValueError
-        if (
-            reconstructed.session_id != session_id
-            or reconstructed.logical_step_id != logical_step_id
-            or storage_key != _model_completion_stage_winner_storage_key(logical_step_id)
-        ):
-            raise ValueError
-        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != reconstructed.record_digest
-        ):
-            raise ValueError
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion winner is malformed or conflicts with its key."
-        ) from exc
-    return reconstructed
-
-
-def _reconstruct_model_completion_stage_preparation(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    stage_id: str,
-    storage_key: str,
-) -> model_stage_contracts._ModelCompletionStagePreparationRecord:
-    try:
-        if type(record) is not dict:
-            raise TypeError
-        if set(record) != set(
-            model_stage_contracts._ModelCompletionStagePreparationRecord.model_fields
-        ):
-            raise ValueError
-        for field in (
-            "record_type",
-            "session_id",
-            "stage_id",
-            "logical_step_id",
-            "purpose",
-            "request_digest",
-            "source_status",
-            "prepared_at",
-            "record_digest",
-        ):
-            if type(record[field]) is not str:
-                raise TypeError
-        if type(record["schema_version"]) is not int:
-            raise TypeError
-        if type(record["dispatch_ordinal"]) is not int:
-            raise TypeError
-        if type(record["intent"]) is not dict or type(record["reservation_ids"]) is not list:
-            raise TypeError
-        if type(record["source_run_epoch"]) is not int:
-            raise TypeError
-        if type(record["source_transcript_cursor"]) is not int:
-            raise TypeError
-        session_authority_rules._require_raw_sha256_digest(record["request_digest"])
-        session_authority_rules._require_raw_sha256_digest(record["record_digest"])
-        reconstructed = model_stage_contracts._ModelCompletionStagePreparationRecord.model_validate(
-            record
-        )
-        if reconstructed.record_type != MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE:
-            raise ValueError
-        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
-            raise ValueError
-        if reconstructed.session_id != session_id or reconstructed.stage_id != stage_id:
-            raise ValueError
-        _, _, expected_key, _ = _model_completion_stage_storage_identity(session_id, stage_id)
-        if storage_key != expected_key:
-            raise ValueError
-        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != reconstructed.record_digest
-        ):
-            raise ValueError
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion preparation is malformed or conflicts with its key."
-        ) from exc
-    return reconstructed
-
-
-def _reconstruct_model_completion_stage_terminal(
-    record: dict[str, Any],
-    *,
-    session_id: str,
-    stage_id: str,
-    storage_key: str,
-) -> model_stage_contracts._ModelCompletionStageTerminalRecord:
-    try:
-        if type(record) is not dict:
-            raise TypeError
-        if set(record) != set(
-            model_stage_contracts._ModelCompletionStageTerminalRecord.model_fields
-        ):
-            raise ValueError
-        for field in (
-            "record_type",
-            "session_id",
-            "stage_id",
-            "logical_step_id",
-            "purpose",
-            "preparation_digest",
-            "publication_material_digest",
-            "completed_at",
-            "record_digest",
-        ):
-            if type(record[field]) is not str:
-                raise TypeError
-        if (
-            type(record["schema_version"]) is not int
-            or type(record["dispatch_ordinal"]) is not int
-            or type(record["publication"]) is not dict
-        ):
-            raise TypeError
-        session_authority_rules._require_raw_sha256_digest(record["preparation_digest"])
-        session_authority_rules._require_raw_sha256_digest(record["publication_material_digest"])
-        session_authority_rules._require_raw_sha256_digest(record["record_digest"])
-        publication_record = record["publication"]
-        required_publication_fields = set(RuntimePublicationRequest.model_fields) - {
-            "interaction_id"
-        }
-        if not required_publication_fields.issubset(publication_record) or (
-            set(publication_record) - set(RuntimePublicationRequest.model_fields)
-        ):
-            raise ValueError
-        raw_transcript = publication_record["transcript_messages"]
-        raw_events = publication_record["events"]
-        if type(raw_transcript) is not list or type(raw_events) is not list:
-            raise TypeError
-        publication = RuntimePublicationRequest(
-            publication_id=publication_record["publication_id"],
-            kind=publication_record["kind"],
-            interaction_id=publication_record.get("interaction_id"),
-            intent=publication_record["intent"],
-            mutation=publication_record["mutation"],
-            transcript_messages=tuple(
-                Message.model_validate(message) for message in raw_transcript
-            ),
-            events=tuple(Event.model_validate(event) for event in raw_events),
-            operation_record_mutations=publication_record["operation_record_mutations"],
-            referenced_events=publication_record["referenced_events"],
-        )
-        reconstructed = model_stage_contracts._ModelCompletionStageTerminalRecord.model_validate(
-            {**record, "publication": publication}
-        )
-        if reconstructed.record_type != MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE:
-            raise ValueError
-        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
-            raise ValueError
-        if reconstructed.session_id != session_id or reconstructed.stage_id != stage_id:
-            raise ValueError
-        _, _, _, expected_key = _model_completion_stage_storage_identity(session_id, stage_id)
-        if storage_key != expected_key:
-            raise ValueError
-        publication_payload = reconstructed.publication.model_dump(mode="json")
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(publication_payload)
-            != reconstructed.publication_material_digest
-        ):
-            raise ValueError
-        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
-            != reconstructed.record_digest
-        ):
-            raise ValueError
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable terminal model completion is malformed or conflicts with its key."
-        ) from exc
-    return reconstructed
-
-
-def _reconstruct_model_completion_stage(
-    preparation_record: dict[str, Any] | None,
-    terminal_record: dict[str, Any] | None,
-    *,
-    session_id: str,
-    stage_id: str,
-    preparation_storage_key: str,
-    terminal_storage_key: str,
-) -> ModelCompletionStage | None:
-    if preparation_record is None:
-        if terminal_record is not None:
-            raise SessionModelCompletionStageConflict(
-                "A terminal model completion exists without its immutable preparation."
-            )
-        return None
-    preparation = _reconstruct_model_completion_stage_preparation(
-        preparation_record,
-        session_id=session_id,
-        stage_id=stage_id,
-        storage_key=preparation_storage_key,
-    )
-    terminal = None
-    if terminal_record is not None:
-        terminal = _reconstruct_model_completion_stage_terminal(
-            terminal_record,
-            session_id=session_id,
-            stage_id=stage_id,
-            storage_key=terminal_storage_key,
-        )
-        if terminal.preparation_digest != preparation.record_digest:
-            raise SessionModelCompletionStageConflict(
-                "The terminal model completion does not match its immutable preparation."
-            )
-        if (
-            terminal.logical_step_id != preparation.logical_step_id
-            or terminal.dispatch_ordinal != preparation.dispatch_ordinal
-            or terminal.purpose != preparation.purpose
-        ):
-            raise SessionModelCompletionStageConflict(
-                "The terminal model completion identity conflicts with its preparation."
-            )
-        if not session_authority_rules._runtime_publication_json_equal(
-            terminal.publication.intent, preparation.intent
-        ):
-            raise SessionModelCompletionStageConflict(
-                "The terminal model completion intent conflicts with its preparation."
-            )
-        try:
-            _validate_model_completion_stage_publication(
-                terminal.publication,
-                session_id=session_id,
-                stage=preparation,
-            )
-        except (TypeError, ValueError) as exc:
-            raise SessionModelCompletionStageConflict(
-                "The terminal model completion publication conflicts with its preparation."
-            ) from exc
-
-    try:
-        return ModelCompletionStage(
-            session_id=session_id,
-            stage_id=stage_id,
-            logical_step_id=preparation.logical_step_id,
-            dispatch_ordinal=preparation.dispatch_ordinal,
-            purpose=preparation.purpose,
-            state="in_flight" if terminal is None else "completed",
-            intent=preparation.intent,
-            reservation_ids=preparation.reservation_ids,
-            preparation_request_digest=preparation.request_digest,
-            preparation_digest=preparation.record_digest,
-            source_status=preparation.source_status,
-            source_run_epoch=preparation.source_run_epoch,
-            source_transcript_cursor=preparation.source_transcript_cursor,
-            prepared_at=preparation.prepared_at,
-            publication=None if terminal is None else terminal.publication,
-            publication_material_digest=(
-                None if terminal is None else terminal.publication_material_digest
-            ),
-            completion_digest=None if terminal is None else terminal.record_digest,
-            completed_at=None if terminal is None else terminal.completed_at,
-        )
-    except (TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The durable model-completion stage is malformed."
-        ) from exc
-
-
-def _reconstruct_active_model_completion_stage(
-    active_record: dict[str, Any] | None,
-    preparation_record: dict[str, Any] | None,
-    terminal_record: dict[str, Any] | None,
-    *,
-    session_id: str,
-) -> ActiveModelCompletionStage | None:
-    if active_record is None:
-        if preparation_record is not None or terminal_record is not None:
-            raise SessionModelCompletionStageConflict(
-                "Active model-completion material exists without its marker."
-            )
-        return None
-    marker = _reconstruct_active_model_completion_stage_record(
-        active_record,
-        session_id=session_id,
-    )
-    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session_id,
-        marker.stage_id,
-    )
-    stage = _reconstruct_model_completion_stage(
-        preparation_record,
-        terminal_record,
-        session_id=session_id,
-        stage_id=marker.stage_id,
-        preparation_storage_key=preparation_key,
-        terminal_storage_key=terminal_key,
-    )
-    if stage is None:
-        raise SessionModelCompletionStageConflict(
-            "The active model-completion marker references a missing stage."
-        )
-    if (
-        stage.logical_step_id != marker.logical_step_id
-        or stage.dispatch_ordinal != marker.dispatch_ordinal
-        or stage.purpose != marker.purpose
-        or stage.preparation_digest != marker.preparation_digest
-        or stage.source_status != marker.source_status
-        or stage.source_run_epoch != marker.source_run_epoch
-        or stage.source_transcript_cursor != marker.source_transcript_cursor
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The active model-completion marker conflicts with its stage."
-        )
-    try:
-        return ActiveModelCompletionStage(
-            stage=stage,
-            activated_at=marker.activated_at,
-            marker_digest=marker.record_digest,
-        )
-    except (TypeError, ValueError) as exc:
-        raise SessionModelCompletionStageConflict(
-            "The active model-completion snapshot is malformed."
-        ) from exc
-
-
-def _reconstruct_active_model_completion_stage_from_records(
-    records: Mapping[str, dict[str, Any]],
-    *,
-    session_id: str,
-) -> ActiveModelCompletionStage | None:
-    active_record = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
-    if active_record is None:
-        return None
-    marker = _reconstruct_active_model_completion_stage_record(
-        active_record,
-        session_id=session_id,
-    )
-    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session_id,
-        marker.stage_id,
-    )
-    return _reconstruct_active_model_completion_stage(
-        active_record,
-        records.get(preparation_key),
-        records.get(terminal_key),
-        session_id=session_id,
-    )
-
-
-def _validate_model_completion_active_marker_for_preparation(
-    active: ActiveModelCompletionStage | None,
-    prepared: _PreparedModelCompletionStage,
-    *,
-    source_status: SessionStatus,
-) -> None:
-    if active is None:
-        return
-    current = active.stage
-    request = prepared.request
-    if current.state == "completed":
-        raise SessionModelCompletionStageConflict(
-            "A terminal model-completion stage must be published before another dispatch."
-        )
-    if (
-        current.logical_step_id != request.logical_step_id
-        or current.purpose != request.purpose
-        or current.source_status != source_status
-        or current.source_run_epoch != prepared.expected_run_epoch
-        or current.source_transcript_cursor != prepared.expected_transcript_cursor
-    ):
-        raise SessionModelCompletionStageConflict(
-            "A different logical model completion is already active for the session."
-        )
-    if request.dispatch_ordinal <= current.dispatch_ordinal:
-        raise SessionModelCompletionStageConflict(
-            "A model-completion retry must advance dispatch_ordinal monotonically."
-        )
-
-
-def _validate_model_completion_preparation_replay_state(
-    stage: ModelCompletionStage,
-    *,
-    active: ActiveModelCompletionStage | None,
-    winner_exists: bool,
-    receipt_exists: bool,
-) -> None:
-    if winner_exists or receipt_exists:
-        raise SessionModelCompletionStageConflict(
-            "A prepared model-completion stage already has durable publication state."
-        )
-    if active is None:
-        raise SessionModelCompletionStageConflict(
-            "A prepared model-completion stage no longer has an active marker."
-        )
-    active_stage = active.stage
-    if (
-        active_stage.stage_id != stage.stage_id
-        or active_stage.logical_step_id != stage.logical_step_id
-        or active_stage.dispatch_ordinal != stage.dispatch_ordinal
-        or active_stage.purpose != stage.purpose
-        or active_stage.preparation_digest != stage.preparation_digest
-        or active_stage.source_status != stage.source_status
-        or active_stage.source_run_epoch != stage.source_run_epoch
-        or active_stage.source_transcript_cursor != stage.source_transcript_cursor
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The prepared model-completion stage is no longer the exact active dispatch."
-        )
-
-
-def _validate_model_completion_stage_repreparation(
-    abandonment_record: dict[str, Any] | None,
-    prepared: _PreparedModelCompletionStage,
-    *,
-    source_status: SessionStatus,
-) -> None:
-    if abandonment_record is None:
-        return
-    abandonment = _reconstruct_model_completion_stage_abandonment(
-        abandonment_record,
-        session_id=prepared.session_id,
-        stage_id=prepared.request.stage_id,
-        storage_key=prepared.abandonment_storage_key,
-    )
-    request = prepared.request
-    if (
-        abandonment.logical_step_id != request.logical_step_id
-        or abandonment.dispatch_ordinal != request.dispatch_ordinal
-        or abandonment.purpose != request.purpose
-        or abandonment.preparation_request_digest != prepared.request_digest
-        or abandonment.source_status != source_status
-        or abandonment.source_run_epoch != prepared.expected_run_epoch
-        or abandonment.source_transcript_cursor != prepared.expected_transcript_cursor
-    ):
-        raise SessionModelCompletionStageConflict(
-            "An abandoned model-completion stage id can only be reused for its exact "
-            "request and durable source boundary."
-        )
-
-
-def _replay_model_completion_stage_abandonment(
-    prepared: _PreparedModelCompletionStageAbandonment,
-    abandonment_record: dict[str, Any] | None,
-) -> ModelCompletionStageAbandonmentResult:
-    if abandonment_record is None:
-        raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
-    abandonment = _reconstruct_model_completion_stage_abandonment(
-        abandonment_record,
-        session_id=prepared.session_id,
-        stage_id=prepared.stage_id,
-        storage_key=prepared.abandonment_storage_key,
-    )
-    if (
-        abandonment.preparation_digest != prepared.preparation_digest
-        or abandonment.source_run_epoch != prepared.stage_source_run_epoch
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The model-completion abandonment conflicts with the durable tombstone."
-        )
-    return ModelCompletionStageAbandonmentResult(
-        abandonment=abandonment,
-        replayed=True,
-    )
-
-
-def _validate_model_completion_stage_for_abandonment(
-    *,
-    session: Session,
-    stage: ModelCompletionStage,
-    active: ActiveModelCompletionStage | None,
-    prepared: _PreparedModelCompletionStageAbandonment,
-    abandonment_record: dict[str, Any] | None,
-    dispatch_exists: bool,
-    winner_exists: bool,
-    receipt_exists: bool,
-) -> None:
-    if stage.state != "in_flight":
-        raise SessionModelCompletionStageConflict(
-            "A terminal model-completion stage cannot be abandoned."
-        )
-    if stage.preparation_digest != prepared.preparation_digest:
-        raise SessionModelCompletionStageConflict(
-            "The model-completion abandonment preparation digest is stale."
-        )
-    if stage.source_run_epoch != prepared.stage_source_run_epoch:
-        raise SessionRunFenced(
-            "Model-completion stage run epoch is stale: expected source "
-            f"{prepared.stage_source_run_epoch}, prepared {stage.source_run_epoch}."
-        )
-    invocation_scope._assert_session_run_epoch(prepared.session_id, session)
-    if session.run_epoch != prepared.expected_run_epoch:
-        raise SessionRunFenced(
-            "Session source run epoch is stale: expected "
-            f"{prepared.expected_run_epoch}, current {session.run_epoch}."
-        )
-    if active is None or active.stage != stage:
-        raise SessionModelCompletionStageConflict(
-            "Only the exact active model-completion stage can be abandoned."
-        )
-    if dispatch_exists:
-        raise SessionModelCompletionStageConflict(
-            "A dispatched model-completion stage cannot be abandoned."
-        )
-    if winner_exists or receipt_exists:
-        raise SessionModelCompletionStageConflict(
-            "A model-completion stage with durable publication state cannot be abandoned."
-        )
-    if abandonment_record is None:
-        return
-    prior = _reconstruct_model_completion_stage_abandonment(
-        abandonment_record,
-        session_id=prepared.session_id,
-        stage_id=prepared.stage_id,
-        storage_key=prepared.abandonment_storage_key,
-    )
-    if (
-        prior.logical_step_id != stage.logical_step_id
-        or prior.dispatch_ordinal != stage.dispatch_ordinal
-        or prior.purpose != stage.purpose
-        or prior.preparation_request_digest != stage.preparation_request_digest
-        or prior.source_status != stage.source_status
-        or prior.source_run_epoch != stage.source_run_epoch
-        or prior.source_transcript_cursor != stage.source_transcript_cursor
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The active model-completion stage conflicts with its prior abandonment."
-        )
-    if prior.preparation_digest == stage.preparation_digest:
-        raise SessionModelCompletionStageConflict(
-            "An abandoned model-completion preparation was unexpectedly restored."
-        )
-
-
-def _validate_model_completion_promotion_replay_active_marker(
-    active: ActiveModelCompletionStage | None,
-    stage: ModelCompletionStage,
-) -> None:
-    if active is not None and active.stage.logical_step_id == stage.logical_step_id:
-        raise SessionModelCompletionStageConflict(
-            "A published model-completion winner still has an active marker."
-        )
-
-
-def _model_completion_terminal_advances_last_activity(
-    active_record: dict[str, Any] | None,
-    *,
-    stage: ModelCompletionStage,
-    current_run_epoch: int,
-) -> bool:
-    if active_record is None:
-        return False
-    try:
-        marker = _reconstruct_active_model_completion_stage_record(
-            active_record,
-            session_id=stage.session_id,
-        )
-    except SessionModelCompletionStageConflict:
-        # Terminal provider evidence is append-only even when unrelated active
-        # state is corrupt. A malformed marker can never refresh run liveness.
-        return False
-    return (
-        stage.source_run_epoch == current_run_epoch
-        and marker.stage_id == stage.stage_id
-        and marker.logical_step_id == stage.logical_step_id
-        and marker.dispatch_ordinal == stage.dispatch_ordinal
-        and marker.purpose == stage.purpose
-        and marker.preparation_digest == stage.preparation_digest
-        and marker.source_status == stage.source_status
-        and marker.source_run_epoch == stage.source_run_epoch
-        and marker.source_transcript_cursor == stage.source_transcript_cursor
-    )
-
-
-def _validate_model_completion_active_marker_for_promotion(
-    active: ActiveModelCompletionStage | None,
-    stage: ModelCompletionStage,
-) -> None:
-    if active is None:
-        raise SessionModelCompletionStageConflict(
-            "The model-completion stage is no longer active and cannot be promoted."
-        )
-    if (
-        active.stage.stage_id != stage.stage_id
-        or active.stage.logical_step_id != stage.logical_step_id
-        or active.stage.dispatch_ordinal != stage.dispatch_ordinal
-        or active.stage.purpose != stage.purpose
-        or active.stage.preparation_digest != stage.preparation_digest
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The model-completion stage was superseded before promotion."
-        )
-
-
-def _validate_model_completion_stage_winner(
-    winner_record: dict[str, Any] | None,
-    *,
-    stage: ModelCompletionStage,
-    receipt: RuntimePublicationReceipt,
-    winner_storage_key: str,
-) -> model_stage_contracts._ModelCompletionStageWinnerRecord:
-    if winner_record is None:
-        raise SessionModelCompletionStageConflict(
-            "A model-completion receipt exists without its durable winner claim."
-        )
-    winner = _reconstruct_model_completion_stage_winner_record(
-        winner_record,
-        session_id=stage.session_id,
-        logical_step_id=stage.logical_step_id,
-        storage_key=winner_storage_key,
-    )
-    if (
-        winner.stage_id != stage.stage_id
-        or winner.dispatch_ordinal != stage.dispatch_ordinal
-        or winner.purpose != stage.purpose
-        or winner.preparation_digest != stage.preparation_digest
-        or winner.completion_digest != stage.completion_digest
-        or winner.publication_material_digest != stage.publication_material_digest
-        or winner.receipt_request_digest != receipt.request_digest
-        or winner.publication_digest != receipt.publication_digest
-        or winner.published_at != receipt.published_at
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The runtime publication receipt belongs to a different model-completion winner."
-        )
-    return winner
-
-
-def _validate_model_completion_stage_preparation_replay(
-    stage: ModelCompletionStage,
-    prepared: _PreparedModelCompletionStage,
-) -> None:
-    if stage.preparation_request_digest != prepared.request_digest:
-        raise SessionModelCompletionStageConflict(
-            "The model-completion stage id was already prepared for a different request."
-        )
-
-
-def _validate_model_completion_stage_terminal_replay(
-    stage: ModelCompletionStage,
-    prepared: _PreparedModelCompletionStageTerminal,
-) -> None:
-    if (
-        stage.state != "completed"
-        or stage.publication_material_digest != prepared.publication_material_digest
-        or (
-            prepared.recovery_fence is not None
-            and stage.preparation_digest != prepared.recovery_fence.preparation_digest
-        )
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The model-completion stage already has different terminal material."
-        )
-
-
-def _reject_settled_model_completion_stage(
-    settlement_record: dict[str, Any] | None,
-    *,
-    session_id: str,
-    stage_id: str,
-    settlement_storage_key: str,
-) -> None:
-    if settlement_record is None:
-        return
-    settlement = _reconstruct_model_completion_stage_settlement(
-        settlement_record,
-        session_id=session_id,
-        stage_id=stage_id,
-        storage_key=settlement_storage_key,
-    )
-    raise SessionModelCompletionStageConflict(
-        "The model-completion stage is already terminally settled as "
-        f"{settlement.disposition.value}."
-    )
-
-
-def _model_completion_stage_promotion_statuses(stage: ModelCompletionStage) -> set[SessionStatus]:
-    statuses = {stage.source_status, SessionStatus.INTERRUPTING, SessionStatus.FAILED}
-    if stage.purpose == "auxiliary-inference":
-        # Auxiliary publications are accounting only: they cannot reopen the
-        # conversation or alter the parent transcript/checkpoint.
-        statuses.update({SessionStatus.COMPLETED, SessionStatus.INTERRUPTED})
-    return statuses
-
-
-def _prepare_model_completion_stage_promotion(
-    stage: ModelCompletionStage,
-    *,
-    expected_run_epoch: int,
-) -> publication_rules._PreparedRuntimePublication:
-    if stage.state != "completed" or stage.publication is None:
-        raise SessionModelCompletionStageIncomplete(
-            f"Model-completion stage is still in flight: {stage.stage_id}"
-        )
-    return publication_rules._prepare_runtime_publication(
-        stage.session_id,
-        stage.publication,
-        expected_statuses=_model_completion_stage_promotion_statuses(stage),
-        expected_run_epoch=expected_run_epoch,
-        expected_transcript_cursor=(
-            None if stage.purpose == "auxiliary-inference" else stage.source_transcript_cursor
-        ),
-    )
-
-
-def _replay_promoted_model_completion_stage(
-    *,
-    session: Session,
-    stage: ModelCompletionStage,
-    receipt_record: dict[str, Any],
-    winner_record: dict[str, Any] | None,
-) -> RuntimePublicationResult:
-    if stage.state != "completed" or stage.publication is None:
-        raise SessionModelCompletionStageIncomplete(
-            f"Model-completion stage is still in flight: {stage.stage_id}"
-        )
-    storage_key = publication_contracts._runtime_publication_storage_key(stage.logical_step_id)
-    receipt = publication_rules._reconstruct_runtime_publication_receipt(
-        receipt_record,
-        storage_key=storage_key,
-        session_id=stage.session_id,
-        publication_id=stage.logical_step_id,
-    )
-    if receipt.source_status not in _model_completion_stage_promotion_statuses(stage) or (
-        stage.purpose != "auxiliary-inference"
-        and receipt.transcript_start_cursor != stage.source_transcript_cursor
-    ):
-        raise SessionModelCompletionStageConflict(
-            "The runtime publication receipt conflicts with its model-completion stage."
-        )
-    _validate_model_completion_stage_winner(
-        winner_record,
-        stage=stage,
-        receipt=receipt,
-        winner_storage_key=_model_completion_stage_winner_storage_key(stage.logical_step_id),
-    )
-    prepared = publication_rules._prepare_runtime_publication(
-        stage.session_id,
-        stage.publication,
-        expected_statuses={stage.source_status},
-        expected_run_epoch=receipt.source_run_epoch,
-        expected_transcript_cursor=(
-            None if stage.purpose == "auxiliary-inference" else stage.source_transcript_cursor
-        ),
-    )
-    receipt = publication_rules._reconstruct_runtime_publication_receipt(
-        receipt_record,
-        storage_key=prepared.storage_key,
-        session_id=stage.session_id,
-        publication_id=stage.logical_step_id,
-        request_digest=prepared.request_digest,
-    )
-    publication_rules._validate_runtime_publication_replay_receipt(receipt, prepared)
-    return RuntimePublicationResult(
-        session=session.model_copy(deep=True),
-        receipt=receipt,
-        replayed=True,
-    )
-
-
 def _copy_workflow_step_reservation(
     session_id: str,
     event: Event,
@@ -22278,7 +19940,7 @@ def _validate_historical_queued_interaction_profile_handoff_stage(
         )
     stage = active_model_stage.stage
     try:
-        _validate_model_completion_stage_dispatch(stage_dispatch, stage)
+        model_stage_rules._validate_model_completion_stage_dispatch(stage_dispatch, stage)
     except SessionModelCompletionStageConflict as exc:
         raise SessionRunFenced(
             "Historical queued interaction handoff has conflicting target dispatch evidence."
@@ -22287,7 +19949,7 @@ def _validate_historical_queued_interaction_profile_handoff_stage(
         stage.session_id != target.session_id
         or stage.source_run_epoch != target.run_epoch
         or stage.intent.get("interaction_id") != target.interaction_id
-        or _model_completion_stage_execution_profile_fingerprint(stage)
+        or model_stage_rules._model_completion_stage_execution_profile_fingerprint(stage)
         != target.profile.fingerprint
         or stage_dispatch.interaction_id != target.interaction_id
         or stage_dispatch.source_run_epoch != target.run_epoch
@@ -22307,26 +19969,28 @@ def _historical_queued_handoff_stage_from_records(
     active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
     if active_record is None:
         return None, None
-    marker = _reconstruct_active_model_completion_stage_record(
+    marker = model_stage_rules._reconstruct_active_model_completion_stage_record(
         active_record,
         session_id=session_id,
     )
-    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-        session_id,
-        marker.stage_id,
+    _, _, preparation_key, terminal_key = (
+        model_stage_rules._model_completion_stage_storage_identity(
+            session_id,
+            marker.stage_id,
+        )
     )
-    active = _reconstruct_active_model_completion_stage(
+    active = model_stage_rules._reconstruct_active_model_completion_stage(
         active_record,
         operation_records.get(preparation_key),
         operation_records.get(terminal_key),
         session_id=session_id,
     )
-    dispatch_key = _model_completion_stage_dispatch_storage_key(marker.stage_id)
+    dispatch_key = model_stage_rules._model_completion_stage_dispatch_storage_key(marker.stage_id)
     dispatch_record = operation_records.get(dispatch_key)
     dispatch = (
         None
         if dispatch_record is None
-        else _reconstruct_model_completion_stage_dispatch(
+        else model_stage_rules._reconstruct_model_completion_stage_dispatch(
             dispatch_record,
             session_id=session_id,
             stage_id=marker.stage_id,

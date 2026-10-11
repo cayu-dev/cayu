@@ -40,12 +40,9 @@ from cayu.sessions._model_stage import (
     ModelCompletionStageRequest,
     SessionModelCompletionStageConflict,
 )
+from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    SessionStore,
-    model_completion_stage_settlement_request,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

@@ -30,17 +30,19 @@ from cayu.sessions._interaction_transitions import (
 )
 from cayu.sessions._invocation_scope import _assert_session_run_epoch
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+from cayu.sessions._model_stage_rules import (
+    _model_completion_stage_dispatch_storage_key,
+    _model_completion_stage_storage_identity,
+    _reconstruct_active_model_completion_stage,
+    _reconstruct_active_model_completion_stage_record,
+    _reconstruct_model_completion_stage_dispatch,
+)
 from cayu.sessions.base import (
     SessionMessageQueueStatus,
     SessionRunFenced,
     _check_closure_lineage_owner,
     _checkpoint_after_queued_interaction_profile_handoff,
     _historical_queued_handoff_stage_from_records,
-    _model_completion_stage_dispatch_storage_key,
-    _model_completion_stage_storage_identity,
-    _reconstruct_active_model_completion_stage,
-    _reconstruct_active_model_completion_stage_record,
-    _reconstruct_model_completion_stage_dispatch,
     _validate_message_delivery_eligible_through,
 )
 from cayu.sessions.messaging import (

@@ -38,11 +38,8 @@ from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _validate_model_completion_stage_dispatch,
-)
+from cayu.sessions._model_stage_rules import _validate_model_completion_stage_dispatch
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import Session, SessionStatus

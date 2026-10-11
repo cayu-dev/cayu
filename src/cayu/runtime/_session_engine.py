@@ -506,6 +506,7 @@ from cayu.sessions._model_stage import (
     SessionModelCompletionStageConflict,
     copy_model_completion_manual_recovery_request,
 )
+from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     interruption_request_id_from_payload,
@@ -520,7 +521,6 @@ from cayu.sessions.base import (
     SessionStore,
     _checkpoint_with_session_run_operation,
     _initial_transcript_pending_interaction_id,
-    model_completion_stage_settlement_request,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
