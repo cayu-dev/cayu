@@ -46321,5 +46321,9 @@
   "tests/core/test_memory_event_read_ownership.py::test_event_reads_apply_access_bounds_with_independent_state": 0.0010242919670417905,
   "tests/core/test_memory_event_read_ownership.py::test_event_reads_compose_with_independent_locked_state": 0.0062234579818323255,
   "tests/core/test_memory_event_read_ownership.py::test_event_reads_import_without_store_implementations": 0.5191026260145009,
-  "tests/core/test_memory_event_read_ownership.py::test_store_event_view_is_acquired_after_the_writer_lock": 0.350637125025969
+  "tests/core/test_memory_event_read_ownership.py::test_store_event_view_is_acquired_after_the_writer_lock": 0.350637125025969,
+  "tests/core/test_memory_session_query_ownership.py::test_session_listing_composes_with_independent_state_and_access_bounds": 0.0030992510146461427,
+  "tests/core/test_memory_session_query_ownership.py::test_session_queries_import_without_store_implementations": 0.40754533297149464,
+  "tests/core/test_memory_session_query_ownership.py::test_session_tree_queries_use_independent_indexes_and_reject_stale_entries": 0.0009707079734653234,
+  "tests/core/test_memory_session_query_ownership.py::test_store_discovery_view_reads_replaced_indexes_after_acquiring_lock": 0.0018080000299960375
 }

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-import cayu.sessions.memory as sessions_runtime
+import cayu.sessions._memory_session_queries as sessions_runtime
 import cayu.support_bundles as support_bundles
 import cayu.tasks.memory as tasks_runtime
 from cayu.applications import CayuApp
