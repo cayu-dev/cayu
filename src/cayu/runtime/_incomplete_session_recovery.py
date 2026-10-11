@@ -137,6 +137,7 @@ from cayu.runtime._session_finalization import (
     _checkpoint_with_pending_session_interrupt,
     _recovery_task_event,
 )
+from cayu.runtime._session_task_lifecycle import SessionTaskLifecycle
 from cayu.runtime._structured_output_tool_round import has_recoverable_structured_output_round
 from cayu.runtime._terminal_evidence_finalization import (
     _RECOVERY_RESUMABLE_SESSION_STATUSES,
@@ -455,6 +456,7 @@ class IncompleteSessionRecovery:
         deferred_input: DeferredInteractionInput,
         effective_retry_policy: Callable[[RetryPolicy | None], RetryPolicy],
         engine: SessionEngine,
+        session_tasks: SessionTaskLifecycle,
         environment_lifecycle: EnvironmentLifecycle,
         event_writer: RuntimeEventWriter,
         execution_profile_continuation: ExecutionProfileContinuation,
@@ -486,6 +488,7 @@ class IncompleteSessionRecovery:
         self._deferred_input = deferred_input
         self._effective_retry_policy = effective_retry_policy
         self._engine = engine
+        self._session_tasks = session_tasks
         self._environment_lifecycle = environment_lifecycle
         self._event_writer = event_writer
         self._execution_profile_continuation = execution_profile_continuation
@@ -1344,11 +1347,13 @@ class IncompleteSessionRecovery:
             raise RuntimeError("Zero-work interruption authority changed before publication.")
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        recovered_runtime_failure = await self._engine.recover_committed_runtime_task_failure(
-            session,
-            checkpoint,
-            previous_status,
-            admit_before_mutation,
+        recovered_runtime_failure = (
+            await self._session_tasks.recover_committed_runtime_task_failure(
+                session,
+                checkpoint,
+                previous_status,
+                admit_before_mutation,
+            )
         )
         if recovered_runtime_failure is not None:
             return recovered_runtime_failure

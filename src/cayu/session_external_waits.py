@@ -249,7 +249,7 @@ class SessionExternalWaitAdapter:
         session = await self.waits.store.load(request.session_id)
         if session is None:
             raise ExternalWaitUnavailable("External resume source is unavailable.")
-        linked_task, _ = await self.app._session_engine.linked_resume_task_id(request)
+        linked_task, _ = await self.app._session_tasks.linked_resume_task_id(request)
         if session.parent_session_id is not None or linked_task is not None:
             raise ValueError("External session waits support ordinary root sessions only.")
         await self.app._require_participant_execution(session, None)

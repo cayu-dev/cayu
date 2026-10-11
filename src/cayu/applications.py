@@ -451,6 +451,7 @@ from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_preparation import SessionPreparation
 from cayu.runtime._session_recovery import SessionRecovery
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
+from cayu.runtime._session_task_lifecycle import SessionTaskLifecycle
 from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
     task_store_completion_evaluation_capability_is_complete,
@@ -1769,7 +1770,24 @@ class CayuApp:
             policy_selection=None if model_policy is None else model_policy.selection,
         )
 
+        self._session_tasks = SessionTaskLifecycle(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            session_finalization=self._session_finalization,
+            event_writer=self._event_writer,
+            terminal_event_publication=self._terminal_event_publication,
+            execution_profile_continuation=self._execution_profile_continuation,
+            secret_redactor=self._secret_redactor,
+            get_budget_policy=lambda: self.budget_policy,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+        )
+
         self._session_engine = SessionEngine(
+            session_tasks=self._session_tasks,
             session_preparation=self._session_preparation,
             compaction=self._session_compaction,
             session_finalization=self._session_finalization,
@@ -1847,6 +1865,7 @@ class CayuApp:
         )
 
         self._incomplete_recovery = IncompleteSessionRecovery(
+            session_tasks=self._session_tasks,
             resource_access_policy=resource_access_policy,
             clock=self._clock,
             deferred_input=self._deferred_input,
@@ -1913,6 +1932,7 @@ class CayuApp:
         )
 
         self._session_recovery = SessionRecovery(
+            session_tasks=self._session_tasks,
             session_store=self._runtime_session_store,
             engine=self._session_engine,
             effective_retry_policy=self._effective_retry_policy,
@@ -8973,7 +8993,7 @@ class CayuApp:
         allow_terminal_failure_replay: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
     ) -> tuple[str | None, str | None, tuple[Event, ...] | None]:
-        task_id, session_instance_id = await self._session_engine.linked_continuation_task_id(
+        task_id, session_instance_id = await self._session_tasks.linked_continuation_task_id(
             session_id=session_id,
             task_worker_id=task_worker_id,
             task_handoff_id=task_handoff_id,
@@ -8983,7 +9003,7 @@ class CayuApp:
         (
             replayed_failure,
             replay_events,
-        ) = await self._session_engine.replay_runtime_task_failure_if_needed(
+        ) = await self._session_tasks.replay_runtime_task_failure_if_needed(
             session_id=session_id,
             task_id=task_id,
             task_worker_id=task_worker_id,
@@ -9014,7 +9034,7 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is not None:
             await self._require_participant_execution(session, participant_context)
-        await self._session_engine.require_continuation_task_authority(
+        await self._session_tasks.require_continuation_task_authority(
             session_id=session_id,
             session_instance_id=session_instance_id,
             task_id=task_id,
@@ -9112,7 +9132,7 @@ class CayuApp:
             after_admission=(
                 None
                 if task_id is None
-                else lambda: self._session_engine.require_continuation_task_authority(
+                else lambda: self._session_tasks.require_continuation_task_authority(
                     session_id=session_id,
                     session_instance_id=task_session_instance_id,
                     task_id=task_id,
@@ -9214,7 +9234,7 @@ class CayuApp:
             after_admission=(
                 None
                 if task_id is None
-                else lambda: self._session_engine.require_continuation_task_authority(
+                else lambda: self._session_tasks.require_continuation_task_authority(
                     session_id=session_id,
                     session_instance_id=task_session_instance_id,
                     task_id=task_id,
@@ -9343,7 +9363,7 @@ class CayuApp:
             after_admission=(
                 None
                 if task_id is None
-                else lambda: self._session_engine.require_continuation_task_authority(
+                else lambda: self._session_tasks.require_continuation_task_authority(
                     session_id=session_id,
                     session_instance_id=task_session_instance_id,
                     task_id=task_id,
@@ -9435,7 +9455,7 @@ class CayuApp:
             after_admission=(
                 None
                 if task_id is None
-                else lambda: self._session_engine.require_continuation_task_authority(
+                else lambda: self._session_tasks.require_continuation_task_authority(
                     session_id=session_id,
                     session_instance_id=task_session_instance_id,
                     task_id=task_id,
@@ -9535,7 +9555,7 @@ class CayuApp:
             after_admission=(
                 None
                 if task_id is None
-                else lambda: self._session_engine.require_continuation_task_authority(
+                else lambda: self._session_tasks.require_continuation_task_authority(
                     session_id=session_id,
                     session_instance_id=task_session_instance_id,
                     task_id=task_id,
@@ -9791,7 +9811,7 @@ class CayuApp:
             after_admission=(
                 None
                 if task_id is None
-                else lambda: self._session_engine.require_continuation_task_authority(
+                else lambda: self._session_tasks.require_continuation_task_authority(
                     session_id=session_id,
                     session_instance_id=task_session_instance_id,
                     task_id=task_id,

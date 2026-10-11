@@ -1494,7 +1494,7 @@ def test_worker_uses_current_hidden_lease_for_session_attachment(
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
         created = await store.create_task(TaskCreate(task_id="renew-before-attach", type="job"))
-        original_start_task = app._session_engine._start_task
+        original_start_task = app._session_tasks.start_task
 
         async def start_after_periodic_renewal(**kwargs):
             await asyncio.wait_for(periodic_heartbeat.wait(), timeout=3)
@@ -1502,7 +1502,7 @@ def test_worker_uses_current_hidden_lease_for_session_attachment(
             assert acknowledged_leases[-1] != kwargs["lease_expires_at"]
             return await original_start_task(**kwargs)
 
-        monkeypatch.setattr(app._session_engine, "_start_task", start_after_periodic_renewal)
+        monkeypatch.setattr(app._session_tasks, "start_task", start_after_periodic_renewal)
         handled = await run_task_worker(
             app,
             store,

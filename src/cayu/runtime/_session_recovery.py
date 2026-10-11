@@ -66,6 +66,7 @@ from cayu.runtime._session_finalization import (
     _pop_interaction_transition_cancellation_outcome,
     _run_interaction_transition_cancellation_cleanup_steps,
 )
+from cayu.runtime._session_task_lifecycle import SessionTaskLifecycle
 from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
 )
@@ -156,6 +157,7 @@ class SessionRecovery:
         *,
         session_store: SessionStore,
         engine: SessionEngine,
+        session_tasks: SessionTaskLifecycle,
         recovery_coordinator: RecoveryCoordinator,
         incomplete_recovery: IncompleteSessionRecovery,
         background_interruption_coordinator: BackgroundInterruptionCoordinator,
@@ -174,6 +176,7 @@ class SessionRecovery:
     ) -> None:
         self.session_store = session_store
         self._engine = engine
+        self._session_tasks = session_tasks
         self._recovery_coordinator = recovery_coordinator
         self._incomplete_recovery = incomplete_recovery
         self._background_interruption_coordinator = background_interruption_coordinator
@@ -1348,8 +1351,11 @@ class SessionRecovery:
             request, configuration_differences = await inherit_resume_configuration(
                 self.session_store, session, request, self._effective_retry_policy(None)
             )
-        task_id, task_session_instance_id = await self._engine.linked_resume_task_id(request)
-        replayed_failure, replay_events = await self._engine.replay_runtime_task_failure_if_needed(
+        task_id, task_session_instance_id = await self._session_tasks.linked_resume_task_id(request)
+        (
+            replayed_failure,
+            replay_events,
+        ) = await self._session_tasks.replay_runtime_task_failure_if_needed(
             session_id=request.session_id,
             task_id=task_id,
             task_worker_id=request.task_worker_id,

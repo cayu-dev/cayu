@@ -354,6 +354,12 @@ stores and runtime collaborators supplied at composition. Interaction-start
 events and work-attempt source fingerprints use shared lower-level constructors,
 so ordinary execution and governed admission retain the same durable identities.
 
+`SessionTaskLifecycle` owns linked-task attachment, continuation authority,
+completion and setup-failure settlement, and exact failed-task replay/recovery.
+Application, execution and recovery callers compose the same instance with the
+captured session/task stores and existing publication collaborators. Its operations
+do not import or call the session engine.
+
 `QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
 request preparation, frozen profile and session-instance validation, execution
 or exact terminal replay, settlement classification, and receipt acknowledgement.

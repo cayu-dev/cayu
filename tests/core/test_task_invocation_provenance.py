@@ -248,7 +248,7 @@ def test_session_engine_revalidates_an_already_running_task_attachment() -> None
         )
 
         with pytest.raises(ValueError, match="provenance conflict"):
-            await app._session_engine._start_task(
+            await app._session_tasks.start_task(
                 task_id=task.id,
                 session=session,
             )
