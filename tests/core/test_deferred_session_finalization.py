@@ -53,7 +53,7 @@ async def test_deferred_cancelled_session_finalization(tmp_path, monkeypatch, ba
     reached = asyncio.Event()
     release = asyncio.Event()
     close_entered = asyncio.Event()
-    original_close = app._session_engine._close_durable_pending_tool_round_after_interrupt
+    original_close = app._interruption_cleanup.close_durable_pending_tool_round_after_interrupt
 
     async def delayed_close(**kwargs):
         close_entered.set()
@@ -66,7 +66,7 @@ async def test_deferred_cancelled_session_finalization(tmp_path, monkeypatch, ba
             yield event
 
     monkeypatch.setattr(
-        app._session_engine, "_close_durable_pending_tool_round_after_interrupt", delayed_close
+        app._interruption_cleanup, "close_durable_pending_tool_round_after_interrupt", delayed_close
     )
     original_append = store.append_event
 

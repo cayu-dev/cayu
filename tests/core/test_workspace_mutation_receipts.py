@@ -21,7 +21,7 @@ from tests.core._execution_profile_fixtures import (
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
-import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._session_interruption_cleanup as interruption_cleanup_module
 import cayu.runtime._tool_invocation.invocation as tool_invocation_module
 import cayu.sessions._staged_tool_terminal_reader as staged_terminal_reader
 import cayu.tools._operation_boundary as operation_boundary_module
@@ -6370,7 +6370,7 @@ def test_interruption_cleanup_does_not_invoke_failure_truthiness() -> None:
     hostile = HostileTruthinessFailure("private cleanup diagnostic")
     failure = BaseExceptionGroup("cleanup failures", [preserved, hostile])
 
-    classified = session_engine_module._session_interruption_cleanup_child_error(
+    classified = interruption_cleanup_module._session_interruption_cleanup_child_error(
         failure,
         operation="Session interruption cleanup",
         preserved_failure=preserved,
@@ -6399,11 +6399,13 @@ def test_interruption_cleanup_failure_preserves_historical_task_cancellation() -
             ],
         )
         retain_workspace_observation_pending_cancellation_requests(authoritative, 1)
-        propagated = session_engine_module._session_interruption_failure_with_additional_control(
-            authoritative,
-            RuntimeError("interruption cleanup failed"),
-            group_message="Session interruption finalization failed.",
-            historical_cancellation_requests=1,
+        propagated = (
+            interruption_cleanup_module._session_interruption_failure_with_additional_control(
+                authoritative,
+                RuntimeError("interruption cleanup failed"),
+                group_message="Session interruption finalization failed.",
+                historical_cancellation_requests=1,
+            )
         )
 
         assert current.cancelling() == 1
@@ -6439,7 +6441,7 @@ def test_interruption_cleanup_handles_deep_preserved_failure_group_iteratively()
     for _ in range(2_000):
         failure = BaseExceptionGroup("nested cleanup", [failure])
 
-    classified = session_engine_module._session_interruption_cleanup_child_error(
+    classified = interruption_cleanup_module._session_interruption_cleanup_child_error(
         failure,
         operation="Session interruption cleanup",
         preserved_failure=preserved,

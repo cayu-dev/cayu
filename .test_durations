@@ -1,4 +1,9 @@
 {
+  "tests/core/test_session_interruption_composition.py::test_interruption_cleanup_imports_without_application_or_engine": 3.861364,
+  "tests/core/test_session_interruption_composition.py::test_interruption_cleanup_settles_after_preparation_failure_without_engine[memory]": 0.126394,
+  "tests/core/test_session_interruption_composition.py::test_interruption_cleanup_settles_after_preparation_failure_without_engine[sqlite]": 0.33535,
+  "tests/core/test_session_interruption_composition.py::test_interruption_finalizer_retains_later_control_and_drains_all_steps[False]": 0.002919,
+  "tests/core/test_session_interruption_composition.py::test_interruption_finalizer_retains_later_control_and_drains_all_steps[True]": 0.002255,
   "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_imports_without_adapters_or_driver": 0.824,
   "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_composes_and_rolls_back_failed_writes[RuntimeError]": 0.76,
   "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_composes_and_rolls_back_failed_writes[CancelledError]": 0.183,

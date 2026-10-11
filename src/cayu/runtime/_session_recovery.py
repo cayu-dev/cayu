@@ -54,8 +54,6 @@ from cayu.runtime._session_control import (
 )
 from cayu.runtime._session_engine import (
     SessionEngine,
-    _detach_billing_cancellation_for_public,
-    _detach_provider_cancellation_for_public,
 )
 from cayu.runtime._session_finalization import (
     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
@@ -65,6 +63,10 @@ from cayu.runtime._session_finalization import (
     _is_interaction_transition_run_fence,
     _pop_interaction_transition_cancellation_outcome,
     _run_interaction_transition_cancellation_cleanup_steps,
+)
+from cayu.runtime._session_interruption_cleanup import (
+    _detach_billing_cancellation_for_public,
+    _detach_provider_cancellation_for_public,
 )
 from cayu.runtime._session_task_lifecycle import SessionTaskLifecycle
 from cayu.runtime._task_store_operation_boundary import (

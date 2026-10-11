@@ -370,6 +370,13 @@ scheduling, deferred transcript materialization and cancellation supervision sta
 with their existing owners. Deferred transcript materialization is supplied as an
 explicit operation; outcome publication retains no engine reference.
 
+`SessionInterruptionCleanup` settles durable interruption, closes pending tool
+rounds and supervises finalizer awaits. It retains the original failure, later
+control signals and task cancellation counts while cleanup finishes. Authenticated
+provider and billing cancellation detachment lives with this owner and is shared
+by execution and recovery. The component uses the captured store and existing
+finalization, recovery and tool-round owners without importing the engine.
+
 `QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
 request preparation, frozen profile and session-instance validation, execution
 or exact terminal replay, settlement classification, and receipt acknowledgement.

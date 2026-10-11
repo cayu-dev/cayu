@@ -447,6 +447,7 @@ from cayu.runtime._session_engine import (
 from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._session_fork import SessionFork
+from cayu.runtime._session_interruption_cleanup import SessionInterruptionCleanup
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.runtime._session_preparation import SessionPreparation
@@ -1804,7 +1805,15 @@ class CayuApp:
             clock=self._clock,
         )
 
+        self._interruption_cleanup = SessionInterruptionCleanup(
+            session_store=self._runtime_session_store,
+            session_finalization=self._session_finalization,
+            recovery_ownership=self._recovery_ownership,
+            pending_tool_round_recovery=self._pending_tool_round_recovery,
+        )
+
         self._session_engine = SessionEngine(
+            interruption_cleanup=self._interruption_cleanup,
             session_outcomes=self._session_outcomes,
             session_tasks=self._session_tasks,
             session_preparation=self._session_preparation,
