@@ -1249,6 +1249,14 @@ runner or connection, readiness and session reader. Shared evidence classificati
 and bounded spool backing retain their existing owners; snapshot isolation,
 hydration limits and cancellation cleanup stay with the native read operation.
 
+Native SQLite public-authority alias persistence and key reconciliation live in
+`storage/_sqlite_public_authority.py`. The owner keeps scoped lookup,
+authenticated registration, key continuity and backfill with native transaction
+boundaries. Stores supply the immutable codec and explicit execution/connection
+capabilities. Store readiness and connection lifetimes, the shared codec and
+schema history retain their existing owners. Codec configuration remains
+optional for stores whose durable registry is unconfigured.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and

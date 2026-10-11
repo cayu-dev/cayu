@@ -27,6 +27,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage import _sqlite_functions as sqlite_functions
+from cayu.storage import _sqlite_public_authority as public_authority_ops
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sql
 from cayu.storage import migrations as schema
@@ -109,7 +110,9 @@ def test_historical_sqlite_upgrade_continues_session(
         )
         with closing(sqlite3.connect(db)) as connection:
             sqlite_functions._register_sqlite_functions(connection)
-            seed_store._register_public_authority_alias_sql_function(connection)
+            public_authority_ops.register_sql_functions(
+                connection, codec=seed_store.public_authority_alias_codec
+            )
             connection.row_factory = sqlite3.Row
             connection.execute(sqlite_schema_history._MIGRATIONS_TABLE_DDL)
             sql._apply_pending(connection, sql.read_schema_state(connection))

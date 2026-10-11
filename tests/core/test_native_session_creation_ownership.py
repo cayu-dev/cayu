@@ -21,6 +21,7 @@ from cayu.messages import Message
 from cayu.sessions.forks import fork_session_invocation
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.storage import _sqlite_public_authority as public_authority_ops
 
 TABLES = (
     "cayu_sessions",
@@ -222,7 +223,7 @@ def test_sqlite_creation_owner_composes_with_direct_connection(tmp_path):
         readers._closure_lineage_owners_unlocked = partial(
             SQLiteSessionStore._closure_lineage_owners_unlocked, readers
         )
-        SQLiteSessionStore._register_public_authority_alias_sql_function(readers, connection)
+        public_authority_ops.register_sql_functions(connection, codec=None)
 
         def now():
             assert lock.locked() and connection.in_transaction
@@ -230,13 +231,15 @@ def test_sqlite_creation_owner_composes_with_direct_connection(tmp_path):
 
         capabilities = {
             "lock": lock,
+            "require_authority_configuration": partial(
+                public_authority_ops.require_current_configuration, codec=None
+            ),
             "store_now": now,
             "closure_owners": readers._closure_lineage_owners_unlocked,
             "supports_model_failover": lambda: True,
             "touch_activity": _touch_session_activity,
         }
         for name, method in {
-            "require_authority_configuration": "_require_current_public_authority_configuration",
             "require_available_closure_identity": "_require_available_closure_identity_unlocked",
             "require_external_creation": "_require_external_creation_unlocked",
             "load_checkpoint": "_load_checkpoint_unlocked",

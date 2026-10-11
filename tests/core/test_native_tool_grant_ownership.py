@@ -22,6 +22,7 @@ from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAutho
 from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.storage import _sqlite_public_authority as public_authority_ops
 from cayu.tools.grants import (
     PreparedTargetedToolGrant,
     TargetedToolGrant,
@@ -280,9 +281,7 @@ def test_sqlite_tool_grant_owner_composes_with_direct_connection(tmp_path):
         connection = _sqlite_connection.connect(path)
         # The interaction authority was registered during seeding. These native
         # SQL functions use the same codec without retaining the store instance.
-        adapter.SQLiteSessionStore._register_public_authority_alias_sql_function(
-            SimpleNamespace(_public_authority_alias_codec=alias_codec), connection
-        )
+        public_authority_ops.register_sql_functions(connection, codec=alias_codec)
         active = False
         fault = SimpleNamespace(enabled=False, reading=False)
 

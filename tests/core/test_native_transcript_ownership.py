@@ -16,6 +16,7 @@ from cayu.messages import Message, MessageRole
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_queries import TranscriptQuery, TranscriptSearchQuery
+from cayu.storage import _sqlite_public_authority as public_authority_ops
 
 
 def _assert_import_without_adapters(backend):
@@ -73,7 +74,9 @@ def test_sqlite_transcript_composes_with_direct_connection(tmp_path):
             )
             await store.append_transcript_messages("transcript", [initial], interaction_id=None)
             connection = sqlite_connection.connect(path)
-            store._register_public_authority_alias_sql_function(connection)
+            public_authority_ops.register_sql_functions(
+                connection, codec=store.public_authority_alias_codec
+            )
         finally:
             await store.close()
 

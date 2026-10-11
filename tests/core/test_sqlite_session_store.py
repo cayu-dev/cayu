@@ -43,6 +43,7 @@ from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_connection as sqlite_connection
+from cayu.storage import _sqlite_public_authority as public_authority_ops
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sqlite_support
@@ -1015,17 +1016,19 @@ def test_sqlite_rotation_fence_is_atomic_with_identity_write_transaction(
             RunRequest(agent_name="assistant", session_id="session", messages=[]),
             identity=_identity(),
         )
-        original_check = stale_store._require_current_public_authority_configuration
+        original_check = public_authority_ops.require_current_configuration
 
-        def pause_after_precheck(connection: sqlite3.Connection) -> None:
-            original_check(connection)
+        def pause_after_precheck(connection: sqlite3.Connection, *, codec) -> None:
+            original_check(connection, codec=codec)
+            if codec is not first_codec:
+                return
             precheck_completed.set()
             if not allow_write.wait(timeout=5):
                 raise AssertionError("rotation race was not released")
 
         monkeypatch.setattr(
-            stale_store,
-            "_require_current_public_authority_configuration",
+            public_authority_ops,
+            "require_current_configuration",
             pause_after_precheck,
         )
         append_task = asyncio.create_task(
