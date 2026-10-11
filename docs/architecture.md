@@ -1233,6 +1233,13 @@ lock scope. Creation, forks, deletion and runtime publication use the index
 functions within their existing atomic operations; the transcript owner does not
 import or receive the store implementation.
 
+`sessions/_memory_evidence.py` owns in-memory recall receipts and context
+exposures: creation, reads, bounded paging and exposure transitions. Its typed
+state views resolve current indexes after acquiring the store lock. Replay,
+closure admission, validation and index publication remain within each complete
+operation. The store retains state construction, deletion and closure capture;
+the evidence owner can be composed without importing the store implementation.
+
 Native session event queries, session listing/inspection, topology/lineage,
 child lifecycle reads, summaries and accounting reads live in
 `storage/_sqlite_session_queries.py` and `storage/_postgres_session_queries.py`.

@@ -8,15 +8,19 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from tests._session_provenance import fixture_session_invocation
-from tests.core.session_store_conformance.support import _recall_receipt
+from tests.core.session_store_conformance.support import _planned_context_exposure, _recall_receipt
 
 import cayu
-from cayu.memory.evidence import RecallEvidenceConflict, RecallEvidenceQuery
+from cayu.memory.evidence import (
+    ContextExposureTransitionRequest,
+    RecallEvidenceConflict,
+    RecallEvidenceQuery,
+)
 from cayu.sessions import _memory_evidence as evidence
 from cayu.sessions.records import Session
 
@@ -64,6 +68,8 @@ sys.meta_path.insert(0, RejectStores())
 owner = importlib.import_module("cayu.sessions._memory_evidence")
 assert callable(owner.create_recall_receipt)
 assert callable(owner.list_recall_receipts)
+assert callable(owner.create_context_exposure)
+assert callable(owner.transition_context_exposure)
 """,
         ],
         env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
@@ -198,6 +204,221 @@ def test_cancelled_recall_waiter_leaves_state_and_lock_usable(write):
         finally:
             lock.release()
         assert await evidence.create_recall_receipt(locked, receipt) == receipt
+        assert not lock.locked()
+
+    asyncio.run(scenario())
+
+
+def _exposure_state(receipt):
+    recalls = _recall_state()
+    return evidence.MemoryContextExposureState(
+        context_exposure_by_model_attempt={},
+        context_exposure_by_provider_attempt={},
+        context_exposure_ids_by_session={},
+        context_exposure_page_keys_by_interaction={},
+        context_exposure_page_keys_by_interaction_step={},
+        context_exposure_page_keys_by_session={},
+        context_exposure_page_keys_by_step={},
+        context_exposures={},
+        recall_item_exposures={},
+        recall_receipts={receipt.receipt_id: receipt},
+        session_closure_progress={},
+        sessions=recalls.sessions,
+    )
+
+
+def _prepared_transition(exposure):
+    return ContextExposureTransitionRequest(
+        transition_id="prepared-" + exposure.exposure_id,
+        expected_state="planned",
+        expected_revision=0,
+        state="prepared",
+        occurred_at=exposure.created_at + timedelta(seconds=1),
+        evidence_kind="request_prepared",
+        evidence_ref="prepared-request",
+    )
+
+
+def test_context_exposures_compose_independently_with_replay_and_paging():
+    async def scenario():
+        receipt = _recall_receipt("source", session_id="session")
+        state = _exposure_state(receipt)
+        lock = asyncio.Lock()
+        entrances = 0
+
+        @asynccontextmanager
+        async def locked():
+            nonlocal entrances
+            async with lock:
+                entrances += 1
+                yield state
+
+        first, items = _planned_context_exposure("a", receipt)
+        second, second_items = _planned_context_exposure("b", receipt)
+        assert await evidence.create_context_exposure(locked, first, items) == first
+        assert entrances == 1 and not lock.locked()
+        assert await evidence.load_context_exposure(locked, "session", first.exposure_id) == first
+        returned_items = await evidence.load_recall_item_exposures(
+            locked, "session", first.exposure_id
+        )
+        assert returned_items == items
+        assert (
+            returned_items[0].identity
+            is not state.recall_item_exposures[first.exposure_id][0].identity
+        )
+        object.__setattr__(returned_items[0].identity, "record_id", "changed-output")
+        assert (
+            await evidence.load_recall_item_exposures(locked, "session", first.exposure_id) == items
+        )
+        assert await evidence.load_context_exposure(locked, "foreign", first.exposure_id) is None
+        assert await evidence.load_recall_item_exposures(locked, "foreign", first.exposure_id) == ()
+        await evidence.create_context_exposure(locked, second, second_items)
+        page = await evidence.list_context_exposures(
+            locked, RecallEvidenceQuery(session_id="session", limit=1)
+        )
+        assert page.items == (first,) and page.truncated and page.next_cursor
+        last = await evidence.list_context_exposures(
+            locked, RecallEvidenceQuery(session_id="session", limit=1, cursor=page.next_cursor)
+        )
+        assert last.items == (second,) and not last.truncated and last.next_cursor is None
+        transition = _prepared_transition(first)
+        updated = await evidence.transition_context_exposure(
+            locked, "session", first.exposure_id, transition
+        )
+        assert updated.state.value == "prepared" and updated.state_revision == 1
+        state.session_closure_progress[("session", "closure")] = {
+            "root_session_id": "session",
+            "plan_id": "closure",
+            "descendants": [],
+        }
+        before = deepcopy(state)
+        assert await evidence.create_context_exposure(locked, first, items) == updated
+        assert (
+            await evidence.transition_context_exposure(
+                locked, "session", first.exposure_id, transition
+            )
+            == updated
+        )
+        with pytest.raises(ValueError, match="unfinished recursive closure"):
+            await evidence.transition_context_exposure(
+                locked, "session", second.exposure_id, _prepared_transition(second)
+            )
+        assert state == before and not lock.locked()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_receipt", "model_attempt", "provider_attempt", "item_content", "closure"]
+)
+def test_context_exposure_validation_failure_publishes_no_indexes(failure):
+    async def scenario():
+        receipt = _recall_receipt("source", session_id="session")
+        state = _exposure_state(receipt)
+        exposure, items = _planned_context_exposure("candidate", receipt)
+        lock = asyncio.Lock()
+
+        @asynccontextmanager
+        async def locked():
+            async with lock:
+                yield state
+
+        if failure == "missing_receipt":
+            state.recall_receipts.clear()
+        elif failure == "model_attempt":
+            state.context_exposure_by_model_attempt[("session", exposure.model_attempt_id)] = (
+                "existing"
+            )
+        elif failure == "provider_attempt":
+            state.context_exposure_by_provider_attempt[
+                ("session", exposure.provider_attempt_id)
+            ] = "existing"
+        elif failure == "item_content":
+            items = (items[0].model_copy(update={"content_sha256": "0" * 64}),)
+        else:
+            state.session_closure_progress[("session", "closure")] = {
+                "root_session_id": "session",
+                "plan_id": "closure",
+                "descendants": [],
+            }
+        expected_error = (
+            KeyError
+            if failure == "missing_receipt"
+            else RecallEvidenceConflict
+            if failure in {"model_attempt", "provider_attempt"}
+            else ValueError
+        )
+        before = deepcopy(state)
+        with pytest.raises(expected_error):
+            await evidence.create_context_exposure(locked, exposure, items)
+        assert state == before and not lock.locked()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_context_exposure_state_resolves_after_lock_acquisition(write):
+    from cayu.sessions.memory import InMemorySessionStore
+
+    async def scenario():
+        store = InMemorySessionStore()
+        receipt = _recall_receipt("source", session_id="session")
+        state = _exposure_state(receipt)
+        exposure, items = _planned_context_exposure("current", receipt)
+        old_exposures = store._context_exposures
+        await store._lock.acquire()
+        operation = (
+            store.create_context_exposure(exposure, items)
+            if write
+            else store.load_context_exposure("session", exposure.exposure_id)
+        )
+        pending = asyncio.create_task(operation)
+        try:
+            await asyncio.sleep(0)
+            assert not pending.done()
+            if not write:
+                state.context_exposures[exposure.exposure_id] = exposure
+            for name, value in zip(state._fields, state, strict=True):
+                setattr(store, "_" + name, value)
+        finally:
+            store._lock.release()
+        assert await pending == exposure
+        assert old_exposures == {} and state.context_exposures[exposure.exposure_id] == exposure
+        if write:
+            assert (
+                await store.list_context_exposures(RecallEvidenceQuery(session_id="session"))
+            ).items == (exposure,)
+            assert await store.load_recall_item_exposures("session", exposure.exposure_id) == items
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_context_exposure_waiter_leaves_state_and_lock_usable():
+    async def scenario():
+        receipt = _recall_receipt("source", session_id="session")
+        state = _exposure_state(receipt)
+        exposure, items = _planned_context_exposure("cancelled", receipt)
+        before = deepcopy(state)
+        lock = asyncio.Lock()
+        started = asyncio.Event()
+
+        @asynccontextmanager
+        async def locked():
+            started.set()
+            async with lock:
+                yield state
+
+        await lock.acquire()
+        pending = asyncio.create_task(evidence.create_context_exposure(locked, exposure, items))
+        try:
+            await started.wait()
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert lock.locked() and state == before
+        finally:
+            lock.release()
+        assert await evidence.create_context_exposure(locked, exposure, items) == exposure
         assert not lock.locked()
 
     asyncio.run(scenario())

@@ -1,4 +1,13 @@
 {
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposures_compose_independently_with_replay_and_paging": 0.009,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_validation_failure_publishes_no_indexes[missing_receipt]": 0.002,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_validation_failure_publishes_no_indexes[model_attempt]": 0.003,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_validation_failure_publishes_no_indexes[provider_attempt]": 0.002,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_validation_failure_publishes_no_indexes[item_content]": 0.002,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_validation_failure_publishes_no_indexes[closure]": 0.002,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_state_resolves_after_lock_acquisition[False]": 0.002,
+  "tests/core/test_memory_evidence_ownership.py::test_context_exposure_state_resolves_after_lock_acquisition[True]": 0.004,
+  "tests/core/test_memory_evidence_ownership.py::test_cancelled_context_exposure_waiter_leaves_state_and_lock_usable": 0.003,
   "tests/core/test_memory_evidence_ownership.py::test_memory_evidence_imports_without_store_implementations": 0.303,
   "tests/core/test_memory_evidence_ownership.py::test_recall_receipts_compose_independently_with_atomic_indexes": 0.024,
   "tests/core/test_memory_evidence_ownership.py::test_recall_state_resolves_after_lock_acquisition[False]": 0.012,

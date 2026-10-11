@@ -7,7 +7,7 @@ import base64
 import heapq
 import math
 import secrets
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
@@ -15,7 +15,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from itertools import islice
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from uuid import uuid4
 
@@ -52,29 +51,13 @@ from cayu.execution_profiles import (
 )
 from cayu.execution_units import ToolRoundIdentity
 from cayu.memory.evidence import (
-    MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
     ContextExposurePage,
     ContextExposureTransitionRequest,
-    RecallEvidenceConflict,
     RecallEvidenceQuery,
     RecallItemExposure,
     RecallReceipt,
     RecallReceiptPage,
-    append_context_exposure_transition,
-    context_exposure_creation_matches,
-    context_exposure_transition_replays,
-    copy_context_exposure,
-    copy_recall_item_exposure,
-    decode_recall_evidence_cursor,
-    encode_recall_evidence_cursor,
-    memory_evidence_document_bytes,
-    recall_item_exposure_matches_receipt_item,
-    require_memory_evidence_id,
-    require_memory_evidence_session_id,
-    validate_context_exposure_carried_receipt_scope,
-    validate_context_exposure_receipt_scope,
-    validate_new_context_exposure,
 )
 from cayu.messages import Message, MessageRole, copy_message, detach_message
 from cayu.runtime._child_session_notifications import (
@@ -1164,6 +1147,26 @@ class InMemorySessionStore(
                 recall_receipt_page_keys_by_interaction_step=self._recall_receipt_page_keys_by_interaction_step,
                 recall_receipt_page_keys_by_session=self._recall_receipt_page_keys_by_session,
                 recall_receipt_page_keys_by_step=self._recall_receipt_page_keys_by_step,
+                recall_receipts=self._recall_receipts,
+                session_closure_progress=self._session_closure_progress,
+                sessions=self._sessions,
+            )
+
+    @asynccontextmanager
+    async def _context_exposure_state(
+        self,
+    ) -> AsyncIterator[memory_evidence.MemoryContextExposureState]:
+        async with self._lock:
+            yield memory_evidence.MemoryContextExposureState(
+                context_exposure_by_model_attempt=self._context_exposure_by_model_attempt,
+                context_exposure_by_provider_attempt=self._context_exposure_by_provider_attempt,
+                context_exposure_ids_by_session=self._context_exposure_ids_by_session,
+                context_exposure_page_keys_by_interaction=self._context_exposure_page_keys_by_interaction,
+                context_exposure_page_keys_by_interaction_step=self._context_exposure_page_keys_by_interaction_step,
+                context_exposure_page_keys_by_session=self._context_exposure_page_keys_by_session,
+                context_exposure_page_keys_by_step=self._context_exposure_page_keys_by_step,
+                context_exposures=self._context_exposures,
+                recall_item_exposures=self._recall_item_exposures,
                 recall_receipts=self._recall_receipts,
                 session_closure_progress=self._session_closure_progress,
                 sessions=self._sessions,
@@ -10053,194 +10056,33 @@ class InMemorySessionStore(
         exposure: ContextExposure,
         item_exposures: tuple[RecallItemExposure, ...] = (),
     ) -> ContextExposure:
-        copied = copy_context_exposure(exposure)
-        copied_items = tuple(copy_recall_item_exposure(item) for item in item_exposures)
-        validate_new_context_exposure(copied, copied_items)
-
-        async with self._lock:
-            current = self._context_exposures.get(copied.exposure_id)
-            if current is not None:
-                current_items = self._recall_item_exposures[copied.exposure_id]
-                if not context_exposure_creation_matches(current, copied) or tuple(
-                    memory_evidence_document_bytes(item, "stored recall item exposure")
-                    for item in current_items
-                ) != tuple(
-                    memory_evidence_document_bytes(item, "recall item exposure")
-                    for item in copied_items
-                ):
-                    raise RecallEvidenceConflict("Context exposure", copied.exposure_id)
-                return copy_context_exposure(current)
-            if copied.session_id not in self._sessions:
-                raise KeyError(f"Session not found: {copied.session_id}")
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (copied.session_id,))
-
-            attempt_key = copied.session_id, copied.model_attempt_id
-            conflicting_exposure_id = self._context_exposure_by_model_attempt.get(attempt_key)
-            if conflicting_exposure_id is not None:
-                raise RecallEvidenceConflict("Model-attempt exposure", conflicting_exposure_id)
-            provider_attempt_key = copied.session_id, copied.provider_attempt_id
-            conflicting_exposure_id = self._context_exposure_by_provider_attempt.get(
-                provider_attempt_key
-            )
-            if conflicting_exposure_id is not None:
-                raise RecallEvidenceConflict(
-                    "Provider-attempt exposure",
-                    conflicting_exposure_id,
-                )
-
-            receipts: dict[str, RecallReceipt] = {}
-            for receipt_id in copied.receipt_ids:
-                receipt = self._recall_receipts.get(receipt_id)
-                if receipt is None:
-                    raise KeyError(f"Recall receipt not found: {receipt_id}")
-                validate_context_exposure_receipt_scope(copied, receipt)
-                receipts[receipt_id] = receipt
-            for receipt_id in copied.carried_receipt_ids:
-                receipt = self._recall_receipts.get(receipt_id)
-                if receipt is None:
-                    raise KeyError(f"Recall receipt not found: {receipt_id}")
-                validate_context_exposure_carried_receipt_scope(copied, receipt)
-            for item in copied_items:
-                if not recall_item_exposure_matches_receipt_item(
-                    item,
-                    receipts[item.receipt_id],
-                ):
-                    raise ValueError(
-                        "Recall item exposure differs from its immutable receipt item."
-                    )
-
-            self._context_exposures[copied.exposure_id] = copied
-            self._context_exposure_ids_by_session.setdefault(copied.session_id, set()).add(
-                copied.exposure_id
-            )
-            self._recall_item_exposures[copied.exposure_id] = copied_items
-            self._context_exposure_by_model_attempt[attempt_key] = copied.exposure_id
-            self._context_exposure_by_provider_attempt[provider_attempt_key] = copied.exposure_id
-            page_key = copied.created_at, copied.exposure_id
-            for page_keys in (
-                self._context_exposure_page_keys_by_session.setdefault(copied.session_id, []),
-                self._context_exposure_page_keys_by_interaction.setdefault(
-                    (copied.session_id, copied.interaction_id), []
-                ),
-                self._context_exposure_page_keys_by_step.setdefault(
-                    (copied.session_id, copied.model_step_id), []
-                ),
-                self._context_exposure_page_keys_by_interaction_step.setdefault(
-                    (copied.session_id, copied.interaction_id, copied.model_step_id), []
-                ),
-            ):
-                page_keys.insert(bisect_right(page_keys, page_key), page_key)
-            return copy_context_exposure(copied)
+        return await memory_evidence.create_context_exposure(
+            self._context_exposure_state, exposure, item_exposures
+        )
 
     async def load_context_exposure(
         self,
         session_id: str,
         exposure_id: str,
     ) -> ContextExposure | None:
-        session_id = require_memory_evidence_session_id(session_id)
-        exposure_id = require_memory_evidence_id(exposure_id, "exposure_id")
-        async with self._lock:
-            exposure = self._context_exposures.get(exposure_id)
-            if exposure is None or exposure.session_id != session_id:
-                return None
-            return copy_context_exposure(exposure)
+        return await memory_evidence.load_context_exposure(
+            self._context_exposure_state, session_id, exposure_id
+        )
 
     async def load_recall_item_exposures(
         self,
         session_id: str,
         exposure_id: str,
     ) -> tuple[RecallItemExposure, ...]:
-        session_id = require_memory_evidence_session_id(session_id)
-        exposure_id = require_memory_evidence_id(exposure_id, "exposure_id")
-        async with self._lock:
-            exposure = self._context_exposures.get(exposure_id)
-            if exposure is None or exposure.session_id != session_id:
-                return ()
-            if len(self._recall_item_exposures[exposure_id]) > MAX_RECALL_RECEIPT_ITEMS:
-                raise ValueError("Stored recall item exposures exceed their count bound.")
-            return tuple(
-                copy_recall_item_exposure(item) for item in self._recall_item_exposures[exposure_id]
-            )
+        return await memory_evidence.load_recall_item_exposures(
+            self._context_exposure_state, session_id, exposure_id
+        )
 
     async def list_context_exposures(
         self,
         query: RecallEvidenceQuery,
     ) -> ContextExposurePage:
-        copied_query = RecallEvidenceQuery.model_validate(query.model_dump(mode="python"))
-        query_fingerprint = copied_query.fingerprint("exposure")
-        after = (
-            None
-            if copied_query.cursor is None
-            else decode_recall_evidence_cursor(
-                copied_query.cursor,
-                record_kind="exposure",
-                query_fingerprint=query_fingerprint,
-            )
-        )
-        async with self._lock:
-            if copied_query.interaction_id is not None and copied_query.model_step_id is not None:
-                page_keys = self._context_exposure_page_keys_by_interaction_step.get(
-                    (
-                        copied_query.session_id,
-                        copied_query.interaction_id,
-                        copied_query.model_step_id,
-                    ),
-                    (),
-                )
-            elif copied_query.interaction_id is not None:
-                page_keys = self._context_exposure_page_keys_by_interaction.get(
-                    (copied_query.session_id, copied_query.interaction_id),
-                    (),
-                )
-            elif copied_query.model_step_id is not None:
-                page_keys = self._context_exposure_page_keys_by_step.get(
-                    (copied_query.session_id, copied_query.model_step_id),
-                    (),
-                )
-            else:
-                page_keys = self._context_exposure_page_keys_by_session.get(
-                    copied_query.session_id,
-                    (),
-                )
-            start = 0 if after is None else bisect_right(page_keys, after)
-            candidates = tuple(
-                self._context_exposures[exposure_id]
-                for _, exposure_id in islice(
-                    page_keys,
-                    start,
-                    start + copied_query.limit + 1,
-                )
-            )
-            retained: list[ContextExposure] = []
-            retained_bytes = 2
-            for exposure in candidates:
-                document_bytes = len(
-                    memory_evidence_document_bytes(exposure, "context exposure page item")
-                )
-                separator_bytes = 1 if retained else 0
-                if len(retained) >= copied_query.limit or (
-                    retained_bytes + separator_bytes + document_bytes > copied_query.max_bytes
-                ):
-                    break
-                retained.append(exposure)
-                retained_bytes += separator_bytes + document_bytes
-            truncated = len(retained) < len(candidates)
-            next_cursor = (
-                encode_recall_evidence_cursor(
-                    record_kind="exposure",
-                    query_fingerprint=query_fingerprint,
-                    created_at=retained[-1].created_at,
-                    record_id=retained[-1].exposure_id,
-                )
-                if truncated and retained
-                else None
-            )
-            return ContextExposurePage(
-                items=tuple(retained),
-                next_cursor=next_cursor,
-                truncated=truncated,
-            )
+        return await memory_evidence.list_context_exposures(self._context_exposure_state, query)
 
     async def transition_context_exposure(
         self,
@@ -10248,35 +10090,9 @@ class InMemorySessionStore(
         exposure_id: str,
         request: ContextExposureTransitionRequest,
     ) -> ContextExposure:
-        session_id = require_memory_evidence_session_id(session_id)
-        exposure_id = require_memory_evidence_id(exposure_id, "exposure_id")
-        copied_request = ContextExposureTransitionRequest.model_validate(
-            request.model_dump(mode="python")
+        return await memory_evidence.transition_context_exposure(
+            self._context_exposure_state, session_id, exposure_id, request
         )
-        async with self._lock:
-            exposure = self._context_exposures.get(exposure_id)
-            if exposure is None or exposure.session_id != session_id:
-                raise KeyError(f"Context exposure not found: {exposure_id}")
-            replay = next(
-                (
-                    transition
-                    for transition in exposure.transitions
-                    if transition.transition_id == copied_request.transition_id
-                ),
-                None,
-            )
-            if replay is not None:
-                if not context_exposure_transition_replays(exposure, copied_request):
-                    raise RecallEvidenceConflict(
-                        "Context exposure transition",
-                        copied_request.transition_id,
-                    )
-                return copy_context_exposure(exposure)
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (session_id,))
-            updated = append_context_exposure_transition(exposure, copied_request)
-            self._context_exposures[exposure_id] = updated
-            return copy_context_exposure(updated)
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
