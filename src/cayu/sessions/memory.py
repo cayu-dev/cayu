@@ -128,7 +128,6 @@ from cayu.sessions import records as session_record_rules
 from cayu.sessions import recovery as session_recovery_rules
 from cayu.sessions import requests as session_request_contracts
 from cayu.sessions import terminal_evidence as terminal_session_evidence
-from cayu.sessions import transcript_input as session_transcript_input
 from cayu.sessions._access_rules import _RECIPIENT_PROVENANCE_CAPABILITY
 from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
@@ -146,7 +145,6 @@ from cayu.sessions._interaction_transitions import (
 from cayu.sessions._invocation_scope import (
     INHERIT_INTERACTION,
     InteractionAttribution,
-    resolve_interaction_attribution,
 )
 from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.sessions._model_completion_publication import ModelCompletionStageSettlementRequest
@@ -307,7 +305,6 @@ from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     DeferredInteractionInput,
     copy_transcript_messages,
-    require_deferred_initial_transcript_replacement,
     session_messages_input_contract_evidence,
 )
 from cayu.sessions.transcript_queries import (
@@ -1176,6 +1173,24 @@ class InMemorySessionStore(
                 indexes=self._transcript_indexes_unlocked(),
                 sessions=self._sessions,
                 deferred_interaction_inputs=self._deferred_interaction_inputs,
+            )
+
+    @asynccontextmanager
+    async def _write_transcript_state(
+        self,
+    ) -> AsyncIterator[memory_transcripts.MemoryTranscriptWriteState]:
+        async with self._lock:
+            yield memory_transcripts.MemoryTranscriptWriteState(
+                indexes=self._transcript_indexes_unlocked(),
+                sessions=self._sessions,
+                deferred_interaction_inputs=self._deferred_interaction_inputs,
+                checkpoints=self._checkpoints,
+                session_closure_progress=self._session_closure_progress,
+                participant_session_receipts=self._participant_session_receipts,
+                ownership_clock=self._ownership_clock,
+                register_private_alias=self._register_private_authority_alias_unlocked,
+                store_checkpoint=self._store_checkpoint_unlocked,
+                refresh_queued_receipts=self._refresh_queued_dispatch_terminal_receipts_unlocked,
             )
 
     @property
@@ -9862,36 +9877,9 @@ class InMemorySessionStore(
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
-        copied_messages = copy_transcript_messages(messages)
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            invocation_scope._assert_session_run_epoch(session_id, session)
-            if not copied_messages:
-                return
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (session_id,))
-            if interaction_id is not None:
-                self._register_private_authority_alias_unlocked(
-                    interaction_id,
-                    field_name="interaction_id",
-                    scope_session_id=session_id,
-                )
-            self._transcripts[session_id].extend(copied_messages)
-            memory_transcripts.extend_search(
-                self._transcript_indexes_unlocked(), session_id, copied_messages
-            )
-            memory_transcripts.extend_attribution(
-                self._transcript_indexes_unlocked(),
-                session_id,
-                [interaction_id] * len(copied_messages),
-            )
-            self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": self._ownership_clock()}
-            )
+        return await memory_transcripts.append_transcript_messages(
+            self._write_transcript_state, session_id, messages, interaction_id=interaction_id
+        )
 
     async def transform_checkpoint_with_store_time(
         self,
@@ -9939,87 +9927,15 @@ class InMemorySessionStore(
         checkpoint_transform: CheckpointTransform | None = None,
         runtime_suffix_count: int = 0,
     ) -> None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
-        if interaction_id is None:
-            raise ValueError("Initial transcript publication requires an interaction identity.")
-        expected = copy_transcript_messages(expected_messages)
-        replacement = copy_transcript_messages(replacement_messages)
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            invocation_scope._assert_session_run_epoch(session_id, session)
-            deferred = self._deferred_interaction_inputs.get(session_id)
-            if deferred is None or deferred.interaction_id != interaction_id:
-                raise RuntimeError("Deferred interaction input changed before finalization.")
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (session_id,))
-            require_deferred_initial_transcript_replacement(
-                deferred,
-                expected_messages=expected,
-                replacement_messages=replacement,
-            )
-            self._register_private_authority_alias_unlocked(
-                interaction_id,
-                field_name="interaction_id",
-                scope_session_id=session_id,
-            )
-            if self._transcripts.get(session_id):
-                from cayu.sessions._participant_execution_identity import (
-                    require_initial_execution_input,
-                )
-
-                require_initial_execution_input(
-                    session,
-                    self._participant_session_receipts.get(session_id),
-                    self._transcripts[session_id],
-                    expected,
-                )
-            prefix_count = session_transcript_input._initial_transcript_prefix_count(
-                expected,
-                replacement,
-                runtime_suffix_count=runtime_suffix_count,
-            )
-            current_checkpoint = self._checkpoints.get(session_id)
-            if checkpoint_transform is not None:
-                transformed = checkpoint_transform(
-                    session.model_copy(deep=True),
-                    checkpoint_preservation._copy_checkpoint_for_transform(
-                        current_checkpoint,
-                        session_id=session_id,
-                    ),
-                )
-                if transformed is not None:
-                    current_checkpoint = checkpoint_preservation._checkpoint_transform_result_preserving_completion_result_event_publications(
-                        current_checkpoint,
-                        transformed,
-                        session_id=session_id,
-                    )
-            checkpoint = checkpoint_publication._checkpoint_after_initial_transcript_publication(
-                current_checkpoint,
-                interaction_id=interaction_id,
-            )
-            self._transcripts[session_id] = replacement
-            memory_transcripts.replace_latest_role_indexes(
-                self._transcript_indexes_unlocked(), session_id
-            )
-            memory_transcripts.replace_search_session(
-                self._transcript_indexes_unlocked(), session_id, replacement
-            )
-            self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
-                interaction_id
-            ] * (len(expected) + runtime_suffix_count)
-            self._transcript_indices_by_interaction.pop(session_id, None)
-            self._deferred_interaction_inputs.pop(session_id, None)
-            if checkpoint is None:
-                self._refresh_queued_dispatch_terminal_receipts_unlocked(session_id, None)
-                self._checkpoints.pop(session_id, None)
-            else:
-                self._store_checkpoint_unlocked(session_id, checkpoint)
-            self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": self._ownership_clock()}
-            )
+        return await memory_transcripts.replace_initial_transcript_messages(
+            self._write_transcript_state,
+            session_id,
+            expected_messages,
+            replacement_messages,
+            interaction_id=interaction_id,
+            checkpoint_transform=checkpoint_transform,
+            runtime_suffix_count=runtime_suffix_count,
+        )
 
     async def materialize_deferred_interaction_input(
         self,
@@ -10027,35 +9943,9 @@ class InMemorySessionStore(
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> bool:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            invocation_scope._assert_session_run_epoch(session_id, session)
-            deferred = self._deferred_interaction_inputs.get(session_id)
-            if deferred is None:
-                return False
-            if deferred.interaction_id != interaction_id:
-                raise RuntimeError("Deferred interaction input belongs to another interaction.")
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (session_id,))
-            messages = deferred.source_messages
-            self._transcripts[session_id].extend(messages)
-            memory_transcripts.extend_search(
-                self._transcript_indexes_unlocked(), session_id, messages
-            )
-            memory_transcripts.extend_attribution(
-                self._transcript_indexes_unlocked(),
-                session_id,
-                [interaction_id] * len(messages),
-            )
-            self._deferred_interaction_inputs.pop(session_id, None)
-            self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": self._ownership_clock()}
-            )
-            return True
+        return await memory_transcripts.materialize_deferred_interaction_input(
+            self._write_transcript_state, session_id, interaction_id=interaction_id
+        )
 
     async def load_deferred_interaction_input(
         self,
@@ -10073,52 +9963,13 @@ class InMemorySessionStore(
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
-        copied_messages = copy_transcript_messages(messages)
-        if checkpoint_transform is None:
-            raise TypeError("checkpoint_transform is required.")
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            invocation_scope._assert_session_run_epoch(session_id, session)
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (session_id,))
-            current = self._checkpoints.get(session_id)
-            transformed = checkpoint_transform(
-                session.model_copy(deep=True),
-                checkpoint_preservation._copy_checkpoint_for_transform(
-                    current, session_id=session_id
-                ),
-            )
-            if transformed is None:
-                raise ValueError("Checkpoint transform must return a checkpoint.")
-            copied_checkpoint = checkpoint_preservation._checkpoint_transform_result_preserving_completion_result_event_publications(
-                current,
-                transformed,
-                session_id=session_id,
-            )
-            if copied_messages:
-                if interaction_id is not None:
-                    self._register_private_authority_alias_unlocked(
-                        interaction_id,
-                        field_name="interaction_id",
-                        scope_session_id=session_id,
-                    )
-                self._transcripts[session_id].extend(copied_messages)
-                memory_transcripts.extend_search(
-                    self._transcript_indexes_unlocked(), session_id, copied_messages
-                )
-                memory_transcripts.extend_attribution(
-                    self._transcript_indexes_unlocked(),
-                    session_id,
-                    [interaction_id] * len(copied_messages),
-                )
-            self._store_checkpoint_unlocked(session_id, copied_checkpoint)
-            self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": self._ownership_clock()}
-            )
+        return await memory_transcripts.append_transcript_messages_and_transform_checkpoint(
+            self._write_transcript_state,
+            session_id,
+            messages,
+            checkpoint_transform,
+            interaction_id=interaction_id,
+        )
 
     async def load_transcript(self, session_id: str) -> list[Message]:
         return await memory_transcripts.load_transcript(self._read_transcript_state, session_id)

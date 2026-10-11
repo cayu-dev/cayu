@@ -1,4 +1,10 @@
 {
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_publication_composes_with_one_locked_write": 0.000874,
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_transform_failure_releases_context_before_mutation[ValueError]": 0.000429,
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_transform_failure_releases_context_before_mutation[CancelledError]": 0.000343,
+  "tests/core/test_memory_transcript_ownership.py::test_deferred_transcript_publication_composes_without_store[True]": 0.000592,
+  "tests/core/test_memory_transcript_ownership.py::test_deferred_transcript_publication_composes_without_store[False]": 0.000501,
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_write_view_observes_replacement_before_lock_acquisition": 0.000926,
   "tests/core/test_memory_transcript_ownership.py::test_memory_transcripts_import_without_store_implementations": 0.194,
   "tests/core/test_memory_transcript_ownership.py::test_transcript_read_view_observes_indexes_replaced_while_waiting": 0.497,
   "tests/core/test_memory_transcript_ownership.py::test_transcript_reads_compose_with_independent_indexes": 0.006,

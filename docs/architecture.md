@@ -1225,6 +1225,14 @@ public-authority registry validation belongs with the alias codec. These parts
 can be composed without a concrete session store. Authorization and mutation
 remain inside each backend's existing atomic operation.
 
+`sessions/_memory_transcripts.py` owns memory transcript reads, search, initial
+and deferred-input publication, and attribution/search index maintenance. Operations
+receive typed state resolved after acquiring the store lock. Transcript writes
+compose checkpoint publication and private-alias registration inside that same
+lock scope. Creation, forks, deletion and runtime publication use the index
+functions within their existing atomic operations; the transcript owner does not
+import or receive the store implementation.
+
 Native session event queries, session listing/inspection, topology/lineage,
 child lifecycle reads, summaries and accounting reads live in
 `storage/_sqlite_session_queries.py` and `storage/_postgres_session_queries.py`.

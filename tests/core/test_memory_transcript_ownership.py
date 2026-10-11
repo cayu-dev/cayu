@@ -17,6 +17,7 @@ import cayu
 from cayu.messages import Message, MessageRole, ToolCallPart
 from cayu.sessions import _memory_transcripts as transcripts
 from cayu.sessions.records import Session
+from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.sessions.transcript_queries import TranscriptQuery, TranscriptSearchQuery
 
 
@@ -68,6 +69,7 @@ sys.meta_path.insert(0, RejectStores())
 owner = importlib.import_module("cayu.sessions._memory_transcripts")
 assert callable(owner.query_transcript)
 assert callable(owner.search_transcript)
+assert callable(owner.append_transcript_messages)
 """,
         ],
         env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
@@ -203,5 +205,218 @@ def test_transcript_search_cancellation_releases_independent_context():
             await pending
         assert not lock.locked()
         assert (await transcripts.load_transcript_snapshot(read, "session")).cursor == 300
+
+    asyncio.run(scenario())
+
+
+def _write_state(state, lock, calls):
+    checkpoints = {"session": {"value": {"count": 1}}}
+    now = datetime(2026, 2, 1, tzinfo=UTC)
+
+    def alias(value, *, field_name, scope_session_id=None):
+        assert lock.locked()
+        calls.append(("alias", value, field_name, scope_session_id))
+
+    def checkpoint(session_id, value):
+        assert lock.locked()
+        calls.append(("checkpoint", session_id))
+        checkpoints[session_id] = value
+
+    def receipts(session_id, value):
+        assert lock.locked()
+        calls.append(("receipts", session_id, value))
+
+    return transcripts.MemoryTranscriptWriteState(
+        indexes=state.indexes,
+        sessions=state.sessions,
+        deferred_interaction_inputs=state.deferred_interaction_inputs,
+        checkpoints=checkpoints,
+        session_closure_progress={},
+        participant_session_receipts={},
+        ownership_clock=lambda: now,
+        register_private_alias=alias,
+        store_checkpoint=checkpoint,
+        refresh_queued_receipts=receipts,
+    )
+
+
+def test_transcript_publication_composes_with_one_locked_write():
+    async def scenario():
+        state = _state()
+        lock = asyncio.Lock()
+        calls = []
+        writes = _write_state(state, lock, calls)
+        entrances = 0
+
+        @asynccontextmanager
+        async def write():
+            nonlocal entrances
+            async with lock:
+                entrances += 1
+                yield writes
+
+        def transform(session, checkpoint):
+            assert lock.locked()
+            assert session.id == "session"
+            assert state.indexes.messages["session"] == []
+            checkpoint["value"]["count"] += 1
+            return checkpoint
+
+        message = Message(
+            role="assistant",
+            content=[
+                ToolCallPart(
+                    tool_call_id="call",
+                    tool_name="tool",
+                    arguments={"nested": {"value": 1}},
+                )
+            ],
+        )
+        await transcripts.append_transcript_messages_and_transform_checkpoint(
+            write, "session", [message], transform, interaction_id="interaction"
+        )
+        assert entrances == 1 and not lock.locked()
+        assert writes.checkpoints["session"]["value"]["count"] == 2
+        assert calls == [
+            ("alias", "interaction", "interaction_id", "session"),
+            ("checkpoint", "session"),
+        ]
+        assert state.indexes.interaction_ids["session"] == ["interaction"]
+        assert state.sessions["session"].last_activity_at == writes.ownership_clock()
+        message.content[0].arguments["nested"]["value"] = 9
+        assert state.indexes.messages["session"][0].content[0].arguments["nested"]["value"] == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error_type", [ValueError, asyncio.CancelledError])
+def test_transcript_transform_failure_releases_context_before_mutation(error_type):
+    async def scenario():
+        state = _state()
+        lock = asyncio.Lock()
+        calls = []
+        writes = _write_state(state, lock, calls)
+        original_session = state.sessions["session"]
+
+        @asynccontextmanager
+        async def write():
+            async with lock:
+                yield writes
+
+        def transform(session, checkpoint):
+            session.labels["changed"] = "yes"
+            checkpoint["value"]["count"] = 99
+            raise error_type("stop publication")
+
+        with pytest.raises(error_type, match="stop publication"):
+            await transcripts.append_transcript_messages_and_transform_checkpoint(
+                write,
+                "session",
+                [Message.text("user", "unpublished")],
+                transform,
+                interaction_id="interaction",
+            )
+        assert not lock.locked() and calls == []
+        assert state.sessions["session"] == original_session
+        assert "changed" not in original_session.labels
+        assert writes.checkpoints["session"] == {"value": {"count": 1}}
+        assert state.indexes.messages["session"] == []
+        assert state.indexes.interaction_ids["session"] == []
+        assert state.indexes.search_postings == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("initial", [True, False])
+def test_deferred_transcript_publication_composes_without_store(initial):
+    async def scenario():
+        state = _state()
+        lock = asyncio.Lock()
+        calls = []
+        writes = _write_state(state, lock, calls)
+        writes.checkpoints.clear()
+        source = [Message.text("user", "Atlas input")]
+        replacement = [Message.text("system", "instructions"), *source]
+        state.deferred_interaction_inputs["session"] = DeferredInteractionInput(
+            interaction_id="interaction",
+            source_messages=source,
+            initial_transcript_messages=replacement if initial else None,
+        )
+
+        @asynccontextmanager
+        async def write():
+            async with lock:
+                yield writes
+
+        if initial:
+            await transcripts.replace_initial_transcript_messages(
+                write, "session", source, replacement, interaction_id="interaction"
+            )
+            assert state.indexes.messages["session"] == replacement
+            assert state.indexes.interaction_ids["session"] == [None, "interaction"]
+            assert calls[-1] == ("receipts", "session", None)
+        else:
+            with pytest.raises(RuntimeError, match="another interaction"):
+                await transcripts.materialize_deferred_interaction_input(
+                    write, "session", interaction_id="other"
+                )
+            assert state.indexes.messages["session"] == []
+            assert await transcripts.materialize_deferred_interaction_input(
+                write, "session", interaction_id="interaction"
+            )
+            assert not await transcripts.materialize_deferred_interaction_input(
+                write, "session", interaction_id="interaction"
+            )
+            assert state.indexes.messages["session"] == source
+            assert state.indexes.interaction_ids["session"] == ["interaction"]
+        assert "session" not in state.deferred_interaction_inputs
+
+        @asynccontextmanager
+        async def read():
+            async with lock:
+                yield state
+
+        found = await transcripts.search_transcript(
+            read, TranscriptSearchQuery(text="Atlas", session_ids=("session",))
+        )
+        assert [hit.transcript_index for hit in found.hits] == [1 if initial else 0]
+        assert not lock.locked()
+
+    asyncio.run(scenario())
+
+
+def test_transcript_write_view_observes_replacement_before_lock_acquisition():
+    from cayu.sessions.memory import InMemorySessionStore
+
+    async def scenario():
+        store = InMemorySessionStore()
+        state = _state()
+        old_messages = store._transcripts
+        await store._lock.acquire()
+        pending = asyncio.create_task(
+            store.append_transcript_messages(
+                "session", [Message.text("user", "current indexes")], interaction_id="interaction"
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not pending.done()
+            store._sessions = state.sessions
+            store._transcripts = state.indexes.messages
+            store._transcript_interaction_ids = state.indexes.interaction_ids
+        finally:
+            store._lock.release()
+        await pending
+        assert old_messages == {}
+        assert (await store.load_transcript_snapshot("session")).cursor == 1
+        assert [
+            hit.transcript_index
+            for hit in (
+                await store.search_transcript(
+                    TranscriptSearchQuery(text="current", session_ids=("session",))
+                )
+            ).hits
+        ] == [0]
+        assert state.indexes.interaction_ids["session"] == ["interaction"]
 
     asyncio.run(scenario())

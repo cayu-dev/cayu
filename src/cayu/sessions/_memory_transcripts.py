@@ -7,17 +7,31 @@ import heapq
 from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import NamedTuple
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.messages import Message, MessageRole, detach_message
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions import _checkpoint_publication as checkpoint_publication
+from cayu.sessions import _closure_records as closure_records
+from cayu.sessions import _invocation_scope as invocation_scope
+from cayu.sessions import transcript_input as session_transcript_input
 from cayu.sessions import transcript_queries as session_transcript_queries
+from cayu.sessions._invocation_scope import (
+    INHERIT_INTERACTION,
+    InteractionAttribution,
+    resolve_interaction_attribution,
+)
 from cayu.sessions.records import (
+    CheckpointTransform,
     Session,
     TranscriptRecord,
 )
 from cayu.sessions.transcript_input import (
     DeferredInteractionInput,
+    copy_transcript_messages,
+    require_deferred_initial_transcript_replacement,
 )
 from cayu.sessions.transcript_queries import (
     LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
@@ -38,6 +52,11 @@ from cayu.sessions.transcript_queries import (
     transcript_search_position_after_cursor,
     transcript_search_query_document,
 )
+
+if TYPE_CHECKING:
+    from cayu.sessions.context_views import (
+        ParticipantSessionCreationReceipt,
+    )
 
 
 class MemoryTranscriptIndexes(NamedTuple):
@@ -496,3 +515,238 @@ def replace_search_session(
     remove_search_session(indexes, session_id)
     indexes.search_documents[session_id] = []
     extend_search(indexes, session_id, messages)
+
+
+class RegisterPrivateAlias(Protocol):
+    """Register transcript interaction authority inside the current lock scope."""
+
+    def __call__(
+        self, private_value: str, *, field_name: str, scope_session_id: str | None = None
+    ) -> None: ...
+
+
+class MemoryTranscriptWriteState(NamedTuple):
+    """Transcript publication state and capabilities sharing one store lock.
+
+    Resolve every reference after locking. Checkpoint and alias capabilities
+    must operate in this same scope without acquiring the lock again.
+    """
+
+    indexes: MemoryTranscriptIndexes
+    sessions: dict[str, Session]
+    deferred_interaction_inputs: dict[str, DeferredInteractionInput]
+    checkpoints: dict[str, dict[str, Any]]
+    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    participant_session_receipts: dict[str, ParticipantSessionCreationReceipt]
+    ownership_clock: Callable[[], datetime]
+    register_private_alias: RegisterPrivateAlias
+    store_checkpoint: Callable[[str, dict[str, Any]], None]
+    refresh_queued_receipts: Callable[[str, dict[str, Any] | None], None]
+
+
+LockedTranscriptWrite = Callable[[], AbstractAsyncContextManager[MemoryTranscriptWriteState]]
+
+
+async def append_transcript_messages(
+    write: LockedTranscriptWrite,
+    session_id: str,
+    messages: list[Message],
+    *,
+    interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+) -> None:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+    copied_messages = copy_transcript_messages(messages)
+    async with write() as state:
+        session = state.sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        invocation_scope._assert_session_run_epoch(session_id, session)
+        if not copied_messages:
+            return
+        for owner in state.session_closure_progress.values():
+            closure_records._check_closure_lineage_owner(owner, (session_id,))
+        if interaction_id is not None:
+            state.register_private_alias(
+                interaction_id,
+                field_name="interaction_id",
+                scope_session_id=session_id,
+            )
+        state.indexes.messages[session_id].extend(copied_messages)
+        extend_search(state.indexes, session_id, copied_messages)
+        extend_attribution(state.indexes, session_id, [interaction_id] * len(copied_messages))
+        state.sessions[session_id] = session.model_copy(
+            update={"last_activity_at": state.ownership_clock()}
+        )
+
+
+async def replace_initial_transcript_messages(
+    write: LockedTranscriptWrite,
+    session_id: str,
+    expected_messages: list[Message],
+    replacement_messages: list[Message],
+    *,
+    interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    checkpoint_transform: CheckpointTransform | None = None,
+    runtime_suffix_count: int = 0,
+) -> None:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+    if interaction_id is None:
+        raise ValueError("Initial transcript publication requires an interaction identity.")
+    expected = copy_transcript_messages(expected_messages)
+    replacement = copy_transcript_messages(replacement_messages)
+    async with write() as state:
+        session = state.sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        invocation_scope._assert_session_run_epoch(session_id, session)
+        deferred = state.deferred_interaction_inputs.get(session_id)
+        if deferred is None or deferred.interaction_id != interaction_id:
+            raise RuntimeError("Deferred interaction input changed before finalization.")
+        for owner in state.session_closure_progress.values():
+            closure_records._check_closure_lineage_owner(owner, (session_id,))
+        require_deferred_initial_transcript_replacement(
+            deferred,
+            expected_messages=expected,
+            replacement_messages=replacement,
+        )
+        state.register_private_alias(
+            interaction_id,
+            field_name="interaction_id",
+            scope_session_id=session_id,
+        )
+        if state.indexes.messages.get(session_id):
+            from cayu.sessions._participant_execution_identity import (
+                require_initial_execution_input,
+            )
+
+            require_initial_execution_input(
+                session,
+                state.participant_session_receipts.get(session_id),
+                state.indexes.messages[session_id],
+                expected,
+            )
+        prefix_count = session_transcript_input._initial_transcript_prefix_count(
+            expected,
+            replacement,
+            runtime_suffix_count=runtime_suffix_count,
+        )
+        current_checkpoint = state.checkpoints.get(session_id)
+        if checkpoint_transform is not None:
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                checkpoint_preservation._copy_checkpoint_for_transform(
+                    current_checkpoint,
+                    session_id=session_id,
+                ),
+            )
+            if transformed is not None:
+                current_checkpoint = checkpoint_preservation._checkpoint_transform_result_preserving_completion_result_event_publications(
+                    current_checkpoint,
+                    transformed,
+                    session_id=session_id,
+                )
+        checkpoint = checkpoint_publication._checkpoint_after_initial_transcript_publication(
+            current_checkpoint,
+            interaction_id=interaction_id,
+        )
+        state.indexes.messages[session_id] = replacement
+        replace_latest_role_indexes(state.indexes, session_id)
+        replace_search_session(state.indexes, session_id, replacement)
+        state.indexes.interaction_ids[session_id] = [None] * prefix_count + [interaction_id] * (
+            len(expected) + runtime_suffix_count
+        )
+        state.indexes.indices_by_interaction.pop(session_id, None)
+        state.deferred_interaction_inputs.pop(session_id, None)
+        if checkpoint is None:
+            state.refresh_queued_receipts(session_id, None)
+            state.checkpoints.pop(session_id, None)
+        else:
+            state.store_checkpoint(session_id, checkpoint)
+        state.sessions[session_id] = session.model_copy(
+            update={"last_activity_at": state.ownership_clock()}
+        )
+
+
+async def materialize_deferred_interaction_input(
+    write: LockedTranscriptWrite,
+    session_id: str,
+    *,
+    interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+) -> bool:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+    async with write() as state:
+        session = state.sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        invocation_scope._assert_session_run_epoch(session_id, session)
+        deferred = state.deferred_interaction_inputs.get(session_id)
+        if deferred is None:
+            return False
+        if deferred.interaction_id != interaction_id:
+            raise RuntimeError("Deferred interaction input belongs to another interaction.")
+        for owner in state.session_closure_progress.values():
+            closure_records._check_closure_lineage_owner(owner, (session_id,))
+        messages = deferred.source_messages
+        state.indexes.messages[session_id].extend(messages)
+        extend_search(state.indexes, session_id, messages)
+        extend_attribution(
+            state.indexes,
+            session_id,
+            [interaction_id] * len(messages),
+        )
+        state.deferred_interaction_inputs.pop(session_id, None)
+        state.sessions[session_id] = session.model_copy(
+            update={"last_activity_at": state.ownership_clock()}
+        )
+        return True
+
+
+async def append_transcript_messages_and_transform_checkpoint(
+    write: LockedTranscriptWrite,
+    session_id: str,
+    messages: list[Message],
+    checkpoint_transform: CheckpointTransform,
+    *,
+    interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+) -> None:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+    copied_messages = copy_transcript_messages(messages)
+    if checkpoint_transform is None:
+        raise TypeError("checkpoint_transform is required.")
+    async with write() as state:
+        session = state.sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        invocation_scope._assert_session_run_epoch(session_id, session)
+        for owner in state.session_closure_progress.values():
+            closure_records._check_closure_lineage_owner(owner, (session_id,))
+        current = state.checkpoints.get(session_id)
+        transformed = checkpoint_transform(
+            session.model_copy(deep=True),
+            checkpoint_preservation._copy_checkpoint_for_transform(current, session_id=session_id),
+        )
+        if transformed is None:
+            raise ValueError("Checkpoint transform must return a checkpoint.")
+        copied_checkpoint = checkpoint_preservation._checkpoint_transform_result_preserving_completion_result_event_publications(
+            current,
+            transformed,
+            session_id=session_id,
+        )
+        if copied_messages:
+            if interaction_id is not None:
+                state.register_private_alias(
+                    interaction_id,
+                    field_name="interaction_id",
+                    scope_session_id=session_id,
+                )
+            state.indexes.messages[session_id].extend(copied_messages)
+            extend_search(state.indexes, session_id, copied_messages)
+            extend_attribution(state.indexes, session_id, [interaction_id] * len(copied_messages))
+        state.store_checkpoint(session_id, copied_checkpoint)
+        state.sessions[session_id] = session.model_copy(
+            update={"last_activity_at": state.ownership_clock()}
+        )
