@@ -1205,6 +1205,13 @@ the durable row decoders reused by export snapshots. Stores supply explicit
 read/write runners or connections, readiness and closure readers; memory
 contracts, recall policy and snapshot orchestration retain their existing owners.
 
+Native SQLite terminal-session evidence reads and export live in
+`storage/_sqlite_terminal_evidence.py`. The owner keeps eager reads, runner-owned
+interruption proofs and streamed export inside the native snapshot and resource
+lifetime, composed with an explicit read runner. Shared evidence classification
+and bounded spool backing retain their existing owners; hydration limits and
+cancellation cleanup stay with the native read operation.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and

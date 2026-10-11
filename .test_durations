@@ -1,4 +1,8 @@
 {
+  "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_evidence_imports_without_adapters_or_driver": 0.99,
+  "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_evidence_composes_and_releases_failed_snapshots[RuntimeError]": 0.187,
+  "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_evidence_composes_and_releases_failed_snapshots[CancelledError]": 0.177,
+  "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_export_cancellation_waits_for_native_reader": 0.174,
   "tests/core/test_postgres_memory_evidence_ownership.py::test_postgres_memory_evidence_imports_without_adapters_or_driver": 0.923,
   "tests/core/test_postgres_memory_evidence_ownership.py::test_postgres_memory_evidence_composes_with_native_connection[RuntimeError]": 1.399,
   "tests/core/test_postgres_memory_evidence_ownership.py::test_postgres_memory_evidence_composes_with_native_connection[CancelledError]": 0.546,
