@@ -16,6 +16,8 @@
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[RuntimeError]": 0.166,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[CancelledError]": 0.204,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_cancellation_retains_writer_until_commit": 0.201,
+  "tests/core/test_session_delivery_rules_layout.py::test_completion_event_reservations_compose_without_stores": 0.6095200409763493,
+  "tests/core/test_session_delivery_rules_layout.py::test_first_event_delivery_validates_exact_unclaimed_attempt_without_stores": 0.11914887599414214,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime-inspect_provider_operation-session_store-cayu.sessions.base-SessionStore]": 0.02617462503258139,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime._model_failover_stage-ModelFailoverStageAdmission-invocation_context-cayu.runtime._invocation_lifecycle-InvocationContext]": 0.16546170803485438,
   "tests/core/test_model_stage_rules_layout.py::test_model_terminalization_plan_checks_exact_live_ownership_without_stores": 1.2019811679492705,

@@ -35,7 +35,7 @@ from cayu.sessions._invocation_scope import (
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
 )
-from cayu.sessions.base import SessionStore, _copy_pending_first_event_delivery
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_delivery import (
     PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS as _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS,
 )
@@ -44,6 +44,7 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    _copy_pending_first_event_delivery,
     portable_persisted_event_side_effect_error,
 )
 from cayu.sessions.event_queries import EventQuery

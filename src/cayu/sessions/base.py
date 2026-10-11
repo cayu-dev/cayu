@@ -48,6 +48,7 @@ from cayu.sessions import _tool_round_publication_rules as tool_publication_rule
 from cayu.sessions import _user_input_publication as user_input_publication_rules
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import creation_fence
+from cayu.sessions import event_delivery as event_delivery_rules
 from cayu.sessions import event_delivery as session_event_rules
 from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions import event_queries as event_query_rules
@@ -1146,7 +1147,6 @@ from cayu.sessions.authority import (
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
-    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.invocation import SessionExecutionSource as SessionExecutionSource
@@ -1432,238 +1432,6 @@ SessionOperationInitializer = Callable[
 ]
 
 
-def _prune_expired_completion_result_event_publication_owners(
-    reservations: dict[str, dict[str, Any]],
-    *,
-    now: datetime,
-) -> None:
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("Completion-result event publication time must be timezone-aware.")
-    normalized_now = now.astimezone(UTC)
-    for publication_id in tuple(reservations):
-        owners = reservations[publication_id]["owners"]
-        for owner_id in tuple(owners):
-            expires_at = checkpoint_preservation._completion_result_event_publication_owner_expiry(
-                owners[owner_id]["expires_at"]
-            )
-            if expires_at <= normalized_now:
-                del owners[owner_id]
-        if not owners:
-            del reservations[publication_id]
-
-
-def _reserve_completion_result_event_publication(
-    checkpoint: dict[str, Any] | None,
-    *,
-    publication_id: str,
-    authority_sha256: str,
-    owner_id: str,
-    owner_expires_at: datetime,
-    now: datetime,
-) -> dict[str, Any]:
-    publication_id = require_clean_nonblank(publication_id, "publication_id")
-    if len(publication_id) > 256:
-        raise ValueError("publication_id cannot exceed 256 characters.")
-    if (
-        type(authority_sha256) is not str
-        or len(authority_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in authority_sha256)
-    ):
-        raise ValueError("authority_sha256 must be a lowercase SHA-256 digest.")
-    if (
-        publication_id
-        != f"{checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX}{authority_sha256}"
-    ):
-        raise ValueError("publication_id does not match its authority digest.")
-    if not checkpoint_preservation._is_completion_result_event_publication_owner_id(owner_id):
-        raise ValueError("owner_id is not a completion-result publication owner identity.")
-    if owner_expires_at.tzinfo is None or owner_expires_at.utcoffset() is None:
-        raise ValueError("owner_expires_at must be timezone-aware.")
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("now must be timezone-aware.")
-    normalized_expiry = owner_expires_at.astimezone(UTC)
-    normalized_now = now.astimezone(UTC)
-    if normalized_expiry <= normalized_now:
-        raise ValueError("owner_expires_at must be later than now.")
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    reservations = checkpoint_preservation._completion_result_event_publication_reservations(
-        updated
-    )
-    _prune_expired_completion_result_event_publication_owners(
-        reservations,
-        now=normalized_now,
-    )
-    requested: dict[str, Any] = {
-        "schema_version": checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
-        "publication_id": publication_id,
-        "authority_sha256": authority_sha256,
-        "owners": {},
-    }
-    existing = reservations.get(publication_id)
-    if existing is not None and any(
-        existing.get(key) != requested[key]
-        for key in ("schema_version", "publication_id", "authority_sha256")
-    ):
-        raise ValueError("Completion-result event publication identity conflicts.")
-    if existing is None:
-        if len(reservations) >= checkpoint_preservation._MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS:
-            raise ValueError("Completion-result event publication capacity is exhausted.")
-        reservations[publication_id] = requested
-        existing = requested
-    owners = existing.get("owners")
-    if type(owners) is not dict:
-        raise ValueError("Completion-result event publication reservation is malformed.")
-    if (
-        owner_id not in owners
-        and len(owners) >= checkpoint_preservation._MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS
-    ):
-        raise ValueError("Completion-result event publication capacity is exhausted.")
-    owners[owner_id] = {
-        "schema_version": checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
-        "owner_id": owner_id,
-        "expires_at": normalized_expiry.isoformat(),
-    }
-    updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
-        "schema_version": checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
-        "reservations": reservations,
-    }
-    return updated
-
-
-def _release_completion_result_event_publication(
-    checkpoint: dict[str, Any] | None,
-    *,
-    publication_id: str,
-    authority_sha256: str,
-    owner_id: str,
-    require_present: bool,
-    now: datetime,
-) -> dict[str, Any]:
-    if type(require_present) is not bool:
-        raise TypeError("require_present must be a boolean.")
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    reservations = checkpoint_preservation._completion_result_event_publication_reservations(
-        updated
-    )
-    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
-    existing = reservations.get(publication_id)
-    if existing is None:
-        if require_present:
-            raise ValueError("Completion-result event publication reservation is missing.")
-        return updated
-    if existing.get("authority_sha256") != authority_sha256:
-        raise ValueError("Completion-result event publication identity conflicts.")
-    owners = existing["owners"]
-    if owner_id not in owners:
-        if require_present:
-            raise ValueError("Completion-result event publication owner is missing.")
-        return updated
-    del owners[owner_id]
-    if not owners:
-        del reservations[publication_id]
-    if reservations:
-        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
-            "schema_version": checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
-            "reservations": reservations,
-        }
-    else:
-        updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
-    return updated
-
-
-def _renew_completion_result_event_publication(
-    checkpoint: dict[str, Any] | None,
-    *,
-    publication_id: str,
-    authority_sha256: str,
-    owner_id: str,
-    owner_expires_at: datetime,
-    now: datetime,
-) -> dict[str, Any]:
-    if owner_expires_at.tzinfo is None or owner_expires_at.utcoffset() is None:
-        raise ValueError("owner_expires_at must be timezone-aware.")
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("now must be timezone-aware.")
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    reservations = checkpoint_preservation._completion_result_event_publication_reservations(
-        updated
-    )
-    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
-    existing = reservations.get(publication_id)
-    if existing is None or existing.get("authority_sha256") != authority_sha256:
-        raise ValueError("Completion-result event publication reservation is missing.")
-    owners = existing["owners"]
-    if owner_id not in owners:
-        raise ValueError("Completion-result event publication owner is missing.")
-    normalized_expiry = owner_expires_at.astimezone(UTC)
-    if normalized_expiry <= now.astimezone(UTC):
-        raise ValueError("owner_expires_at must be later than now.")
-    owners[owner_id]["expires_at"] = normalized_expiry.isoformat()
-    updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
-        "schema_version": checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
-        "reservations": reservations,
-    }
-    return updated
-
-
-def _complete_completion_result_event_publication(
-    checkpoint: dict[str, Any] | None,
-    *,
-    publication_id: str,
-    authority_sha256: str,
-    owner_id: str,
-    require_present: bool,
-    now: datetime,
-) -> dict[str, Any]:
-    if type(require_present) is not bool:
-        raise TypeError("require_present must be a boolean.")
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    reservations = checkpoint_preservation._completion_result_event_publication_reservations(
-        updated
-    )
-    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
-    existing = reservations.get(publication_id)
-    if existing is None:
-        if require_present:
-            raise ValueError("Completion-result event publication reservation is missing.")
-        return updated
-    if existing.get("authority_sha256") != authority_sha256:
-        raise ValueError("Completion-result event publication identity conflicts.")
-    owners = existing["owners"]
-    if owner_id not in owners:
-        if require_present:
-            raise ValueError("Completion-result event publication owner is missing.")
-        return updated
-    del owners[owner_id]
-    if not owners:
-        del reservations[publication_id]
-    if reservations:
-        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
-            "schema_version": checkpoint_preservation._COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
-            "reservations": reservations,
-        }
-    else:
-        updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
-    return updated
-
-
-def _completion_result_event_publication_delete_block_reason(
-    checkpoint: dict[str, Any] | None,
-    *,
-    now: datetime,
-) -> str | None:
-    reservations = checkpoint_preservation._completion_result_event_publication_reservations(
-        checkpoint
-    )
-    _prune_expired_completion_result_event_publication_owners(
-        reservations,
-        now=now,
-    )
-    if not reservations:
-        return None
-    return "completion-result event publication is incomplete"
-
-
 ForkCheckpointAuthorityDecoder = Callable[
     [dict[str, Any] | None],
     dict[str, Any] | None,
@@ -1762,43 +1530,6 @@ class QueuedDispatchTerminalReceiptQuery(BaseModel):
         if (self.after_session_id is None) != (self.after_operation_id is None):
             raise ValueError("Queued dispatch receipt cursor fields must be supplied together.")
         return self
-
-
-def _copy_pending_first_event_delivery(
-    expected: PersistedEventSideEffectDelivery,
-) -> PersistedEventSideEffectDelivery:
-    if type(expected) is not PersistedEventSideEffectDelivery:
-        raise TypeError("Expected a persisted event delivery.")
-    copied = PersistedEventSideEffectDelivery.model_validate(
-        expected.model_dump(mode="python", warnings=False)
-    )
-    if (
-        copied.status is not PersistedEventSideEffectStatus.PENDING
-        or copied.attempts != 0
-        or copied.claim_id is not None
-        or copied.lease_expires_at is not None
-    ):
-        raise ValueError("First delivery requires an unclaimed pending event.")
-    return copied
-
-
-def _copy_failed_first_delivery_retirement(
-    expected: PersistedEventSideEffectDelivery,
-) -> PersistedEventSideEffectDelivery:
-    """Only an exact returned first callback may be retired without dispatch."""
-    if type(expected) is not PersistedEventSideEffectDelivery:
-        raise TypeError("Expected a persisted event delivery.")
-    copied = PersistedEventSideEffectDelivery.model_validate(
-        expected.model_dump(mode="python", warnings=False)
-    )
-    if (
-        copied.status is not PersistedEventSideEffectStatus.FAILED
-        or copied.attempts != 1
-        or copied.claim_id is not None
-        or copied.lease_expires_at is not None
-    ):
-        raise ValueError("Retirement requires an unclaimed failed first delivery.")
-    return copied
 
 
 def _public_authority_alias_store_key(
@@ -3481,7 +3212,7 @@ class SessionStore(ABC):
         Never take over a lease or retry a failed delivery. Return None when
         unsupported or when any expected field changed; callers must reread.
         """
-        _copy_pending_first_event_delivery(expected)
+        event_delivery_rules._copy_pending_first_event_delivery(expected)
         return None
 
     async def retire_failed_first_event_delivery(
@@ -3493,7 +3224,7 @@ class SessionStore(ABC):
         wins or retirement wins, never both. Return None on conflict or when
         unsupported; that absence is not proof of callback settlement.
         """
-        _copy_failed_first_delivery_retirement(expected)
+        event_delivery_rules._copy_failed_first_delivery_retirement(expected)
         return None
 
     @abstractmethod
@@ -10938,7 +10669,7 @@ class InMemorySessionStore(
                 f"{active_operation_id} is active: {session_id}"
             )
         completion_result_publication_block = (
-            _completion_result_event_publication_delete_block_reason(
+            checkpoint_preservation._completion_result_event_publication_delete_block_reason(
                 checkpoint,
                 now=deletion_now,
             )
@@ -11514,7 +11245,7 @@ class InMemorySessionStore(
                 tool_capability_ceiling
             )
         )
-        expected_latest_interaction_event_id = _copy_optional_event_id(
+        expected_latest_interaction_event_id = event_delivery_rules._copy_optional_event_id(
             expected_latest_interaction_event_id,
             "expected_latest_interaction_event_id",
         )
@@ -13174,7 +12905,7 @@ class InMemorySessionStore(
     async def claim_first_persisted_event_side_effect(
         self, expected: PersistedEventSideEffectDelivery
     ) -> PersistedEventSideEffectClaim | None:
-        expected = _copy_pending_first_event_delivery(expected)
+        expected = event_delivery_rules._copy_pending_first_event_delivery(expected)
         return await self._claim_persisted_event_side_effect(
             session_id=expected.session_id, event_id=expected.event_id, expected=expected
         )
@@ -13286,7 +13017,7 @@ class InMemorySessionStore(
     async def retire_failed_first_event_delivery(
         self, expected: PersistedEventSideEffectDelivery
     ) -> PersistedEventSideEffectDelivery | None:
-        expected = _copy_failed_first_delivery_retirement(expected)
+        expected = event_delivery_rules._copy_failed_first_delivery_retirement(expected)
         key = (expected.session_id, expected.event_id)
         async with self._lock:
             if self._persisted_event_side_effect_deliveries.get(key) != expected:
@@ -18836,17 +18567,6 @@ class InMemorySessionStore(
                 else checkpoint["pending_interruption_cascade"]
             )
             return _project_interruption_cascade_marker(marker)
-
-
-def _copy_optional_event_id(value: str | None, field_name: str) -> str | None:
-    """Defensively validate an optional exact durable event identity."""
-
-    if value is None:
-        return None
-    copied = require_clean_nonblank(value, field_name)
-    if len(copied) > EVENT_ID_MAX_CHARS:
-        raise ValueError(f"{field_name} exceeds the event-id limit.")
-    return copied
 
 
 def _audit_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | None:

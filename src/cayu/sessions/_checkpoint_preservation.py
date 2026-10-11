@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_durable_json_object
+from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_visible,
     project_browser_control_checkpoint,
@@ -431,3 +432,219 @@ def _checkpoint_transform_result_preserving_completion_result_event_publications
         copy_durable_json_object(transformed, "checkpoint"),
         session_id=session_id,
     )
+
+
+def _prune_expired_completion_result_event_publication_owners(
+    reservations: dict[str, dict[str, Any]],
+    *,
+    now: datetime,
+) -> None:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Completion-result event publication time must be timezone-aware.")
+    normalized_now = now.astimezone(UTC)
+    for publication_id in tuple(reservations):
+        owners = reservations[publication_id]["owners"]
+        for owner_id in tuple(owners):
+            expires_at = _completion_result_event_publication_owner_expiry(
+                owners[owner_id]["expires_at"]
+            )
+            if expires_at <= normalized_now:
+                del owners[owner_id]
+        if not owners:
+            del reservations[publication_id]
+
+
+def _reserve_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    owner_expires_at: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    publication_id = require_clean_nonblank(publication_id, "publication_id")
+    if len(publication_id) > 256:
+        raise ValueError("publication_id cannot exceed 256 characters.")
+    if (
+        type(authority_sha256) is not str
+        or len(authority_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in authority_sha256)
+    ):
+        raise ValueError("authority_sha256 must be a lowercase SHA-256 digest.")
+    if publication_id != f"{_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX}{authority_sha256}":
+        raise ValueError("publication_id does not match its authority digest.")
+    if not _is_completion_result_event_publication_owner_id(owner_id):
+        raise ValueError("owner_id is not a completion-result publication owner identity.")
+    if owner_expires_at.tzinfo is None or owner_expires_at.utcoffset() is None:
+        raise ValueError("owner_expires_at must be timezone-aware.")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    normalized_expiry = owner_expires_at.astimezone(UTC)
+    normalized_now = now.astimezone(UTC)
+    if normalized_expiry <= normalized_now:
+        raise ValueError("owner_expires_at must be later than now.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(
+        reservations,
+        now=normalized_now,
+    )
+    requested: dict[str, Any] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "publication_id": publication_id,
+        "authority_sha256": authority_sha256,
+        "owners": {},
+    }
+    existing = reservations.get(publication_id)
+    if existing is not None and any(
+        existing.get(key) != requested[key]
+        for key in ("schema_version", "publication_id", "authority_sha256")
+    ):
+        raise ValueError("Completion-result event publication identity conflicts.")
+    if existing is None:
+        if len(reservations) >= _MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS:
+            raise ValueError("Completion-result event publication capacity is exhausted.")
+        reservations[publication_id] = requested
+        existing = requested
+    owners = existing.get("owners")
+    if type(owners) is not dict:
+        raise ValueError("Completion-result event publication reservation is malformed.")
+    if owner_id not in owners and len(owners) >= _MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS:
+        raise ValueError("Completion-result event publication capacity is exhausted.")
+    owners[owner_id] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "owner_id": owner_id,
+        "expires_at": normalized_expiry.isoformat(),
+    }
+    updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "reservations": reservations,
+    }
+    return updated
+
+
+def _release_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    require_present: bool,
+    now: datetime,
+) -> dict[str, Any]:
+    if type(require_present) is not bool:
+        raise TypeError("require_present must be a boolean.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
+    existing = reservations.get(publication_id)
+    if existing is None:
+        if require_present:
+            raise ValueError("Completion-result event publication reservation is missing.")
+        return updated
+    if existing.get("authority_sha256") != authority_sha256:
+        raise ValueError("Completion-result event publication identity conflicts.")
+    owners = existing["owners"]
+    if owner_id not in owners:
+        if require_present:
+            raise ValueError("Completion-result event publication owner is missing.")
+        return updated
+    del owners[owner_id]
+    if not owners:
+        del reservations[publication_id]
+    if reservations:
+        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+            "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+            "reservations": reservations,
+        }
+    else:
+        updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
+    return updated
+
+
+def _renew_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    owner_expires_at: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    if owner_expires_at.tzinfo is None or owner_expires_at.utcoffset() is None:
+        raise ValueError("owner_expires_at must be timezone-aware.")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
+    existing = reservations.get(publication_id)
+    if existing is None or existing.get("authority_sha256") != authority_sha256:
+        raise ValueError("Completion-result event publication reservation is missing.")
+    owners = existing["owners"]
+    if owner_id not in owners:
+        raise ValueError("Completion-result event publication owner is missing.")
+    normalized_expiry = owner_expires_at.astimezone(UTC)
+    if normalized_expiry <= now.astimezone(UTC):
+        raise ValueError("owner_expires_at must be later than now.")
+    owners[owner_id]["expires_at"] = normalized_expiry.isoformat()
+    updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "reservations": reservations,
+    }
+    return updated
+
+
+def _complete_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    require_present: bool,
+    now: datetime,
+) -> dict[str, Any]:
+    if type(require_present) is not bool:
+        raise TypeError("require_present must be a boolean.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
+    existing = reservations.get(publication_id)
+    if existing is None:
+        if require_present:
+            raise ValueError("Completion-result event publication reservation is missing.")
+        return updated
+    if existing.get("authority_sha256") != authority_sha256:
+        raise ValueError("Completion-result event publication identity conflicts.")
+    owners = existing["owners"]
+    if owner_id not in owners:
+        if require_present:
+            raise ValueError("Completion-result event publication owner is missing.")
+        return updated
+    del owners[owner_id]
+    if not owners:
+        del reservations[publication_id]
+    if reservations:
+        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+            "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+            "reservations": reservations,
+        }
+    else:
+        updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
+    return updated
+
+
+def _completion_result_event_publication_delete_block_reason(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> str | None:
+    reservations = _completion_result_event_publication_reservations(checkpoint)
+    _prune_expired_completion_result_event_publication_owners(
+        reservations,
+        now=now,
+    )
+    if not reservations:
+        return None
+    return "completion-result event publication is incomplete"

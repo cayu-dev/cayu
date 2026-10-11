@@ -154,6 +154,7 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
@@ -330,8 +331,6 @@ from cayu.sessions.base import (
     _apply_queue_completion_checkpoint_mutation,
     _child_session_notification_consumption_record,
     _child_session_notification_consumption_replays,
-    _completion_result_event_publication_delete_block_reason,
-    _copy_optional_event_id,
     _durable_subagent_parent_delete_block_reason,
     _prepare_queue_completion_checkpoint_mutation,
     _project_interruption_cascade_marker_fields,
@@ -345,6 +344,7 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    _copy_optional_event_id,
     _copy_session_event_batch,
     restore_persisted_event_authority,
 )

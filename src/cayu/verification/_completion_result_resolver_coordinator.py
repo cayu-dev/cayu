@@ -37,13 +37,13 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.sessions.base import (
-    SessionStore,
+from cayu.sessions._checkpoint_preservation import (
     _complete_completion_result_event_publication,
     _release_completion_result_event_publication,
     _renew_completion_result_event_publication,
     _reserve_completion_result_event_publication,
 )
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
 from cayu.tasks.contracts import (
     CompletionDecision,

@@ -16,10 +16,6 @@ from uuid import uuid4
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
 from cayu.sessions import event_delivery as side_effect_health
-from cayu.sessions.base import (
-    _copy_failed_first_delivery_retirement,
-    _copy_pending_first_event_delivery,
-)
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectClaimLost,
@@ -28,6 +24,8 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
     PersistedEventSideEffectStatus,
+    _copy_failed_first_delivery_retirement,
+    _copy_pending_first_event_delivery,
     _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     validate_persisted_event_side_effect_error,

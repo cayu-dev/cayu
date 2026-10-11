@@ -15,11 +15,15 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, copy_durable_json_object
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
+)
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu._validation import require_durable_nonblank as require_nonblank
 from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
 from cayu.events import (
+    EVENT_ID_MAX_CHARS,
     Event,
     EventType,
     copy_event,
@@ -592,3 +596,51 @@ def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str
         seen_event_ids.add(copied_event.id)
         copied_events.append(copied_event)
     return session_id, copied_events
+
+
+def _copy_pending_first_event_delivery(
+    expected: PersistedEventSideEffectDelivery,
+) -> PersistedEventSideEffectDelivery:
+    if type(expected) is not PersistedEventSideEffectDelivery:
+        raise TypeError("Expected a persisted event delivery.")
+    copied = PersistedEventSideEffectDelivery.model_validate(
+        expected.model_dump(mode="python", warnings=False)
+    )
+    if (
+        copied.status is not PersistedEventSideEffectStatus.PENDING
+        or copied.attempts != 0
+        or copied.claim_id is not None
+        or copied.lease_expires_at is not None
+    ):
+        raise ValueError("First delivery requires an unclaimed pending event.")
+    return copied
+
+
+def _copy_failed_first_delivery_retirement(
+    expected: PersistedEventSideEffectDelivery,
+) -> PersistedEventSideEffectDelivery:
+    """Only an exact returned first callback may be retired without dispatch."""
+    if type(expected) is not PersistedEventSideEffectDelivery:
+        raise TypeError("Expected a persisted event delivery.")
+    copied = PersistedEventSideEffectDelivery.model_validate(
+        expected.model_dump(mode="python", warnings=False)
+    )
+    if (
+        copied.status is not PersistedEventSideEffectStatus.FAILED
+        or copied.attempts != 1
+        or copied.claim_id is not None
+        or copied.lease_expires_at is not None
+    ):
+        raise ValueError("Retirement requires an unclaimed failed first delivery.")
+    return copied
+
+
+def _copy_optional_event_id(value: str | None, field_name: str) -> str | None:
+    """Defensively validate an optional exact durable event identity."""
+
+    if value is None:
+        return None
+    copied = require_clean_nonblank(value, field_name)
+    if len(copied) > EVENT_ID_MAX_CHARS:
+        raise ValueError(f"{field_name} exceeds the event-id limit.")
+    return copied

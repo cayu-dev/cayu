@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-import cayu.sessions.base as sessions_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.events import Event
 from cayu.messages import Message
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventQuery
@@ -240,7 +240,7 @@ async def assert_session_store_time_conformance(
 
     def reserve_completion_publication(_session, checkpoint, observed_at):
         observed_completion_publication_times.append(observed_at)
-        return sessions_module._reserve_completion_result_event_publication(
+        return checkpoint_preservation._reserve_completion_result_event_publication(
             checkpoint,
             publication_id=publication_id,
             authority_sha256=publication_digest,
@@ -269,7 +269,7 @@ async def assert_session_store_time_conformance(
         await store._publish_completion_result_event_publication(
             completion_publication_session_id,
             checkpoint_transform=lambda _session, checkpoint, observed_at: (
-                sessions_module._complete_completion_result_event_publication(
+                checkpoint_preservation._complete_completion_result_event_publication(
                     checkpoint,
                     publication_id=publication_id,
                     authority_sha256=publication_digest,

@@ -275,6 +275,7 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._checkpoint_preservation import _reserve_completion_result_event_publication
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
@@ -285,7 +286,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     _checkpoint_with_session_run_operation,
-    _reserve_completion_result_event_publication,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
