@@ -36,6 +36,7 @@ from cayu.runtime._interruption_coordinator import (
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
 )
+from cayu.runtime._manual_model_completion_recovery import ManualModelCompletionRecovery
 from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
     model_completion_recovery_context_from_stage,
@@ -161,6 +162,7 @@ class SessionRecovery:
         *,
         session_store: SessionStore,
         engine: SessionEngine,
+        manual_model_completion_recovery: ManualModelCompletionRecovery,
         session_tasks: SessionTaskLifecycle,
         recovery_coordinator: RecoveryCoordinator,
         incomplete_recovery: IncompleteSessionRecovery,
@@ -180,6 +182,7 @@ class SessionRecovery:
     ) -> None:
         self.session_store = session_store
         self._engine = engine
+        self._manual_model_completion_recovery = manual_model_completion_recovery
         self._session_tasks = session_tasks
         self._recovery_coordinator = recovery_coordinator
         self._incomplete_recovery = incomplete_recovery
@@ -583,7 +586,7 @@ class SessionRecovery:
                 return ()
         except ProviderOperationEvidenceError:
             return ()
-        result = await self._engine.recover_model_completion_stage(
+        result = await self._manual_model_completion_recovery.recover_model_completion_stage(
             ModelCompletionManualRecoveryRequest(
                 session_id=session.id,
                 stage_id=stage.stage_id,

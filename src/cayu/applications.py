@@ -409,6 +409,7 @@ from cayu.runtime._isolated_tool_process import (
     wait_for_retained_isolated_tool_cleanups,
 )
 from cayu.runtime._local_execution_attempt_owner import retained_local_execution_tasks
+from cayu.runtime._manual_model_completion_recovery import ManualModelCompletionRecovery
 from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import ModelPolicy
 from cayu.runtime._model_step_executor import (
@@ -455,6 +456,7 @@ from cayu.runtime._session_preparation import SessionPreparation
 from cayu.runtime._session_recovery import SessionRecovery
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
 from cayu.runtime._session_task_lifecycle import SessionTaskLifecycle
+from cayu.runtime._task_execution_admission import verifier_aware_task_execution_outcome
 from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
     task_store_completion_evaluation_capability_is_complete,
@@ -1345,6 +1347,7 @@ class CayuApp:
             if not isinstance(getattr(closure_store, "store_id", None), str):
                 raise TypeError("session_closure_stores must expose a string store_id.")
         self.task_store = task_store
+        self._recovery_task_store = task_store
         self.knowledge_store = knowledge_store
         owned_store_ids = list(closure_stores)
         if self.task_store is not None:
@@ -1687,6 +1690,21 @@ class CayuApp:
             close_interrupted_round=self._pending_tool_round_recovery.close_interrupted_tool_round,
         )
 
+        self._manual_model_completion_recovery = ManualModelCompletionRecovery(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            run_limit_controller=self._run_limit_controller,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            get_budget_policy=lambda: self.budget_policy,
+            execution_profile_continuation=self._execution_profile_continuation,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            environment_lifecycle=self._environment_lifecycle,
+            recovery_ownership=self._recovery_ownership,
+        )
+
         self._model_completion_recovery = ModelCompletionRecovery(
             session_store=self._runtime_session_store,
             event_writer=self._event_writer,
@@ -1978,6 +1996,7 @@ class CayuApp:
         )
 
         self._session_recovery = SessionRecovery(
+            manual_model_completion_recovery=self._manual_model_completion_recovery,
             session_tasks=self._session_tasks,
             session_store=self._runtime_session_store,
             engine=self._session_engine,
@@ -7728,7 +7747,7 @@ class CayuApp:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
-        return await self._session_engine.recover_model_completion_stage(request)
+        return await self._manual_model_completion_recovery.recover_model_completion_stage(request)
 
     @_admitted_entrance
     async def _recover_incomplete_session_private(
@@ -9002,8 +9021,10 @@ class CayuApp:
         task_id: str | None = None,
         admit_session: bool = True,
     ) -> tuple[bool, BaseException | None]:
-        return await self._session_engine.verifier_aware_task_execution_outcome(
+        return await verifier_aware_task_execution_outcome(
             task_id,
+            task_store=self._recovery_task_store,
+            redactor=self._secret_redactor,
             session_id=session_id,
             admit_session=admit_session,
         )

@@ -5,16 +5,11 @@ Executable registrations never enter this path. Unknown dependent work blocks it
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import UTC, datetime
-from hashlib import sha256
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from cayu._validation import canonical_durable_json_bytes
-from cayu.events import Event, EventType, event_with_runtime_envelope_authority
 from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
     model_completion_recovery_context_from_stage,
@@ -24,32 +19,17 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions._invocation_terminal_decision import (
-    InvocationTerminalDecision,
-    InvocationTerminalOutcome,
-    build_invocation_terminal_decision,
-    checkpoint_with_invocation_terminal_decision,
-    invocation_terminal_decision_from_checkpoint,
-    invocation_terminal_event_id,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.sessions._model_stage import (
     ActiveModelCompletionStage,
-    ModelCompletionManualRecoveryRequest,
-    ModelCompletionManualRecoveryResult,
 )
 from cayu.sessions._model_stage_rules import (
     _validate_model_completion_stage_dispatch,
-    require_terminalization_plan_owner,
 )
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
-
-if TYPE_CHECKING:
-    from cayu.runtime._session_engine import SessionEngine
 
 _PLAN_OWNER: ContextVar[DurableOperationOwnership | None] = ContextVar(
     "model_terminalization_plan_owner", default=None
@@ -69,7 +49,6 @@ def terminalization_plan_owner() -> DurableOperationOwnership | None:
     return _PLAN_OWNER.get()
 
 
-_TERMINALIZATION_DEADLINE_SECONDS = 30
 _ALLOWED_KEYS = {
     "checkpoint_schema_version",
     "active_invocation_execution_profile",
@@ -149,251 +128,3 @@ async def inspect_terminalization(
         )
     _validate_model_completion_stage_dispatch(dispatch, stage)
     return active
-
-
-async def terminalize_dispatched_model(
-    engine: SessionEngine, request: ModelCompletionManualRecoveryRequest
-) -> ModelCompletionManualRecoveryResult:
-    store = engine.session_store
-    plan_owner = terminalization_plan_owner()
-    session = await store.load(request.session_id)
-    if session is None:
-        raise KeyError("Session not found.")
-    if session.instance_id != request.expected_session_instance_id:
-        raise SessionRunFenced(
-            "Model terminalization request belongs to another session incarnation."
-        )
-    checkpoint = await store.load_checkpoint(session.id)
-    # Claim epochs and inactivity bounds describe admission of an attempt, not
-    # the operator's disposition of this exact stage. Replanning after a failed
-    # publication must retain the elected decision across a new recovery epoch.
-    request_digest = sha256(
-        canonical_durable_json_bytes(
-            request.model_dump(mode="json", exclude={"expected_run_epoch", "inactive_for_seconds"}),
-            "model terminalization",
-        )
-    ).hexdigest()
-    source_id = "model-recovery:" + request_digest
-    elected = invocation_terminal_decision_from_checkpoint(checkpoint)
-    settled_decision = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
-    previous = elected or settled_decision
-    matching_decision = previous is not None and (
-        (previous.model_recovery_id or previous.interruption_request_id) == source_id
-        and previous.session_instance_id == session.instance_id
-        and previous.session_id == session.id
-    )
-    if elected is not None and not matching_decision:
-        raise SessionRunFenced("Another model terminalization decision owns this invocation.")
-    if request.expected_run_epoch > session.run_epoch or (
-        not matching_decision and session.run_epoch != request.expected_run_epoch
-    ):
-        raise SessionRunFenced("Model terminalization request has a stale run epoch.")
-    prior = await store.load_model_completion_stage_settlement(session.id, request.stage_id)
-    if prior is not None:
-        if (
-            not matching_decision
-            or session.status is not request.terminal_status
-            or session.run_epoch not in {prior.settlement_run_epoch, prior.settlement_run_epoch + 1}
-        ):
-            raise SessionRunFenced("Model terminalization replay conflicts with durable state.")
-        # Paired terminal evidence and exact release are authenticated by the
-        # existing invocation cleanup boundary, including commit-before-ack.
-        from cayu.sessions._invocation_lifecycle import (
-            require_released_invocation_command_authority,
-        )
-        from cayu.sessions._invocation_scope import _activate_owned_session_run_fence
-
-        if session.run_epoch == prior.settlement_run_epoch:
-            owner = _activate_owned_session_run_fence(session)
-            try:
-                await engine._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                    session_id=session.id
-                )
-            finally:
-                owner.retire()
-            session = await store.load(request.session_id)
-            if session is None:
-                raise SessionRunFenced("Model terminalization session disappeared during release.")
-            checkpoint = await store.load_checkpoint(session.id)
-        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        if profile is None:
-            raise SessionRunFenced("Model terminalization replay lost its released profile.")
-        require_released_invocation_command_authority(
-            session,
-            checkpoint,
-            session_id=session.id,
-            session_instance_id=session.instance_id,
-            active_profile=profile,
-        )
-        current = await store.load(session.id)
-        if current is None:
-            raise SessionRunFenced("Model terminalization session disappeared during replay.")
-        return ModelCompletionManualRecoveryResult(session=current, settlement=prior, replayed=True)
-    try:
-        active = await inspect_terminalization(store, session, checkpoint)
-    except ModelCompletionManualRecoveryRequired as error:
-        # These preflight reads are not a transaction. Another terminalizer
-        # can settle after our settlement lookup and before stage inspection.
-        # Positive owner advancement fences this attempt; it is not evidence
-        # that an unchanged invocation requires a different recovery policy.
-        current = await store.load(session.id)
-        if current is None or (
-            current.instance_id != session.instance_id
-            or current.run_epoch != session.run_epoch
-            or current.status != session.status
-        ):
-            raise SessionRunFenced(
-                "Model terminalization owner changed during preflight; reconcile exact state."
-            ) from error
-        raise
-    if active.stage.stage_id != request.stage_id:
-        raise SessionRunFenced("Model terminalization selected another active stage.")
-    source_profile = require_terminalization_checkpoint(session, checkpoint)
-    decision: InvocationTerminalDecision | None = None
-
-    def claim_transform(current: Session, updated: dict[str, Any] | None) -> dict[str, Any]:
-        if updated is None:
-            raise SessionRunFenced("Model terminalization claim has no checkpoint.")
-        nonlocal decision
-        # The transform runs under the same transaction that advances the epoch.
-        profile = active_invocation_execution_profile_from_checkpoint(updated)
-        if profile is None:
-            raise SessionRunFenced("Model terminalization claim lost its active profile.")
-        require_terminalization_checkpoint(
-            current.model_copy(update={"run_epoch": profile.run_epoch}), updated
-        )
-        require_terminalization_plan_owner(
-            updated,
-            plan_owner,
-            datetime.fromisoformat(updated["incomplete_session_recovery_claim"]["claimed_at"]),
-        )
-        existing = invocation_terminal_decision_from_checkpoint(updated)
-        if existing is not None:
-            if (existing.model_recovery_id or existing.interruption_request_id) != source_id:
-                raise SessionRunFenced("Another terminal outcome has already been elected.")
-            decision = existing
-            return updated
-        outcome = InvocationTerminalOutcome(request.terminal_status.value)
-        observed = datetime.now(UTC)
-        if outcome is InvocationTerminalOutcome.INTERRUPTED:
-            event_ids = [
-                invocation_terminal_event_id(
-                    outcome=outcome,
-                    session_id=current.id,
-                    session_instance_id=current.instance_id,
-                    run_epoch=profile.run_epoch,
-                    interaction_id=profile.interaction_id,
-                    source_id=source_id,
-                    event_kind=kind,
-                )
-                for kind in ("interaction", "session")
-            ]
-        else:
-            event_ids = [source_id + ":interaction_failed", source_id + ":session_failed"]
-        decision = build_invocation_terminal_decision(
-            outcome=outcome,
-            session_id=current.id,
-            session_instance_id=current.instance_id,
-            run_epoch=profile.run_epoch,
-            profile_interaction_id=profile.interaction_id,
-            interaction_id=profile.interaction_id,
-            execution_profile_fingerprint=profile.profile.fingerprint,
-            interaction_event_id=event_ids[0],
-            terminal_event_id=event_ids[1],
-            observed_at=observed,
-            terminal_payload={
-                "reason": "operator_model_outcome_unknown",
-                "terminalization_only": True,
-            },
-            interruption_request_id=source_id
-            if outcome is InvocationTerminalOutcome.INTERRUPTED
-            else None,
-            model_recovery_id=source_id if outcome is InvocationTerminalOutcome.FAILED else None,
-        )
-        return updated
-
-    ownership = engine._recovery_ownership
-    claim = await ownership.claim(
-        session=session,
-        inactive_for_seconds=request.inactive_for_seconds,
-        execution_profile_snapshot=source_profile,
-        checkpoint_transform=claim_transform,
-    )
-    if claim is None:
-        raise SessionRunFenced(
-            "Model terminalization could not acquire an inactive recovery owner."
-        )
-
-    async def recover_owned() -> ModelCompletionManualRecoveryResult:
-        current = await store.load(session.id)
-        if current is None:
-            raise SessionRunFenced("Model terminalization session disappeared.")
-        confirmed = await inspect_terminalization(
-            store, current, await store.load_checkpoint(session.id)
-        )
-        if confirmed != active:
-            raise SessionRunFenced("Active model stage changed during terminalization claim.")
-        assert decision is not None
-        from cayu.sessions._checkpoint_preservation import (
-            _invocation_lifecycle_authority_mutation_scope,
-        )
-        from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
-
-        def elect(
-            current_session: Session, current_checkpoint: dict[str, Any] | None, now: datetime
-        ) -> dict[str, Any]:
-            assert decision is not None
-            owned = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
-            if (
-                current_session.instance_id != session.instance_id
-                or current_session.run_epoch != claim.session.run_epoch
-                or owned is None
-                or owned[0] != claim.claim_id
-                or owned[1] <= now
-            ):
-                raise SessionRunFenced("Model terminalization lost its claim before election.")
-            require_terminalization_plan_owner(current_checkpoint, plan_owner, now)
-            require_terminalization_checkpoint(current_session, current_checkpoint)
-            return checkpoint_with_invocation_terminal_decision(current_checkpoint, decision)
-
-        with _invocation_lifecycle_authority_mutation_scope():
-            await store.transform_checkpoint_with_store_time(session.id, elect)
-        terminal = engine._event_writer.prepare(
-            event_with_runtime_envelope_authority(
-                Event(
-                    id=decision.terminal_event_id,
-                    type=EventType.SESSION_FAILED
-                    if request.terminal_status is SessionStatus.FAILED
-                    else EventType.SESSION_INTERRUPTED,
-                    session_id=session.id,
-                    agent_name=session.agent_name,
-                    timestamp=decision.observed_at,
-                    payload=decision.terminal_payload,
-                ),
-                "session_id",
-            )
-        )
-        return await engine._recover_model_completion_stage(
-            request.model_copy(update={"expected_run_epoch": claim.session.run_epoch}),
-            terminalization=(claim, decision, terminal),
-        )
-
-    failure = None
-    try:
-        async with asyncio.timeout(_TERMINALIZATION_DEADLINE_SECONDS):
-            result = await ownership.run_with_heartbeat(
-                claim=claim,
-                recovery=recover_owned,
-            )
-    except BaseException as exc:
-        failure = exc
-        raise
-    finally:
-        await ownership.cleanup_claim(
-            authority=claim.require_authority(),
-            authoritative_failure=failure,
-        )
-    current = await store.load(session.id)
-    if current is None:
-        raise SessionRunFenced("Model terminalization session disappeared after settlement.")
-    return result.model_copy(update={"session": current})

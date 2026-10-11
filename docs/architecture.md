@@ -616,6 +616,16 @@ and recovery planner use this component directly. Provider recovery composes the
 model-step executor and assistant publication owner without an application
 forwarder.
 
+`ManualModelCompletionRecovery` owns explicit settlement of an ambiguous model
+dispatch and terminalization from durable evidence without registrations. It
+keeps budget settlement, terminal election, exact replay, claim renewal and
+cleanup together. The public application entrance and abandoned-dispatch recovery
+call this owner directly. Its captured store, profile validator, registration
+resolvers, budget controller, event writer, environment lifecycle and recovery
+ownership are explicit dependencies; it does not depend on session turn execution.
+Shared terminalization inspection and plan authority remain in
+`_durable_model_terminalization.py` for recovery planning.
+
 `ExecutionProfileContinuation` validates saved execution settings for both live
 execution and recovery, including exact profile rejection and queued-interaction
 handoff repair. Its process-local policy identity registry is shared by all
