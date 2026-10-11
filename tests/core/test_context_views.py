@@ -547,7 +547,7 @@ async def _test_public_participant_context_view_witness(
         command,
         make_store,
     )
-    from tests.core.test_explicit_session_compaction import RecordingCompactor
+    from tests.core._explicit_compaction_fixtures import RecordingCompactor
     from tests.core.test_participant_identity import CONTEXT, app, create, registration
 
     from cayu.agents import AgentSpec

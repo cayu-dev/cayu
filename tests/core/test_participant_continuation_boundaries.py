@@ -89,7 +89,7 @@ async def collect(stream):
 def test_participant_continuation_requires_current_authority(
     backend, entrance, lifecycle, tmp_path, request
 ):
-    from tests.core.test_explicit_session_compaction import RecordingCompactor
+    from tests.core._explicit_compaction_fixtures import RecordingCompactor
 
     factory = _factory(backend, tmp_path, request, [datetime.now(UTC)])
 

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import pytest
-from tests.core.test_explicit_session_compaction import (
+from tests.core._explicit_compaction_fixtures import (
     UsageCompactionProvider,
     _create_profiled_session,
 )

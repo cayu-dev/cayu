@@ -229,7 +229,7 @@ def test_operation_budget_history_is_durable_and_only_unresolved_tail_is_overlai
 
 @pytest.mark.parametrize("scope", ["session", "run"])
 def test_explicit_compaction_budget_survives_more_than_256_provider_completions(scope, monkeypatch):
-    from tests.core.test_explicit_session_compaction import (
+    from tests.core._explicit_compaction_fixtures import (
         UsageCompactionProvider,
         _create_profiled_session,
     )

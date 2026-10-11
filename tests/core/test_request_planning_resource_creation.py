@@ -13,11 +13,11 @@ from examples.collaboration.planning import fork_policy, fresh_policy
 from pydantic import ValidationError
 from tests.artifacts.test_resource_transfer_templates import registered_template
 from tests.artifacts.test_resources import preparation_permit
+from tests.core._explicit_compaction_fixtures import RecordingCompactor
 from tests.core.test_budget_binding import _binding
 from tests.core.test_builtin_tools import TINY_PNG_BYTES
 from tests.core.test_collaboration_request_foundation import setup
 from tests.core.test_context_selection_exclusion import reopened_store
-from tests.core.test_explicit_session_compaction import RecordingCompactor
 from tests.core.test_participant_identity import CONTEXT, app, create, registration
 from tests.core.test_prepared_admission_public import PreparationResolver
 from tests.core.test_prepared_admission_public import native_stores as native_stores

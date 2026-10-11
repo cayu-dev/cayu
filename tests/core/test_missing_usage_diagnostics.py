@@ -5,7 +5,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
-from tests.core.test_explicit_session_compaction import _create_profiled_session
+from tests.core._explicit_compaction_fixtures import _create_profiled_session
 
 from cayu import (
     AgentSpec,

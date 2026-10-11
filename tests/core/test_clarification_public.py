@@ -996,7 +996,7 @@ async def test_public_question_uses_real_assistant_export(
                 AgentSpec(name="reviewer", model="gpt-test"), tools=[UserInputTool()]
             )
         elif final_latch_timing is not None:
-            from tests.core.test_explicit_session_compaction import RecordingCompactor
+            from tests.core._explicit_compaction_fixtures import RecordingCompactor
 
             from cayu.context import CheckpointCompactionContextPolicy
 
