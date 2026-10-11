@@ -46316,5 +46316,10 @@
   "tests/core/test_session_store_composition.py::test_store_public_imports_and_historical_symbol_pickles_keep_identity[SessionStore]": 0.6548852070700377,
   "tests/core/test_size_report.py::test_report_follows_session_store_owner_without_losing_historical_revisions": 0.444,
   "tests/core/test_support_bundles.py::test_memory_session_store_schema_readiness_uses_exact_builtin_identity[builtin]": 0.008,
-  "tests/core/test_support_bundles.py::test_memory_session_store_schema_readiness_uses_exact_builtin_identity[custom]": 0.007
+  "tests/core/test_support_bundles.py::test_memory_session_store_schema_readiness_uses_exact_builtin_identity[custom]": 0.007,
+  "tests/core/test_memory_event_read_ownership.py::test_accounting_cancellation_releases_the_read_context": 0.026408958074171096,
+  "tests/core/test_memory_event_read_ownership.py::test_event_reads_apply_access_bounds_with_independent_state": 0.0010242919670417905,
+  "tests/core/test_memory_event_read_ownership.py::test_event_reads_compose_with_independent_locked_state": 0.0062234579818323255,
+  "tests/core/test_memory_event_read_ownership.py::test_event_reads_import_without_store_implementations": 0.5191026260145009,
+  "tests/core/test_memory_event_read_ownership.py::test_store_event_view_is_acquired_after_the_writer_lock": 0.350637125025969
 }

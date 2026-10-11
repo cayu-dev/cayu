@@ -9,7 +9,8 @@ import math
 import secrets
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -53,7 +54,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
 )
-from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.execution_units import ToolRoundIdentity
 from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
@@ -108,6 +109,7 @@ from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
+from cayu.sessions import _memory_event_reads as memory_event_reads
 from cayu.sessions import _model_failover_rules as model_failover_rules
 from cayu.sessions import _model_stage_publication as model_stage_publication
 from cayu.sessions import _model_stage_rules as model_stage_rules
@@ -121,10 +123,8 @@ from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import creation_fence
 from cayu.sessions import event_delivery as session_event_rules
 from cayu.sessions import event_delivery as side_effect_health
-from cayu.sessions import event_queries as event_query_rules
 from cayu.sessions import forks as session_fork_rules
 from cayu.sessions import inspection as session_inspection_rules
-from cayu.sessions import interactions as interaction_contracts
 from cayu.sessions import lineage as lineage_rules
 from cayu.sessions import messaging as session_messaging
 from cayu.sessions import queries as session_query_rules
@@ -140,7 +140,6 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
     SessionRuntimePublicationConflict,
 )
-from cayu.sessions._checkpoint_publication import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
 from cayu.sessions._execution_profile_rules import SessionModelTransition
 from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
@@ -181,8 +180,6 @@ from cayu.sessions._runtime_publication import (
     _run_session_commit_guard_owned,
 )
 from cayu.sessions._terminal_evidence import (
-    TERMINAL_EVIDENCE_EVENT_TYPES,
-    TERMINAL_EVIDENCE_QUERY_LIMIT,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
 )
@@ -205,10 +202,7 @@ from cayu.sessions.event_delivery import (
     validate_persisted_event_side_effect_error,
 )
 from cayu.sessions.event_queries import (
-    EventOrder,
     EventQuery,
-    EventQueryResultTooLarge,
-    copy_event_query,
 )
 from cayu.sessions.exports import _require_session_export_target
 from cayu.sessions.forks import (
@@ -326,13 +320,9 @@ from cayu.sessions.summaries import (
     EventSummary,
     SessionOperationalSnapshot,
     SessionOutcome,
-    event_summary_from_records,
-    session_outcome_from_records,
 )
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
 )
 from cayu.sessions.topology import (
@@ -1156,6 +1146,33 @@ class InMemorySessionStore(
         # at most two IDs: a second canonical acceptance makes quarantine ambiguous.
         self._session_message_acceptance_event_ids: dict[tuple[str, str], set[str]] = {}
         self._next_session_message_ordering_key = 1
+
+    @asynccontextmanager
+    async def _read_event_state(self) -> AsyncIterator[memory_event_reads.MemoryEventReadState]:
+        # Resolve current indexes only after acquiring the writer lock.
+        async with self._lock:
+            yield memory_event_reads.MemoryEventReadState(
+                accounting_generation=self._accounting_generation,
+                checkpoints=self._checkpoints,
+                cost_accounting_authority=self._cost_accounting_authority,
+                cost_event_index=self._cost_event_index,
+                event_records=self._event_records,
+                event_records_by_id=self._event_records_by_id,
+                events=self._events,
+                interaction_event_records=self._interaction_event_records,
+                latest_interaction_event_records_by_sequence=self._latest_interaction_event_records_by_sequence,
+                pending_action_event_history=self._pending_action_event_history,
+                session_event_records=self._session_event_records,
+                session_usage_cache=self._session_usage_cache,
+                sessions=self._sessions,
+                transcript_interaction_ids=self._transcript_interaction_ids,
+                transcripts=self._transcripts,
+                type_event_records=self._type_event_records,
+                user_input_supersession_event_records=self._user_input_supersession_event_records,
+                workflow_attempt_event_records=self._workflow_attempt_event_records,
+                workflow_fenced_step_event_records=self._workflow_fenced_step_event_records,
+                workflow_step_event_records=self._workflow_step_event_records,
+            )
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec:
@@ -9702,61 +9719,25 @@ class InMemorySessionStore(
         return await memory_observation(self, command, kind=kind)
 
     async def load_events(self, session_id: str) -> list[Event]:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(session_id))
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            return [event.model_copy(deep=True) for event in self._events.get(session_id, [])]
+        return await memory_event_reads.load_events(self._read_event_state, session_id)
 
     async def load_user_input_supersession_events(
         self,
         session_id: str,
         input_id: str,
     ) -> list[Event]:
-        from cayu.sessions.pending_actions import pending_action_lookup_key
-
-        session_id = require_clean_nonblank(session_id, "session_id")
-        input_id = require_clean_nonblank(input_id, "input_id")
-        lookup_key = pending_action_lookup_key(input_id)
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            records = self._user_input_supersession_event_records.get(
-                (session_id, lookup_key),
-                (),
-            )
-            return [copy_event(record.event) for record in records[:2]]
+        return await memory_event_reads.load_user_input_supersession_events(
+            self._read_event_state, session_id, input_id
+        )
 
     async def load_tool_round_lifecycle_events(
         self,
         session_id: str,
         tool_call_ids: list[str] | tuple[str, ...],
     ) -> list[Event]:
-        from cayu.sessions.pending_actions import pending_action_lookup_key
-
-        session_id = require_clean_nonblank(session_id, "session_id")
-        copied_ids = tool_publication_rules._validate_tool_round_call_ids(
-            tool_call_ids, "tool_call_ids"
+        return await memory_event_reads.load_tool_round_lifecycle_events(
+            self._read_event_state, session_id, tool_call_ids
         )
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            history = self._pending_action_event_history.get(session_id, {})
-            records = [
-                record
-                for tool_call_id in copied_ids
-                for record in history.get(pending_action_lookup_key(tool_call_id), ())
-                if record.event.type in tool_publication_rules._TOOL_ROUND_LIFECYCLE_EVENT_TYPES
-            ]
-            records.sort(key=lambda record: record.sequence)
-            if len(records) > publication_contracts._tool_round_lifecycle_event_limit(copied_ids):
-                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
-            return [copy_event(record.event) for record in records]
 
     async def load_tool_round_lifecycle_events_for_round(
         self,
@@ -9765,128 +9746,26 @@ class InMemorySessionStore(
         *,
         tool_round_identity: ToolRoundIdentity,
     ) -> list[Event]:
-        from cayu.sessions.pending_actions import pending_action_lookup_key
-
-        session_id = require_clean_nonblank(session_id, "session_id")
-        copied_ids = tool_publication_rules._validate_tool_round_call_ids(
-            tool_call_ids, "tool_call_ids"
+        return await memory_event_reads.load_tool_round_lifecycle_events_for_round(
+            self._read_event_state,
+            session_id,
+            tool_call_ids,
+            tool_round_identity=tool_round_identity,
         )
-        tool_round_identity = copy_tool_round_identity(tool_round_identity)
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            history = self._pending_action_event_history.get(session_id, {})
-            records = [
-                record
-                for tool_call_id in copied_ids
-                for record in history.get(pending_action_lookup_key(tool_call_id), ())
-                if record.event.type in tool_publication_rules._TOOL_ROUND_LIFECYCLE_EVENT_TYPES
-                and tool_publication_rules._tool_round_event_matches_scope_or_is_ambiguous(
-                    record.event,
-                    tool_round_identity,
-                )
-            ]
-            records.sort(key=lambda record: record.sequence)
-            if len(records) > publication_contracts._tool_round_lifecycle_event_limit(copied_ids):
-                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
-            return [copy_event(record.event) for record in records]
 
-    @runtime_session_query
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
-        query = copy_event_query(query)
-        async with self._lock:
-            return self._query_events_unlocked(query, max_bytes=None)
+        return await memory_event_reads.query_events(self._read_event_state, query)
 
-    @runtime_session_query
     async def event_exists(self, query: EventQuery) -> bool:
-        query = copy_event_query(query)
-        event_types = frozenset(
-            (str(query.event_type),)
-            if query.event_type is not None
-            else map(str, query.event_types)
-        )
-        excluded_types = frozenset(map(str, query.exclude_event_types))
-        async with self._lock:
-            records = (
-                self._session_event_records.get(query.session_id, [])
-                if query.session_id is not None
-                else self._event_records
-            )
-            start = bisect_right(records, query.after_sequence or 0, key=lambda row: row.sequence)
-            for index in range(start, len(records)):
-                record = records[index]
-                if query.before_sequence is not None and record.sequence >= query.before_sequence:
-                    break
-                if event_query_rules._event_record_matches(
-                    record, query, event_types, excluded_types
-                ) and _event_record_matches_session(record, query, self._sessions):
-                    return True
-            return False
+        return await memory_event_reads.event_exists(self._read_event_state, query)
 
-    @runtime_session_query
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:
-        from cayu.runtime._usage_accounting import (
-            USAGE_ACCOUNTING_PAGE_SIZE,
-            SessionUsageCache,
-            UsageAccountingReducer,
-            usage_accounting_query,
+        return await memory_event_reads.read_usage_accounting(
+            self._read_event_state, query, by_session=by_session, by_identity=by_identity
         )
 
-        query = usage_accounting_query(query)
-        cached_session_id = SessionUsageCache.session_scope(
-            query, by_session=by_session, by_identity=by_identity
-        )
-        async with self._lock:
-            generation = self._accounting_generation
-            prior = (
-                None
-                if cached_session_id is None
-                else self._session_usage_cache.resume_after(cached_session_id, generation)
-            )
-            if prior is not None:
-                query = copy_event_query(query, update={"after_sequence": prior.scanned_through})
-            reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
-            event_types = frozenset(str(kind) for kind in query.event_types)
-            # Reuse durable indexes without merging complete per-type/session lists.
-            candidates = (
-                self._session_event_records.get(query.session_id, [])
-                if query.session_id is not None
-                else self._event_records
-            )
-            start = bisect_right(
-                candidates, query.after_sequence or 0, key=lambda row: row.sequence
-            )
-            page: list[EventRecord] = []
-            for index in range(start, len(candidates)):
-                record = candidates[index]
-                if query.before_sequence is not None and record.sequence >= query.before_sequence:
-                    break
-                if not event_query_rules._event_record_matches(
-                    record, query, event_types, frozenset()
-                ):
-                    continue
-                if not _event_record_matches_session(record, query, self._sessions):
-                    continue
-                page.append(record)
-                if len(page) == USAGE_ACCOUNTING_PAGE_SIZE:
-                    reducer.add_page(page)
-                    page.clear()
-                    await asyncio.sleep(0)
-            if page:
-                reducer.add_page(page)
-            if cached_session_id is not None:
-                return self._session_usage_cache.settle(
-                    cached_session_id,
-                    generation,
-                    prior,
-                    reducer.snapshot(),
-                    boundary=candidates[-1].sequence if candidates else 0,
-                )
-        return reducer.snapshot().model_copy(update={"generation": generation})
-
-    @runtime_session_query
     async def read_cost_accounting(
         self,
         query: EventQuery,
@@ -9899,95 +9778,27 @@ class InMemorySessionStore(
         max_detail_bytes: int | None = None,
         previous: CostAccountingSnapshot | None = None,
     ) -> CostAccountingSnapshot:
-        from cayu.runtime._cost_accounting import (
-            COST_ACCOUNTING_PAGE_SIZE,
-            cost_accounting_query,
-            cost_pending_events,
+        return await memory_event_reads.read_cost_accounting(
+            self._read_event_state,
+            query,
+            pricing,
+            currency=currency,
+            details=details,
+            by_session=by_session,
+            additional_events=additional_events,
+            max_detail_bytes=max_detail_bytes,
+            previous=previous,
         )
-        from cayu.runtime._cost_accounting_refresh import CostAccountingRead
 
-        query = cost_accounting_query(query)
-        pending = cost_pending_events(query, additional_events)
-        event_types = frozenset(str(kind) for kind in query.event_types)
-        async with self._lock:
-            if query.causal_budget_id is not None:
-                pending = tuple(
-                    event
-                    for event in pending
-                    if (session := self._sessions.get(event.session_id)) is not None
-                    and session.causal_budget_id == query.causal_budget_id
-                )
-            pending = tuple(
-                event
-                for event in pending
-                if (record := self._event_records_by_id.get((event.session_id, event.id))) is None
-                or not event_query_rules._event_record_matches(
-                    record, query, event_types, frozenset()
-                )
-            )
-            boundary_session_id = query.session_id or (
-                query.session_ids[0] if len(query.session_ids) == 1 else None
-            )
-            boundary_records = (
-                self._session_event_records.get(boundary_session_id, [])
-                if boundary_session_id is not None
-                else self._event_records
-            )
-            boundary_end = (
-                bisect_left(boundary_records, query.before_sequence, key=lambda row: row.sequence)
-                if query.before_sequence is not None
-                else len(boundary_records)
-            )
-            through_sequence = boundary_records[boundary_end - 1].sequence if boundary_end else 0
-            reducer = CostAccountingRead(
-                query,
-                pricing,
-                currency=currency,
-                details=details,
-                max_detail_bytes=max_detail_bytes,
-                previous=previous,
-                generation=self._accounting_generation,
-                through_sequence=through_sequence,
-                authority=self._cost_accounting_authority,
-                by_session=by_session,
-                additional_events=pending,
-            )
-            scanned = 0
-            for key, records in self._cost_event_index.groups(reducer):
-                if query.session_id is not None and key[0] != query.session_id:
-                    continue
-                if query.session_ids and key[0] not in query.session_ids:
-                    continue
-                if (
-                    query.causal_budget_id is not None
-                    and self._sessions[key[0]].causal_budget_id != query.causal_budget_id
-                ):
-                    continue
-                for hosted_phase in (True, False):
-                    for record in records:
-                        scanned += 1
-                        if scanned % COST_ACCOUNTING_PAGE_SIZE == 0:
-                            await asyncio.sleep(0)
-                        if (record.event.type == EventType.MODEL_HOSTED_TOOL_CALL) != hosted_phase:
-                            continue
-                        if event_query_rules._event_record_matches(
-                            record, reducer.source_query, event_types, frozenset()
-                        ) and _event_record_matches_session(record, query, self._sessions):
-                            reducer.add(record.sequence, record.event)
-            return reducer.snapshot()
-
-    @runtime_session_query
     async def query_events_bounded(
         self,
         query: EventQuery,
         *,
         max_bytes: int,
     ) -> list[EventRecord]:
-        query = copy_event_query(query)
-        if type(max_bytes) is not int or max_bytes < 1:
-            raise ValueError("max_bytes must be a positive integer.")
-        async with self._lock:
-            return self._query_events_unlocked(query, max_bytes=max_bytes)
+        return await memory_event_reads.query_events_bounded(
+            self._read_event_state, query, max_bytes=max_bytes
+        )
 
     async def load_terminal_session_evidence(
         self,
@@ -9995,12 +9806,8 @@ class InMemorySessionStore(
         *,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
-        return await self._load_terminal_session_evidence(
-            session_id,
-            limits=limits,
-            observed_interrupted_events=None,
-            expected_interrupted_parent_session_id=None,
-            require_interrupted_proof=False,
+        return await memory_event_reads.load_terminal_session_evidence(
+            self._read_event_state, session_id, limits=limits
         )
 
     async def load_runner_owned_interrupted_evidence(
@@ -10011,204 +9818,13 @@ class InMemorySessionStore(
         expected_parent_session_id: str | None = None,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
-        return await self._load_terminal_session_evidence(
+        return await memory_event_reads.load_runner_owned_interrupted_evidence(
+            self._read_event_state,
             session_id,
+            observed_events=observed_events,
+            expected_parent_session_id=expected_parent_session_id,
             limits=limits,
-            observed_interrupted_events=observed_events,
-            expected_interrupted_parent_session_id=expected_parent_session_id,
-            require_interrupted_proof=True,
         )
-
-    async def _load_terminal_session_evidence(
-        self,
-        session_id: str,
-        *,
-        limits: TerminalSessionEvidenceLimits | None,
-        observed_interrupted_events: tuple[RunnerObservedEventIdentity, ...] | None,
-        expected_interrupted_parent_session_id: str | None,
-        require_interrupted_proof: bool,
-    ) -> TerminalSessionEvidence:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        limits = terminal_session_evidence._copy_terminal_session_evidence_limits(limits)
-        observed, expected_parent_session_id = (
-            terminal_session_evidence._copy_runner_owned_interruption_proof(
-                session_id,
-                observed_events=observed_interrupted_events,
-                expected_parent_session_id=expected_interrupted_parent_session_id,
-                limits=limits,
-                required=require_interrupted_proof,
-            )
-        )
-        allow_interrupted = observed is not None or expected_parent_session_id is not None
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
-                )
-            terminal_session_evidence._terminal_session_evidence_expected_event_type(
-                session.status,
-                allow_interrupted=allow_interrupted,
-            )
-            if allow_interrupted and session.status != SessionStatus.INTERRUPTED:
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                )
-            if (
-                expected_parent_session_id is not None
-                and session.parent_session_id != expected_parent_session_id
-            ):
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                )
-            checkpoint = self._checkpoints.get(session_id)
-            marker = terminal_session_evidence._terminal_session_evidence_marker_from_checkpoint(
-                checkpoint
-            )
-            session_records = self._session_event_records.get(session_id, [])
-            if observed is not None:
-                if len(session_records) != len(observed):
-                    raise TerminalSessionEvidenceError(
-                        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                    )
-                terminal_session_evidence._validate_runner_observed_event_identity_snapshot(
-                    observed,
-                    tuple(
-                        RunnerObservedEventIdentity(
-                            session_id=record.event.session_id,
-                            sequence=record.sequence,
-                            event_type=record.event.type,
-                        )
-                        for record in session_records
-                    ),
-                )
-            newest_evidence_records = tuple(
-                islice(
-                    (
-                        record
-                        for record in reversed(session_records)
-                        if record.event.type in TERMINAL_EVIDENCE_EVENT_TYPES
-                    ),
-                    TERMINAL_EVIDENCE_QUERY_LIMIT,
-                )
-            )
-            terminal_record = terminal_session_evidence._classify_terminal_session_evidence_records(
-                session_id=session.id,
-                status=session.status,
-                run_epoch=session.run_epoch,
-                marker=marker,
-                newest_evidence_records=newest_evidence_records,
-                initial_transcript_pending=(
-                    checkpoint is not None
-                    and INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY in checkpoint
-                ),
-                pending_session_interrupt=(
-                    checkpoint is not None and "pending_session_interrupt" in checkpoint
-                ),
-                allow_interrupted=allow_interrupted,
-            )
-            event_stop = bisect_right(
-                session_records,
-                terminal_record.sequence,
-                key=lambda record: record.sequence,
-            )
-            if event_stop > limits.max_events:
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
-                    limit=limits.max_events,
-                    observed=event_stop,
-                )
-            events = session_records[:event_stop]
-
-            messages = self._transcripts.get(session_id, [])
-            interaction_ids = self._transcript_interaction_ids.get(session_id, [])
-            if len(messages) != len(interaction_ids):
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                )
-            if len(messages) > limits.max_transcript_records:
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
-                    limit=limits.max_transcript_records,
-                    observed=len(messages),
-                )
-            # The store already owns detached, validated messages. Construct
-            # lightweight record views so oversized evidence is byte-checked
-            # before any message payload is copied for the returned model.
-            transcript_records = tuple(
-                TranscriptRecord.model_construct(
-                    index=index,
-                    interaction_id=interaction_ids[index],
-                    message=message,
-                )
-                for index, message in enumerate(messages)
-            )
-            return terminal_session_evidence._assemble_terminal_session_evidence(
-                session=session,
-                marker=marker,
-                terminal_record=terminal_record,
-                events=events,
-                transcript=transcript_records,
-                limits=limits,
-                allow_interrupted=allow_interrupted,
-            )
-
-    def _query_events_unlocked(
-        self,
-        query: EventQuery,
-        *,
-        max_bytes: int | None,
-    ) -> list[EventRecord]:
-        # `event_type` and `event_types` are mutually exclusive, so they
-        # collapse into one filter set (empty = no type filter).
-        if query.event_type is not None:
-            event_types = frozenset((str(query.event_type),))
-        else:
-            event_types = frozenset(str(event_type) for event_type in query.event_types)
-        excluded_event_types = frozenset(
-            str(event_type) for event_type in query.exclude_event_types
-        )
-        candidates = self._query_candidate_records(query, event_types)
-        start = (
-            bisect_right(candidates, query.after_sequence, key=lambda record: record.sequence)
-            if query.after_sequence is not None
-            else 0
-        )
-        stop = (
-            bisect_left(candidates, query.before_sequence, key=lambda record: record.sequence)
-            if query.before_sequence is not None
-            else len(candidates)
-        )
-        indexes = (
-            range(stop - 1, start - 1, -1)
-            if query.order_by == EventOrder.SEQUENCE_DESC
-            else range(start, stop)
-        )
-        size_counter = None if max_bytes is None else JsonUtf8SizeCounter(max_bytes)
-        records: list[EventRecord] = []
-        for index in indexes:
-            record = candidates[index]
-            if not event_query_rules._event_record_matches(
-                record,
-                query,
-                event_types,
-                excluded_event_types,
-            ):
-                continue
-            if not _event_record_matches_session(record, query, self._sessions):
-                continue
-            if size_counter is not None and not size_counter.value(record):
-                assert max_bytes is not None
-                raise EventQueryResultTooLarge(max_bytes)
-            records.append(
-                EventRecord(
-                    sequence=record.sequence,
-                    event=record.event,
-                )
-            )
-            if len(records) == query.limit:
-                break
-        return records
 
     async def query_latest_interaction_events(
         self,
@@ -10217,165 +9833,15 @@ class InMemorySessionStore(
         before_sequence: int | None = None,
         limit: int = 100,
     ) -> list[EventRecord]:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        before_sequence, limit = interaction_contracts._validate_interaction_page(
-            before_sequence, limit
+        return await memory_event_reads.query_latest_interaction_events(
+            self._read_event_state, session_id, before_sequence=before_sequence, limit=limit
         )
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            records = self._latest_interaction_event_records_by_sequence.get(session_id, [])
-            stop = (
-                bisect_left(
-                    records,
-                    before_sequence,
-                    key=lambda record: record.sequence,
-                )
-                if before_sequence is not None
-                else len(records)
-            )
-            start = max(0, stop - limit)
-            return [record.model_copy(deep=True) for record in reversed(records[start:stop])]
-
-    def _query_candidate_records(
-        self,
-        query: EventQuery,
-        event_types: frozenset[str],
-    ) -> list[EventRecord]:
-        """Pick the narrowest index that still covers a query's candidate rows.
-
-        All returned lists stay sequence-ascending so downstream ordering and
-        ``after_sequence`` paging behave exactly as a full scan would.
-        """
-        if query.event_id is not None and query.session_id is not None:
-            record = self._event_records_by_id.get((query.session_id, query.event_id))
-            return [] if record is None else [record]
-        if (
-            query.session_id is not None
-            and query.workflow_name is not None
-            and event_types == frozenset((str(WORKFLOW_ATTEMPT_EVENT_TYPE),))
-        ):
-            return self._workflow_attempt_event_records.get(
-                (query.session_id, query.workflow_name),
-                [],
-            )
-        if query.workflow_step_id is not None:
-            assert query.session_id is not None
-            assert query.workflow_name is not None
-            if len(event_types) == 1:
-                event_type = next(iter(event_types))
-                if query.workflow_attempt_fenced:
-                    return self._workflow_fenced_step_event_records.get(
-                        (
-                            query.session_id,
-                            query.workflow_name,
-                            query.workflow_step_id,
-                            event_type,
-                        ),
-                        [],
-                    )
-                if query.workflow_attempt_id is not None:
-                    return self._workflow_step_event_records.get(
-                        (
-                            query.session_id,
-                            query.workflow_name,
-                            query.workflow_attempt_id,
-                            query.workflow_step_id,
-                            event_type,
-                        ),
-                        [],
-                    )
-                raise RuntimeError("Workflow-step queries require an attempt scope.")
-            merged: list[EventRecord] = []
-            for event_type in event_types:
-                if query.workflow_attempt_fenced:
-                    merged.extend(
-                        self._workflow_fenced_step_event_records.get(
-                            (
-                                query.session_id,
-                                query.workflow_name,
-                                query.workflow_step_id,
-                                event_type,
-                            ),
-                            [],
-                        )
-                    )
-                elif query.workflow_attempt_id is not None:
-                    merged.extend(
-                        self._workflow_step_event_records.get(
-                            (
-                                query.session_id,
-                                query.workflow_name,
-                                query.workflow_attempt_id,
-                                query.workflow_step_id,
-                                event_type,
-                            ),
-                            [],
-                        )
-                    )
-                else:
-                    raise RuntimeError("Workflow-step queries require an attempt scope.")
-            merged.sort(key=lambda record: record.sequence)
-            return merged
-        if query.session_id is not None:
-            if query.interaction_id is not None:
-                return self._interaction_event_records.get(query.session_id, {}).get(
-                    query.interaction_id,
-                    [],
-                )
-            return self._session_event_records.get(query.session_id, [])
-        if query.session_ids:
-            merged: list[EventRecord] = []
-            for session_id in query.session_ids:
-                if query.interaction_id is None:
-                    merged.extend(self._session_event_records.get(session_id, []))
-                else:
-                    merged.extend(
-                        self._interaction_event_records.get(session_id, {}).get(
-                            query.interaction_id,
-                            [],
-                        )
-                    )
-            merged.sort(key=lambda record: record.sequence)
-            return merged
-        if event_types:
-            if len(event_types) == 1:
-                return self._type_event_records.get(next(iter(event_types)), [])
-            merged = []
-            for event_type in event_types:
-                merged.extend(self._type_event_records.get(event_type, []))
-            merged.sort(key=lambda record: record.sequence)
-            return merged
-        return self._event_records
 
     async def summarize_events(self, session_id: str) -> EventSummary:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(session_id))
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-
-            records = self._session_event_records.get(session_id, [])
-            return event_summary_from_records(session_id, records)
+        return await memory_event_reads.summarize_events(self._read_event_state, session_id)
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(session_id))
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-
-            records = self._session_event_records.get(session_id, [])
-            return session_outcome_from_records(session, records)
+        return await memory_event_reads.summarize_outcome(self._read_event_state, session_id)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         from cayu.resource_access import current_data_bounds
@@ -12070,21 +11536,3 @@ def _session_matches_debug_state(
 
 def _is_tool_debug_event(event_type: EventType | str) -> bool:
     return event_type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_BLOCKED}
-
-
-def _event_record_matches_session(
-    record: EventRecord,
-    query: EventQuery,
-    sessions: dict[str, Session],
-) -> bool:
-    from cayu.sessions._access_rules import _query_bounds
-
-    bounds = _query_bounds.get()
-    if bounds is not None:
-        owner = sessions.get(record.event.session_id)
-        if owner is None or not bounds.matches(owner.labels):
-            return False
-    if query.causal_budget_id is None:
-        return True
-    session = sessions.get(record.event.session_id)
-    return session is not None and session.causal_budget_id == query.causal_budget_id

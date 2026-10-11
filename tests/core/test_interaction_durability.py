@@ -4388,7 +4388,10 @@ def test_in_memory_interaction_query_uses_interaction_scoped_candidates() -> Non
         )
 
         query = EventQuery(session_id=session_id, interaction_id=interaction_id)
-        candidates = store._query_candidate_records(query, frozenset())
+        from cayu.sessions._memory_event_reads import _query_candidate_records
+
+        async with store._read_event_state() as state:
+            candidates = _query_candidate_records(state, query, frozenset())
         records = await store.query_events(query)
 
         assert candidates

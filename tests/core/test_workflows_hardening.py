@@ -1140,7 +1140,9 @@ def test_gated_loop_replays_unversioned_legacy_identity_that_looks_like_v2(
     assert calls == []
 
 
-def test_step_replay_ids_returns_a_bounded_number_of_records_for_many_steps() -> None:
+def test_step_replay_ids_returns_a_bounded_number_of_records_for_many_steps(monkeypatch) -> None:
+    from cayu.sessions import _memory_event_reads as event_reads
+
     class CountingStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
         returned_event_records = 0
@@ -1151,12 +1153,15 @@ def test_step_replay_ids_returns_a_bounded_number_of_records_for_many_steps() ->
             self.returned_event_records += len(records)
             return records
 
-        def _query_candidate_records(self, query, event_types):
-            records = super()._query_candidate_records(query, event_types)
-            self.candidate_event_records += len(records)
-            return records
-
     store = CountingStore()
+    original_candidates = event_reads._query_candidate_records
+
+    def count_candidates(state, query, event_types):
+        records = original_candidates(state, query, event_types)
+        store.candidate_event_records += len(records)
+        return records
+
+    monkeypatch.setattr(event_reads, "_query_candidate_records", count_candidates)
     app = CayuApp(session_store=store, enable_logging=False)
     ctx = TinyWorkflow(app).context("wf-bounded-step-replay")
 
