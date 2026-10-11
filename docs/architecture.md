@@ -1337,6 +1337,16 @@ supply explicit execution, connection, reader, writer and clock capabilities.
 Required store protocol hooks delegate to these owners; shared model-stage rules,
 runtime execution and publication transactions retain their existing owners.
 
+Native publication transactions live in `storage/_sqlite_publication.py` and
+`storage/_postgres_publication.py`. Each owner keeps runtime publication, receipt
+reads and material validation together with checkpoint/event publication. Stores
+supply explicit transaction execution, readers, native writers, clocks and
+authority capabilities. Model-stage promotion composes the same runtime
+publication operation. Authorization, checkpoint changes, operation records,
+transcript/event writes, commit guards and receipt publication retain their
+native snapshot and transaction boundaries. Record decoding and material
+validation have one canonical implementation per backend.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and

@@ -1,0 +1,102 @@
+{
+  "parent": "eef15d848001ff953473f147e7894e6f4d1601b8",
+  "implementation": "5bc3c4e896b5a5b39fa5ebfbb96f2a1218c0db65",
+  "existing_parent_cases_passed": 304,
+  "distinct_source_cases_passed": 318,
+  "installed_wheel_cases_passed": 318,
+  "installed_import_guard": true,
+  "distinct_recovery_cases_passed": 109,
+  "recovery_cases_retried_after_disk_io_error": 1,
+  "static": {
+    "lint": 0,
+    "format": 0,
+    "types": 0,
+    "sidecar": 0,
+    "dashboard": 0,
+    "collection": 0
+  },
+  "collected_tests": 47696,
+  "preserved_parent_timings": 46289,
+  "new_measured_timings": 14,
+  "source_wheel_sdist_install_python_stub_files_matched": 1372,
+  "source_body_audit": {
+    "sqlite": {
+      "moved_operations": 4,
+      "protocol_hooks_preserved": 3,
+      "retained_methods": 213,
+      "retained_helpers": 19,
+      "SQL_bodies_signatures_wiring_bindings_metadata": "passed"
+    },
+    "postgres": {
+      "moved_operations": 4,
+      "protocol_hooks_preserved": 3,
+      "retained_methods": 212,
+      "retained_helpers": 8,
+      "SQL_bodies_signatures_wiring_bindings_metadata": "passed"
+    }
+  },
+  "fixture_audit": {
+    "stage_helper_bodies_unchanged": true,
+    "test_node_ids_preserved": true
+  },
+  "review_cases_passed": 54,
+  "benchmark_coverage": {
+    "pairs_per_backend": 6,
+    "result_summaries_and_sql_counts_match": true,
+    "postgres_batch_count_probe": {
+      "batch_calls": 3,
+      "parameter_sets": 5,
+      "persisted_rows": 5
+    },
+    "postgres_runtime_write": {
+      "statements": 16,
+      "batch_calls": 2,
+      "parameter_sets": 2
+    },
+    "postgres_checkpoint_events": {
+      "statements": 12,
+      "batch_calls": 1,
+      "parameter_sets": 1
+    },
+    "worker_sha256": "fdf7530e9884dc32b31d8b07f62c2d9266fe18841f6023d1efa664193960dab3",
+    "driver_sha256": "3e901b7efed76fd9347ef0cbb4351a54f5893c2f23e6f8b97f6d6f93930ad2a0"
+  },
+  "rebase": {
+    "parent": "7fbcd127e8ffecef6fefeb6add32826962ddf040",
+    "implementation": "d63987d4702c88b9a80d62dfb53f73d6aacb56a6",
+    "source_cases_passed": 332,
+    "guarded_wheel_cases_passed": 68,
+    "wheel_import_guard": {
+      "loaded_cayu_modules": 859,
+      "all_from_installed_wheel": true
+    },
+    "static": {
+      "lint": 0,
+      "format": 0,
+      "types": 0,
+      "sidecar": 0,
+      "dashboard": 0,
+      "collection": 0
+    },
+    "collected_tests": 47725,
+    "preserved_parent_timings": 46318,
+    "new_measured_timings": 14,
+    "source_wheel_sdist_install_python_stub_files_matched": 1375,
+    "source_body_audit": {
+      "sqlite": {
+        "moved_operations": 4,
+        "protocol_hooks_preserved": 3,
+        "retained_methods": 213,
+        "retained_helpers": 19,
+        "SQL_bodies_signatures_wiring_bindings_metadata": "passed"
+      },
+      "postgres": {
+        "moved_operations": 4,
+        "protocol_hooks_preserved": 3,
+        "retained_methods": 212,
+        "retained_helpers": 8,
+        "SQL_bodies_signatures_wiring_bindings_metadata": "passed"
+      }
+    }
+  }
+}

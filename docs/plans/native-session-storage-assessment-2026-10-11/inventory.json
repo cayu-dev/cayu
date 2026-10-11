@@ -1,0 +1,1820 @@
+{
+  "base": "7fbcd127e8ffecef6fefeb6add32826962ddf040",
+  "backends": {
+    "sqlite": {
+      "adapter_before": 9188,
+      "adapter_after": 8222,
+      "publication_owner": 1090,
+      "net_production_lines": 124,
+      "adapter_below_10000": true,
+      "receiving_owner_below_10000": true,
+      "native_modules": {
+        "src/cayu/storage/_sqlite_aggregates.py": 1270,
+        "src/cayu/storage/_sqlite_budget_schema.py": 150,
+        "src/cayu/storage/_sqlite_catalog.py": 82,
+        "src/cayu/storage/_sqlite_closure_schema.py": 65,
+        "src/cayu/storage/_sqlite_connection.py": 337,
+        "src/cayu/storage/_sqlite_context_views.py": 783,
+        "src/cayu/storage/_sqlite_eval_schema.py": 546,
+        "src/cayu/storage/_sqlite_event_delivery.py": 578,
+        "src/cayu/storage/_sqlite_event_publication.py": 503,
+        "src/cayu/storage/_sqlite_functions.py": 138,
+        "src/cayu/storage/_sqlite_knowledge_schema.py": 1382,
+        "src/cayu/storage/_sqlite_memory_evidence.py": 634,
+        "src/cayu/storage/_sqlite_memory_evidence_schema.py": 216,
+        "src/cayu/storage/_sqlite_model_stage.py": 1039,
+        "src/cayu/storage/_sqlite_peer_content.py": 773,
+        "src/cayu/storage/_sqlite_producer_schema.py": 39,
+        "src/cayu/storage/_sqlite_public_authority.py": 497,
+        "src/cayu/storage/_sqlite_publication.py": 1090,
+        "src/cayu/storage/_sqlite_records.py": 554,
+        "src/cayu/storage/_sqlite_schema_history.py": 4516,
+        "src/cayu/storage/_sqlite_session_creation.py": 814,
+        "src/cayu/storage/_sqlite_session_messages.py": 1440,
+        "src/cayu/storage/_sqlite_session_queries.py": 1377,
+        "src/cayu/storage/_sqlite_session_schema.py": 537,
+        "src/cayu/storage/_sqlite_support.py": 1871,
+        "src/cayu/storage/_sqlite_task_graphs.py": 481,
+        "src/cayu/storage/_sqlite_task_groups.py": 335,
+        "src/cayu/storage/_sqlite_task_schema.py": 276,
+        "src/cayu/storage/_sqlite_terminal_evidence.py": 678,
+        "src/cayu/storage/_sqlite_tool_grants.py": 1068,
+        "src/cayu/storage/_sqlite_transcript.py": 1067,
+        "src/cayu/storage/_sqlite_transcript_schema.py": 162,
+        "src/cayu/storage/_sqlite_verified_work_schema.py": 461,
+        "src/cayu/storage/_sqlite_work_context_schema.py": 918
+      },
+      "retained_methods": [
+        {
+          "name": "_access_create_session",
+          "lines": 8
+        },
+        {
+          "name": "_access_update_metadata",
+          "lines": 2
+        },
+        {
+          "name": "_access_delete_session",
+          "lines": 2
+        },
+        {
+          "name": "_access_read_records",
+          "lines": 4
+        },
+        {
+          "name": "_access_list_sessions",
+          "lines": 10
+        },
+        {
+          "name": "_access_update_labels",
+          "lines": 4
+        },
+        {
+          "name": "_access_load_session",
+          "lines": 28
+        },
+        {
+          "name": "__init__",
+          "lines": 109
+        },
+        {
+          "name": "durable_state_paths",
+          "lines": 6
+        },
+        {
+          "name": "public_authority_alias_codec",
+          "lines": 4
+        },
+        {
+          "name": "_terminalize_zero_work_interruption",
+          "lines": 8
+        },
+        {
+          "name": "_run_read",
+          "lines": 31
+        },
+        {
+          "name": "_retain_detached_read_task",
+          "lines": 21
+        },
+        {
+          "name": "_run_write",
+          "lines": 18
+        },
+        {
+          "name": "register_public_authority_alias",
+          "lines": 18
+        },
+        {
+          "name": "resolve_public_authority_alias",
+          "lines": 16
+        },
+        {
+          "name": "issue_targeted_tool_grants",
+          "lines": 21
+        },
+        {
+          "name": "list_targeted_tool_grants",
+          "lines": 16
+        },
+        {
+          "name": "load_targeted_tool_grant_state",
+          "lines": 10
+        },
+        {
+          "name": "bind_targeted_tool_grant_use",
+          "lines": 14
+        },
+        {
+          "name": "revoke_targeted_tool_grant",
+          "lines": 22
+        },
+        {
+          "name": "reconstruct_targeted_tool_grants",
+          "lines": 36
+        },
+        {
+          "name": "public_authority_private_value_exists",
+          "lines": 14
+        },
+        {
+          "name": "create",
+          "lines": 44
+        },
+        {
+          "name": "create_participant_owned_session",
+          "lines": 32
+        },
+        {
+          "name": "_create_participant_owned_session_unserialized",
+          "lines": 43
+        },
+        {
+          "name": "lookup_participant_session_creation",
+          "lines": 3
+        },
+        {
+          "name": "_lookup_participant_session_creation_unserialized",
+          "lines": 19
+        },
+        {
+          "name": "load_participant_session_binding",
+          "lines": 3
+        },
+        {
+          "name": "_scan_participant_session_bindings",
+          "lines": 28
+        },
+        {
+          "name": "load_participant_session_creation_receipt",
+          "lines": 12
+        },
+        {
+          "name": "capture_context_view_publication_source",
+          "lines": 2
+        },
+        {
+          "name": "_capture_completed_turn_snapshot",
+          "lines": 112
+        },
+        {
+          "name": "publish_context_view",
+          "lines": 4
+        },
+        {
+          "name": "lookup_context_view_publication",
+          "lines": 4
+        },
+        {
+          "name": "select_context_view",
+          "lines": 2
+        },
+        {
+          "name": "_select_context_view",
+          "lines": 8
+        },
+        {
+          "name": "lookup_context_view_selection",
+          "lines": 4
+        },
+        {
+          "name": "transition_context_view_ownership",
+          "lines": 2
+        },
+        {
+          "name": "_transition_context_view_ownership",
+          "lines": 8
+        },
+        {
+          "name": "validate_context_view_source_closure",
+          "lines": 14
+        },
+        {
+          "name": "validate_context_view_compaction",
+          "lines": 5
+        },
+        {
+          "name": "_validate_context_view_compaction_unlocked",
+          "lines": 35
+        },
+        {
+          "name": "read_context_view_lifecycle_events",
+          "lines": 10
+        },
+        {
+          "name": "read_context_view",
+          "lines": 4
+        },
+        {
+          "name": "create_fork",
+          "lines": 23
+        },
+        {
+          "name": "create_fork_with_transcript_validation",
+          "lines": 24
+        },
+        {
+          "name": "create_profiled_fork",
+          "lines": 36
+        },
+        {
+          "name": "_create_fork",
+          "lines": 44
+        },
+        {
+          "name": "load",
+          "lines": 15
+        },
+        {
+          "name": "load_state",
+          "lines": 22
+        },
+        {
+          "name": "load_invocation_snapshot",
+          "lines": 21
+        },
+        {
+          "name": "create_recall_receipt",
+          "lines": 4
+        },
+        {
+          "name": "load_recall_receipt",
+          "lines": 2
+        },
+        {
+          "name": "list_recall_receipts",
+          "lines": 2
+        },
+        {
+          "name": "create_context_exposure",
+          "lines": 9
+        },
+        {
+          "name": "load_context_exposure",
+          "lines": 6
+        },
+        {
+          "name": "load_recall_item_exposures",
+          "lines": 6
+        },
+        {
+          "name": "list_context_exposures",
+          "lines": 2
+        },
+        {
+          "name": "transition_context_exposure",
+          "lines": 10
+        },
+        {
+          "name": "inspect_identity",
+          "lines": 2
+        },
+        {
+          "name": "update_status",
+          "lines": 13
+        },
+        {
+          "name": "load_session_closure_receipt",
+          "lines": 12
+        },
+        {
+          "name": "load_session_closure_progress",
+          "lines": 8
+        },
+        {
+          "name": "save_session_closure_progress",
+          "lines": 24
+        },
+        {
+          "name": "_closure_lineage_owners_unlocked",
+          "lines": 13
+        },
+        {
+          "name": "claim_session_closure_progress",
+          "lines": 54
+        },
+        {
+          "name": "_require_available_closure_identity_unlocked",
+          "lines": 11
+        },
+        {
+          "name": "load_session_closure_tombstones",
+          "lines": 12
+        },
+        {
+          "name": "detach_session_children",
+          "lines": 85
+        },
+        {
+          "name": "_require_session_erasure_quiescence_unlocked",
+          "lines": 173
+        },
+        {
+          "name": "validate_session_closure_admission",
+          "lines": 11
+        },
+        {
+          "name": "delete_session",
+          "lines": 16
+        },
+        {
+          "name": "_delete_session_unserialized",
+          "lines": 22
+        },
+        {
+          "name": "apply_retention_policy",
+          "lines": 17
+        },
+        {
+          "name": "inspect_session_retention",
+          "lines": 16
+        },
+        {
+          "name": "retention_artifact_references",
+          "lines": 6
+        },
+        {
+          "name": "list_retention_audits",
+          "lines": 15
+        },
+        {
+          "name": "load_retention_audit",
+          "lines": 7
+        },
+        {
+          "name": "begin_retention_audit",
+          "lines": 17
+        },
+        {
+          "name": "record_retention_entry",
+          "lines": 6
+        },
+        {
+          "name": "complete_retention_audit",
+          "lines": 11
+        },
+        {
+          "name": "_require_session_deletion_admission_unlocked",
+          "lines": 43
+        },
+        {
+          "name": "_delete_session_in_transaction_unlocked",
+          "lines": 63
+        },
+        {
+          "name": "update_labels",
+          "lines": 73
+        },
+        {
+          "name": "update_metadata",
+          "lines": 52
+        },
+        {
+          "name": "transition_status",
+          "lines": 75
+        },
+        {
+          "name": "transition_status_and_checkpoint",
+          "lines": 587
+        },
+        {
+          "name": "reject_execution_profile_resume",
+          "lines": 106
+        },
+        {
+          "name": "fence_stalled_run",
+          "lines": 64
+        },
+        {
+          "name": "reserve_stalled_run_recovery",
+          "lines": 87
+        },
+        {
+          "name": "fence_run_and_transform_checkpoint",
+          "lines": 112
+        },
+        {
+          "name": "transition_status_if_no_queued_messages",
+          "lines": 83
+        },
+        {
+          "name": "publish_interaction_transition",
+          "lines": 522
+        },
+        {
+          "name": "settle_session_invocation",
+          "lines": 31
+        },
+        {
+          "name": "load_interaction_transition_receipt",
+          "lines": 64
+        },
+        {
+          "name": "_load_historical_interaction_settlement_record",
+          "lines": 18
+        },
+        {
+          "name": "_load_interaction_transition_receipt_by_event_id",
+          "lines": 67
+        },
+        {
+          "name": "release_run_fence",
+          "lines": 17
+        },
+        {
+          "name": "release_session_invocation",
+          "lines": 159
+        },
+        {
+          "name": "append_event",
+          "lines": 2
+        },
+        {
+          "name": "claim_budget_reservation_identity",
+          "lines": 12
+        },
+        {
+          "name": "append_events",
+          "lines": 10
+        },
+        {
+          "name": "append_tool_effect_conflict",
+          "lines": 9
+        },
+        {
+          "name": "append_workflow_step_started",
+          "lines": 14
+        },
+        {
+          "name": "load_mcp_manifest_baselines",
+          "lines": 4
+        },
+        {
+          "name": "compare_and_publish_mcp_manifest_checks",
+          "lines": 19
+        },
+        {
+          "name": "claim_first_persisted_event_side_effect",
+          "lines": 6
+        },
+        {
+          "name": "claim_persisted_event_side_effect",
+          "lines": 14
+        },
+        {
+          "name": "get_persisted_event_side_effect_delivery",
+          "lines": 6
+        },
+        {
+          "name": "retire_failed_first_event_delivery",
+          "lines": 6
+        },
+        {
+          "name": "mark_persisted_event_side_effect_delivered",
+          "lines": 6
+        },
+        {
+          "name": "mark_persisted_event_side_effect_failed",
+          "lines": 16
+        },
+        {
+          "name": "defer_persisted_event_side_effect",
+          "lines": 6
+        },
+        {
+          "name": "renew_persisted_event_side_effect",
+          "lines": 9
+        },
+        {
+          "name": "get_persisted_event_side_effect_health",
+          "lines": 4
+        },
+        {
+          "name": "query_persisted_event_side_effect_deliveries",
+          "lines": 6
+        },
+        {
+          "name": "list_persisted_event_side_effect_deliveries",
+          "lines": 16
+        },
+        {
+          "name": "snapshot_session_message_source",
+          "lines": 16
+        },
+        {
+          "name": "inspect_session_messages",
+          "lines": 11
+        },
+        {
+          "name": "apply_session_message_action",
+          "lines": 11
+        },
+        {
+          "name": "enqueue_session_message",
+          "lines": 16
+        },
+        {
+          "name": "deliver_queued_session_messages",
+          "lines": 31
+        },
+        {
+          "name": "repair_queued_interaction_profile_handoff",
+          "lines": 17
+        },
+        {
+          "name": "publish_checkpoint_and_events",
+          "lines": 24
+        },
+        {
+          "name": "_publish_completion_result_event_publication",
+          "lines": 22
+        },
+        {
+          "name": "load_session_operation",
+          "lines": 77
+        },
+        {
+          "name": "_load_runtime_publication_receipt_record",
+          "lines": 9
+        },
+        {
+          "name": "_load_model_completion_stage_records",
+          "lines": 9
+        },
+        {
+          "name": "_load_model_completion_stage_settlement_record",
+          "lines": 8
+        },
+        {
+          "name": "_load_model_completion_stage_dispatch_record",
+          "lines": 8
+        },
+        {
+          "name": "_load_active_model_completion_stage_records",
+          "lines": 5
+        },
+        {
+          "name": "_mark_model_completion_stage_dispatched_atomic",
+          "lines": 15
+        },
+        {
+          "name": "_prepare_model_completion_stage_atomic",
+          "lines": 12
+        },
+        {
+          "name": "_complete_model_completion_stage_atomic",
+          "lines": 11
+        },
+        {
+          "name": "_abandon_model_completion_stage_atomic",
+          "lines": 7
+        },
+        {
+          "name": "_promote_model_completion_stage_atomic",
+          "lines": 18
+        },
+        {
+          "name": "_publish_runtime_publication_atomic",
+          "lines": 15
+        },
+        {
+          "name": "publish_session_operation",
+          "lines": 28
+        },
+        {
+          "name": "publish_session_operation_guarded",
+          "lines": 29
+        },
+        {
+          "name": "_prepare_temporary_side_service",
+          "lines": 76
+        },
+        {
+          "name": "publish_session_operation_guarded_with_store_time",
+          "lines": 32
+        },
+        {
+          "name": "_publish_checkpoint_and_events",
+          "lines": 44
+        },
+        {
+          "name": "load_session_closure_records",
+          "lines": 11
+        },
+        {
+          "name": "_load_session_closure_records_unlocked",
+          "lines": 205
+        },
+        {
+          "name": "_complete_native_producer_cleanup",
+          "lines": 6
+        },
+        {
+          "name": "_retire_native_producer_cleanup",
+          "lines": 6
+        },
+        {
+          "name": "_read_completed_native_producer_cleanup",
+          "lines": 6
+        },
+        {
+          "name": "_read_native_producer_release",
+          "lines": 6
+        },
+        {
+          "name": "_read_native_producer_progress",
+          "lines": 6
+        },
+        {
+          "name": "_read_native_producer_attachment",
+          "lines": 6
+        },
+        {
+          "name": "load_session_export_snapshot",
+          "lines": 99
+        },
+        {
+          "name": "load_events",
+          "lines": 2
+        },
+        {
+          "name": "load_user_input_supersession_events",
+          "lines": 8
+        },
+        {
+          "name": "load_tool_round_lifecycle_events",
+          "lines": 8
+        },
+        {
+          "name": "load_tool_round_lifecycle_events_for_round",
+          "lines": 10
+        },
+        {
+          "name": "query_events",
+          "lines": 2
+        },
+        {
+          "name": "read_usage_accounting",
+          "lines": 10
+        },
+        {
+          "name": "read_cost_accounting",
+          "lines": 24
+        },
+        {
+          "name": "event_exists",
+          "lines": 2
+        },
+        {
+          "name": "query_events_bounded",
+          "lines": 9
+        },
+        {
+          "name": "load_terminal_session_evidence",
+          "lines": 9
+        },
+        {
+          "name": "load_runner_owned_interrupted_evidence",
+          "lines": 15
+        },
+        {
+          "name": "load_bounded",
+          "lines": 35
+        },
+        {
+          "name": "export_terminal_session_evidence",
+          "lines": 10
+        },
+        {
+          "name": "query_latest_interaction_events",
+          "lines": 10
+        },
+        {
+          "name": "summarize_events",
+          "lines": 2
+        },
+        {
+          "name": "summarize_outcome",
+          "lines": 63
+        },
+        {
+          "name": "prune_events",
+          "lines": 261
+        },
+        {
+          "name": "compact_transcript",
+          "lines": 15
+        },
+        {
+          "name": "list_sessions",
+          "lines": 12
+        },
+        {
+          "name": "query_session_topology",
+          "lines": 5
+        },
+        {
+          "name": "query_session_lineage",
+          "lines": 5
+        },
+        {
+          "name": "query_child_session_lifecycle",
+          "lines": 5
+        },
+        {
+          "name": "aggregate_operational_snapshot",
+          "lines": 42
+        },
+        {
+          "name": "aggregate_usage",
+          "lines": 2
+        },
+        {
+          "name": "list_sessions_with_pending_interruption_cascade",
+          "lines": 10
+        },
+        {
+          "name": "list_queued_dispatch_terminal_receipts",
+          "lines": 100
+        },
+        {
+          "name": "query_pending_actions",
+          "lines": 922
+        },
+        {
+          "name": "append_transcript_messages",
+          "lines": 16
+        },
+        {
+          "name": "append_peer_content",
+          "lines": 15
+        },
+        {
+          "name": "read_peer_content_attempt",
+          "lines": 4
+        },
+        {
+          "name": "list_pending_peer_content",
+          "lines": 5
+        },
+        {
+          "name": "read_peer_content",
+          "lines": 2
+        },
+        {
+          "name": "record_peer_content_exposure",
+          "lines": 4
+        },
+        {
+          "name": "begin_peer_content_exposure",
+          "lines": 4
+        },
+        {
+          "name": "read_peer_content_exposure",
+          "lines": 6
+        },
+        {
+          "name": "exclude_peer_content",
+          "lines": 4
+        },
+        {
+          "name": "retry_pending_peer_content",
+          "lines": 18
+        },
+        {
+          "name": "replace_initial_transcript_messages",
+          "lines": 24
+        },
+        {
+          "name": "materialize_deferred_interaction_input",
+          "lines": 15
+        },
+        {
+          "name": "load_deferred_interaction_input",
+          "lines": 5
+        },
+        {
+          "name": "append_transcript_messages_and_transform_checkpoint",
+          "lines": 20
+        },
+        {
+          "name": "load_transcript",
+          "lines": 2
+        },
+        {
+          "name": "load_transcript_snapshot",
+          "lines": 2
+        },
+        {
+          "name": "load_transcript_cursor",
+          "lines": 2
+        },
+        {
+          "name": "load_latest_transcript_message",
+          "lines": 9
+        },
+        {
+          "name": "load_latest_transcript_text",
+          "lines": 10
+        },
+        {
+          "name": "load_transcript_window",
+          "lines": 10
+        },
+        {
+          "name": "query_transcript",
+          "lines": 2
+        },
+        {
+          "name": "search_transcript",
+          "lines": 5
+        },
+        {
+          "name": "checkpoint",
+          "lines": 46
+        },
+        {
+          "name": "transform_checkpoint",
+          "lines": 64
+        },
+        {
+          "name": "transform_checkpoint_with_store_time",
+          "lines": 60
+        },
+        {
+          "name": "load_checkpoint",
+          "lines": 20
+        },
+        {
+          "name": "load_execution_snapshot_checkpoint",
+          "lines": 20
+        },
+        {
+          "name": "load_interruption_cascade_marker",
+          "lines": 14
+        },
+        {
+          "name": "_load_checkpoint_unlocked",
+          "lines": 2
+        },
+        {
+          "name": "close",
+          "lines": 8
+        },
+        {
+          "name": "_connect",
+          "lines": 2
+        },
+        {
+          "name": "_connect_read_only",
+          "lines": 4
+        },
+        {
+          "name": "_initialize_schema",
+          "lines": 13
+        },
+        {
+          "name": "_load_unlocked",
+          "lines": 2
+        },
+        {
+          "name": "_load_labels_unlocked",
+          "lines": 2
+        },
+        {
+          "name": "_session_exists_unlocked",
+          "lines": 2
+        },
+        {
+          "name": "_first_existing_event_id_unlocked",
+          "lines": 6
+        }
+      ]
+    },
+    "postgres": {
+      "adapter_before": 8515,
+      "adapter_after": 7473,
+      "publication_owner": 1176,
+      "net_production_lines": 134,
+      "adapter_below_10000": true,
+      "receiving_owner_below_10000": true,
+      "native_modules": {
+        "src/cayu/storage/_postgres_aggregates.py": 1409,
+        "src/cayu/storage/_postgres_base.py": 2027,
+        "src/cayu/storage/_postgres_budget_schema.py": 91,
+        "src/cayu/storage/_postgres_catalog.py": 54,
+        "src/cayu/storage/_postgres_context_views.py": 928,
+        "src/cayu/storage/_postgres_eval_schema.py": 826,
+        "src/cayu/storage/_postgres_event_delivery.py": 588,
+        "src/cayu/storage/_postgres_event_publication.py": 631,
+        "src/cayu/storage/_postgres_knowledge_schema.py": 1605,
+        "src/cayu/storage/_postgres_memory_evidence.py": 722,
+        "src/cayu/storage/_postgres_memory_evidence_schema.py": 320,
+        "src/cayu/storage/_postgres_model_stage.py": 1051,
+        "src/cayu/storage/_postgres_peer_content.py": 783,
+        "src/cayu/storage/_postgres_producer_schema.py": 66,
+        "src/cayu/storage/_postgres_public_authority.py": 523,
+        "src/cayu/storage/_postgres_publication.py": 1176,
+        "src/cayu/storage/_postgres_schema_history.py": 5126,
+        "src/cayu/storage/_postgres_session_creation.py": 807,
+        "src/cayu/storage/_postgres_session_messages.py": 1438,
+        "src/cayu/storage/_postgres_session_queries.py": 1437,
+        "src/cayu/storage/_postgres_session_schema.py": 508,
+        "src/cayu/storage/_postgres_support.py": 378,
+        "src/cayu/storage/_postgres_task_graphs.py": 537,
+        "src/cayu/storage/_postgres_task_groups.py": 349,
+        "src/cayu/storage/_postgres_task_schema.py": 438,
+        "src/cayu/storage/_postgres_terminal_evidence.py": 722,
+        "src/cayu/storage/_postgres_tool_grants.py": 1159,
+        "src/cayu/storage/_postgres_transcript.py": 962,
+        "src/cayu/storage/_postgres_transcript_schema.py": 95,
+        "src/cayu/storage/_postgres_verified_work.py": 3856,
+        "src/cayu/storage/_postgres_verified_work_schema.py": 687,
+        "src/cayu/storage/_postgres_work_context_schema.py": 964
+      },
+      "retained_methods": [
+        {
+          "name": "_access_create_session",
+          "lines": 8
+        },
+        {
+          "name": "_access_update_metadata",
+          "lines": 2
+        },
+        {
+          "name": "_access_delete_session",
+          "lines": 2
+        },
+        {
+          "name": "_access_read_records",
+          "lines": 4
+        },
+        {
+          "name": "_access_list_sessions",
+          "lines": 9
+        },
+        {
+          "name": "_access_update_labels",
+          "lines": 4
+        },
+        {
+          "name": "_access_load_session",
+          "lines": 19
+        },
+        {
+          "name": "__init__",
+          "lines": 45
+        },
+        {
+          "name": "public_authority_alias_codec",
+          "lines": 4
+        },
+        {
+          "name": "_terminalize_zero_work_interruption",
+          "lines": 8
+        },
+        {
+          "name": "_preflight_migration_authority",
+          "lines": 5
+        },
+        {
+          "name": "_session_store_now",
+          "lines": 6
+        },
+        {
+          "name": "register_public_authority_alias",
+          "lines": 19
+        },
+        {
+          "name": "resolve_public_authority_alias",
+          "lines": 17
+        },
+        {
+          "name": "public_authority_private_value_exists",
+          "lines": 15
+        },
+        {
+          "name": "issue_targeted_tool_grants",
+          "lines": 22
+        },
+        {
+          "name": "list_targeted_tool_grants",
+          "lines": 17
+        },
+        {
+          "name": "load_targeted_tool_grant_state",
+          "lines": 11
+        },
+        {
+          "name": "bind_targeted_tool_grant_use",
+          "lines": 15
+        },
+        {
+          "name": "revoke_targeted_tool_grant",
+          "lines": 23
+        },
+        {
+          "name": "reconstruct_targeted_tool_grants",
+          "lines": 37
+        },
+        {
+          "name": "_ensure_ready",
+          "lines": 15
+        },
+        {
+          "name": "create",
+          "lines": 49
+        },
+        {
+          "name": "create_participant_owned_session",
+          "lines": 51
+        },
+        {
+          "name": "lookup_participant_session_creation",
+          "lines": 22
+        },
+        {
+          "name": "load_participant_session_binding",
+          "lines": 3
+        },
+        {
+          "name": "_scan_participant_session_bindings",
+          "lines": 23
+        },
+        {
+          "name": "load_participant_session_creation_receipt",
+          "lines": 15
+        },
+        {
+          "name": "capture_context_view_publication_source",
+          "lines": 2
+        },
+        {
+          "name": "_capture_completed_turn_snapshot",
+          "lines": 116
+        },
+        {
+          "name": "publish_context_view",
+          "lines": 10
+        },
+        {
+          "name": "lookup_context_view_publication",
+          "lines": 4
+        },
+        {
+          "name": "select_context_view",
+          "lines": 2
+        },
+        {
+          "name": "_select_context_view",
+          "lines": 10
+        },
+        {
+          "name": "lookup_context_view_selection",
+          "lines": 4
+        },
+        {
+          "name": "transition_context_view_ownership",
+          "lines": 2
+        },
+        {
+          "name": "_transition_context_view_ownership",
+          "lines": 10
+        },
+        {
+          "name": "validate_context_view_source_closure",
+          "lines": 15
+        },
+        {
+          "name": "validate_context_view_compaction",
+          "lines": 8
+        },
+        {
+          "name": "_validate_context_view_compaction",
+          "lines": 41
+        },
+        {
+          "name": "read_context_view_lifecycle_events",
+          "lines": 11
+        },
+        {
+          "name": "read_context_view",
+          "lines": 7
+        },
+        {
+          "name": "create_fork",
+          "lines": 23
+        },
+        {
+          "name": "create_fork_with_transcript_validation",
+          "lines": 24
+        },
+        {
+          "name": "create_profiled_fork",
+          "lines": 36
+        },
+        {
+          "name": "_create_fork",
+          "lines": 49
+        },
+        {
+          "name": "load",
+          "lines": 15
+        },
+        {
+          "name": "load_state",
+          "lines": 21
+        },
+        {
+          "name": "load_invocation_snapshot",
+          "lines": 23
+        },
+        {
+          "name": "create_recall_receipt",
+          "lines": 8
+        },
+        {
+          "name": "load_recall_receipt",
+          "lines": 4
+        },
+        {
+          "name": "list_recall_receipts",
+          "lines": 4
+        },
+        {
+          "name": "create_context_exposure",
+          "lines": 11
+        },
+        {
+          "name": "load_context_exposure",
+          "lines": 6
+        },
+        {
+          "name": "load_recall_item_exposures",
+          "lines": 6
+        },
+        {
+          "name": "list_context_exposures",
+          "lines": 4
+        },
+        {
+          "name": "transition_context_exposure",
+          "lines": 12
+        },
+        {
+          "name": "inspect_identity",
+          "lines": 2
+        },
+        {
+          "name": "update_status",
+          "lines": 9
+        },
+        {
+          "name": "load_session_closure_receipt",
+          "lines": 14
+        },
+        {
+          "name": "load_session_closure_progress",
+          "lines": 12
+        },
+        {
+          "name": "save_session_closure_progress",
+          "lines": 21
+        },
+        {
+          "name": "_lock_closure_lineage",
+          "lines": 7
+        },
+        {
+          "name": "_closure_lineage_owners",
+          "lines": 12
+        },
+        {
+          "name": "claim_session_closure_progress",
+          "lines": 52
+        },
+        {
+          "name": "_require_available_closure_identity",
+          "lines": 9
+        },
+        {
+          "name": "load_session_closure_tombstones",
+          "lines": 15
+        },
+        {
+          "name": "detach_session_children",
+          "lines": 87
+        },
+        {
+          "name": "_require_session_erasure_quiescence",
+          "lines": 166
+        },
+        {
+          "name": "validate_session_closure_admission",
+          "lines": 8
+        },
+        {
+          "name": "delete_session",
+          "lines": 25
+        },
+        {
+          "name": "apply_retention_policy",
+          "lines": 17
+        },
+        {
+          "name": "inspect_session_retention",
+          "lines": 16
+        },
+        {
+          "name": "retention_artifact_references",
+          "lines": 6
+        },
+        {
+          "name": "list_retention_audits",
+          "lines": 15
+        },
+        {
+          "name": "load_retention_audit",
+          "lines": 7
+        },
+        {
+          "name": "begin_retention_audit",
+          "lines": 17
+        },
+        {
+          "name": "record_retention_entry",
+          "lines": 6
+        },
+        {
+          "name": "complete_retention_audit",
+          "lines": 11
+        },
+        {
+          "name": "_require_session_deletion_admission",
+          "lines": 40
+        },
+        {
+          "name": "_delete_session_in_transaction",
+          "lines": 70
+        },
+        {
+          "name": "update_labels",
+          "lines": 68
+        },
+        {
+          "name": "update_metadata",
+          "lines": 51
+        },
+        {
+          "name": "transition_status",
+          "lines": 67
+        },
+        {
+          "name": "transition_status_and_checkpoint",
+          "lines": 563
+        },
+        {
+          "name": "reject_execution_profile_resume",
+          "lines": 129
+        },
+        {
+          "name": "transition_status_if_no_queued_messages",
+          "lines": 73
+        },
+        {
+          "name": "publish_interaction_transition",
+          "lines": 504
+        },
+        {
+          "name": "settle_session_invocation",
+          "lines": 31
+        },
+        {
+          "name": "load_interaction_transition_receipt",
+          "lines": 56
+        },
+        {
+          "name": "_load_historical_interaction_settlement_record",
+          "lines": 13
+        },
+        {
+          "name": "_load_interaction_transition_receipt_by_event_id",
+          "lines": 57
+        },
+        {
+          "name": "fence_stalled_run",
+          "lines": 58
+        },
+        {
+          "name": "reserve_stalled_run_recovery",
+          "lines": 72
+        },
+        {
+          "name": "fence_run_and_transform_checkpoint",
+          "lines": 92
+        },
+        {
+          "name": "release_run_fence",
+          "lines": 19
+        },
+        {
+          "name": "release_session_invocation",
+          "lines": 154
+        },
+        {
+          "name": "append_event",
+          "lines": 2
+        },
+        {
+          "name": "claim_budget_reservation_identity",
+          "lines": 12
+        },
+        {
+          "name": "_publish_budget_reservation_identities",
+          "lines": 63
+        },
+        {
+          "name": "_append_events_with_cursor",
+          "lines": 45
+        },
+        {
+          "name": "_insert_event_rows_with_cursor",
+          "lines": 62
+        },
+        {
+          "name": "_record_invocation_terminal_event_receipts",
+          "lines": 46
+        },
+        {
+          "name": "_append_event_once_with_cursor",
+          "lines": 23
+        },
+        {
+          "name": "append_events",
+          "lines": 12
+        },
+        {
+          "name": "append_tool_effect_conflict",
+          "lines": 11
+        },
+        {
+          "name": "append_workflow_step_started",
+          "lines": 22
+        },
+        {
+          "name": "load_mcp_manifest_baselines",
+          "lines": 6
+        },
+        {
+          "name": "compare_and_publish_mcp_manifest_checks",
+          "lines": 27
+        },
+        {
+          "name": "claim_first_persisted_event_side_effect",
+          "lines": 6
+        },
+        {
+          "name": "claim_persisted_event_side_effect",
+          "lines": 14
+        },
+        {
+          "name": "get_persisted_event_side_effect_delivery",
+          "lines": 6
+        },
+        {
+          "name": "retire_failed_first_event_delivery",
+          "lines": 6
+        },
+        {
+          "name": "mark_persisted_event_side_effect_delivered",
+          "lines": 6
+        },
+        {
+          "name": "mark_persisted_event_side_effect_failed",
+          "lines": 15
+        },
+        {
+          "name": "defer_persisted_event_side_effect",
+          "lines": 6
+        },
+        {
+          "name": "renew_persisted_event_side_effect",
+          "lines": 6
+        },
+        {
+          "name": "get_persisted_event_side_effect_health",
+          "lines": 4
+        },
+        {
+          "name": "query_persisted_event_side_effect_deliveries",
+          "lines": 6
+        },
+        {
+          "name": "list_persisted_event_side_effect_deliveries",
+          "lines": 15
+        },
+        {
+          "name": "snapshot_session_message_source",
+          "lines": 18
+        },
+        {
+          "name": "inspect_session_messages",
+          "lines": 13
+        },
+        {
+          "name": "apply_session_message_action",
+          "lines": 12
+        },
+        {
+          "name": "enqueue_session_message",
+          "lines": 20
+        },
+        {
+          "name": "deliver_queued_session_messages",
+          "lines": 39
+        },
+        {
+          "name": "repair_queued_interaction_profile_handoff",
+          "lines": 19
+        },
+        {
+          "name": "publish_checkpoint_and_events",
+          "lines": 24
+        },
+        {
+          "name": "_publish_completion_result_event_publication",
+          "lines": 22
+        },
+        {
+          "name": "load_session_operation",
+          "lines": 59
+        },
+        {
+          "name": "_load_runtime_publication_receipt_record",
+          "lines": 13
+        },
+        {
+          "name": "_load_model_completion_stage_records",
+          "lines": 13
+        },
+        {
+          "name": "_load_model_completion_stage_settlement_record",
+          "lines": 11
+        },
+        {
+          "name": "_load_model_completion_stage_dispatch_record",
+          "lines": 11
+        },
+        {
+          "name": "_load_active_model_completion_stage_records",
+          "lines": 7
+        },
+        {
+          "name": "_mark_model_completion_stage_dispatched_atomic",
+          "lines": 17
+        },
+        {
+          "name": "_prepare_model_completion_stage_atomic",
+          "lines": 14
+        },
+        {
+          "name": "_complete_model_completion_stage_atomic",
+          "lines": 12
+        },
+        {
+          "name": "_abandon_model_completion_stage_atomic",
+          "lines": 10
+        },
+        {
+          "name": "_promote_model_completion_stage_atomic",
+          "lines": 18
+        },
+        {
+          "name": "_publish_runtime_publication_atomic",
+          "lines": 18
+        },
+        {
+          "name": "publish_session_operation",
+          "lines": 28
+        },
+        {
+          "name": "publish_session_operation_guarded",
+          "lines": 29
+        },
+        {
+          "name": "_prepare_temporary_side_service",
+          "lines": 55
+        },
+        {
+          "name": "publish_session_operation_guarded_with_store_time",
+          "lines": 32
+        },
+        {
+          "name": "_publish_checkpoint_and_events",
+          "lines": 47
+        },
+        {
+          "name": "load_session_closure_records",
+          "lines": 9
+        },
+        {
+          "name": "_load_session_closure_records",
+          "lines": 138
+        },
+        {
+          "name": "_complete_native_producer_cleanup",
+          "lines": 6
+        },
+        {
+          "name": "_retire_native_producer_cleanup",
+          "lines": 6
+        },
+        {
+          "name": "_read_completed_native_producer_cleanup",
+          "lines": 6
+        },
+        {
+          "name": "_read_native_producer_release",
+          "lines": 6
+        },
+        {
+          "name": "_read_native_producer_progress",
+          "lines": 6
+        },
+        {
+          "name": "_read_native_producer_attachment",
+          "lines": 6
+        },
+        {
+          "name": "load_session_export_snapshot",
+          "lines": 106
+        },
+        {
+          "name": "load_events",
+          "lines": 4
+        },
+        {
+          "name": "load_user_input_supersession_events",
+          "lines": 8
+        },
+        {
+          "name": "load_tool_round_lifecycle_events",
+          "lines": 8
+        },
+        {
+          "name": "load_tool_round_lifecycle_events_for_round",
+          "lines": 13
+        },
+        {
+          "name": "query_events",
+          "lines": 2
+        },
+        {
+          "name": "event_exists",
+          "lines": 2
+        },
+        {
+          "name": "read_usage_accounting",
+          "lines": 10
+        },
+        {
+          "name": "read_cost_accounting",
+          "lines": 24
+        },
+        {
+          "name": "query_events_bounded",
+          "lines": 9
+        },
+        {
+          "name": "load_terminal_session_evidence",
+          "lines": 13
+        },
+        {
+          "name": "load_runner_owned_interrupted_evidence",
+          "lines": 17
+        },
+        {
+          "name": "load_bounded",
+          "lines": 31
+        },
+        {
+          "name": "export_terminal_session_evidence",
+          "lines": 14
+        },
+        {
+          "name": "query_latest_interaction_events",
+          "lines": 10
+        },
+        {
+          "name": "summarize_events",
+          "lines": 4
+        },
+        {
+          "name": "summarize_outcome",
+          "lines": 66
+        },
+        {
+          "name": "list_sessions",
+          "lines": 9
+        },
+        {
+          "name": "query_session_topology",
+          "lines": 5
+        },
+        {
+          "name": "query_session_lineage",
+          "lines": 5
+        },
+        {
+          "name": "query_child_session_lifecycle",
+          "lines": 7
+        },
+        {
+          "name": "aggregate_operational_snapshot",
+          "lines": 45
+        },
+        {
+          "name": "aggregate_usage",
+          "lines": 2
+        },
+        {
+          "name": "list_sessions_with_pending_interruption_cascade",
+          "lines": 7
+        },
+        {
+          "name": "list_queued_dispatch_terminal_receipts",
+          "lines": 98
+        },
+        {
+          "name": "query_pending_actions",
+          "lines": 748
+        },
+        {
+          "name": "append_peer_content",
+          "lines": 16
+        },
+        {
+          "name": "read_peer_content_attempt",
+          "lines": 6
+        },
+        {
+          "name": "list_pending_peer_content",
+          "lines": 8
+        },
+        {
+          "name": "read_peer_content",
+          "lines": 4
+        },
+        {
+          "name": "record_peer_content_exposure",
+          "lines": 6
+        },
+        {
+          "name": "begin_peer_content_exposure",
+          "lines": 6
+        },
+        {
+          "name": "read_peer_content_exposure",
+          "lines": 6
+        },
+        {
+          "name": "exclude_peer_content",
+          "lines": 6
+        },
+        {
+          "name": "retry_pending_peer_content",
+          "lines": 19
+        },
+        {
+          "name": "append_transcript_messages",
+          "lines": 19
+        },
+        {
+          "name": "replace_initial_transcript_messages",
+          "lines": 28
+        },
+        {
+          "name": "materialize_deferred_interaction_input",
+          "lines": 18
+        },
+        {
+          "name": "load_deferred_interaction_input",
+          "lines": 7
+        },
+        {
+          "name": "append_transcript_messages_and_transform_checkpoint",
+          "lines": 24
+        },
+        {
+          "name": "load_transcript",
+          "lines": 4
+        },
+        {
+          "name": "load_transcript_snapshot",
+          "lines": 4
+        },
+        {
+          "name": "load_transcript_cursor",
+          "lines": 2
+        },
+        {
+          "name": "load_latest_transcript_message",
+          "lines": 9
+        },
+        {
+          "name": "load_latest_transcript_text",
+          "lines": 14
+        },
+        {
+          "name": "load_transcript_window",
+          "lines": 14
+        },
+        {
+          "name": "query_transcript",
+          "lines": 4
+        },
+        {
+          "name": "search_transcript",
+          "lines": 5
+        },
+        {
+          "name": "checkpoint",
+          "lines": 21
+        },
+        {
+          "name": "transform_checkpoint",
+          "lines": 38
+        },
+        {
+          "name": "transform_checkpoint_with_store_time",
+          "lines": 39
+        },
+        {
+          "name": "load_checkpoint",
+          "lines": 11
+        },
+        {
+          "name": "load_execution_snapshot_checkpoint",
+          "lines": 18
+        },
+        {
+          "name": "load_interruption_cascade_marker",
+          "lines": 87
+        },
+        {
+          "name": "_load",
+          "lines": 12
+        },
+        {
+          "name": "_load_for_update",
+          "lines": 12
+        },
+        {
+          "name": "_load_for_key_share",
+          "lines": 14
+        },
+        {
+          "name": "_load_labels",
+          "lines": 11
+        },
+        {
+          "name": "_reject_new_work_after_steering",
+          "lines": 23
+        },
+        {
+          "name": "_load_checkpoint",
+          "lines": 9
+        },
+        {
+          "name": "_upsert_checkpoint",
+          "lines": 27
+        },
+        {
+          "name": "_first_existing_event_id",
+          "lines": 14
+        }
+      ]
+    }
+  },
+  "new_production_modules": 2
+}
