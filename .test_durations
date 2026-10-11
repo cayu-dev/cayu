@@ -1,4 +1,8 @@
 {
+  "tests/core/test_session_interruption_composition.py::test_session_interruption_imports_without_application_or_engine": 3.036449,
+  "tests/core/test_session_interruption_composition.py::test_public_interruption_and_replay_work_without_engine[memory]": 0.401145,
+  "tests/core/test_session_interruption_composition.py::test_public_interruption_and_replay_work_without_engine[sqlite]": 0.213341,
+  "tests/core/test_session_interruption_composition.py::test_public_interruption_and_replay_work_without_engine[postgres]": 0.885799,
   "tests/core/test_session_interruption_composition.py::test_interruption_cleanup_imports_without_application_or_engine": 3.861364,
   "tests/core/test_session_interruption_composition.py::test_interruption_cleanup_settles_after_preparation_failure_without_engine[memory]": 0.126394,
   "tests/core/test_session_interruption_composition.py::test_interruption_cleanup_settles_after_preparation_failure_without_engine[sqlite]": 0.33535,

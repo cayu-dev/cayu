@@ -447,6 +447,7 @@ from cayu.runtime._session_engine import (
 from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._session_fork import SessionFork
+from cayu.runtime._session_interruption import SessionInterruption
 from cayu.runtime._session_interruption_cleanup import SessionInterruptionCleanup
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_outcome_publication import SessionOutcomePublication
@@ -1812,6 +1813,26 @@ class CayuApp:
             pending_tool_round_recovery=self._pending_tool_round_recovery,
         )
 
+        self._session_interruption = SessionInterruption(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            environment_lifecycle=self._environment_lifecycle,
+            session_control=self._session_control,
+            recovery_ownership=self._recovery_ownership,
+            terminal_evidence=self._terminal_evidence,
+            terminal_finalization=self._terminal_finalization,
+            session_finalization=self._session_finalization,
+            terminal_event_publication=self._terminal_event_publication,
+            background_interruption_coordinator=self._background_interruption_coordinator,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            model_completion_recovery=self._model_completion_recovery,
+            user_input_evidence=self._user_input_evidence,
+        )
+
         self._session_engine = SessionEngine(
             interruption_cleanup=self._interruption_cleanup,
             session_outcomes=self._session_outcomes,
@@ -1823,7 +1844,6 @@ class CayuApp:
             deferred_input=self._deferred_input,
             terminal_event_publication=self._terminal_event_publication,
             recovery_ownership=self._recovery_ownership,
-            terminal_evidence=self._terminal_evidence,
             terminal_finalization=self._terminal_finalization,
             resource_access_policy=resource_access_policy,
             resource_session_stream=self._resource_session_stream,
@@ -1839,12 +1859,10 @@ class CayuApp:
             assistant_model_publication=self._assistant_model_publication,
             execution_profile_continuation=self._execution_profile_continuation,
             model_completion_recovery=self._model_completion_recovery,
-            user_input_evidence=self._user_input_evidence,
             request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             pending_tool_round_recovery=self._pending_tool_round_recovery,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
-            background_interruption_coordinator=(self._background_interruption_coordinator),
             secret_redactor=self._secret_redactor,
             clock=self._clock,
             runtime_hooks=self._runtime_hooks,
@@ -5842,7 +5860,7 @@ class CayuApp:
         session_id = await self._resolve_public_session_id(
             require_clean_nonblank(session_id, "session_id")
         )
-        return await self._session_engine.interruption_cascade_status(session_id=session_id)
+        return await self._background_interruption_coordinator.cascade_status(session_id=session_id)
 
     @_tracked_entrance
     async def inspect_targeted_tool_grants(
@@ -7610,7 +7628,7 @@ class CayuApp:
         if type(request) is not InterruptSessionRequest:
             raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
         request = copy_interrupt_session_request(request)
-        stream = self._session_engine.interrupt_session(
+        stream = self._session_interruption.interrupt_session(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
         )

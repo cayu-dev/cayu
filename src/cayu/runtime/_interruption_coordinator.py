@@ -1598,3 +1598,88 @@ class BackgroundInterruptionCoordinator:
             return copied_checkpoint
 
         await self._session_store.transform_checkpoint_with_store_time(session_id, transform)
+
+    async def cascade_status(self, session_id: str) -> str:
+        """Return the public control-plane state of a session's durable cascade."""
+        durable_status = "none"
+
+        def inspect(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> None:
+            nonlocal durable_status
+            if checkpoint is None:
+                return None
+            marker = checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if marker is None:
+                return None
+            durable_status = "failed"
+            if type(marker) is not dict:
+                return None
+            attempt_id = marker.get("attempt_id")
+            interrupt_payload = marker.get("interrupt_payload")
+            generation = marker.get("generation", 0)
+            if (
+                type(attempt_id) is not str
+                or not attempt_id.strip()
+                or type(interrupt_payload) is not dict
+                or type(generation) is not int
+                or generation < 0
+            ):
+                return None
+            failure_recorded = marker.get("failure_recorded", False)
+            if type(failure_recorded) is not bool:
+                return None
+            try:
+                claim_id = marker.get("claim_id")
+                claim_expires_at = _interruption_cascade_marker_datetime(
+                    marker,
+                    "claim_expires_at",
+                )
+                if claim_id is not None:
+                    if (
+                        type(claim_id) is not str
+                        or not claim_id.strip()
+                        or claim_expires_at is None
+                        or generation < 1
+                    ):
+                        return None
+                elif claim_expires_at is not None:
+                    return None
+                created_at = _interruption_cascade_marker_datetime(marker, "created_at")
+            except ValueError:
+                return None
+            if claim_id is not None:
+                assert claim_expires_at is not None
+                durable_status = "pending" if claim_expires_at > store_now else "failed"
+                return None
+            if failure_recorded or created_at is None:
+                return None
+            unclaimed_grace = timedelta(seconds=interruption_cascade_lease_seconds())
+            durable_status = "pending" if created_at + unclaimed_grace > store_now else "failed"
+            return None
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, inspect)
+        if self.is_pending(session_id):
+            return "pending"
+        return durable_status
+
+    async def clear_pending_interruption_cascade(self, session_id: str) -> str | None:
+        cleared_attempt_id: str | None = None
+
+        def transform(_session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+            nonlocal cleared_attempt_id
+            if checkpoint is None:
+                return {}
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+            marker = copied_checkpoint.pop(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, None)
+            if marker is None:
+                return copied_checkpoint
+            if type(marker) is not dict or type(marker.get("attempt_id")) is not str:
+                raise ValueError("Pending interruption cascade checkpoint is invalid.")
+            cleared_attempt_id = marker["attempt_id"]
+            return copied_checkpoint
+
+        await self._session_store.transform_checkpoint(session_id, transform)
+        return cleared_attempt_id

@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from tests.core.test_recovery_composition import _run_without_owners
 
-from cayu import AgentSpec, CayuApp, EventType, RunRequest
+from cayu import AgentSpec, CayuApp, EventType, InterruptSessionRequest, RunRequest
 from cayu._exception_groups import iter_exception_tree
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
@@ -23,6 +23,68 @@ def test_interruption_cleanup_imports_without_application_or_engine() -> None:
         ("cayu.applications", "cayu.runtime._session_engine"),
         "from cayu.runtime._session_interruption_cleanup import SessionInterruptionCleanup\n",
     )
+
+
+def test_session_interruption_imports_without_application_or_engine() -> None:
+    _run_without_owners(
+        ("cayu.applications", "cayu.runtime._session_engine"),
+        "from cayu.runtime._session_interruption import SessionInterruption\n",
+    )
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_public_interruption_and_replay_work_without_engine(
+    backend, sqlite_resources, monkeypatch, request
+) -> None:
+    async def scenario() -> None:
+        async with sqlite_resources as resources:
+            if backend == "postgres":
+                from cayu.storage.migrations import SchemaMode
+                from cayu.storage.postgres import PostgresSessionStore
+
+                store = PostgresSessionStore(
+                    request.getfixturevalue("postgres_dsn"), schema_mode=SchemaMode.CREATE
+                )
+            elif backend == "sqlite":
+                store = resources.own(SQLiteSessionStore(resources.path()))
+            else:
+                store = InMemorySessionStore()
+            app = CayuApp(session_store=store, enable_logging=False)
+            try:
+                app.register_agent(AgentSpec(name="assistant", model="fake"))
+                session = await store.create(
+                    RunRequest(agent_name="assistant", messages=[]),
+                    identity=SessionIdentity(provider_name="fake", model="fake"),
+                )
+                monkeypatch.delattr(app, "_session_engine")
+                stop = InterruptSessionRequest(session_id=session.id, reason="operator stop")
+                first = [event async for event in app.interrupt_session(stop)]
+                app.session_store = InMemorySessionStore()
+                direct_replay = [
+                    event async for event in app._session_interruption.interrupt_session(stop)
+                ]
+                assert await app.session_store.load(session.id) is None
+                # Public event projection deliberately uses the current public store.
+                app.session_store = store
+                replay = [event async for event in app.interrupt_session(stop)]
+                assert [event.type for event in first] == [EventType.SESSION_INTERRUPTED]
+                assert [event.id for event in replay] == [event.id for event in first]
+                assert first[0].payload["reason"] == "operator stop"
+                persisted = await store.load(session.id)
+                assert persisted is not None
+                assert persisted.status is SessionStatus.INTERRUPTED
+                records = await store.query_events(
+                    EventQuery(session_id=session.id, event_type=EventType.SESSION_INTERRUPTED)
+                )
+                assert len(records) == 1
+                assert records[0].event.id == direct_replay[0].id
+                assert await app.interruption_cascade_status(session.id) == "none"
+            finally:
+                await app.aclose()
+                if backend == "postgres":
+                    await store.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

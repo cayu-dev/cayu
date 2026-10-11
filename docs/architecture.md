@@ -265,6 +265,8 @@ CayuApp
   -> ExecutionProfileClassifier
   -> SessionFork
   -> SessionPreparation
+  -> SessionInterruptionCleanup
+  -> SessionInterruption
   -> SessionEngine
   -> WorkAttemptExecution
   -> IncompleteSessionRecovery
@@ -274,8 +276,8 @@ CayuApp
   -> QueuedDispatchCoordinator
 ```
 
-`SessionEngine` owns execution, queued-message
-delivery, task linkage, and model/tool loop decisions. `SessionRecovery` owns
+`SessionEngine` owns execution, queued-message delivery and model/tool loop
+decisions. `SessionRecovery` owns
 startup recovery, abandoned-run recovery, and public resume orchestration above
 the engine. Resume prepares and validates its inputs before recovery, retains its
 budget snapshot, then enters execution after recovery settles.
@@ -376,6 +378,16 @@ control signals and task cancellation counts while cleanup finishes. Authenticat
 provider and billing cancellation detachment lives with this owner and is shared
 by execution and recovery. The component uses the captured store and existing
 finalization, recovery and tool-round owners without importing the engine.
+
+`SessionInterruption` owns explicit stop requests, including active-run handoff,
+offline provider cancellation, approval/input supersession and exact interruption
+replay. It composes the existing session control, terminal evidence, finalization
+and publication components directly. The application routes public stop requests
+to this owner and retains request authority and event projection. The background
+interruption coordinator owns cascade status and marker clearing alongside its
+existing durable claim, renewal, failure and completion operations. These paths
+do not require the session engine. Ordinary run/resume admission, turn scheduling
+and run-fence lifetime remain with execution.
 
 `QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
 request preparation, frozen profile and session-instance validation, execution

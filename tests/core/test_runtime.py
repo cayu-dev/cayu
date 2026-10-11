@@ -21308,7 +21308,7 @@ def test_interruption_cascade_status_prefers_cleared_durable_marker_over_stale_d
                 }
             },
         )
-        app._session_engine._defer_background_interruption_cascade(
+        app._background_interruption_coordinator.defer(
             parent_session_id=parent_id,
             interrupt_payload=payload,
             retry_after_seconds=30,
@@ -22901,7 +22901,9 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         )
         preserved = await store.load_checkpoint(session_id)
         await app._session_finalization.clear_pending_session_interrupt(session_id)
-        await app._session_engine._clear_pending_interruption_cascade(session_id)
+        await app._background_interruption_coordinator.clear_pending_interruption_cascade(
+            session_id
+        )
         await store._publish_completion_result_event_publication(
             session_id,
             checkpoint_transform=lambda _session, checkpoint, _store_now: {
