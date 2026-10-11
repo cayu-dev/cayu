@@ -1219,7 +1219,7 @@ def test_cli_and_server_inspect_safe_snapshot_metadata(tmp_path, capsys):
     assert record.artifacts[0].artifact_id not in json.dumps(cli)
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from tests.server.test_server import _LOCAL_SERVER_CONFIG
+    from tests.server.server_test_support import _LOCAL_SERVER_CONFIG
 
     from cayu.server import create_server
 
