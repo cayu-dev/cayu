@@ -1,4 +1,8 @@
 {
+  "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_imports_without_adapters_or_driver": 0.772,
+  "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_composes_and_rolls_back_failed_writes[RuntimeError]": 0.744,
+  "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_composes_and_rolls_back_failed_writes[CancelledError]": 0.159,
+  "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_cancellation_retains_writer_until_commit": 0.151,
   "tests/core/test_session_interruption_composition.py::test_session_interruption_imports_without_application_or_engine": 3.036449,
   "tests/core/test_session_interruption_composition.py::test_public_interruption_and_replay_work_without_engine[memory]": 0.401145,
   "tests/core/test_session_interruption_composition.py::test_public_interruption_and_replay_work_without_engine[sqlite]": 0.213341,

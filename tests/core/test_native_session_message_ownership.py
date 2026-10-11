@@ -23,6 +23,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.storage import _sqlite_model_stage as sqlite_model_stage
 
 
 def _assert_import_without_adapters(backend):
@@ -206,7 +207,7 @@ def test_sqlite_queue_operations_compose_with_direct_connection(tmp_path):
                 load_checkpoint=sqlite_adapter._load_checkpoint_state,
                 touch_activity=sqlite_adapter._touch_session_activity,
                 reject_steering=sqlite_adapter._reject_new_work_after_steering,
-                decode_stage_record=sqlite_adapter._decode_model_completion_stage_record,
+                decode_stage_record=sqlite_model_stage.decode_stage_record,
             ),
         )
         try:
