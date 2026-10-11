@@ -20,6 +20,7 @@ from cayu.sessions._checkpoint_preservation import (
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_checkpoint
 from cayu.sessions._interaction_transitions import _copy_optional_interaction_admission
 from cayu.sessions._invocation_scope import _activate_session_run_fence
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
@@ -28,7 +29,6 @@ from cayu.sessions.base import (
     ForkCheckpointAuthorityDecoder,
     SessionOperationInitializer,
     _check_closure_lineage_owner,
-    _initial_transcript_pending_checkpoint,
     _prepare_initial_session_operation_records,
     transform_fork_checkpoint,
 )

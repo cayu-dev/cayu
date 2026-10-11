@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -229,3 +230,49 @@ INTERACTION_TRANSITION_OPERATION_KEY_PREFIX = "__cayu_interaction_transition_v1_
 
 
 INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX = "__cayu_invocation_terminal_event_v1__:"
+
+
+def _active_unexpired_session_operation_id(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> str | None:
+    """Return the active durable operation while its claim lease is valid."""
+
+    if checkpoint is None:
+        return None
+    stored = checkpoint.get("session_operations")
+    if stored is None:
+        return None
+    if type(stored) is not dict:
+        raise ValueError("Session operation checkpoint must be an object.")
+    active_operation_id = stored.get("active_operation_id")
+    if active_operation_id is None:
+        return None
+    active_operation_id = require_clean_nonblank(
+        active_operation_id,
+        "active_operation_id",
+    )
+    records = stored.get("records")
+    if type(records) is not dict:
+        raise ValueError("Session operation checkpoint records must be an object.")
+    active_record = next(
+        (
+            record
+            for record in records.values()
+            if type(record) is dict and record.get("operation_id") == active_operation_id
+        ),
+        None,
+    )
+    if active_record is None:
+        raise ValueError("Active durable session operation record is missing.")
+    claim_expires_at = active_record.get("claim_expires_at")
+    if type(claim_expires_at) is not str:
+        return active_operation_id
+    try:
+        expiry = datetime.fromisoformat(claim_expires_at)
+    except ValueError:
+        return active_operation_id
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        return active_operation_id
+    return active_operation_id if expiry.astimezone(UTC) > now.astimezone(UTC) else None

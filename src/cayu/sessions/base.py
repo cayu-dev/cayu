@@ -32,6 +32,7 @@ from cayu.collaboration.peer_content import (
 )
 from cayu.sessions import _checkpoint_mutations as checkpoint_mutation_rules
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions import _checkpoint_publication as checkpoint_publication
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
@@ -54,6 +55,8 @@ from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions import event_queries as event_query_rules
 from cayu.sessions import forks as session_fork_rules
 from cayu.sessions import inspection as session_inspection_rules
+from cayu.sessions import interactions as interaction_contracts
+from cayu.sessions import messaging as message_rules
 from cayu.sessions import messaging as session_messaging
 from cayu.sessions import queries as session_query_rules
 from cayu.sessions import records as session_record_rules
@@ -83,6 +86,9 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
+)
+from cayu.sessions._checkpoint_publication import (
+    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
 from cayu.sessions._completion_finalization import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY as PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
@@ -281,6 +287,12 @@ from cayu.sessions._runtime_publication import (
 )
 from cayu.sessions._runtime_publication_rules import (
     runtime_publication_request_digest as runtime_publication_request_digest,
+)
+from cayu.sessions._terminal_evidence import (
+    QueuedDispatchTerminalReceipt as QueuedDispatchTerminalReceipt,
+)
+from cayu.sessions._terminal_evidence import (
+    QueuedDispatchTerminalReceiptQuery as QueuedDispatchTerminalReceiptQuery,
 )
 from cayu.sessions.authority import (
     CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS as CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
@@ -999,13 +1011,7 @@ if TYPE_CHECKING:
     )
 
 from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
     SecretStr,
-    StrictInt,
-    field_validator,
-    model_validator,
 )
 
 from cayu._clock import utc_clock, utc_duration_cutoff
@@ -1043,11 +1049,9 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.pricing import PriceBook
 from cayu.events import (
-    EVENT_ID_MAX_CHARS,
     Event,
     EventType,
     copy_event,
-    event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
 from cayu.execution_profiles import (
@@ -1135,7 +1139,6 @@ from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
 from cayu.sessions._terminal_evidence import (
-    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
     classify_current_terminal_evidence,
@@ -1144,10 +1147,6 @@ from cayu.sessions.authority import (
     CheckpointValueAuthority,
     SessionRunFenced,
     checkpoint_value_authority,
-)
-from cayu.sessions.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.invocation import SessionExecutionSource as SessionExecutionSource
 from cayu.sessions.invocation import (
@@ -1483,53 +1482,6 @@ StoreTimeSessionOperationTransform = Callable[
     [Session, dict[str, Any] | None, dict[str, Any] | None, datetime],
     SessionOperationPublication,
 ]
-
-
-class QueuedDispatchTerminalReceipt(BaseModel):
-    """Exact session-side handoff awaiting queue-task acknowledgement."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    session_id: str
-    queue_task_id: str
-    operation_id: str
-    terminal_event_id: str
-
-    @field_validator(
-        "session_id",
-        "queue_task_id",
-        "operation_id",
-        "terminal_event_id",
-    )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        value = require_clean_nonblank(value, info.field_name)
-        if info.field_name == "terminal_event_id" and len(value) > EVENT_ID_MAX_CHARS:
-            raise ValueError("terminal_event_id is too long.")
-        return value
-
-
-class QueuedDispatchTerminalReceiptQuery(BaseModel):
-    """Bounded keyset query for live queued-dispatch handoffs."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    after_session_id: str | None = None
-    after_operation_id: str | None = None
-    limit: StrictInt = Field(default=100, ge=1, le=1000)
-
-    @field_validator("after_session_id", "after_operation_id")
-    @classmethod
-    def validate_optional_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-    @model_validator(mode="after")
-    def require_complete_cursor(self) -> QueuedDispatchTerminalReceiptQuery:
-        if (self.after_session_id is None) != (self.after_operation_id is None):
-            raise ValueError("Queued dispatch receipt cursor fields must be supplied together.")
-        return self
 
 
 def _public_authority_alias_store_key(
@@ -7968,7 +7920,7 @@ class InMemorySessionStore(
     ) -> None:
         previous_keys = self._queued_dispatch_terminal_receipt_keys_by_session.get(session_id, ())
         previous_key_set = set(previous_keys)
-        receipts = _queued_dispatch_terminal_receipts_for_session(
+        receipts = terminal_event_evidence._queued_dispatch_terminal_receipts_for_session(
             session_id,
             checkpoint,
             durable_event_ids=self._event_ids.get(session_id, set()),
@@ -9194,7 +9146,7 @@ class InMemorySessionStore(
                 session = session.model_copy(update={"last_activity_at": now})
                 prepared_checkpoint = self._prepare_checkpoint_store_unlocked(
                     session.id,
-                    _initial_transcript_pending_checkpoint(
+                    checkpoint_publication._initial_transcript_pending_checkpoint(
                         session,
                         interaction_id,
                         checkpoint_transform=checkpoint_transform,
@@ -10637,7 +10589,9 @@ class InMemorySessionStore(
                 "Cannot delete a session while terminal publication "
                 f"{run_operation.operation_id} is incomplete: {session_id}"
             )
-        queued_terminal_receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+        queued_terminal_receipts = (
+            terminal_event_evidence._queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+        )
         if queued_terminal_receipts:
             raise ValueError(
                 "Cannot delete a session while queued dispatch terminal "
@@ -10659,7 +10613,7 @@ class InMemorySessionStore(
             raise ValueError(
                 f"Cannot delete a session while {terminal_publication_block}: {session_id}"
             )
-        active_operation_id = _active_unexpired_session_operation_id(
+        active_operation_id = operation_record_rules._active_unexpired_session_operation_id(
             checkpoint,
             now=deletion_now,
         )
@@ -11537,7 +11491,9 @@ class InMemorySessionStore(
         allowed_statuses = session_record_rules._validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
-        mutation = _prepare_queue_completion_checkpoint_mutation(checkpoint_mutation, to_status)
+        mutation = completion_finalization._prepare_queue_completion_checkpoint_mutation(
+            checkpoint_mutation, to_status
+        )
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -11560,7 +11516,7 @@ class InMemorySessionStore(
             checkpoint = (
                 None
                 if mutation is None
-                else _apply_queue_completion_checkpoint_mutation(
+                else completion_finalization._apply_queue_completion_checkpoint_mutation(
                     session, mutation, self._checkpoints.get(session_id)
                 )
             )
@@ -14280,7 +14236,9 @@ class InMemorySessionStore(
             interaction_started_event,
             profile_handoff,
         )
-        eligible_through = _validate_message_delivery_eligible_through(eligible_through)
+        eligible_through = message_rules._validate_message_delivery_eligible_through(
+            eligible_through
+        )
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
         async with self._lock:
@@ -16777,7 +16735,9 @@ class InMemorySessionStore(
         limit: int = 100,
     ) -> list[EventRecord]:
         session_id = require_clean_nonblank(session_id, "session_id")
-        before_sequence, limit = _validate_interaction_page(before_sequence, limit)
+        before_sequence, limit = interaction_contracts._validate_interaction_page(
+            before_sequence, limit
+        )
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
@@ -17661,7 +17621,7 @@ class InMemorySessionStore(
                         transformed,
                         session_id=session_id,
                     )
-            checkpoint = _checkpoint_after_initial_transcript_publication(
+            checkpoint = checkpoint_publication._checkpoint_after_initial_transcript_publication(
                 current_checkpoint,
                 interaction_id=interaction_id,
             )
@@ -18619,48 +18579,6 @@ def _prepare_initial_session_operation_records(
     return copied
 
 
-def _prepare_queue_completion_checkpoint_mutation(
-    value: dict[str, Any] | None,
-    to_status: SessionStatus,
-) -> RuntimePublicationMutation | None:
-    if value is None:
-        return None
-    if to_status is not SessionStatus.RUNNING:
-        raise ValueError("Queue completion checkpointing must retain running status.")
-    copied = copy_durable_json_object(value, "checkpoint_mutation")
-    completion_finalization._validate_completion_finalization_mutation_shape(copied)
-    mutation = RuntimePublicationMutation.model_validate(copied)
-    completion_finalization.pending_completion_finalization_from_checkpoint(
-        {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: mutation.operations[0].value}
-    )
-    return mutation
-
-
-def _apply_queue_completion_checkpoint_mutation(
-    session: Session,
-    mutation: RuntimePublicationMutation,
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Check durable owner authority under the session lock, then apply the marker CAS."""
-
-    active = active_invocation_execution_profile_from_checkpoint(checkpoint)
-    marker = mutation.operations[0].value
-    if (
-        session.status is not SessionStatus.RUNNING
-        or active is None
-        or active.session_id != session.id
-        or active.run_epoch != session.run_epoch
-        or marker["execution_profile_fingerprint"] != active.profile.fingerprint
-        or marker["environment_name"] != session.environment_name
-    ):
-        raise SessionRunFenced("Queue completion finalization lost its active owner authority.")
-    updated = checkpoint_mutation_rules._apply_runtime_publication_checkpoint_mutation(
-        mutation, checkpoint
-    )
-    assert updated is not None
-    return updated
-
-
 _CHILD_LIFECYCLE_EVENT_TYPE_BY_TERMINAL_STATUS = {
     SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
     SessionStatus.FAILED: EventType.SESSION_FAILED,
@@ -19038,27 +18956,6 @@ def _validate_equivalent_message_delivery(
         raise ValueError("delivery_id was already used for a different queue delivery.")
 
 
-def _validate_message_delivery_eligible_through(value: int | None) -> int | None:
-    if value is None:
-        return None
-    if type(value) is not int or not 0 <= value <= MAX_DURABLE_JSON_INTEGER:
-        raise ValueError(
-            f"eligible_through must be an integer between 0 and {MAX_DURABLE_JSON_INTEGER}."
-        )
-    return value
-
-
-def _validate_interaction_page(
-    before_sequence: int | None,
-    limit: int,
-) -> tuple[int | None, int]:
-    if before_sequence is not None and (type(before_sequence) is not int or before_sequence < 1):
-        raise ValueError("before_sequence must be a positive integer.")
-    if type(limit) is not int or limit < 1 or limit > 5000:
-        raise ValueError("limit must be between 1 and 5000.")
-    return before_sequence, limit
-
-
 def _session_matches_debug_state(
     session: Session,
     records: list[EventRecord],
@@ -19086,7 +18983,6 @@ def _is_tool_debug_event(event_type: EventType | str) -> bool:
 
 # Sessions that must be interrupted before they can be deleted (in-flight work).
 DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
-INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY = "initial_transcript_pending"
 # Storage implementations import these aliases while collecting the same
 # bounded evidence consumed by the shared runtime classifier.
 _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES = TERMINAL_EVIDENCE_EVENT_TYPES
@@ -19174,381 +19070,6 @@ def _terminal_publication_delete_block_reason(
     if terminal_event_required and not terminal_events:
         return "terminal publication evidence is incomplete"
     return None
-
-
-def _initial_transcript_pending_checkpoint(
-    session: Session,
-    interaction_id: str,
-    *,
-    checkpoint_transform: CheckpointTransform | None = None,
-) -> dict[str, Any]:
-    """Create the authority marker held until initial transcript publication."""
-
-    checkpoint = {
-        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-        INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY: {
-            "version": 1,
-            "interaction_id": require_clean_nonblank(interaction_id, "interaction_id"),
-        },
-    }
-    if checkpoint_transform is None:
-        return checkpoint
-    transformed = checkpoint_transform(session, checkpoint)
-    if type(transformed) is not dict:
-        raise TypeError("Initial transcript checkpoint transform must return an object.")
-    return (
-        checkpoint_preservation._replace_checkpoint_preserving_completion_result_event_publications(
-            checkpoint,
-            copy_durable_json_object(transformed, "checkpoint"),
-            session_id=session.id,
-        )
-    )
-
-
-def _initial_transcript_pending_interaction_id(
-    checkpoint: dict[str, Any] | None,
-) -> str | None:
-    if checkpoint is None or INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY not in checkpoint:
-        return None
-    marker = checkpoint[INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY]
-    if type(marker) is not dict or marker.get("version") != 1:
-        raise ValueError("Initial transcript authority marker is invalid.")
-    interaction_id = marker.get("interaction_id")
-    if type(interaction_id) is not str:
-        raise ValueError("Initial transcript authority marker is invalid.")
-    return require_clean_nonblank(interaction_id, "interaction_id")
-
-
-def _checkpoint_after_initial_transcript_publication(
-    checkpoint: dict[str, Any] | None,
-    *,
-    interaction_id: str,
-) -> dict[str, Any] | None:
-    pending_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
-    if pending_interaction_id is None:
-        # Deferred admission is also used after session creation, when there is
-        # no environment-derived bootstrap authority to protect.
-        return checkpoint
-    if pending_interaction_id != interaction_id:
-        raise RuntimeError("Initial transcript authority changed before finalization.")
-    assert checkpoint is not None
-    updated = copy_durable_json_object(checkpoint, "checkpoint")
-    updated.pop(INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY)
-    return updated or None
-
-
-_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
-_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY = "queued_dispatch_terminal_receipts"
-
-
-@dataclass(frozen=True)
-class _QueuedDispatchTerminalReceiptIdentity:
-    queue_task_id: str
-    terminal_event_id: str
-    run_epoch: int
-
-
-def _queued_dispatch_terminal_receipts_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, _QueuedDispatchTerminalReceiptIdentity]:
-    """Parse terminal evidence retained until its queue task is acknowledged."""
-
-    if checkpoint is None or _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY not in checkpoint:
-        return {}
-    marker = checkpoint[_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY]
-    if type(marker) is not dict or set(marker) != {"version", "receipts"}:
-        raise ValueError("Queued dispatch terminal receipt checkpoint is invalid.")
-    if marker.get("version") != 1 or type(marker.get("receipts")) is not dict:
-        raise ValueError("Queued dispatch terminal receipt checkpoint is invalid.")
-    receipts: dict[str, _QueuedDispatchTerminalReceiptIdentity] = {}
-    for operation_id, receipt in marker["receipts"].items():
-        operation_id = require_clean_nonblank(
-            operation_id,
-            "queued_dispatch_terminal_receipt.operation_id",
-        )
-        if type(receipt) is not dict or set(receipt) != {
-            "queue_task_id",
-            "terminal_event_id",
-            "run_epoch",
-        }:
-            raise ValueError("Queued dispatch terminal receipt is invalid.")
-        queue_task_id = require_clean_nonblank(
-            receipt.get("queue_task_id"),
-            "queued_dispatch_terminal_receipt.queue_task_id",
-        )
-        terminal_event_id = require_clean_nonblank(
-            receipt.get("terminal_event_id"),
-            "queued_dispatch_terminal_receipt.terminal_event_id",
-        )
-        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
-            raise ValueError("Queued dispatch terminal receipt event identity is too long.")
-        run_epoch = receipt.get("run_epoch")
-        if type(run_epoch) is not int or run_epoch < 1 or run_epoch > MAX_DURABLE_JSON_INTEGER:
-            raise ValueError("Queued dispatch terminal receipt run_epoch is invalid.")
-        receipts[operation_id] = _QueuedDispatchTerminalReceiptIdentity(
-            queue_task_id=queue_task_id,
-            terminal_event_id=terminal_event_id,
-            run_epoch=run_epoch,
-        )
-    return receipts
-
-
-def _queued_dispatch_terminal_receipts_for_session(
-    session_id: str,
-    checkpoint: dict[str, Any] | None,
-    *,
-    durable_event_ids: set[str],
-) -> list[QueuedDispatchTerminalReceipt]:
-    """Project all exact live queue/session handoffs from one checkpoint."""
-
-    session_id = require_clean_nonblank(session_id, "session_id")
-    projected: dict[str, QueuedDispatchTerminalReceipt] = {}
-    run_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
-    if (
-        run_operation is not None
-        and run_operation.queue_task_id is not None
-        and run_operation.terminal_event_id is not None
-        and run_operation.terminal_event_id in durable_event_ids
-    ):
-        projected[run_operation.operation_id] = QueuedDispatchTerminalReceipt(
-            session_id=session_id,
-            queue_task_id=run_operation.queue_task_id,
-            operation_id=run_operation.operation_id,
-            terminal_event_id=run_operation.terminal_event_id,
-        )
-    for operation_id, receipt in _queued_dispatch_terminal_receipts_from_checkpoint(
-        checkpoint
-    ).items():
-        candidate = QueuedDispatchTerminalReceipt(
-            session_id=session_id,
-            queue_task_id=receipt.queue_task_id,
-            operation_id=operation_id,
-            terminal_event_id=receipt.terminal_event_id,
-        )
-        existing = projected.get(operation_id)
-        if existing is not None and existing != candidate:
-            raise RuntimeError("Queued dispatch terminal handoff identity conflicts.")
-        projected[operation_id] = candidate
-    return list(projected.values())
-
-
-def _checkpoint_after_session_run_operation_cleanup(
-    checkpoint: dict[str, Any] | None,
-    *,
-    operation: terminal_event_evidence._SessionRunOperation,
-    retain_terminal_receipt: bool,
-) -> dict[str, Any]:
-    """Clear run ownership and optionally transfer terminal retention to the queue."""
-
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    updated.pop(terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
-    if not retain_terminal_receipt or operation.terminal_event_id is None:
-        return updated
-    receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
-    if operation.queue_task_id is None:
-        return updated
-    receipt = _QueuedDispatchTerminalReceiptIdentity(
-        queue_task_id=operation.queue_task_id,
-        terminal_event_id=operation.terminal_event_id,
-        run_epoch=operation.run_epoch,
-    )
-    existing = receipts.get(operation.operation_id)
-    if existing not in {None, receipt}:
-        raise RuntimeError("Queued dispatch terminal receipt identity conflicts.")
-    receipts[operation.operation_id] = receipt
-    updated[_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY] = {
-        "version": 1,
-        "receipts": {
-            operation_id: {
-                "queue_task_id": stored_receipt.queue_task_id,
-                "terminal_event_id": stored_receipt.terminal_event_id,
-                "run_epoch": stored_receipt.run_epoch,
-            }
-            for operation_id, stored_receipt in receipts.items()
-        },
-    }
-    return updated
-
-
-def _checkpoint_after_queued_dispatch_acknowledgement(
-    checkpoint: dict[str, Any] | None,
-    *,
-    queue_task_id: str,
-    operation_id: str,
-    terminal_event_id: str,
-) -> dict[str, Any] | None:
-    """Release exact queue-owned terminal retention after task terminalization."""
-
-    queue_task_id = require_clean_nonblank(queue_task_id, "dispatch queue_task_id")
-    operation_id = require_clean_nonblank(operation_id, "dispatch operation_id")
-    terminal_event_id = require_clean_nonblank(
-        terminal_event_id,
-        "dispatch terminal_event_id",
-    )
-    current_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
-    receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
-    receipt = receipts.get(operation_id)
-    if receipt is not None and (
-        receipt.queue_task_id != queue_task_id or receipt.terminal_event_id != terminal_event_id
-    ):
-        raise RuntimeError("Queued dispatch terminal receipt identity conflicts.")
-    if current_operation is not None and current_operation.operation_id == operation_id:
-        if (
-            current_operation.queue_task_id != queue_task_id
-            or current_operation.terminal_event_id != terminal_event_id
-        ):
-            raise RuntimeError("Queued dispatch run operation identity conflicts.")
-    elif receipt is None:
-        return None
-
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    if current_operation is not None and current_operation.operation_id == operation_id:
-        updated.pop(terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
-    if receipt is not None:
-        receipts.pop(operation_id)
-        if receipts:
-            updated[_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY] = {
-                "version": 1,
-                "receipts": {
-                    stored_operation_id: {
-                        "queue_task_id": stored_receipt.queue_task_id,
-                        "terminal_event_id": stored_receipt.terminal_event_id,
-                        "run_epoch": stored_receipt.run_epoch,
-                    }
-                    for stored_operation_id, stored_receipt in receipts.items()
-                },
-            }
-        else:
-            updated.pop(_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY, None)
-    # ``transform_checkpoint`` reserves ``None`` for a read-only callback, so an
-    # empty object is the required mutation that clears the final receipt.
-    return updated
-
-
-def _checkpoint_with_session_run_operation(
-    *,
-    checkpoint: dict[str, Any] | None,
-    current_session: Session,
-    operation_id: str,
-    terminal_event_id: str | None = None,
-    queue_task_id: str | None = None,
-) -> dict[str, Any]:
-    """Record the next running epoch in the same transaction as its status claim."""
-    operation_id = require_clean_nonblank(operation_id, "session run operation_id")
-    if terminal_event_id is not None:
-        terminal_event_id = require_clean_nonblank(
-            terminal_event_id,
-            "session run terminal_event_id",
-        )
-        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
-            raise ValueError("Session run terminal_event_id is too long.")
-    if queue_task_id is not None:
-        queue_task_id = require_clean_nonblank(
-            queue_task_id,
-            "session run queue_task_id",
-        )
-        if terminal_event_id is None:
-            raise ValueError("Session run queue_task_id requires a terminal_event_id.")
-    existing_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
-    if existing_operation is not None:
-        raise RuntimeError(
-            "Session has incomplete terminal evidence for its previous run. "
-            "Recover the session before starting another run."
-        )
-    if queue_task_id is not None:
-        receipt = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint).get(operation_id)
-        if receipt is not None:
-            if (
-                receipt.queue_task_id != queue_task_id
-                or receipt.terminal_event_id != terminal_event_id
-            ):
-                raise RuntimeError("Queued dispatch terminal receipt identity conflicts.")
-            raise SessionRunFenced(
-                "Queued dispatch terminal evidence is awaiting queue acknowledgement."
-            )
-    next_run_epoch = current_session.run_epoch + 1
-    if next_run_epoch > MAX_DURABLE_JSON_INTEGER:
-        raise ValueError("Session run operation run_epoch exceeds the durable integer limit.")
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    marker: dict[str, Any] = {
-        "version": 1,
-        "operation_id": operation_id,
-        "run_epoch": next_run_epoch,
-    }
-    if terminal_event_id is not None:
-        marker["terminal_event_id"] = terminal_event_id
-    if queue_task_id is not None:
-        marker["queue_task_id"] = queue_task_id
-    updated[terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY] = marker
-    return updated
-
-
-def _event_with_session_run_operation(
-    event: Event,
-    operation: terminal_event_evidence._SessionRunOperation,
-) -> Event:
-    """Bind terminal evidence to the durable run operation that produced it."""
-    payload = copy_durable_json_object(event.payload, "event payload")
-    existing_operation_id = payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
-    if existing_operation_id not in {None, operation.operation_id}:
-        raise ValueError("Terminal event carries a conflicting session run operation identity.")
-    payload[_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = operation.operation_id
-    updates: dict[str, Any] = {"payload": payload}
-    if operation.terminal_event_id is not None:
-        updates["id"] = operation.terminal_event_id
-    bound = event.model_copy(update=updates, deep=True)
-    if operation.terminal_event_id is not None:
-        bound = event_with_runtime_generated_id(bound)
-    return event_with_runtime_payload_authority(
-        bound,
-        _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    )
-
-
-def _active_unexpired_session_operation_id(
-    checkpoint: dict[str, Any] | None,
-    *,
-    now: datetime,
-) -> str | None:
-    """Return the active durable operation while its claim lease is valid."""
-
-    if checkpoint is None:
-        return None
-    stored = checkpoint.get("session_operations")
-    if stored is None:
-        return None
-    if type(stored) is not dict:
-        raise ValueError("Session operation checkpoint must be an object.")
-    active_operation_id = stored.get("active_operation_id")
-    if active_operation_id is None:
-        return None
-    active_operation_id = require_clean_nonblank(
-        active_operation_id,
-        "active_operation_id",
-    )
-    records = stored.get("records")
-    if type(records) is not dict:
-        raise ValueError("Session operation checkpoint records must be an object.")
-    active_record = next(
-        (
-            record
-            for record in records.values()
-            if type(record) is dict and record.get("operation_id") == active_operation_id
-        ),
-        None,
-    )
-    if active_record is None:
-        raise ValueError("Active durable session operation record is missing.")
-    claim_expires_at = active_record.get("claim_expires_at")
-    if type(claim_expires_at) is not str:
-        return active_operation_id
-    try:
-        expiry = datetime.fromisoformat(claim_expires_at)
-    except ValueError:
-        return active_operation_id
-    if expiry.tzinfo is None or expiry.utcoffset() is None:
-        return active_operation_id
-    return active_operation_id if expiry.astimezone(UTC) > now.astimezone(UTC) else None
 
 
 def _event_record_matches_session(

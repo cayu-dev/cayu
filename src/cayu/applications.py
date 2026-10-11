@@ -562,12 +562,14 @@ from cayu.sessions._model_stage import (
     copy_model_completion_manual_recovery_request,
 )
 from cayu.sessions._session_continuation import ContinuationTicket
+from cayu.sessions._terminal_evidence import (
+    QueuedDispatchTerminalReceipt,
+    QueuedDispatchTerminalReceiptQuery,
+)
 from cayu.sessions.base import (
     _RECIPIENT_PROVENANCE_CAPABILITY,
     InMemorySessionStore,
     ModelTarget,
-    QueuedDispatchTerminalReceipt,
-    QueuedDispatchTerminalReceiptQuery,
     SessionRunFenced,
     SessionStore,
 )

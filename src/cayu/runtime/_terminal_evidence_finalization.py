@@ -84,16 +84,14 @@ from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+    _checkpoint_after_session_run_operation_cleanup,
+    _event_with_session_run_operation,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import (
-    SessionStore,
-    _checkpoint_after_session_run_operation_cleanup,
-    _event_with_session_run_operation,
-)
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,

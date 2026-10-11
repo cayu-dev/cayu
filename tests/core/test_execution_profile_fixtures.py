@@ -10,7 +10,8 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.sessions.base import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY, InMemorySessionStore
+from cayu.sessions._checkpoint_publication import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

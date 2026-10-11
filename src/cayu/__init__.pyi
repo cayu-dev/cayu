@@ -3891,6 +3891,9 @@ from cayu.session_external_waits import SessionExternalWaitReceipt as SessionExt
 from cayu.sessions._access_rules import SessionAccessRule as SessionAccessRule
 from cayu.sessions._access_rules import SessionAccessScope as SessionAccessScope
 from cayu.sessions._access_rules import SessionAccessSelector as SessionAccessSelector
+from cayu.sessions._checkpoint_publication import (
+    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
 )
@@ -3940,9 +3943,6 @@ from cayu.sessions.authority import CheckpointRootFieldProjection as CheckpointR
 from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
 from cayu.sessions.authority import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
-)
-from cayu.sessions.base import (
-    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy

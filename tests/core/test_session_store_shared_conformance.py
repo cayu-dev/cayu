@@ -231,6 +231,7 @@ from cayu.sessions import _model_stage_rules as model_stage_rules
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
@@ -273,13 +274,15 @@ from cayu.sessions._runtime_publication import (
     RuntimePublicationRequest,
     runtime_publication_event_reference,
 )
+from cayu.sessions._terminal_evidence import (
+    QueuedDispatchTerminalReceiptQuery,
+    _checkpoint_with_session_run_operation,
+)
 from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
     InMemorySessionStore,
     ModelTarget,
-    QueuedDispatchTerminalReceiptQuery,
     SessionStore,
-    _checkpoint_with_session_run_operation,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -3439,7 +3442,7 @@ def test_in_memory_queued_dispatch_receipt_query_uses_live_index(
             raise AssertionError("receipt query rescanned checkpoint/event history")
 
         monkeypatch.setattr(
-            sessions_module,
+            terminal_event_evidence,
             "_queued_dispatch_terminal_receipts_for_session",
             reject_history_projection,
         )

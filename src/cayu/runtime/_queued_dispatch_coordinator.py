@@ -30,16 +30,13 @@ from cayu.sessions._model_stage import ActiveModelCompletionStage
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
-    _session_run_operation_from_checkpoint,
-)
-from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
-    SessionRunFenced,
-    SessionStore,
     _checkpoint_after_queued_dispatch_acknowledgement,
     _queued_dispatch_terminal_receipts_from_checkpoint,
+    _session_run_operation_from_checkpoint,
 )
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import (

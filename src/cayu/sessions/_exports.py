@@ -172,7 +172,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ForkSystemPromptPolicy": ("cayu.sessions.forks", "ForkSystemPromptPolicy"),
     "ForkSystemPromptReplacement": ("cayu.sessions.forks", "ForkSystemPromptReplacement"),
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_publication",
         "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY",
     ),
     "InMemorySessionStore": ("cayu.sessions.base", "InMemorySessionStore"),

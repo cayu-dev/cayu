@@ -16,9 +16,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import (
-    _initial_transcript_pending_interaction_id,
-)
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions.records import (
     Session,
     SessionStatus,

@@ -811,6 +811,9 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions._checkpoint_publication import (
+    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
 )
@@ -963,9 +966,6 @@ from cayu.sessions.authority import CheckpointRootFieldProjection as CheckpointR
 from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
 from cayu.sessions.authority import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
-)
-from cayu.sessions.base import (
-    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import ModelTarget as ModelTarget

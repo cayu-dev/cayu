@@ -95,10 +95,8 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
 )
-from cayu.sessions.base import (
-    _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    SessionStore,
-)
+from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import (

@@ -9,6 +9,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -20,6 +21,19 @@ _MODULES = (
     "_invocation_terminal_decision",
     "_provider_operation_cancellation_claim",
 )
+_HISTORICAL_EXPORTS = {
+    "_model_completion_publication": (
+        "ModelStepPublicationCheckpoint",
+        "model_step_publication_from_checkpoint",
+    ),
+    "_terminal_evidence": (
+        "CurrentTerminalEvidence",
+        "classify_current_terminal_evidence",
+        "interruption_request_id_from_payload",
+        "queued_dispatch_terminal_event_id",
+        "require_interruption_event_matches_pending_marker",
+    ),
+}
 _CONSTANTS = {
     "_model_completion_publication": (
         "LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY",
@@ -43,13 +57,8 @@ _CONSTANTS = {
 def test_runtime_compatibility_imports_share_canonical_contracts(module_name):
     canonical = importlib.import_module(f"cayu.sessions.{module_name}")
     legacy = importlib.import_module(f"cayu.runtime.{module_name}")
-    # Model-stage settlement contracts came from sessions.base; only these
-    # publication-pointer contracts historically had runtime import paths.
-    names = (
-        ("ModelStepPublicationCheckpoint", "model_step_publication_from_checkpoint")
-        if module_name == "_model_completion_publication"
-        else vars(canonical)
-    )
+    # Contracts moved from sessions.base never had runtime import paths.
+    names = _HISTORICAL_EXPORTS.get(module_name, vars(canonical))
     for name in names:
         value = getattr(canonical, name)
         if name.startswith("_"):
@@ -59,6 +68,21 @@ def test_runtime_compatibility_imports_share_canonical_contracts(module_name):
             assert pickle.loads(f"c{legacy.__name__}\n{name}\n.".encode()) is value
     for name in _CONSTANTS.get(module_name, ()):
         assert getattr(legacy, name) is getattr(canonical, name)
+
+
+def test_session_evidence_annotations_resolve_without_custom_namespaces():
+    from cayu.sessions._completion_finalization import (
+        _apply_queue_completion_checkpoint_mutation,
+        _prepare_queue_completion_checkpoint_mutation,
+    )
+    from cayu.sessions._terminal_evidence import _checkpoint_with_session_run_operation
+    from cayu.sessions.records import Session, SessionStatus
+
+    assert get_type_hints(_checkpoint_with_session_run_operation)["current_session"] is Session
+    assert get_type_hints(_apply_queue_completion_checkpoint_mutation)["session"] is Session
+    assert (
+        get_type_hints(_prepare_queue_completion_checkpoint_mutation)["to_status"] is SessionStatus
+    )
 
 
 def test_old_pickled_evidence_preserves_serialized_authority():

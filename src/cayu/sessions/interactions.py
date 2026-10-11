@@ -206,3 +206,14 @@ class InteractionSummaryEvidence(BaseModel):
         if self.completed_at is not None and self.completed_at < self.started_at:
             raise ValueError("completed_at must not precede started_at.")
         return self
+
+
+def _validate_interaction_page(
+    before_sequence: int | None,
+    limit: int,
+) -> tuple[int | None, int]:
+    if before_sequence is not None and (type(before_sequence) is not int or before_sequence < 1):
+        raise ValueError("before_sequence must be a positive integer.")
+    if type(limit) is not int or limit < 1 or limit > 5000:
+        raise ValueError("limit must be between 1 and 5000.")
+    return before_sequence, limit

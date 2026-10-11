@@ -619,7 +619,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "HumanReviewSource": ("cayu.approvals.review", "HumanReviewSource"),
     "HumanReviewView": ("cayu.approvals.review", "HumanReviewView"),
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_publication",
         "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY",
     ),
     "INVOCATION_LIFECYCLE_COMMAND_VERSION": (

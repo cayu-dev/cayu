@@ -418,6 +418,10 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_read_scope,
 )
+from cayu.sessions._checkpoint_publication import (
+    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
+    _initial_transcript_pending_interaction_id,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
@@ -481,18 +485,11 @@ from cayu.sessions._model_stage import (
 )
 from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._terminal_evidence import (
-    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
-)
-from cayu.sessions.base import (
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
-    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
-    ModelFailoverPolicy,
-    ModelTarget,
-    SessionRunFenced,
-    SessionStore,
+    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _checkpoint_with_session_run_operation,
-    _initial_transcript_pending_interaction_id,
 )
+from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced, SessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

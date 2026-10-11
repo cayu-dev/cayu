@@ -205,6 +205,7 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
 )
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -230,11 +231,7 @@ from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
     classify_current_terminal_evidence,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _initial_transcript_pending_interaction_id,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata

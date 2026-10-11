@@ -132,6 +132,10 @@ from cayu.sessions._checkpoint_preservation import (
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
+from cayu.sessions._completion_finalization import (
+    _apply_queue_completion_checkpoint_mutation,
+    _prepare_queue_completion_checkpoint_mutation,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
 )
@@ -250,6 +254,7 @@ from cayu.sessions._model_stage_rules import (
 from cayu.sessions._operation_records import (
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SessionOperationPublication,
+    _active_unexpired_session_operation_id,
     _apply_runtime_publication_operation_record_mutations,
     _reject_reserved_runtime_publication_key,
     _validate_session_operation_record_keys,
@@ -274,7 +279,12 @@ from cayu.sessions._runtime_publication_rules import (
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_replay_receipt,
 )
-from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
+from cayu.sessions._terminal_evidence import (
+    QueuedDispatchTerminalReceipt,
+    QueuedDispatchTerminalReceiptQuery,
+    _queued_dispatch_terminal_receipts_from_checkpoint,
+    _session_run_operation_from_checkpoint,
+)
 from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _tool_lifecycle_publication_identity,
@@ -295,21 +305,15 @@ from cayu.sessions.base import (
     DELETE_BLOCKED_SESSION_STATUSES,
     BudgetReservationIdentityConflict,
     ForkCheckpointAuthorityDecoder,
-    QueuedDispatchTerminalReceipt,
-    QueuedDispatchTerminalReceiptQuery,
     SessionOperationInitializer,
     SessionOperationTransform,
     SessionRunFenced,
     SessionStore,
     StoreTimeSessionOperationTransform,
-    _active_unexpired_session_operation_id,
-    _apply_queue_completion_checkpoint_mutation,
     _child_session_notification_consumption_record,
     _child_session_notification_consumption_replays,
     _durable_subagent_parent_delete_block_reason,
-    _prepare_queue_completion_checkpoint_mutation,
     _project_interruption_cascade_marker_fields,
-    _queued_dispatch_terminal_receipts_from_checkpoint,
     _require_session_export_target,
     _terminal_publication_delete_block_reason,
     _validate_inactive_for_seconds,

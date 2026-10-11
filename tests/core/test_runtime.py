@@ -280,13 +280,8 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ModelTarget,
-    SessionRunFenced,
-    SessionStore,
-    _checkpoint_with_session_run_operation,
-)
+from cayu.sessions._terminal_evidence import _checkpoint_with_session_run_operation
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,

@@ -36,6 +36,7 @@ from cayu.runtime._work_attempt_session_mutation import (
     settle_work_attempt_session_mutation,
 )
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
@@ -58,11 +59,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _initial_transcript_pending_interaction_id,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.sessions.recovery import (

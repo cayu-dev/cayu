@@ -282,16 +282,13 @@ from cayu.sessions._model_stage_rules import model_completion_stage_settlement_r
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+    _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    _event_with_session_run_operation,
     _session_run_operation_from_checkpoint,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import (
-    _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    SessionRunFenced,
-    SessionStore,
-    _event_with_session_run_operation,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
 )

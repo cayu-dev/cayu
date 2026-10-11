@@ -2747,7 +2747,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "HumanReviewView": ("cayu.approvals.review", "HumanReviewView"),
     "IMMUTABLE_INPUT_FORMAT_VERSION": ("cayu.immutable_inputs", "IMMUTABLE_INPUT_FORMAT_VERSION"),
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_publication",
         "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY",
     ),
     "ImageArtifactReader": ("cayu.tools.files", "ImageArtifactReader"),

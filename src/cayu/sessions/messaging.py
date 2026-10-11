@@ -680,3 +680,13 @@ def enqueue_session_message_input(request: EnqueueSessionMessageRequest) -> Mess
     if request.message is not None:
         return detach_message(request.message)
     return Message.text(MessageRole.USER, request.content)
+
+
+def _validate_message_delivery_eligible_through(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError(
+            f"eligible_through must be an integer between 0 and {MAX_DURABLE_JSON_INTEGER}."
+        )
+    return value

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 import cayu
 
@@ -102,5 +106,89 @@ rejected(lambda: _copy_pending_first_event_delivery(pending.model_copy(update={"
 assert _copy_optional_event_id(None, "event") is None
 assert _copy_optional_event_id("event", "event") == "event"
 rejected(lambda: _copy_optional_event_id("x" * 10000, "event"))
+"""
+    )
+
+
+@pytest.mark.parametrize(
+    "name", ("QueuedDispatchTerminalReceipt", "QueuedDispatchTerminalReceiptQuery")
+)
+def test_queued_dispatch_public_types_keep_identity_and_historical_pickles(name):
+    canonical = getattr(importlib.import_module("cayu.sessions._terminal_evidence"), name)
+    assert getattr(importlib.import_module("cayu.sessions.base"), name) is canonical
+    assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
+    assert pickle.loads(pickle.dumps(canonical)) is canonical
+
+
+def test_queued_run_receipts_transfer_and_release_exact_retention_without_stores():
+    _without_implementations(
+        """
+from tests._session_provenance import session_fixture
+from cayu.events import Event, EventType
+from cayu.sessions import _terminal_evidence as rules
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.records import SessionStatus
+
+session = session_fixture(id="session", agent_name="agent", provider_name="fake", model="fake",
+    status=SessionStatus.PENDING, run_epoch=2)
+operation_id = "a" * 64
+event_id = rules.queued_dispatch_terminal_event_id(operation_id)
+checkpoint = rules._checkpoint_with_session_run_operation(checkpoint=None,
+    current_session=session, operation_id=operation_id, terminal_event_id=event_id,
+    queue_task_id="task")
+operation = rules._session_run_operation_from_checkpoint(checkpoint)
+assert operation.run_epoch == 3
+bound = rules._event_with_session_run_operation(
+    Event(type=EventType.SESSION_COMPLETED, session_id=session.id), operation)
+assert bound.id == event_id
+assert bound.payload[rules.SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] == operation_id
+retained = rules._checkpoint_after_session_run_operation_cleanup(checkpoint,
+    operation=operation, retain_terminal_receipt=True)
+assert rules._session_run_operation_from_checkpoint(retained) is None
+receipts = rules._queued_dispatch_terminal_receipts_for_session(session.id, retained,
+    durable_event_ids={event_id})
+assert len(receipts) == 1 and receipts[0].queue_task_id == "task"
+rejected(lambda: rules._checkpoint_with_session_run_operation(checkpoint=retained,
+    current_session=session, operation_id=operation_id, terminal_event_id=event_id,
+    queue_task_id="task"), SessionRunFenced)
+rejected(lambda: rules._checkpoint_after_queued_dispatch_acknowledgement(retained,
+    queue_task_id="other", operation_id=operation_id, terminal_event_id=event_id), RuntimeError)
+cleared = rules._checkpoint_after_queued_dispatch_acknowledgement(retained,
+    queue_task_id="task", operation_id=operation_id, terminal_event_id=event_id)
+assert cleared == {}
+assert rules._checkpoint_after_queued_dispatch_acknowledgement(cleared,
+    queue_task_id="task", operation_id=operation_id, terminal_event_id=event_id) is None
+"""
+    )
+
+
+def test_transcript_and_queue_finalization_rules_keep_exact_authority_without_stores():
+    _without_implementations(
+        """
+from tests._session_provenance import session_fixture
+from cayu.sessions import _checkpoint_publication as transcript
+from cayu.sessions import _completion_finalization as completion
+from cayu.sessions.records import SessionStatus
+from cayu.sessions.authority import SessionRunFenced
+
+session = session_fixture(id="session", agent_name="agent", provider_name="fake", model="fake",
+    status=SessionStatus.RUNNING, run_epoch=1)
+checkpoint = transcript._initial_transcript_pending_checkpoint(session, "interaction")
+rejected(lambda: transcript._checkpoint_after_initial_transcript_publication(checkpoint,
+    interaction_id="different"), RuntimeError)
+completed = transcript._checkpoint_after_initial_transcript_publication(checkpoint,
+    interaction_id="interaction")
+assert transcript._initial_transcript_pending_interaction_id(checkpoint) == "interaction"
+assert transcript._initial_transcript_pending_interaction_id(completed) is None
+key = completion.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+marker = dict(version=1, outcome="completed", environment_name="environment",
+    binding_generation_id="generation", execution_profile_fingerprint="profile", binding_state={})
+raw = dict(operations=[dict(key=key, expected_value_digest=None, action="set", value=marker)])
+prepared = completion._prepare_queue_completion_checkpoint_mutation(raw, SessionStatus.RUNNING)
+marker["binding_state"]["changed"] = True
+assert prepared.operations[0].value["binding_state"] == {}
+rejected(lambda: completion._prepare_queue_completion_checkpoint_mutation(raw, SessionStatus.COMPLETED))
+rejected(lambda: completion._apply_queue_completion_checkpoint_mutation(session, prepared, None),
+    SessionRunFenced)
 """
     )

@@ -110,6 +110,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     execution_profile_session_metadata,
@@ -125,7 +126,6 @@ from cayu.sessions.base import (
     ModelTarget,
     SessionRunFenced,
     SessionStore,
-    _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import (

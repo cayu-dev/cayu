@@ -97,6 +97,7 @@ from cayu.sessions import _model_completion_publication as model_completion_publ
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
@@ -125,11 +126,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _initial_transcript_pending_interaction_id,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.creation import (
     run_request_with_prepared_work_attempt_creation,
     session_invocation_for_run_request,

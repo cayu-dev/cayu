@@ -8,11 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import cayu.sessions as sessions
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     require_clean_nonblank,
 )
+from cayu.sessions import _checkpoint_mutations as checkpoint_mutation_rules
+from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions.authority import SessionRunFenced
 
 PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY = "pending_completion_finalization"
 _MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES = 4 * 1024 * 1024
@@ -86,3 +93,45 @@ def _validate_completion_finalization_mutation_shape(value: dict[str, Any]) -> N
         or type(operation.get("value")) is not dict
     ):
         raise ValueError("A completion-finalization transition must install a new pending marker.")
+
+
+def _prepare_queue_completion_checkpoint_mutation(
+    value: dict[str, Any] | None,
+    to_status: sessions.SessionStatus,
+) -> RuntimePublicationMutation | None:
+    if value is None:
+        return None
+    if to_status is not sessions.SessionStatus.RUNNING:
+        raise ValueError("Queue completion checkpointing must retain running status.")
+    copied = copy_durable_json_object(value, "checkpoint_mutation")
+    _validate_completion_finalization_mutation_shape(copied)
+    mutation = RuntimePublicationMutation.model_validate(copied)
+    pending_completion_finalization_from_checkpoint(
+        {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: mutation.operations[0].value}
+    )
+    return mutation
+
+
+def _apply_queue_completion_checkpoint_mutation(
+    session: sessions.Session,
+    mutation: RuntimePublicationMutation,
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Check durable owner authority under the session lock, then apply the marker CAS."""
+
+    active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    marker = mutation.operations[0].value
+    if (
+        session.status is not sessions.SessionStatus.RUNNING
+        or active is None
+        or active.session_id != session.id
+        or active.run_epoch != session.run_epoch
+        or marker["execution_profile_fingerprint"] != active.profile.fingerprint
+        or marker["environment_name"] != session.environment_name
+    ):
+        raise SessionRunFenced("Queue completion finalization lost its active owner authority.")
+    updated = checkpoint_mutation_rules._apply_runtime_publication_checkpoint_mutation(
+        mutation, checkpoint
+    )
+    assert updated is not None
+    return updated

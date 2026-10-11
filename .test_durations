@@ -16,6 +16,10 @@
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[RuntimeError]": 0.166,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[CancelledError]": 0.204,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_cancellation_retains_writer_until_commit": 0.201,
+  "tests/core/test_session_delivery_rules_layout.py::test_queued_dispatch_public_types_keep_identity_and_historical_pickles[QueuedDispatchTerminalReceiptQuery]": 0.00019687600433826447,
+  "tests/core/test_session_delivery_rules_layout.py::test_queued_dispatch_public_types_keep_identity_and_historical_pickles[QueuedDispatchTerminalReceipt]": 0.0012782489648088813,
+  "tests/core/test_session_delivery_rules_layout.py::test_queued_run_receipts_transfer_and_release_exact_retention_without_stores": 0.17697366699576378,
+  "tests/core/test_session_delivery_rules_layout.py::test_transcript_and_queue_finalization_rules_keep_exact_authority_without_stores": 0.25575170892989263,
   "tests/core/test_session_delivery_rules_layout.py::test_completion_event_reservations_compose_without_stores": 0.6095200409763493,
   "tests/core/test_session_delivery_rules_layout.py::test_first_event_delivery_validates_exact_unclaimed_attempt_without_stores": 0.11914887599414214,
   "tests/core/test_model_stage_rules_layout.py::test_model_stage_runtime_annotations_resolve[cayu.runtime-inspect_provider_operation-session_store-cayu.sessions.base-SessionStore]": 0.02617462503258139,
@@ -46267,5 +46271,6 @@
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-fork_session_invocation]": 0.0003287490108050406,
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-validate_profiled_fork_evidence]": 0.000335542019456625,
     "tests/core/test_session_creation_rules_layout.py::test_fork_profile_and_model_selection_without_execution": 0.5996532079880126,
-    "tests/core/test_session_creation_rules_layout.py::test_fork_source_validation_without_implementations": 0.7179176660720259
+    "tests/core/test_session_creation_rules_layout.py::test_fork_source_validation_without_implementations": 0.7179176660720259,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_annotations_resolve_without_custom_namespaces": 0.051036583026871085
 }

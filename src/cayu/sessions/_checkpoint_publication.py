@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu._validation import copy_durable_json_object
+from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
@@ -330,3 +331,69 @@ def _runtime_publication_checkpoint_codec_scope(
 
 def _active_runtime_publication_checkpoint_codec() -> _RuntimePublicationCheckpointCodec | None:
     return _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.get()
+
+
+INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY = "initial_transcript_pending"
+
+
+def _initial_transcript_pending_checkpoint(
+    session: Session,
+    interaction_id: str,
+    *,
+    checkpoint_transform: CheckpointTransform | None = None,
+) -> dict[str, Any]:
+    """Create the authority marker held until initial transcript publication."""
+
+    checkpoint = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY: {
+            "version": 1,
+            "interaction_id": require_clean_nonblank(interaction_id, "interaction_id"),
+        },
+    }
+    if checkpoint_transform is None:
+        return checkpoint
+    from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+
+    transformed = checkpoint_transform(session, checkpoint)
+    if type(transformed) is not dict:
+        raise TypeError("Initial transcript checkpoint transform must return an object.")
+    return (
+        checkpoint_preservation._replace_checkpoint_preserving_completion_result_event_publications(
+            checkpoint,
+            copy_durable_json_object(transformed, "checkpoint"),
+            session_id=session.id,
+        )
+    )
+
+
+def _initial_transcript_pending_interaction_id(
+    checkpoint: dict[str, Any] | None,
+) -> str | None:
+    if checkpoint is None or INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY not in checkpoint:
+        return None
+    marker = checkpoint[INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY]
+    if type(marker) is not dict or marker.get("version") != 1:
+        raise ValueError("Initial transcript authority marker is invalid.")
+    interaction_id = marker.get("interaction_id")
+    if type(interaction_id) is not str:
+        raise ValueError("Initial transcript authority marker is invalid.")
+    return require_clean_nonblank(interaction_id, "interaction_id")
+
+
+def _checkpoint_after_initial_transcript_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    interaction_id: str,
+) -> dict[str, Any] | None:
+    pending_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
+    if pending_interaction_id is None:
+        # Deferred admission is also used after session creation, when there is
+        # no environment-derived bootstrap authority to protect.
+        return checkpoint
+    if pending_interaction_id != interaction_id:
+        raise RuntimeError("Initial transcript authority changed before finalization.")
+    assert checkpoint is not None
+    updated = copy_durable_json_object(checkpoint, "checkpoint")
+    updated.pop(INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY)
+    return updated or None

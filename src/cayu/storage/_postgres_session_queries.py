@@ -40,11 +40,11 @@ from cayu.sessions.base import (
     _child_session_lifecycle_entry,
     _child_session_lifecycle_entry_sort_key,
     _child_session_lifecycle_occurrence,
-    _validate_interaction_page,
 )
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
 from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
+from cayu.sessions.interactions import _validate_interaction_page
 from cayu.sessions.lineage import (
     SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
     SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,

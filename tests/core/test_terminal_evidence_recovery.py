@@ -12,13 +12,10 @@ from cayu.exceptions import TerminalEventPublicationUncertain
 from cayu.messages import Message
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.sessions._terminal_evidence import (
+    _checkpoint_with_session_run_operation,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    SessionRunFenced,
-    _checkpoint_with_session_run_operation,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

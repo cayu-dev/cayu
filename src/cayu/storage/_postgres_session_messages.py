@@ -42,7 +42,6 @@ from cayu.sessions.base import (
     SessionMessageQueueStatus,
     SessionRunFenced,
     _check_closure_lineage_owner,
-    _validate_message_delivery_eligible_through,
 )
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -60,6 +59,7 @@ from cayu.sessions.messaging import (
     SessionQueuedMessage,
     _queued_session_message_event_payload,
     _validate_equivalent_queued_session_message,
+    _validate_message_delivery_eligible_through,
     copy_enqueue_session_message_request,
     enqueue_session_message_input,
     queued_session_message_input,

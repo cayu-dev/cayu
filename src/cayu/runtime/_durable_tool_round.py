@@ -92,16 +92,13 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
+from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._invocation_scope import (
     _activate_session_run_fence,
     _deactivate_session_run_fence,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationReceipt
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _initial_transcript_pending_interaction_id,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.records import (
     Session,
     SessionStatus,

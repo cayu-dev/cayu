@@ -25,7 +25,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
+from cayu.sessions._checkpoint_publication import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import RunRequest

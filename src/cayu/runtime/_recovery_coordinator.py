@@ -321,14 +321,11 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
+    _checkpoint_with_session_run_operation,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _checkpoint_with_session_run_operation,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.cleanup import (
     RecoveryCleanupStep,
 )
