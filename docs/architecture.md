@@ -1197,12 +1197,13 @@ access checks remain on the stores; shared validation and runtime fork orchestra
 retain their existing owners. PostgreSQL keeps its database clock, lock order and
 driver exception classification; SQLite retains its immediate write transaction.
 
-Native SQLite recall and context-exposure persistence lives in
-`storage/_sqlite_memory_evidence.py`. This owner keeps receipt and exposure
-writes, closure admission, replay, pagination and state transitions in complete
-native operations. It also owns the durable row decoders reused by export
-snapshots. The store supplies explicit read/write runners and closure readers;
-memory contracts, recall policy and snapshot orchestration retain their owners.
+Native recall and context-exposure persistence live in
+`storage/_sqlite_memory_evidence.py` and `storage/_postgres_memory_evidence.py`.
+These owners keep receipt and exposure writes, closure admission, replay,
+pagination and state transitions in complete native operations. They also own
+the durable row decoders reused by export snapshots. Stores supply explicit
+read/write runners or connections, readiness and closure readers; memory
+contracts, recall policy and snapshot orchestration retain their existing owners.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 

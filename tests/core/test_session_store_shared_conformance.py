@@ -4492,7 +4492,7 @@ def test_postgres_context_exposure_creation_locks_session_before_receipts(
     conformance_postgres_dsn: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import cayu.storage.postgres as postgres_storage_module
+    from cayu.storage import _postgres_memory_evidence as evidence_storage_module
 
     async def bypass_identity_lock(_cur: Any, _lock_id: str) -> None:
         # Identity serialization is orthogonal to the session/receipt row-lock
@@ -4500,8 +4500,8 @@ def test_postgres_context_exposure_creation_locks_session_before_receipts(
         return None
 
     monkeypatch.setattr(
-        postgres_storage_module,
-        "_postgres_lock_memory_evidence_id",
+        evidence_storage_module,
+        "_lock_evidence_id",
         bypass_identity_lock,
     )
 
