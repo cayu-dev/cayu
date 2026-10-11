@@ -22,7 +22,8 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.requests import RunRequest

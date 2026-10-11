@@ -630,7 +630,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "InMemoryBudgetStore": ("cayu.budgets.base", "InMemoryBudgetStore"),
     "InMemoryEventSink": ("cayu.observability.events", "InMemoryEventSink"),
     "InMemoryEventWatcherStore": ("cayu.observability.watchers", "InMemoryEventWatcherStore"),
-    "InMemorySessionStore": ("cayu.sessions.base", "InMemorySessionStore"),
+    "InMemorySessionStore": ("cayu.sessions.memory", "InMemorySessionStore"),
     "InMemoryTaskStore": ("cayu.tasks.memory", "InMemoryTaskStore"),
     "IncompleteSessionRecoveryAction": (
         "cayu.sessions.recovery",
@@ -879,7 +879,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ModelPrice": ("cayu.budgets.pricing", "ModelPrice"),
     "ModelStepCostEstimate": ("cayu.budgets.pricing", "ModelStepCostEstimate"),
     "ModelStepIdentity": ("cayu.execution_units", "ModelStepIdentity"),
-    "ModelTarget": ("cayu.sessions.base", "ModelTarget"),
+    "ModelTarget": ("cayu.sessions._model_failover", "ModelTarget"),
     "NamedCheckManifest": ("cayu.runtime.manifest", "NamedCheckManifest"),
     "NativeStructuredOutputUnsupported": (
         "cayu.context.structured_output",

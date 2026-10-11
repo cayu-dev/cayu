@@ -54,8 +54,8 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest

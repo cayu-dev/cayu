@@ -60,13 +60,13 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import (
     CheckpointTransform,
     EventRecord,

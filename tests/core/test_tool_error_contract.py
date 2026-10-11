@@ -15,7 +15,7 @@ from pydantic import BaseModel, StrictInt, ValidationError
 
 from cayu.artifacts import LocalArtifactStore
 from cayu.runners import LocalRunner
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.tools import (
     ApplyPatchTool,
     DeleteFileTool,

@@ -17,7 +17,7 @@ from cayu.model_policy import (
     PolicyChannel,
 )
 from cayu.runtime._policy_wire import canonical, decode
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.outcomes import run_to_completion
 
 VECTORS = json.loads(

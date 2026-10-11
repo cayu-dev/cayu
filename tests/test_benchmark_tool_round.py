@@ -16,7 +16,7 @@ from scripts.benchmark_tool_round import (
 )
 
 import cayu._validation as validation
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 
 

@@ -15,13 +15,13 @@ from tests.core.task_invocation_fixtures import unattributed_session_invocation_
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu.applications import CayuApp
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionInvocationBinding,
     TaskExecutionSource,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.contracts import (
     CompletionContinuationPolicy,

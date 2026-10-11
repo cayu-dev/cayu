@@ -11,7 +11,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._checkpoint_publication import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -20,6 +19,7 @@ from cayu.sessions.creation_claims import (
     SESSION_CREATE_CLAIM_METADATA_KEY,
     run_request_with_runtime_session_create_claim,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import RunRequest, run_request_with_runtime_generated_authority
 

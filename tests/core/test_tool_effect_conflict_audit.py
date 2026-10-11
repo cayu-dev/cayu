@@ -15,7 +15,7 @@ from cayu.sessions._invocation_scope import (
     _activate_session_run_fence,
     _deactivate_session_run_fence,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

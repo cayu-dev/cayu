@@ -18,6 +18,7 @@ from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.events import EventType
+from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime.authority import SessionRunFenced
@@ -28,7 +29,6 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
     load_pending_provider_operation_disposition,
 )
-from cayu.sessions.base import Message
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,

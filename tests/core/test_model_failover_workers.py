@@ -26,7 +26,7 @@ from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
-from cayu.sessions.base import ModelFailoverPolicy, ModelTarget
+from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.event_queries import EventQuery
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.records import TaskStatus

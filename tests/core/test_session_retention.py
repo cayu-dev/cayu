@@ -151,7 +151,7 @@ def test_session_retention_policy_contract() -> None:
 
 
 def test_retention_is_an_explicit_store_capability() -> None:
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.storage.postgres import PostgresSessionStore
 
     assert SessionStore.supports_storage_retention is False

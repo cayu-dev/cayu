@@ -11,8 +11,8 @@ from tests.core.test_participant_identity import CONTEXT, app, create, registrat
 from cayu.agents import AgentSpec
 from cayu.collaboration.participants import ParticipantRef
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import Message
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,

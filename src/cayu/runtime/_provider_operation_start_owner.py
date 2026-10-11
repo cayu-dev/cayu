@@ -59,7 +59,7 @@ from cayu.runtime.provider_operation_cancellation import (
     ProviderOperationCancellationLifecycle,
 )
 from cayu.runtime.provider_operations import provider_operation_started_event_id
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
 from cayu.sessions.store import SessionStore

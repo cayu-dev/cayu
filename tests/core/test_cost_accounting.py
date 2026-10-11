@@ -179,7 +179,7 @@ def test_native_cost_snapshot_matches_reference(backend, auxiliary, tmp_path, re
 
     from cayu.messages import Message
     from cayu.runtime import CayuApp
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
     from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
@@ -286,7 +286,7 @@ def test_incremental_cost_reprices_only_changed_groups_and_expires_windows(
 
     from cayu.messages import Message
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
     from cayu.sessions.requests import RunRequest
 
@@ -423,7 +423,7 @@ def test_cost_cursor_rejects_modified_totals_and_invalidates_after_deletion(
     from uuid import uuid4
 
     from cayu.messages import Message
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity, SessionStatus
     from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
@@ -739,7 +739,7 @@ def test_active_cost_refresh_serializes_and_drops_removed_scopes():
     from cayu.budgets.run_limits import RunLimits
     from cayu.messages import Message
     from cayu.runtime._run_limits import SessionUsageTracker
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
     from cayu.sessions.requests import RunRequest
 

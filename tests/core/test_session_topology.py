@@ -13,9 +13,9 @@ from tests.core.session_topology_conformance import (
 from cayu import SQLiteSessionStore
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
 from cayu.sessions.lineage import SessionLineageNode, SessionLineageResult
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore

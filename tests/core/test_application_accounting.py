@@ -18,7 +18,7 @@ from cayu.applications import CayuApp
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.events import Event, EventType
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode

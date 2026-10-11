@@ -31,6 +31,7 @@ from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
+    BudgetReservationIdentityConflict,
     BudgetWindow,
     InMemoryBudgetLedger,
     InMemoryBudgetStore,
@@ -72,7 +73,7 @@ from cayu.providers import (
     completed_bedrock_billing_identity,
 )
 from cayu.runtime.stop_policy import StopDecision, StopLimit, first_reached_limit
-from cayu.sessions.base import BudgetReservationIdentityConflict, InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore

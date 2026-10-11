@@ -227,7 +227,7 @@ def test_retirement_acknowledgement_loss_has_exact_reopened_readback(
 
 def test_scope_administration_is_not_inferred_from_source_authority():
     async def scenario():
-        from cayu.sessions.base import InMemorySessionStore
+        from cayu.sessions.memory import InMemorySessionStore
 
         store = InMemorySessionStore()
         waits = ExternalEventWaits(store=store, access_policy=Policy())

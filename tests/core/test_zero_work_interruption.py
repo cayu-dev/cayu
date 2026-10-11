@@ -12,7 +12,7 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._zero_work_interruption import ZeroWorkInterruptionRequest
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,

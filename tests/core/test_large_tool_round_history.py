@@ -5,7 +5,8 @@ import asyncio
 import pytest
 
 from cayu.events import Event, EventType
-from cayu.sessions.base import InMemorySessionStore, ToolRoundIdentity
+from cayu.execution_units import ToolRoundIdentity
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

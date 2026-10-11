@@ -1190,6 +1190,22 @@ backend-specific durable vector indexes later
 
 The local durable session store is `SQLiteSessionStore`. New projects conventionally share `data/cayu.db` across Cayu's SQLite-backed runtime stores; applications may select another path explicitly. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. Session records also persist provider, active model, runtime, agent, environment, and a redacted typed execution-profile identity so resume cannot silently adopt changed runtime, provider target or adapter, durable instructions, context selection, knowledge injection, compaction, provider request controls, application or invocation budgets, structured output, finalization, direct-tool schema, application-declared implementation behavior, registered or invocation policy order, hook order, environment/runner semantics, grant baseline, or effect authority. New sessions start from the agent's default model and freeze that profile in the creation transaction. Resume compares the candidate again inside its status/checkpoint transaction; mismatch evidence contains fingerprints and changed component classes, never raw prompts, schemas, code, policy bodies, or credentials. Model-attempt, usage, cost, structured-result, compaction, budget, tool, approval, runner, hook, environment, workspace, credential-proxy, and virtual-egress evidence references the immutable invocation-profile fingerprint that governed it. An explicit clean-boundary `ModelTarget` adoption atomically updates provider/model identity and the expected profile with its run epoch, checkpoint, interaction admission, portable-projection marker, and `session.model.switched` event; generic retry never changes targets silently. The store keeps the immutable transcript used by resume and checkpoint-backed context compaction, while the projection marker excludes pre-switch provider and thinking state only from later model-facing requests. Storage APIs support filtered session listing, filtered event queries with durable sequence cursors, transcript loading, atomic status/checkpoint/target transitions, and atomic batched event appends. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.
 
+`sessions/store.py` owns the shared `SessionStore` contract, default operations and
+backend capability checks. Importing that contract does not load the memory or
+native adapters. `sessions/memory.py` owns `InMemorySessionStore`, its state,
+lock and prepare/apply mutations. Native adapters implement the same contract
+while retaining their transaction and connection owners. The public package
+exports resolve directly to these owners; `sessions/base.py` retains supported
+public imports for existing callers and serialized references.
+
+Shared publication callbacks and owned commit guards live with
+`sessions/_runtime_publication.py`. Fork transforms, bounded interruption
+projections, query validation and MCP manifest publication checks live with their
+corresponding session domains. Recipient provenance belongs to the access rules;
+public-authority registry validation belongs with the alias codec. These parts
+can be composed without a concrete session store. Authorization and mutation
+remain inside each backend's existing atomic operation.
+
 Native session event queries, session listing/inspection, topology/lineage,
 child lifecycle reads, summaries and accounting reads live in
 `storage/_sqlite_session_queries.py` and `storage/_postgres_session_queries.py`.

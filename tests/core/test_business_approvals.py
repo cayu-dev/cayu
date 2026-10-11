@@ -40,7 +40,7 @@ from cayu.approvals.tools import (
 )
 from cayu.evals import ScriptedModelProvider
 from cayu.events import Event, EventType
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

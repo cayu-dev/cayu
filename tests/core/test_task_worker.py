@@ -56,10 +56,15 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
-from cayu.sessions.base import InMemorySessionStore, SessionMessageQueueStatus, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
-from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
+from cayu.sessions.memory import InMemorySessionStore
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    SessionMessageDeliveryMode,
+    SessionMessageQueueStatus,
+)
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (

@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from cayu import CayuApp, RunRequest
 from cayu.runtime.session_closure import SessionClosureDisposition, SessionClosureRecord
 from cayu.server import ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 
 

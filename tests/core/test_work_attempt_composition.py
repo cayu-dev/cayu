@@ -15,8 +15,8 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import WorkAttemptAdmissionState, WorkAttemptRecoveryRequired

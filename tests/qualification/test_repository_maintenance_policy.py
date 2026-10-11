@@ -13,8 +13,8 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.tools.files import WriteFileTool
 from cayu.tools.patches import ApplyPatchTool

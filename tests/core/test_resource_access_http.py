@@ -111,7 +111,7 @@ def test_http_stream_revalidates_buffered_first_event():
 def test_scoped_http_run_delivers_authorized_events():
     from tests.core.test_resource_execution_access import app_for
 
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     async def run():
         app = app_for(InMemorySessionStore(), Policy())

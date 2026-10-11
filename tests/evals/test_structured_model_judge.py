@@ -62,7 +62,7 @@ from cayu.evals.suite_authoring import EvalSuiteDraftV1
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor

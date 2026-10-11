@@ -19,7 +19,7 @@ from pydantic import SecretStr
 import cayu
 from cayu.events import Event, EventType
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.storage import _sqlite_public_authority as public_authority_ops

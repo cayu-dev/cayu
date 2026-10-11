@@ -4,12 +4,12 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from cayu.external_waits import ExternalWaitAccessPolicy, ExternalWaitContext
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.external_waits import (
     ExternalCorrelationRequest,
     ExternalWaitRegistration,
     ExternalWaitScope,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

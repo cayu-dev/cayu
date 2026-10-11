@@ -5,7 +5,7 @@ from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 
 from cayu.applications import CayuApp
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.tools._browser_control_transport import BrowserControlTransportUnavailable
 from cayu.tools.browser_control_config import BrowserControlConfig
 

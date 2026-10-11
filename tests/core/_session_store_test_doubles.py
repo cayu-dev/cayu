@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionListResult, SessionQuery
 
 

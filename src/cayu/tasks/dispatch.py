@@ -86,7 +86,11 @@ from cayu.runtime.execution_profiles import (
     _ExecutionProfileAdmissionRequestRejected,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
-from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
+from cayu.sessions._model_failover import (
+    ModelFailoverPolicy,
+    ModelTarget,
+    copy_optional_model_failover_policy,
+)
 from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
@@ -94,7 +98,7 @@ from cayu.sessions._terminal_evidence import (
 from cayu.sessions._terminal_evidence import (
     queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,
 )
-from cayu.sessions.base import ModelTarget, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.invocation import (
     SessionInvocationBinding,
     TaskExecutionSource,

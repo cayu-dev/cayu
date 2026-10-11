@@ -24,7 +24,7 @@ from cayu.runners.base import RunnerExecutionError
 from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

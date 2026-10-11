@@ -9,7 +9,7 @@ from tests.core.session_closure_conformance import create_closure_session
 
 from cayu import CayuApp
 from cayu.sessions._closure_records import ClosureRecordsBuilder, ClosureRecordsTooLarge
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

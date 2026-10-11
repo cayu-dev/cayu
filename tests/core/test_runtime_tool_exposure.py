@@ -66,9 +66,10 @@ from cayu.sessions._interaction_transitions import (
     InteractionTransitionSpec,
     SessionInvocationAdmission,
 )
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import ForkExecutionProfileSelection
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest

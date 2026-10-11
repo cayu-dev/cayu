@@ -62,7 +62,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasKeyring
 from cayu.runtime.tool_effects import ToolEffectConflict
 from cayu.server import ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.tasks.creation import TaskCreate

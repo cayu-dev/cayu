@@ -44,7 +44,6 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_event_id,
 )
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
@@ -57,6 +56,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     WorkspaceObservationArtifact,

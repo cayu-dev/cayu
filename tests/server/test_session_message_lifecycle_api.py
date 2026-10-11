@@ -26,8 +26,8 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.server import AuthContext, ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
     SessionMessageAccessContext,

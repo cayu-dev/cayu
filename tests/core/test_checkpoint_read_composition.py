@@ -21,7 +21,6 @@ from cayu.runtime._checkpoint_store import (
 )
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.sessions._pending_tool_round_reader import load_pending_tool_round
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY as VERSION,
 )
@@ -33,6 +32,7 @@ from cayu.sessions.checkpoints import (
     _DecodedRuntimeCheckpoint,
     runtime_checkpoint_writer_view,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

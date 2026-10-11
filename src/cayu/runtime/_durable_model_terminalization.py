@@ -42,7 +42,7 @@ from cayu.sessions._model_stage_rules import (
     _validate_model_completion_stage_dispatch,
     require_terminalization_plan_owner,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import Session, SessionStatus

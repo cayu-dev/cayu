@@ -246,7 +246,7 @@ def test_native_side_target_admission_and_exclusion_race(store_factory, ordering
     from tests.core.test_temporary_continuation_admission import native_command
 
     from cayu.runtime._temporary_continuation_scope import temporary_admission_scope
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     async def run(store):
         expected, command = await native_command(store, side_session=True)

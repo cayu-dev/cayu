@@ -80,7 +80,7 @@ from cayu.runtime.provider_operations import (
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     InteractionStatus,

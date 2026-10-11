@@ -12,7 +12,6 @@ from cayu.messages import Message
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.sessions import creation_claims as session_creation_claims
 from cayu.sessions import requests as session_request_contracts
-from cayu.sessions.base import InMemorySessionStore, SessionExecutionSource
 from cayu.sessions.creation_claims import (
     SESSION_CREATE_CLAIM_METADATA_KEY,
     RuntimeSessionCreateClaimAuthenticationDisposition,
@@ -23,6 +22,8 @@ from cayu.sessions.creation_claims import (
     run_request_with_runtime_session_create_claim_reference,
     runtime_session_create_claim_reference,
 )
+from cayu.sessions.invocation import SessionExecutionSource
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import (
     RunRequest,

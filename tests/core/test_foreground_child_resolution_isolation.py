@@ -9,7 +9,7 @@ from tests.core.test_foreground_subagent_recovery import _Provider
 from cayu.approvals.user_input import UserInputResponse
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import RunRequest

@@ -19,7 +19,7 @@ from cayu import (
     TaskCreate,
 )
 from cayu.server import ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.tasks.topology import TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH

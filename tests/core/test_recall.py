@@ -40,7 +40,7 @@ from cayu.memory.retrieval import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import MAX_SESSION_ID_BYTES, SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_queries import TranscriptSearchQuery

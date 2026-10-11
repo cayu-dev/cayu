@@ -84,7 +84,8 @@ from cayu.sessions._interaction_transitions import (
     SessionInvocationAdmission,
 )
 from cayu.sessions._invocation_scope import _current_session_run_epoch
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
+from cayu.sessions._model_failover import ModelTarget
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -93,6 +94,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,

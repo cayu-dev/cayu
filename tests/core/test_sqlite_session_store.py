@@ -16,12 +16,12 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.aggregates import AggregateUsageMetrics
+from cayu.budgets.base import BudgetReservationIdentityConflict
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions._model_stage import ModelCompletionStageRequest
-from cayu.sessions.base import BudgetReservationIdentityConflict
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

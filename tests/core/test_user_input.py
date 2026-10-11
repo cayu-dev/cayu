@@ -48,7 +48,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -57,6 +56,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import (

@@ -17,7 +17,7 @@ from cayu.context.base import (
     copy_context_compaction_telemetry,
 )
 from cayu.events import EventType
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 

@@ -36,8 +36,8 @@ from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     RecoveryPlanAction,

@@ -146,7 +146,7 @@ from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
     provider_operation_cancellation_claim_from_checkpoint,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.store import SessionStore
 from cayu.tools.catalogue import CALL_TOOL_NAME

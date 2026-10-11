@@ -57,7 +57,7 @@ def require_preparation_writer(session: Session, checkpoint: dict | None) -> Non
     from cayu.sessions._invocation_lifecycle import (
         require_invocation_command_authority,
     )
-    from cayu.sessions.base import SessionRunFenced
+    from cayu.sessions.authority import SessionRunFenced
     from cayu.sessions.records import SessionStatus
 
     authority = _PREPARATION.get()

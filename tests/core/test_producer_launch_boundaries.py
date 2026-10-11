@@ -14,8 +14,11 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _producer_output_store as native
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
-from cayu.sessions.base import SessionMessageQuery
-from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    SessionMessageDeliveryMode,
+    SessionMessageQuery,
+)
 from cayu.sessions.requests import ResumeRequest
 
 

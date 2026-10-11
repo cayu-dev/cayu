@@ -159,12 +159,12 @@ def test_completion_reader_has_one_owner_and_preserves_the_public_session_key():
     from typing import get_type_hints
 
     from cayu.runtime import _environment_lifecycle as lifecycle
-    from cayu.sessions import base
+    from cayu.sessions import base, memory
 
     assert base.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY is (
         reader.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
     )
-    assert lifecycle.completion_finalization is base.completion_finalization is reader
+    assert lifecycle.completion_finalization is memory.completion_finalization is reader
     assert not hasattr(lifecycle, "pending_completion_finalization_from_checkpoint")
     assert not hasattr(lifecycle, "_MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES")
     assert get_type_hints(reader.pending_completion_finalization_from_checkpoint)
@@ -175,7 +175,7 @@ def test_environment_checkpoint_replacement_preserves_pending_completion_evidenc
 
     from tests.core.test_environment_lifecycle import _lifecycle
 
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
     from cayu.sessions.requests import RunRequest
 

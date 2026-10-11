@@ -62,7 +62,7 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import (
     RunRequest,

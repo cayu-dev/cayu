@@ -10,7 +10,7 @@ import pytest
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.cli.project import project_context
 from cayu.runners.docker_workload import DockerImageIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.memory import InMemoryTaskStore

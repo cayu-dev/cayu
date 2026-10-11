@@ -12,8 +12,8 @@ from cayu.runtime._session_control import (
     SessionControl,
     SessionInterruptedByRequest,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 

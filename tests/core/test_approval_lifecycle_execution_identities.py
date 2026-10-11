@@ -26,7 +26,7 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest

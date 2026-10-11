@@ -27,7 +27,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.rounds import ToolRoundRecoveryRequest

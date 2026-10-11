@@ -108,10 +108,11 @@ from cayu.server.sse import (
     SSE_REPLAY_PAGE_EVENTS,
     SSE_SEND_TIMEOUT_SECONDS,
 )
-from cayu.sessions.base import InMemorySessionStore, ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import (
     PendingActionIssue,
     PendingActionIssueCode,

@@ -52,7 +52,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.files import ListArtifactsTool, ListFilesTool, ReadFileTool

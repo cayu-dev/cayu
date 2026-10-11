@@ -115,6 +115,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.budgets.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
+from cayu.budgets.base import BudgetReservationIdentityConflict
 from cayu.events import (
     Event,
     EventType,
@@ -296,10 +297,10 @@ from cayu.sessions.authority import (
     CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
     CheckpointRootFieldGuard,
     CheckpointValueAuthority,
+    SessionRunFenced,
     _runtime_publication_json_equal,
     checkpoint_root_field_projection_from_storage,
 )
-from cayu.sessions.base import BudgetReservationIdentityConflict, SessionRunFenced
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,

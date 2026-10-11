@@ -13,7 +13,7 @@ from cayu.external_waits import ExternalWaitContext, ExternalWaitSnapshot, _snap
 from cayu.runtime._external_wait_observation import external_wait_entrance
 from cayu.session_external_waits import SessionExternalWaitAdapter
 from cayu.sessions._session_continuation import ContinuationConflict, ContinuationUnavailable
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.external_waits import (
     EXTERNAL_WAIT_PAGE_SIZE,
     ExternalWaitCapacityExceeded,

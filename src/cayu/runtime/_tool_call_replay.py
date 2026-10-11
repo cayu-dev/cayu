@@ -21,7 +21,8 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._tool_call_replay_scope import STORAGE_KEY, owner_scope
-from cayu.sessions.base import Session, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
 from cayu.tools._policy_evidence import ToolPolicyEvidence
 from cayu.tools.base import ToolEffect

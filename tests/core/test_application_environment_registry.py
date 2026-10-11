@@ -21,7 +21,7 @@ from cayu.environments.factory import (
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.session_closure import RetainedSessionClosureStore
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -18,7 +18,7 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.runtime._compaction import explicit as _session_compaction
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import CompactSessionRequest, RunRequest
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore

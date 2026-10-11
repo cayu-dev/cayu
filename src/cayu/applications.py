@@ -557,6 +557,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles,
 )
 from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
@@ -567,7 +568,7 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
 )
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.cleanup import (
     RecoveryCleanupOwner,
@@ -611,6 +612,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     copy_session_invocation_binding,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,

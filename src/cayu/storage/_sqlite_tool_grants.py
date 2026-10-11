@@ -19,13 +19,13 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
 )
 from cayu.sessions._closure_records import _check_closure_lineage_owner
-from cayu.sessions.base import SessionRunFenced, SessionStatusConflict
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.invocation import SessionInvocation
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 from cayu.storage._sqlite_event_publication import EventWriter

@@ -120,7 +120,8 @@ from cayu.sessions._execution_profile_rules import (
     _session_metadata_with_model_projection,
     session_model_projection_cursor,
 )
-from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced
+from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,

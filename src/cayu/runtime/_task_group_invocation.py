@@ -27,7 +27,7 @@ from cayu.sessions._invocation_lifecycle import (
     released_invocation_evidence,
     require_invocation_rebind_lineage,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.store import SessionStore
 from cayu.tasks.groups import TaskGroupInvocationObligation, TaskGroupUnavailable
 from cayu.tasks.store import TaskStore

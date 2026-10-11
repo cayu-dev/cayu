@@ -19,8 +19,8 @@ from cayu.runtime._invocation_lifecycle import (
     RebindInvocationCommand,
 )
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest

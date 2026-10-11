@@ -43,8 +43,8 @@ from cayu.providers import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._event_projection import public_event_sequence
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 
 

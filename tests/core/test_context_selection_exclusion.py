@@ -15,8 +15,8 @@ from cayu.sessions._context_selection_fence import (
     ContextViewSelectionExcluded,
     require_selection_fence_store,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import ContextViewLimits, ContextViewSelectionRequest
+from cayu.sessions.memory import InMemorySessionStore
 
 pytestmark = pytest.mark.anyio
 

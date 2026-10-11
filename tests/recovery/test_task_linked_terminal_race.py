@@ -24,8 +24,11 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import SessionMessageQueueStatus
-from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    SessionMessageDeliveryMode,
+    SessionMessageQueueStatus,
+)
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,

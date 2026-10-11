@@ -66,12 +66,13 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import (
     CompactSessionRequest,

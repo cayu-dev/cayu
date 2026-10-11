@@ -102,9 +102,6 @@ from cayu.providers.base import (
     ToolDiscoveryProjectionResult,
 )
 from cayu.runtime._event_projection import public_event_sequence
-from cayu.sessions.base import (
-    InMemorySessionStore,
-)
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -114,6 +111,7 @@ from cayu.sessions.mcp_manifest_history import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage import migrations as schema_migrations
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault

@@ -11,7 +11,7 @@ from cayu.runtime._abandoned_session_recovery import (
 )
 from cayu.runtime._tool_call_replay import started_dispatch_identities
 from cayu.runtime._tool_identity import tool_idempotency_key
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 
 
 def _started(call_id: str, *, approval_id=None, input_id=None, key=None) -> Event:

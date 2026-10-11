@@ -9,7 +9,7 @@ from cayu import AgentSpec, CayuApp, Message, RunRequest, TaskCreate, TaskQuery,
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

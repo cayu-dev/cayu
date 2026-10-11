@@ -113,7 +113,7 @@ from cayu.sessions._invocation_scope import (
     _set_session_interaction_recovered_active_through,
 )
 from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (

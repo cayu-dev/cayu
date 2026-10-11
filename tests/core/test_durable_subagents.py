@@ -58,7 +58,7 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenanceOrigin,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (

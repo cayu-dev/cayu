@@ -23,7 +23,7 @@ from cayu.evals.benchmark_inspection import (
 )
 from cayu.evals.benchmark_package import benchmark_suite_selection, load_benchmark_package
 from cayu.evals.store import EvalRunCostBudget, EvalRunRecoveryPolicyV1
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 

@@ -27,8 +27,8 @@ from cayu.observability.watchers import (
 from cayu.runtime._compaction import automatic as _automatic_compaction
 from cayu.runtime._compaction import explicit as _session_compaction
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 
 

@@ -9,7 +9,7 @@ from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
 from cayu import CayuApp
 from cayu.runtime.session_closure import SessionClosureDisposition, SessionClosureRecord
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate

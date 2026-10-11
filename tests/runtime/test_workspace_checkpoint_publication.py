@@ -17,8 +17,8 @@ from cayu.artifacts import LocalArtifactStore
 from cayu.environments import Environment
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.workspaces import LocalWorkspace
 from cayu.workspaces.checkpoint_lifecycle import WORKSPACE_CHECKPOINTS_KEY

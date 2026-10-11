@@ -14,8 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 import cayu
+from cayu.budgets.base import BudgetReservationIdentityConflict
 from cayu.events import Event, EventType
-from cayu.sessions.base import BudgetReservationIdentityConflict
 from cayu.sessions.mcp_manifest_history import (
     McpManifestBaseline,
     _mcp_authoritative_manifest_hash,

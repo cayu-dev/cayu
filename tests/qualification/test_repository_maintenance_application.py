@@ -29,8 +29,8 @@ from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecResult
 from cayu.runners.docker_workload import DockerImageIdentity
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore

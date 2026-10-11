@@ -45,7 +45,7 @@ from cayu.sessions._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     browser_control_checkpoint_mutation_scope,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import ResumeRequest, RunRequest

@@ -7,7 +7,7 @@ from tests.core.test_tool_effect_state import _event, _intent, _terminal
 
 from cayu.events import Event, EventType
 from cayu.runtime._tool_effect_state import ToolEffectConflict, ToolEffectStateOwner, _digest
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

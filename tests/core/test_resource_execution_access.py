@@ -347,9 +347,7 @@ def test_decision_revision_expiry_outage_and_family_separation(tmp_path):
 def test_stream_revocation_stops_producer_and_recovery_allows_only_settlement():
     from cayu._resource_access_binding import ResourceExecutionBinding
     from cayu.resource_access import encode_scope, guard_stream, recovery_access, require_dispatch
-    from cayu.sessions.base import (
-        InMemorySessionStore,
-    )
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
 
     async def run():
@@ -558,7 +556,7 @@ def test_scoped_foreground_child_pause_without_checkpoint_grant(tmp_path, backen
 
     from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
     from cayu.approvals.user_input import UserInputResponse
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.queries import SessionQuery
     from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
     from cayu.tools.subagents import SubagentSpec, SubagentTool

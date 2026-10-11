@@ -70,8 +70,9 @@ from cayu.sessions._interaction_transitions import (
     queued_interaction_profile_handoff_evidence,
 )
 from cayu.sessions._invocation_lifecycle import RejectInvocationCommand
+from cayu.sessions._model_failover import ModelFailoverPolicy
 from cayu.sessions._model_stage import ActiveModelCompletionStage
-from cayu.sessions.base import ModelFailoverPolicy, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,

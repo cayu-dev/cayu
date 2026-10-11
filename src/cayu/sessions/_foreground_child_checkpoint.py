@@ -32,7 +32,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import MAX_SESSION_ID_BYTES, Session
 from cayu.sessions.requests import ResumeRequest
 

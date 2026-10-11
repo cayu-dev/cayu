@@ -53,7 +53,7 @@ import sys
 from typing import get_type_hints
 
 blocked = {
-    "cayu.sessions.base", "cayu.storage.sqlite", "cayu.storage.postgres",
+    "cayu.sessions.base", "cayu.sessions.store", "cayu.sessions.memory", "cayu.storage.sqlite", "cayu.storage.postgres",
     "cayu.storage.tasks_sqlite", "cayu.tasks.memory",
 }
 class RejectStores(importlib.abc.MetaPathFinder):
@@ -203,7 +203,7 @@ from typing import get_type_hints
 class RejectStores(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname.startswith("cayu.storage") or fullname in {
-            "cayu.sessions.base", "cayu.tasks.memory",
+            "cayu.sessions.base", "cayu.sessions.store", "cayu.sessions.memory", "cayu.tasks.memory",
         }:
             raise AssertionError(f"Terminal evidence imported {fullname}")
 sys.meta_path.insert(0, RejectStores())

@@ -19,7 +19,7 @@ from cayu.embeddings import (
 )
 from cayu.messages import TextPart, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.memory import (
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,

@@ -26,7 +26,7 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider
 from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

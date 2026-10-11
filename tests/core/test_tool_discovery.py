@@ -23,7 +23,7 @@ from cayu.providers.base import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import (

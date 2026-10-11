@@ -8,7 +8,7 @@ import pytest
 from tests.core.test_recovery_composition import _run_without_owners
 
 from cayu import AgentSpec, CayuApp, RunRequest
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import run_request_with_task_invocation
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

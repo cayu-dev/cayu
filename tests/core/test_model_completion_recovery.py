@@ -71,12 +71,12 @@ from cayu.sessions._model_stage import (
     ModelCompletionStageRequest,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,

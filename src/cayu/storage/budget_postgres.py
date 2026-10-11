@@ -30,6 +30,7 @@ from cayu.budgets.base import (
     BudgetLimit,
     BudgetReconciliation,
     BudgetReconciliationPricing,
+    BudgetReservationIdentityConflict,
     BudgetReservationRecord,
     BudgetReservationResult,
     BudgetSettlementCursor,
@@ -56,7 +57,6 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.billing import BillingIdentity, copy_billing_identity
 from cayu.execution_units import ModelAttemptIdentity, copy_model_attempt_identity
-from cayu.sessions.base import BudgetReservationIdentityConflict
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import migrations as schema

@@ -47,8 +47,8 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

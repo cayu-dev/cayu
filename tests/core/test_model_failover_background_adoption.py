@@ -42,7 +42,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyResult,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

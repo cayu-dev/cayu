@@ -95,7 +95,7 @@ from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

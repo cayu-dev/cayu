@@ -75,7 +75,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.forks import fork_session_invocation
 from cayu.sessions.invocation import (

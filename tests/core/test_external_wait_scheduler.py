@@ -137,7 +137,7 @@ def test_native_timer_reconstruction_and_exact_publication(
 
 
 def test_event_only_wait_needs_no_timer_and_early_hint_does_not_elect():
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     async def scenario():
         now = datetime.now(UTC)

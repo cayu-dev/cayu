@@ -60,7 +60,7 @@ from cayu.providers import (
 )
 from cayu.runtime._cache_affinity import cache_affinity_key_for_lineage_root
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage import SQLiteBudgetLedger
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 

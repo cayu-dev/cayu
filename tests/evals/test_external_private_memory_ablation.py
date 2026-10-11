@@ -3605,7 +3605,7 @@ def test_native_preparation_rejects_zero_progress_compaction(already_resumed: bo
 
     from cayu.events import EventType
     from cayu.memory.execution import MemoryInterventionExecutionConflict
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.requests import ResumeRequest, RunRequest
 
     async def run():

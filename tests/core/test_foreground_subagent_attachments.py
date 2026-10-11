@@ -15,7 +15,7 @@ from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

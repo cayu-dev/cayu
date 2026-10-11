@@ -11,7 +11,7 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 

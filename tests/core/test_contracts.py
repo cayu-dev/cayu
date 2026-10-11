@@ -104,7 +104,7 @@ from cayu.runtime._model_errors import (
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryReason, retry_decision
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import ResumeRequest, RunRequest, copy_resume_request, copy_run_request
 from cayu.sessions.store import SessionStore

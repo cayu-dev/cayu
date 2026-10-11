@@ -23,7 +23,7 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
 )
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

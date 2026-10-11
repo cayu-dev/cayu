@@ -33,7 +33,8 @@ from cayu.providers import (
     ModelStreamEvent,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

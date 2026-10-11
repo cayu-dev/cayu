@@ -124,7 +124,7 @@ from cayu.runtime.stop_policy import (
 )
 from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.store import SessionStore

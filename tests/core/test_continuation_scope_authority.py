@@ -38,7 +38,7 @@ from cayu.sessions._session_continuation import (
 from cayu.sessions._temporary_continuation import temporary_service_key
 from cayu.sessions._temporary_service_target import target_service_key
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 
 
 @pytest.mark.parametrize(

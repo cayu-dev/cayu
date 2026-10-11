@@ -210,7 +210,7 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,

@@ -26,7 +26,7 @@ from cayu.runtime.work_attempt_semantics import (
     copy_work_attempt_run_semantics,
 )
 from cayu.server.routes import ResumeBody, RunBody
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import copy_resume_request, copy_run_request
 from cayu.tasks.dispatch import (
     DispatchRequest,

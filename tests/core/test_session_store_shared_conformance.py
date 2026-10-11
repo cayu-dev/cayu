@@ -83,6 +83,7 @@ from cayu.budgets.base import (
     BudgetPolicy,
     BudgetReconciliation,
     BudgetReservation,
+    BudgetReservationIdentityConflict,
     InMemoryBudgetStore,
     budget_reconciliation_payload,
     budget_settlement_id,
@@ -176,6 +177,7 @@ from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionLifecycleQuery,
     ChildSessionNotificationFreshness,
+    child_session_notification_storage_key,
 )
 from cayu.runtime._compaction import automatic as _automatic_compaction
 from cayu.runtime._compaction import explicit as _session_compaction
@@ -259,6 +261,7 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelStepPublicationCheckpoint,
 )
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions._model_stage import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     ModelCompletionStageRequest,
@@ -278,7 +281,6 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceiptQuery,
     _checkpoint_with_session_run_operation,
 )
-from cayu.sessions.base import BudgetReservationIdentityConflict, InMemorySessionStore, ModelTarget
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -308,6 +310,7 @@ from cayu.sessions.mcp_manifest_history import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
     SessionMessageDeliveryMode,
@@ -19935,7 +19938,7 @@ def test_session_store_conformance_dispatch_consumes_child_terminal_notification
             contributor = ChildSessionContextContributor()
             contribution = await contributor.build(session_store=store, session=parent)
             assert contribution.stage_binding is not None
-            consumption_key = sessions_module.child_session_notification_storage_key(
+            consumption_key = child_session_notification_storage_key(
                 contribution.stage_binding.claims[0].child_session_instance_id,
                 "child-notification-terminal",
             )

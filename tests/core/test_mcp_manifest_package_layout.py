@@ -30,7 +30,8 @@ from typing import get_type_hints
 class RejectStores(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname.startswith("cayu.storage") or fullname in {
-            "cayu.sessions.base", "cayu.tasks.memory",
+            "cayu.sessions.base", "cayu.sessions.store", "cayu.sessions.memory", "cayu.tasks.memory",
+            "cayu.sessions.event_delivery",
         } or (fullname.startswith("cayu.runtime.") and fullname != "cayu.runtime._exports"):
             raise AssertionError(f"Manifest contract imported {fullname}")
 sys.meta_path.insert(0, RejectStores())

@@ -123,8 +123,9 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_stage import ModelCompletionStageRequest
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,

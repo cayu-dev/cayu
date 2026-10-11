@@ -27,7 +27,7 @@ from cayu.collaboration.exports import (
     SessionExportUnavailable,
 )
 from cayu.events import Event, EventType, copy_event
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore

@@ -59,7 +59,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.sessions.recovery import (

@@ -104,7 +104,7 @@ def external_resume_admission(
 
 
 def require_external_admission(records: Iterable[ExternalWaitRecord], session: Session) -> None:
-    from cayu.sessions.base import SessionRunFenced
+    from cayu.sessions.authority import SessionRunFenced
 
     expected = _ADMISSION.get()
     matched = False

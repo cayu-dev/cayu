@@ -19,7 +19,7 @@ from cayu.runtime._browser_control_publisher import (
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.sessions._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
     BrowserControlConflict,

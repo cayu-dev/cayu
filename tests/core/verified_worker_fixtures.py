@@ -12,7 +12,7 @@ from uuid import uuid4
 import pytest
 
 from cayu.budgets.base import BudgetLedger, InMemoryBudgetLedger
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.store import SessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.budget_postgres import PostgresBudgetLedger

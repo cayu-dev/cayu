@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-import cayu.sessions.base as sessions_runtime
+import cayu.sessions.memory as sessions_runtime
 import cayu.support_bundles as support_bundles
 import cayu.tasks.memory as tasks_runtime
 from cayu.applications import CayuApp
@@ -31,13 +31,13 @@ from cayu.events import Event, EventType
 from cayu.mcp.base import McpServerSpec
 from cayu.runtime.checks import check_manifest
 from cayu.runtime.mcp_manifest_policy import McpManifestPolicy
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.cleanup import (
     RecoveryCleanupDeadlineScope,
     RecoveryCleanupPolicy,
     RecoveryCleanupRetainedTaskSnapshot,
     RecoveryCleanupSupervisorSnapshot,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
@@ -1439,6 +1439,31 @@ def test_builtin_collectors_report_configured_task_and_mcp_without_server_names(
     assert recovery_cleanup.snapshot.retained_inventory.total_count == 0
     assert isinstance(results["tasks"].evidence, TaskOperationalEvidence)
     assert results["tasks"].disposition is CollectorDisposition.COLLECTED
+
+
+@pytest.mark.parametrize(
+    ("custom_store", "expected"),
+    [(False, "not_applicable"), (True, "unavailable")],
+    ids=["builtin", "custom"],
+)
+def test_memory_session_store_schema_readiness_uses_exact_builtin_identity(
+    custom_store: bool, expected: str
+) -> None:
+    class CustomMemorySessionStore(InMemorySessionStore):
+        pass
+
+    async def scenario() -> SupportBundleReport:
+        store = CustomMemorySessionStore() if custom_store else InMemorySessionStore()
+        context = _context(app=CayuApp(session_store=store, enable_logging=False))
+        collector = next(item for item in builtin_support_collectors() if item.name == "stores")
+        return await collect_support_bundle(context, (collector,))
+
+    report = asyncio.run(scenario())
+    result = report.collectors[0]
+    assert result.disposition is CollectorDisposition.COLLECTED
+    assert isinstance(result.evidence, StoreSummaryEvidence)
+    descriptor = next(item for item in result.evidence.stores if item.role == "session")
+    assert descriptor.schema_readiness == expected
 
 
 def test_store_readiness_fails_closed_without_rendering_mutated_builtin_path() -> None:

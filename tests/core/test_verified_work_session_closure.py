@@ -23,7 +23,7 @@ from tests.core.test_verified_work_contracts import (
 )
 
 from cayu import AgentSpec, CayuApp
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.contracts import (

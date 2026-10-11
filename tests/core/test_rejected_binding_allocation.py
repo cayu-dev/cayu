@@ -222,7 +222,7 @@ def test_rejected_publication_fence_rejects_changed_authority(conflict):
         EnvironmentAllocationCoordinator,
         EnvironmentAllocationTransitionConflict,
     )
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.vaults.redaction import SecretRedactor
 
     async def scenario():

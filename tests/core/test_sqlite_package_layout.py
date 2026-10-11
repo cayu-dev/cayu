@@ -790,7 +790,7 @@ from pathlib import Path
 
 from cayu.storage import _sqlite_connection
 
-for name in ("cayu.sessions.base", "cayu.tasks.base", "cayu.storage._sqlite_functions"):
+for name in ("cayu.sessions.base", "cayu.sessions.store", "cayu.sessions.memory", "cayu.tasks.base", "cayu.storage._sqlite_functions"):
     assert name not in sys.modules, name
 
 with closing(_sqlite_connection.connect(Path(":memory:"))) as connection:

@@ -37,7 +37,8 @@ from cayu.sessions._interaction_transitions import (
     InteractionTransitionSpec,
     SessionInvocationAdmission,
 )
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest, run_request_with_runtime_session_instance_authority
 from cayu.sessions.store import SessionStore

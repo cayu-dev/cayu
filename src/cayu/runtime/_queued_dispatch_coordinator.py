@@ -36,7 +36,7 @@ from cayu.sessions._terminal_evidence import (
     _queued_dispatch_terminal_receipts_from_checkpoint,
     _session_run_operation_from_checkpoint,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import (

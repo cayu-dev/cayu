@@ -76,7 +76,7 @@ from cayu.sessions._session_continuation import (
     continuation_registration_operation,
 )
 from cayu.sessions._session_continuation_scope import consumption_scope
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.sessions.store import SessionStore

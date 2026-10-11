@@ -279,9 +279,10 @@ from cayu.sessions._checkpoint_preservation import _reserve_completion_result_ev
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
 from cayu.sessions._terminal_evidence import _checkpoint_with_session_run_operation
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
@@ -300,6 +301,7 @@ from cayu.sessions.forks import (
     session_prompt_anatomy_transition,
 )
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import (
     EventRecord,

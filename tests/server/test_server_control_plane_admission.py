@@ -24,7 +24,7 @@ from cayu.server.routes import (
     UserInputRecoveryBody,
     UserInputResolveBody,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.store import SessionStore
 from cayu.storage.migrations import SchemaMode
 

@@ -41,13 +41,14 @@ from cayu.sessions._interaction_transitions import (
     InteractionTransitionResult,
     InteractionTransitionSpec,
 )
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     InteractionStatus,
     InteractionSummaryEvidence,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (

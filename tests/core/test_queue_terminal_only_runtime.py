@@ -27,7 +27,8 @@ from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import authority as session_authority_rules
-from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY, InMemorySessionStore
+from cayu.sessions._completion_finalization import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
     SessionMessageAccessContext,

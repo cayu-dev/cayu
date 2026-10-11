@@ -26,7 +26,7 @@ from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.environments.factory import EnvironmentFactoryReleaseAction, EnvironmentFactoryRequest
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.runners.base import ExecCommand
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.base import ToolContext
 from cayu.tools.files import EditFileTool, WriteFileTool

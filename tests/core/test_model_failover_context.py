@@ -36,7 +36,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

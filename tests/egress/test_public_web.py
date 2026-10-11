@@ -180,7 +180,7 @@ def test_public_authority_adoption_preserves_reconnect(
         egress_authority_owner_fingerprint,
     )
     from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     class Adapter(_AdoptionHandoffAdapter):
         supports_reconnect = True

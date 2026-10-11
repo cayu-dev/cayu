@@ -25,7 +25,7 @@ from cayu.runtime.provider_operations import (
     load_pending_provider_operation_disposition,
 )
 from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import EnqueueSessionMessageRequest
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest

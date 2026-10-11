@@ -241,7 +241,7 @@ def test_shutdown_waits_for_stream_acceptance_bookkeeping_after_its_run_ended(
     from cayu.exceptions import TerminalEventPublicationUncertain
     from cayu.runtime import ApplicationAdmissionsSealed
     from cayu.server.routes import _start_detached_event_stream_response
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     class ClosableStore(InMemorySessionStore):
         def __init__(self) -> None:
@@ -582,7 +582,7 @@ def test_shutdown_waits_for_a_receipt_sweep_its_cancelled_worker_started(
 ) -> None:
     from tests.core.test_dispatch import FakeProvider, _batch
 
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.tasks import InMemoryTaskStore, TaskStoreDispatcher
 
     async def scenario() -> None:

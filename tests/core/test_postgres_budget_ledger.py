@@ -29,11 +29,11 @@ from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
+    BudgetReservationIdentityConflict,
     BudgetWindow,
     budget_limits_for_session,
 )
 from cayu.budgets.pricing import ModelPrice, PriceBook
-from cayu.sessions.base import BudgetReservationIdentityConflict
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 

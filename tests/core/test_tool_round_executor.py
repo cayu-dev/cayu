@@ -53,8 +53,8 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
 )
 from cayu.sessions import _invocation_scope as invocation_scope
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.tools import _web_access_result_schema as web_access_result_schema

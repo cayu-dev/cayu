@@ -46,7 +46,7 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenanceOrigin,
 )
 from cayu.sessions import _invocation_scope as invocation_scope
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     CheckpointTransform,

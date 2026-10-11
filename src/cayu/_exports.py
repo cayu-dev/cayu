@@ -2785,7 +2785,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.memory.execution",
         "InMemoryMemoryInterventionExecutionStore",
     ),
-    "InMemorySessionStore": ("cayu.sessions.base", "InMemorySessionStore"),
+    "InMemorySessionStore": ("cayu.sessions.memory", "InMemorySessionStore"),
     "InMemoryTaskStore": ("cayu.tasks.memory", "InMemoryTaskStore"),
     "IncompleteSessionRecoveryAction": (
         "cayu.sessions.recovery",
@@ -4116,8 +4116,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ModelStepCostEstimate": ("cayu.budgets.pricing", "ModelStepCostEstimate"),
     "ModelStepIdentity": ("cayu.execution_units", "ModelStepIdentity"),
     "ModelStreamEvent": ("cayu.providers.base", "ModelStreamEvent"),
-    "ModelFailoverPolicy": ("cayu.sessions.base", "ModelFailoverPolicy"),
-    "ModelTarget": ("cayu.sessions.base", "ModelTarget"),
+    "ModelFailoverPolicy": ("cayu.sessions._model_failover", "ModelFailoverPolicy"),
+    "ModelTarget": ("cayu.sessions._model_failover", "ModelTarget"),
     "NamedCheck": ("cayu.tools.named_checks", "NamedCheck"),
     "NativeBinding": ("cayu.environments.bindings", "NativeBinding"),
     "NativeStructuredOutputSchemaInvalid": (

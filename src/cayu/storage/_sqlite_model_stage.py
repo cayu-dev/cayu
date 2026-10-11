@@ -83,8 +83,7 @@ from cayu.sessions._runtime_publication_rules import (
     _next_runtime_publication_timestamp,
     _PreparedRuntimePublication,
 )
-from cayu.sessions.authority import _runtime_publication_json_equal
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced, _runtime_publication_json_equal
 from cayu.sessions.records import Session, SessionStatusConflict
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript as transcript_ops

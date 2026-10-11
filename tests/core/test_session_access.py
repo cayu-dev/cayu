@@ -7,7 +7,7 @@ import pytest
 
 from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
 from cayu.sessions.access import ScopedSessionAccess, SessionAccessDenied
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest

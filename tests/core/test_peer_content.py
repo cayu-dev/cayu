@@ -406,7 +406,7 @@ def _delivery_request(
 def test_registered_receiver_delegates_current_policy_and_fails_closed() -> None:
     from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
     from cayu.collaboration.peer_content import PeerContentExposureItem
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.vaults.redaction import SecretRedactor
 
     request = _request()
@@ -571,12 +571,12 @@ def test_public_participant_peer_delivery_uses_registered_policy(
     from cayu.events import EventType
     from cayu.messages import Message
     from cayu.providers.base import ModelStreamEvent
-    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.context_views import (
         ParticipantSessionCreationRequest,
         ParticipantSessionExecutionRequest,
     )
     from cayu.sessions.invocation import InvocationOriginClaim
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.requests import RunRequest
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.collaboration_postgres import PostgresCollaborationStore
@@ -1328,8 +1328,8 @@ def test_peer_attempt_generation_bounds(generation):
 def test_store_append_replay_and_conflict(tmp_path, backend, request):
     from cayu.collaboration._contracts import OwnerRef
     from cayu.collaboration.participants import ParticipantRef
-    from cayu.sessions.base import InMemorySessionStore
     from cayu.sessions.context_views import ParticipantSessionBinding
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.messaging import SessionMessageQuery
     from cayu.sessions.records import SessionIdentity, SessionStatus
     from cayu.sessions.requests import RunRequest
@@ -1630,7 +1630,7 @@ def test_real_provider_serialization_reports_positive_boundary(adapter):
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_exclusion_exact_replay_rejects_changed_evidence(tmp_path, backend):
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.storage import SQLiteSessionStore
 
     async def run():

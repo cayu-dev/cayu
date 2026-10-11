@@ -21,13 +21,13 @@ from cayu.sessions._model_failover import (
     copy_model_failover_state,
     validate_model_failover_successor,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

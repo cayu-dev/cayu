@@ -142,7 +142,7 @@ async def producer_participant_settlement(store, checkpoint, expected, commitmen
     """
     from cayu.collaboration._contracts import ExactMatch, ExactUnavailable
     from cayu.collaboration._permits import ReceivingSettlementReceipt
-    from cayu.sessions.base import SessionRunFenced
+    from cayu.sessions.authority import SessionRunFenced
 
     if checkpoint is None or ROOT_KEY not in checkpoint:
         return None

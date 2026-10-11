@@ -18,7 +18,7 @@ from cayu import (
 from cayu.providers import OpenAIProvider
 from cayu.runtime._cache_affinity import cache_affinity_key_for_lineage_root
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 
 _MODEL = "gpt-affinity"
 

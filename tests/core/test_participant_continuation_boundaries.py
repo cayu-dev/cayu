@@ -21,10 +21,10 @@ from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.context import CheckpointCompactionContextPolicy
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
+from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
-from cayu.sessions.base import Message
 from cayu.sessions.context_views import (
     ContextViewPublicationRequest,
     ParticipantSessionCreationRequest,

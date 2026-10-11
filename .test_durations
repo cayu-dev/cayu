@@ -46293,5 +46293,14 @@
   "tests/core/test_session_store_composition.py::test_store_interface_and_custom_checkpoint_reader_compose_without_memory[cayu.runtime]": 0.6640663759899326,
   "tests/core/test_session_store_composition.py::test_store_interface_and_custom_checkpoint_reader_compose_without_memory[cayu.sessions.store]": 0.664459042949602,
   "tests/core/test_session_store_composition.py::test_store_interface_and_custom_checkpoint_reader_compose_without_memory[cayu.sessions]": 0.6810649590333924,
-  "tests/core/test_session_store_composition.py::test_store_interface_and_custom_checkpoint_reader_compose_without_memory[cayu]": 0.7156512079527602
+  "tests/core/test_session_store_composition.py::test_store_interface_and_custom_checkpoint_reader_compose_without_memory[cayu]": 0.7156512079527602,
+  "tests/core/test_session_store_composition.py::test_memory_store_composes_without_native_adapters_or_application": 0.9663150000269525,
+  "tests/core/test_session_store_composition.py::test_store_public_imports_and_historical_symbol_pickles_keep_identity[InMemorySessionStore]": 0.00022062496282160282,
+  "tests/core/test_session_store_composition.py::test_store_public_imports_and_historical_symbol_pickles_keep_identity[SessionExecutionInProgress]": 0.00016895896987989545,
+  "tests/core/test_session_store_composition.py::test_store_public_imports_and_historical_symbol_pickles_keep_identity[SessionMessageQueueStatus]": 0.00016537506598979235,
+  "tests/core/test_session_store_composition.py::test_store_public_imports_and_historical_symbol_pickles_keep_identity[SessionRunFenced]": 0.0001824169303290546,
+  "tests/core/test_session_store_composition.py::test_store_public_imports_and_historical_symbol_pickles_keep_identity[SessionStore]": 0.6548852070700377,
+  "tests/core/test_size_report.py::test_report_follows_session_store_owner_without_losing_historical_revisions": 0.444,
+  "tests/core/test_support_bundles.py::test_memory_session_store_schema_readiness_uses_exact_builtin_identity[builtin]": 0.008,
+  "tests/core/test_support_bundles.py::test_memory_session_store_schema_readiness_uses_exact_builtin_identity[custom]": 0.007
 }

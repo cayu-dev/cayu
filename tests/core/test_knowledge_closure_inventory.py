@@ -117,7 +117,7 @@ def test_public_closure_exports_and_retains_knowledge_sources(tmp_path, request,
     from tests.core.session_closure_conformance import create_closure_session
 
     from cayu import CayuApp
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.storage.memory import (
         KnowledgeIndexReadinessUpdate,
         KnowledgeIndexState,

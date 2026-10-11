@@ -34,7 +34,7 @@ from cayu.sessions._runtime_publication import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ResumeRequest, RunRequest

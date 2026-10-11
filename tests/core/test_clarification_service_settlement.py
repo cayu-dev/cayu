@@ -25,7 +25,7 @@ from cayu.runtime._temporary_continuation_permits import (
     TemporaryServiceSettlementReader,
 )
 from cayu.runtime._temporary_continuation_scope import temporary_admission_scope
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.storage.migrations import SchemaMode

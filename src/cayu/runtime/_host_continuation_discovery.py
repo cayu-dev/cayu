@@ -52,7 +52,7 @@ class ContinuationDiscoveryPage:
 
 
 async def _require_session(app, expected, context):
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 

@@ -45,13 +45,12 @@ from cayu.collaboration.participants import (
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import Event, EventType
-from cayu.messages import FilePart
+from cayu.messages import FilePart, Message
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
 )
-from cayu.sessions.base import InMemorySessionStore, Message
 from cayu.sessions.context_views import (
     ContextViewExtensionProjection,
     ContextViewExtensionRegistration,
@@ -61,6 +60,7 @@ from cayu.sessions.context_views import (
     ContextViewSelectionRequest,
     ParticipantSessionCreationRequest,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

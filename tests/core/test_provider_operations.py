@@ -57,9 +57,10 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
 )
 from cayu.sessions._model_stage import ModelCompletionStageRequest, ModelCompletionStageResult
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_delivery import PersistedEventSideEffectClaim
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest

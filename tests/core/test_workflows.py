@@ -30,7 +30,7 @@ from cayu.context.structured_output import (
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.requests import RunRequest
 from cayu.workflows import (
     GateOutcome,

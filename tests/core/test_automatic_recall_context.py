@@ -148,7 +148,7 @@ from cayu.runtime._memory_evidence import (
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest

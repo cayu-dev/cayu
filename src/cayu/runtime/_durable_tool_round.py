@@ -98,7 +98,7 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_run_fence,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationReceipt
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import (
     Session,
     SessionStatus,

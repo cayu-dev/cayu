@@ -27,7 +27,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime._compaction import automatic as _automatic_compaction
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

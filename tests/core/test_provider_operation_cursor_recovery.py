@@ -53,7 +53,8 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageRequest
 from cayu.sessions._runtime_publication import SessionOperationTransform
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest

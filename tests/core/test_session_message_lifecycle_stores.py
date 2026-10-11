@@ -1393,7 +1393,10 @@ def test_empty_queue_checkpoint_publication_retains_epoch_and_rejects_pending(
         SessionRuntimePublicationConflict,
         runtime_publication_checkpoint_value_digest,
     )
-    from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY, SessionRunFenced
+    from cayu.sessions._completion_finalization import (
+        PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+    )
+    from cayu.sessions.authority import SessionRunFenced
     from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
     from cayu.workspaces.local import LocalWorkspace
 

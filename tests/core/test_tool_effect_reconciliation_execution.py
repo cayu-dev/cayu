@@ -18,7 +18,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.tools._operation_boundary import InvocationOperationCapacityError
 from cayu.vaults.redaction import SecretRedactor
 

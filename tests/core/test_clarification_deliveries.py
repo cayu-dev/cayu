@@ -370,7 +370,7 @@ async def test_delivery_cancelled_readback_stays_pending_until_native_exclusion(
         reconcile_delivery,
         register_delivery_in_transaction,
     )
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     store = stores()
     initial, intent = await registered_question(store)

@@ -14,8 +14,8 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._model_step_executor import _context_usage_state_for_session
 from cayu.sessions import _model_completion_publication as model_completion_publication
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

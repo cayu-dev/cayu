@@ -16,7 +16,7 @@ from cayu.runtime._zero_work_interruption import (
 )
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 

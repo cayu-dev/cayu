@@ -51,7 +51,7 @@ from cayu.runtime.provider_operations import (
     ProviderOperationUnavailableReason,
     inspect_provider_operation,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ResumeRequest, RunRequest

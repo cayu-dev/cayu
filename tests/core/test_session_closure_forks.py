@@ -19,8 +19,8 @@ from cayu.runtime.session_closure import (
     SessionClosurePolicy,
     SessionClosureRecord,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.forks import fork_session_invocation
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

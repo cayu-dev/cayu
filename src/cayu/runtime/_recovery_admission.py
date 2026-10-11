@@ -70,7 +70,7 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_run_fence,
 )
 from cayu.sessions._terminal_evidence import _checkpoint_with_session_run_operation
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.cleanup import (
     RecoveryCleanup,
 )

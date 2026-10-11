@@ -37,13 +37,12 @@ import httpx
 from cayu._version import __version__
 from cayu.observability.events import EventSink
 from cayu.runtime.human_attention import HumanAttentionReference, HumanAttentionRequest
-from cayu.sessions.base import (
-    PendingActionKind,
+from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,
     PendingActionRecord,
     PendingActionResultTooLarge,
-    PendingActionSession,
 )
+from cayu.sessions.records import PendingActionKind, PendingActionSession
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp

@@ -53,12 +53,12 @@ from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import (
     ForkSessionRequest,

@@ -41,8 +41,8 @@ from cayu.sessions._runtime_publication import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolResult

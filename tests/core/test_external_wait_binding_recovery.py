@@ -16,7 +16,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.session_external_waits import SessionExternalWaitAdapter
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.external_waits import (
     ExternalEventDelivery,
     ExternalWaitConflict,

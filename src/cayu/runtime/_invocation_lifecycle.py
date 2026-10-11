@@ -200,7 +200,7 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

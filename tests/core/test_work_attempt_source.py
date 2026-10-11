@@ -20,7 +20,8 @@ from cayu.runtime.work_attempt_source import (
     WORK_ATTEMPT_SOURCE_MAX_ITEMS,
     WorkAttemptSourceRequest,
 )
-from cayu.sessions.base import InMemorySessionStore, ModelFailoverPolicy, ModelTarget
+from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (

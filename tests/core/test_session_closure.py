@@ -25,8 +25,8 @@ from cayu.runtime.session_closure import (
     TaskSessionClosureStore,
     session_closure_target_plan_id,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.lineage import SessionLineageNode, SessionLineageResult
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

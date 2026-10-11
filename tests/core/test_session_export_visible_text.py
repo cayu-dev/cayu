@@ -10,7 +10,7 @@ from tests.core.test_session_exports import backend as backend
 from cayu.collaboration.exports import SessionExportConflict, SessionExportDenied
 from cayu.events import EventType
 from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 
 PRIVATE = "private-validation-canary"

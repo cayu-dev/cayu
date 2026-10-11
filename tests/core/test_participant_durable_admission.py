@@ -12,12 +12,13 @@ from cayu.agents import AgentSpec
 from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, Message
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 
 pytestmark = pytest.mark.anyio

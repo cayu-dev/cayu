@@ -10,7 +10,6 @@ from cayu.external_waits import (
     ExternalEventWaits,
     ExternalWaitProjector,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.external_waits import (
     ExternalEventDelivery,
     ExternalWaitCapacityExceeded,
@@ -18,6 +17,7 @@ from cayu.sessions.external_waits import (
     ExternalWaitLimits,
     ExternalWaitUnavailable,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

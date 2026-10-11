@@ -62,9 +62,10 @@ from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
 )
 from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
-from cayu.sessions.base import InMemorySessionStore, ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionsRecoveryRequest
 from cayu.sessions.requests import RunRequest

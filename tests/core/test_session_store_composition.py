@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -134,3 +136,56 @@ async def scenario():
 asyncio.run(scenario())
 """
     )
+
+
+def test_memory_store_composes_without_native_adapters_or_application():
+    _isolated(
+        """
+import asyncio
+from cayu.sessions.memory import InMemorySessionStore
+from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
+
+async def scenario():
+    store = InMemorySessionStore()
+    session = await store.create(RunRequest(agent_name="agent", messages=[]),
+        identity=SessionIdentity(provider_name="provider", model="model"))
+    await store.checkpoint(session.id, {"customer": {"revision": 1}})
+    before = await store.load_checkpoint(session.id)
+    def reject(session, checkpoint):
+        checkpoint["customer"]["revision"] = 2
+        raise ValueError("rejected transform")
+    try:
+        await store.transform_checkpoint(session.id, reject)
+    except ValueError as error:
+        assert str(error) == "rejected transform"
+    else:
+        raise AssertionError("Invalid transform was committed")
+    assert await store.load_checkpoint(session.id) == before
+    await store.transform_checkpoint(session.id,
+        lambda session, checkpoint: {**checkpoint, "customer": {"revision": 3}})
+    assert (await store.load_checkpoint(session.id))["customer"] == {"revision": 3}
+asyncio.run(scenario())
+""",
+        allow_memory=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "SessionStore",
+        "InMemorySessionStore",
+        "SessionExecutionInProgress",
+        "SessionMessageQueueStatus",
+        "SessionRunFenced",
+    ),
+)
+def test_store_public_imports_and_historical_symbol_pickles_keep_identity(name):
+    canonical = getattr(importlib.import_module("cayu.sessions"), name)
+    for module in ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.base"):
+        assert getattr(importlib.import_module(module), name) is canonical
+    historical = f"ccayu.sessions.base\n{name}\n.".encode()
+    assert pickle.loads(historical) is canonical
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        assert pickle.loads(pickle.dumps(canonical, protocol)) is canonical

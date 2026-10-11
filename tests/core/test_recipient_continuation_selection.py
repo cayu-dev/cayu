@@ -17,11 +17,11 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions import ResumeRequest, RunRequest
 from cayu.sessions._recipient_continuation import RecipientContinuationSelection
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
+from cayu.sessions.memory import InMemorySessionStore
 
 pytestmark = pytest.mark.anyio
 

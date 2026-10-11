@@ -10,7 +10,7 @@ from cayu.sessions._invocation_lifecycle import (
     _invocation_lifecycle_command_sha256,
     _InvocationLifecycleReceiptLedger,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.external_waits import external_wait_digest
 
 

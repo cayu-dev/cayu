@@ -34,8 +34,8 @@ from cayu.server import (
     mount_dashboard,
 )
 from cayu.server.auth import server_auth_dependency
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,

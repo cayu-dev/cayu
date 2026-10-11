@@ -325,7 +325,7 @@ from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.cleanup import (
     RecoveryCleanupStep,
 )

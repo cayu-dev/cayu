@@ -55,7 +55,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.forks import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileSelection,
@@ -69,6 +68,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     TaskInvocation,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,

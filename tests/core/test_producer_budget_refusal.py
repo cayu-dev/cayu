@@ -153,7 +153,7 @@ async def test_dispatched_producer_cannot_settle_against_empty_budget_inventory(
     from cayu.budgets.base import InMemoryBudgetLedger
     from cayu.collaboration.memory import InMemoryCollaborationStore
     from cayu.providers.base import ModelStreamEvent
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     collaboration = InMemoryCollaborationStore()
     stores = collaboration, InMemorySessionStore(), lambda: collaboration, ("memory", None)

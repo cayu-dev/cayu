@@ -19,8 +19,8 @@ from cayu.collaboration.requests import RequestAdmissionCommand
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.sessions import RunRequest
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.context_views import RecipientSessionCreationRequest
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.anyio

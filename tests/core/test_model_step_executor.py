@@ -29,8 +29,8 @@ from cayu.providers import (
     ModelStreamEvent,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import RunRequest
 

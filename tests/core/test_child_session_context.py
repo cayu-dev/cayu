@@ -20,6 +20,7 @@ from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionLifecycleOccurrenceSource,
+    ChildSessionLifecycleQuery,
     ChildSessionLifecycleState,
     ChildSessionNotificationFreshness,
 )
@@ -31,7 +32,7 @@ from cayu.sessions._model_stage import (
     ModelCompletionStageRequest,
     SessionModelCompletionStageConflict,
 )
-from cayu.sessions.base import ChildSessionLifecycleQuery, InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.child_context import (
     ChildSessionContextContribution,
     ChildSessionContextContributor,
@@ -48,6 +49,7 @@ from cayu.sessions.child_results import (
     ChildSessionResultUnavailable,
     project_terminal_child_session_result,
 )
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.sessions.store import SessionStore

@@ -29,7 +29,7 @@ from cayu.sessions._foreground_child_checkpoint import (
     foreground_child_state_from_checkpoint,
 )
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
 

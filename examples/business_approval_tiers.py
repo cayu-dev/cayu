@@ -39,7 +39,7 @@ from cayu import (
 )
 from cayu.evals import ScriptedModelProvider
 from cayu.events import EventType
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 
 CHAIN = ("area", "national", "corporate")
 

@@ -23,7 +23,8 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._environment_exposure import require_environment_exposed
-from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest

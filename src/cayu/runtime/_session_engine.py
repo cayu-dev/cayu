@@ -476,6 +476,7 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelCompletionStageSettlementRequest,
 )
+from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
@@ -489,7 +490,7 @@ from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _checkpoint_with_session_run_operation,
 )
-from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

@@ -24,7 +24,7 @@ from cayu.runtime.execution_profiles import build_execution_profile_identity
 from cayu.sessions import _invocation_lifecycle as contracts
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 
 
 def _active_profile():

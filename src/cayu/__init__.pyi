@@ -3919,6 +3919,8 @@ from cayu.sessions._interaction_transitions import (
 from cayu.sessions._interaction_transitions import (
     SessionInvocationAdmission as SessionInvocationAdmission,
 )
+from cayu.sessions._model_failover import ModelFailoverPolicy as ModelFailoverPolicy
+from cayu.sessions._model_failover import ModelTarget as ModelTarget
 from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
 )
@@ -3944,9 +3946,6 @@ from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
 from cayu.sessions.authority import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
 )
-from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
-from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
-from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION as CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -4121,6 +4120,7 @@ from cayu.sessions.mcp_manifest_history import (
 from cayu.sessions.mcp_manifest_history import (
     McpManifestPublicationResult as McpManifestPublicationResult,
 )
+from cayu.sessions.memory import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.messaging import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
 from cayu.sessions.messaging import EnqueueSessionMessageResult as EnqueueSessionMessageResult
 from cayu.sessions.messaging import SessionMessageAccessContext as SessionMessageAccessContext

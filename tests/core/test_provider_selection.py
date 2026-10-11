@@ -13,7 +13,7 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.requests import ResumeRequest, RunRequest, copy_run_request
 
 

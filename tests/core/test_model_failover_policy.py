@@ -16,7 +16,7 @@ from cayu.runtime._model_failover import (
     decide_model_failover,
 )
 from cayu.runtime.retry_policy import RetrySuppression, retry_decision
-from cayu.sessions.base import copy_model_failover_policy
+from cayu.sessions._model_failover import copy_model_failover_policy
 
 
 def test_failover_public_policy_detaches_ordered_targets():

@@ -19,7 +19,7 @@ from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (

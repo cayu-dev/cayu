@@ -42,7 +42,7 @@ from cayu.deadlines import ExecutionDeadline
 from cayu.egress import VIRTUAL_EGRESS_EVENT_TYPES
 from cayu.events import EventType
 from cayu.messages import Message, MessageRole, TextPart
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from maintenance.model_catalog.agent_tools import (
     _has_explicit_static_mode,
 )

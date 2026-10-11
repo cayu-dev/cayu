@@ -24,7 +24,7 @@ from cayu.sessions.requests import ResumeRequest, RunRequest
 def test_exclusion_fences_delayed_resume_admission(
     backend, cancel_observer, event_first, tmp_path, request, monkeypatch
 ):
-    from cayu.sessions.base import SessionRunFenced
+    from cayu.sessions.authority import SessionRunFenced
 
     async def scenario():
         async with stores(backend, tmp_path, request, [datetime.now(UTC)]) as (store, reopen):

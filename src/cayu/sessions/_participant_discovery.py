@@ -30,7 +30,7 @@ class ParticipantSessionCursor(ContractValue):
 
 async def discover_participant_sessions(app, participant, *, context, cursor=None, limit=32):
     from cayu.collaboration.participants import CollaborationUnavailable
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 

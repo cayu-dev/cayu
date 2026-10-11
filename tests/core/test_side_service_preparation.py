@@ -14,7 +14,7 @@ from cayu.runtime._temporary_continuation import (
     temporary_service_invocation_id,
 )
 from cayu.sessions._temporary_service_target import MAX_TARGET_SERVICES, TemporaryServiceTarget
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 
 
 def test_joint_preparation_exact_replay(store_factory):

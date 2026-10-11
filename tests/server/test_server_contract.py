@@ -47,7 +47,7 @@ from cayu.server.sse import (
     event_to_sse_message,
     parse_last_event_id,
 )
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
 from cayu.tasks.memory import InMemoryTaskStore
 

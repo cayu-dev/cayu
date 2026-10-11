@@ -21,7 +21,7 @@ from cayu.runtime import _run_limits as run_limits
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._runtime_publication import RuntimePublicationRequest, RuntimePublicationResult
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import InterruptSessionRequest, RunRequest

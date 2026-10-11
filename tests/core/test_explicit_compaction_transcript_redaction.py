@@ -34,8 +34,8 @@ from cayu.messages import (
 from cayu.observability.events import InMemoryEventSink
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import CompactSessionRequest, RunRequest
 from cayu.sessions.transcript_queries import TranscriptSnapshot

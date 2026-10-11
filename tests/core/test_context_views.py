@@ -13,9 +13,9 @@ from cayu.artifacts.attachments import file_attachment
 from cayu.collaboration._contracts import OwnerRef
 from cayu.collaboration.participants import ParticipantRef
 from cayu.events import Event, EventType
-from cayu.messages import ToolResultPart
+from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, Message, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.context_views import (
     ContextViewExtensionProjection,
     ContextViewExtensionRegistration,
@@ -35,6 +35,7 @@ from cayu.sessions.context_views import (
     project_context_view_extensions,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatusConflict
 from cayu.sessions.requests import CompactSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

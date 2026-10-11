@@ -18,7 +18,7 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (

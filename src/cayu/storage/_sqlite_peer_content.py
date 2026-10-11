@@ -26,10 +26,6 @@ from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, MessageRole
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.sessions._access_rules import require_resource_session
-from cayu.sessions.base import (
-    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-    session_messages_input_contract_evidence,
-)
 from cayu.sessions.creation_fence import SessionCreationTarget
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -38,6 +34,10 @@ from cayu.sessions.messaging import (
     _queued_session_message_event_payload,
 )
 from cayu.sessions.records import Session
+from cayu.sessions.transcript_input import (
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+    session_messages_input_contract_evidence,
+)
 from cayu.storage import _creation_fence
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage._sqlite_connection import SQLiteOperationRunner

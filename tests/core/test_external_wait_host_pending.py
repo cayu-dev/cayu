@@ -18,8 +18,8 @@ from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._session_continuation_owner import SessionContinuationOwner
 from cayu.session_external_waits import SessionExternalWaitAdapter
 from cayu.sessions._session_continuation import ContinuationConflict, ContinuationUnavailable
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitConflict
+from cayu.sessions.memory import InMemorySessionStore
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

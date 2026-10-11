@@ -15,7 +15,7 @@ from cayu.runtime._policy_freshness import boot_identity, require_fresh
 from cayu.runtime._policy_installation import PolicyInstallationOwner
 from cayu.runtime._policy_storage import ModelPolicyStore
 from cayu.runtime._policy_wire import canonical, decode, identifier, require
-from cayu.sessions.base import ModelTarget
+from cayu.sessions._model_failover import ModelTarget
 
 
 class PolicyChannel(ABC):

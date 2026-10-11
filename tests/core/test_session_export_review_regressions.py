@@ -31,7 +31,7 @@ from cayu.collaboration.exports import (
     SessionExportUnavailable,
 )
 from cayu.events import EventType
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor
 

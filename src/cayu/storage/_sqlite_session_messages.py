@@ -42,7 +42,7 @@ from cayu.sessions._model_stage_rules import (
     _reconstruct_active_model_completion_stage_record,
     _reconstruct_model_completion_stage_dispatch,
 )
-from cayu.sessions.base import SessionMessageQueueStatus, SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
@@ -55,6 +55,7 @@ from cayu.sessions.messaging import (
     SessionMessageDeliveryBatch,
     SessionMessageInspection,
     SessionMessageQuery,
+    SessionMessageQueueStatus,
     SessionMessageSource,
     SessionQueuedMessage,
     _queued_session_message_event_payload,

@@ -55,7 +55,7 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceipt,
     _session_run_operation_from_checkpoint,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.invocation import (
     SessionExecutionSource,
     SessionInvocationBinding,

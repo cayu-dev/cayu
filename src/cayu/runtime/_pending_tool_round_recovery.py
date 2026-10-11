@@ -124,7 +124,7 @@ from cayu.sessions._runtime_publication import RuntimePublicationReceipt
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
 )
-from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (
     Session,

@@ -52,7 +52,7 @@ class RejectImplementations(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname in {
             "cayu.storage.sqlite", "cayu.storage.postgres", "cayu.storage.memory",
-            "cayu.sessions.base", "cayu.tasks.memory", "cayu.applications",
+            "cayu.sessions.base", "cayu.sessions.store", "cayu.sessions.memory", "cayu.tasks.memory", "cayu.applications",
             "cayu.runtime._session_engine", "cayu.runtime._recovery_coordinator",
             "cayu.runtime._model_step_executor", "cayu.runtime._tool_round_executor",
         }:

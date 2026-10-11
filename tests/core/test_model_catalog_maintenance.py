@@ -27,7 +27,7 @@ from cayu.budgets.pricing import (
 )
 from cayu.events import Event, EventType
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.tools.base import ToolContext
 from maintenance.model_catalog import agent_tools as catalog_tools
 from maintenance.model_catalog import browser, local_refresh, refresh, search

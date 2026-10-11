@@ -84,7 +84,7 @@ def _require_released_execution(record: ExternalWaitRecord, session, checkpoint)
         require_released_invocation_command_authority,
     )
     from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
-    from cayu.sessions.base import SessionRunFenced
+    from cayu.sessions.authority import SessionRunFenced
 
     execution = record.execution
     assert execution is not None

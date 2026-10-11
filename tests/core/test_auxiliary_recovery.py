@@ -119,7 +119,7 @@ def test_unattested_store_rejects_public_auxiliary_request_before_dispatch():
 
     from cayu import AgentSpec, CayuApp, Message, RunRequest, ScriptedModelProvider
     from cayu.providers import ModelRequest, ModelStreamEvent
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.tools.base import Tool, ToolResult, ToolSpec
     from cayu.tools.inference import AuxiliaryInferencePolicy
 
@@ -180,7 +180,7 @@ def test_unattested_store_rejects_public_auxiliary_request_before_dispatch():
 
 
 def test_auxiliary_recovery_requires_concrete_atomic_hook_attestation():
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     class Unattested(InMemorySessionStore):
         async def _complete_model_completion_stage_atomic(self, prepared):

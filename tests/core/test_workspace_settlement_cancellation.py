@@ -19,8 +19,8 @@ from cayu.applications import CayuApp
 from cayu.deadlines import ExecutionDeadline
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

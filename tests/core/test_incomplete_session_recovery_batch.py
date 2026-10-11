@@ -10,8 +10,8 @@ import cayu.sessions.recovery as recovery_contracts
 from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionListResult, SessionQuery
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (

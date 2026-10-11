@@ -283,7 +283,7 @@ def test_admission_reconciliation_replays_competing_native_publication(store_fac
 
 def test_prepared_exclusion_and_native_admission_have_one_winner(store_factory):
     from cayu.collaboration._permits import ReceivingSettlementReceipt
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     async def run(store):
         admission, command = await native_command(store)
@@ -553,7 +553,7 @@ def test_native_service_return_reconciles_after_store_reconstruction(store_facto
     from tests.core._execution_profile_fixtures import interrupt_and_release_test_invocation
 
     from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
 
     async def run():
         store = store_factory()

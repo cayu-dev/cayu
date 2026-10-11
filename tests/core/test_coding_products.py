@@ -31,7 +31,7 @@ from cayu.coding_products import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.tasks.contracts import (

@@ -50,7 +50,7 @@ from typing import get_type_hints
 class RejectImplementations(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname.startswith("cayu.storage") or fullname in {
-            "cayu.sessions.base", "cayu.tasks.memory",
+            "cayu.sessions.base", "cayu.sessions.store", "cayu.sessions.memory", "cayu.tasks.memory",
         } or (fullname.startswith("cayu.runtime.") and fullname not in {
             "cayu.runtime._exports", "cayu.runtime.execution_identity",
         }):

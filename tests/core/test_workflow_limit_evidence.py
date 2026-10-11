@@ -13,7 +13,7 @@ from cayu.budgets.run_limits import RunLimits
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.observability.hooks import RuntimeHook
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 from cayu.workflows.base import WorkflowSpec

@@ -156,7 +156,7 @@ def test_work_attempt_stream_clears_inherited_authority_before_yield(close_early
         _current_session_interaction_id,
         _current_session_run_epoch,
     )
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.tasks.admission import WorkAttemptRunRequest
     from cayu.tasks.memory import InMemoryTaskStore
     from cayu.vaults.redaction import SecretRedactor
@@ -208,7 +208,7 @@ def test_work_attempt_stream_preserves_caller_signal_during_cleanup(
         _current_session_interaction_id,
         _current_session_run_epoch,
     )
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.tasks.admission import WorkAttemptRunRequest
     from cayu.tasks.memory import InMemoryTaskStore
     from cayu.vaults.redaction import SecretRedactor

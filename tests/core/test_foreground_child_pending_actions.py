@@ -14,7 +14,7 @@ from cayu.approvals.user_input import UserInputResponse
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import PendingActionKind

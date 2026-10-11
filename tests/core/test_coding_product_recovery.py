@@ -665,7 +665,7 @@ def test_recover_settled_execution_without_provider_redispatch(
     from cayu.agents import AgentSpec
     from cayu.environments.base import Environment, EnvironmentSpec
     from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.requests import ResumeRequest
     from cayu.storage.sqlite import SQLiteSessionStore
 
