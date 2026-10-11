@@ -216,14 +216,11 @@ from cayu.sessions._model_stage_rules import (
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
     _validate_model_completion_stage_for_settlement,
-    _validate_model_completion_stage_release,
 )
 from cayu.sessions._operation_records import (
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
-    SessionOperationPublication,
     _active_unexpired_session_operation_id,
     _reject_reserved_runtime_publication_key,
-    _validate_session_operation_record_keys,
 )
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
@@ -257,7 +254,6 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     _copy_optional_event_id,
-    _copy_session_event_batch,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.exports import _require_session_export_target
@@ -5726,327 +5722,32 @@ class SQLiteSessionStore(
         context_view_compaction_cursor: int | None = None,
         preserve_completion_result_publications: bool = True,
     ) -> Session:
-        from cayu.sessions.pending_actions import pending_action_event_storage_values
-
-        session_id, copied_events = _copy_session_event_batch(session_id, events)
-        transform_count = sum(
-            transform is not None
-            for transform in (
-                checkpoint_transform,
-                store_time_checkpoint_transform,
-                operation_transform,
-                store_time_operation_transform,
-            )
+        return await publication_ops.publish_checkpoint_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            store_time_checkpoint_transform=store_time_checkpoint_transform,
+            operation_idempotency_key=operation_idempotency_key,
+            operation_transform=operation_transform,
+            store_time_operation_transform=store_time_operation_transform,
+            operation_commit_guard=operation_commit_guard,
+            operation_commit_time_guard=operation_commit_time_guard,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+            context_view_compaction_cursor=context_view_compaction_cursor,
+            preserve_completion_result_publications=preserve_completion_result_publications,
+            run_write=self._run_write,
+            load_session=self._load_unlocked,
+            load_checkpoint=self._load_checkpoint_unlocked,
+            store_now=self._ownership_clock,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            first_existing_event_id=_first_existing_event_id,
+            publish_budget_identities=_publish_budget_reservation_identities,
+            record_terminal_receipts=_record_invocation_terminal_event_receipts,
+            touch_activity=_touch_session_activity,
+            validate_compaction=self._validate_context_view_compaction_unlocked,
         )
-        if transform_count != 1:
-            raise TypeError("Exactly one checkpoint publication transform is required.")
-        if (
-            operation_transform is not None or store_time_operation_transform is not None
-        ) and operation_idempotency_key is None:
-            raise TypeError("operation_idempotency_key is required.")
-        from cayu.collaboration import _session_export_store as session_exports
-
-        if operation_idempotency_key is not None:
-            session_exports.require_operation_key_access(operation_idempotency_key, read=False)
-            _require_session_export_target(session_id, operation_idempotency_key)
-        allowed_statuses = (
-            None
-            if expected_statuses is None
-            else _validate_status_set(expected_statuses, "expected_statuses")
-        )
-
-        def statement(connection: sqlite3.Connection) -> Session:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                updated_at = self._ownership_clock()
-                loaded = self._load_unlocked(session_id)
-                if loaded is None:
-                    raise KeyError(f"Session not found: {session_id}")
-                _assert_session_run_epoch(session_id, loaded)
-                for owner in self._closure_lineage_owners_unlocked((session_id,)):
-                    _check_closure_lineage_owner(owner, (session_id,))
-                if allowed_statuses is not None and loaded.status not in allowed_statuses:
-                    raise SessionStatusConflict(
-                        "Session status is not eligible for checkpoint publication: "
-                        f"{loaded.status}"
-                    )
-                if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
-                    raise SessionRunFenced(
-                        f"Session source run epoch is stale: expected {expected_run_epoch}, "
-                        f"current {loaded.run_epoch}."
-                    )
-                current_cursor = transcript_ops.transcript_cursor(connection, session_id)
-                if (
-                    expected_transcript_cursor is not None
-                    and current_cursor != expected_transcript_cursor
-                ):
-                    raise ValueError(
-                        "Session source transcript cursor is stale: expected "
-                        f"{expected_transcript_cursor}, current {current_cursor}."
-                    )
-                if context_view_compaction_cursor is not None:
-                    self._validate_context_view_compaction_unlocked(
-                        session_id, context_view_compaction_cursor
-                    )
-                current_checkpoint = self._load_checkpoint_unlocked(session_id)
-                callback_checkpoint = _copy_checkpoint_for_transform(
-                    current_checkpoint,
-                    session_id=session_id,
-                )
-                operation_records: dict[str, dict[str, Any]] = {}
-                model_completion_stage_release = None
-                if operation_transform is not None or store_time_operation_transform is not None:
-                    operation_row = connection.execute(
-                        "SELECT record_json FROM cayu_session_operations "
-                        "WHERE session_id = ? AND idempotency_key = ?",
-                        (session_id, operation_idempotency_key),
-                    ).fetchone()
-                    current_operation = (
-                        None if operation_row is None else json.loads(operation_row["record_json"])
-                    )
-                    if operation_transform is not None:
-                        publication = operation_transform(
-                            loaded,
-                            callback_checkpoint,
-                            current_operation,
-                        )
-                    else:
-                        assert store_time_operation_transform is not None
-                        publication = store_time_operation_transform(
-                            loaded,
-                            callback_checkpoint,
-                            current_operation,
-                            updated_at,
-                        )
-                    if type(publication) is not SessionOperationPublication:
-                        raise TypeError(
-                            "Session operation transform must return a SessionOperationPublication."
-                        )
-                    transformed = copy_durable_json_object(
-                        publication.checkpoint,
-                        "checkpoint",
-                    )
-                    transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
-                        current_checkpoint,
-                        transformed,
-                        session_id=session_id,
-                    )
-                    operation_records = copy_durable_json_object(
-                        publication.operation_records,
-                        "operation_records",
-                    )
-                    model_completion_stage_release = publication.model_completion_stage_release
-                    _validate_session_operation_record_keys(operation_records)
-                    indices = session_exports.selected_transcript_indices(session_id=session_id)
-                    if (
-                        indices
-                        or session_exports.checkpoint_visible(session_id=session_id)
-                        or any(
-                            key.startswith(session_exports.OPERATION_PREFIX)
-                            for key in operation_records
-                        )
-                    ):
-                        selected_rows: tuple[TranscriptRecord, ...] = ()
-                        if indices:
-                            placeholders = ",".join("?" for _ in indices)
-                            rows = connection.execute(
-                                "SELECT session_order - 1 AS transcript_index, "
-                                "interaction_id, message_json FROM cayu_transcript_messages "
-                                f"WHERE session_id = ? AND session_order IN ({placeholders}) "
-                                "ORDER BY session_order",
-                                (session_id, *(index + 1 for index in indices)),
-                            ).fetchall()
-                            selected_rows = tuple(
-                                TranscriptRecord(
-                                    index=row["transcript_index"],
-                                    interaction_id=row["interaction_id"],
-                                    message=Message(**json.loads(row["message_json"])),
-                                )
-                                for row in rows
-                            )
-                        session_exports.validate_publication(
-                            session=loaded,
-                            current_checkpoint=current_checkpoint,
-                            proposed_checkpoint=transformed,
-                            operation_records=operation_records,
-                            selected_transcript_rows=selected_rows,
-                            events=copied_events,
-                        )
-                else:
-                    if checkpoint_transform is not None:
-                        transformed = checkpoint_transform(loaded, callback_checkpoint)
-                    else:
-                        assert store_time_checkpoint_transform is not None
-                        transformed = store_time_checkpoint_transform(
-                            loaded,
-                            callback_checkpoint,
-                            updated_at,
-                        )
-                    if transformed is None:
-                        raise ValueError("Checkpoint transform must return a checkpoint.")
-                    transformed = copy_durable_json_object(transformed, "checkpoint")
-                    transformed = (
-                        _replace_checkpoint_preserving_completion_result_event_publications(
-                            current_checkpoint,
-                            transformed,
-                            preserve_completion_result_publications=(
-                                preserve_completion_result_publications
-                            ),
-                            session_id=session_id,
-                        )
-                    )
-                event_rows = []
-                for event in copied_events:
-                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
-                        event
-                    )
-                    event_rows.append(
-                        (
-                            session_id,
-                            event.id,
-                            event.interaction_id,
-                            str(event.type),
-                            sqlite_records.format_datetime(event.timestamp),
-                            event.agent_name,
-                            event.environment_name,
-                            event.workflow_name,
-                            event.tool_name,
-                            sqlite_records.json_dumps(event.payload),
-                            lookup_key,
-                            projection,
-                            projection_bytes,
-                        )
-                    )
-                _publish_budget_reservation_identities(connection, copied_events)
-                connection.execute(
-                    """
-                    INSERT INTO cayu_checkpoints (
-                        session_id, state_json, updated_at,
-                        pending_action_source_bytes,
-                        pending_action_tool_call_count,
-                        pending_action_flags,
-                        pending_action_metrics_ready
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                        state_json = excluded.state_json,
-                        updated_at = excluded.updated_at,
-                        pending_action_source_bytes = excluded.pending_action_source_bytes,
-                        pending_action_tool_call_count = excluded.pending_action_tool_call_count,
-                        pending_action_flags = excluded.pending_action_flags,
-                        pending_action_metrics_ready = excluded.pending_action_metrics_ready
-                    """,
-                    sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
-                )
-                if operation_records:
-                    connection.executemany(
-                        """
-                        INSERT INTO cayu_session_operations (
-                            session_id, idempotency_key, record_json, updated_at
-                        )
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(session_id, idempotency_key) DO UPDATE SET
-                            record_json = excluded.record_json,
-                            updated_at = excluded.updated_at
-                        """,
-                        [
-                            (
-                                session_id,
-                                key,
-                                sqlite_records.json_dumps(record),
-                                sqlite_records.format_datetime(updated_at),
-                            )
-                            for key, record in operation_records.items()
-                        ],
-                    )
-                if model_completion_stage_release is not None:
-                    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
-                        session_id,
-                        model_completion_stage_release.stage_id,
-                    )
-                    stage_rows = connection.execute(
-                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
-                        "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
-                        (
-                            session_id,
-                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                            preparation_key,
-                            terminal_key,
-                        ),
-                    ).fetchall()
-                    stage_records = {
-                        row["idempotency_key"]: model_stage_ops.decode_stage_record(
-                            row["record_json"]
-                        )
-                        for row in stage_rows
-                    }
-                    _validate_model_completion_stage_release(
-                        session=loaded,
-                        active_record=stage_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                        preparation_record=stage_records.get(preparation_key),
-                        terminal_record=stage_records.get(terminal_key),
-                        release=model_completion_stage_release,
-                    )
-                    deleted = connection.execute(
-                        "DELETE FROM cayu_session_operations "
-                        "WHERE session_id = ? AND idempotency_key = ?",
-                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                    )
-                    if deleted.rowcount != 1:
-                        raise SessionModelCompletionStageConflict(
-                            "The active model-completion stage changed during disposition."
-                        )
-                if event_rows:
-                    connection.executemany(
-                        """
-                        INSERT INTO cayu_events (
-                            session_id, event_id, interaction_id, event_type, timestamp,
-                            agent_name, environment_name, workflow_name, tool_name,
-                            payload_json, pending_action_lookup_key,
-                            pending_action_projection_json, pending_action_projection_bytes
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        event_rows,
-                    )
-                    _record_invocation_terminal_event_receipts(
-                        connection, session_id, copied_events, activity_at=updated_at
-                    )
-                    event_delivery_ops.enqueue_persisted_event_side_effects(
-                        connection,
-                        session_id,
-                        copied_events,
-                    )
-                if operation_commit_guard is not None:
-                    operation_commit_guard()
-                activity_at = (
-                    self._ownership_clock() if operation_commit_guard is not None else updated_at
-                )
-                if operation_commit_time_guard is not None:
-                    activity_at = self._ownership_clock()
-                    operation_commit_time_guard(activity_at)
-                _touch_session_activity(connection, session_id, activity_at)
-                connection.commit()
-            except sqlite3.IntegrityError as exc:
-                connection.rollback()
-                existing_event_id = _first_existing_event_id(
-                    connection,
-                    session_id,
-                    [event.id for event in copied_events],
-                )
-                if existing_event_id is not None:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {existing_event_id}"
-                    ) from exc
-                raise
-            except BaseException:
-                connection.rollback()
-                raise
-            return loaded.model_copy(
-                update={"updated_at": updated_at, "last_activity_at": activity_at}
-            )
-
-        return await self._run_write(statement)
 
     async def load_session_closure_records(
         self, session_id: str, *, max_records: int, max_bytes: int

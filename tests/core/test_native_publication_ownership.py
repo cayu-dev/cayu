@@ -190,6 +190,42 @@ async def exercise_stage_promotion(owner, caps, session, clean, snapshot):
     clean()
 
 
+async def exercise_checkpoint_publication(owner, caps, session, error, clean, snapshot):
+    publish = bind(owner, "publish_checkpoint_events", caps)
+    event = Event(type="custom.publication", session_id=session.id, payload={"phase": "checkpoint"})
+    arguments = dict(
+        checkpoint_transform=lambda _session, checkpoint: {
+            **(checkpoint or {}),
+            "phase": "checkpoint",
+        },
+        operation_idempotency_key=None,
+        operation_transform=None,
+        store_time_operation_transform=None,
+        operation_commit_time_guard=None,
+        events=[event],
+        expected_statuses={SessionStatus.RUNNING},
+        expected_run_epoch=session.run_epoch,
+        expected_transcript_cursor=0,
+    )
+    guards = []
+
+    def fail_after_writes():
+        guards.append("called")
+        raise error("injected checkpoint commit guard")
+
+    before = await snapshot()
+    with pytest.raises(error, match="injected"):
+        await publish(session.id, **arguments, operation_commit_guard=fail_after_writes)
+    assert guards == ["called"]
+    clean()
+    assert await snapshot() == before
+    result = await publish(session.id, **arguments, operation_commit_guard=None)
+    assert result.id == session.id and result.run_epoch == session.run_epoch
+    assert await caps["read_checkpoint"]() == {"phase": "checkpoint"}
+    assert await snapshot() != before
+    clean()
+
+
 @asynccontextmanager
 async def sqlite_publication(tmp_path, error):
     from cayu.storage import _sqlite_publication as owner
@@ -206,7 +242,19 @@ async def sqlite_publication(tmp_path, error):
                 adapter.SQLiteSessionStore._closure_lineage_owners_unlocked, readers
             ),
             first_existing_event_id=adapter._first_existing_event_id,
+            store_now=stages.complete.keywords["store_now"],
+            publish_budget_identities=adapter._publish_budget_reservation_identities,
+            record_terminal_receipts=adapter._record_invocation_terminal_event_receipts,
+            touch_activity=adapter._touch_session_activity,
+            validate_compaction=partial(
+                adapter.SQLiteSessionStore._validate_context_view_compaction_unlocked, readers
+            ),
         )
+
+        async def read_checkpoint():
+            return await caps["run_read"](lambda _conn: caps["load_checkpoint"](session.id))
+
+        caps["read_checkpoint"] = read_checkpoint
 
         async def snapshot():
             return await caps["run_read"](
@@ -278,5 +326,22 @@ def test_sqlite_publication_cancellation_retains_transaction_until_commit(tmp_pa
             clean()
             fault.enabled = False
             assert (await publish(prepared)).replayed
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+def test_sqlite_checkpoint_publication_composes_and_rolls_back_commit_guard(tmp_path, error):
+    async def run():
+        async with sqlite_publication(tmp_path, error) as (
+            owner,
+            caps,
+            session,
+            _,
+            clean,
+            snapshot,
+            _lock,
+        ):
+            await exercise_checkpoint_publication(owner, caps, session, error, clean, snapshot)
 
     asyncio.run(run())

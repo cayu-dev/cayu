@@ -1,4 +1,6 @@
 {
+  "tests/core/test_native_publication_ownership.py::test_sqlite_checkpoint_publication_composes_and_rolls_back_commit_guard[RuntimeError]": 0.155,
+  "tests/core/test_native_publication_ownership.py::test_sqlite_checkpoint_publication_composes_and_rolls_back_commit_guard[CancelledError]": 0.152,
   "tests/core/test_postgres_publication_ownership.py::test_postgres_publication_imports_without_adapters_or_driver": 1.403,
   "tests/core/test_postgres_publication_ownership.py::test_postgres_stage_promotion_composes_real_publication": 1.008,
   "tests/core/test_postgres_publication_ownership.py::test_postgres_publication_composes_and_rolls_back_failed_writes[RuntimeError]": 0.183,
