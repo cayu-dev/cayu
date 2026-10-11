@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-# ruff: noqa: E402
 import pytest
 
-fastapi = pytest.importorskip("fastapi")
+pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
-httpx = pytest.importorskip("httpx")
+pytest.importorskip("httpx")
 
 import asyncio
 from collections.abc import AsyncIterator
