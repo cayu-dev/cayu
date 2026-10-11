@@ -16,12 +16,14 @@ from tests.core.test_native_tool_grant_ownership import (
     seed,
 )
 
+from cayu.storage import _postgres_public_authority as public_authority_ops
+
 
 def test_postgres_tool_grant_owner_imports_without_adapters_or_driver():
     assert_owner_imports("postgres")
 
 
-def test_postgres_tool_grant_owner_composes_with_direct_connection(postgres_dsn):
+def test_postgres_tool_grant_owner_composes_with_direct_connection(postgres_dsn, monkeypatch):
     import psycopg
     from psycopg import sql
 
@@ -63,19 +65,27 @@ def test_postgres_tool_grant_owner_composes_with_direct_connection(postgres_dsn)
             assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
             return ()
 
-        async def register_event_authorities(cur, session_id, events):
+        original_register = public_authority_ops.register_event_authorities
+
+        async def register_event_authorities(cur, session_id, events, *, codec):
             # Seeding registered this interaction. All subsequent events belong
             # to that scope and introduce no new interaction authority.
             assert active and session_id == session.id
             assert all(event.interaction_id == record.interaction_id for event in events)
             assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
 
+            await original_register(cur, session_id, events, codec=codec)
+
+        monkeypatch.setattr(
+            public_authority_ops, "register_event_authorities", register_event_authorities
+        )
+
         # Compose only the existing transaction-local event writers. No session
         # adapter instance is kept alive or supplied to the grant owner.
         writer = SimpleNamespace(
             _session_store_now=adapter.PostgresSessionStore._session_store_now,
             _publish_budget_reservation_identities=adapter.PostgresSessionStore._publish_budget_reservation_identities,
-            _register_event_public_authorities=register_event_authorities,
+            public_authority_alias_codec=alias_codec,
         )
         for name in (
             "_record_invocation_terminal_event_receipts",
@@ -115,9 +125,7 @@ def test_postgres_tool_grant_owner_composes_with_direct_connection(postgres_dsn)
                 decode_grant=adapter._targeted_tool_grant_from_postgres_row,
                 decode_use=adapter._targeted_tool_use_from_postgres_row,
                 validate_use_counts=adapter._validate_targeted_tool_use_counts,
-                register_alias=partial(
-                    adapter.PostgresSessionStore._register_public_authority_alias_row, None
-                ),
+                register_alias=public_authority_ops.register_alias_row,
                 append_events=append_events,
                 append_event_once=append_once,
                 closure_owners=closure_owners,

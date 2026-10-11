@@ -17,6 +17,8 @@ from tests.core.test_native_session_creation_ownership import (
     seed,
 )
 
+from cayu.storage import _postgres_public_authority as public_authority_ops
+
 
 def test_postgres_creation_owner_imports_without_adapters_or_driver():
     assert_owner_imports("postgres")
@@ -89,7 +91,7 @@ def test_postgres_creation_owner_composes_with_direct_connection(postgres_dsn, e
         # Compose the existing transaction-local readers and authority writers
         # without retaining a store, pool, or readiness implementation.
         readers = SimpleNamespace(public_authority_alias_codec=None)
-        for method in ("_load_labels", "_closure_lineage_owners", "_register_public_authorities"):
+        for method in ("_load_labels", "_closure_lineage_owners"):
             setattr(readers, method, partial(getattr(PostgresSessionStore, method), readers))
 
         async def now(cur):
@@ -104,7 +106,10 @@ def test_postgres_creation_owner_composes_with_direct_connection(postgres_dsn, e
             "store_now": now,
             "lock_closure_lineage": PostgresSessionStore._lock_closure_lineage,
             "closure_owners": readers._closure_lineage_owners,
-            "register_authorities": readers._register_public_authorities,
+            "register_authorities": partial(public_authority_ops.register_authorities, codec=None),
+            "register_event_authorities": partial(
+                public_authority_ops.register_event_authorities, codec=None
+            ),
             "supports_model_failover": lambda: True,
             "checkpoint_values": _checkpoint_row_values,
             "jsonb": Jsonb,
@@ -119,7 +124,6 @@ def test_postgres_creation_owner_composes_with_direct_connection(postgres_dsn, e
             "load_session": "_load",
             "load_for_update": "_load_for_update",
             "load_for_key_share": "_load_for_key_share",
-            "register_event_authorities": "_register_event_public_authorities",
         }.items():
             capabilities[name] = partial(getattr(PostgresSessionStore, method), readers)
         ops = compose(owner, connect, capabilities)

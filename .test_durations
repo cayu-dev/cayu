@@ -1,4 +1,8 @@
 {
+  "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_imports_without_adapters_or_driver": 0.824,
+  "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_composes_and_rolls_back_failed_writes[RuntimeError]": 0.76,
+  "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_composes_and_rolls_back_failed_writes[CancelledError]": 0.183,
+  "tests/core/test_postgres_public_authority_ownership.py::test_postgres_public_authority_cancellation_rolls_back_registration": 0.226,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_imports_without_adapters_or_driver": 0.835,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[RuntimeError]": 0.166,
   "tests/core/test_native_public_authority_ownership.py::test_sqlite_public_authority_composes_and_rolls_back_failed_writes[CancelledError]": 0.204,
