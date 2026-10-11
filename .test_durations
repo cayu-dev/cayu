@@ -1,4 +1,8 @@
 {
+  "tests/core/test_memory_transcript_ownership.py::test_memory_transcripts_import_without_store_implementations": 0.194,
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_read_view_observes_indexes_replaced_while_waiting": 0.497,
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_reads_compose_with_independent_indexes": 0.006,
+  "tests/core/test_memory_transcript_ownership.py::test_transcript_search_cancellation_releases_independent_context": 0.016,
   "tests/core/test_postgres_publication_ownership.py::test_postgres_checkpoint_publication_composes_and_rolls_back_commit_guard[RuntimeError]": 0.172,
   "tests/core/test_postgres_publication_ownership.py::test_postgres_checkpoint_publication_composes_and_rolls_back_commit_guard[CancelledError]": 0.222,
   "tests/core/test_native_publication_ownership.py::test_sqlite_checkpoint_publication_composes_and_rolls_back_commit_guard[RuntimeError]": 0.155,

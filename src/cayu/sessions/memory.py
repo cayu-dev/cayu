@@ -9,7 +9,7 @@ import math
 import secrets
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -106,6 +106,7 @@ from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _memory_event_reads as memory_event_reads
 from cayu.sessions import _memory_session_queries as memory_session_queries
+from cayu.sessions import _memory_transcripts as memory_transcripts
 from cayu.sessions import _model_failover_rules as model_failover_rules
 from cayu.sessions import _model_stage_publication as model_stage_publication
 from cayu.sessions import _model_stage_rules as model_stage_rules
@@ -128,7 +129,6 @@ from cayu.sessions import recovery as session_recovery_rules
 from cayu.sessions import requests as session_request_contracts
 from cayu.sessions import terminal_evidence as terminal_session_evidence
 from cayu.sessions import transcript_input as session_transcript_input
-from cayu.sessions import transcript_queries as session_transcript_queries
 from cayu.sessions._access_rules import _RECIPIENT_PROVENANCE_CAPABILITY
 from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
@@ -311,26 +311,14 @@ from cayu.sessions.transcript_input import (
     session_messages_input_contract_evidence,
 )
 from cayu.sessions.transcript_queries import (
-    LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
     ForkTranscriptValidator,
     TranscriptPage,
     TranscriptQuery,
-    TranscriptSearchHit,
     TranscriptSearchQuery,
     TranscriptSearchResult,
     TranscriptSnapshot,
-    copy_transcript_query,
-    copy_transcript_search_query,
-    decode_transcript_search_cursor,
-    encode_transcript_search_cursor,
-    filter_transcript_records,
     fork_source_transcript_sha256,
     fork_transcript_is_accepted,
-    transcript_search_document,
-    transcript_search_document_score,
-    transcript_search_hit_from_message,
-    transcript_search_position_after_cursor,
-    transcript_search_query_document,
 )
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage._creation_fence import MemoryCreationFenceMixin
@@ -1168,6 +1156,28 @@ class InMemorySessionStore(
                 sessions=self._sessions,
             )
 
+    def _transcript_indexes_unlocked(self) -> memory_transcripts.MemoryTranscriptIndexes:
+        # Called only under the store lock; writers may replace whole indexes.
+        return memory_transcripts.MemoryTranscriptIndexes(
+            messages=self._transcripts,
+            interaction_ids=self._transcript_interaction_ids,
+            indices_by_interaction=self._transcript_indices_by_interaction,
+            latest_indexes_by_role=self._latest_transcript_indexes_by_role,
+            search_documents=self._transcript_search_documents,
+            search_postings=self._transcript_search_postings,
+        )
+
+    @asynccontextmanager
+    async def _read_transcript_state(
+        self,
+    ) -> AsyncIterator[memory_transcripts.MemoryTranscriptReadState]:
+        async with self._lock:
+            yield memory_transcripts.MemoryTranscriptReadState(
+                indexes=self._transcript_indexes_unlocked(),
+                sessions=self._sessions,
+                deferred_interaction_inputs=self._deferred_interaction_inputs,
+            )
+
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec:
         return self._public_authority_alias_codec
@@ -1441,91 +1451,6 @@ class InMemorySessionStore(
     def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
         prepared = self._prepare_checkpoint_store_unlocked(session_id, checkpoint)
         self._apply_checkpoint_store_unlocked(session_id, prepared)
-
-    def _extend_transcript_attribution_unlocked(
-        self,
-        session_id: str,
-        interaction_ids: list[str | None],
-    ) -> None:
-        """Append attribution and maintain a lazily built absolute-index projection."""
-
-        stored = self._transcript_interaction_ids[session_id]
-        start = len(stored)
-        stored.extend(interaction_ids)
-        messages = self._transcripts[session_id]
-        if len(messages) != len(stored):
-            raise RuntimeError("In-memory transcript attribution is inconsistent.")
-        latest_by_role = self._latest_transcript_indexes_by_role.setdefault(session_id, {})
-        for index in range(start, len(messages)):
-            latest_by_role[messages[index].role] = index
-        projection = self._transcript_indices_by_interaction.get(session_id)
-        if projection is None:
-            return
-        for offset, interaction_id in enumerate(interaction_ids):
-            projection.setdefault(interaction_id, []).append(start + offset)
-
-    def _replace_latest_transcript_role_indexes_unlocked(self, session_id: str) -> None:
-        latest_by_role: dict[MessageRole, int] = {}
-        for index, message in enumerate(self._transcripts.get(session_id, ())):
-            latest_by_role[message.role] = index
-        self._latest_transcript_indexes_by_role[session_id] = latest_by_role
-
-    def _transcript_interaction_projection_unlocked(
-        self,
-        session_id: str,
-    ) -> dict[str | None, list[int]]:
-        projection = self._transcript_indices_by_interaction.get(session_id)
-        if projection is not None:
-            return projection
-        projection = {}
-        for index, interaction_id in enumerate(
-            self._transcript_interaction_ids.get(session_id, ())
-        ):
-            projection.setdefault(interaction_id, []).append(index)
-        self._transcript_indices_by_interaction[session_id] = projection
-        return projection
-
-    def _remove_transcript_search_session_unlocked(self, session_id: str) -> None:
-        documents = self._transcript_search_documents.pop(session_id, ())
-        posting_keys = {(token, role) for role, document in documents for token in document.split()}
-        for posting_key in posting_keys:
-            sessions = self._transcript_search_postings.get(posting_key)
-            if sessions is None:
-                raise RuntimeError("In-memory transcript search index is inconsistent.")
-            sessions.pop(session_id, None)
-            if not sessions:
-                del self._transcript_search_postings[posting_key]
-
-    def _extend_transcript_search_unlocked(
-        self,
-        session_id: str,
-        messages: Sequence[Message],
-    ) -> None:
-        documents = self._transcript_search_documents.setdefault(session_id, [])
-        expected_start = len(self._transcripts.get(session_id, ())) - len(messages)
-        if len(documents) != expected_start:
-            raise RuntimeError("In-memory transcript search index is inconsistent.")
-        for offset, message in enumerate(messages):
-            document = (
-                transcript_search_document(message)
-                if message.role in {MessageRole.USER, MessageRole.ASSISTANT}
-                else ""
-            )
-            transcript_index = expected_start + offset
-            documents.append((message.role, document))
-            for token in set(document.split()):
-                self._transcript_search_postings.setdefault((token, message.role), {}).setdefault(
-                    session_id, []
-                ).append(transcript_index)
-
-    def _replace_transcript_search_session_unlocked(
-        self,
-        session_id: str,
-        messages: Sequence[Message],
-    ) -> None:
-        self._remove_transcript_search_session_unlocked(session_id)
-        self._transcript_search_documents[session_id] = []
-        self._extend_transcript_search_unlocked(session_id, messages)
 
     async def _terminalize_zero_work_interruption(
         self,
@@ -2758,8 +2683,12 @@ class InMemorySessionStore(
             self._latest_transcript_indexes_by_role[session.id] = {}
             self._transcript_search_documents[session.id] = []
             if recipient_messages:
-                self._replace_latest_transcript_role_indexes_unlocked(session.id)
-                self._replace_transcript_search_session_unlocked(session.id, recipient_messages)
+                memory_transcripts.replace_latest_role_indexes(
+                    self._transcript_indexes_unlocked(), session.id
+                )
+                memory_transcripts.replace_search_session(
+                    self._transcript_indexes_unlocked(), session.id, recipient_messages
+                )
             self._refresh_child_lifecycle_candidate_unlocked(session)
             if prepared_admission_events is not None:
                 assert admission is not None
@@ -3890,8 +3819,12 @@ class InMemorySessionStore(
             self._pending_action_event_records[fork.id] = {}
             self._session_operation_records[fork.id] = initial_operation_records
             self._transcripts[fork.id] = copied_transcript
-            self._replace_latest_transcript_role_indexes_unlocked(fork.id)
-            self._replace_transcript_search_session_unlocked(fork.id, copied_transcript)
+            memory_transcripts.replace_latest_role_indexes(
+                self._transcript_indexes_unlocked(), fork.id
+            )
+            memory_transcripts.replace_search_session(
+                self._transcript_indexes_unlocked(), fork.id, copied_transcript
+            )
             # Historical attribution remains tied to the source session's
             # interactions; new child work receives new child interaction IDs.
             self._transcript_interaction_ids[fork.id] = copied_interaction_ids
@@ -4307,7 +4240,9 @@ class InMemorySessionStore(
                 for key, records in self._user_input_supersession_event_records.items()
                 if key[0] != session_id
             }
-            self._remove_transcript_search_session_unlocked(session_id)
+            memory_transcripts.remove_search_session(
+                self._transcript_indexes_unlocked(), session_id
+            )
             self._transcripts.pop(session_id, None)
             self._transcript_interaction_ids.pop(session_id, None)
             self._latest_transcript_indexes_by_role.pop(session_id, None)
@@ -4958,9 +4893,13 @@ class InMemorySessionStore(
                     )
                 else:
                     self._transcripts[session_id].extend(source_messages)
-                    self._extend_transcript_search_unlocked(session_id, source_messages)
-                    self._extend_transcript_attribution_unlocked(
-                        session_id, [interaction_id] * len(source_messages)
+                    memory_transcripts.extend_search(
+                        self._transcript_indexes_unlocked(), session_id, source_messages
+                    )
+                    memory_transcripts.extend_attribution(
+                        self._transcript_indexes_unlocked(),
+                        session_id,
+                        [interaction_id] * len(source_messages),
                     )
                 updated = self._sessions[session_id]
             result = updated.model_copy(deep=True)
@@ -8079,10 +8018,14 @@ class InMemorySessionStore(
             )
             updated_session = self._append_events_unlocked(session, persisted_events)
             self._transcripts.setdefault(session_id, []).extend(transcript_messages)
-            self._extend_transcript_search_unlocked(session_id, transcript_messages)
+            memory_transcripts.extend_search(
+                self._transcript_indexes_unlocked(), session_id, transcript_messages
+            )
             self._transcript_interaction_ids.setdefault(session_id, [])
-            self._extend_transcript_attribution_unlocked(
-                session_id, [interaction_id] * len(transcript_messages)
+            memory_transcripts.extend_attribution(
+                self._transcript_indexes_unlocked(),
+                session_id,
+                [interaction_id] * len(transcript_messages),
             )
             self._pending_session_messages[selected_key] = selected_queue
             if not selected_queue:
@@ -9590,9 +9533,13 @@ class InMemorySessionStore(
             }
         )
         self._transcripts[session_id].extend(request.transcript_messages)
-        self._extend_transcript_search_unlocked(session_id, request.transcript_messages)
-        self._extend_transcript_attribution_unlocked(
-            session_id, [request.interaction_id] * len(request.transcript_messages)
+        memory_transcripts.extend_search(
+            self._transcript_indexes_unlocked(), session_id, request.transcript_messages
+        )
+        memory_transcripts.extend_attribution(
+            self._transcript_indexes_unlocked(),
+            session_id,
+            [request.interaction_id] * len(request.transcript_messages),
         )
         if prepared_checkpoint is not None:
             self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
@@ -9934,9 +9881,13 @@ class InMemorySessionStore(
                     scope_session_id=session_id,
                 )
             self._transcripts[session_id].extend(copied_messages)
-            self._extend_transcript_search_unlocked(session_id, copied_messages)
-            self._extend_transcript_attribution_unlocked(
-                session_id, [interaction_id] * len(copied_messages)
+            memory_transcripts.extend_search(
+                self._transcript_indexes_unlocked(), session_id, copied_messages
+            )
+            memory_transcripts.extend_attribution(
+                self._transcript_indexes_unlocked(),
+                session_id,
+                [interaction_id] * len(copied_messages),
             )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": self._ownership_clock()}
@@ -10050,8 +10001,12 @@ class InMemorySessionStore(
                 interaction_id=interaction_id,
             )
             self._transcripts[session_id] = replacement
-            self._replace_latest_transcript_role_indexes_unlocked(session_id)
-            self._replace_transcript_search_session_unlocked(session_id, replacement)
+            memory_transcripts.replace_latest_role_indexes(
+                self._transcript_indexes_unlocked(), session_id
+            )
+            memory_transcripts.replace_search_session(
+                self._transcript_indexes_unlocked(), session_id, replacement
+            )
             self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
                 interaction_id
             ] * (len(expected) + runtime_suffix_count)
@@ -10088,8 +10043,11 @@ class InMemorySessionStore(
                 closure_records._check_closure_lineage_owner(owner, (session_id,))
             messages = deferred.source_messages
             self._transcripts[session_id].extend(messages)
-            self._extend_transcript_search_unlocked(session_id, messages)
-            self._extend_transcript_attribution_unlocked(
+            memory_transcripts.extend_search(
+                self._transcript_indexes_unlocked(), session_id, messages
+            )
+            memory_transcripts.extend_attribution(
+                self._transcript_indexes_unlocked(),
                 session_id,
                 [interaction_id] * len(messages),
             )
@@ -10103,16 +10061,9 @@ class InMemorySessionStore(
         self,
         session_id: str,
     ) -> DeferredInteractionInput | None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            deferred = self._deferred_interaction_inputs.get(session_id)
-            if deferred is None:
-                return None
-            return DeferredInteractionInput.model_validate(
-                deferred.model_dump(mode="python", warnings=False)
-            )
+        return await memory_transcripts.load_deferred_interaction_input(
+            self._read_transcript_state, session_id
+        )
 
     async def append_transcript_messages_and_transform_checkpoint(
         self,
@@ -10156,9 +10107,13 @@ class InMemorySessionStore(
                         scope_session_id=session_id,
                     )
                 self._transcripts[session_id].extend(copied_messages)
-                self._extend_transcript_search_unlocked(session_id, copied_messages)
-                self._extend_transcript_attribution_unlocked(
-                    session_id, [interaction_id] * len(copied_messages)
+                memory_transcripts.extend_search(
+                    self._transcript_indexes_unlocked(), session_id, copied_messages
+                )
+                memory_transcripts.extend_attribution(
+                    self._transcript_indexes_unlocked(),
+                    session_id,
+                    [interaction_id] * len(copied_messages),
                 )
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = session.model_copy(
@@ -10166,47 +10121,17 @@ class InMemorySessionStore(
             )
 
     async def load_transcript(self, session_id: str) -> list[Message]:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(session_id))
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            return [detach_message(message) for message in self._transcripts.get(session_id, [])]
+        return await memory_transcripts.load_transcript(self._read_transcript_state, session_id)
 
     async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(session_id))
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            messages = self._transcripts.get(session_id, [])
-            interaction_ids = self._transcript_interaction_ids.get(session_id, [])
-            return TranscriptSnapshot(
-                records=[
-                    TranscriptRecord(
-                        index=index,
-                        interaction_id=interaction_ids[index],
-                        message=detach_message(message),
-                    )
-                    for index, message in enumerate(messages)
-                ],
-                cursor=len(messages),
-            )
+        return await memory_transcripts.load_transcript_snapshot(
+            self._read_transcript_state, session_id
+        )
 
     async def load_transcript_cursor(self, session_id: str) -> int:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            return len(self._transcripts.get(session_id, []))
+        return await memory_transcripts.load_transcript_cursor(
+            self._read_transcript_state, session_id
+        )
 
     async def load_latest_transcript_message(
         self,
@@ -10214,22 +10139,9 @@ class InMemorySessionStore(
         *,
         role: MessageRole,
     ) -> TranscriptRecord | None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        if not isinstance(role, MessageRole):
-            raise TypeError("role must be a MessageRole.")
-        async with self._lock:
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            messages = self._transcripts.get(session_id, [])
-            interaction_ids = self._transcript_interaction_ids.get(session_id, [])
-            index = self._latest_transcript_indexes_by_role.get(session_id, {}).get(role)
-            if index is None:
-                return None
-            return TranscriptRecord(
-                index=index,
-                interaction_id=interaction_ids[index],
-                message=detach_message(messages[index]),
-            )
+        return await memory_transcripts.load_latest_transcript_message(
+            self._read_transcript_state, session_id, role=role
+        )
 
     async def load_latest_transcript_text(
         self,
@@ -10238,251 +10150,18 @@ class InMemorySessionStore(
         role: MessageRole,
         max_chars: int,
     ) -> tuple[str, bool] | None:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-        if not isinstance(role, MessageRole):
-            raise TypeError("role must be a MessageRole.")
-        if type(max_chars) is not int:
-            raise TypeError("max_chars must be an integer.")
-        if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
-            raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(session_id))
-            if session_id not in self._sessions:
-                raise KeyError(f"Session not found: {session_id}")
-            index = self._latest_transcript_indexes_by_role.get(session_id, {}).get(role)
-            if index is None:
-                return None
-            return session_transcript_queries._bounded_transcript_message_text(
-                self._transcripts[session_id][index],
-                max_chars=max_chars,
-            )
+        return await memory_transcripts.load_latest_transcript_text(
+            self._read_transcript_state, session_id, role=role, max_chars=max_chars
+        )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        query = copy_transcript_query(query)
-        async with self._lock:
-            if access_bounds is not None:
-                access_bounds.require_read(self._sessions.get(query.session_id))
-            if query.session_id not in self._sessions:
-                raise KeyError(f"Session not found: {query.session_id}")
-
-            messages = self._transcripts.get(query.session_id, [])
-            interaction_ids = self._transcript_interaction_ids.get(query.session_id, [])
-            if query.interaction_id is None:
-                candidate_indices: Sequence[int] = range(len(messages))
-            else:
-                candidate_indices = self._transcript_interaction_projection_unlocked(
-                    query.session_id
-                ).get(query.interaction_id, ())
-            if query.role is not None:
-                candidate_indices = [
-                    index for index in candidate_indices if messages[index].role == query.role
-                ]
-            total_records = len(candidate_indices)
-            page_indices = candidate_indices[query.offset : query.offset + query.limit]
-            # Per filter_transcript_records' contract, the include_thinking=False
-            # path already isolates — detach only pass-through records.
-            records = [
-                TranscriptRecord(
-                    index=index,
-                    interaction_id=interaction_ids[index],
-                    message=(
-                        detach_message(messages[index])
-                        if query.include_thinking
-                        else messages[index]
-                    ),
-                )
-                for index in page_indices
-            ]
-            return TranscriptPage(
-                records=filter_transcript_records(records, include_thinking=query.include_thinking),
-                total_records=total_records,
-            )
+        return await memory_transcripts.query_transcript(self._read_transcript_state, query)
 
     async def search_transcript(
         self,
         query: TranscriptSearchQuery,
     ) -> TranscriptSearchResult:
-        query = copy_transcript_search_query(query)
-        cursor = decode_transcript_search_cursor(query)
-        query_document = transcript_search_query_document(query.text)
-        query_tokens = tuple(query_document.split())
-        role_set = set(query.roles)
-        candidate_heap: list[tuple[int, str, int, Message, str | None]] = []
-        overflow = False
-
-        async with self._lock:
-            selected = frozenset(
-                session_id for session_id in query.session_ids if session_id in self._sessions
-            )
-            posting_sources: list[tuple[str, list[int]]] = []
-            posting_heap: list[tuple[str, int, int, int]] = []
-            for token in query_tokens:
-                for role in query.roles:
-                    posting_sessions = self._transcript_search_postings.get((token, role), {})
-                    for session_id in sorted(selected):
-                        indexes = posting_sessions.get(session_id)
-                        if not indexes:
-                            continue
-                        source_index = len(posting_sources)
-                        posting_sources.append((session_id, indexes))
-                        before_index = query.before_transcript_indexes.get(session_id)
-                        position = (
-                            len(indexes) - 1
-                            if before_index is None
-                            else bisect_left(indexes, before_index) - 1
-                        )
-                        if position < 0:
-                            continue
-                        heapq.heappush(
-                            posting_heap,
-                            (session_id, -indexes[position], source_index, position),
-                        )
-
-            popped = 0
-            next_yield = 256
-            while posting_heap:
-                session_id, negative_index, source_index, position = heapq.heappop(posting_heap)
-                candidate_key = (session_id, negative_index)
-                same_candidate = [(source_index, position)]
-                while posting_heap and posting_heap[0][:2] == candidate_key:
-                    _, _, duplicate_source, duplicate_position = heapq.heappop(posting_heap)
-                    same_candidate.append((duplicate_source, duplicate_position))
-                for matched_source, matched_position in same_candidate:
-                    source_session_id, indexes = posting_sources[matched_source]
-                    next_position = matched_position - 1
-                    if next_position >= 0:
-                        heapq.heappush(
-                            posting_heap,
-                            (
-                                source_session_id,
-                                -indexes[next_position],
-                                matched_source,
-                                next_position,
-                            ),
-                        )
-                popped += len(same_candidate)
-                if popped >= next_yield:
-                    next_yield = popped + 256
-                    await asyncio.sleep(0)
-
-                transcript_index = -negative_index
-                messages = self._transcripts.get(session_id, ())
-                interaction_ids = self._transcript_interaction_ids.get(session_id, ())
-                documents = self._transcript_search_documents.get(session_id, ())
-                if not (
-                    transcript_index < len(messages)
-                    and len(messages) == len(interaction_ids) == len(documents)
-                ):
-                    raise RuntimeError("In-memory transcript search index is inconsistent.")
-                message = messages[transcript_index]
-                if message.role not in role_set:
-                    continue
-                indexed_role, document = documents[transcript_index]
-                if indexed_role != message.role:
-                    raise RuntimeError("In-memory transcript search index is inconsistent.")
-                score = transcript_search_document_score(document, query_document)
-                if score <= 0:  # pragma: no cover - postings establish a token match
-                    raise RuntimeError("In-memory transcript search posting is inconsistent.")
-                if len(candidate_heap) >= query.max_records_scanned:
-                    overflow = True
-                    break
-                heapq.heappush(
-                    candidate_heap,
-                    (
-                        -score,
-                        session_id,
-                        -transcript_index,
-                        message,
-                        interaction_ids[transcript_index],
-                    ),
-                )
-
-            if overflow:
-                return TranscriptSearchResult(
-                    query=query,
-                    matched_records_examined=query.max_records_scanned,
-                    truncated=True,
-                    coverage_complete=False,
-                )
-
-            matched_records_examined = len(candidate_heap)
-            hits: list[TranscriptSearchHit] = []
-            remaining_bytes = query.max_bytes
-            truncated = False
-            continuation_available = False
-            ranked_examined = 0
-            while candidate_heap:
-                (
-                    negative_score,
-                    session_id,
-                    negative_transcript_index,
-                    message,
-                    interaction_id,
-                ) = heapq.heappop(candidate_heap)
-                score = -negative_score
-                transcript_index = -negative_transcript_index
-                ranked_examined += 1
-                if ranked_examined % 256 == 0:
-                    await asyncio.sleep(0)
-                if cursor is not None and not transcript_search_position_after_cursor(
-                    raw_score=score,
-                    session_id=session_id,
-                    transcript_index=transcript_index,
-                    cursor=cursor,
-                ):
-                    continue
-                if len(hits) >= query.limit:
-                    truncated = True
-                    continuation_available = True
-                    break
-                hit = transcript_search_hit_from_message(
-                    session_id=session_id,
-                    transcript_index=transcript_index,
-                    interaction_id=interaction_id,
-                    message=message,
-                    max_text_bytes=remaining_bytes,
-                    raw_score=float(score),
-                )
-                if hit is None:
-                    truncated = True
-                    continuation_available = bool(hits)
-                    break
-                hits.append(hit)
-                remaining_bytes -= len(hit.text.encode("utf-8"))
-                if not hit.text_complete:
-                    truncated = True
-                    continuation_available = bool(candidate_heap)
-                    break
-                if remaining_bytes == 0:
-                    truncated = bool(candidate_heap)
-                    continuation_available = truncated
-                    break
-
-        next_cursor = (
-            encode_transcript_search_cursor(
-                query,
-                raw_score=int(hits[-1].raw_score or 0),
-                session_id=hits[-1].session_id,
-                transcript_index=hits[-1].transcript_index,
-            )
-            if continuation_available and hits
-            else None
-        )
-        return TranscriptSearchResult(
-            query=query,
-            hits=tuple(hits),
-            matched_records_examined=matched_records_examined,
-            truncated=truncated,
-            coverage_complete=True,
-            next_cursor=next_cursor,
-        )
+        return await memory_transcripts.search_transcript(self._read_transcript_state, query)
 
     async def create_recall_receipt(self, receipt: RecallReceipt) -> RecallReceipt:
         copied = copy_recall_receipt(receipt)
