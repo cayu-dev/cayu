@@ -420,7 +420,7 @@ SCENARIOS = (
         "Long and wide tool rounds compact atomically within the effective request bound",
         "compaction checkpoint publication",
         core(
-            "explicit_session_compaction",
+            "size_based_compaction",
             "size_based_compaction_uses_configured_attachment_retention",
             "size_based_compaction_compacts_an_oversized_latest_tool_round_atomically",
             "size_based_compaction_checkpoint_survives_sqlite_restart",
