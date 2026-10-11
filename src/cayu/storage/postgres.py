@@ -242,13 +242,10 @@ from cayu.sessions._model_stage_rules import (
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
     _validate_model_completion_stage_for_settlement,
-    _validate_model_completion_stage_release,
 )
 from cayu.sessions._operation_records import (
-    SessionOperationPublication,
     _active_unexpired_session_operation_id,
     _reject_reserved_runtime_publication_key,
-    _validate_session_operation_record_keys,
 )
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
@@ -258,7 +255,6 @@ from cayu.sessions._runtime_publication import (
     SessionOperationInitializer,
     SessionOperationTransform,
     StoreTimeSessionOperationTransform,
-    _run_session_commit_guard_owned,
     _runtime_publication_storage_key,
 )
 from cayu.sessions._runtime_publication_rules import (
@@ -283,7 +279,6 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     _copy_optional_event_id,
-    _copy_session_event_batch,
     restore_persisted_event_authority,
 )
 from cayu.sessions.event_queries import EventQuery
@@ -5314,362 +5309,35 @@ class PostgresSessionStore(
         context_view_compaction_cursor: int | None = None,
         preserve_completion_result_publications: bool = True,
     ) -> Session:
-        from cayu.sessions.pending_actions import pending_action_event_storage_values
-
-        session_id, copied_events = _copy_session_event_batch(session_id, events)
-        transform_count = sum(
-            transform is not None
-            for transform in (
-                checkpoint_transform,
-                store_time_checkpoint_transform,
-                operation_transform,
-                store_time_operation_transform,
-            )
+        return await publication_ops.publish_checkpoint_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            store_time_checkpoint_transform=store_time_checkpoint_transform,
+            operation_idempotency_key=operation_idempotency_key,
+            operation_transform=operation_transform,
+            store_time_operation_transform=store_time_operation_transform,
+            operation_commit_guard=operation_commit_guard,
+            operation_commit_time_guard=operation_commit_time_guard,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+            context_view_compaction_cursor=context_view_compaction_cursor,
+            preserve_completion_result_publications=preserve_completion_result_publications,
+            unique_violation=UniqueViolation,
+            connect=self._connection,
+            ensure_ready=self._ensure_ready,
+            load_for_update=self._load_for_update,
+            load_checkpoint=self._load_checkpoint,
+            store_now=self._session_store_now,
+            closure_owners=self._closure_lineage_owners,
+            public_authority_alias_codec=self.public_authority_alias_codec,
+            first_existing_event_id=self._first_existing_event_id,
+            publish_budget_identities=self._publish_budget_reservation_identities,
+            record_terminal_receipts=self._record_invocation_terminal_event_receipts,
+            upsert_checkpoint=self._upsert_checkpoint,
+            validate_compaction=self._validate_context_view_compaction,
         )
-        if transform_count != 1:
-            raise TypeError("Exactly one checkpoint publication transform is required.")
-        if (
-            operation_transform is not None or store_time_operation_transform is not None
-        ) and operation_idempotency_key is None:
-            raise TypeError("operation_idempotency_key is required.")
-        from cayu.collaboration import _session_export_store as session_exports
-
-        if operation_idempotency_key is not None:
-            session_exports.require_operation_key_access(operation_idempotency_key, read=False)
-            _require_session_export_target(session_id, operation_idempotency_key)
-        allowed_statuses = (
-            None
-            if expected_statuses is None
-            else _validate_status_set(expected_statuses, "expected_statuses")
-        )
-        await self._ensure_ready()
-        async with self._connection() as conn:
-            commit_guard_signal: BaseException | None = None
-            try:
-                async with conn.cursor() as cur:
-                    if context_view_compaction_cursor is not None:
-                        await cur.execute(
-                            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                            (f"context-view-session:{session_id}",),
-                        )
-                    loaded = await self._load_for_update(cur, session_id)
-                    if loaded is None:
-                        raise KeyError(f"Session not found: {session_id}")
-                    updated_at = await self._session_store_now(cur)
-                    _assert_session_run_epoch(session_id, loaded)
-                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
-                        _check_closure_lineage_owner(owner, (session_id,))
-                    if allowed_statuses is not None and loaded.status not in allowed_statuses:
-                        raise SessionStatusConflict(
-                            "Session status is not eligible for checkpoint publication: "
-                            f"{loaded.status}"
-                        )
-                    if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
-                        raise SessionRunFenced(
-                            f"Session source run epoch is stale: expected {expected_run_epoch}, "
-                            f"current {loaded.run_epoch}."
-                        )
-                    current_cursor = await transcript_ops.transcript_cursor(cur, session_id)
-                    if (
-                        expected_transcript_cursor is not None
-                        and current_cursor != expected_transcript_cursor
-                    ):
-                        raise ValueError(
-                            "Session source transcript cursor is stale: expected "
-                            f"{expected_transcript_cursor}, current {current_cursor}."
-                        )
-                    if context_view_compaction_cursor is not None:
-                        await self._validate_context_view_compaction(
-                            cur, session_id, context_view_compaction_cursor
-                        )
-                    current_checkpoint = await self._load_checkpoint(cur, session_id)
-                    callback_checkpoint = _copy_checkpoint_for_transform(
-                        current_checkpoint,
-                        session_id=session_id,
-                    )
-                    operation_records: dict[str, dict[str, Any]] = {}
-                    model_completion_stage_release = None
-                    if (
-                        operation_transform is not None
-                        or store_time_operation_transform is not None
-                    ):
-                        await cur.execute(
-                            "SELECT record FROM cayu_session_operations "
-                            "WHERE session_id = %s AND idempotency_key = %s",
-                            (session_id, operation_idempotency_key),
-                        )
-                        operation_row = await cur.fetchone()
-                        current_operation = (
-                            None
-                            if operation_row is None
-                            else pg_support._json_obj(operation_row[0])
-                        )
-                        if operation_transform is not None:
-                            publication = operation_transform(
-                                loaded,
-                                callback_checkpoint,
-                                current_operation,
-                            )
-                        else:
-                            assert store_time_operation_transform is not None
-                            publication = store_time_operation_transform(
-                                loaded,
-                                callback_checkpoint,
-                                current_operation,
-                                updated_at,
-                            )
-                        if type(publication) is not SessionOperationPublication:
-                            raise TypeError(
-                                "Session operation transform must return a "
-                                "SessionOperationPublication."
-                            )
-                        transformed = copy_durable_json_object(
-                            publication.checkpoint,
-                            "checkpoint",
-                        )
-                        transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
-                            current_checkpoint,
-                            transformed,
-                            session_id=session_id,
-                        )
-                        operation_records = copy_durable_json_object(
-                            publication.operation_records,
-                            "operation_records",
-                        )
-                        model_completion_stage_release = publication.model_completion_stage_release
-                        _validate_session_operation_record_keys(operation_records)
-                        indices = session_exports.selected_transcript_indices(session_id=session_id)
-                        if (
-                            indices
-                            or session_exports.checkpoint_visible(session_id=session_id)
-                            or any(
-                                key.startswith(session_exports.OPERATION_PREFIX)
-                                for key in operation_records
-                            )
-                        ):
-                            selected_rows: tuple[TranscriptRecord, ...] = ()
-                            if indices:
-                                await cur.execute(
-                                    "SELECT session_order - 1, interaction_id, message "
-                                    "FROM cayu_transcript_messages "
-                                    "WHERE session_id = %s AND session_order = ANY(%s) "
-                                    "ORDER BY session_order",
-                                    (session_id, [index + 1 for index in indices]),
-                                )
-                                selected_rows = tuple(
-                                    TranscriptRecord(
-                                        index=row[0],
-                                        interaction_id=row[1],
-                                        message=Message(**pg_support._json_obj(row[2])),
-                                    )
-                                    for row in await cur.fetchall()
-                                )
-                            session_exports.validate_publication(
-                                session=loaded,
-                                current_checkpoint=current_checkpoint,
-                                proposed_checkpoint=transformed,
-                                operation_records=operation_records,
-                                selected_transcript_rows=selected_rows,
-                                events=copied_events,
-                            )
-                    else:
-                        if checkpoint_transform is not None:
-                            transformed = checkpoint_transform(loaded, callback_checkpoint)
-                        else:
-                            assert store_time_checkpoint_transform is not None
-                            transformed = store_time_checkpoint_transform(
-                                loaded,
-                                callback_checkpoint,
-                                updated_at,
-                            )
-                        if transformed is None:
-                            raise ValueError("Checkpoint transform must return a checkpoint.")
-                        transformed = copy_durable_json_object(transformed, "checkpoint")
-                        transformed = (
-                            _replace_checkpoint_preserving_completion_result_event_publications(
-                                current_checkpoint,
-                                transformed,
-                                preserve_completion_result_publications=(
-                                    preserve_completion_result_publications
-                                ),
-                                session_id=session_id,
-                            )
-                        )
-
-                    await public_authority_ops.register_event_authorities(
-                        cur, session_id, copied_events, codec=self.public_authority_alias_codec
-                    )
-                    await self._publish_budget_reservation_identities(cur, copied_events)
-                    await cur.execute(
-                        """
-                        UPDATE cayu_sessions
-                        SET event_seq = event_seq + %s,
-                            updated_at = %s,
-                            last_activity_at = %s
-                        WHERE id = %s
-                        RETURNING event_seq
-                        """,
-                        (len(copied_events), updated_at, updated_at, session_id),
-                    )
-                    order_row = await cur.fetchone()
-                    if order_row is None:
-                        raise KeyError(f"Session not found: {session_id}")
-                    await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
-                    if operation_records:
-                        await cur.executemany(
-                            """
-                            INSERT INTO cayu_session_operations (
-                                session_id, idempotency_key, record, updated_at
-                            )
-                            VALUES (%s, %s, %s, %s)
-                            ON CONFLICT(session_id, idempotency_key) DO UPDATE SET
-                                record = excluded.record,
-                                updated_at = excluded.updated_at
-                            """,
-                            [
-                                (session_id, key, pg_support._dumps(record), updated_at)
-                                for key, record in operation_records.items()
-                            ],
-                        )
-                    if model_completion_stage_release is not None:
-                        _, _, preparation_key, terminal_key = (
-                            _model_completion_stage_storage_identity(
-                                session_id,
-                                model_completion_stage_release.stage_id,
-                            )
-                        )
-                        await cur.execute(
-                            "SELECT idempotency_key, record FROM cayu_session_operations "
-                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
-                            (
-                                session_id,
-                                [
-                                    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                                    preparation_key,
-                                    terminal_key,
-                                ],
-                            ),
-                        )
-                        stage_records = {
-                            row[0]: model_stage_ops.decode_stage_record(row[1])
-                            for row in await cur.fetchall()
-                        }
-                        marker = _validate_model_completion_stage_release(
-                            session=loaded,
-                            active_record=stage_records.get(
-                                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
-                            ),
-                            preparation_record=stage_records.get(preparation_key),
-                            terminal_record=stage_records.get(terminal_key),
-                            release=model_completion_stage_release,
-                        )
-                        await cur.execute(
-                            "DELETE FROM cayu_session_operations "
-                            "WHERE session_id = %s AND idempotency_key = %s "
-                            "AND record->>'record_digest' = %s",
-                            (
-                                session_id,
-                                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                                marker.record_digest,
-                            ),
-                        )
-                        if cur.rowcount != 1:
-                            raise SessionModelCompletionStageConflict(
-                                "The active model-completion stage changed during disposition."
-                            )
-
-                    next_order = order_row[0] - len(copied_events)
-                    rows = []
-                    for event in copied_events:
-                        next_order += 1
-                        lookup_key, projection, projection_bytes = (
-                            pending_action_event_storage_values(event)
-                        )
-                        rows.append(
-                            (
-                                session_id,
-                                next_order,
-                                event.id,
-                                event.interaction_id,
-                                str(event.type),
-                                pg_support.to_utc(event.timestamp),
-                                event.agent_name,
-                                event.environment_name,
-                                event.workflow_name,
-                                event.tool_name,
-                                pg_support._dumps(event.payload),
-                                pg_support._dumps(event.model_dump(mode="json")),
-                                lookup_key,
-                                projection,
-                                projection_bytes,
-                            )
-                        )
-                    if rows:
-                        await cur.executemany(
-                            """
-                            INSERT INTO cayu_events (
-                                session_id, session_order, event_id, interaction_id,
-                                event_type, timestamp,
-                                agent_name, environment_name, workflow_name, tool_name,
-                                payload, event, pending_action_lookup_key,
-                                pending_action_projection, pending_action_projection_bytes
-                            )
-                            VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s
-                            )
-                            """,
-                            rows,
-                        )
-                        await self._record_invocation_terminal_event_receipts(
-                            cur, session_id, copied_events, activity_at=updated_at
-                        )
-                        await event_delivery_ops.enqueue_persisted_event_side_effects(
-                            cur,
-                            session_id,
-                            copied_events,
-                        )
-                    if operation_commit_guard is not None:
-                        commit_guard_signal = await _run_session_commit_guard_owned(
-                            operation_commit_guard
-                        )
-                    activity_at = (
-                        await self._session_store_now(cur)
-                        if operation_commit_guard is not None
-                        else updated_at
-                    )
-                    if operation_commit_time_guard is not None:
-                        activity_at = await self._session_store_now(cur)
-                        operation_commit_time_guard(activity_at)
-                    if activity_at != updated_at:
-                        await cur.execute(
-                            "UPDATE cayu_sessions SET last_activity_at = %s WHERE id = %s",
-                            (activity_at, session_id),
-                        )
-                await conn.commit()
-                if commit_guard_signal is not None:
-                    raise commit_guard_signal
-            except UniqueViolation as exc:
-                await conn.rollback()
-                if commit_guard_signal is not None:
-                    raise commit_guard_signal from exc
-                existing = await self._first_existing_event_id(
-                    session_id,
-                    [event.id for event in copied_events],
-                )
-                if existing is not None:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {existing}"
-                    ) from exc
-                raise
-            except Exception as error:
-                await conn.rollback()
-                if commit_guard_signal is not None:
-                    raise commit_guard_signal from error
-                raise
-            return loaded.model_copy(
-                update={"updated_at": updated_at, "last_activity_at": activity_at}
-            )
 
     async def load_session_closure_records(
         self, session_id: str, *, max_records: int, max_bytes: int
