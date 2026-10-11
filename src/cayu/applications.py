@@ -448,6 +448,7 @@ from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._session_fork import SessionFork
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
+from cayu.runtime._session_preparation import SessionPreparation
 from cayu.runtime._session_recovery import SessionRecovery
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
 from cayu.runtime._task_store_operation_boundary import (
@@ -467,7 +468,8 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
 )
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
-from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator, WorkAttemptEngine
+from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator, WorkAttemptOperations
+from cayu.runtime._work_attempt_execution import WorkAttemptExecution
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
 )
@@ -1413,8 +1415,8 @@ class CayuApp:
             event_writer=self._event_writer,
             secret_redactor=self._secret_redactor,
             profile_policy=completion_verifier_profile_policy,
-            release=lambda admission: self._session_engine.load_work_attempt_release_evidence(
-                admission
+            release=lambda admission: (
+                self._work_attempt_execution.load_work_attempt_release_evidence(admission)
             ),
             admit=lambda request, *, execution: self.admit_work_attempt(
                 request, execution=execution
@@ -1744,7 +1746,31 @@ class CayuApp:
             execution_profile_process_identity=self._execution_profile_process_identity,
         )
 
+        self._session_preparation = SessionPreparation(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            environment_lifecycle=self._environment_lifecycle,
+            execution_profile_continuation=self._execution_profile_continuation,
+            session_finalization=self._session_finalization,
+            secret_redactor=self._secret_redactor,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=self._loop_policy_execution_profile_identities,
+            get_budget_policy=lambda: self.budget_policy,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            route_registered_provider_for_model=lambda model: (
+                self._route_registered_provider_for_model(model=model)
+            ),
+            get_registered_environment=self._get_registered_environment,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            effective_retry_policy=self._effective_retry_policy,
+            execution_profile_process_identity=self._execution_profile_process_identity,
+            policy_selection=None if model_policy is None else model_policy.selection,
+        )
+
         self._session_engine = SessionEngine(
+            session_preparation=self._session_preparation,
             compaction=self._session_compaction,
             session_finalization=self._session_finalization,
             foreground_gate_policy_owner=self._foreground_gate_policy_owner,
@@ -1753,7 +1779,6 @@ class CayuApp:
             recovery_ownership=self._recovery_ownership,
             terminal_evidence=self._terminal_evidence,
             terminal_finalization=self._terminal_finalization,
-            policy_selection=(None if model_policy is None else model_policy.selection),
             resource_access_policy=resource_access_policy,
             resource_session_stream=self._resource_session_stream,
             session_store=self._runtime_session_store,
@@ -1783,9 +1808,6 @@ class CayuApp:
             ),
             get_registered_agent=self._get_registered_agent,
             get_registered_provider=self._get_registered_provider,
-            route_registered_provider_for_model=(
-                lambda model: self._route_registered_provider_for_model(model=model)
-            ),
             get_registered_environment=self._get_registered_environment,
             get_registered_environment_for_session=(self._get_registered_environment_for_session),
             effective_retry_policy=self._effective_retry_policy,
@@ -1908,10 +1930,32 @@ class CayuApp:
             terminal_evidence=self._terminal_evidence,
         )
 
+        self._work_attempt_execution = WorkAttemptExecution(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            session_preparation=self._session_preparation,
+            execution_profile_continuation=self._execution_profile_continuation,
+            environment_lifecycle=self._environment_lifecycle,
+            event_writer=self._event_writer,
+            model_completion_recovery=self._model_completion_recovery,
+            pending_tool_round_recovery=self._pending_tool_round_recovery,
+            session_finalization=self._session_finalization,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            get_budget_policy=lambda: self.budget_policy,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            effective_retry_policy=self._effective_retry_policy,
+            execute_session=self._session_engine._run_recovered_session,
+        )
+
         self._work_attempt_coordinator = WorkAttemptCoordinator(
             get_task_store=lambda: self.task_store,
             session_store=self._runtime_session_store,
-            engine=self._session_engine,
+            execution=self._work_attempt_execution,
             recovery=self._session_recovery,
             redactor=self._secret_redactor,
             apply_run_defaults=self._with_application_run_defaults,
@@ -6218,7 +6262,7 @@ class CayuApp:
     def resolve_run_model_target(self, request: RunRequest) -> ModelTarget:
         """Resolve initial provider/model routing without preparing runtime state."""
 
-        return self._session_engine.resolve_initial_model_target(request)
+        return self._session_preparation.resolve_initial_model_target(request)
 
     @_admitted_entrance
     async def start_model_policy(self) -> None:
@@ -6277,13 +6321,13 @@ class CayuApp:
         ).execution_profile.fingerprint
 
     @property
-    def work_attempt_execution(self) -> WorkAttemptEngine:
+    def work_attempt_execution(self) -> WorkAttemptOperations:
         """Execution and settlement operations for coordinated work-attempt workers.
 
         Admission and recovery remain owned by the work-attempt coordinator.
         These operations consume its durable admission authority.
         """
-        return self._session_engine
+        return self._work_attempt_execution
 
     @property
     def execution_profile_policy_identity(self) -> str | None:
@@ -6330,7 +6374,7 @@ class CayuApp:
                 causal_budget_id=causal_budget_id,
             )
         )
-        prepared = await self._session_engine.prepare_initial_run(
+        prepared = await self._session_preparation.prepare_initial_run(
             request,
             admit_session=False,
             inspect_only=True,
@@ -6388,7 +6432,7 @@ class CayuApp:
             raise TypeError("Effective-configuration inspection requires a RunRequest.")
         explicit_fields = frozenset(request.model_fields_set)
         request = self._with_application_run_defaults(request)
-        prepared = await self._session_engine.prepare_initial_run(
+        prepared = await self._session_preparation.prepare_initial_run(
             request,
             admit_session=False,
             inspect_only=True,
@@ -7865,7 +7909,7 @@ class CayuApp:
         request: RunRequest,
     ) -> DurableSubagentPreparedRun:
         request = self._with_application_run_defaults(request)
-        preparation = self._session_engine.prepare_initial_run(request)
+        preparation = self._session_preparation.prepare_initial_run(request)
         del request
         prepared = await preparation
         del preparation

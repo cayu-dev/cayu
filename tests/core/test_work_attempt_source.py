@@ -12,6 +12,7 @@ from cayu._validation import canonical_durable_json_bytes
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.messages import Message
+from cayu.runtime._session_request_boundary import work_attempt_source_document
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.work_attempt_source import (
     WORK_ATTEMPT_SOURCE_MAX_BYTES,
@@ -90,7 +91,7 @@ def test_source_snapshot_preserves_explicit_defaults_and_detaches_data() -> None
 @pytest.mark.parametrize("kind", ["initial", "continuation"])
 @pytest.mark.parametrize("policy_state", ["implicit", "none", "configured"])
 def test_runtime_source_snapshot_preserves_optional_failover(kind, policy_state):
-    engine = CayuApp(enable_logging=False)._session_engine
+    execution = CayuApp(enable_logging=False)._work_attempt_execution
     model = RunRequest if kind == "initial" else ResumeRequest
     fields = {"agent_name": "worker"} if kind == "initial" else {"session_id": "source"}
     policy = ModelFailoverPolicy(
@@ -99,8 +100,10 @@ def test_runtime_source_snapshot_preserves_optional_failover(kind, policy_state)
     if policy_state != "implicit":
         fields["failover"] = policy if policy_state == "configured" else None
     request = model(messages=[Message.text("user", "work")], **fields)
-    digest = engine.work_attempt_source_request_sha256(request, kind=kind)
-    snapshot = engine.work_attempt_source_snapshot(request, kind=kind, source_request_sha256=digest)
+    digest = execution.work_attempt_source_request_sha256(request, kind=kind)
+    snapshot = execution.work_attempt_source_snapshot(
+        request, kind=kind, source_request_sha256=digest
+    )
     assert snapshot is not None
     assert ("failover" in snapshot.fields_set) is (policy_state != "implicit")
     assert snapshot.request["failover"] == (
@@ -109,11 +112,11 @@ def test_runtime_source_snapshot_preserves_optional_failover(kind, policy_state)
     stored = WorkAttemptSourceRequest.model_validate_json(snapshot.model_dump_json())
     reconstructed = model.model_validate(stored.request)
     object.__setattr__(reconstructed, "__pydantic_fields_set__", set(stored.fields_set))
-    assert engine._work_attempt_source_document(reconstructed) == stored.request
-    assert engine.work_attempt_source_request_sha256(reconstructed, kind=kind) == digest
+    assert work_attempt_source_document(reconstructed) == stored.request
+    assert execution.work_attempt_source_request_sha256(reconstructed, kind=kind) == digest
     if policy_state == "implicit":
         explicit = request.model_copy(update={"failover": None})
-        assert engine.work_attempt_source_request_sha256(explicit, kind=kind) != digest
+        assert execution.work_attempt_source_request_sha256(explicit, kind=kind) != digest
 
 
 @pytest.mark.parametrize(

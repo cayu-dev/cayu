@@ -65,7 +65,7 @@ def _crash_prepared_expiry(
         app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
         handler = _StaticHandler()
         prepare = type(tasks).prepare_work_attempt_admission
-        activate = type(app._session_engine)._activate_runtime_work_attempt
+        activate = type(app._work_attempt_execution)._activate_runtime_work_attempt
         enter = type(tasks).enter_work_attempt_execution
 
         async def crash_entered(store, request):
@@ -98,7 +98,7 @@ def _crash_prepared_expiry(
         if recovery_entry:
             type(tasks).enter_work_attempt_execution = crash_entered
         elif session_mutated:
-            type(app._session_engine)._activate_runtime_work_attempt = crash_created
+            type(app._work_attempt_execution)._activate_runtime_work_attempt = crash_created
         else:
             type(tasks).prepare_work_attempt_admission = crash_prepared
         async with VerifiedTaskWorker(
@@ -157,7 +157,7 @@ def test_worker_settles_expired_prepared_admission(
             original_app = make_app()
             handler = _StaticHandler()
             prepare = type(tasks).prepare_work_attempt_admission
-            activate = type(original_app._session_engine)._activate_runtime_work_attempt
+            activate = type(original_app._work_attempt_execution)._activate_runtime_work_attempt
 
             def target(admission):
                 return (admission.kind == "continuation") is continuing
@@ -219,7 +219,7 @@ def test_worker_settles_expired_prepared_admission(
             with monkeypatch.context() as faults:
                 if session_mutated:
                     faults.setattr(
-                        type(original_app._session_engine),
+                        type(original_app._work_attempt_execution),
                         "_activate_runtime_work_attempt",
                         stop_before_activation,
                     )

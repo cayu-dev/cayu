@@ -306,7 +306,7 @@ async def service_clarification(
             ),
             participant_binding_sha256=continuation_digest(binding),
             execution_profile_sha256=profile.profile.fingerprint,
-            resume_sha256=app._session_engine.work_attempt_source_request_sha256(
+            resume_sha256=app._work_attempt_execution.work_attempt_source_request_sha256(
                 resume, kind="continuation"
             ),
             invocation_id=temporary_service_invocation_id(request.operation),

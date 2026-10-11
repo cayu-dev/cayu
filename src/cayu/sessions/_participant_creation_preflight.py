@@ -13,7 +13,7 @@ from cayu.runtime import _session_request_boundary as request_boundary
 from cayu.sessions.context_views import json_commitment
 
 if TYPE_CHECKING:
-    from cayu.runtime._session_engine import _PreparedInitialRun
+    from cayu.runtime._session_preparation import _PreparedInitialRun
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +27,7 @@ class ParticipantCreationMaterial:
 async def prepare_participant_creation_material(
     app, creation, *, resource_owner=None, attachments=()
 ):
-    prepared = await app._session_engine.prepare_initial_run(
+    prepared = await app._session_preparation.prepare_initial_run(
         app._with_application_run_defaults(creation.request),
         admit_session=False,
     )

@@ -184,7 +184,9 @@ def test_memory_worker_recovers_stop_acknowledgement_loss(reason, monkeypatch):
         admission = await tasks.load_latest_work_attempt_admission(task.id)
         assert admission.execution_stop.request.reason == reason
         assert (
-            await app._session_engine.load_work_attempt_released_recovery_evidence(admission)
+            await app._work_attempt_execution.load_work_attempt_released_recovery_evidence(
+                admission
+            )
             is None
         )
         assert await tasks.load_work_attempt_lifecycle_receipt(admission.admission_id) is None
@@ -266,7 +268,7 @@ def test_replacement_worker_finishes_unreleased_limit_stop(
             assert (await tasks.load_task(task.id)).status is TaskStatus.RUNNING
             assert await tasks.load_work_attempt_lifecycle_receipt(admission.admission_id) is None
             app, provider, verifier = _limit_app(sessions, tasks, reason)
-            engine = app._session_engine
+            engine = app._work_attempt_execution
             assert await engine.load_work_attempt_released_recovery_evidence(admission) is None
             assert not await engine.has_recoverable_work_attempt_model_result(admission)
             active = await sessions.load_active_model_completion_stage(admission.session_id)

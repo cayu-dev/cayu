@@ -79,7 +79,7 @@ async def run():
     engine = Engine()
     coordinator = WorkAttemptCoordinator(
         get_task_store=lambda: store[0], session_store=InMemorySessionStore(),
-        engine=engine, recovery=Recovery(), redactor=SecretRedactor(),
+        execution=engine, recovery=Recovery(), redactor=SecretRedactor(),
         apply_run_defaults=lambda request: request.model_copy(update={"max_steps": 3}),
         resolve_session=resolve_session, checkpoint_guard=checkpoint_guard,
     )

@@ -21,6 +21,7 @@ from tests._tool_admission_fixtures import (
 import cayu.runtime._execution_profile_admission as execution_profile_admission
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._session_fork as session_fork_module
+import cayu.runtime._session_preparation as session_preparation_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
@@ -5958,7 +5959,11 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
             source_revision="revision-b",
         )
         monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
-        for provenance_owner in (session_engine_module, _session_execution_profile):
+        for provenance_owner in (
+            session_engine_module,
+            session_preparation_module,
+            _session_execution_profile,
+        ):
             monkeypatch.setattr(
                 provenance_owner,
                 "current_runtime_build_provenance",
@@ -5987,7 +5992,11 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
             baseline = before.metadata[EXECUTION_PROFILE_METADATA_KEY]["baseline"]
 
             monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
-            for provenance_owner in (session_engine_module, _session_execution_profile):
+            for provenance_owner in (
+                session_engine_module,
+                session_preparation_module,
+                _session_execution_profile,
+            ):
                 monkeypatch.setattr(
                     provenance_owner,
                     "current_runtime_build_provenance",
@@ -6078,6 +6087,7 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
         monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
         for provenance_owner in (
             session_engine_module,
+            session_preparation_module,
             session_fork_module,
             _session_execution_profile,
         ):
@@ -6108,6 +6118,7 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
             monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
             for provenance_owner in (
                 session_engine_module,
+                session_preparation_module,
                 session_fork_module,
                 _session_execution_profile,
             ):
@@ -9397,7 +9408,11 @@ def test_public_run_fails_closed_before_work_when_required_identity_is_unavailab
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        for provenance_owner in (session_engine_module, _session_execution_profile):
+        for provenance_owner in (
+            session_engine_module,
+            session_preparation_module,
+            _session_execution_profile,
+        ):
             monkeypatch.setattr(
                 provenance_owner,
                 "current_runtime_build_provenance",

@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 import cayu.runtime._run_limits as run_limits_module
-import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._session_preparation as session_preparation_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -138,7 +138,7 @@ def _profiled_identity_for_app(
         causal_budget_id=session_id,
         limits=limits,
     )
-    return session_engine_module._session_identity(
+    return session_preparation_module._session_identity(
         provider_name="fake",
         model="fake-model",
         execution_profile=profile,

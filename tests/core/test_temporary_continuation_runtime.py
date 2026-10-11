@@ -262,7 +262,7 @@ async def test_bound_participant_service_uses_real_resume_preparation(
                 ),
                 "participant_binding_sha256": continuation_digest(binding),
                 "execution_profile_sha256": active.profile.fingerprint,
-                "resume_sha256": application._session_engine.work_attempt_source_request_sha256(
+                "resume_sha256": application._work_attempt_execution.work_attempt_source_request_sha256(
                     resume, kind="continuation"
                 ),
                 "prepared_at_ms": int(datetime.now(UTC).timestamp() * 1000),

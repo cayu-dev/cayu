@@ -26,6 +26,9 @@ from cayu.runtime import _session_execution_profile
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._interaction_events import (
+    build_interaction_started_event_from_identity,
+)
 from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
     CreateInvocationCommand,
@@ -308,7 +311,8 @@ def runtime_interaction_started_event(
 ) -> Event:
     """Build exact runtime interaction evidence for low-level crash fixtures."""
 
-    return app._session_engine._interaction_started_event_from_identity(
+    return build_interaction_started_event_from_identity(
+        clock=app._clock,
         session_id=session_id,
         interaction_id=interaction_id,
         agent_name=agent_name,

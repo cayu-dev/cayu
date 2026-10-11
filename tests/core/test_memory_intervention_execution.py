@@ -1138,8 +1138,8 @@ class _ProfileRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactor
             view=view,
         )
         assert type(app) is CayuApp
-        engine = app._session_engine
-        original_prepare = engine.prepare_initial_run
+        preparation = app._session_preparation
+        original_prepare = preparation.prepare_initial_run
         prepare_calls = 0
 
         async def prepare_with_registration_race(*args, **kwargs):
@@ -1153,7 +1153,7 @@ class _ProfileRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactor
                 )
             return await original_prepare(*args, **kwargs)
 
-        engine.prepare_initial_run = prepare_with_registration_race  # type: ignore[method-assign]
+        preparation.prepare_initial_run = prepare_with_registration_race  # type: ignore[method-assign]
         return app
 
 
@@ -1193,8 +1193,8 @@ class _StoreRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory)
             view=view,
         )
         assert type(app) is CayuApp
-        engine = app._session_engine
-        original_prepare = engine.prepare_initial_run
+        preparation = app._session_preparation
+        original_prepare = preparation.prepare_initial_run
         prepare_calls = 0
 
         async def prepare_with_store_race(*args, **kwargs):
@@ -1213,7 +1213,7 @@ class _StoreRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory)
                 )
             return prepared
 
-        engine.prepare_initial_run = prepare_with_store_race  # type: ignore[method-assign]
+        preparation.prepare_initial_run = prepare_with_store_race  # type: ignore[method-assign]
         return app
 
 
@@ -1557,7 +1557,7 @@ async def _record_runtime_profile(
         scope=scope,
         policy=policy,
     )
-    prepared = await app._session_engine.prepare_initial_run(
+    prepared = await app._session_preparation.prepare_initial_run(
         RunRequest(
             agent_name="agent",
             session_id=f"profile-{suffix}",

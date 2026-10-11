@@ -18,7 +18,7 @@ from tests.core.verified_worker_fixtures import (
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
-from cayu.runtime._session_engine import SessionEngine
+from cayu.runtime._session_preparation import SessionPreparation
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
@@ -44,7 +44,7 @@ def test_worker_receipts_elapsed_preparation_without_dispatch(
         provider = _RecordingProvider()
         holds = []
         original_hold = type(tasks).hold_work_attempt_preparation
-        original_prepare = SessionEngine.prepare_initial_run
+        original_prepare = SessionPreparation.prepare_initial_run
 
         async def observe_hold(store, request):
             receipt = await original_hold(store, request)
@@ -63,7 +63,7 @@ def test_worker_receipts_elapsed_preparation_without_dispatch(
                 return await super().prepare(context)
 
         monkeypatch.setattr(type(tasks), "hold_work_attempt_preparation", observe_hold)
-        monkeypatch.setattr(SessionEngine, "prepare_initial_run", delayed_admission)
+        monkeypatch.setattr(SessionPreparation, "prepare_initial_run", delayed_admission)
         try:
             app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
             app.register_provider(provider, default=True)

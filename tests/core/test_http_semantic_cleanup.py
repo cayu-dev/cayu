@@ -405,9 +405,9 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
 
 @pytest.mark.anyio
 async def test_semantic_http_cleanup_watchdog_excludes_session_setup(tmp_path, monkeypatch):
-    from cayu.runtime._session_engine import SessionEngine
+    from cayu.runtime._session_preparation import SessionPreparation
 
-    prepare = SessionEngine.prepare_initial_run
+    prepare = SessionPreparation.prepare_initial_run
 
     async def slow_prepare(self, request, **kwargs):
         # Longer than the unchanged post-dispatch watchdog. This must not turn
@@ -415,7 +415,7 @@ async def test_semantic_http_cleanup_watchdog_excludes_session_setup(tmp_path, m
         await asyncio.sleep(3.1)
         return await prepare(self, request, **kwargs)
 
-    monkeypatch.setattr(SessionEngine, "prepare_initial_run", slow_prepare)
+    monkeypatch.setattr(SessionPreparation, "prepare_initial_run", slow_prepare)
     await test_semantic_idle_http_cleanup(tmp_path, monkeypatch, "delayed", "whitespace", True)
 
 

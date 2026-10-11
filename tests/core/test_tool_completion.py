@@ -897,7 +897,7 @@ def test_unconfigured_approval_keeps_checkpoint_read_budget():
 def test_portable_work_attempt_source_preserves_completion_controls(kind, policy_state):
     from cayu.sessions.requests import copy_resume_request, copy_run_request
 
-    engine = CayuApp(enable_logging=False)._session_engine
+    engine = CayuApp(enable_logging=False)._work_attempt_execution
     model = RunRequest if kind == "initial" else ResumeRequest
     fields = {"agent_name": "support"} if kind == "initial" else {"session_id": "s"}
     policy = ToolCompletionPolicy(tool_names=("ask_customer",))

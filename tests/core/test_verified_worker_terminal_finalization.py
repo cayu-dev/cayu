@@ -91,7 +91,7 @@ async def _crash_during_finalization(root, reason, dsn):
 
 async def _assert_rejected_marker_scans(app, tasks, admission, monkeypatch):
     """Untrusted/conflicting observations cannot turn cleanup into execution."""
-    engine = app._session_engine
+    engine = app._work_attempt_execution
     snapshot = engine._load_work_attempt_execution_snapshot
     task = await tasks.load_task(admission.task_id)
     for field, value, error in (
@@ -181,7 +181,9 @@ def test_replacement_worker_recovers_terminal_binding_marker(
             admission = await tasks.load_latest_work_attempt_admission(task.id)
             app, provider, verifier = _app_with_binding(sessions, tasks, factory.directory, reason)
             assert (
-                await app._session_engine.load_work_attempt_released_recovery_evidence(admission)
+                await app._work_attempt_execution.load_work_attempt_released_recovery_evidence(
+                    admission
+                )
                 is None
             )
             assert await tasks.load_work_attempt_lifecycle_receipt(admission.admission_id) is None

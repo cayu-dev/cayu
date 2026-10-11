@@ -220,7 +220,7 @@ class SessionExternalWaitAdapter:
         self.waits._authorize(registration.correlation.request, context, "service")
         if request.parent_session_id is not None or request.task_id is not None:
             raise ValueError("External session waits support ordinary root sessions only.")
-        source_digest = self.app._session_engine.work_attempt_source_request_sha256(
+        source_digest = self.app._work_attempt_execution.work_attempt_source_request_sha256(
             request, kind="initial"
         )
         session_id = request.session_id or str(
@@ -253,7 +253,7 @@ class SessionExternalWaitAdapter:
         if session.parent_session_id is not None or linked_task is not None:
             raise ValueError("External session waits support ordinary root sessions only.")
         await self.app._require_participant_execution(session, None)
-        source_digest = self.app._session_engine.work_attempt_source_request_sha256(
+        source_digest = self.app._work_attempt_execution.work_attempt_source_request_sha256(
             request, kind="continuation"
         )
         return await self._execute_to_wait(

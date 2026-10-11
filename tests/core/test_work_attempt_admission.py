@@ -1209,7 +1209,7 @@ def test_public_initial_admission_applies_configured_max_steps_unless_overridden
         ]
 
         observed_max_steps: dict[str, int] = {}
-        engine_type = type(app._session_engine)
+        engine_type = type(app._work_attempt_execution)
         original = engine_type.admit_initial_work_attempt
 
         async def capture_resolved_request(engine, request, *, authority):
@@ -1435,6 +1435,8 @@ def test_continuation_admission_reuses_source_profile_across_app_defaults(
             "prepare_work_attempt_admission",
             verify_store_rejects_changed_settings,
         )
+        # Admission composes runtime preparation without the turn execution owner.
+        monkeypatch.delattr(replacement_app, "_session_engine")
         second = await replacement_app.admit_work_attempt(
             ResumeRequest(
                 session_id=first.session_id,

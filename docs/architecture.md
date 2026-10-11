@@ -264,7 +264,9 @@ CayuApp
   -> ModelCompletionRecovery
   -> ExecutionProfileClassifier
   -> SessionFork
+  -> SessionPreparation
   -> SessionEngine
+  -> WorkAttemptExecution
   -> IncompleteSessionRecovery
   -> RecoveryCoordinator
   -> SessionRecovery
@@ -331,8 +333,11 @@ the application, execution engine, or continuation coordinators.
 `WorkAttemptCoordinator` owns application work-attempt admission, execution
 claim checks and renewal, recovery, and proposal publication. It owns one
 process-local execution identity and refreshes it after a process fork. TaskStore
-retains durable claim and receipt authority; the existing engine retains session
-preparation, execution and settlement behind the coordinator's typed interface.
+retains durable claim and receipt authority. `WorkAttemptExecution` owns runtime
+admission, execution election, interaction-start handoff, invocation closure and
+exact release/recovery evidence behind the coordinator's `WorkAttemptOperations`
+interface. It enters the ordinary turn loop through one typed execution callable;
+admission, replay and settlement do not require the concrete session engine.
 `CayuApp` supplies current-store access, run defaults, public-session resolution
 and the checkpoint guard, and keeps admission/tracking and request detachment at
 its public entrances. The verified worker can still acquire an acknowledged
@@ -341,6 +346,13 @@ coordinator can be composed without importing the application or concrete engine
 its collaborators provide execution, recovery, and checkpoint contracts.
 The verified worker uses `CayuApp.work_attempt_execution`, a typed interface to
 the same execution instance, for admitted-attempt settlement and evidence reads.
+
+`SessionPreparation` is shared by ordinary runs and work-attempt admission. It
+resolves model routing, validates task authority and tool grants, and freezes
+prompts, budgets and execution profiles before session creation. It retains the
+stores and runtime collaborators supplied at composition. Interaction-start
+events and work-attempt source fingerprints use shared lower-level constructors,
+so ordinary execution and governed admission retain the same durable identities.
 
 `QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
 request preparation, frozen profile and session-instance validation, execution

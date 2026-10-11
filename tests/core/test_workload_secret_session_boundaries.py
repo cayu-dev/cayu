@@ -23,7 +23,7 @@ from cayu.messages import Message, MessageRole, ToolCallPart
 from cayu.observability.events import InMemoryEventSink
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelStreamEvent
-from cayu.runtime._session_engine import _with_environment_name
+from cayu.runtime._session_preparation import _with_environment_name
 from cayu.runtime._session_request_boundary import (
     prepare_derived_fork_session,
     prepare_fork_session_request,

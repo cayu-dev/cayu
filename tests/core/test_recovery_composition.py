@@ -116,7 +116,7 @@ def test_execution_imports_without_continuation_recovery():
         ),
         """
 from cayu.runtime._session_engine import SessionEngine
-from cayu.runtime._work_attempt_coordinator import WorkAttemptEngine
+from cayu.runtime._work_attempt_coordinator import WorkAttemptOperations
 assert callable(SessionEngine.prepare_resume)
 assert callable(SessionEngine.resume)
 assert callable(SessionEngine.continue_run)

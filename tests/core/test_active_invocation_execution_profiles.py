@@ -57,6 +57,9 @@ from cayu.providers.operations import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _session_execution_profile
+from cayu.runtime._interaction_events import (
+    build_interaction_started_event,
+)
 from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
     InvocationContext,
@@ -3609,7 +3612,8 @@ def test_cleanup_does_not_release_successor_from_prior_terminal_event() -> None:
         assert released is not None
         assert prior_profile is not None
         successor_interaction_id = "successor-without-terminal-evidence"
-        successor_started = app._session_engine._interaction_started_event(
+        successor_started = build_interaction_started_event(
+            clock=app._clock,
             session=released,
             registered_agent=app._agents["assistant"],
             environment_name=None,
@@ -4997,7 +5001,8 @@ async def _assert_snapshot_only_restart_profile_boundary(
     assert released is not None
     assert prior_profile is not None
     interaction_id = f"snapshot-only-interaction-{uuid4().hex}"
-    interaction_started = original_app._session_engine._interaction_started_event(
+    interaction_started = build_interaction_started_event(
+        clock=original_app._clock,
         session=released,
         registered_agent=original_app._agents["assistant"],
         environment_name=None,
@@ -5336,7 +5341,8 @@ def test_worker_recovery_releases_terminal_invocation_owner(
                 ),
             )
             interaction_id = f"terminal-owner-interaction-{uuid4().hex}"
-            interaction_started = original_app._session_engine._interaction_started_event(
+            interaction_started = build_interaction_started_event(
+                clock=original_app._clock,
                 session=pending,
                 registered_agent=original_app._agents["assistant"],
                 environment_name=None,

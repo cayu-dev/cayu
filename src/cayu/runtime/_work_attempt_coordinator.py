@@ -104,7 +104,7 @@ from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 
-class WorkAttemptEngine(Protocol):
+class WorkAttemptOperations(Protocol):
     """Session execution and settlement used by work-attempt coordination."""
 
     def work_attempt_source_request_sha256(
@@ -229,7 +229,7 @@ class WorkAttemptCoordinator:
         *,
         get_task_store: Callable[[], TaskStore | None],
         session_store: SessionStore,
-        engine: WorkAttemptEngine,
+        execution: WorkAttemptOperations,
         recovery: WorkAttemptRecovery,
         redactor: SecretRedactor,
         apply_run_defaults: Callable[[RunRequest], RunRequest],
@@ -238,7 +238,7 @@ class WorkAttemptCoordinator:
     ) -> None:
         self._get_task_store = get_task_store
         self._runtime_session_store = session_store
-        self._session_engine = engine
+        self._execution = execution
         self._session_recovery = recovery
         self._secret_redactor = redactor
         self._with_application_run_defaults = apply_run_defaults
@@ -332,13 +332,13 @@ class WorkAttemptCoordinator:
                 raise ValueError(
                     "Initial work-attempt task selection conflicts with RunRequest.task_id."
                 )
-            source_request_sha256 = self._session_engine.work_attempt_source_request_sha256(
+            source_request_sha256 = self._execution.work_attempt_source_request_sha256(
                 prepared_request,
                 kind="initial",
             )
             snapshot_validation = capture_sensitive_validation(
                 lambda: (
-                    self._session_engine.work_attempt_source_snapshot(
+                    self._execution.work_attempt_source_snapshot(
                         prepared_request,
                         kind="initial",
                         source_request_sha256=source_request_sha256,
@@ -363,7 +363,7 @@ class WorkAttemptCoordinator:
                 source_request=snapshot_validation.result[0],
             )
             del snapshot_validation
-            admission_operation = self._session_engine.admit_initial_work_attempt(
+            admission_operation = self._execution.admit_initial_work_attempt(
                 prepared_request,
                 authority=authority,
             )
@@ -397,13 +397,13 @@ class WorkAttemptCoordinator:
             session_id, _store_resolved_session_id = session_resolution.result
             del session_resolution
             prepared_request = prepared_request.model_copy(update={"session_id": session_id})
-            source_request_sha256 = self._session_engine.work_attempt_source_request_sha256(
+            source_request_sha256 = self._execution.work_attempt_source_request_sha256(
                 prepared_request,
                 kind="continuation",
             )
             snapshot_validation = capture_sensitive_validation(
                 lambda: (
-                    self._session_engine.work_attempt_source_snapshot(
+                    self._execution.work_attempt_source_snapshot(
                         prepared_request,
                         kind="continuation",
                         source_request_sha256=source_request_sha256,
@@ -428,7 +428,7 @@ class WorkAttemptCoordinator:
                 source_request=snapshot_validation.result[0],
             )
             del snapshot_validation
-            admission_operation = self._session_engine.admit_continuation_work_attempt(
+            admission_operation = self._execution.admit_continuation_work_attempt(
                 prepared_request,
                 authority=authority,
             )
@@ -505,7 +505,7 @@ class WorkAttemptCoordinator:
         # Removing local tokens is not durable release or a dispatch grant.
         _deactivate_session_interaction(admission.session_id)
         _deactivate_session_run_fence(admission.session_id)
-        stream = self._session_engine.execute_admitted_work_attempt(
+        stream = self._execution.execute_admitted_work_attempt(
             admission, lease_seconds=stable.lease_seconds
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -826,7 +826,7 @@ class WorkAttemptCoordinator:
             raise RuntimeError("Work-attempt recovery authority lookup returned no authority.")
         if prior.state is WorkAttemptAdmissionState.PREPARING:
             validation = capture_sensitive_result_validation(
-                lambda prior=prior: self._session_engine.reconstruct_preparing_work_attempt_source(
+                lambda prior=prior: self._execution.reconstruct_preparing_work_attempt_source(
                     prior
                 ),
                 operation_name="Prepared recovery source validation",
@@ -899,7 +899,7 @@ class WorkAttemptCoordinator:
         ):
             raise WorkAttemptExecutionClaimLost("Recovery ownership belongs to another runtime.")
         if claimed.state is WorkAttemptAdmissionState.PREPARING:
-            return await self._session_engine.recover_preparing_work_attempt(ownership)
+            return await self._execution.recover_preparing_work_attempt(ownership)
         del ownership
         stable = WorkAttemptRecoveryRequest(
             admission_id=claim_request.admission_id,
@@ -914,9 +914,7 @@ class WorkAttemptCoordinator:
         # session.  The active replay branch below reinstalls only the current
         # durable epoch after validating its complete authority.
         _deactivate_session_run_fence(claimed.session_id)
-        released_recovery = await self._session_engine.reconcile_released_work_attempt_recovery(
-            claimed
-        )
+        released_recovery = await self._execution.reconcile_released_work_attempt_recovery(claimed)
         if released_recovery is not None:
             return released_recovery
         already_active = claimed.state is WorkAttemptAdmissionState.ACTIVE
@@ -989,7 +987,7 @@ class WorkAttemptCoordinator:
             if session.status is SessionStatus.RUNNING:
                 _activate_session_run_fence(session)
                 _activate_session_interaction(session.id, claimed.interaction_id)
-            return await self._session_engine.fan_out_work_attempt_interaction_started(
+            return await self._execution.fan_out_work_attempt_interaction_started(
                 claimed,
                 lease_seconds=stable.lease_seconds,
             )
@@ -1119,8 +1117,8 @@ class WorkAttemptCoordinator:
                 raise WorkAttemptRecoveryRequired(
                     "Recovery cannot prove the crashed predecessor invocation authority."
                 )
-            model_result_ready = (
-                await self._session_engine.has_recoverable_work_attempt_model_result(claimed)
+            model_result_ready = await self._execution.has_recoverable_work_attempt_model_result(
+                claimed
             )
             if has_active_model_completion and not model_result_ready:
                 raise WorkAttemptRecoveryRequired(
@@ -1481,7 +1479,7 @@ class WorkAttemptCoordinator:
         del activation_validation
         if active is None:
             raise RuntimeError("Work-attempt recovery activation returned no authority.")
-        return await self._session_engine.fan_out_work_attempt_interaction_started(
+        return await self._execution.fan_out_work_attempt_interaction_started(
             active,
             lease_seconds=stable.lease_seconds,
         )

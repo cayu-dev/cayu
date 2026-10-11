@@ -1275,7 +1275,7 @@ def test_worker_recovers_tool_publication_after_process_exit(
             if hook_mode != "none":
                 assert (tmp_path / "hooks.txt").read_text(encoding="utf-8") == "record-effect\n"
             if crash_staged_terminal:
-                assert await app._session_engine.has_recoverable_work_attempt_model_result(
+                assert await app._work_attempt_execution.has_recoverable_work_attempt_model_result(
                     admission
                 )
                 if call_count == 2:
@@ -2129,7 +2129,7 @@ def _crash_replacement_after_execution_entry(
         app.register_completion_verifier(contract.verifier, RecordingVerifier(_accepted_decision()))
         app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
         handler = _StaticHandler()
-        enter = app._session_engine._enter_work_attempt_invocation_context
+        enter = app._work_attempt_execution._enter_work_attempt_invocation_context
 
         async def crash_after_entry(*args, **kwargs):
             context = await enter(*args, **kwargs)
@@ -2141,7 +2141,7 @@ def _crash_replacement_after_execution_entry(
             assert handler.preparations == []
             os._exit(74)
 
-        app._session_engine._enter_work_attempt_invocation_context = crash_after_entry
+        app._work_attempt_execution._enter_work_attempt_invocation_context = crash_after_entry
         async with VerifiedTaskWorker(
             app,
             handler,
@@ -2973,7 +2973,7 @@ def test_worker_recovers_preparing_source_without_repeating_handler(
                         raise ConnectionError("created session reconciled before activation")
 
                     patch.setattr(
-                        type(source_app._session_engine),
+                        type(source_app._work_attempt_execution),
                         "_activate_runtime_work_attempt",
                         stop_before_activation,
                     )
@@ -3272,7 +3272,9 @@ def test_worker_recovers_expired_completed_execution_without_redispatch(
             original_checkpoint = await sessions.load_checkpoint(session.id)
             if human_pause:
                 assert f"pending_{outcome}" in original_checkpoint
-            release = await app._session_engine.load_work_attempt_release_evidence(admission)
+            release = await app._work_attempt_execution.load_work_attempt_release_evidence(
+                admission
+            )
             assert await tasks.load_completion_proposal_for_attempt(admission.attempt_id) is None
             assert (await tasks.load_task(task.id)).status is TaskStatus.RUNNING
             # Real expiry, not a constructed claim-loss exception or mutated
@@ -3373,7 +3375,9 @@ def test_worker_recovers_expired_completed_execution_without_redispatch(
             assert recovered.execution_entry == admission.execution_entry
             assert recovered.run_semantics == admission.run_semantics
             assert (
-                await restarted._session_engine.load_work_attempt_release_evidence(recovered)
+                await restarted._work_attempt_execution.load_work_attempt_release_evidence(
+                    recovered
+                )
                 == release
             )
             assert len(provider.requests) == 1

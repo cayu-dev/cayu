@@ -254,7 +254,7 @@ from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
     detach_billing_identity_cancellation_group,
 )
-from cayu.runtime._session_engine import _require_native_structured_output_support
+from cayu.runtime._session_preparation import _require_native_structured_output_support
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,

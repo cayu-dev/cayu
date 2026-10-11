@@ -15,6 +15,7 @@ from tests.core._execution_profile_fixtures import versioned_test_provider_ident
 
 import cayu.applications as runtime_app_module
 import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._session_preparation as session_preparation_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.configuration import CayuConfig, ToolExecutionConfig
@@ -4211,7 +4212,7 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
         app.register_provider(_DurableSubagentProvider(), default=True)
         _register_durable_subagent_agents(app)
         if crash_phase == "during_preparation":
-            original_prepare = app._session_engine.prepare_initial_run
+            original_prepare = app._session_preparation.prepare_initial_run
             preparation_calls = 0
 
             async def lose_worker_during_child_preparation(*args, **kwargs):
@@ -4225,7 +4226,7 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
                 return result
 
             monkeypatch.setattr(
-                app._session_engine,
+                app._session_preparation,
                 "prepare_initial_run",
                 lose_worker_during_child_preparation,
             )
@@ -4950,7 +4951,11 @@ def test_worker_rejects_changed_runtime_build_before_provider_dispatch(monkeypat
                 "current_runtime_build_provenance",
                 lambda: build_b,
             )
-            for provenance_owner in (session_engine_module, _session_execution_profile):
+            for provenance_owner in (
+                session_engine_module,
+                session_preparation_module,
+                _session_execution_profile,
+            ):
                 build_b_context.setattr(
                     provenance_owner,
                     "current_runtime_build_provenance",

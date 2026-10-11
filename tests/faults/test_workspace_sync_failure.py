@@ -1199,11 +1199,11 @@ def test_restarted_completion_finalization_settles_attached_task(
                         register_runtime(
                             replacement, binding=recovery_binding, provider=recovery_provider
                         )
-                        assert not await replacement._session_engine.has_recoverable_work_attempt_model_result(
+                        assert not await replacement._work_attempt_execution.has_recoverable_work_attempt_model_result(
                             stopped
                         )
                         assert (
-                            await replacement._session_engine.load_work_attempt_released_recovery_evidence(
+                            await replacement._work_attempt_execution.load_work_attempt_released_recovery_evidence(
                                 stopped
                             )
                             is None
@@ -1307,8 +1307,10 @@ def test_restarted_completion_finalization_settles_attached_task(
             ) is not governed
             assert EventType.SESSION_FAILED in {event.type for event in durable_events}
             if governed:
-                release = await recovery_app._session_engine.load_work_attempt_release_evidence(
-                    recovery
+                release = (
+                    await recovery_app._work_attempt_execution.load_work_attempt_release_evidence(
+                        recovery
+                    )
                 )
                 ownership_now[0] = recovery.claim.lease_expires_at + timedelta(seconds=1)
                 # No registered provider/environment or surviving runtime context
@@ -1330,7 +1332,9 @@ def test_restarted_completion_finalization_settles_attached_task(
                 assert next_owner.execution_stop == recovery.execution_stop
                 assert next_owner.execution_entry == recovery.execution_entry
                 assert (
-                    await fresh_app._session_engine.load_work_attempt_release_evidence(next_owner)
+                    await fresh_app._work_attempt_execution.load_work_attempt_release_evidence(
+                        next_owner
+                    )
                     == release
                 )
                 assert await recovery_session_store.load(admission.session_id) == recovered_session

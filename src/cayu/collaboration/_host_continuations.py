@@ -65,7 +65,7 @@ def snapshot_continuation_rule(app, rule):
         or service.ticket.registration_key != expected.registration_key
     ):
         raise ValueError("Host continuation selection mixes native identities.")
-    app._session_engine.work_attempt_source_request_sha256(request, kind="continuation")
+    app._work_attempt_execution.work_attempt_source_request_sha256(request, kind="continuation")
     size = len(
         canonical_durable_json_bytes(
             request.model_dump(mode="json", warnings=False),
@@ -163,7 +163,7 @@ class HostContinuationOwner:
         service = prepare_contract(ContinuationService, service, redactor=redactor)
         context = prepare_contract(CollaborationAccessContext, context, redactor=redactor)
         request = copy_resume_request(request)
-        request_digest = app._session_engine.work_attempt_source_request_sha256(
+        request_digest = app._work_attempt_execution.work_attempt_source_request_sha256(
             request, kind="continuation"
         )
         request_bytes = canonical_durable_json_bytes(

@@ -1020,7 +1020,7 @@ class SessionContinuationOwner:
             ):
                 raise ValueError("Temporary resume field presence is invalid.")
             object.__setattr__(copied, "__pydantic_fields_set__", set(fields))
-            digest = app._session_engine.work_attempt_source_request_sha256(
+            digest = app._work_attempt_execution.work_attempt_source_request_sha256(
                 copied, kind="continuation"
             )
         except Exception as error:
@@ -1163,7 +1163,7 @@ class SessionContinuationOwner:
         failure = None
         try:
             copied_request = copy_resume_request(request)
-            request_digest = app._session_engine.work_attempt_source_request_sha256(
+            request_digest = app._work_attempt_execution.work_attempt_source_request_sha256(
                 copied_request, kind="continuation"
             )
         except Exception as error:

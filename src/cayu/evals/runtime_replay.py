@@ -1468,9 +1468,9 @@ def _isolated_app(
         clock=_runtime_replay_clock(clock_instant),
     )
     isolated._execution_profile_process_identity = app._execution_profile_process_identity
-    isolated._session_engine._execution_profile_process_identity = (
-        app._execution_profile_process_identity
-    )
+    # Preparation and execution must share the source's process-local tool identities.
+    for runtime in (isolated._session_engine, isolated._session_preparation):
+        runtime._execution_profile_process_identity = app._execution_profile_process_identity
     if provider_batches is not None and (
         request_billing_identities is None or completion_billing_identities is None
     ):
@@ -1571,7 +1571,7 @@ async def _candidate_profile(
             tool_capability_ceiling=tool_capability_ceiling,
         )
     )
-    prepared = await isolated._session_engine.prepare_initial_run(
+    prepared = await isolated._session_preparation.prepare_initial_run(
         request,
         admit_session=False,
         store_resolved_existing_session_id=None,

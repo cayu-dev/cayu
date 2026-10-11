@@ -135,7 +135,7 @@ def test_admitted_common_runtime_settles_session_without_accepting_task(
             await sessions.load_deferred_interaction_input(admission.session_id) == deferred_input
         )
         session = await sessions.load(admission.session_id)
-        context = await app._session_engine._resolve_work_attempt_invocation_context(
+        context = await app._work_attempt_execution._resolve_work_attempt_invocation_context(
             admission,
             session=session,
             checkpoint=await sessions.load_checkpoint(session.id),
@@ -157,7 +157,7 @@ def test_admitted_common_runtime_settles_session_without_accepting_task(
                 # The provider is actually in flight, not merely admitted.
                 # A duplicate runtime entrance must not acquire a second run.
                 with pytest.raises(WorkAttemptRecoveryRequired, match="already entered"):
-                    await app._session_engine._enter_work_attempt_invocation_context(
+                    await app._work_attempt_execution._enter_work_attempt_invocation_context(
                         admission,
                         session=session,
                         checkpoint=await sessions.load_checkpoint(session.id),
@@ -210,7 +210,9 @@ def test_admitted_common_runtime_settles_session_without_accepting_task(
         # A new app needs no provider registration or process-local context to
         # verify the exact released invocation from durable evidence.
         assert (
-            await foreign_app._session_engine.load_work_attempt_release_evidence(durable_admission)
+            await foreign_app._work_attempt_execution.load_work_attempt_release_evidence(
+                durable_admission
+            )
             == evidence
         )
         wrong_entry = durable_admission.execution_entry.model_copy(
@@ -221,7 +223,7 @@ def test_admitted_common_runtime_settles_session_without_accepting_task(
             }
         )
         with pytest.raises(RuntimeError):
-            await foreign_app._session_engine.load_work_attempt_release_evidence(
+            await foreign_app._work_attempt_execution.load_work_attempt_release_evidence(
                 durable_admission.model_copy(update={"execution_entry": wrong_entry})
             )
         with pytest.raises(WorkAttemptRecoveryRequired, match="already entered"):
@@ -266,7 +268,7 @@ def test_admitted_common_runtime_settles_session_without_accepting_task(
         assert await sessions.load_checkpoint(session.id) == checkpoint_before
         assert await sessions.load_transcript(session.id) == transcript_before
         assert (
-            await foreign_app._session_engine.load_work_attempt_release_evidence(recovered)
+            await foreign_app._work_attempt_execution.load_work_attempt_release_evidence(recovered)
             == evidence
         )
         assert (await tasks.load_task(admission.task_id)).status is TaskStatus.RUNNING
@@ -407,7 +409,7 @@ def test_governed_initial_publication_acknowledgement_loss(
                 assert failures[0].payload["error"] == "initial publication acknowledgement lost"
                 assert (await sessions.load(admission.session_id)).status is SessionStatus.FAILED
             entered = await tasks.load_work_attempt_admission(admission.admission_id)
-            await app._session_engine.load_work_attempt_release_evidence(entered)
+            await app._work_attempt_execution.load_work_attempt_release_evidence(entered)
         finally:
             if backend == "sqlite":
                 await tasks.close()

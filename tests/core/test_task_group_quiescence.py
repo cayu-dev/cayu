@@ -3238,7 +3238,7 @@ async def test_pre_entry_recovery_waits_for_admission_sink_return(
         query=TaskQuery(type="b"),
         poll_interval_s=0.01,
     )
-    proof = peer._session_engine.settle_work_attempt_admission_handoff
+    proof = peer._work_attempt_execution.settle_work_attempt_admission_handoff
     stop = asyncio.Event()
 
     async def observe(admission):
@@ -3249,7 +3249,9 @@ async def test_pre_entry_recovery_waits_for_admission_sink_return(
             stop.set()
         return result
 
-    monkeypatch.setattr(peer._session_engine, "settle_work_attempt_admission_handoff", observe)
+    monkeypatch.setattr(
+        peer._work_attempt_execution, "settle_work_attempt_admission_handoff", observe
+    )
     try:
         async with asyncio.timeout(20):
             await entered.wait()

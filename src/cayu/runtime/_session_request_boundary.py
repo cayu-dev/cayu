@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import traceback as traceback_module
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.approvals.tools import ResolutionActor
@@ -16,6 +16,9 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.messages import Message
+from cayu.runtime._execution_profile_identity_validation import (
+    copy_secret_free_execution_profile_behavior_identity,
+)
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
     redact_untrusted_message_for_boundary,
@@ -24,6 +27,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     public_authority_alias_is_reserved,
 )
+from cayu.runtime.work_attempt_source import work_attempt_source_digest
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
@@ -1128,3 +1132,67 @@ def _validate_run_request(request: RunRequest) -> RunRequest:
 
 def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
     return copy_resume_request(request)
+
+
+def work_attempt_source_document(request: RunRequest | ResumeRequest) -> dict[str, Any]:
+    document = request.model_dump(mode="json", warnings=False)
+    # Portable source snapshots retain explicit defaults, unlike ordinary
+    # wire projections. An explicitly absent policy must remain represented
+    # when failover is present in the request's explicit fields_set.
+    if request.failover is None:
+        document["failover"] = None
+    if request.tool_completion is None and "tool_completion" in request.model_fields_set:
+        document["tool_completion"] = None
+    if type(request) is RunRequest:
+        # An unbounded deadline must not become an inherited replacement
+        # deadline merely because the ordinary serializer omits it.
+        document["execution_deadline"] = request.execution_deadline.model_dump(
+            mode="json", warnings=False
+        )
+    return document
+
+
+def work_attempt_source_request_sha256(
+    request: RunRequest | ResumeRequest,
+    *,
+    redactor: SecretRedactor,
+    policy_instance_identity: Callable[[object], str],
+    kind: Literal["initial", "continuation"],
+) -> str:
+    """Bind one public request and its otherwise excluded policy authority."""
+
+    if kind == "initial":
+        if type(request) is not RunRequest:
+            raise TypeError("Initial work-attempt authority requires a RunRequest.")
+    elif kind == "continuation":
+        if type(request) is not ResumeRequest:
+            raise TypeError("Continuation work-attempt authority requires a ResumeRequest.")
+    else:  # pragma: no cover - private literal invariant
+        raise ValueError("Unsupported work-attempt request kind.")
+    loop_policy_authority: list[dict[str, Any]] = []
+    for index, policy in enumerate(request.loop_policies):
+        identity = copy_secret_free_execution_profile_behavior_identity(
+            policy.execution_profile_identity,
+            redactor=redactor,
+            field_name=f"request.loop_policies[{index}].execution_profile_identity",
+        )
+        if identity is None:
+            loop_policy_authority.append(
+                {
+                    "kind": "process_local",
+                    "instance_identity": (policy_instance_identity(policy)),
+                }
+            )
+        else:
+            loop_policy_authority.append(
+                {
+                    "kind": "application_versioned",
+                    "identity": identity.model_dump(mode="json", warnings=False),
+                }
+            )
+    return work_attempt_source_digest(
+        kind=kind,
+        request=work_attempt_source_document(request),
+        fields_set=tuple(sorted(request.model_fields_set)),
+        loop_policy_authority=loop_policy_authority,
+    )

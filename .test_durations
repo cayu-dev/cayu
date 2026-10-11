@@ -1,4 +1,12 @@
 {
+  "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[factory-RuntimeError]": 1.991159,
+  "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[factory-CancelledError]": 0.661463,
+  "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[iteration-RuntimeError]": 0.26267,
+  "tests/core/test_work_attempt_composition.py::test_execution_failure_clears_local_ownership_and_retains_durable_entry[iteration-CancelledError]": 0.195384,
+  "tests/core/test_work_attempt_composition.py::test_admission_replay_and_pre_entry_release_need_no_turn_execution[memory]": 2.3313541670213453,
+  "tests/core/test_work_attempt_composition.py::test_admission_replay_and_pre_entry_release_need_no_turn_execution[sqlite]": 2.5291006669867784,
+  "tests/core/test_work_attempt_composition.py::test_preparation_keeps_its_composed_task_authority_store": 0.012554667016956955,
+  "tests/core/test_work_attempt_composition.py::test_work_attempt_parts_import_without_application_or_session_engine": 6.912387333984952,
   "tests/core/test_runtime_publication_rules_layout.py::test_user_input_publication_requires_exact_pause_and_run_authority_without_stores": 0.7502820009831339,
   "tests/core/test_runtime_publication_rules_layout.py::test_tool_publication_binds_results_lifecycle_and_pending_marker_without_stores": 0.8877864159876481,
   "tests/core/test_runtime_publication_rules_layout.py::test_publication_receipts_bind_exact_material_and_reject_tampering_without_stores": 1.0744149169768207,
