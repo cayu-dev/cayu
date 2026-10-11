@@ -10,10 +10,10 @@ import time
 from pathlib import Path
 
 import pytest
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     _reset_postgres_data,
 )
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     conformance_postgres_dsn as conformance_postgres_dsn,
 )
 

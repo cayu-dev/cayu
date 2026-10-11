@@ -5,7 +5,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     _close_store,
     _open_store,
     _public_authority_alias_codec,

@@ -4,14 +4,14 @@ import asyncio
 
 import pytest
 from pydantic import ValidationError
+from tests.core.session_store_conformance.support import (
+    conformance_postgres_dsn as conformance_postgres_dsn,
+)
 from tests.core.test_explicit_session_compaction import UsageCompactionProvider
 from tests.core.test_queued_session_messages import (
     BlockingApprovalProvider,
     BlockingTool,
     ToolRoundProvider,
-)
-from tests.core.test_session_store_shared_conformance import (
-    conformance_postgres_dsn as conformance_postgres_dsn,
 )
 from tests.core.test_user_input import _ScriptedProvider
 

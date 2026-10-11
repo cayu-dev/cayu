@@ -4,17 +4,17 @@ import asyncio
 from contextlib import aclosing
 
 import pytest
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     _close_store,
     _collect_events,
     _open_store,
     _SimulatedProcessLoss,
     _UserInputRecoveryProvider,
 )
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     conformance_postgres_dsn as conformance_postgres_dsn,
 )
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     session_store_case as session_store_case,
 )
 

@@ -14,7 +14,11 @@ from cayu.storage.tasks_postgres import PostgresTaskStore
 @pytest.mark.parametrize(
     ("module", "tables_name"),
     [
-        ("test_session_store_shared_conformance", "_POSTGRES_TABLES"),
+        pytest.param(
+            "session_store_conformance.support",
+            "_POSTGRES_TABLES",
+            id="test_session_store_shared_conformance-_POSTGRES_TABLES",
+        ),
         ("test_event_watchers", "_POSTGRES_TABLES"),
         ("test_postgres_budget_ledger", "_TABLES"),
         ("postgres_contention_support", "POSTGRES_CONTENTION_TABLES"),

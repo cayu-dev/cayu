@@ -143,7 +143,7 @@ def test_public_export_serialization_is_bounded_without_model_dump(
 def test_public_closure_fences_native_writes_but_allows_exact_replay(
     tmp_path, request, backend, revoke_before_closure
 ):
-    from tests.core.test_session_store_shared_conformance import (
+    from tests.core.session_store_conformance.support import (
         _planned_context_exposure,
         _recall_receipt,
     )
@@ -330,7 +330,7 @@ def test_public_closure_fences_native_writes_but_allows_exact_replay(
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 def test_public_closure_includes_session_memory_evidence(tmp_path, request, backend):
-    from tests.core.test_session_store_shared_conformance import (
+    from tests.core.session_store_conformance.support import (
         _planned_context_exposure,
         _recall_receipt,
     )

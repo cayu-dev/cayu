@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     _planned_context_exposure,
     _recall_receipt,
 )

@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from tests.core.test_human_review import CONTEXT, ReviewPolicy, decision, make_app, pause, resolve
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     _close_store,
     _open_store,
     conformance_postgres_dsn,  # noqa: F401 - imported pytest fixture
     session_store_case,  # noqa: F401 - imported pytest fixture
 )
+from tests.core.test_human_review import CONTEXT, ReviewPolicy, decision, make_app, pause, resolve
 
 
 @pytest.mark.parametrize("approval", [False, True])

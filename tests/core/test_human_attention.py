@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from examples.human_attention.app import build
 from examples.human_attention.consumer import reconcile
-from tests.core.test_session_store_shared_conformance import (
+from tests.core.session_store_conformance.support import (
     _close_store,
     _open_store,
     conformance_postgres_dsn,
