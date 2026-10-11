@@ -1294,13 +1294,13 @@ schema-lock acquisition. Store readiness and connection lifetimes, the shared
 codec and schema history retain their existing owners. Codec configuration
 remains optional for stores whose durable registry is unconfigured.
 
-Native SQLite model-completion stage persistence lives in
-`storage/_sqlite_model_stage.py`. The owner keeps stage reads, preparation,
-dispatch, completion and abandonment inside native transaction boundaries,
-and composes promotion with the existing runtime-publication operation. The store
-supplies explicit execution, reader, writer and clock capabilities. Required store
-protocol hooks delegate to the owner; shared model-stage rules, runtime execution
-and publication transactions retain their existing owners.
+Native model-completion stage persistence lives in `storage/_sqlite_model_stage.py`
+and `storage/_postgres_model_stage.py`. These owners keep stage reads, preparation,
+dispatch, completion and abandonment inside their native transaction boundaries,
+and compose promotion with the existing runtime-publication operation. Stores
+supply explicit execution, connection, reader, writer and clock capabilities.
+Required store protocol hooks delegate to these owners; shared model-stage rules,
+runtime execution and publication transactions retain their existing owners.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 

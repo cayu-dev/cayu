@@ -23,6 +23,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.storage import _postgres_model_stage as postgres_model_stage
 from cayu.storage import _sqlite_model_stage as sqlite_model_stage
 
 
@@ -377,7 +378,7 @@ def test_postgres_queue_operations_compose_with_direct_connection(queue_postgres
             register_authorities=register_authorities,
             reject_steering=reject_steering,
             upsert_checkpoint=upsert_checkpoint,
-            decode_stage_record=adapter._decode_model_completion_stage_record,
+            decode_stage_record=postgres_model_stage.decode_stage_record,
         )
         source = await snapshot(sid, include_transcript_digest=True, include_checkpoint_digest=True)
         assert source.transcript_sha256 and source.checkpoint_sha256

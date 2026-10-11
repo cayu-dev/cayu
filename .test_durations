@@ -1,4 +1,8 @@
 {
+  "tests/core/test_postgres_model_stage_ownership.py::test_postgres_model_stage_imports_without_adapters_or_driver": 0.805,
+  "tests/core/test_postgres_model_stage_ownership.py::test_postgres_model_stage_composes_and_rolls_back_failed_writes[RuntimeError]": 0.712,
+  "tests/core/test_postgres_model_stage_ownership.py::test_postgres_model_stage_composes_and_rolls_back_failed_writes[CancelledError]": 0.215,
+  "tests/core/test_postgres_model_stage_ownership.py::test_postgres_model_stage_cancellation_rolls_back_preparation": 0.201,
   "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_imports_without_adapters_or_driver": 0.772,
   "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_composes_and_rolls_back_failed_writes[RuntimeError]": 0.744,
   "tests/core/test_native_model_stage_ownership.py::test_sqlite_model_stage_composes_and_rolls_back_failed_writes[CancelledError]": 0.159,
