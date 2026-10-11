@@ -22,7 +22,7 @@ from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.sessions import creation_fence
 from cayu.sessions._access_rules import runtime_session_mutation, runtime_session_query
-from cayu.sessions.base import (
+from cayu.sessions._closure_records import (
     _check_closure_lineage_owner,
     _closure_progress_targets,
     _validate_closure_progress_update,
@@ -329,9 +329,6 @@ from cayu.sessions.authority import (
     checkpoint_root_field_projection_from_storage,
 )
 from cayu.sessions.base import (
-    _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
-    _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
-    DELETE_BLOCKED_SESSION_STATUSES,
     BudgetReservationIdentityConflict,
     ForkCheckpointAuthorityDecoder,
     SessionOperationInitializer,
@@ -339,11 +336,9 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     StoreTimeSessionOperationTransform,
-    _durable_subagent_parent_delete_block_reason,
     _project_interruption_cascade_marker_fields,
     _require_session_export_target,
     _run_session_commit_guard_owned,
-    _terminal_publication_delete_block_reason,
     _validate_inactive_for_seconds,
 )
 from cayu.sessions.event_delivery import (
@@ -364,8 +359,10 @@ from cayu.sessions.forks import (
 from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.invocation import SessionInvocation
 from cayu.sessions.lineage import (
+    DELETE_BLOCKED_SESSION_STATUSES,
     SessionLineageQuery,
     SessionLineageResult,
+    _durable_subagent_parent_delete_block_reason,
 )
 from cayu.sessions.mcp_manifest_history import (
     McpManifestBaseline,
@@ -435,10 +432,13 @@ from cayu.sessions.summaries import (
     session_outcome,
 )
 from cayu.sessions.terminal_evidence import (
+    _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
+    _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
+    _terminal_publication_delete_block_reason,
 )
 from cayu.sessions.topology import (
     SessionTopologyQuery,
@@ -1935,8 +1935,8 @@ class PostgresSessionStore(
             raise ValueError("Session has a pending external-wait handoff.")
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
         from cayu.collaboration import _session_export_store as session_exports
-        from cayu.runtime._session_closure_records import require_terminal_protected_effect
         from cayu.sessions import _session_continuation_store as continuations
+        from cayu.sessions._closure_records import require_terminal_protected_effect
 
         session_id = session.id
         export_records: dict[str, dict[str, Any]] = {}
@@ -7248,7 +7248,7 @@ class PostgresSessionStore(
     async def _load_session_closure_records(
         self, cur: Any, session_id: str, *, max_records: int, max_bytes: int
     ) -> dict[str, Any]:
-        from cayu.runtime._session_closure_records import (
+        from cayu.sessions._closure_records import (
             ClosureRecordsBuilder,
             ClosureRecordsTooLarge,
         )

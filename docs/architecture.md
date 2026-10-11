@@ -759,6 +759,23 @@ concrete session store. Each backend retains authorization, locking, transaction
 and the complete prepare/apply operation. Public imports continue to resolve to
 the canonical records and rules.
 
+### Shared delivery, child lifecycle and closure rules
+
+Completion-event reservations live with checkpoint preservation, and exact first
+attempt delivery validation lives with event delivery contracts. Queued dispatch
+receipt retention, acknowledgement and run-event identity use
+`sessions/_terminal_evidence.py`; initial transcript publication and queue
+finalization reuse the checkpoint publication and completion finalization owners.
+
+`sessions/_child_lifecycle_rules.py` derives current child observations and exact
+notification consumption from the existing child contracts and supplied records.
+`sessions/_closure_records.py` owns bounded native-record collection, protected
+effect validation, recursive plan identity and closure replay/progress checks.
+Lineage and terminal evidence modules own the corresponding deletion guards.
+These parts can be composed without loading session stores or runtime execution;
+stores retain snapshot collection, authorization, clocks, locking and transactions.
+The runtime closure coordinator composes the same closure rules.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

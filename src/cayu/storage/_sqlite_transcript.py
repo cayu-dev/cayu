@@ -16,6 +16,7 @@ from cayu.sessions._checkpoint_preservation import (
     _copy_checkpoint_for_transform,
 )
 from cayu.sessions._checkpoint_publication import _checkpoint_after_initial_transcript_publication
+from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions._invocation_scope import (
     INHERIT_INTERACTION,
     InteractionAttribution,
@@ -25,7 +26,6 @@ from cayu.sessions._invocation_scope import (
 from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
 from cayu.sessions._operation_records import RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX
-from cayu.sessions.base import _check_closure_lineage_owner
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, TranscriptRecord
 from cayu.sessions.transcript_input import (
     DeferredInteractionInput,

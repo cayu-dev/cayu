@@ -21,6 +21,7 @@ from pydantic import (
     model_validator,
 )
 
+import cayu.sessions as sessions
 from cayu._task_wait import (
     await_shielded_task_outcome,
     capture_awaitable_outcome,
@@ -49,7 +50,6 @@ from cayu.sessions._checkpoint_mutations import (
     apply_runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session
 
@@ -345,7 +345,7 @@ def validate_tool_effect_uncertainty_event(event: Event, record: ToolEffectRecor
 
 
 class ToolEffectStateOwner:
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(self, store: sessions.SessionStore) -> None:
         self._store = store
 
     async def load_uncertainty_events(

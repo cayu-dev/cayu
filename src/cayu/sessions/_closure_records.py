@@ -1,14 +1,17 @@
-"""Bounded native-record snapshots shared by closure inventory and export.
+"""Bounded closure records, replay validation and exact recursive lineage ownership.
 
 Store implementations feed records while holding their read snapshot. Conversion
 walks the owned fields without first calling a model serializer or allocating an
 unbounded intermediate representation.
 """
 
+from __future__ import annotations
+
 from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from enum import Enum
+from hashlib import sha256
 from typing import Any, cast
 
 from pydantic import BaseModel
@@ -223,3 +226,77 @@ class ClosureRecordsBuilder:
             max_nodes=1_000_000,
         )
         return document
+
+
+def session_closure_target_plan_id(root_plan_id: str, target_session_id: str) -> str:
+    """Derive a stable per-descendant receipt identity from the root plan."""
+
+    return sha256(
+        canonical_durable_json_bytes(
+            {"root_plan_id": root_plan_id, "target_session_id": target_session_id},
+            "session_closure.target_plan",
+        )
+    ).hexdigest()
+
+
+def _validate_session_closure_detach_replay(
+    tombstones: tuple[dict[str, Any], ...],
+    *,
+    root_id: str,
+    plan_id: str,
+    parent_session_id: str,
+    child_session_ids: tuple[str, ...],
+) -> None:
+    if (
+        len(tombstones) != len(child_session_ids)
+        or {item.get("child_session_id") for item in tombstones} != set(child_session_ids)
+        or any(
+            item.get("root_session_id") != root_id
+            or item.get("plan_id") != plan_id
+            or item.get("original_parent_session_id") != parent_session_id
+            for item in tombstones
+        )
+    ):
+        raise ValueError("Closure detachment replay identity conflict.")
+
+
+def _closure_progress_targets(progress: dict[str, Any]) -> set[str]:
+    return {progress["root_session_id"], *(item["session_id"] for item in progress["descendants"])}
+
+
+def _check_closure_lineage_owner(
+    progress: dict[str, Any], session_ids: Iterable[str], receipt: dict[str, Any] | None = None
+) -> None:
+    """Only the exact recursive owner may delete a claimed session."""
+    for session_id in set(session_ids) & _closure_progress_targets(progress):
+        root_id, plan_id = progress["root_session_id"], progress["plan_id"]
+        expected_plan = (
+            plan_id
+            if session_id == root_id
+            else session_closure_target_plan_id(plan_id, session_id)
+        )
+        if receipt is None or receipt.get("plan_id") != expected_plan:
+            raise ValueError("Session lineage is owned by an unfinished recursive closure.")
+        if session_id != root_id and (
+            receipt.get("root_session_id") != root_id
+            or receipt.get("target_session_id") != session_id
+            or receipt.get("operation") != "recursive"
+        ):
+            raise ValueError("Recursive closure deletion owner conflicts.")
+
+
+def _validate_closure_progress_update(existing: dict[str, Any], proposed: dict[str, Any]) -> None:
+    for key in (
+        "schema_version",
+        "root_session_id",
+        "plan_id",
+        "policy_digest",
+        "max_records",
+        "max_bytes",
+        "phase",
+        "descendants",
+    ):
+        if existing.get(key) != proposed.get(key):
+            raise ValueError("Closure progress identity conflict.")
+    if not set(existing["completed"]) <= set(proposed["completed"]):
+        raise ValueError("Closure progress cannot forget completed descendants.")

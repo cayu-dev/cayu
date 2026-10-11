@@ -231,7 +231,7 @@ class KnowledgeClosureInventory:
 
     def add_readiness(self, readiness) -> None:
         from cayu.knowledge.indexing import KnowledgeEmbeddingIdentity, KnowledgeIndexReadiness
-        from cayu.runtime._session_closure_records import ClosureRecordsBuilder
+        from cayu.sessions._closure_records import ClosureRecordsBuilder
 
         if type(readiness) is not KnowledgeIndexReadiness:
             raise ValueError("Invalid knowledge closure readiness record.")

@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from tests.core.session_closure_conformance import create_closure_session
 
 from cayu import CayuApp
-from cayu.runtime._session_closure_records import ClosureRecordsBuilder, ClosureRecordsTooLarge
+from cayu.sessions._closure_records import ClosureRecordsBuilder, ClosureRecordsTooLarge
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 

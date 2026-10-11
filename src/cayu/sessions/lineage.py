@@ -17,8 +17,9 @@ from pydantic import (
 )
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import EVENT_ID_MAX_CHARS, EventType
-from cayu.sessions.records import MAX_SESSION_ID_BYTES
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, Session, SessionStatus
 from cayu.sessions.topology import _bounded_session_topology_text
 
 SESSION_LINEAGE_DEFAULT_CHILD_LIMIT = 25
@@ -267,3 +268,24 @@ def decode_session_lineage_cursor(
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         raise ValueError("Invalid session lineage cursor.")
     return created_at.astimezone(UTC), child_session_id
+
+
+# Sessions that must be interrupted before they can be deleted (in-flight work).
+DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
+
+
+def _is_durable_subagent_child(session: Session) -> bool:
+    """Return positive runtime metadata evidence for a task-backed subagent child."""
+
+    if type(session) is not Session:
+        raise TypeError("Durable subagent child classification requires an exact session.")
+    subagent = session.metadata.get("subagent")
+    return type(subagent) is dict and subagent.get("mode") == "durable"
+
+
+def _durable_subagent_parent_delete_block_reason(child_session_id: str) -> str:
+    child_session_id = require_clean_nonblank(child_session_id, "child_session_id")
+    return (
+        "Cannot delete a session while durable subagent child authority still exists; "
+        f"settle and delete the child first: {child_session_id}"
+    )

@@ -65,7 +65,7 @@ class _SessionStore:
             raise ValueError("Closure target is not quiescent.")
 
     async def load_session_closure_records(self, session_id, *, max_records, max_bytes):
-        from cayu.runtime._session_closure_records import (
+        from cayu.sessions._closure_records import (
             SESSION_CLOSURE_NATIVE_CLASSES,
             ClosureRecordsBuilder,
         )

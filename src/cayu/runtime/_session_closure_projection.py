@@ -2,15 +2,15 @@
 
 from collections.abc import Callable
 
-from cayu.runtime._session_closure_records import (
-    SESSION_CLOSURE_NATIVE_CLASSES,
-    ClosureRecordsBuilder,
-)
 from cayu.runtime.session_closure import (
     SessionClosureExport,
     SessionClosureManifest,
     SessionClosureRecord,
     SessionClosureReport,
+)
+from cayu.sessions._closure_records import (
+    SESSION_CLOSURE_NATIVE_CLASSES,
+    ClosureRecordsBuilder,
 )
 from cayu.vaults.redaction import SecretRedactor
 

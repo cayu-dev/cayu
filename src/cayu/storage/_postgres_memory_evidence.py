@@ -37,7 +37,7 @@ from cayu.memory.evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
-from cayu.sessions.base import _check_closure_lineage_owner
+from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._postgres_transcript import PostgresConnection
 

@@ -15,10 +15,6 @@ from cayu._validation import require_durable_clean_nonblank as require_clean_non
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.runtime.evidence_spool import EvidenceSpool
-from cayu.sessions.base import (
-    _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
-    _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
-)
 from cayu.sessions.records import (
     EventRecord,
     RunnerObservedEventIdentity,
@@ -26,6 +22,8 @@ from cayu.sessions.records import (
     TranscriptRecord,
 )
 from cayu.sessions.terminal_evidence import (
+    _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
+    _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     TerminalPublicationMarker,
     TerminalSessionEvidence,

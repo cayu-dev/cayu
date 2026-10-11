@@ -14,10 +14,10 @@ from typing import Protocol
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
+from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions._invocation_scope import _assert_session_run_epoch, _current_session_run_epoch
 from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
-    _check_closure_lineage_owner,
     _copy_mcp_manifest_publication,
     _copy_workflow_step_reservation,
 )

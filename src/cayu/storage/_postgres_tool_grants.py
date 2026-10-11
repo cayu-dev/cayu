@@ -13,10 +13,10 @@ from typing import Any, Protocol
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event, EventType
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
+from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatusConflict,
-    _check_closure_lineage_owner,
     _public_authority_alias_store_key,
 )
 from cayu.sessions.interactions import (

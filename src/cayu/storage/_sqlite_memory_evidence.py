@@ -37,7 +37,7 @@ from cayu.memory.evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
-from cayu.sessions.base import _check_closure_lineage_owner
+from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 from cayu.storage._sqlite_transcript import ClosureOwners

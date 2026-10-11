@@ -13,6 +13,12 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER, compact_json_utf8_size
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event, EventType
 from cayu.messages import Message
+from cayu.sessions import _terminal_evidence as terminal_event_evidence
+from cayu.sessions import _tool_round_publication_rules as tool_publication_rules
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+)
 from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
@@ -978,3 +984,76 @@ def _assemble_terminal_session_evidence(
         terminal_publication_marker=(None if marker is None else marker.model_copy(deep=True)),
         boundary=boundary.model_copy(deep=True),
     )
+
+
+# Storage implementations collect the bounded evidence used by the shared classifier.
+_TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES = TERMINAL_EVIDENCE_EVENT_TYPES
+
+
+_TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT = TERMINAL_EVIDENCE_QUERY_LIMIT
+
+
+_TERMINAL_PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
+    {
+        "pending_tool_approval",
+        "pending_user_input",
+        tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+    }
+)
+
+
+def _terminal_publication_delete_block_reason(
+    *,
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    evidence_events: Sequence[Event],
+) -> str | None:
+    """Return why deletion would erase repairable current-run terminal evidence.
+
+    ``evidence_events`` must contain the newest lifecycle/terminal events in
+    descending session-sequence order, bounded by
+    ``_TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT``.
+    """
+
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if active_profile is not None and not active_invocation_execution_profile_is_released(
+        active_profile, session_id=session.id, run_epoch=session.run_epoch
+    ):
+        return "invocation terminal hooks or trailing cleanup still own the run fence"
+
+    expected_event_type = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(session.status)
+    if expected_event_type is None:
+        return None
+    if len(evidence_events) > _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT:
+        raise ValueError("Terminal publication deletion evidence exceeds its bounded query.")
+
+    if checkpoint is not None and "pending_session_interrupt" in checkpoint:
+        return "pending interruption terminal publication is incomplete"
+
+    run_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
+    classification = classify_current_terminal_evidence(
+        evidence_events=evidence_events,
+        expected_event_type=expected_event_type,
+        run_operation_id=(None if run_operation is None else run_operation.operation_id),
+        interruption_request_id=None,
+    )
+    terminal_events = classification.events
+    if classification.run_operation_conflict:
+        return "terminal publication evidence contradicts the pending run operation"
+
+    if any(event.type != expected_event_type for event in terminal_events):
+        return "terminal publication evidence contradicts the durable session status"
+    if len(terminal_events) > 1:
+        return "terminal publication contains duplicate current-run evidence"
+
+    pending_action = checkpoint is not None and any(
+        key in checkpoint for key in _TERMINAL_PENDING_ACTION_CHECKPOINT_KEYS
+    )
+    terminal_event_required = (
+        run_operation is not None
+        or pending_action
+        or classification.latest_lifecycle_event_type != EventType.SESSION_FORKED
+    )
+    if terminal_event_required and not terminal_events:
+        return "terminal publication evidence is incomplete"
+    return None

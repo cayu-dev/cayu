@@ -265,3 +265,120 @@ rejected(lambda: rules._child_session_notification_consumption(raw, parent=paren
     occurrence=occurrence.model_copy(update={"source_id": "different"})), RuntimeError)
 """
     )
+
+
+def test_closure_inventory_is_bounded_and_detached_without_stores():
+    _without_implementations(
+        """
+from cayu.sessions._closure_records import (
+    SESSION_CLOSURE_NATIVE_CLASSES, ClosureRecordsBuilder, ClosureRecordsTooLarge,
+    validate_closure_records,
+)
+
+source = {"items": [1]}
+builder = ClosureRecordsBuilder(max_records=1, max_bytes=10000)
+for name in SESSION_CLOSURE_NATIVE_CLASSES:
+    builder.add_class(name, [source] if name == "session" else [])
+source["items"].append(2)
+inventory = builder.finish()
+assert inventory["records"]["session"] == [{"items": [1]}]
+validated = validate_closure_records(inventory, max_records=1, max_bytes=10000)
+assert validated == inventory and validated is not inventory
+inventory["records"]["session"][0]["items"].append(3)
+assert validated["records"]["session"] == [{"items": [1]}]
+rejected(lambda: validate_closure_records(inventory, max_records=1, max_bytes=10000))
+limited = ClosureRecordsBuilder(max_records=1, max_bytes=10000)
+rejected(lambda: limited.add_class("session", [1, 2]), ClosureRecordsTooLarge)
+rejected(limited.finish)
+"""
+    )
+
+
+def test_closure_owner_and_progress_require_exact_replay_without_stores():
+    _without_implementations(
+        """
+from cayu.sessions import _closure_records as rules
+
+progress = dict(schema_version=1, root_session_id="root", plan_id="plan", policy_digest="digest",
+    max_records=100, max_bytes=10000, phase="erase", descendants=[{"session_id": "child"}],
+    completed=[])
+receipt = dict(plan_id=rules.session_closure_target_plan_id("plan", "child"),
+    root_session_id="root", target_session_id="child", operation="recursive")
+rules._check_closure_lineage_owner(progress, ["child"], receipt)
+rules._check_closure_lineage_owner(progress, ["unrelated"])
+rejected(lambda: rules._check_closure_lineage_owner(progress, ["child"], None))
+rejected(lambda: rules._check_closure_lineage_owner(progress, ["child"],
+    {**receipt, "root_session_id": "other"}))
+completed = {**progress, "completed": ["child"]}
+rules._validate_closure_progress_update(progress, completed)
+rejected(lambda: rules._validate_closure_progress_update(completed, progress))
+rejected(lambda: rules._validate_closure_progress_update(progress, {**completed, "plan_id": "other"}))
+tombstones = ({"child_session_id": "child", "root_session_id": "root", "plan_id": "plan",
+    "original_parent_session_id": "root"},)
+rules._validate_session_closure_detach_replay(tombstones, root_id="root", plan_id="plan",
+    parent_session_id="root", child_session_ids=("child",))
+rejected(lambda: rules._validate_session_closure_detach_replay(tombstones, root_id="root",
+    plan_id="other", parent_session_id="root", child_session_ids=("child",)))
+"""
+    )
+
+
+def test_closure_protected_effect_validation_works_without_stores():
+    _without_implementations(
+        """
+from cayu.sessions._closure_records import require_terminal_protected_effect
+from cayu.runtime._tool_effect_state import ToolEffectRecord, ToolEffectTerminal, effect_storage_key
+from cayu.sessions._tool_effect_intent import ToolEffectIntent
+
+intent = ToolEffectIntent(session_id="session", session_instance_id="instance", source_run_epoch=1,
+    interaction_id="interaction", model_step_id="step", model_attempt_id="attempt",
+    tool_round_id="round", tool_call_id="call", agent_name="agent", tool_name="deploy",
+    idempotency_key="key", execution_profile_fingerprint="profile", schema_digest="a"*64,
+    arguments_digest="b"*64)
+record = ToolEffectRecord(intent=intent, revision=2, state="completed", dispatch_id="dispatch",
+    terminal=ToolEffectTerminal(event_id="event", result_digest="c"*64), publication_digest="d"*64)
+key = effect_storage_key(intent)
+raw = record.model_dump(mode="json")
+require_terminal_protected_effect("session", "instance", key, raw)
+rejected(lambda: require_terminal_protected_effect("session", "other", key, raw))
+rejected(lambda: require_terminal_protected_effect("session", "instance", "other", raw))
+rejected(lambda: require_terminal_protected_effect("session", "instance", key,
+    {**raw, "terminal": None, "state": "outcome_unknown"}))
+"""
+    )
+
+
+def test_terminal_deletion_requires_matching_evidence_without_stores():
+    _without_implementations(
+        """
+from tests._session_provenance import session_fixture
+from cayu.events import Event, EventType
+from cayu.sessions.lineage import DELETE_BLOCKED_SESSION_STATUSES, _is_durable_subagent_child
+from cayu.sessions.records import SessionStatus
+from cayu.sessions.terminal_evidence import _terminal_publication_delete_block_reason
+
+session = session_fixture(id="session", agent_name="agent", provider_name="fake", model="fake",
+    status=SessionStatus.COMPLETED)
+assert DELETE_BLOCKED_SESSION_STATUSES == {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+assert not _is_durable_subagent_child(session)
+assert _is_durable_subagent_child(session.model_copy(update={"metadata": {"subagent": {"mode": "durable"}}}))
+def reason(events, checkpoint=None):
+    return _terminal_publication_delete_block_reason(session=session, checkpoint=checkpoint,
+        evidence_events=events)
+event = Event(type=EventType.SESSION_COMPLETED, session_id=session.id)
+assert reason([event]) is None
+assert reason([]) is not None
+assert reason([event, event]) is not None
+assert reason([Event(type=EventType.SESSION_FAILED, session_id=session.id)]) is not None
+assert reason([event], {"pending_session_interrupt": {}}) is not None
+"""
+    )
+
+
+def test_effect_owner_store_annotation_resolves_without_custom_namespace():
+    from typing import get_type_hints
+
+    from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+    from cayu.sessions.base import SessionStore
+
+    assert get_type_hints(ToolEffectStateOwner.__init__)["store"] is SessionStore

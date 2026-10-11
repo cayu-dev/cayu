@@ -41,10 +41,11 @@ from cayu.memory.evidence import (
     MIN_MEMORY_EVIDENCE_PAGE_BYTES,
     RecallEvidenceQuery,
 )
-from cayu.runtime._session_closure_records import (
+from cayu.sessions._closure_records import (
     SESSION_CLOSURE_NATIVE_CLASSES,
     ClosureRecordsBuilder,
     ClosureRecordsTooLarge,
+    session_closure_target_plan_id,
     validate_closure_records,
 )
 from cayu.sessions.lineage import SessionLineageQuery
@@ -2246,17 +2247,6 @@ def session_closure_plan_id(
         "store_ids": list(store_ids),
     }
     return sha256(canonical_durable_json_bytes(material, "session_closure.plan")).hexdigest()
-
-
-def session_closure_target_plan_id(root_plan_id: str, target_session_id: str) -> str:
-    """Derive a stable per-descendant receipt identity from the root plan."""
-
-    return sha256(
-        canonical_durable_json_bytes(
-            {"root_plan_id": root_plan_id, "target_session_id": target_session_id},
-            "session_closure.target_plan",
-        )
-    ).hexdigest()
 
 
 def bounded_session_closure_metadata(value: dict[str, Any]) -> dict[str, Any]:
