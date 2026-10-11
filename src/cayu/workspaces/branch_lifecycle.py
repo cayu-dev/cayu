@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.sessions._operation_records import SessionOperationPublication
-from cayu.sessions.base import _OwnedOffThreadSessionCommitGuard
+from cayu.sessions._runtime_publication import _OwnedOffThreadSessionCommitGuard
 from cayu.workspaces.branches import WorkspaceBranchStoreDurability
 
 if TYPE_CHECKING:

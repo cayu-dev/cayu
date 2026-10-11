@@ -576,3 +576,13 @@ def _session_after_cursor(
             return value < cursor_value
         return value > cursor_value
     return session.id > cursor_id
+
+
+def _validate_inactive_for_seconds(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError("inactive_for_seconds must be an integer.")
+    if value < 0 or value > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError(f"inactive_for_seconds must be between 0 and {MAX_DURABLE_JSON_INTEGER}.")
+    return value

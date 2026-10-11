@@ -4351,7 +4351,7 @@ class SessionEngine:
                 return
         if loaded_session.status not in _session_checkpoint_admission._RESUMABLE_SESSION_STATUSES:
             if loaded_session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
-                from cayu.sessions.base import SessionExecutionInProgress
+                from cayu.sessions.recovery import SessionExecutionInProgress
 
                 raise SessionExecutionInProgress(loaded_session.id, loaded_session.status)
             raise SessionStatusConflict(

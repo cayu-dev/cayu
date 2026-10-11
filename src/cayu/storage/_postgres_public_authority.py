@@ -13,8 +13,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from cayu.events import Event, EventType
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.sessions.base import (
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
     _authenticated_public_authority_alias_private_value,
     _public_authority_alias_store_key,
 )

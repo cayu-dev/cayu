@@ -443,12 +443,18 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "SessionModelCompletionStageIncomplete",
     ),
     "SessionModelTransition": ("cayu.sessions._execution_profile_rules", "SessionModelTransition"),
-    "SessionOperationInitializer": ("cayu.sessions.base", "SessionOperationInitializer"),
+    "SessionOperationInitializer": (
+        "cayu.sessions._runtime_publication",
+        "SessionOperationInitializer",
+    ),
     "SessionOperationPublication": (
         "cayu.sessions._operation_records",
         "SessionOperationPublication",
     ),
-    "SessionOperationTransform": ("cayu.sessions.base", "SessionOperationTransform"),
+    "SessionOperationTransform": (
+        "cayu.sessions._runtime_publication",
+        "SessionOperationTransform",
+    ),
     "SessionOperationalSnapshot": ("cayu.sessions.summaries", "SessionOperationalSnapshot"),
     "SessionOrder": ("cayu.sessions.queries", "SessionOrder"),
     "SessionOutcome": ("cayu.sessions.summaries", "SessionOutcome"),
@@ -464,7 +470,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionExecutionState": ("cayu.sessions.execution", "SessionExecutionState"),
     "SessionStateSnapshot": ("cayu.sessions.records", "SessionStateSnapshot"),
     "SessionStatus": ("cayu.sessions.records", "SessionStatus"),
-    "SessionExecutionInProgress": ("cayu.sessions.base", "SessionExecutionInProgress"),
+    "SessionExecutionInProgress": ("cayu.sessions.recovery", "SessionExecutionInProgress"),
     "SessionStatusConflict": ("cayu.sessions.records", "SessionStatusConflict"),
     "SessionStatusCounts": ("cayu.sessions.queries", "SessionStatusCounts"),
     "SessionStore": ("cayu.sessions.base", "SessionStore"),
@@ -479,7 +485,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "StaleRecoveryPlanError": ("cayu.sessions.recovery", "StaleRecoveryPlanError"),
     "StoreTimeCheckpointTransform": ("cayu.sessions.records", "StoreTimeCheckpointTransform"),
     "StoreTimeSessionOperationTransform": (
-        "cayu.sessions.base",
+        "cayu.sessions._runtime_publication",
         "StoreTimeSessionOperationTransform",
     ),
     "StructuredOutputResult": ("cayu.sessions.outcomes", "StructuredOutputResult"),

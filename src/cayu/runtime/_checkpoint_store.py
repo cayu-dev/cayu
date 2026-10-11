@@ -36,10 +36,12 @@ from cayu.sessions._checkpoint_preservation import (
 from cayu.sessions._checkpoint_publication import _runtime_publication_checkpoint_codec_scope
 from cayu.sessions._interaction_transitions import SessionInvocationAdmission
 from cayu.sessions._model_stage import ModelCompletionStageRecoveryFence
-from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions._runtime_publication import (
+    RuntimePublicationRequest,
+    SessionOperationInitializer,
+)
 from cayu.sessions.authority import CheckpointRootFieldGuard
 from cayu.sessions.base import (
-    SessionOperationInitializer,
     SessionStore,
     _session_continuation_methods_owned,
     _session_export_methods_owned,

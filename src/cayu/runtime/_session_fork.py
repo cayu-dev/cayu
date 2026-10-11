@@ -120,19 +120,14 @@ from cayu.sessions._execution_profile_rules import (
     _session_metadata_with_model_projection,
     session_model_projection_cursor,
 )
-from cayu.sessions.base import (
-    FORK_TRANSCRIPT_VALIDATION_ERROR,
-    ModelFailoverPolicy,
-    ModelTarget,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import ModelFailoverPolicy, ModelTarget, SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
     FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_EXECUTION_PROFILE_ORDINARY_SCHEMA_VERSION,
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
+    FORK_TRANSCRIPT_VALIDATION_ERROR,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileDecisionRecord,
     ForkExecutionProfileSelection,

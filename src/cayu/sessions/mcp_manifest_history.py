@@ -414,3 +414,89 @@ def _validate_mcp_manifest_publication_state(
                 raise ValueError(
                     "A changed MCP manifest event must differ from the current baseline."
                 )
+
+
+def _copy_mcp_manifest_publication(
+    session_id: str,
+    *,
+    expected_generations: dict[str, int | None],
+    baseline_updates: dict[str, McpManifestBaseline],
+    events: list[Event],
+) -> tuple[
+    str,
+    dict[str, int | None],
+    dict[str, McpManifestBaseline],
+    list[Event],
+]:
+    if type(expected_generations) is not dict or not expected_generations:
+        raise ValueError("expected_generations must be a non-empty dict.")
+    expected: dict[str, int | None] = {}
+    for key, generation in expected_generations.items():
+        key = _require_sha256_identifier(key, "expected_generations key")
+        if generation is not None and (type(generation) is not int or generation < 1):
+            raise ValueError("Expected MCP manifest generations must be positive integers or None.")
+        expected[key] = generation
+
+    if type(baseline_updates) is not dict:
+        raise TypeError("baseline_updates must be a dict.")
+    updates: dict[str, McpManifestBaseline] = {}
+    for key, baseline in baseline_updates.items():
+        key = _require_sha256_identifier(key, "baseline_updates key")
+        if key not in expected:
+            raise ValueError("MCP baseline update has no matching generation expectation.")
+        if type(baseline) is not McpManifestBaseline:
+            raise TypeError("baseline_updates must contain McpManifestBaseline values.")
+        copied = McpManifestBaseline.model_validate(baseline.model_dump(mode="python"))
+        if copied.history_key != key:
+            raise ValueError("MCP baseline history_key does not match its update key.")
+        expected_generation = expected[key]
+        next_generation = 1 if expected_generation is None else expected_generation + 1
+        if copied.generation != next_generation:
+            raise ValueError("MCP baseline update generation does not follow its expectation.")
+        updates[key] = copied
+
+    from cayu.sessions import event_delivery as session_event_rules
+
+    session_id, copied_events = session_event_rules._copy_session_event_batch(session_id, events)
+    if not copied_events:
+        raise ValueError("MCP manifest publication requires at least one event.")
+    for event in copied_events:
+        if event.type not in {
+            EventType.MCP_MANIFEST_CHECKED,
+            EventType.MCP_MANIFEST_BLOCKED,
+        }:
+            raise ValueError("MCP manifest publication contains an unrelated event.")
+        history_key = event.payload.get("history_key")
+        if not isinstance(history_key, str) or history_key not in expected:
+            raise ValueError("MCP manifest event has no matching history expectation.")
+        if (
+            event.type == EventType.MCP_MANIFEST_CHECKED
+            and event.payload.get("status") in {"first_seen", "changed"}
+            and event.payload.get("outcome") == "accepted"
+        ):
+            baseline = updates.get(history_key)
+            if baseline is None or baseline.accepted_event_id != event.id:
+                raise ValueError(
+                    "Every accepted MCP manifest transition must have exactly one "
+                    "matching baseline update."
+                )
+    events_by_id = {event.id: event for event in copied_events}
+    for history_key, baseline in updates.items():
+        accepted_event = events_by_id.get(baseline.accepted_event_id)
+        if (
+            accepted_event is None
+            or accepted_event.type != EventType.MCP_MANIFEST_CHECKED
+            or _mcp_manifest_session_ref(accepted_event.session_id) != baseline.accepted_session_ref
+            or accepted_event.timestamp != baseline.accepted_at
+            or accepted_event.payload.get("history_key") != history_key
+            or accepted_event.payload.get("manifest_identity") != baseline.manifest_identity
+            or accepted_event.payload.get("manifest_hash") != baseline.manifest_hash
+            or accepted_event.payload.get("source_manifest_hash") != baseline.source_manifest_hash
+            or accepted_event.payload.get("server_hash") != baseline.server_hash
+            or accepted_event.payload.get("status") not in {"first_seen", "changed"}
+            or accepted_event.payload.get("outcome") != "accepted"
+        ):
+            raise ValueError(
+                "MCP baseline update must match exactly one accepted manifest-check event."
+            )
+    return session_id, expected, updates, copied_events

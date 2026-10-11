@@ -24,11 +24,11 @@ from cayu._exception_groups import (
 )
 from cayu.events import Event, EventType
 from cayu.sessions._operation_records import _reject_reserved_runtime_publication_key
-from cayu.sessions.base import (
+from cayu.sessions._runtime_publication import (
     SessionOperationTransform,
-    SessionStore,
     _OwnedOffThreadSessionCommitGuard,
 )
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
 
 _MAX_SAFE_ID_BYTES = 64

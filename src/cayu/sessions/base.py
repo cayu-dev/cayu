@@ -30,6 +30,10 @@ from cayu.collaboration.peer_content import (
     PeerContentReceipt,
     PeerContentUnavailable,
 )
+from cayu.runtime.public_authority import (
+    _authenticated_public_authority_alias_private_value,
+    _public_authority_alias_store_key,
+)
 from cayu.sessions import _checkpoint_mutations as checkpoint_mutation_rules
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _checkpoint_publication as checkpoint_publication
@@ -67,6 +71,7 @@ from cayu.sessions import terminal_evidence as terminal_session_evidence
 from cayu.sessions import transcript_input as session_transcript_input
 from cayu.sessions import transcript_queries as session_transcript_queries
 from cayu.sessions import usage as session_usage_rules
+from cayu.sessions._access_rules import _RECIPIENT_PROVENANCE_CAPABILITY
 from cayu.sessions._checkpoint_mutations import (
     RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS as RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS,
 )
@@ -284,6 +289,19 @@ from cayu.sessions._runtime_publication import (
 )
 from cayu.sessions._runtime_publication import RuntimePublicationResult as RuntimePublicationResult
 from cayu.sessions._runtime_publication import (
+    SessionOperationInitializer as SessionOperationInitializer,
+)
+from cayu.sessions._runtime_publication import (
+    SessionOperationTransform as SessionOperationTransform,
+)
+from cayu.sessions._runtime_publication import (
+    StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
+)
+from cayu.sessions._runtime_publication import (
+    _prepare_initial_session_operation_records,
+    _run_session_commit_guard_owned,
+)
+from cayu.sessions._runtime_publication import (
     runtime_publication_event_reference as runtime_publication_event_reference,
 )
 from cayu.sessions._runtime_publication_rules import (
@@ -398,6 +416,7 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectHealth,
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
+    _copy_workflow_step_reservation,
 )
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectStatus as PersistedEventSideEffectStatus,
@@ -416,6 +435,7 @@ from cayu.sessions.event_queries import EventQuery as EventQuery
 from cayu.sessions.event_queries import EventQueryResultTooLarge as EventQueryResultTooLarge
 from cayu.sessions.event_queries import copy_event_query as copy_event_query
 from cayu.sessions.execution import SessionExecutionState
+from cayu.sessions.exports import _require_session_export_target
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION as FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
 )
@@ -431,6 +451,7 @@ from cayu.sessions.forks import (
 from cayu.sessions.forks import (
     FORK_SOURCE_SNAPSHOT_METADATA_KEY as FORK_SOURCE_SNAPSHOT_METADATA_KEY,
 )
+from cayu.sessions.forks import FORK_TRANSCRIPT_VALIDATION_ERROR as FORK_TRANSCRIPT_VALIDATION_ERROR
 from cayu.sessions.forks import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY as PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
 )
@@ -440,6 +461,7 @@ from cayu.sessions.forks import (
 from cayu.sessions.forks import (
     PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION as PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION,
 )
+from cayu.sessions.forks import ForkCheckpointAuthorityDecoder as ForkCheckpointAuthorityDecoder
 from cayu.sessions.forks import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
@@ -475,6 +497,7 @@ from cayu.sessions.forks import (
 from cayu.sessions.forks import (
     session_prompt_anatomy_transition as session_prompt_anatomy_transition,
 )
+from cayu.sessions.forks import transform_fork_checkpoint as transform_fork_checkpoint
 from cayu.sessions.forks import validate_profiled_fork_evidence as validate_profiled_fork_evidence
 from cayu.sessions.inspection import (
     SESSION_INSPECTION_LABEL_LIMIT as SESSION_INSPECTION_LABEL_LIMIT,
@@ -523,8 +546,7 @@ from cayu.sessions.mcp_manifest_history import (
     McpManifestPublicationResult as McpManifestPublicationResult,
 )
 from cayu.sessions.mcp_manifest_history import (
-    _mcp_manifest_session_ref,
-    _require_sha256_identifier,
+    _copy_mcp_manifest_publication,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
 )
@@ -599,6 +621,7 @@ from cayu.sessions.queries import SessionListResult as SessionListResult
 from cayu.sessions.queries import SessionOrder as SessionOrder
 from cayu.sessions.queries import SessionQuery as SessionQuery
 from cayu.sessions.queries import SessionStatusCounts as SessionStatusCounts
+from cayu.sessions.queries import _validate_inactive_for_seconds
 from cayu.sessions.queries import (
     copy_label_selector_requirements as copy_label_selector_requirements,
 )
@@ -649,6 +672,10 @@ from cayu.sessions.records import (
 )
 from cayu.sessions.records import session_user_metadata as session_user_metadata
 from cayu.sessions.recovery import (
+    _INTERRUPTION_CASCADE_MISSING,
+    _project_interruption_cascade_marker,
+)
+from cayu.sessions.recovery import (
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES as MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
 )
 from cayu.sessions.recovery import (
@@ -664,6 +691,7 @@ from cayu.sessions.recovery import IncompleteSessionsRecoveryPage as IncompleteS
 from cayu.sessions.recovery import (
     IncompleteSessionsRecoveryRequest as IncompleteSessionsRecoveryRequest,
 )
+from cayu.sessions.recovery import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.recovery import (
     copy_incomplete_session_recovery_request as copy_incomplete_session_recovery_request,
 )
@@ -1028,9 +1056,6 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu._validation import (
-    require_durable_nonblank as require_nonblank,
-)
 from cayu.approvals.tools import (
     ResolutionActor,
 )
@@ -1196,339 +1221,10 @@ from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 # Unexported capability used only by CayuApp's recipient boundary. Direct
 # store callers cannot manufacture recipient provenance by shaping a request.
-_RECIPIENT_PROVENANCE_CAPABILITY = object()
-
-
-class _SessionCommitGuardCancelled(RuntimeError):
-    """An owned commit guard stopped without caller-owned cancellation."""
-
-
-@dataclass(frozen=True, slots=True)
-class _OwnedOffThreadSessionCommitGuard:
-    callback: Callable[[], None]
-
-    def __call__(self) -> None:
-        try:
-            self.callback()
-        except asyncio.CancelledError as error:
-            raise _SessionCommitGuardCancelled(
-                "Session commit guard was unexpectedly cancelled."
-            ) from error
-
-
-async def _run_session_commit_guard_owned(
-    commit_guard: Callable[[], None],
-) -> BaseException | None:
-    """Run an explicitly off-thread commit guard without abandoning its mutation."""
-
-    if type(commit_guard) is not _OwnedOffThreadSessionCommitGuard:
-        commit_guard()
-        return None
-
-    worker = asyncio.create_task(asyncio.to_thread(commit_guard))
-    caller_signal: BaseException | None = None
-    while not worker.done():
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError as cancellation:
-            if caller_signal is None:
-                caller_signal = cancellation
-            elif isinstance(caller_signal, asyncio.CancelledError):
-                caller_signal.add_note(
-                    "Additional cancellation arrived while the session commit guard settled."
-                )
-            else:
-                caller_signal = BaseExceptionGroup(
-                    "Session commit guard received multiple control signals.",
-                    [caller_signal, cancellation],
-                )
-        except BaseException as signal:
-            if worker.done():
-                break
-            caller_signal = (
-                signal
-                if caller_signal is None
-                else BaseExceptionGroup(
-                    "Session commit guard received multiple control signals.",
-                    [caller_signal, signal],
-                )
-            )
-    try:
-        worker.result()
-    except BaseException as guard_error:
-        if not isinstance(guard_error, (Exception, asyncio.CancelledError)):
-            if caller_signal is not None:
-                raise guard_error from caller_signal
-            raise
-        if caller_signal is not None:
-            raise caller_signal from guard_error
-        raise
-    return caller_signal
-
-
-class SessionExecutionInProgress(SessionStatusConflict):
-    """Continuation cannot establish that the current execution was abandoned."""
-
-    def __init__(self, session_id: str, status: SessionStatus) -> None:
-        self.session_id = session_id
-        self.status = status
-        super().__init__(
-            f"Session {session_id!r} is {status.value}: execution is still in progress "
-            "or its process stopped before releasing ownership. Retry after its execution "
-            "lease expires; continuation recovers an abandoned owner automatically. "
-            "For sessions without execution ownership, confirm that the previous executor "
-            "has stopped before calling app.recover_incomplete_session("
-            "IncompleteSessionRecoveryRequest(session_id=...))."
-        )
-
-
-_INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS = 128
-_INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS = 128
-_INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS = 64
-_INTERRUPTION_CASCADE_GENERATION_MAX_CHARS = 32
-_INTERRUPTION_CASCADE_MISSING = object()
-
-
-def _project_interruption_cascade_marker_fields(
-    marker_type: str | None,
-    field_types: Mapping[str, str | None],
-    field_values: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Build the bounded marker view used by control-plane status polling."""
-
-    if marker_type is None or marker_type == "null":
-        return None
-    if marker_type != "object":
-        return {}
-
-    projected: dict[str, Any] = {}
-
-    def required_string(field: str, max_chars: int) -> None:
-        value = field_values.get(field)
-        if (
-            field_types.get(field) == "string"
-            and type(value) is str
-            and value.strip()
-            and len(value) <= max_chars
-        ):
-            projected[field] = value
-        else:
-            projected[field] = None
-
-    def optional_string(field: str, max_chars: int) -> None:
-        field_type = field_types.get(field)
-        if field_type is None or field_type == "null":
-            return
-        value = field_values.get(field)
-        if type(value) is str and field_type == "string" and len(value) <= max_chars:
-            projected[field] = value
-        else:
-            projected[field] = 0
-
-    required_string("attempt_id", _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS)
-    projected["interrupt_payload"] = (
-        {} if field_types.get("interrupt_payload") == "object" else None
-    )
-
-    generation_type = field_types.get("generation")
-    if generation_type is not None:
-        generation = field_values.get("generation")
-        try:
-            if (
-                generation_type not in {"integer", "number"}
-                or type(generation) is not str
-                or len(generation) > _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS
-                or not generation.lstrip("-").isdigit()
-            ):
-                raise ValueError
-            projected["generation"] = int(generation)
-        except ValueError:
-            projected["generation"] = None
-
-    failure_type = field_types.get("failure_recorded")
-    if failure_type is not None:
-        failure = field_values.get("failure_recorded")
-        if failure_type == "boolean" and type(failure) is bool:
-            projected["failure_recorded"] = failure
-        else:
-            projected["failure_recorded"] = None
-
-    optional_string("claim_id", _INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS)
-    optional_string("claim_expires_at", _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS)
-    optional_string("created_at", _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS)
-    return projected
-
-
-def _project_interruption_cascade_marker(marker: Any) -> dict[str, Any] | None:
-    if marker is _INTERRUPTION_CASCADE_MISSING or marker is None:
-        return None
-    if type(marker) is not dict:
-        return {}
-
-    field_types: dict[str, str | None] = {}
-    field_values: dict[str, Any] = {}
-    for field in (
-        "attempt_id",
-        "interrupt_payload",
-        "generation",
-        "failure_recorded",
-        "claim_id",
-        "claim_expires_at",
-        "created_at",
-    ):
-        if field not in marker:
-            field_types[field] = None
-            continue
-        value = marker[field]
-        if value is None:
-            field_types[field] = "null"
-        elif type(value) is str:
-            field_types[field] = "string"
-            max_chars = {
-                "attempt_id": _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS,
-                "claim_id": _INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS,
-                "claim_expires_at": _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS,
-                "created_at": _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS,
-            }.get(field, _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS)
-            field_values[field] = value[: max_chars + 1]
-        elif type(value) is bool:
-            field_types[field] = "boolean"
-            field_values[field] = value
-        elif type(value) is int:
-            field_types[field] = "integer"
-            field_values[field] = str(value)[: _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS + 1]
-        elif type(value) is float:
-            field_types[field] = "number"
-            field_values[field] = str(value)[: _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS + 1]
-        elif type(value) is dict:
-            field_types[field] = "object"
-        elif type(value) is list:
-            field_types[field] = "array"
-        else:
-            field_types[field] = "other"
-    return _project_interruption_cascade_marker_fields("object", field_types, field_values)
-
-
-def _validate_inactive_for_seconds(value: int | None) -> int | None:
-    if value is None:
-        return None
-    if type(value) is not int:
-        raise TypeError("inactive_for_seconds must be an integer.")
-    if value < 0 or value > MAX_DURABLE_JSON_INTEGER:
-        raise ValueError(f"inactive_for_seconds must be between 0 and {MAX_DURABLE_JSON_INTEGER}.")
-    return value
-
-
-SessionOperationInitializer = Callable[
-    [Session],
-    Mapping[str, dict[str, Any]],
-]
-
-
-ForkCheckpointAuthorityDecoder = Callable[
-    [dict[str, Any] | None],
-    dict[str, Any] | None,
-]
-FORK_TRANSCRIPT_VALIDATION_ERROR = (
-    "Fork transcript failed atomic copy validation because it changed after "
-    "preflight or contains a workload secret and cannot be copied without "
-    "changing durable conversation history."
-)
-
-
-def transform_fork_checkpoint(
-    source_session: Session,
-    source_checkpoint: dict[str, Any] | None,
-    transform: CheckpointTransform,
-) -> dict[str, Any] | None:
-    """Apply a fork transform without retaining its raw input on failure."""
-
-    try:
-        transformed = transform(source_session, source_checkpoint)
-        if transformed is None:
-            return None
-        # Forked checkpoints never inherit the source session's private
-        # completion-result publication ownership. Apply the same rule when a
-        # raw store caller returns the source checkpoint unchanged or attempts
-        # to manufacture the reserved root.
-        return checkpoint_preservation._replace_checkpoint_preserving_completion_result_event_publications(
-            None,
-            transformed,
-            preserve_session_exports=False,
-            preserve_session_continuations=False,
-            session_id=source_session.id,
-        )
-    except BaseException:
-        if source_checkpoint is not None:
-            source_checkpoint.clear()
-        raise
 
 
 # Must hold everything an admitted RunRequest carries into recovery: up to
 # 256 KiB of request metadata plus budget limits and run settings.
-
-
-SessionOperationTransform = Callable[
-    [Session, dict[str, Any] | None, dict[str, Any] | None],
-    SessionOperationPublication,
-]
-StoreTimeSessionOperationTransform = Callable[
-    [Session, dict[str, Any] | None, dict[str, Any] | None, datetime],
-    SessionOperationPublication,
-]
-
-
-def _public_authority_alias_store_key(
-    public_alias: str,
-    *,
-    field_name: str,
-    private_value: str | None,
-    scope_session_id: str | None,
-) -> tuple[str, str, str]:
-    parsed = parse_public_authority_alias(public_alias)
-    if parsed is None or parsed.field_name != field_name:
-        raise ValueError("Public authority alias is malformed or field-mismatched.")
-    if field_name in {"session_id", "causal_budget_id"}:
-        if scope_session_id is not None:
-            raise ValueError(f"{field_name} aliases must not have a session scope.")
-        scope_key = ""
-    elif field_name in {"interaction_id", TARGETED_TOOL_REFERENCE_FIELD_NAME}:
-        if scope_session_id is None:
-            raise ValueError(f"{field_name} aliases require a private session scope.")
-        scope_key = require_nonblank(scope_session_id, "scope_session_id")
-    else:
-        raise ValueError(
-            "field_name must be session_id, causal_budget_id, interaction_id, or tool_ref."
-        )
-    if private_value is not None:
-        require_nonblank(private_value, "private_value")
-    return field_name, scope_key, public_alias
-
-
-def _authenticated_public_authority_alias_private_value(
-    codec: PublicAuthorityAliasCodec | None,
-    public_alias: str,
-    private_value: str | None,
-    *,
-    field_name: str,
-    scope_session_id: str | None,
-) -> str | None:
-    """Return a registry value only while its signing key remains accepted."""
-
-    if private_value is None or codec is None:
-        return None
-    try:
-        authenticated = codec.matches(
-            public_alias,
-            private_value,
-            field_name=field_name,
-            session_id=scope_session_id,
-        )
-    except (TypeError, ValueError):
-        raise ValueError(
-            "Public authority alias registry contains invalid private authority."
-        ) from None
-    return private_value if authenticated else None
 
 
 _SESSION_EXPORT_OWNER_METHODS = (
@@ -18481,153 +18177,6 @@ def _audit_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | 
         tenant=actor.tenant,
         source=actor.source,
     )
-
-
-def _require_session_export_target(session_id: str, key: str) -> None:
-    """Bind private key access to its target before returning callback input."""
-    from cayu.collaboration._session_export_store import OPERATION_PREFIX, checkpoint_visible
-    from cayu.collaboration.exports import SessionExportConflict
-
-    if key.startswith(OPERATION_PREFIX) and not checkpoint_visible(session_id=session_id):
-        raise SessionExportConflict()
-
-
-def _prepare_initial_session_operation_records(
-    session: Session,
-    initializer: SessionOperationInitializer | None,
-) -> dict[str, dict[str, Any]]:
-    """Run one initializer against a detached session and validate its records."""
-
-    if initializer is None:
-        return {}
-    raw_records = initializer(session.model_copy(deep=True))
-    if not isinstance(raw_records, Mapping):
-        raise TypeError("Session operation initializer must return a mapping.")
-    if len(raw_records) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
-        raise ValueError(
-            "Initial session operation records cannot exceed "
-            f"{RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS} entries."
-        )
-    copied = copy_durable_json_object(
-        dict(raw_records),
-        "initial_session_operation_records",
-    )
-    from cayu.collaboration._session_export_store import OPERATION_PREFIX
-
-    if any(key.startswith(OPERATION_PREFIX) for key in copied):
-        raise ValueError("Session export records require their publication owner.")
-    operation_record_rules._validate_session_operation_record_keys(copied)
-    for record in copied.values():
-        if type(record) is not dict:
-            raise ValueError("Initial session operation records must be objects.")
-    return copied
-
-
-def _copy_workflow_step_reservation(
-    session_id: str,
-    event: Event,
-    *,
-    workflow_name: str,
-    attempt_id: str,
-) -> tuple[str, Event, str, str]:
-    session_id, copied_events = session_event_rules._copy_session_event_batch(session_id, [event])
-    copied_event = copied_events[0]
-    workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
-    attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
-    if copied_event.type != EventType.WORKFLOW_STEP_STARTED:
-        raise ValueError("Workflow step reservation requires a workflow.step.started event.")
-    if copied_event.workflow_name != workflow_name:
-        raise ValueError("Workflow step reservation event has the wrong workflow_name.")
-    if copied_event.payload.get("attempt_id") != attempt_id:
-        raise ValueError("Workflow step reservation event has the wrong attempt_id.")
-    step_id = copied_event.payload.get("step_id")
-    if not isinstance(step_id, str) or not step_id:
-        raise ValueError("Workflow step reservation requires a non-empty step_id.")
-    return session_id, copied_event, workflow_name, attempt_id
-
-
-def _copy_mcp_manifest_publication(
-    session_id: str,
-    *,
-    expected_generations: dict[str, int | None],
-    baseline_updates: dict[str, McpManifestBaseline],
-    events: list[Event],
-) -> tuple[
-    str,
-    dict[str, int | None],
-    dict[str, McpManifestBaseline],
-    list[Event],
-]:
-    if type(expected_generations) is not dict or not expected_generations:
-        raise ValueError("expected_generations must be a non-empty dict.")
-    expected: dict[str, int | None] = {}
-    for key, generation in expected_generations.items():
-        key = _require_sha256_identifier(key, "expected_generations key")
-        if generation is not None and (type(generation) is not int or generation < 1):
-            raise ValueError("Expected MCP manifest generations must be positive integers or None.")
-        expected[key] = generation
-
-    if type(baseline_updates) is not dict:
-        raise TypeError("baseline_updates must be a dict.")
-    updates: dict[str, McpManifestBaseline] = {}
-    for key, baseline in baseline_updates.items():
-        key = _require_sha256_identifier(key, "baseline_updates key")
-        if key not in expected:
-            raise ValueError("MCP baseline update has no matching generation expectation.")
-        if type(baseline) is not McpManifestBaseline:
-            raise TypeError("baseline_updates must contain McpManifestBaseline values.")
-        copied = McpManifestBaseline.model_validate(baseline.model_dump(mode="python"))
-        if copied.history_key != key:
-            raise ValueError("MCP baseline history_key does not match its update key.")
-        expected_generation = expected[key]
-        next_generation = 1 if expected_generation is None else expected_generation + 1
-        if copied.generation != next_generation:
-            raise ValueError("MCP baseline update generation does not follow its expectation.")
-        updates[key] = copied
-
-    session_id, copied_events = session_event_rules._copy_session_event_batch(session_id, events)
-    if not copied_events:
-        raise ValueError("MCP manifest publication requires at least one event.")
-    for event in copied_events:
-        if event.type not in {
-            EventType.MCP_MANIFEST_CHECKED,
-            EventType.MCP_MANIFEST_BLOCKED,
-        }:
-            raise ValueError("MCP manifest publication contains an unrelated event.")
-        history_key = event.payload.get("history_key")
-        if not isinstance(history_key, str) or history_key not in expected:
-            raise ValueError("MCP manifest event has no matching history expectation.")
-        if (
-            event.type == EventType.MCP_MANIFEST_CHECKED
-            and event.payload.get("status") in {"first_seen", "changed"}
-            and event.payload.get("outcome") == "accepted"
-        ):
-            baseline = updates.get(history_key)
-            if baseline is None or baseline.accepted_event_id != event.id:
-                raise ValueError(
-                    "Every accepted MCP manifest transition must have exactly one "
-                    "matching baseline update."
-                )
-    events_by_id = {event.id: event for event in copied_events}
-    for history_key, baseline in updates.items():
-        accepted_event = events_by_id.get(baseline.accepted_event_id)
-        if (
-            accepted_event is None
-            or accepted_event.type != EventType.MCP_MANIFEST_CHECKED
-            or _mcp_manifest_session_ref(accepted_event.session_id) != baseline.accepted_session_ref
-            or accepted_event.timestamp != baseline.accepted_at
-            or accepted_event.payload.get("history_key") != history_key
-            or accepted_event.payload.get("manifest_identity") != baseline.manifest_identity
-            or accepted_event.payload.get("manifest_hash") != baseline.manifest_hash
-            or accepted_event.payload.get("source_manifest_hash") != baseline.source_manifest_hash
-            or accepted_event.payload.get("server_hash") != baseline.server_hash
-            or accepted_event.payload.get("status") not in {"first_seen", "changed"}
-            or accepted_event.payload.get("outcome") != "accepted"
-        ):
-            raise ValueError(
-                "MCP baseline update must match exactly one accepted manifest-check event."
-            )
-    return session_id, expected, updates, copied_events
 
 
 def _validate_equivalent_message_delivery(

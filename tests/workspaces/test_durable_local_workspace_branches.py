@@ -51,7 +51,7 @@ from cayu import (
 )
 from cayu._validation import canonical_durable_json_bytes
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.sessions.base import _OwnedOffThreadSessionCommitGuard
+from cayu.sessions._runtime_publication import _OwnedOffThreadSessionCommitGuard
 from cayu.workspaces.branches import workspace_branch_change_set_digest
 from cayu.workspaces.revisions import WorkspaceIdentity, observe_deterministic_workspace
 

@@ -550,6 +550,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationTarget,
 )
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
+from cayu.sessions._access_rules import _RECIPIENT_PROVENANCE_CAPABILITY
 from cayu.sessions._execution_profile_checkpoint import (
     SessionExecutionProfiles,
     execution_profile_from_session_metadata,
@@ -566,13 +567,7 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
 )
-from cayu.sessions.base import (
-    _RECIPIENT_PROVENANCE_CAPABILITY,
-    InMemorySessionStore,
-    ModelTarget,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
 from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.cleanup import (
     RecoveryCleanupOwner,

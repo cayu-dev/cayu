@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import traceback as traceback_module
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -1253,3 +1253,46 @@ def validate_profiled_fork_evidence(
         )
     ):
         raise ValueError("Fork event payload conflicts with its profile relationship.")
+
+
+ForkCheckpointAuthorityDecoder = Callable[
+    [dict[str, Any] | None],
+    dict[str, Any] | None,
+]
+
+
+FORK_TRANSCRIPT_VALIDATION_ERROR = (
+    "Fork transcript failed atomic copy validation because it changed after "
+    "preflight or contains a workload secret and cannot be copied without "
+    "changing durable conversation history."
+)
+
+
+def transform_fork_checkpoint(
+    source_session: Session,
+    source_checkpoint: dict[str, Any] | None,
+    transform: CheckpointTransform,
+) -> dict[str, Any] | None:
+    """Apply a fork transform without retaining its raw input on failure."""
+
+    try:
+        transformed = transform(source_session, source_checkpoint)
+        if transformed is None:
+            return None
+        from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+
+        # Forked checkpoints never inherit the source session's private
+        # completion-result publication ownership. Apply the same rule when a
+        # raw store caller returns the source checkpoint unchanged or attempts
+        # to manufacture the reserved root.
+        return checkpoint_preservation._replace_checkpoint_preserving_completion_result_event_publications(
+            None,
+            transformed,
+            preserve_session_exports=False,
+            preserve_session_continuations=False,
+            session_id=source_session.id,
+        )
+    except BaseException:
+        if source_checkpoint is not None:
+            source_checkpoint.clear()
+        raise

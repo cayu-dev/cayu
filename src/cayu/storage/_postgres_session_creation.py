@@ -25,15 +25,14 @@ from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions._interaction_transitions import _copy_optional_interaction_admission
 from cayu.sessions._invocation_scope import _activate_session_run_fence
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
-from cayu.sessions.base import (
-    FORK_TRANSCRIPT_VALIDATION_ERROR,
-    ForkCheckpointAuthorityDecoder,
+from cayu.sessions._runtime_publication import (
     SessionOperationInitializer,
     _prepare_initial_session_operation_records,
-    transform_fork_checkpoint,
 )
 from cayu.sessions.creation import session_invocation_for_run_request, session_metadata_for_creation
 from cayu.sessions.forks import (
+    FORK_TRANSCRIPT_VALIDATION_ERROR,
+    ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     SessionForkActiveModelStageConflict,
     SessionForkProfileRelationship,
@@ -43,6 +42,7 @@ from cayu.sessions.forks import (
     _validate_profiled_fork_authority,
     _validate_session_fork_source,
     apply_fork_system_prompt_replacement,
+    transform_fork_checkpoint,
 )
 from cayu.sessions.records import (
     CheckpointTransform,
@@ -123,7 +123,9 @@ async def create(
                 await lock_closure_lineage(cur)
                 await require_available_closure_identity(cur, session_id)
                 await require_external_creation(conn, request)
-                from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+                from cayu.sessions._access_rules import (
+                    _RECIPIENT_PROVENANCE_CAPABILITY,
+                )
 
                 if (
                     participant_provenance is _RECIPIENT_PROVENANCE_CAPABILITY
@@ -250,7 +252,9 @@ async def create(
                         ),
                     )
                     if receipt.recipient_metadata_json is not None:
-                        from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+                        from cayu.sessions._access_rules import (
+                            _RECIPIENT_PROVENANCE_CAPABILITY,
+                        )
 
                         if participant_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY:
                             raise PermissionError(

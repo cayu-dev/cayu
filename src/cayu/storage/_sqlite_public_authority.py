@@ -10,8 +10,8 @@ import hmac
 import json
 import sqlite3
 
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.sessions.base import (
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
     _authenticated_public_authority_alias_private_value,
     _public_authority_alias_store_key,
 )

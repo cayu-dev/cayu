@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.sessions.base import SessionOperationInitializer, SessionStore
+from cayu.sessions._runtime_publication import SessionOperationInitializer
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,

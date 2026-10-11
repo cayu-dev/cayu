@@ -37,6 +37,9 @@ _ACTIONS = (
 _MAX_SELECTOR_VALUES = 500
 
 
+# Recipient provenance is a capability, never caller-shaped request data.
+_RECIPIENT_PROVENANCE_CAPABILITY = object()
+
 _MAX_RULE_SELECTORS = 64
 
 

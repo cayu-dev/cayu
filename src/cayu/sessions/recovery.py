@@ -30,7 +30,7 @@ from cayu.environments.factory import EnvironmentAllocationState
 from cayu.events import Event, copy_event
 from cayu.sessions import records as session_record_rules
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.records import PendingActionKind, SessionStatus
+from cayu.sessions.records import PendingActionKind, SessionStatus, SessionStatusConflict
 from cayu.tasks.records import TaskStatus
 
 # These budgets are nested deliberately. A maximum-size session ID is
@@ -996,3 +996,154 @@ def _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
         raise SessionRunFenced(
             "Incomplete-session recovery claim expired before run ownership transfer."
         )
+
+
+class SessionExecutionInProgress(SessionStatusConflict):
+    """Continuation cannot establish that the current execution was abandoned."""
+
+    def __init__(self, session_id: str, status: SessionStatus) -> None:
+        self.session_id = session_id
+        self.status = status
+        super().__init__(
+            f"Session {session_id!r} is {status.value}: execution is still in progress "
+            "or its process stopped before releasing ownership. Retry after its execution "
+            "lease expires; continuation recovers an abandoned owner automatically. "
+            "For sessions without execution ownership, confirm that the previous executor "
+            "has stopped before calling app.recover_incomplete_session("
+            "IncompleteSessionRecoveryRequest(session_id=...))."
+        )
+
+
+_INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS = 128
+
+
+_INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS = 128
+
+
+_INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS = 64
+
+
+_INTERRUPTION_CASCADE_GENERATION_MAX_CHARS = 32
+
+
+_INTERRUPTION_CASCADE_MISSING = object()
+
+
+def _project_interruption_cascade_marker_fields(
+    marker_type: str | None,
+    field_types: Mapping[str, str | None],
+    field_values: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Build the bounded marker view used by control-plane status polling."""
+
+    if marker_type is None or marker_type == "null":
+        return None
+    if marker_type != "object":
+        return {}
+
+    projected: dict[str, Any] = {}
+
+    def required_string(field: str, max_chars: int) -> None:
+        value = field_values.get(field)
+        if (
+            field_types.get(field) == "string"
+            and type(value) is str
+            and value.strip()
+            and len(value) <= max_chars
+        ):
+            projected[field] = value
+        else:
+            projected[field] = None
+
+    def optional_string(field: str, max_chars: int) -> None:
+        field_type = field_types.get(field)
+        if field_type is None or field_type == "null":
+            return
+        value = field_values.get(field)
+        if type(value) is str and field_type == "string" and len(value) <= max_chars:
+            projected[field] = value
+        else:
+            projected[field] = 0
+
+    required_string("attempt_id", _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS)
+    projected["interrupt_payload"] = (
+        {} if field_types.get("interrupt_payload") == "object" else None
+    )
+
+    generation_type = field_types.get("generation")
+    if generation_type is not None:
+        generation = field_values.get("generation")
+        try:
+            if (
+                generation_type not in {"integer", "number"}
+                or type(generation) is not str
+                or len(generation) > _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS
+                or not generation.lstrip("-").isdigit()
+            ):
+                raise ValueError
+            projected["generation"] = int(generation)
+        except ValueError:
+            projected["generation"] = None
+
+    failure_type = field_types.get("failure_recorded")
+    if failure_type is not None:
+        failure = field_values.get("failure_recorded")
+        if failure_type == "boolean" and type(failure) is bool:
+            projected["failure_recorded"] = failure
+        else:
+            projected["failure_recorded"] = None
+
+    optional_string("claim_id", _INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS)
+    optional_string("claim_expires_at", _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS)
+    optional_string("created_at", _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS)
+    return projected
+
+
+def _project_interruption_cascade_marker(marker: Any) -> dict[str, Any] | None:
+    if marker is _INTERRUPTION_CASCADE_MISSING or marker is None:
+        return None
+    if type(marker) is not dict:
+        return {}
+
+    field_types: dict[str, str | None] = {}
+    field_values: dict[str, Any] = {}
+    for field in (
+        "attempt_id",
+        "interrupt_payload",
+        "generation",
+        "failure_recorded",
+        "claim_id",
+        "claim_expires_at",
+        "created_at",
+    ):
+        if field not in marker:
+            field_types[field] = None
+            continue
+        value = marker[field]
+        if value is None:
+            field_types[field] = "null"
+        elif type(value) is str:
+            field_types[field] = "string"
+            max_chars = {
+                "attempt_id": _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS,
+                "claim_id": _INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS,
+                "claim_expires_at": _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS,
+                "created_at": _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS,
+            }.get(field, _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS)
+            field_values[field] = value[: max_chars + 1]
+        elif type(value) is bool:
+            field_types[field] = "boolean"
+            field_values[field] = value
+        elif type(value) is int:
+            field_types[field] = "integer"
+            field_values[field] = str(value)[: _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS + 1]
+        elif type(value) is float:
+            field_types[field] = "number"
+            field_values[field] = str(value)[: _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS + 1]
+        elif type(value) is dict:
+            field_types[field] = "object"
+        elif type(value) is list:
+            field_types[field] = "array"
+        else:
+            field_types[field] = "other"
+    return _project_interruption_cascade_marker_fields("object", field_types, field_values)

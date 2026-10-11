@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 from pydantic import SecretStr
 
+from cayu._validation import require_durable_nonblank as require_nonblank
 from cayu._validation import require_unicode_scalar_text
 
 PUBLIC_AUTHORITY_ALIAS_PREFIX = "cayu_authority_"
@@ -444,3 +445,58 @@ def _mac_input(
         private_value.encode("utf-8"),
     )
     return b"".join(len(component).to_bytes(8, "big") + component for component in components)
+
+
+def _public_authority_alias_store_key(
+    public_alias: str,
+    *,
+    field_name: str,
+    private_value: str | None,
+    scope_session_id: str | None,
+) -> tuple[str, str, str]:
+    from cayu.tools.grants import TARGETED_TOOL_REFERENCE_FIELD_NAME
+
+    parsed = parse_public_authority_alias(public_alias)
+    if parsed is None or parsed.field_name != field_name:
+        raise ValueError("Public authority alias is malformed or field-mismatched.")
+    if field_name in {"session_id", "causal_budget_id"}:
+        if scope_session_id is not None:
+            raise ValueError(f"{field_name} aliases must not have a session scope.")
+        scope_key = ""
+    elif field_name in {"interaction_id", TARGETED_TOOL_REFERENCE_FIELD_NAME}:
+        if scope_session_id is None:
+            raise ValueError(f"{field_name} aliases require a private session scope.")
+        scope_key = require_nonblank(scope_session_id, "scope_session_id")
+    else:
+        raise ValueError(
+            "field_name must be session_id, causal_budget_id, interaction_id, or tool_ref."
+        )
+    if private_value is not None:
+        require_nonblank(private_value, "private_value")
+    return field_name, scope_key, public_alias
+
+
+def _authenticated_public_authority_alias_private_value(
+    codec: PublicAuthorityAliasCodec | None,
+    public_alias: str,
+    private_value: str | None,
+    *,
+    field_name: str,
+    scope_session_id: str | None,
+) -> str | None:
+    """Return a registry value only while its signing key remains accepted."""
+
+    if private_value is None or codec is None:
+        return None
+    try:
+        authenticated = codec.matches(
+            public_alias,
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Public authority alias registry contains invalid private authority."
+        ) from None
+    return private_value if authenticated else None

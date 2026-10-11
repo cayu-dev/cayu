@@ -3947,7 +3947,6 @@ from cayu.sessions.authority import (
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
-from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionStore as SessionStore
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (
@@ -4244,6 +4243,7 @@ from cayu.sessions.recovery import RecoveryReceipt as RecoveryReceipt
 from cayu.sessions.recovery import RecoveryRegistrationEvidence as RecoveryRegistrationEvidence
 from cayu.sessions.recovery import RecoveryRegistrationStatus as RecoveryRegistrationStatus
 from cayu.sessions.recovery import RecoveryTaskClaimEvidence as RecoveryTaskClaimEvidence
+from cayu.sessions.recovery import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.recovery import StaleRecoveryPlanError as StaleRecoveryPlanError
 from cayu.sessions.recovery import StartupRecoveryBlockedSession as StartupRecoveryBlockedSession
 from cayu.sessions.recovery import StartupRecoveryResult as StartupRecoveryResult

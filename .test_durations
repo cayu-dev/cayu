@@ -46287,5 +46287,7 @@
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-validate_profiled_fork_evidence]": 0.000335542019456625,
     "tests/core/test_session_creation_rules_layout.py::test_fork_profile_and_model_selection_without_execution": 0.5996532079880126,
     "tests/core/test_session_creation_rules_layout.py::test_fork_source_validation_without_implementations": 0.7179176660720259,
-    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_annotations_resolve_without_custom_namespaces": 0.051036583026871085
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_annotations_resolve_without_custom_namespaces": 0.051036583026871085,
+  "tests/core/test_session_store_composition.py::test_interruption_marker_projection_works_without_store_implementations": 0.3032375000184402,
+  "tests/core/test_session_store_composition.py::test_shared_store_publication_callbacks_work_without_store_implementations": 0.4372174989548512
 }

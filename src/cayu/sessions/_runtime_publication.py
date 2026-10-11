@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import asyncio
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, Literal, cast
@@ -33,6 +35,7 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._operation_records import (
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     RuntimePublicationOperationRecordMutation,
+    SessionOperationPublication,
 )
 from cayu.sessions.records import Session, SessionStatus
 
@@ -454,3 +457,119 @@ def _runtime_publication_event_limit(kind: str, intent: dict[str, Any]) -> int:
         if type(call_ids) is list or type(call_ids) is tuple:
             return _tool_round_lifecycle_event_limit(call_ids)
     return RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS
+
+
+class _SessionCommitGuardCancelled(RuntimeError):
+    """An owned commit guard stopped without caller-owned cancellation."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedOffThreadSessionCommitGuard:
+    callback: Callable[[], None]
+
+    def __call__(self) -> None:
+        try:
+            self.callback()
+        except asyncio.CancelledError as error:
+            raise _SessionCommitGuardCancelled(
+                "Session commit guard was unexpectedly cancelled."
+            ) from error
+
+
+async def _run_session_commit_guard_owned(
+    commit_guard: Callable[[], None],
+) -> BaseException | None:
+    """Run an explicitly off-thread commit guard without abandoning its mutation."""
+
+    if type(commit_guard) is not _OwnedOffThreadSessionCommitGuard:
+        commit_guard()
+        return None
+
+    worker = asyncio.create_task(asyncio.to_thread(commit_guard))
+    caller_signal: BaseException | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as cancellation:
+            if caller_signal is None:
+                caller_signal = cancellation
+            elif isinstance(caller_signal, asyncio.CancelledError):
+                caller_signal.add_note(
+                    "Additional cancellation arrived while the session commit guard settled."
+                )
+            else:
+                caller_signal = BaseExceptionGroup(
+                    "Session commit guard received multiple control signals.",
+                    [caller_signal, cancellation],
+                )
+        except BaseException as signal:
+            if worker.done():
+                break
+            caller_signal = (
+                signal
+                if caller_signal is None
+                else BaseExceptionGroup(
+                    "Session commit guard received multiple control signals.",
+                    [caller_signal, signal],
+                )
+            )
+    try:
+        worker.result()
+    except BaseException as guard_error:
+        if not isinstance(guard_error, (Exception, asyncio.CancelledError)):
+            if caller_signal is not None:
+                raise guard_error from caller_signal
+            raise
+        if caller_signal is not None:
+            raise caller_signal from guard_error
+        raise
+    return caller_signal
+
+
+SessionOperationInitializer = Callable[
+    [Session],
+    Mapping[str, dict[str, Any]],
+]
+
+
+SessionOperationTransform = Callable[
+    [Session, dict[str, Any] | None, dict[str, Any] | None],
+    SessionOperationPublication,
+]
+
+
+StoreTimeSessionOperationTransform = Callable[
+    [Session, dict[str, Any] | None, dict[str, Any] | None, datetime],
+    SessionOperationPublication,
+]
+
+
+def _prepare_initial_session_operation_records(
+    session: Session,
+    initializer: SessionOperationInitializer | None,
+) -> dict[str, dict[str, Any]]:
+    """Run one initializer against a detached session and validate its records."""
+
+    if initializer is None:
+        return {}
+    raw_records = initializer(session.model_copy(deep=True))
+    if not isinstance(raw_records, Mapping):
+        raise TypeError("Session operation initializer must return a mapping.")
+    if len(raw_records) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
+        raise ValueError(
+            "Initial session operation records cannot exceed "
+            f"{RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS} entries."
+        )
+    copied = copy_durable_json_object(
+        dict(raw_records),
+        "initial_session_operation_records",
+    )
+    from cayu.collaboration._session_export_store import OPERATION_PREFIX
+
+    if any(key.startswith(OPERATION_PREFIX) for key in copied):
+        raise ValueError("Session export records require their publication owner.")
+    operation_record_rules._validate_session_operation_record_keys(copied)
+    for record in copied.values():
+        if type(record) is not dict:
+            raise ValueError("Initial session operation records must be objects.")
+    return copied

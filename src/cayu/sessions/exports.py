@@ -254,3 +254,12 @@ class SessionExportBuilder:
         ):
             raise SessionExportTooLarge("Session export exceeds max_bytes.")
         return snapshot
+
+
+def _require_session_export_target(session_id: str, key: str) -> None:
+    """Bind private key access to its target before returning callback input."""
+    from cayu.collaboration._session_export_store import OPERATION_PREFIX, checkpoint_visible
+    from cayu.collaboration.exports import SessionExportConflict
+
+    if key.startswith(OPERATION_PREFIX) and not checkpoint_visible(session_id=session_id):
+        raise SessionExportConflict()

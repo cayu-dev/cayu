@@ -644,3 +644,26 @@ def _copy_optional_event_id(value: str | None, field_name: str) -> str | None:
     if len(copied) > EVENT_ID_MAX_CHARS:
         raise ValueError(f"{field_name} exceeds the event-id limit.")
     return copied
+
+
+def _copy_workflow_step_reservation(
+    session_id: str,
+    event: Event,
+    *,
+    workflow_name: str,
+    attempt_id: str,
+) -> tuple[str, Event, str, str]:
+    session_id, copied_events = _copy_session_event_batch(session_id, [event])
+    copied_event = copied_events[0]
+    workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
+    attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+    if copied_event.type != EventType.WORKFLOW_STEP_STARTED:
+        raise ValueError("Workflow step reservation requires a workflow.step.started event.")
+    if copied_event.workflow_name != workflow_name:
+        raise ValueError("Workflow step reservation event has the wrong workflow_name.")
+    if copied_event.payload.get("attempt_id") != attempt_id:
+        raise ValueError("Workflow step reservation event has the wrong attempt_id.")
+    step_id = copied_event.payload.get("step_id")
+    if not isinstance(step_id, str) or not step_id:
+        raise ValueError("Workflow step reservation requires a non-empty step_id.")
+    return session_id, copied_event, workflow_name, attempt_id

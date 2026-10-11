@@ -236,6 +236,9 @@ from cayu.sessions._provider_operation_cancellation_claim import (
 from cayu.sessions._runtime_publication import (
     RuntimePublicationReceipt,
     RuntimePublicationResult,
+    SessionOperationInitializer,
+    SessionOperationTransform,
+    StoreTimeSessionOperationTransform,
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
     _tool_round_lifecycle_event_limit,
@@ -270,18 +273,7 @@ from cayu.sessions.authority import (
     _runtime_publication_json_equal,
     checkpoint_root_field_projection_from_storage,
 )
-from cayu.sessions.base import (
-    BudgetReservationIdentityConflict,
-    ForkCheckpointAuthorityDecoder,
-    SessionOperationInitializer,
-    SessionOperationTransform,
-    SessionRunFenced,
-    SessionStore,
-    StoreTimeSessionOperationTransform,
-    _project_interruption_cascade_marker_fields,
-    _require_session_export_target,
-    _validate_inactive_for_seconds,
-)
+from cayu.sessions.base import BudgetReservationIdentityConflict, SessionRunFenced, SessionStore
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -290,8 +282,10 @@ from cayu.sessions.event_delivery import (
     _copy_session_event_batch,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.exports import _require_session_export_target
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
+    ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     ProfiledSessionForkResult,
     SessionForkProfileRelationship,
@@ -331,6 +325,7 @@ from cayu.sessions.queries import (
     SessionOrder,
     SessionQuery,
     SessionStatusCounts,
+    _validate_inactive_for_seconds,
     copy_session_aggregate_filter,
     copy_session_query,
     decode_session_cursor,
@@ -360,6 +355,7 @@ from cayu.sessions.records import (
 from cayu.sessions.recovery import (
     _active_unexpired_incomplete_recovery_claim_id,
     _incomplete_recovery_claim_from_checkpoint,
+    _project_interruption_cascade_marker_fields,
     _require_live_incomplete_recovery_claim_for_run_epoch_transfer,
 )
 from cayu.sessions.requests import (
@@ -1604,7 +1600,9 @@ class SQLiteSessionStore(
         recipient_receipt_validator=None,
     ):
         if creation_request.metadata_json is not None:
-            from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+            from cayu.sessions._access_rules import (
+                _RECIPIENT_PROVENANCE_CAPABILITY,
+            )
 
             if recipient_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY:
                 raise PermissionError(
