@@ -1,4 +1,13 @@
 {
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionManualRecoveryRequest]": 0.00018195802113041282,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStageDispatch]": 0.00018841703422367573,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStageRecoveryFence]": 0.0001775839482434094,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStageRequest]": 0.00038941693492233753,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStageSettlement]": 0.00017012597527354956,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_model_stage-ModelCompletionStage]": 0.00020658300491049886,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_operation_records-ModelCompletionStageRelease]": 0.0001611249754205346,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_public_imports_and_historical_pickles[_operation_records-SessionOperationPublication]": 0.0001680420245975256,
+  "tests/core/test_model_stage_rules_layout.py::test_model_stage_values_detach_intent_and_preserve_operation_authority_without_stores": 0.7999482919694856,
   "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_evidence_imports_without_adapters_or_driver": 0.99,
   "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_evidence_composes_and_releases_failed_snapshots[RuntimeError]": 0.187,
   "tests/core/test_native_terminal_evidence_ownership.py::test_sqlite_terminal_evidence_composes_and_releases_failed_snapshots[CancelledError]": 0.177,

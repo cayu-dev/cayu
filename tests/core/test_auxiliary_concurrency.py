@@ -23,7 +23,10 @@ from cayu import (
 )
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
 from cayu.budgets.pricing import ModelPrice, PriceBook
-from cayu.sessions.base import ModelCompletionStageRequest, SessionModelCompletionStageConflict
+from cayu.sessions._model_stage import (
+    ModelCompletionStageRequest,
+    SessionModelCompletionStageConflict,
+)
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 

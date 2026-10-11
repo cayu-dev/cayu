@@ -45,7 +45,7 @@ from cayu.vaults.redaction import SecretRedactor
 def test_public_auxiliary_preparation_binds_every_intent_field(
     sqlite_resources, backend, monkeypatch
 ):
-    from cayu.sessions.base import SessionModelCompletionStageConflict
+    from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 
     limits = InferenceLimits(max_input_tokens=10, max_output_tokens=10, timeout_seconds=30)
     checked = []
@@ -216,7 +216,7 @@ def test_public_auxiliary_preparation_binds_every_intent_field(
 )
 def test_public_auxiliary_output_failure_retains_fence_and_usage(sqlite_resources, backend, case):
     from cayu.runtime import IncompleteSessionRecoveryRequest
-    from cayu.sessions.base import SessionModelCompletionStageConflict
+    from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 
     async def scenario():
         bounds = InferenceLimits(
@@ -610,7 +610,7 @@ def test_public_inference_input_boundary(
 )
 def test_public_auxiliary_publication_failure_preserves_recovery_owner(monkeypatch, phase):
     from cayu.runtime import IncompleteSessionRecoveryRequest
-    from cayu.sessions.base import SessionModelCompletionStageConflict
+    from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 
     async def run():
         bounds = InferenceLimits(max_input_tokens=10, max_output_tokens=10, timeout_seconds=10)

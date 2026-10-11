@@ -554,18 +554,20 @@ from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles,
 )
 from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
+from cayu.sessions._model_stage import (
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryResult,
+    copy_model_completion_manual_recovery_request,
+)
 from cayu.sessions._session_continuation import ContinuationTicket
 from cayu.sessions.base import (
     _RECIPIENT_PROVENANCE_CAPABILITY,
     InMemorySessionStore,
-    ModelCompletionManualRecoveryRequest,
-    ModelCompletionManualRecoveryResult,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     SessionRunFenced,
     SessionStore,
-    copy_model_completion_manual_recovery_request,
 )
 from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.cleanup import (

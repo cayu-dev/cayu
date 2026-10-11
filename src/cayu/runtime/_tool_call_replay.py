@@ -19,13 +19,9 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._tool_call_replay_scope import STORAGE_KEY, owner_scope
-from cayu.sessions.base import (
-    Session,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import Session, SessionRunFenced, SessionStore
 from cayu.tools._policy_evidence import ToolPolicyEvidence
 from cayu.tools.base import ToolEffect
 from cayu.tools.policy import ToolPolicyDecision

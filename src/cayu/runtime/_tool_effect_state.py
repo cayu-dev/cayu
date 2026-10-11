@@ -48,7 +48,8 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
     apply_runtime_publication_checkpoint_mutation,
 )
-from cayu.sessions.base import SessionOperationPublication, SessionStore
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session
 

@@ -9,7 +9,7 @@ from cayu.runtime._model_completion_contracts import (
     model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._run_limits import BorrowedAutomaticCompactionOutcomeUnknown, RunLimitController
-from cayu.sessions.base import ModelCompletionStage
+from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions.records import Session
 
 

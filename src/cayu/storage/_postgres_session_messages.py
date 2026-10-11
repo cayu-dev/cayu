@@ -26,8 +26,8 @@ from cayu.sessions._interaction_transitions import (
     _copy_queued_interaction_started_event,
 )
 from cayu.sessions._invocation_scope import _assert_session_run_epoch
+from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
 from cayu.sessions.base import (
-    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     SessionMessageQueueStatus,
     SessionRunFenced,
     _check_closure_lineage_owner,

@@ -25,9 +25,9 @@ from cayu.sessions._checkpoint_preservation import (
 )
 from cayu.sessions._interaction_transitions import _copy_optional_interaction_admission
 from cayu.sessions._invocation_scope import _activate_session_run_fence
+from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
 from cayu.sessions.base import (
     FORK_TRANSCRIPT_VALIDATION_ERROR,
-    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     ForkCheckpointAuthorityDecoder,
     SessionOperationInitializer,
     _check_closure_lineage_owner,

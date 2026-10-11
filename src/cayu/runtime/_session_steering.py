@@ -22,7 +22,8 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._invocation_terminal_decision import invocation_terminal_decision_from_checkpoint
-from cayu.sessions.base import SessionOperationPublication, SessionRunFenced, SessionStore
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults.redaction import SecretRedactor
 

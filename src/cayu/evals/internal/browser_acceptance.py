@@ -89,8 +89,8 @@ from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAutho
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
-from cayu.sessions.base import SessionOperationPublication
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import RunnerObservedEventIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest

@@ -5,6 +5,7 @@ from cayu.runtime._producer_release import release_from_snapshot
 from cayu.runtime._session_steering import require_steering_receipt, steering_operation_key
 from cayu.runtime.session_steering import SessionSteeringConflict, SessionSteeringReceipt
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
@@ -12,7 +13,6 @@ from cayu.sessions._producer_checkpoint import (
     NativeProducerPausedStop,
     _publication_scope,
 )
-from cayu.sessions.base import SessionOperationPublication
 from cayu.sessions.records import SessionStatus
 
 

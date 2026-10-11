@@ -16,8 +16,11 @@ from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.tools.inference import validate_inference_purpose
 
 if TYPE_CHECKING:
+    from cayu.sessions._model_stage import (
+        ModelCompletionStage,
+        _ModelCompletionStagePreparationRecord,
+    )
     from cayu.sessions._runtime_publication import RuntimePublicationRequest
-    from cayu.sessions.base import ModelCompletionStage, _ModelCompletionStagePreparationRecord
 
 
 AuxiliaryInferenceOutcome = Literal[

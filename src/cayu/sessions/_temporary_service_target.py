@@ -162,6 +162,7 @@ def acknowledge_side_target(
 def publish_target_record(session, checkpoint, current, previous, proposed, now):
     """Atomic native target compare, bounded index and receipt-retention update."""
     from cayu.collaboration._preparation import prepare_contract
+    from cayu.sessions._operation_records import SessionOperationPublication
     from cayu.sessions._session_continuation import (
         CONTINUATION_NAMESPACE_KEY,
         ContinuationNamespace,
@@ -173,7 +174,6 @@ def publish_target_record(session, checkpoint, current, previous, proposed, now)
         native_service_outcome,
         require_service_deadline,
     )
-    from cayu.sessions.base import SessionOperationPublication
     from cayu.vaults.redaction import SecretRedactor
 
     proposed = prepare_contract(TemporaryServiceTarget, proposed, redactor=SecretRedactor())

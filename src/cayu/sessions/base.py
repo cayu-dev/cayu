@@ -37,6 +37,7 @@ from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
+from cayu.sessions import _model_stage as model_stage_contracts
 from cayu.sessions import _operation_records as operation_record_rules
 from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _runtime_publication_rules as publication_rules
@@ -83,7 +84,6 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._completion_finalization import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY as PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
 )
-from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_rules import SessionModelTransition as SessionModelTransition
 from cayu.sessions._execution_profile_rules import (
     execution_profile_adoption_request_fingerprint as execution_profile_adoption_request_fingerprint,
@@ -151,6 +151,81 @@ from cayu.sessions._model_failover import (
 from cayu.sessions._model_failover import (
     MODEL_TARGET_PROJECTION_SCHEMA_VERSION as MODEL_TARGET_PROJECTION_SCHEMA_VERSION,
 )
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE as MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY as MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES as MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES as MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE as MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_DISPATCH_OPERATION_KEY_PREFIX as MODEL_COMPLETION_STAGE_DISPATCH_OPERATION_KEY_PREFIX,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_DISPATCH_RECORD_TYPE as MODEL_COMPLETION_STAGE_DISPATCH_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE as MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_RECORD_TYPE as MODEL_COMPLETION_STAGE_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_SCHEMA_VERSION as MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_SETTLEMENT_RECORD_TYPE as MODEL_COMPLETION_STAGE_SETTLEMENT_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE as MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_WINNER_RECORD_TYPE as MODEL_COMPLETION_WINNER_RECORD_TYPE,
+)
+from cayu.sessions._model_stage import ActiveModelCompletionStage as ActiveModelCompletionStage
+from cayu.sessions._model_stage import (
+    ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
+)
+from cayu.sessions._model_stage import (
+    ModelCompletionManualRecoveryResult as ModelCompletionManualRecoveryResult,
+)
+from cayu.sessions._model_stage import ModelCompletionPurpose as ModelCompletionPurpose
+from cayu.sessions._model_stage import ModelCompletionStage as ModelCompletionStage
+from cayu.sessions._model_stage import (
+    ModelCompletionStageAbandonment as ModelCompletionStageAbandonment,
+)
+from cayu.sessions._model_stage import (
+    ModelCompletionStageAbandonmentResult as ModelCompletionStageAbandonmentResult,
+)
+from cayu.sessions._model_stage import ModelCompletionStageDispatch as ModelCompletionStageDispatch
+from cayu.sessions._model_stage import (
+    ModelCompletionStageRecoveryFence as ModelCompletionStageRecoveryFence,
+)
+from cayu.sessions._model_stage import ModelCompletionStageRequest as ModelCompletionStageRequest
+from cayu.sessions._model_stage import ModelCompletionStageResult as ModelCompletionStageResult
+from cayu.sessions._model_stage import (
+    ModelCompletionStageSettlement as ModelCompletionStageSettlement,
+)
+from cayu.sessions._model_stage import (
+    SessionModelCompletionDispatchAlreadyAuthorized as SessionModelCompletionDispatchAlreadyAuthorized,
+)
+from cayu.sessions._model_stage import (
+    SessionModelCompletionStageConflict as SessionModelCompletionStageConflict,
+)
+from cayu.sessions._model_stage import (
+    SessionModelCompletionStageIncomplete as SessionModelCompletionStageIncomplete,
+)
+from cayu.sessions._model_stage import (
+    copy_model_completion_manual_recovery_request as copy_model_completion_manual_recovery_request,
+)
 from cayu.sessions._operation_records import (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX as MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
 )
@@ -161,7 +236,13 @@ from cayu.sessions._operation_records import (
     ZERO_WORK_INTERRUPTION_OPERATION_KEY as ZERO_WORK_INTERRUPTION_OPERATION_KEY,
 )
 from cayu.sessions._operation_records import (
+    ModelCompletionStageRelease as ModelCompletionStageRelease,
+)
+from cayu.sessions._operation_records import (
     RuntimePublicationOperationRecordMutation as RuntimePublicationOperationRecordMutation,
+)
+from cayu.sessions._operation_records import (
+    SessionOperationPublication as SessionOperationPublication,
 )
 from cayu.sessions._operation_records import (
     runtime_publication_operation_record_value_digest as runtime_publication_operation_record_value_digest,
@@ -916,7 +997,6 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
-    StrictBool,
     StrictInt,
     field_validator,
     model_validator,
@@ -927,12 +1007,10 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
     canonical_bounded_durable_json_bytes,
-    canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_label_map,
-    require_durable_clean_nonblank,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -1229,161 +1307,6 @@ class SessionExecutionInProgress(SessionStatusConflict):
             "has stopped before calling app.recover_incomplete_session("
             "IncompleteSessionRecoveryRequest(session_id=...))."
         )
-
-
-class SessionModelCompletionStageConflict(SessionRuntimePublicationConflict):
-    """A logical model-completion stage conflicts with immutable durable evidence."""
-
-
-class SessionModelCompletionDispatchAlreadyAuthorized(SessionModelCompletionStageConflict):
-    """A provider dispatch won admission before terminal-decision election."""
-
-
-class SessionModelCompletionStageIncomplete(RuntimeError):
-    """A logical model step was prepared but has no durable terminal completion."""
-
-
-class ModelCompletionStageSettlement(BaseModel):
-    """Append-only proof that one exact prepared model effect is no longer active."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    record_type: Literal["cayu.model-completion-stage.settled"] = (
-        "cayu.model-completion-stage.settled"
-    )
-    schema_version: Literal[1] = 1
-    session_id: str
-    stage_id: str
-    logical_step_id: str
-    model_attempt_id: str
-    interaction_id: str
-    request_fingerprint: str
-    provider_effect_id: str
-    execution_profile_fingerprint: str | None = None
-    preparation_digest: str
-    settlement_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    settled_reservation_ids: tuple[str, ...]
-    disposition: ModelCompletionStageDisposition
-    reason_code: str
-    superseding_stage_id: str | None = None
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    settled_at: datetime
-    record_digest: str
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, value: str) -> str:
-        return require_clean_nonblank(value, "session_id")
-
-    @field_validator("settled_at")
-    @classmethod
-    def normalize_settled_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("settled_at must include a timezone.")
-        return value.astimezone(UTC)
-
-    @field_validator("record_digest")
-    @classmethod
-    def validate_record_digest(cls, value: str) -> str:
-        session_authority_rules._require_raw_sha256_digest(value)
-        return value
-
-    @model_validator(mode="after")
-    def validate_request_shape(self) -> ModelCompletionStageSettlement:
-        ModelCompletionStageSettlementRequest.model_validate(
-            self.model_dump(
-                mode="python",
-                include=set(ModelCompletionStageSettlementRequest.model_fields),
-            )
-        )
-        return self
-
-
-class ModelCompletionManualRecoveryRequest(BaseModel):
-    """Runtime-owned terminal disposition for one ambiguous model dispatch."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    session_id: str
-    stage_id: str = Field(max_length=256)
-    expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    terminal_status: SessionStatus
-    terminalization_only: StrictBool = False
-    expected_session_instance_id: str | None = None
-    inactive_for_seconds: StrictInt = Field(default=30, ge=0)
-
-    @model_validator(mode="after")
-    def validate_terminalization_identity(self) -> ModelCompletionManualRecoveryRequest:
-        if self.terminalization_only and not self.expected_session_instance_id:
-            raise ValueError(
-                "Terminalization-only recovery requires the exact session incarnation."
-            )
-        return self
-
-    @field_validator("session_id", "stage_id")
-    @classmethod
-    def validate_identifiers(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("terminal_status")
-    @classmethod
-    def validate_terminal_status(cls, value: SessionStatus) -> SessionStatus:
-        if value not in {SessionStatus.FAILED, SessionStatus.INTERRUPTED}:
-            raise ValueError("terminal_status must be failed or interrupted.")
-        return value
-
-
-def copy_model_completion_manual_recovery_request(
-    request: ModelCompletionManualRecoveryRequest,
-    *,
-    session_id: str | None = None,
-) -> ModelCompletionManualRecoveryRequest:
-    """Detach one public manual model-recovery request."""
-
-    if type(request) is not ModelCompletionManualRecoveryRequest:
-        raise TypeError("request must be a ModelCompletionManualRecoveryRequest.")
-    return ModelCompletionManualRecoveryRequest(
-        session_id=request.session_id if session_id is None else session_id,
-        stage_id=request.stage_id,
-        expected_run_epoch=request.expected_run_epoch,
-        terminal_status=request.terminal_status,
-        terminalization_only=request.terminalization_only,
-        expected_session_instance_id=request.expected_session_instance_id,
-        inactive_for_seconds=request.inactive_for_seconds,
-    )
-
-
-class ModelCompletionManualRecoveryResult(BaseModel):
-    """Verified accounting and stage settlement from manual model recovery."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    session: Session
-    settlement: ModelCompletionStageSettlement
-    budget_events: tuple[Event, ...] = ()
-    replayed: StrictBool = False
-
-    @field_validator("session")
-    @classmethod
-    def copy_session(cls, value: Session) -> Session:
-        return copy_session(value)
-
-    @field_validator("settlement")
-    @classmethod
-    def copy_settlement(
-        cls,
-        value: ModelCompletionStageSettlement,
-    ) -> ModelCompletionStageSettlement:
-        if type(value) is not ModelCompletionStageSettlement:
-            raise TypeError("settlement must be a ModelCompletionStageSettlement.")
-        return value.model_copy(deep=True)
-
-    @field_validator("budget_events", mode="before")
-    @classmethod
-    def copy_budget_events(cls, value) -> tuple[Event, ...]:
-        return tuple(copy_event(event) for event in value)
 
 
 _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS = 128
@@ -1800,500 +1723,12 @@ def transform_fork_checkpoint(
         raise
 
 
-MODEL_COMPLETION_STAGE_RECORD_TYPE = "cayu.model-completion-stage"
-MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE = "cayu.model-completion-stage.prepared"
-MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE = "cayu.model-completion-stage.completed"
-MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE = "cayu.model-completion-stage.active"
-MODEL_COMPLETION_WINNER_RECORD_TYPE = "cayu.model-completion-stage.winner"
-MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE = "cayu.model-completion-stage.abandoned"
-MODEL_COMPLETION_STAGE_SETTLEMENT_RECORD_TYPE = "cayu.model-completion-stage.settled"
-MODEL_COMPLETION_STAGE_DISPATCH_RECORD_TYPE = "cayu.model-completion-stage.dispatched"
-MODEL_COMPLETION_STAGE_SCHEMA_VERSION = 1
-MODEL_COMPLETION_STAGE_DISPATCH_OPERATION_KEY_PREFIX = (
-    MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "dispatched:"
-)
-MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY = MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "active"
 # Must hold everything an admitted RunRequest carries into recovery: up to
 # 256 KiB of request metadata plus budget limits and run settings.
-MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES = 2 * 1024 * 1024
-MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES = 16 * 1024
 _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
 _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
     "continue"
 }
-ModelCompletionPurpose = Literal["assistant-turn", "context-compaction", "auxiliary-inference"]
-
-
-class ModelCompletionStageRequest(BaseModel):
-    """Immutable identity and accounting link prepared before provider dispatch."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    stage_id: str = Field(max_length=256)
-    logical_step_id: str = Field(max_length=256)
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose = "assistant-turn"
-    intent: dict[str, Any]
-    reservation_ids: tuple[str, ...] = Field(default_factory=tuple)
-
-    @field_validator("stage_id", "logical_step_id")
-    @classmethod
-    def validate_stage_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("intent", mode="before")
-    @classmethod
-    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "intent")
-        recovery_context = copied.get("recovery_context")
-        if recovery_context is not None:
-            if type(recovery_context) is not dict:
-                raise ValueError("intent.recovery_context must be an object.")
-            if (
-                len(
-                    canonical_durable_json_bytes(
-                        recovery_context,
-                        "intent.recovery_context",
-                    )
-                )
-                > MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
-            ):
-                raise ValueError(
-                    "intent.recovery_context exceeds the durable byte limit of "
-                    f"{MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES}."
-                )
-        provider_start = copied.get("provider_operation_start")
-        if provider_start is not None:
-            if type(provider_start) is not dict:
-                raise ValueError("intent.provider_operation_start must be an object.")
-            if (
-                len(
-                    canonical_durable_json_bytes(
-                        provider_start,
-                        "intent.provider_operation_start",
-                    )
-                )
-                > MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES
-            ):
-                raise ValueError(
-                    "intent.provider_operation_start exceeds the durable byte limit of "
-                    f"{MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES}."
-                )
-        return copied
-
-    @field_validator("reservation_ids", mode="before")
-    @classmethod
-    def copy_reservation_ids(cls, value) -> tuple[str, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("reservation_ids must be a list or tuple of reservation ids.")
-        copied = tuple(
-            require_clean_nonblank(reservation_id, "reservation_ids item")
-            for reservation_id in value
-        )
-        if len(copied) > 32:
-            raise ValueError("reservation_ids cannot contain more than 32 ids.")
-        if len(set(copied)) != len(copied):
-            raise ValueError("reservation_ids must not contain duplicate ids.")
-        return copied
-
-
-class ModelCompletionStage(BaseModel):
-    """Verified view assembled from append-only preparation and completion records."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage"] = MODEL_COMPLETION_STAGE_RECORD_TYPE
-    schema_version: Literal[1] = MODEL_COMPLETION_STAGE_SCHEMA_VERSION
-    session_id: str
-    stage_id: str = Field(max_length=256)
-    logical_step_id: str = Field(max_length=256)
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    state: Literal["in_flight", "completed"]
-    intent: dict[str, Any]
-    reservation_ids: tuple[str, ...]
-    preparation_request_digest: str
-    preparation_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    prepared_at: datetime
-    publication: RuntimePublicationRequest | None = None
-    publication_material_digest: str | None = None
-    completion_digest: str | None = None
-    completed_at: datetime | None = None
-
-    @field_validator("session_id", "stage_id", "logical_step_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("intent", mode="before")
-    @classmethod
-    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "intent")
-
-    @field_validator("reservation_ids", mode="before")
-    @classmethod
-    def copy_reservation_ids(cls, value) -> tuple[str, ...]:
-        return ModelCompletionStageRequest.copy_reservation_ids(value)
-
-    @field_validator(
-        "preparation_request_digest",
-        "preparation_digest",
-        "publication_material_digest",
-        "completion_digest",
-    )
-    @classmethod
-    def validate_digest(cls, value: str | None, info) -> str | None:
-        if value is None and info.field_name in {
-            "publication_material_digest",
-            "completion_digest",
-        }:
-            return None
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("prepared_at", "completed_at")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime | None, info) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"{info.field_name} must include a timezone.")
-        return value.astimezone(UTC)
-
-    @model_validator(mode="after")
-    def validate_state(self) -> ModelCompletionStage:
-        terminal_fields = (
-            self.publication,
-            self.publication_material_digest,
-            self.completion_digest,
-            self.completed_at,
-        )
-        if self.state == "in_flight" and any(value is not None for value in terminal_fields):
-            raise ValueError("An in-flight model-completion stage cannot contain terminal data.")
-        if self.state == "completed" and any(value is None for value in terminal_fields):
-            raise ValueError("A completed model-completion stage requires all terminal data.")
-        if self.completed_at is not None and self.completed_at < self.prepared_at:
-            raise ValueError("completed_at cannot precede prepared_at.")
-        return self
-
-
-class ModelCompletionStageDispatch(BaseModel):
-    """Append-only proof that one exact prepared request may reach its provider."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    record_type: Literal["cayu.model-completion-stage.dispatched"] = (
-        MODEL_COMPLETION_STAGE_DISPATCH_RECORD_TYPE
-    )
-    schema_version: Literal[1] = MODEL_COMPLETION_STAGE_SCHEMA_VERSION
-    session_id: str
-    stage_id: str = Field(max_length=256)
-    logical_step_id: str = Field(max_length=256)
-    model_attempt_id: str = Field(max_length=256)
-    interaction_id: str = Field(max_length=256)
-    request_fingerprint: str
-    provider_effect_id: str = Field(max_length=512)
-    execution_profile_fingerprint: str | None = None
-    preparation_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    dispatched_at: datetime
-    record_digest: str
-
-    @field_validator(
-        "session_id",
-        "stage_id",
-        "logical_step_id",
-        "model_attempt_id",
-        "interaction_id",
-        "provider_effect_id",
-    )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator(
-        "request_fingerprint",
-        "execution_profile_fingerprint",
-        "preparation_digest",
-        "record_digest",
-    )
-    @classmethod
-    def validate_digest(cls, value: str | None, info) -> str | None:
-        if value is None:
-            if info.field_name == "execution_profile_fingerprint":
-                return None
-            raise ValueError(f"{info.field_name} is required.")
-        try:
-            session_authority_rules._require_raw_sha256_digest(value)
-        except ValueError as exc:
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.") from exc
-        return value
-
-    @field_validator("dispatched_at")
-    @classmethod
-    def normalize_dispatched_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("dispatched_at must include a timezone.")
-        return value.astimezone(UTC)
-
-
-class ModelCompletionStageResult(BaseModel):
-    """Result of preparing or terminally completing one immutable stage."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    stage: ModelCompletionStage
-    replayed: StrictBool
-    dispatch_authorized: StrictBool
-    prepared_events: tuple[Event, ...] = Field(
-        default_factory=tuple, exclude_if=lambda events: not events
-    )
-
-    @field_validator("prepared_events", mode="before")
-    @classmethod
-    def copy_prepared_events(cls, value):
-        if type(value) not in (list, tuple) or len(value) > 1:
-            raise ValueError("Stage preparation may publish at most one selection event.")
-        return tuple(copy_event(event) for event in value)
-
-    @model_validator(mode="after")
-    def validate_dispatch_authorization(self) -> ModelCompletionStageResult:
-        expected = self.stage.state == "in_flight" and not self.replayed
-        if self.dispatch_authorized != expected:
-            raise ValueError(
-                "dispatch_authorized must be true exactly for a newly inserted "
-                "in-flight preparation."
-            )
-        if self.prepared_events and not expected:
-            raise ValueError("Only a newly prepared stage returns newly published events.")
-        return self
-
-
-class ActiveModelCompletionStage(BaseModel):
-    """Verified snapshot of the model dispatch currently eligible to publish."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    stage: ModelCompletionStage
-    activated_at: datetime
-    marker_digest: str
-
-    @field_validator("activated_at")
-    @classmethod
-    def normalize_activated_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("activated_at must include a timezone.")
-        return value.astimezone(UTC)
-
-    @field_validator("marker_digest")
-    @classmethod
-    def validate_marker_digest(cls, value: str) -> str:
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError("marker_digest must be a lowercase SHA-256 digest.")
-        return value
-
-
-class ModelCompletionStageAbandonment(BaseModel):
-    """Durable proof that an exact pre-dispatch preparation was abandoned."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage.abandoned"] = (
-        MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE
-    )
-    schema_version: Literal[1] = MODEL_COMPLETION_STAGE_SCHEMA_VERSION
-    session_id: str
-    stage_id: str = Field(max_length=256)
-    logical_step_id: str = Field(max_length=256)
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    preparation_request_digest: str
-    preparation_digest: str
-    active_marker_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    abandoned_at: datetime
-    abandonment_digest: str
-
-    @field_validator("session_id", "stage_id", "logical_step_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator(
-        "preparation_request_digest",
-        "preparation_digest",
-        "active_marker_digest",
-        "abandonment_digest",
-    )
-    @classmethod
-    def validate_digest(cls, value: str, info) -> str:
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("abandoned_at")
-    @classmethod
-    def normalize_abandoned_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("abandoned_at must include a timezone.")
-        return value.astimezone(UTC)
-
-
-class ModelCompletionStageAbandonmentResult(BaseModel):
-    """Result of a new abandonment or an exact durable replay."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    abandonment: ModelCompletionStageAbandonment
-    replayed: StrictBool
-
-
-class _ModelCompletionStagePreparationRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage.prepared"]
-    schema_version: Literal[1]
-    session_id: str
-    stage_id: str
-    logical_step_id: str
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    intent: dict[str, Any]
-    reservation_ids: tuple[str, ...]
-    request_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    prepared_at: datetime
-    record_digest: str
-
-
-class _ModelCompletionStageTerminalRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage.completed"]
-    schema_version: Literal[1]
-    session_id: str
-    stage_id: str
-    logical_step_id: str
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    preparation_digest: str
-    publication: RuntimePublicationRequest
-    publication_material_digest: str
-    completed_at: datetime
-    record_digest: str
-
-
-class ModelCompletionStageRecoveryFence(BaseModel):
-    """Expected live owner for inserting recovery-generated terminal material.
-
-    This is an admission fence, not evidence that a provider completed. Exact
-    terminal replay is checked before this transient lease is required again.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    expected_session_instance_id: str
-    expected_run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
-    expected_active_profile: ActiveInvocationExecutionProfile
-    recovery_claim_id: str
-    preparation_digest: str
-    recovery_plan_ownership: DurableOperationOwnership | None = None
-
-    @field_validator("expected_session_instance_id", "recovery_claim_id", "preparation_digest")
-    @classmethod
-    def validate_identifiers(cls, value: str, info) -> str:
-        value = require_durable_clean_nonblank(value, info.field_name)
-        if info.field_name == "preparation_digest" and (
-            len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
-        ):
-            raise ValueError("preparation_digest must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("expected_active_profile", mode="before")
-    @classmethod
-    def copy_profile(cls, value: object) -> ActiveInvocationExecutionProfile:
-        if type(value) is ActiveInvocationExecutionProfile:
-            value = value.model_dump(mode="python")
-        return ActiveInvocationExecutionProfile.model_validate(value)
-
-
-class _ActiveModelCompletionStageRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage.active"]
-    schema_version: Literal[1]
-    session_id: str
-    stage_id: str
-    logical_step_id: str
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    preparation_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    activated_at: datetime
-    record_digest: str
-
-
-class _ModelCompletionStageWinnerRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage.winner"]
-    schema_version: Literal[1]
-    session_id: str
-    stage_id: str
-    logical_step_id: str
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    preparation_digest: str
-    completion_digest: str
-    publication_material_digest: str
-    receipt_request_digest: str
-    publication_digest: str
-    published_at: datetime
-    record_digest: str
-
-
-class _ModelCompletionStageAbandonmentRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.model-completion-stage.abandoned"]
-    schema_version: Literal[1]
-    session_id: str
-    stage_id: str
-    logical_step_id: str
-    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    purpose: ModelCompletionPurpose
-    preparation_request_digest: str
-    preparation_digest: str
-    active_marker_digest: str
-    source_status: SessionStatus
-    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    abandoned_at: datetime
-    record_digest: str
 
 
 @dataclass(frozen=True)
@@ -2344,57 +1779,6 @@ class _ModelCompletionStagePromotionContext:
     active_storage_key: str
     winner_storage_key: str
     completion_digest: str
-
-
-class ModelCompletionStageRelease(BaseModel):
-    """Exact active-stage authority released by an auditable external disposition."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    stage_id: str = Field(max_length=256)
-    preparation_digest: str
-
-    @field_validator("stage_id")
-    @classmethod
-    def validate_stage_id(cls, value: str) -> str:
-        return require_clean_nonblank(value, "stage_id")
-
-    @field_validator("preparation_digest")
-    @classmethod
-    def validate_preparation_digest(cls, value: str) -> str:
-        session_authority_rules._require_raw_sha256_digest(value)
-        return value
-
-
-class SessionOperationPublication(BaseModel):
-    """One atomic checkpoint/event publication plus terminal operation records."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    checkpoint: dict[str, Any]
-    operation_records: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    model_completion_stage_release: ModelCompletionStageRelease | None = None
-
-    @field_validator("checkpoint", mode="before")
-    @classmethod
-    def copy_checkpoint(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "checkpoint")
-
-    @field_validator("operation_records", mode="before")
-    @classmethod
-    def copy_operation_records(
-        cls,
-        value: dict[str, dict[str, Any]],
-    ) -> dict[str, dict[str, Any]]:
-        copied = copy_durable_json_object(value, "operation_records")
-        operation_record_rules._validate_session_operation_record_keys(copied)
-        for key, record in copied.items():
-            operation_record_rules._reject_reserved_runtime_publication_key(
-                key, "operation_records key"
-            )
-            if type(record) is not dict:
-                raise ValueError("Session operation records must be objects.")
-        return copied
 
 
 SessionOperationTransform = Callable[
@@ -20402,7 +19786,7 @@ def _validate_model_completion_stage_publication(
     publication: RuntimePublicationRequest,
     *,
     session_id: str,
-    stage: ModelCompletionStage | _ModelCompletionStagePreparationRecord,
+    stage: ModelCompletionStage | model_stage_contracts._ModelCompletionStagePreparationRecord,
 ) -> None:
     if publication.publication_id != stage.logical_step_id:
         raise ValueError("Model completion publication_id must equal logical_step_id.")
@@ -20502,7 +19886,7 @@ def _validate_model_completion_stage_publication(
 def _validate_assistant_model_completion_publication(
     publication: RuntimePublicationRequest,
     *,
-    stage: ModelCompletionStage | _ModelCompletionStagePreparationRecord,
+    stage: ModelCompletionStage | model_stage_contracts._ModelCompletionStagePreparationRecord,
     completed_event: Event,
     classification: Any,
 ) -> None:
@@ -20962,7 +20346,7 @@ def _validate_model_completion_stage_release(
     preparation_record: dict[str, Any] | None,
     terminal_record: dict[str, Any] | None,
     release: ModelCompletionStageRelease,
-) -> _ActiveModelCompletionStageRecord:
+) -> model_stage_contracts._ActiveModelCompletionStageRecord:
     """Validate exact in-flight stage ownership before a disposition clears it."""
 
     if type(release) is not ModelCompletionStageRelease:
@@ -21725,11 +21109,11 @@ def _reconstruct_active_model_completion_stage_record(
     *,
     session_id: str,
     storage_key: str = MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-) -> _ActiveModelCompletionStageRecord:
+) -> model_stage_contracts._ActiveModelCompletionStageRecord:
     try:
         if type(record) is not dict:
             raise TypeError
-        if set(record) != set(_ActiveModelCompletionStageRecord.model_fields):
+        if set(record) != set(model_stage_contracts._ActiveModelCompletionStageRecord.model_fields):
             raise ValueError
         for field in (
             "record_type",
@@ -21754,7 +21138,9 @@ def _reconstruct_active_model_completion_stage_record(
                 raise TypeError
         session_authority_rules._require_raw_sha256_digest(record["preparation_digest"])
         session_authority_rules._require_raw_sha256_digest(record["record_digest"])
-        reconstructed = _ActiveModelCompletionStageRecord.model_validate(record)
+        reconstructed = model_stage_contracts._ActiveModelCompletionStageRecord.model_validate(
+            record
+        )
         if reconstructed.record_type != MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE:
             raise ValueError
         if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
@@ -21786,7 +21172,9 @@ def _reconstruct_model_completion_stage_abandonment(
     try:
         if type(record) is not dict:
             raise TypeError
-        if set(record) != set(_ModelCompletionStageAbandonmentRecord.model_fields):
+        if set(record) != set(
+            model_stage_contracts._ModelCompletionStageAbandonmentRecord.model_fields
+        ):
             raise ValueError
         for field in (
             "record_type",
@@ -21818,7 +21206,9 @@ def _reconstruct_model_completion_stage_abandonment(
             "record_digest",
         ):
             session_authority_rules._require_raw_sha256_digest(record[field])
-        reconstructed = _ModelCompletionStageAbandonmentRecord.model_validate(record)
+        reconstructed = model_stage_contracts._ModelCompletionStageAbandonmentRecord.model_validate(
+            record
+        )
         if reconstructed.record_type != MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE:
             raise ValueError
         if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
@@ -21860,11 +21250,11 @@ def _reconstruct_model_completion_stage_winner_record(
     session_id: str,
     logical_step_id: str,
     storage_key: str,
-) -> _ModelCompletionStageWinnerRecord:
+) -> model_stage_contracts._ModelCompletionStageWinnerRecord:
     try:
         if type(record) is not dict:
             raise TypeError
-        if set(record) != set(_ModelCompletionStageWinnerRecord.model_fields):
+        if set(record) != set(model_stage_contracts._ModelCompletionStageWinnerRecord.model_fields):
             raise ValueError
         for field in (
             "record_type",
@@ -21895,7 +21285,9 @@ def _reconstruct_model_completion_stage_winner_record(
             "record_digest",
         ):
             session_authority_rules._require_raw_sha256_digest(record[field])
-        reconstructed = _ModelCompletionStageWinnerRecord.model_validate(record)
+        reconstructed = model_stage_contracts._ModelCompletionStageWinnerRecord.model_validate(
+            record
+        )
         if reconstructed.record_type != MODEL_COMPLETION_WINNER_RECORD_TYPE:
             raise ValueError
         if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
@@ -21925,11 +21317,13 @@ def _reconstruct_model_completion_stage_preparation(
     session_id: str,
     stage_id: str,
     storage_key: str,
-) -> _ModelCompletionStagePreparationRecord:
+) -> model_stage_contracts._ModelCompletionStagePreparationRecord:
     try:
         if type(record) is not dict:
             raise TypeError
-        if set(record) != set(_ModelCompletionStagePreparationRecord.model_fields):
+        if set(record) != set(
+            model_stage_contracts._ModelCompletionStagePreparationRecord.model_fields
+        ):
             raise ValueError
         for field in (
             "record_type",
@@ -21956,7 +21350,9 @@ def _reconstruct_model_completion_stage_preparation(
             raise TypeError
         session_authority_rules._require_raw_sha256_digest(record["request_digest"])
         session_authority_rules._require_raw_sha256_digest(record["record_digest"])
-        reconstructed = _ModelCompletionStagePreparationRecord.model_validate(record)
+        reconstructed = model_stage_contracts._ModelCompletionStagePreparationRecord.model_validate(
+            record
+        )
         if reconstructed.record_type != MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE:
             raise ValueError
         if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
@@ -21985,11 +21381,13 @@ def _reconstruct_model_completion_stage_terminal(
     session_id: str,
     stage_id: str,
     storage_key: str,
-) -> _ModelCompletionStageTerminalRecord:
+) -> model_stage_contracts._ModelCompletionStageTerminalRecord:
     try:
         if type(record) is not dict:
             raise TypeError
-        if set(record) != set(_ModelCompletionStageTerminalRecord.model_fields):
+        if set(record) != set(
+            model_stage_contracts._ModelCompletionStageTerminalRecord.model_fields
+        ):
             raise ValueError
         for field in (
             "record_type",
@@ -22038,7 +21436,7 @@ def _reconstruct_model_completion_stage_terminal(
             operation_record_mutations=publication_record["operation_record_mutations"],
             referenced_events=publication_record["referenced_events"],
         )
-        reconstructed = _ModelCompletionStageTerminalRecord.model_validate(
+        reconstructed = model_stage_contracts._ModelCompletionStageTerminalRecord.model_validate(
             {**record, "publication": publication}
         )
         if reconstructed.record_type != MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE:
@@ -22487,7 +21885,7 @@ def _validate_model_completion_stage_winner(
     stage: ModelCompletionStage,
     receipt: RuntimePublicationReceipt,
     winner_storage_key: str,
-) -> _ModelCompletionStageWinnerRecord:
+) -> model_stage_contracts._ModelCompletionStageWinnerRecord:
     if winner_record is None:
         raise SessionModelCompletionStageConflict(
             "A model-completion receipt exists without its durable winner claim."

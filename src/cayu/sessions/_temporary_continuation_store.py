@@ -39,7 +39,7 @@ from cayu.sessions._temporary_continuation import (
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
     from cayu.sessions.records import Session
 
 
@@ -61,7 +61,8 @@ def publish_service_record(
     now: datetime,
 ) -> SessionOperationPublication:
     """Build an atomic parent/index/child update, not a foreign admission grant."""
-    from cayu.sessions.base import SessionOperationPublication, _continuation_writer_was_released
+    from cayu.sessions._operation_records import SessionOperationPublication
+    from cayu.sessions.base import _continuation_writer_was_released
 
     redactor = SecretRedactor()
     proposed = prepare_contract(TemporaryServiceRecord, proposed, redactor=redactor)

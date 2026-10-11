@@ -10,7 +10,8 @@ from tests.core.test_model_completion_recovery import (
 )
 
 from cayu import CayuApp, EventQuery, EventType
-from cayu.sessions.base import InMemorySessionStore, ModelCompletionManualRecoveryRequest
+from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 

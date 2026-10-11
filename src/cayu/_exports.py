@@ -4094,7 +4094,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ModelCompactor": ("cayu.context.base", "ModelCompactor"),
     "ModelCompletion": ("cayu.providers.base", "ModelCompletion"),
     "ModelCompletionManualRecoveryRequest": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "ModelCompletionManualRecoveryRequest",
     ),
     "ModelCompletionManualRecoveryRequired": (
@@ -4102,7 +4102,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ModelCompletionManualRecoveryRequired",
     ),
     "ModelCompletionManualRecoveryResult": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "ModelCompletionManualRecoveryResult",
     ),
     "ModelContextPressureProfile": ("cayu.providers.base", "ModelContextPressureProfile"),

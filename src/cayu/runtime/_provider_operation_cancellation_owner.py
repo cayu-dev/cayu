@@ -60,13 +60,14 @@ from cayu.runtime.provider_operations import (
     load_provider_operation_cancellation_resolution,
     provider_operation_cancellation_event_id,
 )
+from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
     checkpoint_with_provider_operation_cancellation_claim,
     checkpoint_without_provider_operation_cancellation_claim,
     provider_operation_cancellation_claim_from_checkpoint,
 )
-from cayu.sessions.base import ModelCompletionStage, SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.records import Session
 
 _PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0

@@ -385,7 +385,7 @@ async def test_output_contract_from_real_admission_is_bounded_and_non_dispatchin
         attachment_index,
     )
     from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
 
     native = NativeProducerAttachment.from_registration(record)
     index = attachment_index(native)

@@ -498,6 +498,14 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelCompletionStageSettlementRequest,
 )
+from cayu.sessions._model_stage import (
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryResult,
+    ModelCompletionStageSettlement,
+    SessionModelCompletionDispatchAlreadyAuthorized,
+    SessionModelCompletionStageConflict,
+    copy_model_completion_manual_recovery_request,
+)
 from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     interruption_request_id_from_payload,
@@ -506,18 +514,12 @@ from cayu.sessions._terminal_evidence import (
 from cayu.sessions.base import (
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
-    ModelCompletionManualRecoveryRequest,
-    ModelCompletionManualRecoveryResult,
-    ModelCompletionStageSettlement,
     ModelFailoverPolicy,
     ModelTarget,
-    SessionModelCompletionDispatchAlreadyAuthorized,
-    SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
     _checkpoint_with_session_run_operation,
     _initial_transcript_pending_interaction_id,
-    copy_model_completion_manual_recovery_request,
     model_completion_stage_settlement_request,
 )
 from cayu.sessions.checkpoints import (

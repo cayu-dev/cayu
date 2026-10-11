@@ -40,7 +40,7 @@ from cayu.sessions._model_failover import (
     ModelFailoverSelection,
     copy_model_failover_state,
 )
-from cayu.sessions.base import ModelCompletionStage
+from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions.records import Session
 
 

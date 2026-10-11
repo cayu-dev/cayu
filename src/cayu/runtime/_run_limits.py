@@ -122,12 +122,9 @@ from cayu.runtime.stop_policy import (
     auxiliary_token_admission,
     first_reached_limit,
 )
-from cayu.sessions.base import (
-    ModelCompletionStage,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions._model_stage import ModelCompletionStage
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.inference import InferenceLimits

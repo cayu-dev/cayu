@@ -26,13 +26,13 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_matches_session_epoch,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._model_stage import ActiveModelCompletionStage
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
     _session_run_operation_from_checkpoint,
 )
 from cayu.sessions.base import (
-    ActiveModelCompletionStage,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     SessionRunFenced,

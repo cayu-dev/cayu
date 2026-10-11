@@ -223,6 +223,7 @@ from cayu.sessions._invocation_scope import (
     _current_session_run_epoch,
     _deactivate_session_run_fence,
 )
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -230,7 +231,6 @@ from cayu.sessions._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.sessions.base import (
-    SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
     _initial_transcript_pending_interaction_id,

@@ -27,11 +27,13 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
+from cayu.sessions._model_stage import (
+    ModelCompletionStageRequest,
+    SessionModelCompletionStageConflict,
+)
 from cayu.sessions.base import (
     ChildSessionLifecycleQuery,
     InMemorySessionStore,
-    ModelCompletionStageRequest,
-    SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
 )

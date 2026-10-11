@@ -39,8 +39,8 @@ from cayu import (
 )
 from cayu.messages import MessageRole, TextPart, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions._model_stage import ModelCompletionStageResult
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import ModelCompletionStageResult
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 TRUNK_SESSION_ID = "async-forks-trunk"

@@ -257,8 +257,15 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelStepPublicationCheckpoint,
 )
+from cayu.sessions._model_stage import (
+    MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
+    ModelCompletionStageRequest,
+    SessionModelCompletionStageConflict,
+    SessionModelCompletionStageIncomplete,
+)
 from cayu.sessions._operation_records import (
     RuntimePublicationOperationRecordMutation,
+    SessionOperationPublication,
     runtime_publication_operation_record_value_digest,
 )
 from cayu.sessions._runtime_publication import (
@@ -266,15 +273,10 @@ from cayu.sessions._runtime_publication import (
     runtime_publication_event_reference,
 )
 from cayu.sessions.base import (
-    MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     BudgetReservationIdentityConflict,
     InMemorySessionStore,
-    ModelCompletionStageRequest,
     ModelTarget,
     QueuedDispatchTerminalReceiptQuery,
-    SessionModelCompletionStageConflict,
-    SessionModelCompletionStageIncomplete,
-    SessionOperationPublication,
     SessionStore,
     _checkpoint_with_session_run_operation,
 )
@@ -17680,7 +17682,7 @@ def test_auxiliary_recovery_terminal_requires_live_exact_owner(
     session_store_case, monkeypatch, dispatched, with_plan
 ) -> None:
     from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
-    from cayu.sessions.base import ModelCompletionStageRecoveryFence
+    from cayu.sessions._model_stage import ModelCompletionStageRecoveryFence
 
     async def run() -> None:
         store = await _open_store(session_store_case)

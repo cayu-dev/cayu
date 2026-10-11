@@ -278,9 +278,9 @@ from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflic
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
 from cayu.sessions.base import (
     InMemorySessionStore,
-    ModelCompletionManualRecoveryRequest,
     ModelTarget,
     SessionRunFenced,
     SessionStore,

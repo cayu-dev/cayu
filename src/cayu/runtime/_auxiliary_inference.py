@@ -95,13 +95,13 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.retry_policy import RetryDecision, retry_decision
-from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import (
+from cayu.sessions._model_stage import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
     SessionModelCompletionStageConflict,
-    SessionStore,
 )
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.inference import InferenceLimits, copy_inference_limits, validate_inference_purpose
 from cayu.vaults.redaction import SecretRedactor

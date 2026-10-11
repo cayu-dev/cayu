@@ -23,7 +23,8 @@ from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,
 )
-from cayu.sessions.base import InMemorySessionStore, SessionOperationPublication
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     BROWSER_CONTROLS_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

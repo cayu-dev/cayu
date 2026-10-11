@@ -121,13 +121,9 @@ from cayu.sessions._invocation_scope import _deactivate_session_run_fence
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ModelCompletionStageRequest,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions._model_stage import ModelCompletionStageRequest
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions.base import InMemorySessionStore, SessionRunFenced, SessionStore
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (

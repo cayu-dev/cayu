@@ -110,7 +110,8 @@ from cayu.sessions._invocation_scope import (
     _latest_session_invocation_interaction_is_settled,
     _set_session_interaction_recovered_active_through,
 )
-from cayu.sessions.base import ModelCompletionManualRecoveryRequest, SessionRunFenced, SessionStore
+from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (

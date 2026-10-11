@@ -57,7 +57,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions._execution_profile_checkpoint",
         "ActiveInvocationExecutionProfile",
     ),
-    "ActiveModelCompletionStage": ("cayu.sessions.base", "ActiveModelCompletionStage"),
+    "ActiveModelCompletionStage": ("cayu.sessions._model_stage", "ActiveModelCompletionStage"),
     "AdmitInvocationCommand": ("cayu.sessions._invocation_lifecycle", "AdmitInvocationCommand"),
     "AdmittedCompletionProposalRequest": (
         "cayu.tasks.admission",
@@ -840,7 +840,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ModelCatalog": ("cayu.budgets.pricing", "ModelCatalog"),
     "ModelCompactor": ("cayu.context.base", "ModelCompactor"),
     "ModelCompletionManualRecoveryRequest": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "ModelCompletionManualRecoveryRequest",
     ),
     "ModelCompletionManualRecoveryRequired": (
@@ -848,23 +848,29 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ModelCompletionManualRecoveryRequired",
     ),
     "ModelCompletionManualRecoveryResult": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "ModelCompletionManualRecoveryResult",
     ),
-    "ModelCompletionStage": ("cayu.sessions.base", "ModelCompletionStage"),
-    "ModelCompletionStageAbandonment": ("cayu.sessions.base", "ModelCompletionStageAbandonment"),
+    "ModelCompletionStage": ("cayu.sessions._model_stage", "ModelCompletionStage"),
+    "ModelCompletionStageAbandonment": (
+        "cayu.sessions._model_stage",
+        "ModelCompletionStageAbandonment",
+    ),
     "ModelCompletionStageAbandonmentResult": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "ModelCompletionStageAbandonmentResult",
     ),
-    "ModelCompletionStageDispatch": ("cayu.sessions.base", "ModelCompletionStageDispatch"),
+    "ModelCompletionStageDispatch": ("cayu.sessions._model_stage", "ModelCompletionStageDispatch"),
     "ModelCompletionStageDisposition": (
         "cayu.sessions._model_completion_publication",
         "ModelCompletionStageDisposition",
     ),
-    "ModelCompletionStageRequest": ("cayu.sessions.base", "ModelCompletionStageRequest"),
-    "ModelCompletionStageResult": ("cayu.sessions.base", "ModelCompletionStageResult"),
-    "ModelCompletionStageSettlement": ("cayu.sessions.base", "ModelCompletionStageSettlement"),
+    "ModelCompletionStageRequest": ("cayu.sessions._model_stage", "ModelCompletionStageRequest"),
+    "ModelCompletionStageResult": ("cayu.sessions._model_stage", "ModelCompletionStageResult"),
+    "ModelCompletionStageSettlement": (
+        "cayu.sessions._model_stage",
+        "ModelCompletionStageSettlement",
+    ),
     "ModelCompletionStageSettlementRequest": (
         "cayu.sessions._model_completion_publication",
         "ModelCompletionStageSettlementRequest",
@@ -1343,16 +1349,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionMessageSource": ("cayu.sessions.messaging", "SessionMessageSource"),
     "SessionMessageTarget": ("cayu.sessions.messaging", "SessionMessageTarget"),
     "SessionModelCompletionStageConflict": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "SessionModelCompletionStageConflict",
     ),
     "SessionModelCompletionStageIncomplete": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_stage",
         "SessionModelCompletionStageIncomplete",
     ),
     "SessionModelTransition": ("cayu.sessions._execution_profile_rules", "SessionModelTransition"),
     "SessionOperationInitializer": ("cayu.sessions.base", "SessionOperationInitializer"),
-    "SessionOperationPublication": ("cayu.sessions.base", "SessionOperationPublication"),
+    "SessionOperationPublication": (
+        "cayu.sessions._operation_records",
+        "SessionOperationPublication",
+    ),
     "SessionOperationTransform": ("cayu.sessions.base", "SessionOperationTransform"),
     "SessionOperationalSnapshot": ("cayu.sessions.summaries", "SessionOperationalSnapshot"),
     "SessionOrder": ("cayu.sessions.queries", "SessionOrder"),

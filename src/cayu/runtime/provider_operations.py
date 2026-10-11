@@ -50,13 +50,12 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.runtime._model_errors import model_provider_error_from_payload
-from cayu.sessions.base import (
-    ModelCompletionStage,
+from cayu.sessions._model_stage import ModelCompletionStage
+from cayu.sessions._operation_records import (
     ModelCompletionStageRelease,
     SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
 )
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus, SessionStatusConflict

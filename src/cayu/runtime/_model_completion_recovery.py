@@ -89,6 +89,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_recovery_profile,
 )
+from cayu.sessions._model_stage import ActiveModelCompletionStage, ModelCompletionStage
 from cayu.sessions._runtime_publication import (
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     RuntimePublicationReceipt,
@@ -98,12 +99,7 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
 )
-from cayu.sessions.base import (
-    ActiveModelCompletionStage,
-    ModelCompletionStage,
-    SessionStore,
-    _model_completion_stage_promotion_statuses,
-)
+from cayu.sessions.base import SessionStore, _model_completion_stage_promotion_statuses
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
@@ -2019,7 +2015,7 @@ class ModelCompletionRecovery:
             auxiliary_terminal_publication,
         )
         from cayu.runtime._durable_model_terminalization import terminalization_plan_owner
-        from cayu.sessions.base import ModelCompletionStageRecoveryFence
+        from cayu.sessions._model_stage import ModelCompletionStageRecoveryFence
 
         invocation._validate()
         if invocation.recovery_claim_id is None:

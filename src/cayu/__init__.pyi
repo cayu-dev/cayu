@@ -3916,6 +3916,12 @@ from cayu.sessions._interaction_transitions import (
 from cayu.sessions._interaction_transitions import (
     SessionInvocationAdmission as SessionInvocationAdmission,
 )
+from cayu.sessions._model_stage import (
+    ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
+)
+from cayu.sessions._model_stage import (
+    ModelCompletionManualRecoveryResult as ModelCompletionManualRecoveryResult,
+)
 from cayu.sessions._participant_discovery import (
     ParticipantSessionCursor as ParticipantSessionCursor,
 )
@@ -3939,12 +3945,6 @@ from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
-from cayu.sessions.base import (
-    ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
-)
-from cayu.sessions.base import (
-    ModelCompletionManualRecoveryResult as ModelCompletionManualRecoveryResult,
-)
 from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress

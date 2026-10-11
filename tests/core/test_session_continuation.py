@@ -55,6 +55,7 @@ from cayu.sessions._invocation_lifecycle import (
     InvocationMutationResult,
     PreparedInvocationBinding,
 )
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._session_continuation import (
     ContinuationConflict,
     ContinuationConsumption,
@@ -75,7 +76,7 @@ from cayu.sessions._session_continuation import (
     continuation_registration_operation,
 )
 from cayu.sessions._session_continuation_scope import consumption_scope
-from cayu.sessions.base import InMemorySessionStore, SessionOperationPublication, SessionStore
+from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

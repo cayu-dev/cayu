@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._session_continuation import (
     ContinuationConflict,
     ContinuationRecord,
@@ -11,7 +12,6 @@ from cayu.sessions._session_continuation import (
     continuation_operation_key,
 )
 from cayu.sessions._session_continuation_store import require_history
-from cayu.sessions.base import SessionOperationPublication
 
 if TYPE_CHECKING:
     from cayu.collaboration.waits import CollaborationWait

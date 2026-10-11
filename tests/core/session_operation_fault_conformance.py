@@ -30,8 +30,9 @@ from cayu.sessions._interaction_receipts import (
 from cayu.sessions._operation_records import (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
+    SessionOperationPublication,
 )
-from cayu.sessions.base import SessionOperationPublication, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.tools.base import DurableToolOperationConflict

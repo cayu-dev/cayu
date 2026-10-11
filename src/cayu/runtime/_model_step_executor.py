@@ -330,12 +330,13 @@ from cayu.sessions._model_failover import (
     ModelFailoverProgress,
     copy_model_failover_state,
 )
+from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageRequest
 from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
 )
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.base import ModelCompletionStage, ModelCompletionStageRequest, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict

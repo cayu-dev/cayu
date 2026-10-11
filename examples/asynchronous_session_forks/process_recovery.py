@@ -44,8 +44,8 @@ from cayu import (
 )
 from cayu.messages import TextPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions._model_stage import ModelCompletionStageResult
 from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import ModelCompletionStageResult
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 
 _MODULE = "examples.asynchronous_session_forks.process_recovery"

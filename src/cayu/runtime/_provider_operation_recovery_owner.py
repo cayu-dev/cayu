@@ -140,12 +140,13 @@ from cayu.runtime.provider_operations import (
     provider_operation_unavailable_reason,
 )
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
+from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions._operation_records import RuntimePublicationOperationRecordMutation
 from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
     provider_operation_cancellation_claim_from_checkpoint,
 )
-from cayu.sessions.base import ModelCompletionStage, SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.discovery import (

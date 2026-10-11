@@ -277,6 +277,7 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelCompletionStageSettlementRequest,
 )
+from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -286,7 +287,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
     _event_with_session_run_operation,

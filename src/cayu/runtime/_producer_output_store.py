@@ -362,7 +362,7 @@ async def attach_native_producer(store, registration: ProducerOutputRecord):
     The caller authenticates registration against CollaborationStore before this
     native transaction. No receiving callback executes inside the native scope.
     """
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
     from cayu.sessions.records import SessionStatus
 
     registration = prepare_contract(ProducerOutputRecord, registration, redactor=SecretRedactor())
@@ -454,7 +454,7 @@ async def exclude_native_producer(
     This permanently fences a prepared invocation under the native session lock.
     An admitted invocation is not excluded by guessing from its session status.
     """
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
     from cayu.sessions.records import SessionStatus
 
     redactor = SecretRedactor()
@@ -544,7 +544,7 @@ async def retain_native_output(store, session_id, *, invocation, stage_id):
     """
     from cayu.collaboration._native_output import read_native_output
     from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
 
     with _invocation_lifecycle_authority_read_scope():
         checkpoint = await store.load_checkpoint(session_id)

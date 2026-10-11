@@ -51,10 +51,9 @@ from cayu.runtime.provider_operations import (
     provider_operation_progress_event_id,
     provider_operation_progress_payload,
 )
+from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageRequest
 from cayu.sessions.base import (
     InMemorySessionStore,
-    ModelCompletionStage,
-    ModelCompletionStageRequest,
     SessionOperationTransform,
     SessionRunFenced,
     SessionStore,

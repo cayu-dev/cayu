@@ -16,7 +16,7 @@ from cayu.collaboration._session_export_store import (
     source_digest,
 )
 from cayu.collaboration.exports import SessionExportConflict
-from cayu.sessions.base import SessionOperationPublication
+from cayu.sessions._operation_records import SessionOperationPublication
 
 
 async def publish_export_mutation(

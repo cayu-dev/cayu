@@ -66,12 +66,12 @@ from cayu.sessions._invocation_lifecycle import (
     _invocation_lifecycle_receipt_from_checkpoint,
     require_released_invocation_command_authority,
 )
-from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
-from cayu.sessions.base import (
+from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
-    SessionStore,
 )
+from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import (
     PENDING_ACTION_EVENT_TYPE_VALUES,

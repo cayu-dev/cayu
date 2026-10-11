@@ -33,10 +33,12 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_event_id,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import (
+from cayu.sessions._model_stage import (
     ActiveModelCompletionStage,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
+)
+from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     _validate_model_completion_stage_dispatch,

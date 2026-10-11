@@ -52,7 +52,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecCommand, ExecResult, RunnerExecutionError, RunnerUnavailableError
 from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.sessions.base import SessionOperationPublication
+from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions.outcomes import run_to_completion
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest

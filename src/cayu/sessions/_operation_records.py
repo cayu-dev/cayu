@@ -178,3 +178,52 @@ def _apply_runtime_publication_operation_record_mutations(
             "operation record mutation value",
         )
     return updated
+
+
+class ModelCompletionStageRelease(BaseModel):
+    """Exact active-stage authority released by an auditable external disposition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage_id: str = Field(max_length=256)
+    preparation_digest: str
+
+    @field_validator("stage_id")
+    @classmethod
+    def validate_stage_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "stage_id")
+
+    @field_validator("preparation_digest")
+    @classmethod
+    def validate_preparation_digest(cls, value: str) -> str:
+        session_authority_rules._require_raw_sha256_digest(value)
+        return value
+
+
+class SessionOperationPublication(BaseModel):
+    """One atomic checkpoint/event publication plus terminal operation records."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    checkpoint: dict[str, Any]
+    operation_records: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    model_completion_stage_release: ModelCompletionStageRelease | None = None
+
+    @field_validator("checkpoint", mode="before")
+    @classmethod
+    def copy_checkpoint(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_object(value, "checkpoint")
+
+    @field_validator("operation_records", mode="before")
+    @classmethod
+    def copy_operation_records(
+        cls,
+        value: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        copied = copy_durable_json_object(value, "operation_records")
+        _validate_session_operation_record_keys(copied)
+        for key, record in copied.items():
+            _reject_reserved_runtime_publication_key(key, "operation_records key")
+            if type(record) is not dict:
+                raise ValueError("Session operation records must be objects.")
+        return copied

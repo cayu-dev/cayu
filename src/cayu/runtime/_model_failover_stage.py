@@ -39,11 +39,8 @@ from cayu.sessions._model_failover import (
     copy_model_failover_state,
     validate_model_failover_successor,
 )
-from cayu.sessions.base import (
-    ModelCompletionStage,
-    SessionModelCompletionStageConflict,
-    SessionRunFenced,
-)
+from cayu.sessions._model_stage import ModelCompletionStage, SessionModelCompletionStageConflict
+from cayu.sessions.base import SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

@@ -158,7 +158,8 @@ from cayu.sessions._invocation_scope import (
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
 )
-from cayu.sessions.base import SessionOperationPublication, SessionStore
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,

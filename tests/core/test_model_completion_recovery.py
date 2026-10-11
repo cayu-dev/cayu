@@ -65,13 +65,13 @@ from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
-from cayu.sessions._runtime_publication import RuntimePublicationRequest
-from cayu.sessions.base import (
-    InMemorySessionStore,
+from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionStage,
     ModelCompletionStageRequest,
 )
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

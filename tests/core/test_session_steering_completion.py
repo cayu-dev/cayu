@@ -33,7 +33,8 @@ from cayu.runtime.session_steering import (
     SessionSteeringConflict,
     StopAfterCurrentToolRoundRequest,
 )
-from cayu.sessions.base import ModelCompletionStageRequest, SessionRunFenced
+from cayu.sessions._model_stage import ModelCompletionStageRequest
+from cayu.sessions.base import SessionRunFenced
 from cayu.workspaces.local import LocalWorkspace
 
 

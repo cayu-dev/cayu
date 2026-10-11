@@ -318,7 +318,7 @@ def test_compaction_mutation_requires_independent_material(backend, material, tm
     from tests.core.test_context_view_admission import _close, _factory, _new_manifest, _selection
     from tests.core.test_context_views import _replace_manifest
 
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
 
     factory = _factory(backend, tmp_path, request, [datetime.now(UTC)])
 

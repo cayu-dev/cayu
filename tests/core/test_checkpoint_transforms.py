@@ -15,7 +15,10 @@ from tests._session_provenance import fixture_session_invocation
 
 import cayu
 from cayu.sessions import _checkpoint_transforms as transforms
-from cayu.sessions.base import ModelCompletionStageRelease, SessionOperationPublication
+from cayu.sessions._operation_records import (
+    ModelCompletionStageRelease,
+    SessionOperationPublication,
+)
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY as VERSION,
 )

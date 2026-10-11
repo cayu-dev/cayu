@@ -17,11 +17,8 @@ from cayu.runtime._model_completion_contracts import (
 from cayu.runtime._run_limits import (
     RunLimitController,
 )
-from cayu.sessions.base import (
-    ModelCompletionStage,
-    ModelCompletionStageAbandonmentResult,
-    SessionStore,
-)
+from cayu.sessions._model_stage import ModelCompletionStage, ModelCompletionStageAbandonmentResult
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
 
 

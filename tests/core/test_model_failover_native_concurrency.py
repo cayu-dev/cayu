@@ -15,7 +15,7 @@ from tests.core.test_model_failover_stages import (
 )
 
 from cayu import EventType
-from cayu.sessions.base import SessionModelCompletionStageConflict
+from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

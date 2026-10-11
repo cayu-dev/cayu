@@ -42,7 +42,7 @@ from cayu.sessions._temporary_service_target import (
 )
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions._operation_records import SessionOperationPublication
     from cayu.sessions.records import Session
 
 ROOT_KEY = "session_continuations"
