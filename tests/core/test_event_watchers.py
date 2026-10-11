@@ -501,9 +501,9 @@ def test_event_watcher_cursor_query_preserves_event_id_filter() -> None:
 
 
 def test_event_watcher_preserves_before_sequence_across_cursor_pages(monkeypatch) -> None:
-    import cayu.applications as app_module
+    from cayu.runtime import _event_watcher_delivery
 
-    monkeypatch.setattr(app_module, "EVENT_WATCHER_QUERY_PAGE_LIMIT", 1)
+    monkeypatch.setattr(_event_watcher_delivery, "EVENT_WATCHER_QUERY_PAGE_LIMIT", 1)
 
     async def run() -> list[int]:
         session_id, records, _watcher_store, app = await _bounded_event_watcher_app()

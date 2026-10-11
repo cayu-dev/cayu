@@ -1,26 +1,32 @@
-"""Runtime ownership of one renewable watcher delivery and its cleanup."""
+"""Watcher batch dispatch, renewable delivery supervision and retained cleanup."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, TypeVar
 
 from cayu._task_wait import LateFailures, await_shielded_task_outcome, wait_until_idle
 from cayu.observability.watchers import (
+    EVENT_WATCHER_QUERY_PAGE_LIMIT,
     EventWatcher,
     EventWatcherClaim,
     EventWatcherContext,
     EventWatcherDelivery,
     EventWatcherDeliveryStatus,
     EventWatcherLeaseLost,
+    EventWatcherRunResult,
     EventWatcherStore,
     copy_event_watcher_claim,
     copy_event_watcher_delivery,
+    event_query_after_cursor,
     event_watcher_error_payload,
     run_event_watcher_handler,
 )
 from cayu.runtime._durable_worker_loop import run_durable_lease_heartbeat
+from cayu.runtime._event_projection import public_event_id
+from cayu.sessions.records import EventRecord
+from cayu.sessions.store import SessionStore
 from cayu.vaults import SecretRedactor
 
 _T = TypeVar("_T")
@@ -348,3 +354,183 @@ class EventWatcherSupervisor:
         self._store_tasks.discard(task)
         if not task.cancelled():
             task.exception()
+
+
+async def dispatch_event_watchers(
+    watchers: Iterable[EventWatcher],
+    *,
+    limit: int,
+    get_session_store: Callable[[], SessionStore],
+    get_watcher_store: Callable[[], EventWatcherStore],
+    supervisor: EventWatcherSupervisor,
+    redactor: SecretRedactor,
+    project_record: Callable[[EventRecord], EventRecord],
+) -> list[EventWatcherRunResult]:
+    """Deliver an ordered batch through the existing renewable-lease supervisor.
+
+    Store resolvers retain lookup timing across awaits. Projection changes only
+    the handler's view; durable claims retain the original event identity.
+    The supplied supervisor retains cancelled work for its caller to drain.
+    """
+    watcher_list = _validate_event_watchers(watchers)
+    for watcher in watcher_list:
+        if redactor.redact_text(watcher.name) != watcher.name:
+            raise ValueError(
+                "Event watcher name contains a workload secret and cannot be used as durable watcher authority."
+            )
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be an integer greater than or equal to 1.")
+    undelivered: list[EventWatcherDelivery] = []
+    try:
+        remaining = limit
+        results: list[EventWatcherRunResult] = []
+        for watcher in watcher_list:
+            deliveries: list[EventWatcherDelivery] = []
+            blocked_by_active_lease = False
+            watcher_error: str | None = None
+            try:
+                while remaining > 0 and len(deliveries) < watcher.batch_size:
+                    if supervisor.active(watcher.name):
+                        blocked_by_active_lease = True
+                        break
+                    state = await supervisor.store_call(
+                        get_watcher_store().load_state(watcher.name)
+                    )
+                    if (
+                        watcher.query.before_sequence is not None
+                        and state.cursor_sequence >= watcher.query.before_sequence
+                    ):
+                        break
+                    page_limit = min(
+                        remaining,
+                        watcher.batch_size - len(deliveries),
+                        EVENT_WATCHER_QUERY_PAGE_LIMIT,
+                    )
+                    records = await supervisor.store_call(
+                        get_session_store().query_events(
+                            event_query_after_cursor(
+                                watcher.query,
+                                state.cursor_sequence,
+                                limit=page_limit,
+                            )
+                        ),
+                    )
+                    if not records:
+                        break
+                    stop_watcher = False
+                    for record in records:
+                        outcome = await supervisor.store_call(
+                            get_watcher_store().claim_event(
+                                watcher_name=watcher.name,
+                                record=record,
+                                lease_seconds=watcher.lease_seconds,
+                                max_attempts=watcher.max_attempts,
+                            ),
+                        )
+                        if outcome is None:
+                            refreshed = await supervisor.store_call(
+                                get_watcher_store().load_state(watcher.name),
+                            )
+                            if refreshed.cursor_sequence >= record.sequence:
+                                state = refreshed
+                                continue
+                            blocked_by_active_lease = True
+                            stop_watcher = True
+                            break
+                        if (
+                            outcome.watcher_name != watcher.name
+                            or outcome.event_id != record.event.id
+                            or outcome.event_sequence != record.sequence
+                        ):
+                            raise ValueError("Watcher store returned authority for another event.")
+                        if isinstance(outcome, EventWatcherDelivery):
+                            if (
+                                outcome.status is not EventWatcherDeliveryStatus.DEAD_LETTERED
+                                or outcome.cursor_sequence != record.sequence
+                            ):
+                                raise ValueError(
+                                    "Watcher claim returned a non-dead-letter delivery."
+                                )
+                            delivery = outcome
+                        elif isinstance(outcome, EventWatcherClaim):
+                            if outcome.attempt > watcher.max_attempts:
+                                raise ValueError(
+                                    "Watcher claim exceeds the configured attempt limit."
+                                )
+                            delivery = await supervisor.run(
+                                watcher=watcher,
+                                store=get_watcher_store(),
+                                claim=outcome,
+                                context=EventWatcherContext(
+                                    watcher_name=watcher.name,
+                                    record=project_record(record),
+                                    attempt=outcome.attempt,
+                                ),
+                                cursor_sequence=state.cursor_sequence,
+                                redactor=redactor,
+                            )
+                        else:
+                            raise TypeError("Watcher store returned an invalid claim result.")
+                        deliveries.append(
+                            delivery.model_copy(
+                                update={"event_id": public_event_id(delivery.event_sequence)},
+                                deep=True,
+                            )
+                        )
+                        undelivered.append(deliveries[-1])
+                        remaining -= 1
+                        if delivery.status in {
+                            EventWatcherDeliveryStatus.SUCCEEDED,
+                            EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        }:
+                            state = state.model_copy(
+                                update={"cursor_sequence": delivery.cursor_sequence}
+                            )
+                        if delivery.status not in {
+                            EventWatcherDeliveryStatus.SUCCEEDED,
+                            EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        }:
+                            stop_watcher = True
+                            break
+                        if remaining <= 0 or len(deliveries) >= watcher.batch_size:
+                            stop_watcher = True
+                            break
+                    if stop_watcher or len(records) < page_limit:
+                        break
+            except Exception as error:
+                watcher_error = redactor.redact_text_bounded(
+                    event_watcher_error_payload(error, redactor=redactor),
+                    max_bytes=4096,
+                )
+            results.append(
+                EventWatcherRunResult(
+                    watcher_name=watcher.name,
+                    deliveries=deliveries,
+                    blocked_by_active_lease=blocked_by_active_lease,
+                    error=watcher_error,
+                )
+            )
+        return results
+    except BaseException:
+        # The caller never receives these results, so shutdown must report
+        # any whose outcome could not be recorded. The delivery running
+        # when this call ended is not among them; it reports itself.
+        supervisor.record_undelivered(undelivered)
+        raise
+
+
+def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWatcher, ...]:
+    if isinstance(watchers, str | bytes):
+        raise TypeError("watchers must be an iterable of EventWatcher instances.")
+    try:
+        watcher_list = list(watchers)
+    except TypeError as exc:
+        raise TypeError("watchers must be an iterable of EventWatcher instances.") from exc
+    names: set[str] = set()
+    for watcher in watcher_list:
+        if type(watcher) is not EventWatcher:
+            raise TypeError("watchers must contain EventWatcher instances.")
+        if watcher.name in names:
+            raise ValueError("Duplicate event watcher name.")
+        names.add(watcher.name)
+    return tuple(watcher_list)

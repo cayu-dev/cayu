@@ -1,4 +1,6 @@
 {
+  "tests/core/test_event_watcher_composition.py::test_public_watcher_batch_resolves_replaced_stores_after_await": 0.0077426659991033375,
+  "tests/core/test_event_watcher_composition.py::test_watcher_batch_executes_without_application_or_engine": 2.268073999963235,
   "tests/core/test_manual_model_recovery_composition.py::test_manual_model_recovery_and_replay_without_engine[abandoned-memory]": 0.15915924997534603,
   "tests/core/test_manual_model_recovery_composition.py::test_manual_model_recovery_and_replay_without_engine[abandoned-postgres]": 0.39980154094519094,
   "tests/core/test_manual_model_recovery_composition.py::test_manual_model_recovery_and_replay_without_engine[abandoned-sqlite]": 0.3674572079908103,

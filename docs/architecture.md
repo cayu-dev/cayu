@@ -240,6 +240,15 @@ registrations and projection hooks and keeps lifecycle tracking around each
 complete operation. The component can be used without constructing an application
 or loading execution controllers.
 
+`runtime/_event_watcher_delivery.py` owns watcher batch paging, claims, cursor
+reconciliation and result collection. `dispatch_event_watchers` composes explicit
+store resolvers, redaction and event projection with `EventWatcherSupervisor`,
+which owns each renewable delivery and retained cleanup. Store resolvers preserve
+lookup timing across awaits. Batch dispatch and supervision can be used without
+an application or execution engine. `CayuApp.run_event_watchers` supplies those
+parts and retains public admission; application drain/shutdown keeps resource
+ownership until retained deliveries settle.
+
 `_application_accounting.py` owns session and causal-budget usage/cost readback
 with explicit session-store, identity-resolution and identifier-projection
 dependencies. It composes native accounting snapshots, session pagination and
