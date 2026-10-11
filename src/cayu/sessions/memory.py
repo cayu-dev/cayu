@@ -66,7 +66,6 @@ from cayu.memory.evidence import (
     context_exposure_transition_replays,
     copy_context_exposure,
     copy_recall_item_exposure,
-    copy_recall_receipt,
     decode_recall_evidence_cursor,
     encode_recall_evidence_cursor,
     memory_evidence_document_bytes,
@@ -105,6 +104,7 @@ from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _memory_event_reads as memory_event_reads
+from cayu.sessions import _memory_evidence as memory_evidence
 from cayu.sessions import _memory_session_queries as memory_session_queries
 from cayu.sessions import _memory_transcripts as memory_transcripts
 from cayu.sessions import _model_failover_rules as model_failover_rules
@@ -1150,6 +1150,22 @@ class InMemorySessionStore(
                 queued_dispatch_terminal_receipts=self._queued_dispatch_terminal_receipts,
                 session_event_records=self._session_event_records,
                 session_operation_records=self._session_operation_records,
+                sessions=self._sessions,
+            )
+
+    @asynccontextmanager
+    async def _recall_evidence_state(
+        self,
+    ) -> AsyncIterator[memory_evidence.MemoryRecallState]:
+        async with self._lock:
+            yield memory_evidence.MemoryRecallState(
+                recall_receipt_ids_by_session=self._recall_receipt_ids_by_session,
+                recall_receipt_page_keys_by_interaction=self._recall_receipt_page_keys_by_interaction,
+                recall_receipt_page_keys_by_interaction_step=self._recall_receipt_page_keys_by_interaction_step,
+                recall_receipt_page_keys_by_session=self._recall_receipt_page_keys_by_session,
+                recall_receipt_page_keys_by_step=self._recall_receipt_page_keys_by_step,
+                recall_receipts=self._recall_receipts,
+                session_closure_progress=self._session_closure_progress,
                 sessions=self._sessions,
             )
 
@@ -10015,130 +10031,22 @@ class InMemorySessionStore(
         return await memory_transcripts.search_transcript(self._read_transcript_state, query)
 
     async def create_recall_receipt(self, receipt: RecallReceipt) -> RecallReceipt:
-        copied = copy_recall_receipt(receipt)
-        async with self._lock:
-            current = self._recall_receipts.get(copied.receipt_id)
-            if current is not None:
-                if memory_evidence_document_bytes(
-                    current, "stored recall receipt"
-                ) != memory_evidence_document_bytes(copied, "recall receipt"):
-                    raise RecallEvidenceConflict("Recall receipt", copied.receipt_id)
-                return copy_recall_receipt(current)
-            if copied.session_id not in self._sessions:
-                raise KeyError(f"Session not found: {copied.session_id}")
-            for owner in self._session_closure_progress.values():
-                closure_records._check_closure_lineage_owner(owner, (copied.session_id,))
-            self._recall_receipts[copied.receipt_id] = copied
-            self._recall_receipt_ids_by_session.setdefault(copied.session_id, set()).add(
-                copied.receipt_id
-            )
-            page_key = copied.created_at, copied.receipt_id
-            for page_keys in (
-                self._recall_receipt_page_keys_by_session.setdefault(copied.session_id, []),
-                self._recall_receipt_page_keys_by_interaction.setdefault(
-                    (copied.session_id, copied.interaction_id), []
-                ),
-                self._recall_receipt_page_keys_by_step.setdefault(
-                    (copied.session_id, copied.model_step_id), []
-                ),
-                self._recall_receipt_page_keys_by_interaction_step.setdefault(
-                    (copied.session_id, copied.interaction_id, copied.model_step_id), []
-                ),
-            ):
-                page_keys.insert(bisect_right(page_keys, page_key), page_key)
-            return copy_recall_receipt(copied)
+        return await memory_evidence.create_recall_receipt(self._recall_evidence_state, receipt)
 
     async def load_recall_receipt(
         self,
         session_id: str,
         receipt_id: str,
     ) -> RecallReceipt | None:
-        session_id = require_memory_evidence_session_id(session_id)
-        receipt_id = require_memory_evidence_id(receipt_id, "receipt_id")
-        async with self._lock:
-            receipt = self._recall_receipts.get(receipt_id)
-            if receipt is None or receipt.session_id != session_id:
-                return None
-            return copy_recall_receipt(receipt)
+        return await memory_evidence.load_recall_receipt(
+            self._recall_evidence_state, session_id, receipt_id
+        )
 
     async def list_recall_receipts(
         self,
         query: RecallEvidenceQuery,
     ) -> RecallReceiptPage:
-        copied_query = RecallEvidenceQuery.model_validate(query.model_dump(mode="python"))
-        query_fingerprint = copied_query.fingerprint("receipt")
-        after = (
-            None
-            if copied_query.cursor is None
-            else decode_recall_evidence_cursor(
-                copied_query.cursor,
-                record_kind="receipt",
-                query_fingerprint=query_fingerprint,
-            )
-        )
-        async with self._lock:
-            if copied_query.interaction_id is not None and copied_query.model_step_id is not None:
-                page_keys = self._recall_receipt_page_keys_by_interaction_step.get(
-                    (
-                        copied_query.session_id,
-                        copied_query.interaction_id,
-                        copied_query.model_step_id,
-                    ),
-                    (),
-                )
-            elif copied_query.interaction_id is not None:
-                page_keys = self._recall_receipt_page_keys_by_interaction.get(
-                    (copied_query.session_id, copied_query.interaction_id),
-                    (),
-                )
-            elif copied_query.model_step_id is not None:
-                page_keys = self._recall_receipt_page_keys_by_step.get(
-                    (copied_query.session_id, copied_query.model_step_id),
-                    (),
-                )
-            else:
-                page_keys = self._recall_receipt_page_keys_by_session.get(
-                    copied_query.session_id,
-                    (),
-                )
-            start = 0 if after is None else bisect_right(page_keys, after)
-            candidates = tuple(
-                self._recall_receipts[receipt_id]
-                for _, receipt_id in islice(
-                    page_keys,
-                    start,
-                    start + copied_query.limit + 1,
-                )
-            )
-            retained: list[RecallReceipt] = []
-            retained_bytes = 2
-            for receipt in candidates:
-                document_bytes = len(
-                    memory_evidence_document_bytes(receipt, "recall receipt page item")
-                )
-                separator_bytes = 1 if retained else 0
-                if len(retained) >= copied_query.limit or (
-                    retained_bytes + separator_bytes + document_bytes > copied_query.max_bytes
-                ):
-                    break
-                retained.append(receipt)
-                retained_bytes += separator_bytes + document_bytes
-            truncated = len(retained) < len(candidates)
-            next_cursor = (
-                encode_recall_evidence_cursor(
-                    record_kind="receipt",
-                    query_fingerprint=query_fingerprint,
-                    created_at=retained[-1].created_at,
-                    record_id=retained[-1].receipt_id,
-                )
-                if truncated and retained
-                else None
-            )
-            return RecallReceiptPage(
-                items=tuple(retained),
-                next_cursor=next_cursor,
-                truncated=truncated,
-            )
+        return await memory_evidence.list_recall_receipts(self._recall_evidence_state, query)
 
     async def create_context_exposure(
         self,
