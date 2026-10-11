@@ -1,4 +1,9 @@
 {
+  "tests/core/test_postgres_publication_ownership.py::test_postgres_publication_imports_without_adapters_or_driver": 1.403,
+  "tests/core/test_postgres_publication_ownership.py::test_postgres_stage_promotion_composes_real_publication": 1.008,
+  "tests/core/test_postgres_publication_ownership.py::test_postgres_publication_composes_and_rolls_back_failed_writes[RuntimeError]": 0.183,
+  "tests/core/test_postgres_publication_ownership.py::test_postgres_publication_composes_and_rolls_back_failed_writes[CancelledError]": 0.179,
+  "tests/core/test_postgres_publication_ownership.py::test_postgres_publication_cancellation_rolls_back_transaction": 0.235,
   "tests/core/test_native_publication_ownership.py::test_sqlite_publication_imports_without_adapters_or_driver": 2.137,
   "tests/core/test_native_publication_ownership.py::test_sqlite_stage_promotion_composes_real_publication": 1.408,
   "tests/core/test_native_publication_ownership.py::test_sqlite_publication_composes_and_rolls_back_failed_writes[RuntimeError]": 0.16,
