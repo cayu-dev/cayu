@@ -360,6 +360,16 @@ Application, execution and recovery callers compose the same instance with the
 captured session/task stores and existing publication collaborators. Its operations
 do not import or call the session engine.
 
+`SessionOutcomePublication` sequences successful completion, completion-critical
+workspace finalization, approval/input/foreground pauses and ordinary failures.
+It composes the existing interaction finalization, terminal-event/hook publication,
+environment and task owners. The engine supplies current runtime bindings at the
+outcome boundary and shares only its invocation-local session/task progress, so
+updates remain visible across streamed events and exceptional exits. Turn
+scheduling, deferred transcript materialization and cancellation supervision stay
+with their existing owners. Deferred transcript materialization is supplied as an
+explicit operation; outcome publication retains no engine reference.
+
 `QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
 request preparation, frozen profile and session-instance validation, execution
 or exact terminal replay, settlement classification, and receipt acknowledgement.

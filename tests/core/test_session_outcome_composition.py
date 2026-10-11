@@ -96,3 +96,127 @@ def test_session_task_lifecycle_attaches_and_completes_without_engine(
                 await sessions.close()
 
     asyncio.run(scenario())
+
+
+def test_session_outcome_publication_imports_without_application_or_engine() -> None:
+    _run_without_owners(
+        ("cayu.applications", "cayu.runtime._session_engine"),
+        "from cayu.runtime._session_outcome_publication import SessionOutcomePublication\n",
+    )
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "interrupted"])
+def test_governed_outcome_publication_works_without_turn_execution(outcome, monkeypatch) -> None:
+    import time
+
+    from tests.core.test_work_attempt_admission import _configured_public_initial_admission
+
+    from cayu.events import EventType
+    from cayu.runtime._session_outcome_publication import SessionOutcomeContext, SessionOutcomeState
+    from cayu.runtime.loop_policies import BeforeStopDecision
+    from cayu.sessions._invocation_scope import (
+        _activate_session_interaction,
+        _activate_session_run_fence,
+        _deactivate_session_interaction,
+        _deactivate_session_run_fence,
+    )
+    from cayu.sessions.event_queries import EventQuery
+    from cayu.sessions.records import SessionStatus
+    from cayu.vaults.redaction import SecretRedactor
+
+    async def scenario() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        app, request, execution = await _configured_public_initial_admission(
+            prefix="independent-outcome",
+            sessions=sessions,
+            tasks=tasks,
+            redactor=SecretRedactor(),
+        )
+        monkeypatch.delattr(app, "_session_engine")
+        admission = await app.admit_work_attempt(request, execution=execution)
+        session = await sessions.load(admission.session_id)
+        assert session is not None
+        invocation = await app._work_attempt_execution._enter_work_attempt_invocation_context(
+            admission,
+            session=session,
+            checkpoint=await sessions.load_checkpoint(session.id),
+            lease_seconds=300,
+        )
+        _activate_session_run_fence(session)
+        _activate_session_interaction(session.id, admission.interaction_id)
+        try:
+
+            async def materialize() -> None:
+                await sessions.replace_initial_transcript_messages(
+                    session.id, request.messages, request.messages
+                )
+
+            state = SessionOutcomeState(session=session)
+            context = SessionOutcomeContext(
+                state=state,
+                registered_agent=invocation.registered_agent,
+                registered_environment=invocation.registered_environment,
+                execution_profile=invocation.profile,
+                invocation_context=invocation,
+                environment_name=session.environment_name,
+                run_started_at=time.monotonic(),
+                turn_usage_tracker=app._run_limit_controller.usage_tracker(session.id),
+                active_run=None,
+                task_id=admission.task_id,
+                task_worker_id=admission.claim.worker_id,
+                task_lease_expires_at=admission.claim.lease_expires_at,
+                task_handoff_id=None,
+                request_loop_policies=invocation.request_loop_policies,
+            )
+            owner = app._session_outcomes
+            if outcome == "failed":
+                stream = owner.fail(context, RuntimeError("independent failure"), materialize)
+            else:
+                await materialize()
+                if outcome == "completed":
+                    (
+                        completed,
+                        _,
+                        _,
+                    ) = await app._session_finalization.publish_interaction_transition(
+                        session=session,
+                        invocation_context=invocation,
+                        agent_name=invocation.registered_agent.spec.name,
+                        environment_name=session.environment_name,
+                        to_status=SessionStatus.COMPLETED,
+                        execution_profile=invocation.profile,
+                    )
+                    stream = owner.complete_session(context, completed, None, None)
+                else:
+                    stream = owner.publish_stop_interruption(
+                        context, BeforeStopDecision.interrupt("independent stop")
+                    )
+            try:
+                events = [event async for event in stream]
+            finally:
+                await stream.aclose()
+            terminal = {
+                "completed": EventType.SESSION_COMPLETED,
+                "failed": EventType.SESSION_FAILED,
+                "interrupted": EventType.SESSION_INTERRUPTED,
+            }[outcome]
+            terminal_index = next(i for i, event in enumerate(events) if event.type is terminal)
+            turn_index = next(
+                i for i, event in enumerate(events) if event.type is EventType.TURN_COMPLETED
+            )
+            assert turn_index < terminal_index
+            assert sum(event.type is terminal for event in events) == 1
+            retained = await sessions.load(session.id)
+            assert retained is not None and retained.status is SessionStatus(outcome)
+            records = await sessions.query_events(EventQuery(session_id=session.id))
+            assert sum(record.event.type is terminal for record in records) == 1
+            # Governed task completion remains with the completion-decision owner.
+            task = await tasks.load_task(admission.task_id)
+            assert task is not None and task.status is TaskStatus.RUNNING
+            assert not state.task_finished
+        finally:
+            _deactivate_session_interaction(session.id)
+            _deactivate_session_run_fence(session.id)
+
+    asyncio.run(scenario())

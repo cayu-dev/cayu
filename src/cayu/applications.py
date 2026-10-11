@@ -448,6 +448,7 @@ from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._session_fork import SessionFork
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
+from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.runtime._session_preparation import SessionPreparation
 from cayu.runtime._session_recovery import SessionRecovery
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
@@ -1786,7 +1787,23 @@ class CayuApp:
             loop_policies=self._loop_policies,
         )
 
+        self._session_outcomes = SessionOutcomePublication(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            session_tasks=self._session_tasks,
+            session_finalization=self._session_finalization,
+            terminal_event_publication=self._terminal_event_publication,
+            environment_lifecycle=self._environment_lifecycle,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            foreground_gate_policy_owner=self._foreground_gate_policy_owner,
+            background_interruption_coordinator=self._background_interruption_coordinator,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+        )
+
         self._session_engine = SessionEngine(
+            session_outcomes=self._session_outcomes,
             session_tasks=self._session_tasks,
             session_preparation=self._session_preparation,
             compaction=self._session_compaction,

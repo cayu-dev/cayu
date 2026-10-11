@@ -34304,7 +34304,7 @@ def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch
         )
         invocation_scope._activate_session_interaction(session.id, "interaction-timing")
         registered_agent = app._get_registered_agent("assistant")
-        await app._session_engine._emit_interaction_started(
+        await app._session_outcomes.emit_interaction_started(
             session=session,
             registered_agent=registered_agent,
             environment_name=None,
@@ -34354,7 +34354,7 @@ def test_interaction_summary_pages_more_than_5000_usage_events_without_failing()
         )
         invocation_scope._activate_session_interaction(session.id, "interaction-large")
         registered_agent = app._get_registered_agent("assistant")
-        await app._session_engine._emit_interaction_started(
+        await app._session_outcomes.emit_interaction_started(
             session=session,
             registered_agent=registered_agent,
             environment_name=None,

@@ -2490,7 +2490,7 @@ def test_remote_interrupt_wins_linked_task_failure_and_preserves_queued_turn(
         stale_claim_entered = asyncio.Event()
         release_stale_claim = asyncio.Event()
         if settle_before_stale_claim:
-            original_claim = owner._session_engine._claim_invocation_terminal_decision
+            original_claim = owner._session_outcomes.claim_invocation_terminal_decision
 
             async def pause_stale_failure_claim(*, session, decision):
                 stale_claim_entered.set()
@@ -2498,8 +2498,8 @@ def test_remote_interrupt_wins_linked_task_failure_and_preserves_queued_turn(
                 await original_claim(session=session, decision=decision)
 
             monkeypatch.setattr(
-                owner._session_engine,
-                "_claim_invocation_terminal_decision",
+                owner._session_outcomes,
+                "claim_invocation_terminal_decision",
                 pause_stale_failure_claim,
             )
         await task_store.create_task(
@@ -2746,7 +2746,7 @@ def test_linked_task_failure_winner_fences_remote_interrupt(
 
         decision_claimed = asyncio.Event()
         release_failure_owner = asyncio.Event()
-        original_claim = owner._session_engine._claim_invocation_terminal_decision
+        original_claim = owner._session_outcomes.claim_invocation_terminal_decision
 
         async def claim_then_pause(*, session, decision):
             await original_claim(session=session, decision=decision)
@@ -2754,8 +2754,8 @@ def test_linked_task_failure_winner_fences_remote_interrupt(
             await release_failure_owner.wait()
 
         monkeypatch.setattr(
-            owner._session_engine,
-            "_claim_invocation_terminal_decision",
+            owner._session_outcomes,
+            "claim_invocation_terminal_decision",
             claim_then_pause,
         )
 

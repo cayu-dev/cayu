@@ -33,7 +33,6 @@ from cayu.messages import Message
 from cayu.observability.events import EventSink
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _invocation_scope as invocation_scope
@@ -3782,7 +3781,9 @@ def test_runtime_records_each_replay_attempt_when_store_reuses_exception() -> No
         )
         assert isinstance(representative, ExceptionGroup)
         assert representative.exceptions == (store.failure,)
-        assert session_engine_module._interaction_transition_replay_failures(representative) == (
+        assert session_finalization_module._interaction_transition_replay_failures(
+            representative
+        ) == (
             store.failure,
             store.failure,
             store.failure,
