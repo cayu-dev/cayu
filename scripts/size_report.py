@@ -18,7 +18,7 @@ from collections import Counter, defaultdict
 from collections.abc import Generator
 from contextlib import closing
 from importlib.util import resolve_name
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCHEMA_VERSION = 2
@@ -44,7 +44,9 @@ def _module(path: str) -> str:
     return name.removesuffix(".__init__")
 
 
-def _tracked_blobs(repo: Path, revision: str) -> Generator[tuple[str, bytes], None, None]:
+def _tracked_blobs(
+    repo: Path, revision: str, *, source_only: bool = False
+) -> Generator[tuple[str, bytes], None, None]:
     entries = subprocess.check_output(
         ["git", "-C", str(repo), "ls-tree", "-r", "-z", revision]
     ).split(b"\0")
@@ -61,8 +63,13 @@ def _tracked_blobs(repo: Path, revision: str) -> Generator[tuple[str, bytes], No
             header, encoded_path = entry.split(b"\t", 1)
             mode, kind, object_id = header.split()
             path = encoded_path.decode("utf-8")
-            selected = path.startswith(("src/cayu/", "tests/")) and path.endswith((".py", ".pyi"))
-            if mode not in (b"100644", b"100755") or not (selected or path == ".test_durations"):
+            prefixes = ("src/cayu/",) if source_only else ("src/cayu/", "tests/")
+            selected = path.startswith(prefixes) and path.endswith((".py", ".pyi"))
+            if not (selected or (not source_only and path == ".test_durations")):
+                continue
+            if mode not in (b"100644", b"100755"):
+                if source_only:
+                    raise ValueError(f"Source size check requires a regular file: {path}")
                 continue
             if kind != b"blob":
                 raise ValueError(f"Expected a regular tracked blob: {path}")
@@ -198,6 +205,14 @@ def _duration_snapshot(data: bytes) -> dict[str, int | float]:
     return {"entries": len(values), "seconds": round(total, 6)}
 
 
+def _physical_lines(source: str) -> int:
+    # Python physical lines end at LF, CRLF or CR, not Unicode string separators.
+    lines = source.count("\n") + source.count("\r") - source.count("\r\n")
+    if source and not source.endswith(("\n", "\r")):
+        lines += 1
+    return lines
+
+
 class SourceInventory:
     def __init__(self, modules: set[str]) -> None:
         self.modules = modules
@@ -226,10 +241,7 @@ class SourceInventory:
 
     def observe(self, path: str, data: bytes) -> None:
         source = data.decode("utf-8")
-        # Python physical lines end at LF, CRLF or CR, not Unicode string separators.
-        lines = source.count("\n") + source.count("\r") - source.count("\r\n")
-        if source and not source.endswith(("\n", "\r")):
-            lines += 1
+        lines = _physical_lines(source)
         if path.startswith("src/cayu/") and (
             path.endswith("/_exports.py") or path.endswith("/__init__.pyi")
         ):
@@ -337,11 +349,16 @@ class SourceInventory:
         }
 
 
-def build_report(repo: Path, revision: str) -> dict[str, Any]:
+def _resolve_commit(repo: Path, revision: str) -> str:
     commit = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}")
     # Subsequent Git commands receive this object ID, never a caller-controlled option.
     if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None:
         raise ValueError("Revision did not resolve to a commit object ID")
+    return commit
+
+
+def build_report(repo: Path, revision: str) -> dict[str, Any]:
+    commit = _resolve_commit(repo, revision)
     paths = _git(repo, "ls-tree", "-r", "--name-only", "-z", commit).split("\0")
     inventory = SourceInventory({_module(path) for path in paths if path.endswith(".py")})
     durations = None
@@ -368,18 +385,100 @@ def build_report(repo: Path, revision: str) -> dict[str, Any]:
     }
 
 
+def _source_size_limits(path: Path) -> tuple[int, dict[str, int]]:
+    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate source-size policy key: {key}")
+            result[key] = value
+        return result
+
+    policy = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_pairs)
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != {"schema_version", "default_max_lines", "exceptions"}
+        or type(policy["schema_version"]) is not int
+        or policy["schema_version"] != 1
+        or type(policy["default_max_lines"]) is not int
+        or policy["default_max_lines"] < 1
+        or not isinstance(policy["exceptions"], dict)
+    ):
+        raise ValueError("Invalid source-size policy schema or default_max_lines")
+    maximum = policy["default_max_lines"]
+    exceptions = {}
+    for name, exception in policy["exceptions"].items():
+        source = PurePosixPath(name)
+        if (
+            str(source) != name
+            or not name.startswith("src/cayu/")
+            or ".." in source.parts
+            or source.suffix not in {".py", ".pyi"}
+            or not isinstance(exception, dict)
+            or set(exception) != {"max_lines", "reason"}
+            or type(exception["max_lines"]) is not int
+            or exception["max_lines"] <= maximum
+            or not isinstance(exception["reason"], str)
+            or not exception["reason"].strip()
+        ):
+            raise ValueError(f"Invalid source-size exception: {name}")
+        exceptions[name] = exception["max_lines"]
+    return maximum, exceptions
+
+
+def check_source_size(repo: Path, revision: str, policy: Path) -> tuple[str, int, int]:
+    maximum, exceptions = _source_size_limits(policy)
+    commit = _resolve_commit(repo, revision)
+    with closing(_tracked_blobs(repo, commit, source_only=True)) as blobs:
+        sizes = {path: _physical_lines(data.decode("utf-8")) for path, data in blobs}
+    if not sizes:
+        raise ValueError("Source size check found no production Python or stub files")
+    failures = []
+    for path, lines in sorted(sizes.items()):
+        limit = exceptions.get(path, maximum)
+        if lines > limit:
+            failures.append(f"{path}: {lines:,} lines exceeds the {limit:,}-line limit")
+    for path in sorted(exceptions):
+        if path not in sizes:
+            failures.append(f"{path}: remove the exception for this absent source file")
+        elif sizes[path] <= maximum:
+            failures.append(f"{path}: remove the exception; the file meets the default limit")
+    if failures:
+        raise ValueError(
+            "Source size policy failed:\n"
+            + "\n".join(f"  {failure}" for failure in failures)
+            + "\nReview ownership and any proposed exception in docs/refactoring-baseline.md."
+        )
+    return commit, len(sizes), len(exceptions)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--revision", help="Commit or ref to measure (default: HEAD)")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument(
-        "--revision", default="HEAD", help="Commit or ref to measure (default: HEAD)"
-    )
     selection.add_argument(
         "--check", type=Path, help="Verify a saved report at its recorded revision"
     )
+    selection.add_argument(
+        "--check-source-size",
+        type=Path,
+        help="Check committed production files against a size policy",
+    )
     args = parser.parse_args()
+    if args.check is not None and args.revision is not None:
+        parser.error("--revision cannot be combined with --check")
+    revision = "HEAD" if args.revision is None else args.revision
     try:
+        if args.check_source_size:
+            commit, files, exceptions = check_source_size(
+                args.repo, revision, args.check_source_size
+            )
+            print(
+                f"Source size policy passed at {commit} "
+                f"({files} files, {exceptions} capped exceptions)"
+            )
+            return 0
         expected = json.loads(args.check.read_text()) if args.check else None
         if args.check and (
             not isinstance(expected, dict)
@@ -388,7 +487,7 @@ def main() -> int:
             or not isinstance(expected.get("revision"), str)
         ):
             raise ValueError("Saved report has an unsupported schema or missing revision")
-        revision = expected["revision"] if expected is not None else args.revision
+        revision = expected["revision"] if expected is not None else revision
         report = build_report(args.repo, revision)
         if expected is not None:
             if report != expected:

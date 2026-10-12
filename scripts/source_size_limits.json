@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "default_max_lines": 9999,
+  "exceptions": {
+    "src/cayu/_exports.py": {
+      "max_lines": 10316,
+      "reason": "One declarative lazy-export map and public-name list preserve the root import surface. Splitting this metadata does not establish a new behavior owner; API reduction is separate."
+    },
+    "src/cayu/tools/_browser_guest.py": {
+      "max_lines": 10002,
+      "reason": "Existing standalone browser-image worker. Further separation needs its own guest-protocol, sibling-module deployment and browser qualification; this cap permits no additional growth."
+    }
+  }
+}

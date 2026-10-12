@@ -73,6 +73,18 @@ def test_collection_preflight_gates_hosted_test_matrices() -> None:
     assert "--splits" not in command
 
 
+def test_static_lane_checks_source_size_with_the_committed_policy() -> None:
+    runner = _dry_runner()
+    _RUNNER["_run_static"](runner)
+    (command,) = [
+        item.command for item in runner.evidence if item.label == "Source file size limits"
+    ]
+    assert command == (
+        "uv run --no-sync python scripts/size_report.py "
+        "--check-source-size scripts/source_size_limits.json"
+    )
+
+
 def test_collection_failure_prevents_local_fanout_even_with_keep_going(monkeypatch) -> None:
     phases = []
     namespace = _run_python_suite.__globals__

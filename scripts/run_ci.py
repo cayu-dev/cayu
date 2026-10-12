@@ -484,6 +484,18 @@ def _run_static(runner: LocalCiRunner) -> None:
     )
     for label, command in (
         (
+            "Source file size limits",
+            (
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "scripts/size_report.py",
+                "--check-source-size",
+                "scripts/source_size_limits.json",
+            ),
+        ),
+        (
             "Ruff lint",
             (
                 "uv",

@@ -33,6 +33,51 @@ the measured source. Local edits, untracked files, symlinks and bytecode are
 excluded. Git archive export rules and checkout line-ending conversion do not
 affect the result. Output contains no timestamps or machine-specific paths.
 
+## Source file size limits
+
+The existing static CI lane checks committed production Python and stub files
+under `src/cayu/` against `scripts/source_size_limits.json`:
+
+```sh
+python3 scripts/size_report.py --check-source-size scripts/source_size_limits.json
+```
+
+The default maximum is **9,999 physical lines per file**, including comments and
+blank lines. New files and replacement paths receive the same limit. The check
+reads `HEAD`; commit local source changes before running it, or select another
+available commit with `--revision`. It uses the policy file supplied on disk.
+It needs no parent history, source imports, installed Cayu dependencies or
+network access, so the same command works in shallow CI checkouts. Source
+symlinks are rejected because their implementation cannot be measured as a
+regular source blob. Ordinary inventory reports retain their original behavior.
+
+### Assessed exceptions
+
+At revision `dccef301f`, all twelve original large implementation files are below
+10,000 lines. Two other maintained Python files exceed that threshold:
+
+| File | Maximum lines | Retained responsibility |
+| --- | ---: | --- |
+| `src/cayu/_exports.py` | 10,316 | One literal lazy-export map and public-name list. These declarations preserve the root import surface; distributing them would add composition without moving behavior to a clearer owner. |
+| `src/cayu/tools/_browser_guest.py` | 10,002 | The standalone worker shipped into the versioned browser image. Request decoding, browser lifetime, interactive execution and observations currently share its guest protocol and process state. |
+
+These are explicit caps at the measured sizes, with reasons in the policy file.
+The export manifest remains maintained source. Browser request decoding and
+observation remain candidates for future ownership work, but that work needs
+its own isolated-entry-point, sibling deployment, protocol and browser tests.
+The size check introduces no changes to either implementation.
+
+An exception applies only to its exact path. Remove it when that file disappears
+or meets the default limit; stale entries fail CI. A new exception or a larger
+cap requires a visible policy change with its ownership rationale in the same
+PR. Malformed policies, duplicate keys and unexplained exceptions fail closed.
+Do not delete comments, compress formatting or move arbitrary lines merely to
+pass the check. Review complete responsibilities and their verification needs.
+
+This check covers individual production files. Test-suite organization, the
+combined storage assessment and broader milestone qualification retain their
+own delivery evidence. The historical inventory baseline stays unchanged.
+
 ## Compare revisions
 
 Use the same version of the measurement script and the same metric definitions
