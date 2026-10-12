@@ -1,5 +1,18 @@
 # Release notes
 
+## v0.11.1
+
+Cayu refreshes bundled model metadata and pricing against official provider
+sources so release artifacts pass the model-catalog freshness check.
+
+- Correct Azure GPT-5.6 Sol prices and add published Vertex Batch cache-read
+  prices for Claude Fable 5, Opus 4.8, Opus 5, and Sonnet 4.6. Earlier price
+  schedules remain available for historical cost reconstruction.
+- Remove deprecated Gemini 3.5 Flash from the bundled catalog and price book,
+  matching Google's model documentation.
+- Reorganize session execution and storage internals while preserving the public
+  session-store interfaces.
+
 ## v0.11.0
 
 Cayu adds managed process snapshots, opt-in storage retention, and execution-profile

@@ -1,7 +1,7 @@
 {
   "contextual_pricing_requirements": [],
-  "generated_at": "2026-10-09",
-  "price_book_version": "2026-10-09",
+  "generated_at": "2026-10-12",
+  "price_book_version": "2026-10-12",
   "prices": [
     {
       "aliases": [],
@@ -468,7 +468,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -509,7 +509,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -551,7 +551,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -626,7 +626,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -646,7 +646,7 @@
       "schedules": [
         {
           "effective_from": "2026-07-01",
-          "effective_through": null,
+          "effective_through": "2026-10-11",
           "pricing": {
             "batch": null,
             "cache_write_1h_per_million": null,
@@ -671,6 +671,37 @@
           },
           "provenance": {
             "as_of": "2026-09-09",
+            "source": "official",
+            "url": "https://prices.azure.com/api/retail/prices"
+          }
+        },
+        {
+          "effective_from": "2026-10-12",
+          "effective_through": null,
+          "pricing": {
+            "batch": null,
+            "cache_write_1h_per_million": null,
+            "cache_write_5m_per_million": null,
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.4",
+                "cache_write_input_per_million": "5",
+                "input_per_million": "4",
+                "max_input_tokens": 272000,
+                "output_per_million": "20"
+              },
+              {
+                "cache_read_input_per_million": "0.8",
+                "cache_write_input_per_million": "10",
+                "input_per_million": "8",
+                "max_input_tokens": null,
+                "output_per_million": "30"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -745,7 +776,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -828,7 +859,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/index.json"
           }
@@ -994,48 +1025,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
-            "source": "official",
-            "url": "https://ai.google.dev/gemini-api/docs/pricing"
-          }
-        }
-      ]
-    },
-    {
-      "aliases": [],
-      "cache_write_ttls": [],
-      "match": "exact",
-      "match_prefixes": [
-        "gemini-3.5-flash-00"
-      ],
-      "model": "gemini-3.5-flash",
-      "pricing_context": null,
-      "provider_name": "google",
-      "schedules": [
-        {
-          "effective_from": null,
-          "effective_through": null,
-          "pricing": {
-            "batch": {
-              "cache_read_input_per_million": "0.075",
-              "input_per_million": "0.75",
-              "max_input_tokens": null,
-              "output_per_million": "4.5"
-            },
-            "cache_write_1h_per_million": null,
-            "cache_write_5m_per_million": null,
-            "currency": "USD",
-            "standard": [
-              {
-                "cache_read_input_per_million": "0.15",
-                "input_per_million": "1.5",
-                "max_input_tokens": null,
-                "output_per_million": "9"
-              }
-            ]
-          },
-          "provenance": {
-            "as_of": "2026-09-24",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://ai.google.dev/gemini-api/docs/pricing"
           }
@@ -1323,7 +1313,7 @@
             "web_search_per_thousand": "10"
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://developers.openai.com/api/docs/pricing"
           }
@@ -1590,7 +1580,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-10-11",
           "pricing": {
             "batch": {
               "cache_read_input_per_million": null,
@@ -1612,6 +1602,34 @@
           },
           "provenance": {
             "as_of": "2026-09-09",
+            "source": "official",
+            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+          }
+        },
+        {
+          "effective_from": "2026-10-12",
+          "effective_through": null,
+          "pricing": {
+            "batch": {
+              "cache_read_input_per_million": "0.5",
+              "input_per_million": "5",
+              "max_input_tokens": null,
+              "output_per_million": "25"
+            },
+            "cache_write_1h_per_million": "20",
+            "cache_write_5m_per_million": "12.5",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "1",
+                "input_per_million": "10",
+                "max_input_tokens": null,
+                "output_per_million": "50"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
           }
@@ -1674,7 +1692,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-10-11",
           "pricing": {
             "batch": {
               "cache_read_input_per_million": null,
@@ -1699,6 +1717,34 @@
             "source": "official",
             "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
           }
+        },
+        {
+          "effective_from": "2026-10-12",
+          "effective_through": null,
+          "pricing": {
+            "batch": {
+              "cache_read_input_per_million": "0.25",
+              "input_per_million": "2.5",
+              "max_input_tokens": null,
+              "output_per_million": "12.5"
+            },
+            "cache_write_1h_per_million": "10",
+            "cache_write_5m_per_million": "6.25",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.5",
+                "input_per_million": "5",
+                "max_input_tokens": null,
+                "output_per_million": "25"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-12",
+            "source": "official",
+            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+          }
         }
       ]
     },
@@ -1713,7 +1759,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-10-11",
           "pricing": {
             "batch": {
               "cache_read_input_per_million": null,
@@ -1735,6 +1781,34 @@
           },
           "provenance": {
             "as_of": "2026-09-09",
+            "source": "official",
+            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+          }
+        },
+        {
+          "effective_from": "2026-10-12",
+          "effective_through": null,
+          "pricing": {
+            "batch": {
+              "cache_read_input_per_million": "0.25",
+              "input_per_million": "2.5",
+              "max_input_tokens": null,
+              "output_per_million": "12.5"
+            },
+            "cache_write_1h_per_million": "10",
+            "cache_write_5m_per_million": "6.25",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.5",
+                "input_per_million": "5",
+                "max_input_tokens": null,
+                "output_per_million": "25"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
           }
@@ -1755,7 +1829,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-10-11",
           "pricing": {
             "batch": {
               "cache_read_input_per_million": null,
@@ -1777,6 +1851,34 @@
           },
           "provenance": {
             "as_of": "2026-09-09",
+            "source": "official",
+            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+          }
+        },
+        {
+          "effective_from": "2026-10-12",
+          "effective_through": null,
+          "pricing": {
+            "batch": {
+              "cache_read_input_per_million": "0.15",
+              "input_per_million": "1.5",
+              "max_input_tokens": null,
+              "output_per_million": "7.5"
+            },
+            "cache_write_1h_per_million": "6",
+            "cache_write_5m_per_million": "3.75",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.3",
+                "input_per_million": "3",
+                "max_input_tokens": null,
+                "output_per_million": "15"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
           }
@@ -1818,7 +1920,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-09",
+            "as_of": "2026-10-12",
             "source": "official",
             "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
           }
