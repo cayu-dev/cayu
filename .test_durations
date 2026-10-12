@@ -1,4 +1,12 @@
 {
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_publication_cancellation_does_not_publish": 0.004,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_publication_replay_and_detached_readback": 0.005,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_resolves_replaced_indexes_after_lock": 0.003,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_source_rejects_inexact_evidence[binding]": 0.006,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_source_rejects_inexact_evidence[event]": 0.006,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_source_rejects_inexact_evidence[transcript]": 0.006,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_source_snapshot_detaches_and_keeps_current_flags": 0.498,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_views_import_without_stores": 0.395,
   "tests/core/test_memory_peer_content_ownership.py::test_memory_peer_adapter_resolves_clock_and_indexes_after_lock_wait": 0.081,
   "tests/core/test_memory_peer_content_ownership.py::test_memory_peer_and_ordinary_admission_share_global_queue_ordering": 0.008,
   "tests/core/test_memory_peer_content_ownership.py::test_memory_peer_cancelled_lock_wait_preserves_admission_state": 0.004,

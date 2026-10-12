@@ -80,6 +80,7 @@ from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
+from cayu.sessions import _memory_context_views as memory_context_views
 from cayu.sessions import _memory_event_delivery as memory_event_delivery
 from cayu.sessions import _memory_event_reads as memory_event_reads
 from cayu.sessions import _memory_evidence as memory_evidence
@@ -237,7 +238,6 @@ from cayu.sessions.records import (
     SessionStatusConflict,
     StoreTimeCheckpointTransform,
     TranscriptRecord,
-    copy_session,
     copy_session_identity,
     copy_session_runtime_identity,
     copy_session_user_metadata,
@@ -1249,6 +1249,36 @@ class InMemorySessionStore(
                 transcripts=self._transcripts,
             )
 
+    @asynccontextmanager
+    async def _context_view_source_state(
+        self,
+    ) -> AsyncIterator[memory_context_views.MemoryContextViewSourceState]:
+        async with self._lock:
+            yield memory_context_views.MemoryContextViewSourceState(
+                checkpoints=self._checkpoints,
+                event_records_by_id=self._event_records_by_id,
+                participant_session_bindings=self._participant_session_bindings,
+                pending_session_messages=self._pending_session_messages,
+                session_closure_progress=self._session_closure_progress,
+                session_event_records=self._session_event_records,
+                session_operation_records=self._session_operation_records,
+                sessions=self._sessions,
+                transcript_interaction_ids=self._transcript_interaction_ids,
+                transcripts=self._transcripts,
+                validate_publication_material=self._validate_runtime_publication_material_unlocked,
+            )
+
+    @asynccontextmanager
+    async def _context_view_state(
+        self,
+    ) -> AsyncIterator[memory_context_views.MemoryContextViewState]:
+        async with self._lock:
+            yield memory_context_views.MemoryContextViewState(
+                context_publication_keys=self._context_publication_keys,
+                context_views=self._context_views,
+                sessions=self._sessions,
+            )
+
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec:
         return self._public_authority_alias_codec
@@ -2195,152 +2225,27 @@ class InMemorySessionStore(
         return (await self._capture_completed_turn_snapshot(session_id)).publication
 
     async def _capture_completed_turn_snapshot(self, session_id: str) -> CompletedTurnSnapshot:
-        from cayu.sessions._context_view_source import (
-            CompletedTurnSnapshot,
-            capture_source,
-            closed_round_publication_id,
-            completed_boundary,
-            publication_frontier,
+        return await memory_context_views.capture_completed_turn_snapshot(
+            self._context_view_source_state,
+            session_id,
         )
-
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            binding = self._participant_session_bindings.get(session_id)
-            checkpoint = self._checkpoints.get(session_id)
-            pointer = completed_boundary(session, binding, checkpoint)
-            assert session is not None and binding is not None
-            tool_receipt = None
-            if pointer.tool_round_id is not None:
-                publication_id = f"tool-round:{pointer.tool_round_id}"
-                key = publication_contracts._runtime_publication_storage_key(publication_id)
-                record = self._session_operation_records.get(session_id, {}).get(key)
-                if record is None:
-                    from itertools import islice
-
-                    closures = tuple(
-                        islice(
-                            (
-                                item.event
-                                for item in reversed(
-                                    self._session_event_records.get(session_id, ())
-                                )
-                                if item.event.type is EventType.SESSION_CHECKPOINTED
-                                and item.event.payload.get("tool_round_id") == pointer.tool_round_id
-                                and (
-                                    item.event.payload.get("cleared") is True
-                                    or item.event.payload.get("transition") == "answered"
-                                )
-                            ),
-                            2,
-                        )
-                    )
-                    publication_id = closed_round_publication_id(pointer, closures)
-                    key = publication_contracts._runtime_publication_storage_key(publication_id)
-                    record = self._session_operation_records.get(session_id, {}).get(key)
-                if record is not None:
-                    tool_receipt = publication_rules._reconstruct_runtime_publication_receipt(
-                        record,
-                        storage_key=key,
-                        session_id=session_id,
-                        publication_id=publication_id,
-                    )
-                publication_frontier(pointer, tool_receipt)
-                assert tool_receipt is not None
-                self._validate_runtime_publication_material_unlocked(tool_receipt)
-            end = publication_frontier(pointer, tool_receipt)
-            event = self._event_records_by_id.get((session_id, pointer.completion_event_id))
-            messages = self._transcripts.get(session_id, [])
-            interactions = self._transcript_interaction_ids.get(session_id, [])
-            records = tuple(
-                TranscriptRecord(
-                    index=index,
-                    interaction_id=interactions[index],
-                    message=detach_message(messages[index]),
-                )
-                for index in range(
-                    pointer.source_transcript_cursor,
-                    min(end, len(messages)),
-                )
-            )
-            publication = capture_source(
-                session,
-                binding,
-                checkpoint,
-                pointer,
-                None if event is None else event.event,
-                records,
-                tool_receipt,
-            )
-            return CompletedTurnSnapshot(
-                publication=publication,
-                current_session=copy_session(session),
-                checkpoint=deepcopy(checkpoint),
-                has_queued_input=any(
-                    (session_id, mode) in self._pending_session_messages
-                    for mode in SessionMessageDeliveryMode
-                ),
-                has_closure_owner=any(
-                    session_id in closure_records._closure_progress_targets(owner)
-                    for owner in self._session_closure_progress.values()
-                ),
-                has_active_model_stage=MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
-                in self._session_operation_records.get(session_id, {}),
-                current_transcript_cursor=len(messages),
-            )
 
     async def publish_context_view(
         self, manifest: _ContextViewManifest, *, publication_key: str
     ) -> _ContextViewManifest:
-        from cayu.sessions.context_views import (
-            CONTEXT_VIEW_MAX_PUBLICATIONS_PER_OWNER,
+        return await memory_context_views.publish_context_view(
+            self._context_view_state,
+            manifest,
+            publication_key=publication_key,
         )
-        from cayu.sessions.context_views import (
-            ContextViewManifest as ContextViewManifestType,
-        )
-
-        if type(manifest) is not ContextViewManifestType or type(publication_key) is not str:
-            raise TypeError("Context-view publication requires typed manifest and key.")
-        if len(publication_key.encode("utf-8")) > 512:
-            raise ValueError("publication_key must be at most 512 UTF-8 bytes.")
-        publication_key = require_clean_nonblank(publication_key, "publication_key")
-        async with self._lock:
-            existing_id = self._context_publication_keys.get(publication_key)
-            if existing_id is not None:
-                existing = self._context_views[existing_id]
-                if existing != manifest:
-                    raise ValueError("Context-view publication key conflicts with its manifest.")
-                return existing.model_copy(deep=True)
-            if manifest.view_id in self._context_views:
-                raise ValueError("Context-view ID is already bound to another manifest.")
-            source = self._sessions.get(manifest.source_session_id)
-            if source is None or source.instance_id != manifest.source_session_instance_id:
-                raise LookupError("The source session incarnation is unavailable.")
-            publication_count = sum(
-                view.source_owner == manifest.source_owner for view in self._context_views.values()
-            )
-            if publication_count >= CONTEXT_VIEW_MAX_PUBLICATIONS_PER_OWNER:
-                raise OverflowError("Context-view publication quota exceeded for the owner.")
-            self._context_views[manifest.view_id] = manifest.model_copy(deep=True)
-            self._context_publication_keys[publication_key] = manifest.view_id
-            return manifest.model_copy(deep=True)
 
     async def lookup_context_view_publication(
         self, publication_key: str
     ) -> _ContextViewManifest | None:
-        from cayu.sessions.context_views import ContextViewManifest as ContextViewManifestType
-
-        if type(publication_key) is not str or not publication_key.strip():
-            raise ValueError("Context-view publication keys must be non-blank strings.")
-        if len(publication_key.encode("utf-8")) > 512:
-            raise ValueError("publication_key must be at most 512 UTF-8 bytes.")
-        async with self._lock:
-            view_id = self._context_publication_keys.get(publication_key)
-            if view_id is None:
-                return None
-            manifest = self._context_views.get(view_id)
-            if manifest is None or type(manifest) is not ContextViewManifestType:
-                raise RuntimeError("Context-view publication index is inconsistent.")
-            return manifest.model_copy(deep=True)
+        return await memory_context_views.lookup_context_view_publication(
+            self._context_view_state,
+            publication_key,
+        )
 
     def _require_context_view_lifecycle_capacity(
         self, view_id: str, *, additional_slots: int = 0
@@ -2886,13 +2791,11 @@ class InMemorySessionStore(
     async def read_context_view(
         self, view_id: str, *, source_session_id: str
     ) -> _ContextViewReadback:
-        from cayu.sessions.context_views import ContextViewReadback as ContextViewReadbackType
-
-        async with self._lock:
-            view = self._context_views.get(view_id)
-            if view is None or view.source_session_id != source_session_id:
-                raise LookupError("Context view is unavailable.")
-            return ContextViewReadbackType(view=view.model_copy(deep=True))
+        return await memory_context_views.read_context_view(
+            self._context_view_state,
+            view_id,
+            source_session_id=source_session_id,
+        )
 
     async def create_fork(
         self,
