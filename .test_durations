@@ -1,4 +1,8 @@
 {
+  "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_decision_reader_diagnostics_do_not_expand_callback": 0.001,
+  "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_state_diagnostics_do_not_expand_stored_records[locked]": 0.054,
+  "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_state_diagnostics_do_not_expand_stored_records[participants]": 0.001,
+  "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_state_diagnostics_do_not_expand_stored_records[read_participants]": 0.001,
   "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_and_fork_compose_without_a_store": 0.22,
   "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_cancelled_lock_wait_leaves_state_unchanged[create]": 0.001,
   "tests/core/test_memory_session_creation_ownership.py::test_memory_creation_cancelled_lock_wait_leaves_state_unchanged[fork]": 0.001,

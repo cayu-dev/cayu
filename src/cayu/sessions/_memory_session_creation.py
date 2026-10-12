@@ -139,7 +139,7 @@ class CreateSession(Protocol):
     ) -> Session: ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class MemorySessionCreationState(Generic[EventsT, CheckpointT]):
     """Current creation indexes and synchronous publication capabilities.
 
@@ -147,6 +147,9 @@ class MemorySessionCreationState(Generic[EventsT, CheckpointT]):
     owned by the publication implementation: creation only reads the checkpoint
     and event records needed by validation and returns them to the paired apply
     capability. Callbacks must neither yield nor reacquire the lock.
+
+    Keep the representation opaque: exception diagnostics must not expand the
+    borrowed store records or caller-owned callbacks, which can contain secrets.
     """
 
     apply_checkpoint_store: Callable[[str, CheckpointT], None]
@@ -188,9 +191,12 @@ class MemorySessionCreationState(Generic[EventsT, CheckpointT]):
     transcripts: dict[str, list[Message]]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class MemoryParticipantState:
-    """Participant records borrowed under the operation's existing lock."""
+    """Participant records borrowed under the operation's existing lock.
+
+    Keep diagnostic representations opaque, as for the session creation state.
+    """
 
     sessions: dict[str, Session]
     participant_session_bindings: dict[str, ParticipantSessionBinding]
@@ -199,19 +205,22 @@ class MemoryParticipantState:
     participant_session_request_commitments: dict[str, str | None]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class CreationDecisionReader:
+    """Replay capability whose representation does not inspect its caller."""
+
     read_session_creation_decision: Callable[
         [creation_fence.SessionCreationTarget], Awaitable[object]
     ]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class MemoryParticipantCreationState(MemoryParticipantState):
     """Participant serialization also encloses native create and fence readback.
 
     The create/read callbacks acquire the store lock after the participant lock,
     matching deletion. They must resolve current state at their own lock boundary.
+    Retain the opaque representation of the borrowed participant state.
     """
 
     create: CreateSession

@@ -12,6 +12,7 @@ from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from traceback import TracebackException
 from types import SimpleNamespace
 
 import pytest
@@ -209,6 +210,62 @@ assert callable(owner.create) and callable(owner.create_fork)
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _format_state_failure(state):
+    try:
+        raise ValueError("rejected operation")
+    except ValueError as error:
+        return "".join(TracebackException.from_exception(error, capture_locals=True).format())
+
+
+@pytest.mark.parametrize("context", ["locked", "read_participants", "participants"])
+def test_memory_creation_state_diagnostics_do_not_expand_stored_records(context):
+    secret = "creation-state-diagnostic-secret-canary"
+
+    async def run():
+        harness = _Composition()
+        session = await harness.ops.create(
+            RunRequest(
+                agent_name="agent", session_id="private", messages=[], labels={"private": secret}
+            ),
+            identity=IDENTITY,
+            checkpoint_transform=lambda session, prior: {"private": secret},
+        )
+        harness.indexes.messages[session.id] = [Message.text("user", secret)]
+
+        async with getattr(harness, context)() as state:
+            diagnostic = _format_state_failure(state)
+            assert type(state).__name__ in diagnostic
+            assert secret not in diagnostic
+            assert secret not in repr(state)
+            assert secret not in str(state)
+
+        # Formatting borrowed state must leave the caller's records intact.
+        assert harness.state.sessions[session.id].labels == {"private": secret}
+        assert harness.state.checkpoints[session.id] == {"private": secret}
+        assert harness.indexes.messages[session.id] == [Message.text("user", secret)]
+
+    asyncio.run(run())
+
+
+def test_memory_creation_decision_reader_diagnostics_do_not_expand_callback():
+    @dataclass
+    class Reader:
+        credential: str
+
+        async def __call__(self, target):
+            raise AssertionError("Diagnostics must not call the reader")
+
+    secret = "creation-reader-diagnostic-secret-canary"
+    callback = Reader(credential=secret)
+    reader = creation.CreationDecisionReader(callback)
+    diagnostic = _format_state_failure(reader)
+    assert type(reader).__name__ in diagnostic
+    assert secret not in diagnostic
+    assert secret not in repr(reader)
+    assert secret not in str(reader)
+    assert reader.read_session_creation_decision is callback
 
 
 def test_memory_creation_and_fork_compose_without_a_store():
