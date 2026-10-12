@@ -1,4 +1,10 @@
 {
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_control_requires_authority_and_reports_exact_evidence": 0.004,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_ownership_failure_retains_expiry_evidence": 0.004,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_selection_ownership_and_retention_compose": 0.008,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_selection_restores_all_evidence_after_write_failure[CancelledError]": 0.007,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_selection_restores_all_evidence_after_write_failure[RuntimeError]": 0.006,
+  "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_selection_snapshot_failure_releases_lock": 0.005,
   "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_publication_cancellation_does_not_publish": 0.004,
   "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_publication_replay_and_detached_readback": 0.005,
   "tests/core/test_memory_context_view_ownership.py::test_memory_context_view_resolves_replaced_indexes_after_lock": 0.003,
