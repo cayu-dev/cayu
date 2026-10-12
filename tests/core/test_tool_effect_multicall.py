@@ -4,10 +4,10 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
-from tests.core.test_runtime import _valid_png_bytes
 from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider
+from tests.runtime.runtime_attachment_support import _valid_png_bytes
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp

@@ -11,7 +11,7 @@ import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 from tests.core.test_model_failover_stages import _StageMemoryStore, _StageSQLiteStore
 from tests.core.test_provider_operations import _ReconnectableProvider
-from tests.core.test_runtime import _app_with_artifact_store, _valid_png_bytes
+from tests.runtime.runtime_attachment_support import _app_with_artifact_store, _valid_png_bytes
 
 from cayu import (
     AgentSpec,

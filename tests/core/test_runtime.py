@@ -1,3 +1,5 @@
+"""Application registration, admission and runtime identity contracts."""
+
 from __future__ import annotations
 
 import asyncio
@@ -49,6 +51,96 @@ from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 from tests.provider_traceback_assertions import is_cayu_source_filename
 from tests.runner_cancellation import cancelled_error_with_artifacts
+from tests.runtime.runtime_attachment_support import _app_with_artifact_store, _valid_png_bytes
+from tests.runtime.runtime_budget_support import BlockingBudgetProvider, fake_budget_limit
+from tests.runtime.runtime_compaction_support import (
+    _AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE,
+    CompletedThenRetryableCompactionProvider,
+    FlakyCompactionProvider,
+    ProcessLossAutomaticCompactionStore,
+    RecordingCompactor,
+    _expected_compaction_failure,
+    compaction_price_book,
+)
+from tests.runtime.runtime_environment_support import (
+    EnvironmentProvisioningRecorder,
+    MemoryWorkspace,
+    ProvisionedTestRunner,
+    RecordingEnvironmentFactory,
+    RecordingWorkspaceBinding,
+    WorkspaceIdTool,
+    assert_environment_was_not_provisioned,
+)
+from tests.runtime.runtime_provider_support import (
+    ContextOverflowProvider,
+    CountingProvider,
+    FakeProvider,
+    NativeStructuredOutputFakeProvider,
+    StageRecordingFakeProvider,
+    VersionedFakeProvider,
+)
+from tests.runtime.runtime_recovery_support import (
+    FailingAfterPendingToolRoundCheckpointStore,
+    FailingOrdinaryToolResultCloseStore,
+    FailingSecondTerminalToolEventStore,
+    FailingTerminalToolEventStore,
+    FailNextRunFenceReleaseStore,
+    _crashed_tool_round_app,
+)
+from tests.runtime.runtime_session_support import (
+    _INTERACTION_LIFECYCLE_EVENT_TYPES,
+    _SETTLED_DRAIN_TIMEOUT_S,
+    _AllowForkProfileAdoption,
+    _approval_pause_app,
+    _assert_proxy_tool_effect_remains_unknown,
+    _current_fork_profile_selection,
+    _expected_failure_evidence,
+    _pending_tool_approval_from_public_event,
+    _private_events_for_public_events,
+    _private_record_for_public_event,
+    _reviewer_actor,
+    _runtime_exception_graph,
+    _taint_aware_policy,
+    _test_session,
+    _tool_round_identity,
+    _without_interaction_lifecycle,
+    _without_request_evidence,
+    assert_only_model_step_publication_checkpoint,
+    checkpoint_without_active_invocation_profile,
+    checkpoint_without_model_step_publication,
+    collect_dispatch_events,
+    collect_events,
+    collect_fork_events,
+    collect_interrupt_events,
+    collect_resume_events,
+    collect_tool_approval_events,
+    collect_tool_approval_recovery_events,
+    collect_tool_round_recovery_events,
+    collect_user_input_events,
+    interruption_payload_without_request_id,
+    tool_round_identity_payload,
+    transition_runtime_session_to_running,
+)
+from tests.runtime.runtime_session_support import (
+    request_footprint_session_store as request_footprint_session_store,
+)
+from tests.runtime.runtime_tool_hook_support import (
+    _RecordingEchoTool,
+    _RewriteTextHook,
+    _run_reauth_case,
+    _tool_call_provider,
+)
+from tests.runtime.runtime_tool_support import (
+    EchoTool,
+    ExpiringApprovalPolicy,
+    PureRecordingTool,
+    RequireApprovalPolicy,
+    SideEffectApprovalPolicy,
+    SideEffectTool,
+    UpperTool,
+    _ProtectedEmailTool,
+    _TaintSourceTool,
+)
 
 import cayu
 import cayu.applications as runtime_app_module
@@ -68,13 +160,7 @@ import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.sessions._model_completion_publication as model_completion_publication_module
 import cayu.sessions.base as sessions_module
-from cayu._exception_groups import (
-    exception_cause,
-    exception_context,
-    exception_group_children,
-    exception_suppresses_context,
-    iter_exception_tree,
-)
+from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._validation import canonical_durable_json_bytes
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -172,7 +258,6 @@ from cayu.environments.factory import (
     EnvironmentFactoryResult,
 )
 from cayu.events import Event, EventType
-from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import (
     FilePart,
     Message,
@@ -235,10 +320,7 @@ from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime._binding_cleanup import (
-    binding_cleanup_status,
-    record_binding_cleanup_failure,
-)
+from cayu.runtime._binding_cleanup import binding_cleanup_status, record_binding_cleanup_failure
 from cayu.runtime._compaction import automatic as _automatic_compaction
 from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
 from cayu.runtime._event_projection import (
@@ -295,7 +377,6 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import (
-    ForkExecutionProfileSelection,
     ForkSystemPromptPolicy,
     fork_session_invocation,
     session_prompt_anatomy_transition,
@@ -328,7 +409,6 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
 )
-from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
@@ -384,143 +464,13 @@ from cayu.tools.user_input import UserInputTool
 from cayu.vaults.base import ResolvedSecret, SecretRef
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 from cayu.vaults.static import StaticVault
-from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
 from cayu.workspaces.local import LocalWorkspace
-
-# A drain returns as soon as its work settles, so a check that work did settle
-# needs no tight deadline: this budget only bounds a failing run. Measured under
-# CPU load, these drains took up to ~330 ms; 2 s leaves margin for slower CI
-# runners. Checks that a blocked cleanup does not settle keep short budgets.
-_SETTLED_DRAIN_TIMEOUT_S = 2.0
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
     def __init__(self, *args, **kwargs) -> None:
         kwargs.setdefault("access_scope", KnowledgeAccessScope.privileged())
         super().__init__(*args, **kwargs)
-
-
-class FakeProvider(ModelProvider):
-    name = "fake"
-
-    def __init__(
-        self,
-        events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],
-    ) -> None:
-        if events and isinstance(events[0], list):
-            self.event_batches = events  # type: ignore[assignment]
-        else:
-            self.event_batches = [events]  # type: ignore[list-item]
-        self.requests: list[ModelRequest] = []
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.requests.append(request)
-        batch_index = len(self.requests) - 1
-        if batch_index >= len(self.event_batches):
-            raise AssertionError(f"No fake provider event batch for request {batch_index}")
-        for event in self.event_batches[batch_index]:
-            yield event
-
-
-class StageRecordingFakeProvider(FakeProvider):
-    def __init__(
-        self,
-        events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],
-        *,
-        store: InMemorySessionStore,
-        session_id: str,
-    ) -> None:
-        super().__init__(events)
-        self.store = store
-        self.session_id = session_id
-        self.stage_ids: list[str] = []
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        active = await self.store.load_active_model_completion_stage(self.session_id)
-        assert active is not None
-        self.stage_ids.append(active.stage.stage_id)
-        async for event in super().stream(request):
-            yield event
-
-
-class UsageDialectMutatingProvider(FakeProvider):
-    usage_dialect = UsageDialect.ANTHROPIC
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.usage_dialect = UsageDialect.GENERIC
-        async for event in super().stream(request):
-            yield event
-
-
-class StrictToolHistoryProvider(FakeProvider):
-    """Reject tool history that is not backed by a declared request tool."""
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        declared_tools = {
-            tool["name"] for tool in request.tools if isinstance(tool.get("name"), str)
-        }
-        calls_by_id: dict[str, str] = {}
-        for message in request.messages:
-            for part in message.content:
-                if type(part) is ToolCallPart:
-                    if part.tool_name not in declared_tools:
-                        raise AssertionError(
-                            f"Undeclared tool call in provider history: {part.tool_name}"
-                        )
-                    calls_by_id[part.tool_call_id] = part.tool_name
-                elif type(part) is ToolResultPart:
-                    if part.tool_name not in declared_tools:
-                        raise AssertionError(
-                            f"Undeclared tool result in provider history: {part.tool_name}"
-                        )
-                    if calls_by_id.get(part.tool_call_id) != part.tool_name:
-                        raise AssertionError(
-                            f"Unmatched tool result in provider history: {part.tool_call_id}"
-                        )
-        async for event in super().stream(request):
-            yield event
-
-
-class CompactionIdentityMutatingProvider(FakeProvider):
-    name = "gateway"
-    billing_provider_name = "billco"
-    usage_dialect = UsageDialect.ANTHROPIC
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.name = "poisoned\x00provider"
-        self.billing_provider_name = "poisoned\ud800billing"
-        self.usage_dialect = UsageDialect.GENERIC
-        async for event in super().stream(request):
-            yield event
-
-
-class BlockingBudgetProvider(ModelProvider):
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.cancelled = asyncio.Event()
-        self.requests: list[ModelRequest] = []
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.requests.append(request)
-        self.started.set()
-        try:
-            await self.release.wait()
-        except asyncio.CancelledError:
-            self.cancelled.set()
-            raise
-        yield ModelStreamEvent.completed(
-            {
-                "finish_reason": "stop",
-                "usage": {
-                    "input_tokens": 250_000,
-                    "output_tokens": 0,
-                    "total_tokens": 250_000,
-                },
-            }
-        )
 
 
 class CancellationCleanupFailingBudgetProvider(BlockingBudgetProvider):
@@ -584,58 +534,6 @@ class ObservingHeartbeatBudgetLedger(InMemoryBudgetLedger):
         return renewed
 
 
-class CountingProvider(FakeProvider):
-    def __init__(
-        self,
-        events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],
-        *,
-        count_result: InputTokenCountResult | None = None,
-        count_error: Exception | None = None,
-    ) -> None:
-        super().__init__(events)
-        self.count_result = count_result
-        self.count_error = count_error
-        self.count_requests: list[ModelRequest] = []
-
-    async def count_input_tokens(
-        self,
-        request: ModelRequest,
-    ) -> InputTokenCountResult | None:
-        self.count_requests.append(request)
-        if self.count_error is not None:
-            raise self.count_error
-        return self.count_result
-
-
-class ContextOverflowProvider(ModelProvider):
-    name = "overflow"
-
-    def __init__(
-        self,
-        *,
-        overflow_requests: int = 1,
-        success_events: list[ModelStreamEvent] | None = None,
-    ) -> None:
-        self.overflow_requests = overflow_requests
-        self.success_events = success_events or [
-            ModelStreamEvent.text_delta("recovered"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-        self.requests: list[ModelRequest] = []
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.requests.append(request)
-        if len(self.requests) <= self.overflow_requests:
-            raise ModelContextOverflowError(
-                "context too large",
-                provider=self.name,
-                status_code=400,
-                error_code="context_length_exceeded",
-            )
-        for event in self.success_events:
-            yield event
-
-
 class MessageCountOverflowProvider(ModelProvider):
     """Overflows full history but accepts a bounded two-message rebuild."""
 
@@ -697,22 +595,6 @@ class OtherProvider(FakeProvider):
     name = "other"
 
 
-class VersionedFakeProvider(FakeProvider):
-    """Opaque fake whose request behavior is stable across test app instances."""
-
-    @property
-    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
-        return ExecutionProfileBehaviorIdentity(
-            name="tests:runtime:versioned-fake-provider",
-            behavior_version="1",
-            implementation_version="1",
-        )
-
-
-class NativeStructuredOutputFakeProvider(FakeProvider):
-    supports_native_structured_output = True
-
-
 class SchemaRejectingProvider(NativeStructuredOutputFakeProvider):
     def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
         raise NativeStructuredOutputSchemaInvalid("$: rejected by provider preflight.")
@@ -760,33 +642,6 @@ class MutatingProvider(FakeProvider):
             yield event
 
 
-class RecordingCompactor(ContextCompactor):
-    def __init__(self) -> None:
-        self.requests: list[CompactionRequest] = []
-
-    def provider_budget_identity(self, session: Session) -> None:
-        del session
-        return None
-
-    async def compact(self, request: CompactionRequest) -> CompactionResult:
-        self.requests.append(request)
-        compacted_text = "|".join(message.content[0].text for message in request.messages)
-        if request.existing_summary is not None:
-            summary = f"{request.existing_summary}|{compacted_text}"
-        else:
-            summary = compacted_text
-        return CompactionResult(
-            summary=summary,
-            covered_message_count=len(request.messages),
-            represented_existing_summary_sha256=(
-                hashlib.sha256(request.existing_summary.encode("utf-8")).hexdigest()
-                if request.existing_summary is not None
-                else None
-            ),
-            metadata={"request_count": len(self.requests)},
-        )
-
-
 class FailingCompactor(ContextCompactor):
     def provider_budget_identity(self, _session: Session) -> None:
         return None
@@ -808,108 +663,6 @@ class FailingApprovalCloseStore(InMemorySessionStore):
             self.failed_close_once = True
             raise RuntimeError("approval close unavailable")
         return await super().publish_runtime_publication(session_id, **kwargs)
-
-
-class FailingTerminalToolEventStore(InMemorySessionStore):
-    invocation_lifecycle_command_version = 1
-
-    def __init__(self, *, ownership_clock=None) -> None:
-        super().__init__(ownership_clock=ownership_clock)
-        self.failed_terminal_once = False
-        self.release_calls = 0
-
-    async def release_run_fence(self, session_id: str) -> None:
-        self.release_calls += 1
-        await super().release_run_fence(session_id)
-
-    async def release_session_invocation(self, command):
-        self.release_calls += 1
-        return await super().release_session_invocation(command)
-
-    async def append_events(self, session_id: str, events: list[Event]) -> None:
-        if not self.failed_terminal_once and any(
-            event.type == EventType.TOOL_CALL_COMPLETED for event in events
-        ):
-            self.failed_terminal_once = True
-            raise RuntimeError("terminal tool event unavailable")
-        await super().append_events(session_id, events)
-
-
-class FailNextRunFenceReleaseStore(InMemorySessionStore):
-    invocation_lifecycle_command_version = 1
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.fail_next_release = False
-
-    async def release_run_fence(self, session_id: str) -> None:
-        if self.fail_next_release:
-            self.fail_next_release = False
-            try:
-                raise OSError("run fence database connection lost")
-            except OSError as cause:
-                raise RuntimeError("run fence release failed") from cause
-        await super().release_run_fence(session_id)
-
-    async def release_session_invocation(self, command):
-        if self.fail_next_release:
-            self.fail_next_release = False
-            try:
-                raise OSError("run fence database connection lost")
-            except OSError as cause:
-                raise RuntimeError("run fence release failed") from cause
-        return await super().release_session_invocation(command)
-
-
-class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
-    invocation_lifecycle_command_version = 1
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.failed_tool_round_close_once = False
-
-    async def publish_runtime_publication(
-        self,
-        session_id: str,
-        *,
-        request,
-        expected_statuses=None,
-        expected_run_epoch=None,
-        expected_transcript_cursor=None,
-    ):
-        if not self.failed_tool_round_close_once and request.kind == "tool-round":
-            self.failed_tool_round_close_once = True
-            raise RuntimeError("ordinary tool round close unavailable")
-        return await super().publish_runtime_publication(
-            session_id,
-            request=request,
-            expected_statuses=expected_statuses,
-            expected_run_epoch=expected_run_epoch,
-            expected_transcript_cursor=expected_transcript_cursor,
-        )
-
-
-class FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
-    invocation_lifecycle_command_version = 1
-
-    def __init__(
-        self,
-        *,
-        ownership_clock: Callable[[], datetime] | None = None,
-    ) -> None:
-        super().__init__(ownership_clock=ownership_clock)
-        self.failed_pending_tool_round_once = False
-
-    async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
-        checkpoint = await super().load_checkpoint(session_id)
-        if (
-            not self.failed_pending_tool_round_once
-            and checkpoint is not None
-            and "pending_tool_round" in checkpoint
-        ):
-            self.failed_pending_tool_round_once = True
-            raise RuntimeError("pending tool round checkpoint persisted before crash")
-        return checkpoint
 
 
 async def _checkpoint_allow_policy_plan(
@@ -1028,62 +781,6 @@ class BlockingPostPersistEventsLoadStore(FailingTerminalToolEventStore):
         return events
 
 
-class FailingSecondTerminalToolEventStore(InMemorySessionStore):
-    invocation_lifecycle_command_version = 1
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.completed_tool_events = 0
-
-    async def append_events(self, session_id: str, events: list[Event]) -> None:
-        for event in events:
-            if event.type == EventType.TOOL_CALL_COMPLETED:
-                self.completed_tool_events += 1
-                if self.completed_tool_events == 2:
-                    raise RuntimeError("second terminal tool event unavailable")
-        await super().append_events(session_id, events)
-
-
-class MemoryWorkspace(Workspace):
-    def __init__(self, workspace_id: str) -> None:
-        self.id = workspace_id
-
-    def bounded_read_limit(self, max_bytes: int) -> int:
-        return max_bytes
-
-    async def read_bytes(
-        self,
-        path: str,
-        *,
-        offset: int = 0,
-        max_bytes: int | None = None,
-    ) -> WorkspaceReadResult:
-        return WorkspaceReadResult(content=b"", total_bytes=0)
-
-    async def write_bytes(self, path: str, content: bytes) -> None:
-        return None
-
-    async def delete(self, path: str) -> None:
-        return None
-
-    async def create_bytes(self, path: str, content: bytes):
-        raise NotImplementedError
-
-    async def replace_bytes(self, path: str, content: bytes, *, expected_revision: str):
-        raise NotImplementedError
-
-    async def delete_if_revision(self, path: str, *, expected_revision: str):
-        raise NotImplementedError
-
-    async def list(
-        self,
-        pattern: str = "**/*",
-        *,
-        limit: int | None = None,
-    ) -> WorkspaceListResult:
-        return WorkspaceListResult(paths=(), total_count=0)
-
-
 class MetadataMutatingProvider(FakeProvider):
     def __init__(self) -> None:
         super().__init__(
@@ -1108,245 +805,6 @@ class MetadataMutatingProvider(FakeProvider):
             if len(self.requests) == 1:
                 request.options["agent_metadata"]["nested"]["value"] = "mutated"
             yield event
-
-
-class EchoTool(Tool):
-    spec = ToolSpec(
-        name="echo",
-        description="Echo text.",
-        input_schema={
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
-        },
-    )
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        return ToolResult(
-            content=args["text"],
-            structured={"agent": ctx.agent_name, "echoed": args["text"]},
-        )
-
-
-class WorkspaceIdTool(Tool):
-    spec = ToolSpec(
-        name="workspace_id",
-        description="Return the active workspace id.",
-        input_schema={"type": "object", "properties": {}},
-    )
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        return ToolResult(
-            content=ctx.workspace_id or "none",
-            structured={"workspace_id": ctx.workspace_id},
-        )
-
-
-class RecordingWorkspaceBinding(WorkspaceBinding):
-    def __init__(
-        self,
-        *,
-        bound_workspace: Workspace | None = None,
-        snapshot: WorkspaceSnapshot | None = None,
-        final_snapshot: WorkspaceSnapshot | None = None,
-        fail_bind: bool = False,
-        fail_finalize: bool = False,
-        finalize_error: RuntimeError | None = None,
-    ) -> None:
-        self.bound_workspace = bound_workspace
-        self.snapshot = snapshot
-        self.final_snapshot = final_snapshot
-        self.fail_bind = fail_bind
-        self.fail_finalize = fail_finalize
-        self.finalize_error = finalize_error
-        self.bind_calls: list[dict] = []
-        self.finalize_calls: list[dict] = []
-
-    async def bind(
-        self,
-        workspace: Workspace | None,
-        runner: Any,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-        environment_name: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> BoundWorkspace:
-        self.bind_calls.append(
-            {
-                "workspace": workspace,
-                "runner": runner,
-                "session_id": session_id,
-                "agent_name": agent_name,
-                "environment_name": environment_name,
-                "metadata": metadata,
-            }
-        )
-        if self.fail_bind:
-            raise RuntimeError("bind failed")
-        return BoundWorkspace(
-            workspace=self.bound_workspace if self.bound_workspace is not None else workspace,
-            source_workspace=workspace,
-            runner=runner,
-            path="/bound",
-            metadata={"binding": "recording"},
-            snapshot=self.snapshot,
-        )
-
-    async def finalize(
-        self,
-        bound: BoundWorkspace,
-        *,
-        outcome: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> WorkspaceSnapshot | None:
-        self.finalize_calls.append(
-            {
-                "bound": bound,
-                "outcome": outcome,
-                "metadata": metadata,
-            }
-        )
-        if self.fail_finalize:
-            raise self.finalize_error or RuntimeError("finalize failed")
-        return self.final_snapshot
-
-
-class RecordingEnvironmentFactory(EnvironmentFactory):
-    def __init__(
-        self,
-        environment: Environment,
-        *,
-        fail_create: bool = False,
-        metadata: dict[str, Any] | None = None,
-        reconnect_metadata: dict[str, Any] | None = None,
-        release: Any = None,
-        release_timeout_s: float = 15.0,
-        create_error: BaseException | None = None,
-    ) -> None:
-        self.environment = environment
-        self.fail_create = fail_create
-        self.metadata = metadata or {}
-        self.reconnect_metadata = reconnect_metadata or {}
-        self.release = release
-        self.release_timeout_s = release_timeout_s
-        self.create_error = create_error
-        self.requests: list[EnvironmentFactoryRequest] = []
-
-    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
-        self.requests.append(request)
-        if self.create_error is not None:
-            raise self.create_error
-        if self.fail_create:
-            raise RuntimeError("factory failed")
-        return EnvironmentFactoryResult(
-            environment=self.environment,
-            metadata=self.metadata,
-            reconnect_metadata=self.reconnect_metadata,
-            release=self.release,
-            release_timeout_s=self.release_timeout_s,
-        )
-
-
-class ProvisionedTestRunner(Runner):
-    async def exec(
-        self,
-        command: ExecCommand,
-        *,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_s: int | None = None,
-        stdin: str | None = None,
-        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
-    ) -> ExecResult:
-        return ExecResult(stdout="unused")
-
-
-class RecordingWorkspaceAllocator:
-    def __init__(self) -> None:
-        self.requests: list[EnvironmentFactoryRequest] = []
-        self.workspaces: list[MemoryWorkspace] = []
-
-    def allocate(self, request: EnvironmentFactoryRequest) -> Workspace:
-        self.requests.append(request)
-        workspace = MemoryWorkspace(f"workspace-{request.session_id}")
-        self.workspaces.append(workspace)
-        return workspace
-
-
-class RecordingRunnerAllocator:
-    def __init__(self) -> None:
-        self.requests: list[EnvironmentFactoryRequest] = []
-        self.runners: list[ProvisionedTestRunner] = []
-
-    def allocate(self, request: EnvironmentFactoryRequest) -> Runner:
-        self.requests.append(request)
-        runner = ProvisionedTestRunner()
-        self.runners.append(runner)
-        return runner
-
-
-class RecordingBindingAllocator:
-    def __init__(self) -> None:
-        self.requests: list[EnvironmentFactoryRequest] = []
-        self.bindings: list[RecordingWorkspaceBinding] = []
-
-    def allocate(self, request: EnvironmentFactoryRequest) -> WorkspaceBinding:
-        self.requests.append(request)
-        binding = RecordingWorkspaceBinding()
-        self.bindings.append(binding)
-        return binding
-
-
-class AllocatingEnvironmentFactory(EnvironmentFactory):
-    def __init__(
-        self,
-        environment_name: str,
-        *,
-        workspace_allocator: RecordingWorkspaceAllocator,
-        runner_allocator: RecordingRunnerAllocator,
-        binding_allocator: RecordingBindingAllocator,
-    ) -> None:
-        self.environment_name = environment_name
-        self.workspace_allocator = workspace_allocator
-        self.runner_allocator = runner_allocator
-        self.binding_allocator = binding_allocator
-        self.requests: list[EnvironmentFactoryRequest] = []
-
-    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
-        self.requests.append(request)
-        return EnvironmentFactoryResult(
-            environment=Environment(
-                EnvironmentSpec(name=self.environment_name),
-                workspace=self.workspace_allocator.allocate(request),
-                runner=self.runner_allocator.allocate(request),
-                binding=self.binding_allocator.allocate(request),
-            ),
-            reconnect_metadata={"sandbox_id": "unexpected"},
-        )
-
-
-class EnvironmentProvisioningRecorder:
-    def __init__(self, environment_name: str) -> None:
-        self.workspace_allocator = RecordingWorkspaceAllocator()
-        self.runner_allocator = RecordingRunnerAllocator()
-        self.binding_allocator = RecordingBindingAllocator()
-        self.factory = AllocatingEnvironmentFactory(
-            environment_name,
-            workspace_allocator=self.workspace_allocator,
-            runner_allocator=self.runner_allocator,
-            binding_allocator=self.binding_allocator,
-        )
-
-
-def assert_environment_was_not_provisioned(recorder: EnvironmentProvisioningRecorder) -> None:
-    assert recorder.factory.requests == []
-    assert recorder.workspace_allocator.requests == []
-    assert recorder.workspace_allocator.workspaces == []
-    assert recorder.runner_allocator.requests == []
-    assert recorder.runner_allocator.runners == []
-    assert recorder.binding_allocator.requests == []
-    assert recorder.binding_allocator.bindings == []
 
 
 class RecordingSessionFailedHook(RuntimeHook):
@@ -1424,59 +882,6 @@ class InvalidConstructedResultTool(Tool):
         )
 
 
-class SideEffectTool(Tool):
-    spec = ToolSpec(
-        name="side_effect",
-        description="Record execution.",
-        input_schema={"type": "object", "properties": {}},
-        execution_profile_identity=ExecutionProfileBehaviorIdentity(
-            name="tests:runtime:side-effect-tool",
-            behavior_version="1",
-            implementation_version="1",
-        ),
-    )
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.calls: list[dict] = []
-        self.contexts: list[ToolContext] = []
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        self.calls.append(args)
-        self.contexts.append(ctx)
-        return ToolResult(content="recorded")
-
-
-class PureRecordingTool(SideEffectTool):
-    """Compute a fixed result; calls/contexts are test instrumentation only.
-
-    Manual-recovery lifecycle tests use this tool because operator disposition
-    remains supported for NONE effects, not for selected external evidence.
-    """
-
-    spec = SideEffectTool.spec.model_copy(update={"effect": ToolEffect.NONE})
-
-
-class RequireApprovalPolicy(ToolPolicy):
-    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
-        return ToolPolicyResult(
-            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-            reason=f"Approval required for {request.tool_name}.",
-            metadata={"scope": "human"},
-        )
-
-
-class SideEffectApprovalPolicy(ToolPolicy):
-    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
-        if request.tool_name == "side_effect":
-            return ToolPolicyResult(
-                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-                reason=f"Approval required for {request.tool_name}.",
-                metadata={"scope": "human"},
-            )
-        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
-
-
 class DenyEchoRequireSideEffectApprovalPolicy(ToolPolicy):
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         if request.tool_name == "echo":
@@ -1522,21 +927,6 @@ class ResultHoldingTool(Tool):
             artifacts=[{"nested": {"value": "original"}}],
         )
         return self.result
-
-
-class UpperTool(Tool):
-    spec = ToolSpec(
-        name="upper",
-        description="Uppercase text.",
-        input_schema={
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
-        },
-    )
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        return ToolResult(content=args["text"].upper())
 
 
 class ContinueBeforeStopPolicy(LoopPolicy):
@@ -1601,57 +991,6 @@ class FailBeforeStopPolicy(LoopPolicy):
         return BeforeStopDecision.fail("completion gate failed")
 
 
-_INTERACTION_LIFECYCLE_EVENT_TYPES = {
-    EventType.INTERACTION_STARTED,
-    EventType.INTERACTION_RESUMED,
-    EventType.INTERACTION_PAUSED,
-    EventType.INTERACTION_COMPLETED,
-    EventType.INTERACTION_FAILED,
-    EventType.INTERACTION_INTERRUPTED,
-}
-
-
-def _without_interaction_lifecycle(events: list[Event]) -> list[Event]:
-    """Keep legacy event-sequence assertions focused on their original contract."""
-    return [event for event in events if event.type not in _INTERACTION_LIFECYCLE_EVENT_TYPES]
-
-
-def _without_request_evidence(events: list[Event]) -> list[Event]:
-    """Keep pre-evidence event-sequence assertions focused on their contracts."""
-    request_evidence_types = {
-        EventType.REQUEST_FOOTPRINT_RECORDED,
-        EventType.TOOL_EXPOSURE_RECORDED,
-        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
-    }
-    return [event for event in events if event.type not in request_evidence_types]
-
-
-def _runtime_exception_graph(error: BaseException) -> list[BaseException]:
-    """Collect one runtime-owned exception graph, including explicit causes."""
-
-    pending = [error]
-    collected: list[BaseException] = []
-    visited: set[int] = set()
-    while pending:
-        candidate = pending.pop()
-        if id(candidate) in visited:
-            continue
-        visited.add(id(candidate))
-        collected.append(candidate)
-        if isinstance(candidate, BaseExceptionGroup):
-            children = exception_group_children(candidate)
-            if children is not None:
-                pending.extend(children)
-        cause = exception_cause(candidate)
-        if cause is not None:
-            pending.append(cause)
-        elif not exception_suppresses_context(candidate):
-            context = exception_context(candidate)
-            if context is not None:
-                pending.append(context)
-    return collected
-
-
 def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
     interaction_ids = {
         event.interaction_id
@@ -1665,85 +1004,12 @@ def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
     return interaction_id
 
 
-async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
-    events = [event async for event in app.run(request)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
 async def collect_request_footprint_events(
     app: CayuApp,
     request: RunRequest,
 ) -> list[Event]:
     events = [event async for event in app.run(request)]
     return _without_interaction_lifecycle(events)
-
-
-def _private_record_for_public_event(
-    records: list[EventRecord],
-    event: Event,
-) -> EventRecord:
-    """Resolve one public app event to its private record without comparing raw IDs."""
-
-    sequence = public_event_sequence(event.id)
-    assert sequence is not None
-    matches = [record for record in records if record.sequence == sequence]
-    assert len(matches) == 1
-    return matches[0]
-
-
-async def _private_events_for_public_events(
-    store: SessionStore,
-    session_id: str,
-    events: list[Event],
-) -> list[Event]:
-    records = await store.query_events(EventQuery(session_id=session_id))
-    return [_private_record_for_public_event(records, event).event for event in events]
-
-
-async def _pending_tool_approval_from_public_event(
-    store: InMemorySessionStore,
-    event: Event,
-) -> PendingToolApproval:
-    private_event = (
-        await _private_events_for_public_events(
-            store,
-            event.session_id,
-            [event],
-        )
-    )[0]
-    projected_approval = PendingToolApprovalEventView.from_event(private_event)
-    checkpoint_approval = pending_approval_reader.pending_approval_from_checkpoint(
-        await store.load_checkpoint(event.session_id)
-    )
-    assert checkpoint_approval is not None
-    assert (
-        projected_approval.approval_id,
-        projected_approval.tool_call_id,
-        projected_approval.model_step_id,
-        projected_approval.model_attempt_id,
-        projected_approval.tool_round_id,
-    ) == (
-        checkpoint_approval.approval_id,
-        checkpoint_approval.tool_call_id,
-        checkpoint_approval.model_step_id,
-        checkpoint_approval.model_attempt_id,
-        checkpoint_approval.tool_round_id,
-    )
-    return checkpoint_approval
-
-
-def tool_round_identity_payload(event: Event) -> dict[str, str]:
-    return {
-        key: event.payload[key] for key in ("model_step_id", "model_attempt_id", "tool_round_id")
-    }
-
-
-def _tool_round_identity() -> ToolRoundIdentity:
-    return ToolRoundIdentity(
-        model_step_id=f"mstep_{'1' * 32}",
-        model_attempt_id=f"matt_{'2' * 32}",
-        tool_round_id=f"tround_{'3' * 32}",
-    )
 
 
 def _interaction_started_event(
@@ -1771,11 +1037,6 @@ def _interaction_started_event(
     )
 
 
-async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
-    events = [event async for event in app.resume(request)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
 def assert_model_step_limit_interruption(
     events: list[Event],
     *,
@@ -1797,118 +1058,6 @@ def assert_model_step_limit_interruption(
     assert interrupted_event.payload["limit"] == "model_steps"
     assert interrupted_event.payload["maximum"] == maximum
     assert interrupted_event.payload["actual"] == actual
-
-
-def assert_only_model_step_publication_checkpoint(
-    checkpoint: dict[str, Any] | None,
-) -> None:
-    assert checkpoint is not None
-    settled = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
-    optional_keys = (
-        {SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY} if settled is not None else set()
-    )
-    assert set(checkpoint) - optional_keys == {
-        CHECKPOINT_SCHEMA_VERSION_KEY,
-        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-        model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
-    assert (
-        model_completion_publication_module.model_step_publication_from_checkpoint(checkpoint)
-        is not None
-    )
-    assert (
-        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
-        is not None
-    )
-
-
-def checkpoint_without_model_step_publication(
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any]:
-    assert checkpoint is not None
-    assert (
-        model_completion_publication_module.model_step_publication_from_checkpoint(checkpoint)
-        is not None
-    )
-    copied = dict(checkpoint)
-    copied.pop(model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
-    copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
-    copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
-    if SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in copied:
-        assert settled_invocation_terminal_decision_from_checkpoint(copied) is not None
-        copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
-    return copied
-
-
-def _expected_failure_evidence(
-    session_id: str, *exception_types: str, run_epoch: int = 1
-) -> dict[str, Any]:
-    return {
-        "classification": "failure",
-        "deadline": None,
-        "deadline_phase": None,
-        "exception_types": list(exception_types),
-        "run_epoch": run_epoch,
-        "secondary_failures": False,
-        "session_id": session_id,
-        "settlement": "unknown",
-        "terminal_event_id": None,
-        "truncated": False,
-    }
-
-
-def _expected_compaction_failure(
-    event: Event,
-    *,
-    reason: str = "internal_failed",
-) -> dict[str, Any]:
-    assert event.type == EventType.CONTEXT_COMPACTION_FAILED
-    elapsed_ms = event.payload["elapsed_ms"]
-    assert type(elapsed_ms) is int and elapsed_ms >= 0
-    expected = {
-        "elapsed_ms": elapsed_ms,
-        "phase": "provider_dispatch",
-        "provider_dispatch_disposition": "unknown",
-        "reason": reason,
-        "recovery_action": "reconcile_completion",
-        "retryable": False,
-    }
-    assert {key: event.payload[key] for key in expected} == expected
-    return expected
-
-
-def checkpoint_without_active_invocation_profile(
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any]:
-    assert checkpoint is not None
-    assert (
-        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
-        is not None
-    )
-    copied = dict(checkpoint)
-    copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
-    copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
-    if SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in copied:
-        assert settled_invocation_terminal_decision_from_checkpoint(copied) is not None
-        copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
-    return copied
-
-
-async def transition_runtime_session_to_running(
-    store: SessionStore,
-    session_id: str,
-) -> Session:
-    return await rebind_test_invocation(store, session_id)
-
-
-def interruption_payload_without_request_id(payload: dict[str, Any]) -> dict[str, Any]:
-    copied = dict(payload)
-    request_id = copied.pop("interruption_request_id")
-    if request_id != PRIVATE_EVENT_AUTHORITY:
-        assert UUID(request_id)
-    return copied
 
 
 def test_context_counting_is_off_by_default() -> None:
@@ -1940,38 +1089,6 @@ def test_context_counting_is_off_by_default() -> None:
     assert provider.count_requests == []
     assert EventType.CONTEXT_COUNTED not in {event.type for event in events}
     assert EventType.CONTEXT_COUNT_RECONCILED not in {event.type for event in events}
-
-
-@pytest.fixture(params=("memory", "sqlite"), ids=("memory", "sqlite"))
-def request_footprint_session_store(request, tmp_path):
-    if request.param == "memory":
-        store = InMemorySessionStore()
-    else:
-        import base64
-
-        from cayu.runtime.public_authority import (
-            PublicAuthorityAliasCodec,
-            PublicAuthorityAliasKeyring,
-        )
-
-        alias_codec = PublicAuthorityAliasCodec(
-            PublicAuthorityAliasKeyring(
-                active_key_id="test",
-                keys={
-                    "test": SecretStr(
-                        base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
-                    )
-                },
-            )
-        )
-        store = SQLiteSessionStore(
-            tmp_path / "request-footprint-matrix.sqlite",
-            public_authority_alias_codec=alias_codec,
-        )
-    yield store
-    close = getattr(store, "close", None)
-    if close is not None:
-        asyncio.run(close())
 
 
 def test_request_footprint_is_default_on_before_model_start_without_provider_counting(
@@ -4851,145 +3968,8 @@ def test_command_policy_redacts_proxy_resolved_secret_before_bounding_denial() -
     assert "BOUNDARY" not in str(tool_result.model_dump(mode="json"))
 
 
-def fake_budget_limit(
-    max_estimated_cost: str,
-    *,
-    scope: Literal["session", "run"] = "session",
-    allow_unpriced: bool = False,
-    window: BudgetWindow | str | None = None,
-    action: Literal["interrupt", "notify"] = "interrupt",
-) -> BudgetLimit:
-    return BudgetLimit(
-        max_estimated_cost=Decimal(max_estimated_cost),
-        window=BudgetWindow.all_time() if window is None else window,
-        pricing=PriceBook(
-            prices=(
-                ModelPrice.fixed(
-                    provider_name="fake",
-                    model="fake-model",
-                    input_per_million=Decimal("1"),
-                    output_per_million=Decimal("10"),
-                ),
-            )
-        ),
-        scope=scope,
-        allow_unpriced=allow_unpriced,
-        action=action,
-    )
-
-
-def compaction_price_book() -> PriceBook:
-    return PriceBook(
-        prices=(
-            ModelPrice.fixed(
-                provider_name="fake",
-                model="fake-model",
-                input_per_million=Decimal("1"),
-                output_per_million=Decimal("10"),
-            ),
-            ModelPrice.fixed(
-                provider_name="fake",
-                model="summary-model",
-                input_per_million=Decimal("1"),
-                output_per_million=Decimal("10"),
-            ),
-        )
-    )
-
-
-async def collect_interrupt_events(app: CayuApp, request: InterruptSessionRequest) -> list[Event]:
-    return [event async for event in app.interrupt_session(request)]
-
-
-async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list[Event]:
-    return [event async for event in app.fork_session(request)]
-
-
-def _current_fork_profile_selection(
-    idempotency_key: str,
-) -> dict[str, object]:
-    return {
-        "execution_profile_selection": ForkExecutionProfileSelection.CURRENT_CHILD,
-        "profile_adoption": ExecutionProfileAdoptionIntent(
-            idempotency_key=idempotency_key,
-            reason="Install the explicitly selected current child execution profile.",
-            requested_by=ResolutionActor(
-                subject="test-caller",
-                source=ResolutionActorSource.REQUEST,
-            ),
-        ),
-    }
-
-
-class _AllowForkProfileAdoption(ExecutionProfilePolicy):
-    @property
-    def identity(self) -> str:
-        return "test:allow-fork-profile-adoption:v1"
-
-    async def decide(
-        self,
-        request: ExecutionProfilePolicyRequest,
-    ) -> ExecutionProfilePolicyResult:
-        return ExecutionProfilePolicyResult(
-            action=ExecutionProfilePolicyAction.ADOPT,
-            reason="The test explicitly authorizes the selected child profile.",
-            authority_decision=(
-                ExecutionProfileAuthorityDecision.AUTHORIZED
-                if request.authority_review_required
-                else ExecutionProfileAuthorityDecision.NOT_REQUIRED
-            ),
-        )
-
-
-async def collect_dispatch_events(app: CayuApp, request: DispatchRequest) -> list[Event]:
-    events = [event async for event in app.dispatch_inline(request)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
 async def submit_dispatch(app: CayuApp, request: DispatchRequest) -> DispatchHandle:
     return await app.dispatch(request)
-
-
-async def collect_tool_approval_events(
-    app: CayuApp,
-    request: ToolApprovalRequest,
-) -> list[Event]:
-    events = [event async for event in app.resolve_tool_approval(request)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
-async def collect_user_input_events(
-    app: CayuApp,
-    response: UserInputResponse,
-) -> list[Event]:
-    events = [event async for event in app.resolve_user_input(response)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
-async def collect_tool_approval_recovery_events(
-    app: CayuApp,
-    request: ToolApprovalRecoveryRequest,
-) -> list[Event]:
-    events = [event async for event in app.recover_tool_approval(request)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
-async def collect_tool_round_recovery_events(
-    app: CayuApp,
-    request: ToolRoundRecoveryRequest,
-) -> list[Event]:
-    events = [event async for event in app.recover_tool_round(request)]
-    return _without_request_evidence(_without_interaction_lifecycle(events))
-
-
-def _test_session() -> Session:
-    return Session(
-        id="sess_context",
-        agent_name="assistant",
-        provider_name="fake",
-        model="fake-model",
-        invocation=fixture_session_invocation("sess_context"),
-    )
 
 
 def _test_session_identity() -> SessionIdentity:
@@ -19146,44 +18126,6 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
     assert provider.requests[2].messages[-1].role == "tool"
 
 
-class _TaintSourceTool(Tool):
-    spec = ToolSpec(
-        name="read_web",
-        description="Fetch untrusted web content.",
-        input_schema={"type": "object", "properties": {}},
-    )
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        return ToolResult(content="untrusted page content")
-
-
-class _ProtectedEmailTool(Tool):
-    spec = ToolSpec(
-        name="send_email",
-        description="Send an email to an external address.",
-        input_schema={
-            "type": "object",
-            "properties": {"body": {"type": "string"}},
-        },
-    )
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.calls: list[dict] = []
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        self.calls.append(args)
-        return ToolResult(content="email sent")
-
-
-def _taint_aware_policy() -> TaintAwareToolPolicy:
-    return TaintAwareToolPolicy(
-        taint_sources={"read_web": ["web"]},
-        protected_tools={"send_email": ["web"]},
-        decision=ToolPolicyDecision.DENY,
-    )
-
-
 def _build_taint_app(
     provider: ModelProvider,
 ) -> tuple[CayuApp, InMemorySessionStore, _ProtectedEmailTool]:
@@ -25107,44 +24049,6 @@ def test_cayu_app_after_tool_call_hook_failure_does_not_stop_tool_round():
     assert session.status == SessionStatus.COMPLETED
 
 
-class _RecordingEchoTool(Tool):
-    spec = ToolSpec(
-        name="echo",
-        description="Echo text, recording each invocation.",
-        input_schema={
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
-        },
-    )
-
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        self.calls.append(args)
-        return ToolResult(content=args["text"], structured={"echoed": args["text"]})
-
-
-def _tool_call_provider() -> FakeProvider:
-    return FakeProvider(
-        [
-            [
-                ModelStreamEvent.tool_call(
-                    id="call_echo",
-                    name="echo",
-                    arguments={"text": "original"},
-                ),
-                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-            ],
-            [
-                ModelStreamEvent.text_delta("done"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ],
-        ]
-    )
-
-
 def test_before_tool_call_hook_modifies_arguments():
     class ArgModifierHook(RuntimeHook):
         async def before_tool_call(
@@ -25204,41 +24108,6 @@ class _DenyTextPolicy(ToolPolicy):
                 metadata={"gate": "effective_arguments"},
             )
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
-
-
-class _RewriteTextHook(RuntimeHook):
-    def __init__(self, value: str) -> None:
-        self._value = value
-
-    async def before_tool_call(self, context: BeforeToolCallHookContext) -> BeforeToolCallDecision:
-        modified = dict(context.arguments)
-        modified["text"] = self._value
-        return BeforeToolCallDecision(action="proceed_modified", modified_arguments=modified)
-
-
-def _run_reauth_case(session_id, policy, hooks, extra_hooks=()):
-    store = InMemorySessionStore()
-    tool = _RecordingEchoTool()
-    app = CayuApp(session_store=store)
-    app.register_provider(_tool_call_provider(), default=True)
-    app.register_agent(
-        AgentSpec(name="assistant", model="fake-model"),
-        tools=[tool],
-        tool_policy=policy,
-        runtime_hooks=[*hooks, *extra_hooks],
-    )
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id=session_id,
-                messages=[Message.text("user", "go")],
-            ),
-        )
-    )
-    transcript = asyncio.run(store.load_transcript(session_id))
-    return tool, events, transcript
 
 
 def test_before_tool_call_modified_args_are_reauthorized_and_denied():
@@ -27544,6 +26413,8 @@ def test_cayu_app_does_not_redispatch_after_established_openai_sse_reset(
 
 
 _SEMANTIC_DEADLINE_PROCESS_EXIT_CODE = 87
+
+
 _SEMANTIC_DEADLINE_PROCESS_SESSION_ID = "semantic-deadline-process-loss"
 
 
@@ -29857,73 +28728,6 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
     ]
     assert transcript[2].content[0].content == "recorded"
     assert transcript[4].content[0].content == "recorded"
-
-
-def _crashed_tool_round_app(
-    session_id: str,
-    store: FailingTerminalToolEventStore | None = None,
-    *,
-    clock: Callable[[], datetime] | None = None,
-    secret_redactor: SecretRedactor | None = None,
-    environment: Environment | None = None,
-    provider_capture: list[FakeProvider] | None = None,
-    limits: RunLimits | None = None,
-    continuation_events: list[ModelStreamEvent] | None = None,
-    tool: SideEffectTool | None = None,
-) -> tuple[CayuApp, FailingTerminalToolEventStore, SideEffectTool, dict]:
-    """Fail terminal-event publication after the only tool has returned.
-
-    Returns a FAILED session with an intact pending round. For EXTERNAL tools
-    the effect record and staged terminal are already selected; this is a
-    publication-repair fixture, not an ambiguous external-effect fixture. A
-    supplied replay-safe tool retains the ordinary manual-recovery contract.
-    """
-    store = store if store is not None else FailingTerminalToolEventStore()
-    tool = SideEffectTool() if tool is None else tool
-    provider = VersionedFakeProvider(
-        [
-            [
-                ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
-                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-            ],
-            (
-                [
-                    ModelStreamEvent.text_delta("recovered"),
-                    ModelStreamEvent.completed({"finish_reason": "stop"}),
-                ]
-                if continuation_events is None
-                else continuation_events
-            ),
-        ]
-    )
-    if provider_capture is not None:
-        provider_capture.append(provider)
-    app = CayuApp(
-        session_store=store,
-        clock=clock,
-        secret_redactor=secret_redactor,
-    )
-    app.register_provider(provider, default=True)
-    if environment is not None:
-        app.register_environment(environment, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
-
-    initial_events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id=session_id,
-                messages=[Message.text("user", "use the tool")],
-                limits=RunLimits() if limits is None else limits,
-            ),
-        )
-    )
-    assert initial_events[-1].type == EventType.SESSION_FAILED
-    checkpoint = asyncio.run(store.load_checkpoint(session_id))
-    assert checkpoint is not None and "pending_tool_round" in checkpoint
-    assert tool.calls == [{}]
-    return app, store, tool, checkpoint
 
 
 def test_recovery_plan_does_not_offer_unvalidated_external_effect_disposition() -> None:
@@ -38281,27 +37085,6 @@ def test_tool_approval_requested_audit_metadata_is_bounded_and_redacted():
     assert all("metadata" not in call for call in unknown_approval["tool_calls"])
 
 
-class ExpiringApprovalPolicy(ToolPolicy):
-    def __init__(self, expires_in_seconds: float = 60.0) -> None:
-        self.expires_in_seconds = expires_in_seconds
-
-    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
-        return ToolPolicyResult(
-            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-            reason=f"Approval required for {request.tool_name}.",
-            approval_expires_in_seconds=self.expires_in_seconds,
-        )
-
-
-def _reviewer_actor() -> ResolutionActor:
-    return ResolutionActor(
-        subject="reviewer@example.com",
-        tenant="acme",
-        source=ResolutionActorSource.REQUEST,
-        claims={"role": "admin"},
-    )
-
-
 class _BlockingApprovalTool(Tool):
     spec = ToolSpec(
         name="side_effect",
@@ -38349,39 +37132,6 @@ class _BlockingApprovalContinuationProvider(ModelProvider):
         self.continuation_started.set()
         await self.never_complete.wait()
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
-
-
-def _approval_pause_app(
-    *,
-    store: InMemorySessionStore,
-    tool: Tool,
-    policy: ToolPolicy,
-    clock=None,
-) -> tuple[CayuApp, FakeProvider]:
-    provider = FakeProvider(
-        [
-            [
-                ModelStreamEvent.tool_call(
-                    id="call_1",
-                    name="side_effect",
-                    arguments={"value": "secret"},
-                ),
-                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-            ],
-            [
-                ModelStreamEvent.text_delta("resolved"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ],
-        ]
-    )
-    app = CayuApp(session_store=store, clock=clock)
-    app.register_provider(provider, default=True)
-    app.register_agent(
-        AgentSpec(name="assistant", model="fake-model"),
-        tools=[tool],
-        tool_policy=policy,
-    )
-    return app, provider
 
 
 def test_tool_approval_resolution_retains_round_authority_for_unknown_secret_scope():
@@ -43766,47 +42516,6 @@ def test_model_compactor_reports_model_completed_payload_with_usage_metrics():
             },
         }
     ]
-
-
-class FlakyCompactionProvider(ModelProvider):
-    name = "flaky"
-
-    def __init__(self, *, failures: int, error: Exception) -> None:
-        self.failures = failures
-        self.error = error
-        self.requests: list[ModelRequest] = []
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.requests.append(request)
-        if len(self.requests) <= self.failures:
-            raise self.error
-        yield ModelStreamEvent.text_delta("recovered summary")
-        yield ModelStreamEvent.completed({"finish_reason": "stop"})
-
-
-class CompletedThenRetryableCompactionProvider(ModelProvider):
-    name = "retry-after-completed"
-
-    def __init__(self) -> None:
-        self.requests: list[ModelRequest] = []
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        self.requests.append(request)
-        attempt = len(self.requests)
-        yield ModelStreamEvent.text_delta(f"summary {attempt}")
-        yield ModelStreamEvent.completed(
-            {
-                "model": request.model,
-                "usage": {"input_tokens": attempt, "output_tokens": 1},
-            }
-        )
-        if attempt == 1:
-            raise ModelProviderError(
-                "transport failed after completed",
-                provider=self.name,
-                status_code=503,
-                retryable=True,
-            )
 
 
 def test_model_compactor_retries_transient_provider_errors():
@@ -55764,26 +54473,6 @@ def test_strip_old_file_attachments_preserves_latest_attachment_result_only():
     assert strip_all[6].content[0].artifacts == []
 
 
-def _app_with_artifact_store(tmp_path, **app_kwargs) -> tuple[CayuApp, LocalArtifactStore]:
-    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
-    app = CayuApp(enable_logging=False, **app_kwargs)
-    app.register_environment(
-        Environment(EnvironmentSpec(name="local"), artifact_store=store),
-        default=True,
-    )
-    return app, store
-
-
-def _valid_png_bytes() -> bytes:
-    import io
-
-    from PIL import Image
-
-    buffer = io.BytesIO()
-    Image.new("RGB", (1, 1), "white").save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
 def _valid_jpeg_bytes() -> bytes:
     import io
 
@@ -61819,28 +60508,6 @@ def test_interrupt_session_stops_in_flight_tool_call():
     )
 
 
-async def _assert_proxy_tool_effect_remains_unknown(store, session_id: str) -> None:
-    from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-
-    session = await store.load(session_id)
-    assert session is not None
-    assert session.status is SessionStatus.INTERRUPTED
-    checkpoint = await store.load_checkpoint(session_id)
-    pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
-    assert pending is not None
-    assert len(pending.tool_calls) == 1
-    record = await ToolEffectStateOwner(store).resolve_call(
-        session,
-        tool_round_id=pending.tool_round_id,
-        tool_call_id=pending.tool_calls[0].tool_call_id,
-    )
-    assert record is not None
-    assert record.state == "outcome_unknown"
-    assert record.terminal is None
-    transcript = await store.load_transcript(session_id)
-    assert not any(message.role == "tool" for message in transcript)
-
-
 def test_interrupt_session_preserves_proxy_authorization_events() -> None:
     class ProxyBlockingTool(Tool):
         spec = ToolSpec(
@@ -65639,7 +64306,6 @@ def test_cayu_app_deadline_capacity_exhaustion_precedes_provider_dispatch() -> N
     asyncio.run(run())
 
 
-_AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE = 88
 _AUTOMATIC_COMPACTION_PROCESS_SESSION_ID = "automatic-compaction-process-loss"
 
 
@@ -65667,45 +64333,6 @@ class ProcessLossSuccessfulCompactionProvider(ModelProvider):
                 "usage": {"input_tokens": 3, "output_tokens": 2},
             }
         )
-
-
-class ProcessLossAutomaticCompactionStore(SQLiteSessionStore):
-    invocation_lifecycle_command_version = 1
-
-    def __init__(self, database: str, *, crash_point: str) -> None:
-        super().__init__(database)
-        self._crash_point = crash_point
-
-    async def complete_model_completion_stage(self, session_id: str, **kwargs):
-        result = await super().complete_model_completion_stage(session_id, **kwargs)
-        if (
-            self._crash_point == "completed"
-            and result.stage.purpose == "context-compaction"
-            and not result.replayed
-        ):
-            os._exit(_AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE)
-        return result
-
-    async def promote_model_completion_stage(
-        self,
-        session_id: str,
-        *,
-        stage_id: str,
-        expected_run_epoch: int,
-    ):
-        active = await self.load_active_model_completion_stage(session_id)
-        result = await super().promote_model_completion_stage(
-            session_id,
-            stage_id=stage_id,
-            expected_run_epoch=expected_run_epoch,
-        )
-        if (
-            self._crash_point == "promoted"
-            and active is not None
-            and active.stage.purpose == "context-compaction"
-        ):
-            os._exit(_AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE)
-        return result
 
 
 def _automatic_compaction_process_budget_policy() -> BudgetPolicy:

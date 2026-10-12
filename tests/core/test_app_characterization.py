@@ -66,7 +66,7 @@ _UNASSOCIATED_INTERACTION_EVENT_TYPES = {
 class ScriptedProvider(ModelProvider):
     """Deterministic provider that replays one scripted event batch per request.
 
-    Modeled on ``tests/core/test_runtime.py``'s ``FakeProvider`` but defined
+    Modeled on ``tests/runtime/runtime_provider_support.py``'s ``FakeProvider`` but defined
     locally so these goldens never depend on another test module. When
     ``count_result`` is set it also answers ``count_input_tokens`` so the
     observe-mode context-counting path can be exercised.

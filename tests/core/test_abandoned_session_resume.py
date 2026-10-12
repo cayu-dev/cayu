@@ -10,8 +10,9 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from tests.core.test_runtime import RequireApprovalPolicy, VersionedFakeProvider
 from tests.core.test_session_execution_presence import _app, _consume, _stores
+from tests.runtime.runtime_provider_support import VersionedFakeProvider
+from tests.runtime.runtime_tool_support import RequireApprovalPolicy
 
 from cayu import (
     AgentSpec,

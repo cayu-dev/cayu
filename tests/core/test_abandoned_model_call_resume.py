@@ -8,8 +8,8 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from tests.core.test_runtime import VersionedFakeProvider
 from tests.core.test_session_execution_presence import _consume
+from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
 from cayu import (
     AgentSpec,

@@ -8,12 +8,12 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from tests.core.test_runtime import (
+from tests.runtime.runtime_provider_support import (
     CountingProvider,
     FakeProvider,
     UsageDialectMutatingProvider,
-    collect_events,
 )
+from tests.runtime.runtime_session_support import collect_events
 
 from cayu import CayuConfig, RunDefaults
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError

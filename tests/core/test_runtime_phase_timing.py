@@ -6,8 +6,8 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import pytest
-from tests.core.test_runtime import VersionedFakeProvider
 from tests.core.test_tool_round_publication_failure_matrix import store_factory as store_factory
+from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
 from cayu import (
     STRUCTURED_OUTPUT_TOOL_NAME,

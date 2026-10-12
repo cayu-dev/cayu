@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from tests.core.test_runtime import FakeProvider, collect_events
+from tests.runtime.runtime_provider_support import FakeProvider
+from tests.runtime.runtime_session_support import collect_events
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp

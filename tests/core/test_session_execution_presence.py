@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from tests.core.test_runtime import VersionedFakeProvider
+from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
 from cayu import (
     AgentSpec,

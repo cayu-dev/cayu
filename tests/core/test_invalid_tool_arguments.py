@@ -194,7 +194,7 @@ def test_profile_changes_only_for_approval_configurations():
 
 
 def test_hook_rewrite_cannot_dispatch_schema_invalid_arguments():
-    from tests.core.test_runtime import _RewriteTextHook, _run_reauth_case
+    from tests.runtime.runtime_tool_hook_support import _RewriteTextHook, _run_reauth_case
 
     tool, events, _transcript = _run_reauth_case(
         "invalid_hook_rewrite", AllowAllToolPolicy(), [_RewriteTextHook(42)]

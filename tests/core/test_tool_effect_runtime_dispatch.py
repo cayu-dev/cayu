@@ -77,7 +77,7 @@ class _ObservingSQLiteStore(SQLiteSessionStore):
 
 
 def test_manual_recovery_cannot_replace_selected_external_terminal():
-    from tests.core.test_runtime import _crashed_tool_round_app
+    from tests.runtime.runtime_recovery_support import _crashed_tool_round_app
 
     session_id = "selected-effect-manual-conflict"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
@@ -134,7 +134,8 @@ def test_manual_recovery_cannot_replace_selected_external_terminal():
 
 @pytest.mark.parametrize("failed", [False, True])
 def test_unprotected_manual_recovery_uses_shared_continuation(monkeypatch, failed):
-    from tests.core.test_runtime import SideEffectTool, _crashed_tool_round_app
+    from tests.runtime.runtime_recovery_support import _crashed_tool_round_app
+    from tests.runtime.runtime_tool_support import SideEffectTool
 
     # This fixture only counts calls. Explicitly use the unprotected effect
     # contract to verify that receipt guards do not alter existing consumers.

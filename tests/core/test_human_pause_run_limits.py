@@ -5,7 +5,8 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from tests.core.test_runtime import SideEffectTool, VersionedFakeProvider
+from tests.runtime.runtime_provider_support import VersionedFakeProvider
+from tests.runtime.runtime_tool_support import SideEffectTool
 
 from cayu import (
     AgentSpec,

@@ -428,7 +428,7 @@ def test_compaction_rejection_publication_failure_keeps_diagnostic(
 
 
 def _run_rejection_until_process_exit(database: str, crash_point: str) -> None:
-    from tests.core.test_runtime import ProcessLossAutomaticCompactionStore
+    from tests.runtime.runtime_compaction_support import ProcessLossAutomaticCompactionStore
 
     store = ProcessLossAutomaticCompactionStore(database, crash_point=crash_point)
     _run(
@@ -442,7 +442,7 @@ def _run_rejection_until_process_exit(database: str, crash_point: str) -> None:
 def test_compaction_rejection_diagnostic_survives_process_loss(
     tmp_path: Path, crash_point: str
 ) -> None:
-    from tests.core.test_runtime import _AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE
+    from tests.runtime.runtime_compaction_support import _AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE
 
     database = tmp_path / "rejection.sqlite"
     root = Path(__file__).resolve().parents[2]

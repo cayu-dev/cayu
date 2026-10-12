@@ -12,16 +12,14 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
-from tests.core.test_runtime import (
+from tests.runtime.runtime_compaction_support import (
     CompactionIdentityMutatingProvider,
     CompletedThenRetryableCompactionProvider,
-    FakeProvider,
     FlakyCompactionProvider,
-    UsageDialectMutatingProvider,
-    _test_session,
-    collect_events,
     compaction_price_book,
 )
+from tests.runtime.runtime_provider_support import FakeProvider, UsageDialectMutatingProvider
+from tests.runtime.runtime_session_support import _test_session, collect_events
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.agents import AgentSpec

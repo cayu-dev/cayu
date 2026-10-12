@@ -8,8 +8,8 @@ from tests._tool_admission_fixtures import (
     simulated_tool_app,
     simulated_tool_executables,  # noqa: F401
 )
-from tests.core.test_runtime import FakeProvider
 from tests.core.test_structured_commands import _policy_request, _profile
+from tests.runtime.runtime_provider_support import FakeProvider
 
 from cayu._command_diagnostics import COMMAND_DENIAL_HINTS, CommandDenialCode
 from cayu.agents import AgentSpec

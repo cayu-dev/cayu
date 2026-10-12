@@ -9,10 +9,10 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import SecretStr
 from tests.core._workload_secret_support import RequireApprovalPolicy
-from tests.core.test_runtime import RecordingEnvironmentFactory
 from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider, _tool_call_response
+from tests.runtime.runtime_environment_support import RecordingEnvironmentFactory
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp

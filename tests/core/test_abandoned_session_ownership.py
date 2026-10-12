@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 from tests.core.test_abandoned_session_resume import _child, _Proposal
-from tests.core.test_runtime import VersionedFakeProvider
 from tests.core.test_session_execution_presence import _app, _consume, _stores
+from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
 from cayu import (
     Message,
