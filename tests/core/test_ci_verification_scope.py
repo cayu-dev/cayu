@@ -39,6 +39,9 @@ def test_sqlite_regression_path_selects_only_cross_version_lane() -> None:
     assert select_pull_request_jobs(["tests/runtime/runtime_environment_support.py"]) == expected
     assert select_pull_request_jobs(["tests/runtime/runtime_provider_support.py"]) == expected
     assert select_pull_request_jobs(["tests/runtime/runtime_session_support.py"]) == expected
+    assert (
+        select_pull_request_jobs(["tests/runtime/test_runtime_environment_cleanup.py"]) == expected
+    )
 
 
 def test_runtime_change_selects_sqlite_and_dashboard_contract_lanes() -> None:

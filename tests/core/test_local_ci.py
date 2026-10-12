@@ -173,6 +173,10 @@ def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:
     assert len(attempts) == 3
     assert len({item.command for item in attempts}) == 1
     assert "<10 canonical SQLite cancellation nodes>" in attempts[0].command
+    assert (
+        "tests/runtime/test_runtime_environment_cleanup.py::"
+        "test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation"
+    ) in _RUNNER["_SQLITE_CANCELLATION_TESTS"]
 
 
 def test_package_plan_skips_publication_policy_unless_explicit(

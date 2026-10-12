@@ -69,7 +69,7 @@ _SQLITE_CANCELLATION_TESTS = (
     "test_sqlite_off_thread_worker_failure_and_cancellation_remain_observable",
     "tests/core/test_sqlite_session_store.py::"
     "test_sqlite_in_memory_read_cancellation_serializes_shared_writer_connection",
-    "tests/core/test_runtime.py::"
+    "tests/runtime/test_runtime_environment_cleanup.py::"
     "test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation",
     "tests/core/test_workspace_mutation_receipts.py::"
     "test_final_workspace_observer_restores_caller_cancellation_requests",
