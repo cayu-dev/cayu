@@ -1240,6 +1240,13 @@ closure admission, validation and index publication remain within each complete
 operation. The store retains state construction, deletion and closure capture;
 the evidence owner can be composed without importing the store implementation.
 
+`sessions/_memory_event_delivery.py` owns in-memory persisted-event delivery
+claims, lease renewal, outcomes, retry state and inspection. Each operation
+resolves current delivery/event/closure state and the ownership clock under the
+store lock. The owner can be composed independently of the store implementation;
+event publication, deletion and closure capture retain their existing atomic
+boundaries and state ownership.
+
 Native session event queries, session listing/inspection, topology/lineage,
 child lifecycle reads, summaries and accounting reads live in
 `storage/_sqlite_session_queries.py` and `storage/_postgres_session_queries.py`.
