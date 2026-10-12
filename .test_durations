@@ -1,4 +1,11 @@
 {
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_adapter_resolves_replaced_state_after_lock_wait": 0.151,
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_cancelled_lock_wait_does_not_publish_or_consume_ordering": 0.001,
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_composes_with_replay_inspection_and_transcript_publication": 0.006,
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_imports_without_stores": 0.605,
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_publication_failure_preserves_records_and_ordering[deliver]": 0.002,
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_publication_failure_preserves_records_and_ordering[enqueue]": 0.001,
+  "tests/core/test_memory_queued_message_ownership.py::test_memory_queue_publication_failure_preserves_records_and_ordering[withdraw]": 0.001,
   "tests/core/test_memory_tool_grant_ownership.py::test_memory_tool_grant_codec_reads_follow_validation_and_reference_lookup": 0.007,
   "tests/core/test_memory_tool_grant_ownership.py::test_memory_tool_grant_preparation_failure_preserves_public_state_and_outbox[bind]": 0.01,
   "tests/core/test_memory_tool_grant_ownership.py::test_memory_tool_grant_preparation_failure_preserves_public_state_and_outbox[issue]": 0.007,

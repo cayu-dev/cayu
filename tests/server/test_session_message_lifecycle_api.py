@@ -1805,7 +1805,9 @@ def test_protected_read_fences_recreated_session_before_content_access(
                 # response postcheck. Positive reauthorization below proves
                 # this spy is on the actual protected reader path.
                 if backend == "memory":
-                    owner = store
+                    from cayu.sessions import _memory_queued_messages
+
+                    owner = _memory_queued_messages
                     reader_name = (
                         "_session_message_source_unlocked"
                         if operation == "source"
