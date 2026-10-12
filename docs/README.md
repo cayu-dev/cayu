@@ -75,6 +75,7 @@ authoritative only where a maintained guide points to the implementation or the
 
 - [Structural measurements](refactoring-baseline.md)
 - [Native session-storage ownership assessment](plans/native-session-storage-assessment-2026-10-11/README.md)
+- [Memory and combined session-storage assessment](plans/memory-storage-assessment-2026-10-12/README.md)
 - [Citation offset diagnostics](citation-offset-diagnostics.md)
 - [Diagnostic support bundles](diagnostic-support-bundles.md)
 - [Persisted event side-effect health](event-side-effect-health.md)

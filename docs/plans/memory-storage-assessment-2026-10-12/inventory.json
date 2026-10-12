@@ -1,0 +1,337 @@
+{
+  "revision": "5b50132aefd95def802faa92a4756f89e990e94c",
+  "baseline_before_first_memory_extraction": "7fbcd127e8ffecef6fefeb6add32826962ddf040",
+  "scope": "Memory session adapter and _memory_ operation owners; physical lines include comments and blanks.",
+  "adapter_lines_before": 12090,
+  "adapter_lines_after": 6969,
+  "owned_source_lines_before": 12090,
+  "owned_source_lines_after": 14395,
+  "own_parent_refactoring_growth": 2296,
+  "own_parent_correction_growth": 9,
+  "total_own_parent_growth": 2305,
+  "interleaved_growth_in_same_files": 0,
+  "memory_owners": {
+    "src/cayu/sessions/_memory_context_views.py": {
+      "physical_lines": 813,
+      "async_operations": 14,
+      "state_and_protocol_fields": {
+        "MemoryContextViewSourceState": 11,
+        "MemoryContextSelectionSnapshot": 3,
+        "MemoryContextViewState": 12
+      },
+      "storage_imports": []
+    },
+    "src/cayu/sessions/_memory_event_delivery.py": {
+      "physical_lines": 461,
+      "async_operations": 12,
+      "state_and_protocol_fields": {
+        "MemoryEventDeliveryState": 4
+      },
+      "storage_imports": []
+    },
+    "src/cayu/sessions/_memory_event_reads.py": {
+      "physical_lines": 796,
+      "async_operations": 15,
+      "state_and_protocol_fields": {
+        "MemoryEventReadState": 20
+      },
+      "storage_imports": []
+    },
+    "src/cayu/sessions/_memory_evidence.py": {
+      "physical_lines": 449,
+      "async_operations": 8,
+      "state_and_protocol_fields": {
+        "MemoryRecallState": 8,
+        "MemoryContextExposureState": 12
+      },
+      "storage_imports": [
+        "cayu.memory.evidence"
+      ]
+    },
+    "src/cayu/sessions/_memory_peer_content.py": {
+      "physical_lines": 616,
+      "async_operations": 9,
+      "state_and_protocol_fields": {
+        "MemoryPeerContentState": 18
+      },
+      "storage_imports": [
+        "cayu.sessions._memory_queued_messages"
+      ]
+    },
+    "src/cayu/sessions/_memory_queued_messages.py": {
+      "physical_lines": 1011,
+      "async_operations": 6,
+      "state_and_protocol_fields": {
+        "MemoryMessageOrdering": 1,
+        "RejectNewWorkAfterSteering": 0,
+        "MemoryMessageDeliveryRecord": 9,
+        "MemoryQueuedMessageState": 18
+      },
+      "storage_imports": [
+        "cayu.sessions._memory_transcripts"
+      ]
+    },
+    "src/cayu/sessions/_memory_session_creation.py": {
+      "physical_lines": 880,
+      "async_operations": 7,
+      "state_and_protocol_fields": {
+        "PreparedEvent": 0,
+        "PreparedEvents": 0,
+        "PreparedCheckpoint": 0,
+        "PrepareCheckpoint": 0,
+        "ApplyEvents": 0,
+        "RegisterAlias": 0,
+        "CreateSession": 0,
+        "MemorySessionCreationState": 37,
+        "MemoryParticipantState": 5,
+        "CreationDecisionReader": 1,
+        "MemoryParticipantCreationState": 3
+      },
+      "storage_imports": [
+        "cayu.sessions._memory_transcripts",
+        "cayu.storage._creation_fence"
+      ]
+    },
+    "src/cayu/sessions/_memory_session_queries.py": {
+      "physical_lines": 717,
+      "async_operations": 8,
+      "state_and_protocol_fields": {
+        "MemorySessionQueryState": 13
+      },
+      "storage_imports": []
+    },
+    "src/cayu/sessions/_memory_tool_grants.py": {
+      "physical_lines": 931,
+      "async_operations": 6,
+      "state_and_protocol_fields": {
+        "MemoryToolGrantState": 17
+      },
+      "storage_imports": []
+    },
+    "src/cayu/sessions/_memory_transcripts.py": {
+      "physical_lines": 752,
+      "async_operations": 12,
+      "state_and_protocol_fields": {
+        "MemoryTranscriptIndexes": 6,
+        "MemoryTranscriptReadState": 3,
+        "RegisterPrivateAlias": 0,
+        "MemoryTranscriptWriteState": 10
+      },
+      "storage_imports": []
+    }
+  },
+  "retained_base_classes": [
+    "MemoryExternalWaitMixin",
+    "MemorySessionExecutionMixin",
+    "MemoryCreationFenceMixin",
+    "SessionStore"
+  ],
+  "retained_method_count": 223,
+  "retained_methods_at_least_80_lines": [
+    {
+      "name": "transition_status_and_checkpoint",
+      "physical_lines": 347,
+      "await_expressions": 0
+    },
+    {
+      "name": "publish_interaction_transition",
+      "physical_lines": 331,
+      "await_expressions": 0
+    },
+    {
+      "name": "_delete_session_unserialized",
+      "physical_lines": 262,
+      "await_expressions": 0
+    },
+    {
+      "name": "_publish_runtime_publication_unlocked",
+      "physical_lines": 234,
+      "await_expressions": 0
+    },
+    {
+      "name": "__init__",
+      "physical_lines": 229,
+      "await_expressions": 0
+    },
+    {
+      "name": "_apply_event_append_unlocked",
+      "physical_lines": 202,
+      "await_expressions": 0
+    },
+    {
+      "name": "_prepare_model_completion_stage_atomic",
+      "physical_lines": 201,
+      "await_expressions": 0
+    },
+    {
+      "name": "_publish_session_operation",
+      "physical_lines": 185,
+      "await_expressions": 1
+    },
+    {
+      "name": "_require_session_erasure_quiescence_unlocked",
+      "physical_lines": 149,
+      "await_expressions": 0
+    },
+    {
+      "name": "_load_session_closure_records_unlocked",
+      "physical_lines": 142,
+      "await_expressions": 0
+    },
+    {
+      "name": "_prepare_event_append_unlocked",
+      "physical_lines": 138,
+      "await_expressions": 0
+    },
+    {
+      "name": "release_session_invocation",
+      "physical_lines": 118,
+      "await_expressions": 0
+    },
+    {
+      "name": "_mark_model_completion_stage_dispatched_atomic",
+      "physical_lines": 115,
+      "await_expressions": 0
+    },
+    {
+      "name": "_abandon_model_completion_stage_atomic",
+      "physical_lines": 105,
+      "await_expressions": 0
+    },
+    {
+      "name": "_prepare_checkpoint_store_unlocked",
+      "physical_lines": 101,
+      "await_expressions": 0
+    },
+    {
+      "name": "_complete_model_completion_stage_atomic",
+      "physical_lines": 95,
+      "await_expressions": 0
+    },
+    {
+      "name": "_publish_checkpoint_and_events",
+      "physical_lines": 81,
+      "await_expressions": 0
+    }
+  ],
+  "native_adapter_lines": {
+    "sqlite": 8222,
+    "postgres": 7473
+  },
+  "deliveries": [
+    {
+      "commit": "e50bc35278a5a4da4f7d0b8a7549d92791ec5429",
+      "subject": "Own in-memory event queries and terminal evidence reads",
+      "production_added": 865,
+      "production_removed": 621,
+      "net_production_lines": 244,
+      "adapter_delta": -552
+    },
+    {
+      "commit": "8dd42c6f476d9ef96b3b57b8e3bdf2709a59c1f1",
+      "subject": "Own in-memory session discovery and aggregate queries",
+      "production_added": 771,
+      "production_removed": 604,
+      "net_production_lines": 167,
+      "adapter_delta": -550
+    },
+    {
+      "commit": "9b1e61af39267b7196187b8c29959431cd3da821",
+      "subject": "Own in-memory transcript queries and index maintenance",
+      "production_added": 601,
+      "production_removed": 424,
+      "net_production_lines": 177,
+      "adapter_delta": -321
+    },
+    {
+      "commit": "e45d2488f4fdb9a21a54c793cf8251850e51b6d0",
+      "subject": "Own atomic in-memory transcript publication",
+      "production_added": 295,
+      "production_removed": 190,
+      "net_production_lines": 105,
+      "adapter_delta": -149
+    },
+    {
+      "commit": "bc9479c92ea9803f2f43b1b3077dd6190c1af3a0",
+      "subject": "Own in-memory recall receipt persistence",
+      "production_added": 198,
+      "production_removed": 114,
+      "net_production_lines": 84,
+      "adapter_delta": -92
+    },
+    {
+      "commit": "dad0fadf28d916ff2e8f57afcd06a5cdfc1b9272",
+      "subject": "Own in-memory context exposure persistence",
+      "production_added": 306,
+      "production_removed": 217,
+      "net_production_lines": 89,
+      "adapter_delta": -184
+    },
+    {
+      "commit": "9f3437c2b3802ee59addd3ec6d15ee8ba88f1fee",
+      "subject": "Own in-memory persisted-event delivery operations",
+      "production_added": 515,
+      "production_removed": 354,
+      "net_production_lines": 161,
+      "adapter_delta": -300
+    },
+    {
+      "commit": "f763477fc340e654078e3b82221d9fdf9a9fce11",
+      "subject": "Own in-memory targeted-tool grant persistence operations",
+      "production_added": 1009,
+      "production_removed": 808,
+      "net_production_lines": 201,
+      "adapter_delta": -730
+    },
+    {
+      "commit": "42b30e7e525c0b5997b64b6c521cda9ba1e6e95c",
+      "subject": "Own in-memory queued-message persistence operations",
+      "production_added": 1079,
+      "production_removed": 869,
+      "net_production_lines": 210,
+      "adapter_delta": -801
+    },
+    {
+      "commit": "36409368a81cc0532af3bd822e6074444be5959b",
+      "subject": "Own in-memory peer-content persistence operations",
+      "production_added": 688,
+      "production_removed": 500,
+      "net_production_lines": 188,
+      "adapter_delta": -428
+    },
+    {
+      "commit": "d027937d712b3e202cf5045228b67029ca3ea869",
+      "subject": "Own in-memory context-view publication and source capture",
+      "production_added": 272,
+      "production_removed": 144,
+      "net_production_lines": 128,
+      "adapter_delta": -97
+    },
+    {
+      "commit": "0bbd1bec65a3fdc1915fc5ac1bd6daa0cea28750",
+      "subject": "Own in-memory context-view selection and retention",
+      "production_added": 651,
+      "production_removed": 528,
+      "net_production_lines": 123,
+      "adapter_delta": -465
+    },
+    {
+      "commit": "1c0e9bfb0163b4ec22c18a29c116b638ba295244",
+      "subject": "Own in-memory session creation and fork persistence",
+      "production_added": 1012,
+      "production_removed": 593,
+      "net_production_lines": 419,
+      "adapter_delta": -452
+    }
+  ],
+  "corrections": [
+    {
+      "commit": "5b50132aefd95def802faa92a4756f89e990e94c",
+      "subject": "Keep memory creation state opaque in exception diagnostics",
+      "production_added": 14,
+      "production_removed": 5,
+      "net_production_lines": 9,
+      "adapter_delta": 0
+    }
+  ]
+}

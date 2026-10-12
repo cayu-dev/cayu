@@ -1,0 +1,269 @@
+{
+  "baseline_adapter": "7fbcd127e8ffecef6fefeb6add32826962ddf040",
+  "current_revision": "1c0e9bfb0163b4ec22c18a29c116b638ba295244",
+  "current_production_tree": "d0ba293b069759eeb2717f92980641b50e203d5e",
+  "python": "3.14.6",
+  "pairs": 30,
+  "warmup_pairs": 5,
+  "scope": "Historical memory adapter and current adapter with identical current shared dependencies; setup, imports and evidence hashing excluded from CPU timings.",
+  "workloads": {
+    "bounded_reads": {
+      "baseline_cpu_us": 131019.5,
+      "current_cpu_us": 132006.0,
+      "percent_medians": 0.7529413560576792,
+      "median_paired_delta_us": 864.0,
+      "matching_material_sha256": "a9f2015220d1550c06ed9e2bdd27b7c04a5fbe011738fb735543edaa53c8f21e",
+      "samples_cpu_us": [
+        {
+          "head": 137531.0,
+          "base": 127791.0
+        },
+        {
+          "base": 129847.0,
+          "head": 131250.0
+        },
+        {
+          "head": 132068.0,
+          "base": 175369.0
+        },
+        {
+          "base": 131078.0,
+          "head": 130089.0
+        },
+        {
+          "head": 131373.0,
+          "base": 129194.0
+        },
+        {
+          "base": 130486.0,
+          "head": 131112.0
+        },
+        {
+          "head": 137111.0,
+          "base": 129835.0
+        },
+        {
+          "base": 129147.0,
+          "head": 134420.0
+        },
+        {
+          "head": 132351.0,
+          "base": 129169.0
+        },
+        {
+          "base": 129848.0,
+          "head": 127326.0
+        },
+        {
+          "head": 129225.0,
+          "base": 128026.0
+        },
+        {
+          "base": 129983.0,
+          "head": 131537.0
+        },
+        {
+          "head": 129806.0,
+          "base": 130029.0
+        },
+        {
+          "base": 132369.0,
+          "head": 132203.0
+        },
+        {
+          "head": 137283.0,
+          "base": 131553.0
+        },
+        {
+          "base": 181146.0,
+          "head": 131480.0
+        },
+        {
+          "head": 132063.0,
+          "base": 130961.0
+        },
+        {
+          "base": 132362.0,
+          "head": 140008.0
+        },
+        {
+          "head": 130903.0,
+          "base": 133376.0
+        },
+        {
+          "base": 192881.0,
+          "head": 131188.0
+        },
+        {
+          "head": 133902.0,
+          "base": 135800.0
+        },
+        {
+          "base": 130137.0,
+          "head": 131455.0
+        },
+        {
+          "head": 134066.0,
+          "base": 128443.0
+        },
+        {
+          "base": 191142.0,
+          "head": 131477.0
+        },
+        {
+          "head": 133123.0,
+          "base": 129777.0
+        },
+        {
+          "base": 133727.0,
+          "head": 131949.0
+        },
+        {
+          "head": 133087.0,
+          "base": 132704.0
+        },
+        {
+          "base": 131092.0,
+          "head": 131478.0
+        },
+        {
+          "head": 140704.0,
+          "base": 142012.0
+        },
+        {
+          "base": 131961.0,
+          "head": 133785.0
+        }
+      ]
+    },
+    "transcript_checkpoint_event_writes": {
+      "baseline_cpu_us": 40213.5,
+      "current_cpu_us": 40627.0,
+      "percent_medians": 1.0282616534248445,
+      "median_paired_delta_us": 254.5,
+      "matching_material_sha256": "b1d0cf73ae6019db62447edf297266b2e1e66c81d5c90fdfa177f2d1a663273b",
+      "samples_cpu_us": [
+        {
+          "head": 39522.0,
+          "base": 40006.0
+        },
+        {
+          "base": 40529.0,
+          "head": 39726.0
+        },
+        {
+          "head": 41964.0,
+          "base": 40206.0
+        },
+        {
+          "base": 39594.0,
+          "head": 49155.0
+        },
+        {
+          "head": 39541.0,
+          "base": 40348.0
+        },
+        {
+          "base": 40457.0,
+          "head": 40920.0
+        },
+        {
+          "head": 42674.0,
+          "base": 41020.0
+        },
+        {
+          "base": 39498.0,
+          "head": 40338.0
+        },
+        {
+          "head": 40871.0,
+          "base": 40798.0
+        },
+        {
+          "base": 39874.0,
+          "head": 40272.0
+        },
+        {
+          "head": 39766.0,
+          "base": 39957.0
+        },
+        {
+          "base": 40682.0,
+          "head": 40914.0
+        },
+        {
+          "head": 40623.0,
+          "base": 41108.0
+        },
+        {
+          "base": 41021.0,
+          "head": 40457.0
+        },
+        {
+          "head": 40836.0,
+          "base": 39102.0
+        },
+        {
+          "base": 40221.0,
+          "head": 46391.0
+        },
+        {
+          "head": 40854.0,
+          "base": 39901.0
+        },
+        {
+          "base": 39287.0,
+          "head": 39958.0
+        },
+        {
+          "head": 40674.0,
+          "base": 39835.0
+        },
+        {
+          "base": 41045.0,
+          "head": 40631.0
+        },
+        {
+          "head": 39828.0,
+          "base": 40237.0
+        },
+        {
+          "base": 40166.0,
+          "head": 40443.0
+        },
+        {
+          "head": 40050.0,
+          "base": 40468.0
+        },
+        {
+          "base": 39948.0,
+          "head": 40503.0
+        },
+        {
+          "head": 39596.0,
+          "base": 39845.0
+        },
+        {
+          "base": 40009.0,
+          "head": 42638.0
+        },
+        {
+          "head": 40765.0,
+          "base": 40751.0
+        },
+        {
+          "base": 47282.0,
+          "head": 40713.0
+        },
+        {
+          "head": 39709.0,
+          "base": 41097.0
+        },
+        {
+          "base": 39757.0,
+          "head": 41116.0
+        }
+      ]
+    }
+  }
+}

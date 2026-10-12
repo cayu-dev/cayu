@@ -1369,6 +1369,17 @@ transcript/event writes, commit guards and receipt publication retain their
 native snapshot and transaction boundaries. Record decoding and material
 validation have one canonical implementation per backend.
 
+The memory store retains shared state, locking, event/checkpoint prepare-and-apply
+primitives, and complete run/publication/lifecycle operations. Those operations
+update several projections atomically; splitting each projection behind a
+separately locking API would separate authority checks from their mutations.
+Memory operation owners receive current typed state after acquiring the shared
+lock, so a later operation observes indexes replaced during rollback. Native
+owners retain the corresponding connection, snapshot and transaction boundaries.
+The [memory/storage assessment](plans/memory-storage-assessment-2026-10-12/README.md)
+records these stopping points, source cost and combined qualification, including
+creation/fork, context selection and opaque creation-state diagnostics.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and
