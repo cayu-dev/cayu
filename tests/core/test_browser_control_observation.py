@@ -13,10 +13,10 @@ from tests._tool_admission_fixtures import (
     SimulatedToolFactory,
     simulated_tool_executables,  # noqa: F401
 )
+from tests.core.browser_session_support import _FakeBrowserBackend
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control import request as takeover_request
 from tests.core.test_browser_control_authorization import Policy
-from tests.core.test_browser_session import _FakeBrowserBackend
 from tests.core.test_environment_allocation_recovery import _FakeRemoteProvider
 
 from cayu.agents import AgentSpec
@@ -452,7 +452,7 @@ def test_confirmed_close_settles_disconnect_before_terminal_commit(
 @pytest.mark.parametrize("protected", [False, True])
 @pytest.mark.parametrize("exhausted", [False, True])
 def test_guest_fresh_observation_uses_retained_protected_result(monkeypatch, protected, exhausted):
-    from tests.core.test_browser_session import _interactive_request
+    from tests.core.browser_guest_support import _interactive_request
 
     from cayu.tools import _browser_guest as guest
 

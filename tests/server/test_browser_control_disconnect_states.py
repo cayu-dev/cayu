@@ -11,13 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
+from tests.core.browser_guest_support import _interactive_request
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_control_coordinator import coordinator, intent_for
 from tests.core.test_browser_control_publisher import publication_fixture
 from tests.core.test_browser_control_service import bound_browser_context
 from tests.core.test_browser_control_transport import control_tls as _control_tls
-from tests.core.test_browser_session import _interactive_request
 from tests.server._browser_control_tls_server import browser_control_tls_server
 
 from cayu.runtime._browser_control_model import browser_model_control_admission

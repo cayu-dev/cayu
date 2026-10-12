@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from tests.core.test_browser_session import _context, _durable_context, _FakeBrowserBackend
+from tests.core.browser_session_support import _context, _durable_context, _FakeBrowserBackend
 
 from cayu import BrowserSessionTool, BrowserVisualPolicy, LocalArtifactStore
 from cayu.runtime._invocation_secrets import InvocationSecretTracker

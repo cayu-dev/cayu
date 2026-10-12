@@ -4,7 +4,7 @@ import asyncio
 import json
 
 import pytest
-from tests.core.test_browser_session import _interactive_raw_request
+from tests.core.browser_guest_support import _interactive_raw_request
 
 from cayu.tools import _browser_guest as guest
 
@@ -127,7 +127,7 @@ def test_explicit_close_drains_response_before_daemon_shutdown(
 
 
 def test_lost_explicit_close_acknowledgement_remains_ambiguous_and_is_not_replayed(tmp_path):
-    from tests.core.test_browser_session import _context, _FakeBrowserBackend
+    from tests.core.browser_session_support import _context, _FakeBrowserBackend
 
     from cayu.tools.browser_session import BrowserSessionTool
 

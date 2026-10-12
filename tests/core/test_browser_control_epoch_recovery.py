@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from tests.core.test_browser_session import _durable_context, _FakeBrowserBackend, _tool
+from tests.core.browser_session_support import _durable_context, _FakeBrowserBackend, _tool
 
 
 @pytest.mark.parametrize("corruption", [None, True, 0, "3", 2**53])

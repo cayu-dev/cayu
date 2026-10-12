@@ -7,13 +7,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from tests.core.test_browser_session import (
+from tests.core.browser_guest_support import (
     _configure_interactive_daemon_for_test,
-    _durable_context,
-    _FakeBrowserBackend,
     _interactive_limits,
     _interactive_request,
 )
+from tests.core.browser_session_support import _durable_context, _FakeBrowserBackend
 
 from cayu.tools import _browser_guest as guest
 from cayu.tools import browser_session as host

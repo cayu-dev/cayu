@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from tests.core.test_browser_session import _interactive_raw_request
+from tests.core.browser_guest_support import _interactive_raw_request
 
 from cayu.tools import _browser_guest as guest
 from cayu.tools.browser_session import _ERROR_MESSAGES

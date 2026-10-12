@@ -19,8 +19,8 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from pydantic import SecretBytes
+from tests.core.browser_session_support import _WireRunner
 from tests.core.test_browser_control_transport import control_tls as _control_tls
-from tests.core.test_browser_session import _WireRunner
 from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory, _FakeRemoteProvider
 from tests.server._browser_control_tls_server import browser_control_tls_server
 from tests.server._browser_operator_mfa_fixture import LocalMfa, totp

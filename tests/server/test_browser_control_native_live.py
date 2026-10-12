@@ -12,12 +12,12 @@ from dataclasses import replace
 import httpx
 import pytest
 from fastapi import FastAPI, WebSocket
+from tests.core.browser_guest_support import _interactive_request
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_control_coordinator import coordinator, intent_for
 from tests.core.test_browser_control_publisher import publication_fixture
 from tests.core.test_browser_control_transport import control_tls as _control_tls
-from tests.core.test_browser_session import _interactive_request
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 from websockets.typing import Subprotocol

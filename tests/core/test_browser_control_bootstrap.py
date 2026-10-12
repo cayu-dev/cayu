@@ -39,8 +39,9 @@ def _run_runtime_allocation(
 ):
     from dataclasses import replace
 
+    from tests.core.browser_profile_support import _browser_profile_binding
+    from tests.core.browser_session_support import _FakeBrowserBackend, _tool
     from tests.core.test_browser_control_authorization import Policy
-    from tests.core.test_browser_session import _browser_profile_binding, _FakeBrowserBackend, _tool
 
     from cayu.agents import AgentSpec
     from cayu.applications import CayuApp

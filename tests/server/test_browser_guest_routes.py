@@ -7,12 +7,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import FastAPI
+from tests.core.browser_guest_support import _interactive_request
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_control_coordinator import coordinator, intent_for
 from tests.core.test_browser_control_publisher import publication_fixture
 from tests.core.test_browser_control_service import bound_browser_context
-from tests.core.test_browser_session import _interactive_request
 
 from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
 from cayu.runtime._browser_control_frames import BrowserViewUnavailable

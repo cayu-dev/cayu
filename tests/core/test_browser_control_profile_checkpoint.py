@@ -8,12 +8,9 @@ import asyncio
 import json
 
 import pytest
+from tests.core.browser_profile_support import _browser_profile_binding, _ProfileWireRunner
+from tests.core.browser_session_support import _durable_context
 from tests.core.test_browser_control import identity, request
-from tests.core.test_browser_session import (
-    _browser_profile_binding,
-    _durable_context,
-    _ProfileWireRunner,
-)
 
 from cayu.browser_profiles import (
     BrowserProfileCheckpointPolicy,

@@ -5,7 +5,7 @@ import hashlib
 from dataclasses import replace
 
 import pytest
-from tests.core.test_browser_session import _context, _durable_context, _FakeBrowserBackend
+from tests.core.browser_session_support import _context, _durable_context, _FakeBrowserBackend
 
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.events import Event, EventType

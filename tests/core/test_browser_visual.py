@@ -7,7 +7,7 @@ from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import pytest
-from tests.core.test_browser_session import (
+from tests.core.browser_guest_support import (
     _configure_interactive_daemon_for_test,
     _interactive_request,
 )

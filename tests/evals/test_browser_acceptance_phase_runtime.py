@@ -14,7 +14,7 @@ from tests._tool_admission_fixtures import (
     SimulatedToolFactory,
     simulated_tool_executables,  # noqa: F401
 )
-from tests.core.test_browser_session import _FakeBrowserBackend
+from tests.core.browser_session_support import _FakeBrowserBackend
 from tests.core.test_environment_allocation_recovery import _FakeRemoteProvider
 from tests.evals.test_browser_acceptance_operator_oracle import (
     _project_operator_record,

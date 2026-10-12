@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from typing import get_args
 
 import pytest
+from tests.core.browser_guest_support import _interactive_request
 from tests.core.test_browser_control_guest import takeover_material
-from tests.core.test_browser_session import _interactive_request
 
 from cayu.tools._browser_control_guest import GuestControlChannel, GuestControlFailure
 from cayu.tools._browser_guest import _GuestFailure, _InteractiveDaemon, _InteractivePage

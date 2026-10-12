@@ -11,8 +11,8 @@ import time
 from dataclasses import replace
 
 import pytest
+from tests.core.browser_guest_support import _interactive_request
 from tests.core.test_browser_control_guest import takeover_material
-from tests.core.test_browser_session import _interactive_request
 
 from cayu.tools._browser_control_guest import GuestControlFailure
 from cayu.tools._browser_guest import (

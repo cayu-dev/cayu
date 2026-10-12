@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
-from tests.core.test_browser_session import _interactive_limits
+from tests.core.browser_guest_support import _interactive_limits
 
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
 

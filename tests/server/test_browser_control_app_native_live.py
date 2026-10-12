@@ -10,10 +10,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretBytes
+from tests.core.browser_session_support import _WireRunner
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_control_transport import control_tls as _control_tls
-from tests.core.test_browser_session import _WireRunner
 from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory, _FakeRemoteProvider
 from tests.server._app_native_allocation_loss import lose_browser_allocation
 from tests.server._app_native_operator import handback_app_browser

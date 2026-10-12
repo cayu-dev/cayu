@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 import pytest
-from tests.core.test_browser_session import _durable_context, _WireRunner
+from tests.core.browser_session_support import _durable_context, _WireRunner
 
 from cayu.tools._browser_control_guest import GuestControlFailure, GuestControlFence
 from cayu.tools._browser_guest import _interactive_request_from_json

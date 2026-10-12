@@ -8,7 +8,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from tests.core.test_browser_session import _interactive_raw_request, _interactive_request
+from tests.core.browser_guest_support import _interactive_raw_request, _interactive_request
 
 from cayu.tools import _browser_guest as guest
 from cayu.tools._browser_control_guest import GuestControlFailure, GuestControlFence

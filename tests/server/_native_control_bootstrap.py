@@ -4,8 +4,8 @@ import asyncio
 import json
 
 import pytest
+from tests.core.browser_session_support import _WireRunner
 from tests.core.test_browser_control_service import bound_browser_context
-from tests.core.test_browser_session import _WireRunner
 
 from cayu.runners import ExecResult
 from cayu.tools import _browser_guest

@@ -5,12 +5,8 @@ import json
 from dataclasses import replace
 
 import pytest
-from tests.core.test_browser_session import (
-    _durable_context,
-    _FakeBrowserBackend,
-    _ProfileWireRunner,
-    _tool,
-)
+from tests.core.browser_profile_support import _ProfileWireRunner
+from tests.core.browser_session_support import _durable_context, _FakeBrowserBackend, _tool
 
 from cayu.tools import browser_session as browser_module
 from cayu.tools.base import _RuntimeBrowserControlAdmission

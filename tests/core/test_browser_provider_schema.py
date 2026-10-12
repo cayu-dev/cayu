@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from tests.core.test_browser_session import _context, _FakeBrowserBackend
+from tests.core.browser_session_support import _context, _FakeBrowserBackend
 
 from cayu import Message
 from cayu.providers.base import ModelRequest

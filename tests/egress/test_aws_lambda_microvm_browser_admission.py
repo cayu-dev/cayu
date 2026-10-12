@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from tests.core.test_browser_session import _WireRunner
+from tests.core.browser_session_support import _WireRunner
 from tests.egress.test_aws_lambda_microvm_adapter import (
     _broker_and_grant,
     _create_adapter_runner,
