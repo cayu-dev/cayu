@@ -6,6 +6,7 @@ import asyncio
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -33,7 +34,7 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.evals.testing import ScriptedModelProvider
-from cayu.events import Event, EventType
+from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
@@ -57,7 +58,7 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import (
@@ -65,8 +66,8 @@ from cayu.sessions.messaging import (
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
 )
-from cayu.sessions.pending_action_contracts import PendingActionQuery
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.pending_action_contracts import PendingActionListResult, PendingActionQuery
+from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -3867,6 +3868,387 @@ def test_all_configured_continuation_executors_can_run_concurrently() -> None:
         "continuation-executor-a",
         "continuation-executor-b",
     }
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_unproductive_continuations_are_bounded_and_fail_the_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+) -> None:
+    task_store: TaskStore = (
+        InMemoryTaskStore() if backend == "memory" else SQLiteTaskStore(tmp_path / "tasks.sqlite")
+    )
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    monkeypatch.setattr(
+        task_worker_module,
+        "_UNPRODUCTIVE_CONTINUATION_INITIAL_BACKOFF_SECONDS",
+        0.001,
+    )
+    continued: list[str] = []
+
+    async def fresh_handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def never_resumes(_app: CayuApp, task: Task, _worker_id: str) -> TaskHandlerOutcome:
+        continued.append(task.id)
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> Task | None:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="dead-workspace-task",
+            session_id="dead-workspace-session",
+        )
+        handled = await asyncio.wait_for(
+            run_task_worker(
+                app,
+                task_store,
+                fresh_handler,
+                worker_id="continuation-executor",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                recovered_interrupted_task_handler=never_resumes,
+                max_unproductive_interrupted_handoffs=3,
+                max_tasks=4,
+            ),
+            timeout=10,
+        )
+        assert handled == 4
+        return await task_store.load_task("dead-workspace-task")
+
+    task = asyncio.run(scenario())
+
+    # The seeded release emits no event, so three continuations each record one
+    # released handoff and the fourth claim fails instead of continuing again.
+    assert continued == ["dead-workspace-task"] * 3
+    assert task is not None
+    assert task.status is TaskStatus.FAILED
+    assert task.error is not None
+    assert task.error["error"] == "InterruptedTaskContinuationStalled"
+    assert task.error["unproductive_interrupted_handoffs"] == 3
+
+
+class _UnproductiveHistoryStore:
+    """Answer the worker's handoff-history reads from an in-order event list."""
+
+    def __init__(self, events: list[Event], *, pending: object = None) -> None:
+        self.records = [
+            EventRecord(sequence=index + 1, event=event) for index, event in enumerate(events)
+        ]
+        self.pending = pending
+
+    async def query_events(self, query: EventQuery) -> list[EventRecord]:
+        types = {query.event_type} if query.event_type is not None else set(query.event_types)
+        matched = [
+            record
+            for record in self.records
+            if record.event.type in types
+            and (query.after_sequence is None or record.sequence > query.after_sequence)
+            and (query.before_sequence is None or record.sequence < query.before_sequence)
+        ]
+        if query.order_by is EventOrder.SEQUENCE_DESC:
+            matched.reverse()
+        return matched[: query.limit]
+
+    async def query_pending_actions(self, query: PendingActionQuery) -> PendingActionListResult:
+        if isinstance(self.pending, Exception):
+            raise self.pending
+        assert isinstance(self.pending, PendingActionListResult)
+        return self.pending
+
+
+class _FailingHistoryStore:
+    async def query_events(self, query: EventQuery) -> list[EventRecord]:
+        raise RuntimeError("event store unavailable")
+
+
+class _HistoryApp:
+    def __init__(self, session_store: object) -> None:
+        self.session_store = session_store
+
+    def redact_json(self, value: object) -> object:
+        return value
+
+
+def _handoff_event(
+    handoff_id: str,
+    *,
+    progress: int | None,
+    status: str = "released",
+    task_id: str = "task",
+) -> Event:
+    payload: dict[str, object] = {
+        "task_id": task_id,
+        "handoff_id": handoff_id,
+        "handoff_status": status,
+    }
+    if progress is not None:
+        payload["progress_sequence"] = progress
+    return Event(type=EventType.TASK_INTERRUPTED_HANDOFF, session_id="session", payload=payload)
+
+
+def _progress_event() -> Event:
+    return Event(type=EventType.MODEL_COMPLETED, session_id="session", payload={})
+
+
+def _count_handoffs(store: object, *, cap: int = 8) -> int:
+    return asyncio.run(
+        task_worker_module._count_unproductive_interrupted_handoffs(
+            _HistoryApp(store),
+            SimpleNamespace(id="task", session_id="session"),
+            cap=cap,
+        )
+    )
+
+
+def test_unproductive_handoff_count_ignores_handoffs_published_after_progress() -> None:
+    # Eight handoffs decided before the progress at sequence 2 land after it.
+    events = [
+        _handoff_event("before", progress=0),
+        _progress_event(),
+        *(_handoff_event(f"late-{index}", progress=0) for index in range(8)),
+        _handoff_event("after", progress=2),
+        _handoff_event("after", progress=2),
+        _handoff_event("other-task", progress=2, task_id="other"),
+        _handoff_event("unmarked", progress=None),
+        _handoff_event("diagnostic", progress=2, status="pending"),
+    ]
+
+    assert _count_handoffs(_UnproductiveHistoryStore(events)) == 1
+    assert _count_handoffs(_FailingHistoryStore()) == 0
+
+
+def test_unproductive_handoff_count_pages_past_diagnostic_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(task_worker_module, "_UNPRODUCTIVE_HANDOFF_HISTORY_PAGE_SIZE", 4)
+    events: list[Event] = []
+    for cycle in range(10):
+        # A release that fails three times, then expired-owner recovery that
+        # fails once and succeeds: six events for one successful handoff.
+        for status in ("pending", "retrying", "retrying", "recovery_required", "pending"):
+            events.append(_handoff_event(f"cycle-{cycle}", progress=0, status=status))
+        events.append(_handoff_event(f"cycle-{cycle}", progress=0, status="recovered"))
+
+    assert _count_handoffs(_UnproductiveHistoryStore(events)) == 8
+    assert _count_handoffs(_UnproductiveHistoryStore(events), cap=20) == 10
+
+
+def test_unproductive_handoff_count_reaches_large_configured_bound() -> None:
+    events = [_handoff_event(f"cycle-{index}", progress=0) for index in range(20_001)]
+
+    async def scenario() -> None:
+        supervision_turn = asyncio.Event()
+        asyncio.get_running_loop().call_soon(supervision_turn.set)
+        count = await task_worker_module._count_unproductive_interrupted_handoffs(
+            _HistoryApp(_UnproductiveHistoryStore(events)),
+            SimpleNamespace(id="task", session_id="session"),
+            cap=20_000,
+        )
+        assert count == 20_000
+        assert supervision_turn.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("slow_read", ["history", "pages", "pending", "backoff", "stop"])
+def test_unproductive_continuation_reads_renew_the_claim(
+    tmp_path: Path,
+    backend: str,
+    slow_read: str,
+) -> None:
+    stop = asyncio.Event()
+
+    class SlowSessionStore(InMemorySessionStore):
+        async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
+            if query is not None and query.event_type is EventType.TASK_INTERRUPTED_HANDOFF:
+                if slow_read == "history":
+                    await asyncio.sleep(2.1)
+                elif slow_read == "pages":
+                    await asyncio.sleep(0.45)
+                elif slow_read == "stop":
+                    stop.set()
+            return await super().query_events(query)
+
+        async def query_pending_actions(
+            self, query: PendingActionQuery | None = None
+        ) -> PendingActionListResult:
+            if slow_read == "pending":
+                await asyncio.sleep(2.1)
+            return await super().query_pending_actions(query)
+
+    task_store: TaskStore = (
+        InMemoryTaskStore() if backend == "memory" else SQLiteTaskStore(tmp_path / "tasks.sqlite")
+    )
+    app = CayuApp(task_store=task_store, session_store=SlowSessionStore(), enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    continued: list[str] = []
+
+    async def handler(_app: CayuApp, task: Task, _worker_id: str) -> TaskHandlerOutcome:
+        continued.append(task.id)
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> Task:
+        await _seed_receipt_backed_continuation(
+            app, task_store, task_id="slow-task", session_id="slow-session"
+        )
+        event_count = {"pages": 2002, "backoff": 4, "stop": 1}.get(slow_read, 2)
+        for index in range(event_count):
+            event = _handoff_event(
+                f"cycle-{index}",
+                task_id="slow-task",
+                progress=None if slow_read == "pages" and index >= 2 else 0,
+            ).model_copy(update={"session_id": "slow-session"})
+            await app.session_store.append_event(
+                "slow-session", event_with_runtime_payload_authority(event, "task_id", "handoff_id")
+            )
+        assert (
+            await asyncio.wait_for(
+                run_task_worker(
+                    app,
+                    task_store,
+                    handler,
+                    worker_id="slow-worker",
+                    lease_seconds=2,
+                    reclaim=False,
+                    recover_interrupted_handoffs=False,
+                    recovered_interrupted_task_handler=handler,
+                    max_unproductive_interrupted_handoffs=2 if slow_read == "pending" else 5,
+                    stop=stop,
+                    max_tasks=1,
+                ),
+                timeout=10,
+            )
+            == 1
+        )
+        task = await task_store.load_task("slow-task")
+        assert task is not None
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+        return task
+
+    task = asyncio.run(scenario())
+    assert task.worker_id is None
+    if slow_read == "pending":
+        assert continued == []
+        assert task.status is TaskStatus.FAILED
+        assert task.error is not None
+        assert task.error["error"] == "InterruptedTaskContinuationStalled"
+        assert task.error["unproductive_interrupted_handoffs"] == 2
+    else:
+        assert continued == ([] if slow_read == "stop" else ["slow-task"])
+        assert task.status is TaskStatus.RUNNING
+        assert task.error is None
+
+
+def test_pending_action_check_fails_safe() -> None:
+    async def has_pending(pending: object) -> bool:
+        return await task_worker_module._session_has_pending_action(
+            _HistoryApp(_UnproductiveHistoryStore([], pending=pending)),
+            "session",
+        )
+
+    assert asyncio.run(has_pending(PendingActionListResult())) is False
+    assert asyncio.run(has_pending(PendingActionListResult(has_more=True))) is True
+    assert asyncio.run(has_pending(RuntimeError("store unavailable"))) is True
+
+
+def test_unproductive_continuation_backoff_is_bounded() -> None:
+    backoff = task_worker_module._unproductive_continuation_backoff
+
+    assert backoff(1) == 0.0
+    assert backoff(2) == 1.0
+    assert backoff(4) == 4.0
+    assert backoff(2000) == 30.0
+
+
+def test_unproductive_continuations_with_pending_actions_are_not_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    monkeypatch.setattr(
+        task_worker_module,
+        "_UNPRODUCTIVE_CONTINUATION_INITIAL_BACKOFF_SECONDS",
+        0.001,
+    )
+
+    async def always_pending(_app: CayuApp, _session_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(task_worker_module, "_session_has_pending_action", always_pending)
+    continued: list[str] = []
+
+    async def fresh_handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def awaiting_approval(_app: CayuApp, task: Task, _worker_id: str) -> TaskHandlerOutcome:
+        continued.append(task.id)
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> Task | None:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="awaiting-approval-task",
+            session_id="awaiting-approval-session",
+        )
+        await asyncio.wait_for(
+            run_task_worker(
+                app,
+                task_store,
+                fresh_handler,
+                worker_id="continuation-executor",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                recovered_interrupted_task_handler=awaiting_approval,
+                max_unproductive_interrupted_handoffs=2,
+                max_tasks=5,
+            ),
+            timeout=10,
+        )
+        return await task_store.load_task("awaiting-approval-task")
+
+    task = asyncio.run(scenario())
+
+    assert continued == ["awaiting-approval-task"] * 5
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.error is None
+
+
+def test_run_task_worker_rejects_invalid_unproductive_handoff_bound() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        return None
+
+    async def scenario() -> None:
+        for bound in (0, True, 1.5):
+            with pytest.raises(ValueError, match="max_unproductive_interrupted_handoffs"):
+                await run_task_worker(
+                    app,
+                    task_store,
+                    handler,
+                    worker_id="worker",
+                    max_unproductive_interrupted_handoffs=bound,  # type: ignore[arg-type]
+                    max_tasks=0,
+                )
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("authority_error", [SessionRunFenced, TaskClaimLost])

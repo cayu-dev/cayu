@@ -103,6 +103,8 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
 )
 from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
@@ -193,6 +195,24 @@ _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
 _INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 10
 _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS = 30.0
+_DEFAULT_MAX_UNPRODUCTIVE_INTERRUPTED_HANDOFFS = 8
+_UNPRODUCTIVE_CONTINUATION_INITIAL_BACKOFF_SECONDS = 1.0
+_UNPRODUCTIVE_CONTINUATION_MAX_BACKOFF_SECONDS = 30.0
+# Enough handoffs for the backoff to reach its maximum when no bound is set.
+_UNPRODUCTIVE_CONTINUATION_BACKOFF_COUNT_CAP = 8
+# Far past the point where the backoff saturates, and small enough that the
+# float conversion cannot overflow for any configured bound.
+_UNPRODUCTIVE_CONTINUATION_MAX_BACKOFF_EXPONENT = 16
+_UNPRODUCTIVE_HANDOFF_HISTORY_PAGE_SIZE = 500
+# A continuation counts as productive once the session has new model output,
+# finished tool work, or new input that a later continuation could act on.
+_CONTINUATION_PROGRESS_EVENT_TYPES = (
+    EventType.MODEL_COMPLETED,
+    EventType.TOOL_CALL_COMPLETED,
+    EventType.TOOL_CALL_APPROVED,
+    EventType.TOOL_CALL_APPROVAL_DENIED,
+    EventType.SESSION_MESSAGE_QUEUED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +340,9 @@ async def run_task_worker(
     interrupted_handoff_recovery_every_s: float = (_INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS),
     recovered_interrupted_task_handler: RecoveredInterruptedTaskHandler | None = None,
     continuation_poll_interval_s: float | None = None,
+    max_unproductive_interrupted_handoffs: int | None = (
+        _DEFAULT_MAX_UNPRODUCTIVE_INTERRUPTED_HANDOFFS
+    ),
     stop: asyncio.Event | None = None,
     max_tasks: int | None = None,
 ) -> int:
@@ -350,6 +373,11 @@ async def run_task_worker(
       independent of expired-owner scanner election.
     - ``continuation_poll_interval_s`` bounds rediscovery latency after an empty
       continuation scan. It defaults to ``poll_interval_s``.
+    - ``max_unproductive_interrupted_handoffs`` bounds how many interrupted
+      handoffs a task's session may record without model, tool, or input
+      progress. A continuation claimed at that bound fails the task instead of
+      running the handler, unless the session has a pending action. ``None``
+      disables the bound; repeated unproductive continuations still back off.
     - ``stop`` is an ``asyncio.Event`` for graceful shutdown.
     - ``max_tasks`` bounds the loop (useful for tests and one-shot drains).
     """
@@ -379,6 +407,11 @@ async def run_task_worker(
             continuation_poll_interval_s,
             "continuation_poll_interval_s",
         )
+    if max_unproductive_interrupted_handoffs is not None and (
+        type(max_unproductive_interrupted_handoffs) is not int
+        or max_unproductive_interrupted_handoffs < 1
+    ):
+        raise ValueError("max_unproductive_interrupted_handoffs must be a positive int or None.")
     if max_tasks is not None and max_tasks < 0:
         raise ValueError("max_tasks must be non-negative.")
     worker_id = require_clean_nonblank(worker_id, "worker_id")
@@ -531,6 +564,8 @@ async def run_task_worker(
                 lease_seconds=lease_seconds,
                 query=query,
                 after=continuation_after,
+                max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
+                stop=stop,
             )
             continuation_scan_scanned += continuation_page.scanned_candidates
             continuation_scan_rejected += continuation_page.rejected_candidates
@@ -2603,6 +2638,9 @@ async def _settle_interrupted_task_handoff_with_retry(
 ) -> TaskInterruptedHandoffReceipt:
     delay = _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS
     last_failure_diagnostic: str | None = None
+    # Read while this handoff still owns the session, so a progress event can
+    # only follow this marker, even when the handoff event itself lands later.
+    progress_sequence = await _session_progress_sequence(app, request.session_id)
     for attempt in range(1, _INTERRUPTED_HANDOFF_MAX_ATTEMPTS + 1):
         failed_attempt_status: Literal["pending", "retrying"] | None = None
         try:
@@ -2634,6 +2672,7 @@ async def _settle_interrupted_task_handoff_with_retry(
                 ),
                 attempt=attempt,
                 recovery_mode=recover_expired or settled_by_recovery,
+                progress_sequence=progress_sequence,
             )
             return receipt
         assert failed_attempt_status is not None
@@ -2646,6 +2685,7 @@ async def _settle_interrupted_task_handoff_with_retry(
             handoff_status=failed_attempt_status,
             attempt=attempt,
             recovery_mode=recover_expired,
+            progress_sequence=progress_sequence,
         )
         try:
             receipt = await task_store.load_interrupted_task_handoff_receipt(
@@ -2669,6 +2709,7 @@ async def _settle_interrupted_task_handoff_with_retry(
                     handoff_status="recovered",
                     attempt=attempt,
                     recovery_mode=recover_expired,
+                    progress_sequence=progress_sequence,
                 )
                 return receipt
         if attempt < _INTERRUPTED_HANDOFF_MAX_ATTEMPTS:
@@ -2681,6 +2722,7 @@ async def _settle_interrupted_task_handoff_with_retry(
         handoff_status="recovery_required",
         attempt=_INTERRUPTED_HANDOFF_MAX_ATTEMPTS,
         recovery_mode=recover_expired,
+        progress_sequence=progress_sequence,
     )
     raise _TaskInterruptedHandoffRecoveryRequired(
         last_failure_diagnostic or "Interrupted-task handoff was not acknowledged."
@@ -2788,6 +2830,7 @@ async def _emit_interrupted_task_handoff_event(
     handoff_status: str,
     attempt: int,
     recovery_mode: bool,
+    progress_sequence: int | None = None,
 ) -> Event | None:
     """Best-effort exact publication that never owns the task mutation."""
 
@@ -2812,6 +2855,7 @@ async def _emit_interrupted_task_handoff_event(
                 "handoff_status": handoff_status,
                 "attempt": attempt,
                 "session_run_epoch": request.session_run_epoch,
+                **({} if progress_sequence is None else {"progress_sequence": progress_sequence}),
             },
         )
     )
@@ -2959,6 +3003,8 @@ async def _run_recovered_interrupted_task_handler(
     lease_seconds: int,
     query: TaskQuery | None,
     after: tuple[datetime, str] | None,
+    max_unproductive_handoffs: int | None = None,
+    stop: asyncio.Event | None = None,
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
 
@@ -2999,6 +3045,45 @@ async def _run_recovered_interrupted_task_handler(
         raise RuntimeError(
             "Interrupted-task continuation claim returned invalid ownership authority."
         )
+
+    async def continue_with_bound(
+        owned_app: CayuApp, owned_task: Task, owned_worker_id: str
+    ) -> TaskHandlerOutcome | None:
+        return await _run_bounded_interrupted_task_handler(
+            owned_app,
+            task_store,
+            owned_task,
+            handler,
+            owned_worker_id,
+            max_unproductive_handoffs=max_unproductive_handoffs,
+            stop=stop,
+        )
+
+    # Session/history reads and backoff can outlast a lease. Supervise the
+    # entire continuation, including its bound decision, as owned handler work.
+    await _handle_with_heartbeat(
+        app,
+        task_store,
+        task,
+        continue_with_bound,
+        worker_id,
+        lease_seconds,
+        recover_interrupted_authority_loss=True,
+    )
+    return page
+
+
+async def _run_bounded_interrupted_task_handler(
+    app: CayuApp,
+    task_store: TaskStore,
+    task: Task,
+    handler: RecoveredInterruptedTaskHandler,
+    worker_id: str,
+    *,
+    max_unproductive_handoffs: int | None,
+    stop: asyncio.Event | None,
+) -> TaskHandlerOutcome | None:
+    assert task.session_id is not None
     session = await app.session_store.load(task.session_id)
     if (
         session is None
@@ -3012,17 +3097,185 @@ async def _run_recovered_interrupted_task_handler(
             app.redact_json(task.id),
             app.redact_json(task.session_id),
         )
-        return page
-    await _handle_with_heartbeat(
+        raise SessionRunFenced("Interrupted-task continuation session changed after claim.")
+    unproductive_handoffs = await _count_unproductive_interrupted_handoffs(
         app,
-        task_store,
         task,
-        handler,
-        worker_id,
-        lease_seconds,
-        recover_interrupted_authority_loss=True,
+        cap=max_unproductive_handoffs or _UNPRODUCTIVE_CONTINUATION_BACKOFF_COUNT_CAP,
     )
-    return page
+    if max_unproductive_handoffs is not None and unproductive_handoffs >= max_unproductive_handoffs:
+        if await _session_has_pending_action(app, task.session_id):
+            # Approvals, user input, delegated actions and manual tool recovery
+            # wait on someone else. Keep throttling them but never fail them.
+            logger.warning(
+                "Interrupted-task continuation made no progress across %d handoffs "
+                "but its session has a pending action; continuing with backoff: "
+                "task_id=%s session_id=%s",
+                unproductive_handoffs,
+                app.redact_json(task.id),
+                app.redact_json(task.session_id),
+            )
+        else:
+            logger.warning(
+                "Interrupted-task continuation made no progress across %d handoffs; "
+                "failing the task instead of continuing it again: task_id=%s session_id=%s",
+                unproductive_handoffs,
+                app.redact_json(task.id),
+                app.redact_json(task.session_id),
+            )
+            async with managed_task_lease_mutation(
+                task_id=task.id,
+                worker_id=worker_id,
+                handoff_id=task.interrupted_handoff_id,
+                presented_lease_expires_at=task.lease_expires_at,
+            ) as effective_lease:
+                await _safe_fail_payload(
+                    task_store,
+                    task.id,
+                    worker_id,
+                    {
+                        "error": "InterruptedTaskContinuationStalled",
+                        "message": (
+                            f"The attached session was handed off {unproductive_handoffs} times "
+                            "without model, tool, or input progress, so its continuation was "
+                            "stopped instead of being released again."
+                        ),
+                        "unproductive_interrupted_handoffs": unproductive_handoffs,
+                    },
+                    lease_expires_at=effective_lease,
+                    handoff_id=task.interrupted_handoff_id,
+                )
+            return None
+    delay = _unproductive_continuation_backoff(unproductive_handoffs)
+    if delay > 0:
+        logger.warning(
+            "Interrupted-task continuation has made no progress across %d handoffs; "
+            "backing off %.1fs before continuing: task_id=%s session_id=%s",
+            unproductive_handoffs,
+            delay,
+            app.redact_json(task.id),
+            app.redact_json(task.session_id),
+        )
+        if await _wait_or_stop(delay, stop) or _worker_should_stop(app, stop):
+            # Hand the claim back so another worker can continue it promptly.
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+    if _worker_should_stop(app, stop):
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+    return await handler(app, task, worker_id)
+
+
+def _unproductive_continuation_backoff(unproductive_handoffs: int) -> float:
+    """Return the wait before continuing while heartbeat supervision runs.
+
+    The first handoff follows the original run; each later one is a continuation
+    that made no progress.
+    """
+
+    if unproductive_handoffs < 2:
+        return 0.0
+    exponent = min(unproductive_handoffs - 2, _UNPRODUCTIVE_CONTINUATION_MAX_BACKOFF_EXPONENT)
+    return min(
+        _UNPRODUCTIVE_CONTINUATION_INITIAL_BACKOFF_SECONDS * 2**exponent,
+        _UNPRODUCTIVE_CONTINUATION_MAX_BACKOFF_SECONDS,
+    )
+
+
+async def _session_progress_sequence(app: CayuApp, session_id: str) -> int | None:
+    """Return the session's latest progress event sequence, or None if unreadable."""
+
+    try:
+        records = await app.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_types=_CONTINUATION_PROGRESS_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+    except Exception:
+        return None
+    return records[0].sequence if records else 0
+
+
+async def _session_has_pending_action(app: CayuApp, session_id: str) -> bool:
+    """Return whether the session may be waiting on someone else's action."""
+
+    try:
+        result = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id=session_id, limit=1)
+        )
+    except Exception:
+        # An unreadable pending-action state is not proof that nothing waits.
+        return True
+    return bool(result.actions or result.issues or result.has_more)
+
+
+async def _count_unproductive_interrupted_handoffs(
+    app: CayuApp,
+    task: Task,
+    *,
+    cap: int,
+) -> int:
+    """Count this task's handoffs decided since its session last made progress.
+
+    Each handoff event records the progress sequence read while that handoff
+    still owned the session. Only handoffs carrying the current sequence count,
+    so a handoff event published after later progress is ignored. Handoff events
+    are an observability projection: a missing event or a failed read can only
+    lower the count.
+    """
+
+    assert task.session_id is not None
+    progress_sequence = await _session_progress_sequence(app, task.session_id)
+    if progress_sequence is None:
+        logger.warning(
+            "Could not read interrupted-task handoff history; continuing without "
+            "the unproductive-continuation bound: task_id=%s session_id=%s",
+            app.redact_json(task.id),
+            app.redact_json(task.session_id),
+        )
+        return 0
+    task_ids = {task.id, app.redact_json(task.id)}
+    handoff_ids: set[str] = set()
+    before_sequence: int | None = None
+    # The descending cursor excludes newly appended events after the first
+    # page. Scan that finite history until the requested count or exhaustion;
+    # a fixed page budget can make an accepted bound permanently unreachable.
+    while True:
+        try:
+            records = await app.session_store.query_events(
+                EventQuery(
+                    session_id=task.session_id,
+                    event_type=EventType.TASK_INTERRUPTED_HANDOFF,
+                    after_sequence=progress_sequence,
+                    before_sequence=before_sequence,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=_UNPRODUCTIVE_HANDOFF_HISTORY_PAGE_SIZE,
+                )
+            )
+        except Exception:
+            break
+        for record in records:
+            payload = record.event.payload
+            recorded_progress = payload.get("progress_sequence")
+            handoff_id = payload.get("handoff_id")
+            if (
+                payload.get("task_id") in task_ids
+                and payload.get("handoff_status") in {"released", "recovered"}
+                and type(recorded_progress) is int
+                and recorded_progress == progress_sequence
+                and type(handoff_id) is str
+            ):
+                handoff_ids.add(handoff_id)
+                if len(handoff_ids) >= cap:
+                    return cap
+        if len(records) < _UNPRODUCTIVE_HANDOFF_HISTORY_PAGE_SIZE:
+            break
+        before_sequence = records[-1].sequence
+        # In-memory adapters may finish a read without yielding. Give lease
+        # renewal and cancellation a turn between pages of a long history.
+        await asyncio.sleep(0)
+    return len(handoff_ids)
 
 
 async def _settle_recovered_continuation_authority_loss(
@@ -3679,6 +3932,7 @@ async def _safe_fail_payload(
     *,
     lease_expires_at: datetime | None = None,
     lease_authority: _TaskLeaseAuthority | None = None,
+    handoff_id: str | None = None,
 ) -> None:
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
@@ -3718,6 +3972,7 @@ async def _safe_fail_payload(
                 lease_expires_at=lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error=payload,
+                handoff_id=handoff_id,
                 idempotency_key=_worker_failure_terminalization_key(
                     task_id,
                     worker_id,

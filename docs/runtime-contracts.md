@@ -7138,6 +7138,32 @@ objective and defaults to the ordinary worker poll interval. A continuation
 claimed concurrently by another worker is simply absent from the next atomic
 claim; notifications and list observations never grant execution authority.
 
+A continuation whose session can never resume would otherwise be claimed,
+interrupted, and released again indefinitely. The session's progress sequence
+is the sequence of its latest `model.completed`, `tool.call.completed`, tool
+approval decision, or queued session message. Every `task.interrupted_handoff`
+event records, as `progress_sequence`, the value read while that handoff still
+owned the session. Before running the handler, the worker counts the distinct
+`released` and `recovered` handoffs of the task whose `progress_sequence` equals
+the current one. It pages through the handoff events after the latest progress,
+until the configured count is reached or the retained history is exhausted,
+so retry diagnostics cannot push successful handoffs out of view, and a handoff
+event that is published after later progress does not count.
+
+From the second such handoff on, the worker waits with exponential backoff (1 s
+doubling to 30 s) and logs a warning. Heartbeat supervision covers the session,
+history, and pending-action reads as well as the backoff and handler. If the
+worker stops before dispatch, it hands the claim back. When the count reaches
+`max_unproductive_interrupted_handoffs` (default 8), the worker
+fails the task with an `InterruptedTaskContinuationStalled` error that records
+the count, rather than continuing it again, so the parent can progress. It does
+not fail a session that has a pending tool approval, user input, delegated
+action, or manual tool recovery, or whose pending actions cannot be read; that
+continuation keeps running with backoff. `None` disables the bound but keeps the
+backoff. Because handoff events are an observability projection, a missing event
+can only delay the bound; an unreadable event history disables it for that
+claim.
+
 Only a `running`, attached, workerless task whose exact released version is
 backed by a committed interrupted-handoff receipt and the same durable
 `interrupted_handoff_id` is eligible. Claim consumes that one-use generation by
