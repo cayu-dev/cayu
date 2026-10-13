@@ -175,10 +175,16 @@ class LocalCiRunner:
         root: Path,
         dry_run: bool,
         keep_going: bool,
+        test_workers: int = 2,
+        profile_tests: Path | None = None,
     ) -> None:
+        if test_workers not in range(1, 9):
+            raise ValueError("test workers must be between 1 and 8")
         self.root = root
         self.dry_run = dry_run
         self.keep_going = keep_going
+        self.test_workers = test_workers
+        self.profile_tests = profile_tests
         self.evidence: list[CommandEvidence] = []
         self.failed = False
 
@@ -645,6 +651,24 @@ def _test_selection(
     )
 
 
+def _test_execution_options(runner: LocalCiRunner, lane: str) -> tuple[str, ...]:
+    # Capacity fixtures already create their own concurrent workers.
+    workers = 1 if lane.startswith(("qualification-", "host-journey-")) else runner.test_workers
+    options = ("-n", str(workers), "--dist", "loadfile", "--durations=20")
+    if runner.profile_tests is not None:
+        options += (
+            "--rootdir",
+            ".",
+            "-c",
+            "pyproject.toml",
+            "-p",
+            "scripts.ci_test_profile",
+            "--ci-profile",
+            str(runner.profile_tests / f"{lane}.json"),
+        )
+    return options
+
+
 def _run_general_shard(runner: LocalCiRunner, shard: int, *, manifest: Path | None = None) -> None:
     if shard not in range(1, _GENERAL_SHARDS + 1):
         raise ValueError(f"general shard must be between 1 and {_GENERAL_SHARDS}")
@@ -658,11 +682,7 @@ def _run_general_shard(runner: LocalCiRunner, shard: int, *, manifest: Path | No
             "pytest",
             "-q",
             *_test_selection(_GENERAL_MARKER, _GENERAL_SHARDS, shard, f"general-{shard}", manifest),
-            "-n",
-            "2",
-            "--dist",
-            "loadfile",
-            "--durations=20",
+            *_test_execution_options(runner, f"general-{shard}"),
         ),
         env=_GENERAL_TEST_ENV,
     )
@@ -690,12 +710,7 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str, *, manifest: Path | N
             "pytest",
             "-q",
             *_test_selection(marker, splits, group, lane, manifest),
-            "-n",
-            # Capacity fixtures already create their own concurrent workers.
-            "1" if lane.startswith(("qualification-", "host-journey-")) else "2",
-            "--dist",
-            "loadfile",
-            "--durations=20",
+            *_test_execution_options(runner, lane),
         ),
         env=_SPECIALIST_TEST_ENV,
     )
@@ -710,7 +725,13 @@ def _run_general_shards(runner: LocalCiRunner, *, jobs: int, manifest: Path | No
         return
 
     shard_runners = {
-        shard: LocalCiRunner(root=runner.root, dry_run=False, keep_going=False)
+        shard: LocalCiRunner(
+            root=runner.root,
+            dry_run=False,
+            keep_going=False,
+            test_workers=runner.test_workers,
+            profile_tests=runner.profile_tests,
+        )
         for shard in range(1, _GENERAL_SHARDS + 1)
     }
     failures: list[str] = []
@@ -1104,6 +1125,18 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="write in the collection lane; consume in general/specialist lanes",
     )
     parser.add_argument(
+        "--test-workers",
+        type=int,
+        choices=range(1, 9),
+        default=2,
+        help="workers per general/parallel specialist job (default: 2; capacity lanes stay at 1)",
+    )
+    parser.add_argument(
+        "--profile-tests",
+        type=Path,
+        help="write per-lane pytest resource/timing JSON to this directory and print it in the log",
+    )
+    parser.add_argument(
         "--python-version",
         choices=_SQLITE_PYTHON_VERSIONS,
         help="SQLite cancellation lane Python version",
@@ -1146,7 +1179,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="include immutable release-note and published-version checks",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.profile_tests is not None:
+        args.profile_tests = args.profile_tests.resolve()
+    return args
 
 
 def _fatal(message: str) -> NoReturn:
@@ -1157,7 +1193,13 @@ def _fatal(message: str) -> NoReturn:
 def _run_ci_lane(args: argparse.Namespace) -> int:
     root = Path(_capture(("git", "rev-parse", "--show-toplevel"), cwd=Path.cwd()))
     _raise_open_file_limit()
-    runner = LocalCiRunner(root=root, dry_run=args.dry_run, keep_going=False)
+    runner = LocalCiRunner(
+        root=root,
+        dry_run=args.dry_run,
+        keep_going=False,
+        test_workers=args.test_workers,
+        profile_tests=args.profile_tests,
+    )
     try:
         if args.lane == "static":
             _run_static(runner)
@@ -1276,6 +1318,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 root=execution_root,
                 dry_run=args.dry_run,
                 keep_going=args.keep_going,
+                test_workers=args.test_workers,
+                profile_tests=args.profile_tests,
             )
             error: str | None = None
             interrupted = False

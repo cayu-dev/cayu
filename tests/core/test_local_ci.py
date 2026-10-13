@@ -175,6 +175,45 @@ def test_manifest_handoff_preserves_workers_and_required_test_environment(tmp_pa
         assert "--splits" not in command
 
 
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_worker_override_and_optional_profile_preserve_capacity_lane_limits(tmp_path, workers):
+    for lane, expected in (
+        ("general-1", workers),
+        ("postgres-conformance-1", workers),
+        ("browser-docker", workers),
+        ("qualification-1", 1),
+        ("host-journey-1", 1),
+    ):
+        runner = LocalCiRunner(
+            root=_ROOT,
+            dry_run=True,
+            keep_going=False,
+            test_workers=workers,
+            profile_tests=tmp_path,
+        )
+        if lane == "general-1":
+            _run_general_shard(runner, 1)
+        else:
+            _run_specialist_lane(runner, lane)
+        command = runner.evidence[-1].command
+        assert f"-n {expected} --dist loadfile" in command
+        assert f"--ci-profile {tmp_path / (lane + '.json')}" in command
+        assert "--rootdir . -c pyproject.toml -p scripts.ci_test_profile" in command
+        assert "CAYU_REQUIRE_POSTGRES_TESTS=1" in command
+    assert _dry_runner().profile_tests is None
+    assert _dry_runner().test_workers == 2
+
+
+def test_profile_paths_survive_the_isolated_local_checkout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = _RUNNER["_parse_args"](["--profile-tests", "profiles", "--test-workers", "4"])
+    assert args.profile_tests == tmp_path / "profiles"
+    assert args.test_workers == 4
+    for workers in (0, 9):
+        with pytest.raises(ValueError, match="test workers must be between 1 and 8"):
+            LocalCiRunner(root=_ROOT, dry_run=True, keep_going=False, test_workers=workers)
+
+
 def test_hosted_manifest_artifacts_connect_each_producer_to_its_consumers():
     import re
 
@@ -203,12 +242,14 @@ def test_hosted_manifest_artifacts_connect_each_producer_to_its_consumers():
             assert '--test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"' in job
 
 
-def test_local_general_shards_use_bounded_parallel_workers(monkeypatch) -> None:
+def test_local_general_shards_use_bounded_parallel_workers(monkeypatch, tmp_path) -> None:
     from threading import Barrier
 
     rendezvous = Barrier(2)
 
     def fake_shard(runner, shard: int, *, manifest=None) -> None:
+        assert runner.test_workers == 4
+        assert runner.profile_tests == tmp_path
         rendezvous.wait(timeout=2)
         runner.evidence.append(
             CommandEvidence(
@@ -223,7 +264,13 @@ def test_local_general_shards_use_bounded_parallel_workers(monkeypatch) -> None:
         )
 
     monkeypatch.setitem(_run_general_shards.__globals__, "_run_general_shard", fake_shard)
-    runner = LocalCiRunner(root=_ROOT, dry_run=False, keep_going=False)
+    runner = LocalCiRunner(
+        root=_ROOT,
+        dry_run=False,
+        keep_going=False,
+        test_workers=4,
+        profile_tests=tmp_path,
+    )
     _run_general_shards(runner, jobs=2)
 
     assert [item.label for item in runner.evidence] == [f"shard {n}" for n in range(1, 33)]

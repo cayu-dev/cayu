@@ -95,5 +95,80 @@ Record those separately before choosing worker counts or provisioning capacity.
 Shorter elapsed time is useful only when the required inventory, assertions,
 backend coverage and artifact checks remain intact.
 
+## Profile test execution
+
+Use the same lane runner with optional process measurements:
+
+```bash
+python3 scripts/run_ci.py --lane collection --test-manifest /tmp/ci-tests.json
+python3 scripts/run_ci.py --lane general --shard 1 \
+  --test-manifest /tmp/ci-tests.json --test-workers 4 \
+  --profile-tests /tmp/ci-profile
+```
+
+The report is written to `/tmp/ci-profile/general-1.json` and printed as one
+`CI execution profile:` JSON line. Profiling is off by default and can also be
+used independently with `pytest -p scripts.ci_test_profile --ci-profile PATH`.
+For independent invocations with output outside the repository, pass
+`--rootdir . -c pyproject.toml` so the output path cannot alter pytest discovery.
+The complete local CI runner accepts these options too; its parallel shards
+write separate reports to the requested directory.
+
+`--test-workers` accepts 1–8 workers for general and parallel specialist lanes.
+The default remains two. Qualification and host-journey lanes always retain one
+worker because their fixtures create their own concurrency. File scheduling,
+manifest assignments and required backend flags are unchanged.
+
+The report distinguishes these measurements:
+
+- Each worker's collection and execution wall time, CPU user/system time,
+  major page faults, block I/O and context switches.
+- Resources charged to the worker itself versus terminated children it has
+  waited for. External Docker services and still-running descendants are not
+  included in these CPU totals. Linux process byte-I/O counters include waited
+  children and are labelled separately.
+- Process-lifetime peak resident memory, in bytes. Child peak memory is the
+  operating system's child high-water measurement; it is not concurrent memory
+  across a process tree. Peaks are neither phase deltas nor additive across
+  workers. The controller's child counters can overlap worker measurements.
+- Shared-host observations at session start/end: CPU count/affinity, load
+  average, available memory, swap and Linux pressure-stall totals. Visible
+  cgroup-v2 limits are recorded from the current group through its mounted
+  ancestors; limits outside a container's visible hierarchy remain unknown.
+  Cgroup memory and throttling counters can include other processes in that
+  group. These observations do not isolate this job's contribution.
+- Collection/execution inventory hashes, test outcomes and the twenty slowest
+  tests/files by accumulated setup/call/teardown time. Summed test durations can
+  overlap in parallel and are not elapsed CI time.
+
+Linux-only or unreadable metrics are `null`; they are not reported as zero.
+Reset counters also produce `null` deltas. Collection and test failures still
+fail pytest. A crashed worker has an incomplete profile rather than fabricated
+zero usage. Reports omit environment variables, command lines, runner identities
+and filesystem locations; keep run-specific results outside the source tree.
+Process measurements begin at pytest session start, so interpreter/plugin startup
+and final process exit remain part of the outer command timing.
+
+### Compare worker counts
+
+The manual **CI execution profiling** workflow runs general shard 1 and PostgreSQL
+shard 1 on separate jobs using an exact commit SHA and one preflight manifest.
+Within each job it runs 2, 4 and 8 workers, then reverses that order for a second
+round. Each lane keeps the same VM and checkout for all counts. Choose one round
+for a preliminary observation; use both before drawing a performance conclusion.
+The workflow keeps failures visible, continues the remaining comparisons and
+retains JSON/log artifacts for seven days. Ordinary PR/release CI does not invoke
+this experiment.
+
+Compare successful runs with identical collection and executed-inventory hashes,
+outcomes and fixture ownership. Record simultaneous workflow load and actual
+CPU/memory limits. The public and private pools may have different capacity;
+eight workers can oversubscribe a small runner. A measurement on one shard or
+runner does not establish a new default or the full validation target.
+
+Measurement semantics: [Python resource usage](https://docs.python.org/3/library/resource.html),
+[Linux process I/O](https://man7.org/linux/man-pages/man5/proc_pid_io.5.html),
+and [cgroup v2](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
 API reference: [workflow runs](https://docs.github.com/en/rest/actions/workflow-runs)
 and [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs).

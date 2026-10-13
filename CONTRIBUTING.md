@@ -355,6 +355,11 @@ This reduces repeated collection work; it does not establish an end-to-end CI co
 
 Use the [CI timing reporter](docs/ci-timing.md) to compare completed workflows,
 including retries, job waiting and individual step durations.
+The same guide describes optional per-worker CPU, memory and I/O profiling with
+`--profile-tests DIRECTORY` and worker-count experiments with
+`--test-workers 1..8`. Defaults remain two workers for parallel lanes and one
+for qualification/host-journey lanes. The manual CI execution profiling workflow
+compares representative shards without changing ordinary PR verification.
 
 Deadline and cancellation tests should wait for the intended operation to start before
 triggering their fault. Use explicit readiness signals or a controlled clock for unit

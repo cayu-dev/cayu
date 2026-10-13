@@ -1,0 +1,102 @@
+name: CI execution profiling
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Exact 40-character commit SHA to profile
+        required: true
+        type: string
+      repetitions:
+        description: Paired rounds (the second reverses worker-count order)
+        type: choice
+        default: "2"
+        options: ["1", "2"]
+
+permissions:
+  contents: read
+
+jobs:
+  collection:
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Require an immutable revision
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: '[[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: python3 scripts/run_ci.py --lane collection --test-manifest "$RUNNER_TEMP/profile-manifest.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: profile-manifest
+          path: ${{ runner.temp }}/profile-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  benchmark:
+    needs: collection
+    name: Profile ${{ matrix.lane }}
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [general-1, postgres-conformance-1]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: ./.github/actions/install-system-packages
+        timeout-minutes: 5
+        with:
+          packages: ripgrep ffmpeg
+          commands: rg ffmpeg
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: profile-manifest
+          path: ${{ runner.temp }}
+      - name: Compare worker counts on the same assigned tests
+        shell: bash
+        env:
+          LANE: ${{ matrix.lane }}
+          REPETITIONS: ${{ inputs.repetitions }}
+        run: |
+          case "$REPETITIONS" in 1|2) ;; *) exit 2 ;; esac
+          if [[ "$LANE" == general-1 ]]; then
+            selection=(--lane general --shard 1)
+          else
+            selection=(--lane specialist --specialist-lane "$LANE")
+          fi
+          status=0
+          for round in $(seq 1 "$REPETITIONS"); do
+            counts=(2 4 8)
+            if [[ "$round" == 2 ]]; then counts=(8 4 2); fi
+            for workers in "${counts[@]}"; do
+              output="$RUNNER_TEMP/ci-profiles/$round-$workers"
+              mkdir -p "$output"
+              if ! python3 scripts/run_ci.py "${selection[@]}" \
+                --test-manifest "$RUNNER_TEMP/profile-manifest.json" \
+                --test-workers "$workers" --profile-tests "$output" \
+                2>&1 | tee "$output/run.log"; then
+                status=1
+              fi
+            done
+          done
+          exit "$status"
+      - name: Retain measurements, including failed comparisons
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: execution-profile-${{ matrix.lane }}
+          path: ${{ runner.temp }}/ci-profiles
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
