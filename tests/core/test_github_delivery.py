@@ -1370,7 +1370,9 @@ def test_conflicting_approval_is_denied_without_provider_mutation(tmp_path):
 
 
 @pytest.mark.parametrize("stop", ["cancel", "deadline"])
-def test_public_waiter_stop_retains_dispatched_owner_and_blocks_more_effects(tmp_path, stop):
+def test_public_waiter_stop_retains_dispatched_owner_and_blocks_more_effects(
+    tmp_path, stop, monkeypatch
+):
     request = _request(reviewers=("reviewer",))
     request = request.model_copy(
         update={"limits": request.limits.model_copy(update={"timeout_seconds": 1})}
@@ -1381,6 +1383,24 @@ def test_public_waiter_stop_retains_dispatched_owner_and_blocks_more_effects(tmp
 
     async def exercise():
         entered, release = asyncio.Event(), asyncio.Event()
+        expire = asyncio.Event()
+        real_wait = asyncio.wait
+        caller = None
+
+        async def controlled_wait(tasks, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+            if asyncio.current_task() is caller:
+                assert timeout == request.limits.timeout_seconds
+                assert tasks == {connector._owners[request.connector_run_id][1]}
+                # Exercise the real wait's cancellation/timeout behavior without
+                # letting filesystem preflight consume the scenario's deadline.
+                if stop == "deadline":
+                    await expire.wait()
+                    timeout = 0
+                else:
+                    timeout = None
+            return await real_wait(tasks, timeout=timeout, return_when=return_when)
+
+        monkeypatch.setattr(asyncio, "wait", controlled_wait)
 
         async def delayed_create(config, current):
             del config
@@ -1392,28 +1412,43 @@ def test_public_waiter_stop_retains_dispatched_owner_and_blocks_more_effects(tmp
 
         transport.create_pull_request = delayed_create
         caller = asyncio.create_task(connector.run(request, object(), object(), approval=approval))
-        await asyncio.wait_for(entered.wait(), timeout=10)
-        if stop == "cancel":
-            caller.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await caller
-            assert caller.cancelled()
-            assert caller.cancelling() == 1
-        else:
-            with pytest.raises(GitHubProviderError, match="provider_timeout"):
-                await caller
-            assert not caller.cancelled()
-        owner = connector._owners[request.connector_run_id][1]
-        assert not owner.done()
-        with pytest.raises(GitHubDeliveryAdmissionError, match="unsettled"):
-            await connector.run(request, object(), object(), approval=approval)
-        release.set()
-        await asyncio.wait_for(asyncio.shield(owner), timeout=5)
-        assert transport.create_calls == 1
-        assert transport.reviewer_calls == 0
-        latest = await connector.repository.latest(request)
-        assert latest.result.state is GitHubDeliveryState.CANCELLED
-        assert any(item.status == "succeeded" for item in latest.result.operations)
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            owner = connector._owners[request.connector_run_id][1]
+            if stop == "cancel":
+                caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(caller), timeout=5)
+                assert caller.cancelled()
+                assert caller.cancelling() == 1
+            else:
+                expire.set()
+                with pytest.raises(GitHubProviderError, match="provider_timeout"):
+                    await asyncio.wait_for(asyncio.shield(caller), timeout=5)
+                assert not caller.cancelled()
+                assert caller.cancelling() == 0
+            assert not owner.done()
+            with pytest.raises(GitHubDeliveryAdmissionError, match="unsettled"):
+                await connector.run(request, object(), object(), approval=approval)
+            release.set()
+            await asyncio.wait_for(asyncio.shield(owner), timeout=5)
+            assert transport.create_calls == 1
+            assert transport.reviewer_calls == 0
+            latest = await connector.repository.latest(request)
+            assert latest.result.state is GitHubDeliveryState.CANCELLED
+            assert any(item.status == "succeeded" for item in latest.result.operations)
+        finally:
+            if not caller.done():
+                caller.cancel()
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(
+                    caller,
+                    *(entry[1] for entry in connector._owners.values()),
+                    return_exceptions=True,
+                ),
+                timeout=5,
+            )
 
     asyncio.run(exercise())
 
