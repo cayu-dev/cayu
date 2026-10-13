@@ -22,6 +22,7 @@ from cayu.budgets.pricing import PriceBook
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
+    EVAL_CORPUS_MAX_NAME_CHARS,
     ArtifactAssertionSpec,
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -1316,7 +1317,7 @@ def build_captured_evaluation_candidate(
             app,
             f"{validated_target_key} regressions",
             "suite.name",
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
         ),
         description="Regression expectations evaluated from bounded Cayu evidence.",
     )
@@ -1650,7 +1651,7 @@ def build_promotion_candidate(
         app,
         f"{validated_target_key} regressions",
         "suite.name",
-        max_chars=256,
+        max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
     )
     suite = EvalSuiteSpec.create(
         id=suite_id,
@@ -1757,7 +1758,7 @@ def score_promotion_candidate(
         app,
         validated_candidate.suite.name,
         "suite.name",
-        max_chars=256,
+        max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
     )
     _safe_pricing_profile_identity(app, validated_candidate.pricing_profile)
     manifest = app.describe(project_root=project_root)

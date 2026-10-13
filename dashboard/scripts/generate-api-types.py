@@ -18,6 +18,7 @@ DASHBOARD_ROOT = Path(__file__).resolve().parents[1]
 GENERATED_DIR = DASHBOARD_ROOT / "src" / "lib" / "generated" / "server-api"
 OPENAPI_BASELINE = DASHBOARD_ROOT / "server-openapi.json"
 RELEASE_METADATA = DASHBOARD_ROOT / "src" / "lib" / "release-metadata.ts"
+EVAL_TEXT_LIMITS = DASHBOARD_ROOT / "src" / "lib" / "generated" / "eval-text-limits.ts"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         schema_path = temp_dir / "server-openapi.json" if args.check else OPENAPI_BASELINE
         output_dir = temp_dir / "server-api" if args.check else GENERATED_DIR
         release_metadata = _release_metadata()
+        eval_text_limits = _eval_text_limits()
         schema_path.write_text(_openapi_json(), encoding="utf-8", newline="\n")
         if not args.check and output_dir.exists():
             shutil.rmtree(output_dir)
@@ -48,8 +50,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _assert_file_matches(expected=schema_path, actual=OPENAPI_BASELINE)
             _assert_generated_tree_matches(expected_dir=output_dir, actual_dir=GENERATED_DIR)
+            if not EVAL_TEXT_LIMITS.is_file() or EVAL_TEXT_LIMITS.read_bytes() != eval_text_limits:
+                raise SystemExit(
+                    "Dashboard evaluation text limits are stale; run `npm run generate:api` "
+                    "with the intended Cayu Python environment."
+                )
         else:
             RELEASE_METADATA.write_bytes(release_metadata)
+            EVAL_TEXT_LIMITS.parent.mkdir(parents=True, exist_ok=True)
+            EVAL_TEXT_LIMITS.write_bytes(eval_text_limits)
     return 0
 
 
@@ -99,6 +108,23 @@ def _release_metadata() -> bytes:
     return (
         f'export const DASHBOARD_SOURCE_CAYU_VERSION = "{cayu_version}"\n'
         f'export const SUPPORTED_SERVER_CONTRACT_VERSION = "{SERVER_CONTRACT_VERSION}"\n'
+    ).encode()
+
+
+def _eval_text_limits() -> bytes:
+    from cayu.evals.corpus import (
+        EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
+        EVAL_CORPUS_MAX_NAME_CHARS,
+        EVAL_CORPUS_TEXT_LENGTH_UNIT,
+    )
+
+    return (
+        "// Generated from cayu.evals.corpus by npm run generate:api.\n"
+        "export const EVAL_TEXT_LIMITS = {\n"
+        f'  unit: "{EVAL_CORPUS_TEXT_LENGTH_UNIT}",\n'
+        f"  name: {EVAL_CORPUS_MAX_NAME_CHARS},\n"
+        f"  description: {EVAL_CORPUS_MAX_DESCRIPTION_CHARS},\n"
+        "} as const\n"
     ).encode()
 
 

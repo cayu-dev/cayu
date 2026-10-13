@@ -71,6 +71,11 @@ _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY = "cayu.structured_model_judge.resul
 EVAL_CORPUS_MAX_BYTES = 8 << 20
 EVAL_CORPUS_MAX_SUITES = 64
 EVAL_CORPUS_MAX_CASES = 1_000
+# Suite/case names and descriptions count Unicode scalar values, not UTF-8
+# bytes or UTF-16 code units. Durable-text validators reject lone surrogates.
+EVAL_CORPUS_TEXT_LENGTH_UNIT: Literal["unicode_scalar_values"] = "unicode_scalar_values"
+EVAL_CORPUS_MAX_NAME_CHARS = 256
+EVAL_CORPUS_MAX_DESCRIPTION_CHARS = 2_048
 EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE = 64
 # A published result repeats every assertion once per trial. This combined
 # ceiling keeps the complete result graph safely below its 32 MiB hard limit,
@@ -1749,7 +1754,7 @@ class EvalSuiteSpec(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -1762,7 +1767,7 @@ class EvalSuiteSpec(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -1877,7 +1882,7 @@ class EvalCaseSpec(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -1890,7 +1895,7 @@ class EvalCaseSpec(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -2298,7 +2303,7 @@ class EvalCorpusSuiteInspectionV1(_SchemaV1PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )

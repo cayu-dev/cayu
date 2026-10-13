@@ -63,6 +63,8 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
     EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
+    EVAL_CORPUS_MAX_NAME_CHARS,
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TRIALS,
     JudgeProfileIdentityV1,
@@ -1308,8 +1310,10 @@ class EvaluationPromotionSuiteDraft(ApiBaseModel):
     """Complete authority-free suite fields editable in one preview."""
 
     id: PromotionPortableId
-    name: StrictStr = Field(min_length=1, max_length=256)
-    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    name: StrictStr = Field(min_length=1, max_length=EVAL_CORPUS_MAX_NAME_CHARS)
+    description: StrictStr | None = Field(
+        default=None, min_length=1, max_length=EVAL_CORPUS_MAX_DESCRIPTION_CHARS
+    )
     trial_request: TrialRequestSpec
 
 
@@ -1318,8 +1322,10 @@ class EvaluationPromotionCaseDraft(ApiBaseModel):
 
     id: PromotionPortableId
     suite_id: PromotionPortableId
-    name: StrictStr = Field(min_length=1, max_length=256)
-    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    name: StrictStr = Field(min_length=1, max_length=EVAL_CORPUS_MAX_NAME_CHARS)
+    description: StrictStr | None = Field(
+        default=None, min_length=1, max_length=EVAL_CORPUS_MAX_DESCRIPTION_CHARS
+    )
     input: RunInputSpec
     assertions: tuple[EvalSuiteAuthoringAssertionSpecV1, ...] = Field(
         min_length=1,
@@ -1373,8 +1379,10 @@ class CapturedEvaluationSuiteDraft(ApiBaseModel):
     """Operator-editable suite identity for one captured evaluation."""
 
     id: PromotionPortableId
-    name: StrictStr = Field(min_length=1, max_length=256)
-    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    name: StrictStr = Field(min_length=1, max_length=EVAL_CORPUS_MAX_NAME_CHARS)
+    description: StrictStr | None = Field(
+        default=None, min_length=1, max_length=EVAL_CORPUS_MAX_DESCRIPTION_CHARS
+    )
 
 
 class CapturedEvaluationCaseDraft(ApiBaseModel):
@@ -1382,8 +1390,10 @@ class CapturedEvaluationCaseDraft(ApiBaseModel):
 
     id: PromotionPortableId
     suite_id: PromotionPortableId
-    name: StrictStr = Field(min_length=1, max_length=256)
-    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    name: StrictStr = Field(min_length=1, max_length=EVAL_CORPUS_MAX_NAME_CHARS)
+    description: StrictStr | None = Field(
+        default=None, min_length=1, max_length=EVAL_CORPUS_MAX_DESCRIPTION_CHARS
+    )
     assertions: tuple[EvalSuiteAuthoringAssertionSpecV1, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,

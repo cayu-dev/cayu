@@ -8,6 +8,7 @@ import {
   requirePortableId,
   validateDeterministicAssertions,
 } from "./evaluation-promotion.ts"
+import { EVAL_TEXT_LIMITS } from "./generated/eval-text-limits.ts"
 import type {
   EvalCaseDraftV2,
   EvalRunCostBudgetInput,
@@ -200,8 +201,8 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV3): EvalSuiteDraftV
   try {
     requirePortableId(draft.id, "Suite ID")
     requirePortableId(draft.target_key, "Target key")
-    requireBoundedCleanText(draft.name, "Suite name", 256)
-    requireOptionalCleanText(draft.description, "Suite description", 2_048)
+    requireBoundedCleanText(draft.name, "Suite name", EVAL_TEXT_LIMITS.name)
+    requireOptionalCleanText(draft.description, "Suite description", EVAL_TEXT_LIMITS.description)
     const trials = draft.trial_request?.trials ?? 1
     const minimumPassed = draft.trial_request?.minimum_passed_trials ?? 1
     requireInteger(trials, "Trials", 1, 100)
@@ -222,8 +223,12 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV3): EvalSuiteDraftV
       requirePortableId(evalCase.id, `${label} ID`)
       if (caseIds.has(evalCase.id)) throw new Error(`Case ID ${evalCase.id} is duplicated.`)
       caseIds.add(evalCase.id)
-      requireBoundedCleanText(evalCase.name, `${label} name`, 256)
-      requireOptionalCleanText(evalCase.description, `${label} description`, 2_048)
+      requireBoundedCleanText(evalCase.name, `${label} name`, EVAL_TEXT_LIMITS.name)
+      requireOptionalCleanText(
+        evalCase.description,
+        `${label} description`,
+        EVAL_TEXT_LIMITS.description,
+      )
       if (evalCase.stimulus.kind === "simple_input") {
         if (evalCase.stimulus.input.opaque_external_case_ref != null) {
           throw new Error(

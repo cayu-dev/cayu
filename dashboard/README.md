@@ -41,6 +41,11 @@ explicit highest-priority override. Ejected dashboard source can use `npm run ch
 selects an ambient `python` unless `CAYU_PYTHON` is set; that environment must contain the exact
 Cayu version recorded in `src/lib/release-metadata.ts` with the `server` extra.
 
+The same commands generate and check `src/lib/generated/eval-text-limits.ts`
+from the evaluation corpus domain. Suite/case name and description limits count
+Unicode scalar values. Update the Python definitions and regenerate the client
+when changing these limits; the dashboard retains its existing text validators.
+
 Serve `dist/` with `DashboardConfig(directory=...)`, `mount_cayu(..., dashboard_dir=...)`, or
 `mount_dashboard(..., dashboard_dir=...)`. Cayu injects the configured base path and API URL,
 including for non-root mounts and React-router deep links.

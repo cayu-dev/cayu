@@ -47,7 +47,9 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
     EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
     EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
+    EVAL_CORPUS_MAX_NAME_CHARS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_SUITES,
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
@@ -873,7 +875,7 @@ class EvalAuthoredSuiteCatalogEntry(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -886,7 +888,7 @@ class EvalAuthoredSuiteCatalogEntry(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -941,7 +943,7 @@ class EvalSuiteCatalogEntry(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -954,7 +956,7 @@ class EvalSuiteCatalogEntry(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -998,7 +1000,7 @@ class EvalCaseCatalogEntry(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -1011,7 +1013,7 @@ class EvalCaseCatalogEntry(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )

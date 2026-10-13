@@ -1,3 +1,4 @@
+import { EVAL_TEXT_LIMITS } from "./generated/eval-text-limits.ts"
 import type {
   CapturedEvaluationCandidateV1,
   CapturedEvaluationDraft,
@@ -252,15 +253,19 @@ function validateCapturedDraft(draft: CapturedEvaluationDraft): void {
     throw new Error("Reload the captured preview before editing this evaluation.")
   }
   requirePortableId(draft.suite.id, "Suite ID")
-  requireBoundedCleanText(draft.suite.name, "Suite name", 256)
-  requireOptionalCleanText(draft.suite.description, "Suite description", 2_048)
+  requireBoundedCleanText(draft.suite.name, "Suite name", EVAL_TEXT_LIMITS.name)
+  requireOptionalCleanText(
+    draft.suite.description,
+    "Suite description",
+    EVAL_TEXT_LIMITS.description,
+  )
   requirePortableId(draft.case.id, "Case ID")
   requirePortableId(draft.case.suite_id, "Case suite ID")
   if (draft.case.suite_id !== draft.suite.id) {
     throw new Error("Case suite ID must match the edited suite ID.")
   }
-  requireBoundedCleanText(draft.case.name, "Case name", 256)
-  requireOptionalCleanText(draft.case.description, "Case description", 2_048)
+  requireBoundedCleanText(draft.case.name, "Case name", EVAL_TEXT_LIMITS.name)
+  requireOptionalCleanText(draft.case.description, "Case description", EVAL_TEXT_LIMITS.description)
   validateDeterministicAssertions(draft.case.assertions)
 }
 
@@ -291,8 +296,12 @@ function validateDraft(draft: EvaluationPromotionDraft): void {
     throw new Error("Reload the promotion preview before editing this candidate.")
   }
   requirePortableId(draft.suite.id, "Suite ID")
-  requireBoundedCleanText(draft.suite.name, "Suite name", 256)
-  requireOptionalCleanText(draft.suite.description, "Suite description", 2_048)
+  requireBoundedCleanText(draft.suite.name, "Suite name", EVAL_TEXT_LIMITS.name)
+  requireOptionalCleanText(
+    draft.suite.description,
+    "Suite description",
+    EVAL_TEXT_LIMITS.description,
+  )
   requireInteger(draft.suite.trial_request.trials ?? 1, "Trials", 1, 100)
   requireInteger(draft.suite.trial_request.timeout_seconds ?? 300, "Timeout", 1, 3_600)
 
@@ -301,8 +310,8 @@ function validateDraft(draft: EvaluationPromotionDraft): void {
   if (draft.case.suite_id !== draft.suite.id) {
     throw new Error("Case suite ID must match the edited suite ID.")
   }
-  requireBoundedCleanText(draft.case.name, "Case name", 256)
-  requireOptionalCleanText(draft.case.description, "Case description", 2_048)
+  requireBoundedCleanText(draft.case.name, "Case name", EVAL_TEXT_LIMITS.name)
+  requireOptionalCleanText(draft.case.description, "Case description", EVAL_TEXT_LIMITS.description)
   if (draft.case.input.opaque_external_case_ref != null) {
     throw new Error("A promotion candidate cannot contain runtime-owned opaque external input.")
   }

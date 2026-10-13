@@ -1,0 +1,163 @@
+[
+  {
+    "id": "name-ascii-at",
+    "field": "name",
+    "text": "x",
+    "repeat": 256,
+    "accepted": true
+  },
+  {
+    "id": "name-ascii-over",
+    "field": "name",
+    "text": "x",
+    "repeat": 257,
+    "accepted": false
+  },
+  {
+    "id": "name-astral-at",
+    "field": "name",
+    "text": "\ud83d\ude00",
+    "repeat": 256,
+    "accepted": true
+  },
+  {
+    "id": "name-astral-over",
+    "field": "name",
+    "text": "\ud83d\ude00",
+    "repeat": 257,
+    "accepted": false
+  },
+  {
+    "id": "name-combining-at",
+    "field": "name",
+    "text": "e\u0301",
+    "repeat": 128,
+    "accepted": true
+  },
+  {
+    "id": "name-combining-over",
+    "field": "name",
+    "text": "e\u0301",
+    "repeat": 129,
+    "accepted": false
+  },
+  {
+    "id": "name-empty",
+    "field": "name",
+    "text": "",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "name-outer-whitespace",
+    "field": "name",
+    "text": "\u0085word",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "name-bom",
+    "field": "name",
+    "text": "\ufeffword",
+    "repeat": 1,
+    "accepted": true
+  },
+  {
+    "id": "name-nul",
+    "field": "name",
+    "text": "word\u0000",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "name-surrogate",
+    "field": "name",
+    "text": "\ud800",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "description-ascii-at",
+    "field": "description",
+    "text": "x",
+    "repeat": 2048,
+    "accepted": true
+  },
+  {
+    "id": "description-ascii-over",
+    "field": "description",
+    "text": "x",
+    "repeat": 2049,
+    "accepted": false
+  },
+  {
+    "id": "description-astral-at",
+    "field": "description",
+    "text": "\ud83d\ude00",
+    "repeat": 2048,
+    "accepted": true
+  },
+  {
+    "id": "description-astral-over",
+    "field": "description",
+    "text": "\ud83d\ude00",
+    "repeat": 2049,
+    "accepted": false
+  },
+  {
+    "id": "description-combining-at",
+    "field": "description",
+    "text": "e\u0301",
+    "repeat": 1024,
+    "accepted": true
+  },
+  {
+    "id": "description-combining-over",
+    "field": "description",
+    "text": "e\u0301",
+    "repeat": 1025,
+    "accepted": false
+  },
+  {
+    "id": "description-empty",
+    "field": "description",
+    "text": "",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "description-outer-whitespace",
+    "field": "description",
+    "text": "\u0085word",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "description-bom",
+    "field": "description",
+    "text": "\ufeffword",
+    "repeat": 1,
+    "accepted": true
+  },
+  {
+    "id": "description-nul",
+    "field": "description",
+    "text": "word\u0000",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "description-surrogate",
+    "field": "description",
+    "text": "\ud800",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "description-null",
+    "field": "description",
+    "text": null,
+    "repeat": 1,
+    "accepted": true
+  }
+]

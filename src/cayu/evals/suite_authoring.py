@@ -19,9 +19,11 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
     EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
     EVAL_CORPUS_MAX_JUDGE_CRITERIA,
     EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS,
     EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS,
+    EVAL_CORPUS_MAX_NAME_CHARS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS,
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
@@ -436,7 +438,7 @@ class _EvalCaseAuthoringBase(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -449,7 +451,7 @@ class _EvalCaseAuthoringBase(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -694,7 +696,7 @@ class EvalSuiteDraftV1(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -707,7 +709,7 @@ class EvalSuiteDraftV1(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -784,7 +786,7 @@ class EvalSuiteDraftV2(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -797,7 +799,7 @@ class EvalSuiteDraftV2(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -908,7 +910,7 @@ class EvalSuiteDraftV3(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=EVAL_CORPUS_MAX_NAME_CHARS,
             nonblank=True,
             clean=True,
         )
@@ -921,7 +923,7 @@ class EvalSuiteDraftV3(_PortableModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=2_048,
+            max_chars=EVAL_CORPUS_MAX_DESCRIPTION_CHARS,
             nonblank=True,
             clean=True,
         )

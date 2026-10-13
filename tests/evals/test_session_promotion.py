@@ -60,6 +60,7 @@ from cayu import (
     session_usage_summary,
     trajectory_from_session,
 )
+from cayu.evals import corpus, promotion
 from cayu.evals.models import _trajectory_promotion_capture_sha256
 from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
@@ -632,6 +633,51 @@ def test_failed_session_input_is_still_eligible_for_a_regression_case():
     assert score.status == "failed"
     assert score.score == 0.0
     assert score.assertions[0].outcome == "failed"
+
+
+@pytest.mark.parametrize("maximum", [256, 300])
+@pytest.mark.parametrize(
+    ("build", "score"),
+    [
+        (build_promotion_candidate, score_promotion_candidate),
+        (build_captured_evaluation_candidate, score_captured_evaluation_candidate),
+    ],
+    ids=["promotion", "captured"],
+)
+def test_candidate_scoring_follows_corpus_suite_name_limit(monkeypatch, maximum, build, score):
+    # Model a new declaration in its owner and the consumer's imported binding.
+    monkeypatch.setattr(corpus, "EVAL_CORPUS_MAX_NAME_CHARS", maximum)
+    monkeypatch.setattr(promotion, "EVAL_CORPUS_MAX_NAME_CHARS", maximum)
+    app, trajectory = asyncio.run(_run_trajectory(InMemorySessionStore()))
+    identity = {
+        "target_key": "assistant",
+        "source_agent_name": "assistant",
+        "application_release_id": "release-2026-08-05",
+    }
+    candidate = build(
+        app,
+        trajectory,
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        **identity,
+    )
+    suite_fields = {
+        "id": candidate.suite.id,
+        "description": candidate.suite.description,
+        "trial_request": candidate.suite.trial_request,
+    }
+    suite = corpus.EvalSuiteSpec.create(name="😀" * maximum, **suite_fields)
+    edited = type(candidate).create(
+        target_key=candidate.target_key,
+        source=candidate.source,
+        evidence_policy=candidate.evidence_policy,
+        pricing_profile=candidate.pricing_profile,
+        evidence=candidate.evidence,
+        suite=suite,
+        case=candidate.case,
+    )
+    assert score(app, trajectory, edited, **identity).status == "passed"
+    with pytest.raises(ValueError, match=f"at most {maximum} characters"):
+        corpus.EvalSuiteSpec.create(name="😀" * (maximum + 1), **suite_fields)
 
 
 def test_candidate_projection_is_deterministic_editable_and_identity_free():
