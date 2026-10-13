@@ -180,6 +180,17 @@ def prepare_contract(
     The supplied schema/redactor are trusted application code. This returns a
     detached value, not authorization. No external operation is called here.
     """
+    checked, _encoded = _prepare_contract(schema, value, redactor=redactor)
+    return checked
+
+
+def _prepare_contract(
+    schema: type[ValueT],
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[ValueT, bytes]:
+    """Keep the encoding from this validation call; never cache across inputs."""
     if not isinstance(schema, type) or not issubclass(schema, ContractValue):
         raise TypeError("A collaboration contract schema is required.")
     if type(redactor) is not SecretRedactor:
@@ -191,7 +202,7 @@ def prepare_contract(
         _require_raw_secret_free(schema, plain, redactor)
         result = schema.model_validate(plain)
         _require_secret_free(schema, result, redactor)
-        canonical_bounded_durable_json_bytes(
+        encoded = canonical_bounded_durable_json_bytes(
             snapshot_input(result),
             "contract",
             max_bytes=MAX_ENVELOPE_BYTES,
@@ -203,21 +214,15 @@ def prepare_contract(
     if failed:
         raise CollaborationContractError("Invalid or unsafe collaboration contract.") from None
     assert result is not None
-    return result
+    return result, encoded
 
 
 def contract_bytes(value: ValueT, *, redactor: SecretRedactor) -> bytes:
     """Canonical complete material; callers must retain it, not only a digest."""
     if not isinstance(value, ContractValue):
         raise CollaborationContractError("A typed collaboration contract is required.")
-    checked = prepare_contract(type(value), value, redactor=redactor)
-    return canonical_bounded_durable_json_bytes(
-        snapshot_input(checked),
-        "contract",
-        max_bytes=MAX_ENVELOPE_BYTES,
-        max_nodes=MAX_NODES,
-        max_nesting=MAX_DEPTH,
-    )
+    _checked, encoded = _prepare_contract(type(value), value, redactor=redactor)
+    return encoded
 
 
 def require_exact_contract(

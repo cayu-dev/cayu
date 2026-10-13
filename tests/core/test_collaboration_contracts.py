@@ -76,6 +76,23 @@ def test_reference_roundtrip_and_detachment() -> None:
     assert copied.intent.target == "B"
 
 
+def test_contract_encoding_rechecks_mutation_and_current_secrets() -> None:
+    original = command()
+    redactor = SecretRedactor()
+    encoded = contract_bytes(original, redactor=redactor)
+    object.__setattr__(original.intent, "target", "changed-target")
+    changed = contract_bytes(original, redactor=redactor)
+    assert json.loads(encoded)["intent"]["target"] == "B"
+    assert json.loads(changed)["intent"]["target"] == "changed-target"
+    with pytest.raises(CollaborationContractError) as caught:
+        contract_bytes(original, redactor=redactor.with_secret("changed-target"))
+    assert caught.value.__context__ is None
+    assert contract_bytes(original, redactor=redactor) == changed
+    object.__setattr__(original.operation, "generation", True)
+    with pytest.raises(CollaborationContractError):
+        contract_bytes(original, redactor=redactor)
+
+
 @pytest.mark.parametrize("value", [True, False, 1.0, "1", 0, -1, MAX_PORTABLE_JSON_INTEGER + 1])
 def test_strict_generation_before_canonicalization(value) -> None:
     raw = command().operation.model_dump()
@@ -503,7 +520,10 @@ def test_ambiguous_union_cannot_borrow_another_branch_control_exemption() -> Non
 
 
 @pytest.mark.parametrize("replacement", ["literal-canary-829182", "unknown", True])
-def test_after_validator_cannot_invalidate_literal_control(replacement, caplog, capsys) -> None:
+@pytest.mark.parametrize("encode", [False, True], ids=["preparation", "encoding"])
+def test_after_validator_cannot_invalidate_literal_control(
+    replacement, encode, caplog, capsys
+) -> None:
     class Control(ContractValue):
         status: Literal["applied"]
 
@@ -518,7 +538,11 @@ def test_after_validator_cannot_invalidate_literal_control(replacement, caplog, 
         caplog.at_level(logging.DEBUG),
         pytest.raises(CollaborationContractError) as caught,
     ):
-        prepare_contract(Control, {"status": "applied"}, redactor=SecretRedactor([canary]))
+        redactor = SecretRedactor([canary])
+        if encode:
+            contract_bytes(Control.model_construct(status="applied"), redactor=redactor)
+        else:
+            prepare_contract(Control, {"status": "applied"}, redactor=redactor)
     assert list(iter_exception_tree(caught.value)) == [caught.value]
     assert not recorded
     captured = capsys.readouterr()
@@ -528,7 +552,8 @@ def test_after_validator_cannot_invalidate_literal_control(replacement, caplog, 
     )
 
 
-def test_secret_checks_before_and_after_owner_normalization() -> None:
+@pytest.mark.parametrize("encode", [False, True], ids=["preparation", "encoding"])
+def test_secret_checks_before_and_after_owner_normalization(encode) -> None:
     canary = "normalization-canary-829182"
 
     class ErasingSchema(ContractValue):
@@ -549,7 +574,11 @@ def test_secret_checks_before_and_after_owner_normalization() -> None:
 
     for schema, value in ((ErasingSchema, canary), (IntroducingSchema, "clean")):
         with pytest.raises(CollaborationContractError) as caught:
-            prepare_contract(schema, {"value": value}, redactor=SecretRedactor([canary]))
+            redactor = SecretRedactor([canary])
+            if encode:
+                contract_bytes(schema.model_construct(value=value), redactor=redactor)
+            else:
+                prepare_contract(schema, {"value": value}, redactor=redactor)
         assert canary not in str(caught.value)
         assert caught.value.__context__ is None
 
