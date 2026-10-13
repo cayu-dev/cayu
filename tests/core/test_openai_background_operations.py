@@ -1466,9 +1466,17 @@ async def test_openai_background_generic_stream_error_remains_reconnectable() ->
     ids=("first-read", "mid-stream"),
 )
 async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
+    monkeypatch: pytest.MonkeyPatch,
     reconnect_progress: bool,
     expected_progress_kind: ProviderProgressKind,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    # Keep the initial simulated worker loss independent of host scheduling.
+    # Advance time only at the reconnect read whose deadline is under test.
+    monkeypatch.setattr(loop, "time", lambda: now)
+    reconnect_closed = asyncio.Event()
+
     class DeadlineReconnectTransport(BackgroundTransport):
         async def reconnect_response_events(
             self,
@@ -1482,6 +1490,7 @@ async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
             semantic_progress_timeout_s: float,
             absolute_stream_timeout_s: float,
         ) -> AsyncIterator[Mapping[str, Any]]:
+            nonlocal now
             self.reconnect_calls.append(
                 {
                     "url": url,
@@ -1494,14 +1503,23 @@ async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
                     "absolute_stream_timeout_s": absolute_stream_timeout_s,
                 }
             )
-            if reconnect_progress:
+            try:
+                if reconnect_progress:
+                    yield {
+                        "type": "response.output_text.delta",
+                        "sequence_number": starting_after + 1,
+                        "delta": "continued",
+                    }
+                # A late result exercises expiry without an unbounded fake read
+                # if the deadline guard regresses. The guard must reject it.
+                now += 0.03
                 yield {
                     "type": "response.output_text.delta",
-                    "sequence_number": starting_after + 1,
-                    "delta": "continued",
+                    "sequence_number": starting_after + (2 if reconnect_progress else 1),
+                    "delta": "late",
                 }
-            await asyncio.Event().wait()
-            raise AssertionError("the reconnect stream unexpectedly resumed")
+            finally:
+                reconnect_closed.set()
 
     transport = DeadlineReconnectTransport()
     transport.start_batches.append(
@@ -1557,6 +1575,7 @@ async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
     assert len(transport.start_calls) == 1
     assert len(transport.reconnect_calls) == 1
     assert transport.retrieve_calls == []
+    assert reconnect_closed.is_set()
     stage_after = await store.load_active_model_completion_stage(session_id)
     assert stage_after is not None
     assert stage_after.stage.stage_id == stage_before.stage.stage_id
@@ -1573,6 +1592,8 @@ async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
     assert deadline_error.payload["provider"] == "openai"
     assert deadline_error.payload["provider_deadline_kind"] == "semantic_idle"
     assert deadline_error.payload["provider_deadline_timeout_s"] == 0.02
+    assert deadline_error.payload["provider_stream_elapsed_s"] == pytest.approx(0.03)
+    assert deadline_error.payload["provider_semantic_idle_elapsed_s"] == pytest.approx(0.03)
     assert deadline_error.payload["provider_last_progress_kind"] == expected_progress_kind.value
     assert deadline_error.payload["provider_effect_outcome"] == "unknown"
     assert deadline_error.payload["provider_recovery_disposition"] == ("reattach_exact_operation")
