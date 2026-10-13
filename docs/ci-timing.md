@@ -152,19 +152,29 @@ and final process exit remain part of the outer command timing.
 ### Compare worker counts
 
 The manual **CI execution profiling** workflow runs general shard 1 and PostgreSQL
-shard 1 on separate jobs using an exact commit SHA and one preflight manifest.
-Within each job it runs 2, 4 and 8 workers, then reverses that order for a second
-round. Each lane keeps the same VM and checkout for all counts. Choose one round
-for a preliminary observation; use both before drawing a performance conclusion.
-The workflow keeps failures visible, continues the remaining comparisons and
-retains JSON/log artifacts for seven days. Ordinary PR/release CI does not invoke
-this experiment.
+shard 1 with 2, 4 and 8 workers, using an exact commit SHA and one preflight
+manifest. Each lane, worker count and repetition gets its own job: six jobs for
+one repetition, twelve for the default two. At most two jobs run concurrently.
+Use one repetition for a preliminary observation and both before drawing a
+performance conclusion.
+
+Each job uploads its JSON/log artifact immediately after its run and retains it
+for seven days. Artifact names include the lane, worker count, repetition and run
+attempt, so a retry preserves earlier results. Test failures remain visible and
+do not cancel other comparisons. The test step is limited to 45 minutes within a
+55-minute job, leaving time for setup and a bounded artifact upload after a test
+timeout. A disconnected runner can still lose its current measurement; results
+already uploaded by other jobs remain available. Ordinary PR/release CI does not
+invoke this experiment.
 
 Compare successful runs with identical collection and executed-inventory hashes,
-outcomes and fixture ownership. Record simultaneous workflow load and actual
-CPU/memory limits. The public and private pools may have different capacity;
-eight workers can oversubscribe a small runner. A measurement on one shard or
-runner does not establish a new default or the full validation target.
+outcomes and fixture ownership. Jobs can use different VMs: match actual CPU and
+memory capacity, record simultaneous workflow load and inspect the profiles'
+load, pressure and cgroup limits before comparing times. Independent repetitions
+do not control VM variation or cache warmth. The public and private pools may have
+different capacity; eight workers can oversubscribe a small runner. A measurement
+on one shard or runner does not establish a new default or the full validation
+target.
 
 Measurement semantics: [Python resource usage](https://docs.python.org/3/library/resource.html),
 [Linux process I/O](https://man7.org/linux/man-pages/man5/proc_pid_io.5.html),

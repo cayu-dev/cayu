@@ -287,20 +287,29 @@ def test_missing_cgroup_membership_is_unavailable(monkeypatch):
     assert profile._host_snapshot()["cgroup_v2"] is None
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_manual_workflow_runs_both_orders_and_does_not_hide_piped_failures(tmp_path, fail):
-    workflow = (_ROOT / ".github/workflows/ci-profiling.yml").read_text()
-    assert "workflow_dispatch:" in workflow and "pull_request:" not in workflow
-    assert "push:" not in workflow
-    assert "run: '[[ \"$REVISION\" =~ ^[0-9a-f]{40}$ ]]'" in workflow
-    assert "shell: bash" in workflow
-    for reference in re.findall(r"uses: ([^\s#]+)", workflow):
-        assert reference.startswith("./") or re.fullmatch(r"[^@]+@[a-f0-9]{40}", reference)
-    [script] = re.findall(
-        r"        run: \|\n(.*?)(?=      - name: Retain)",
+def _workflow_script(workflow, name):
+    [step] = re.findall(
+        rf"      - name: {re.escape(name)}\n(.*?)(?=      - |\Z)",
         workflow,
         re.DOTALL,
     )
+    assert "shell: bash" in step
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+
+def _workflow_shell(script, env):
+    return subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", script],
+        env=os.environ | env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+@pytest.fixture
+def manual_profile_workflow(tmp_path):
+    workflow = (_ROOT / ".github/workflows/ci-profiling.yml").read_text()
     binary = tmp_path / "bin"
     binary.mkdir()
     python = binary / "python3"
@@ -309,38 +318,121 @@ def test_manual_workflow_runs_both_orders_and_does_not_hide_piped_failures(tmp_p
         "import json, os, sys\n"
         "from pathlib import Path\n"
         "with Path(os.environ['CALLS']).open('a') as out: out.write(json.dumps(sys.argv[1:])+'\\n')\n"
-        "workers=sys.argv[sys.argv.index('--test-workers')+1]\n"
-        "sys.exit(13 if os.environ.get('SAMPLE_FAIL') and workers=='4' else 0)\n"
+        "print('retained run output', flush=True)\n"
+        "sys.exit(13 if os.environ.get('SAMPLE_FAIL') else 0)\n"
     )
     python.chmod(0o755)
-    calls = tmp_path / "calls.jsonl"
-    result = subprocess.run(
-        ["bash", "-e", "-o", "pipefail", "-c", textwrap.dedent(script)],
-        env=os.environ
-        | {
-            "PATH": str(binary) + os.pathsep + os.environ["PATH"],
-            "RUNNER_TEMP": str(tmp_path),
-            "LANE": "general-1",
-            "REPETITIONS": "2",
-            "CALLS": str(calls),
-            "SAMPLE_FAIL": "1" if fail else "",
-        },
-        capture_output=True,
-        text=True,
-        timeout=15,
+    return workflow, {
+        "PATH": str(binary) + os.pathsep + os.environ["PATH"],
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "REVISION": "a" * 40,
+        "CALLS": str(tmp_path / "calls.jsonl"),
+        "SAMPLE_FAIL": "",
+    }
+
+
+@pytest.mark.parametrize("repetitions", ["1", "2"])
+def test_manual_workflow_profiles_each_requested_configuration_once(
+    manual_profile_workflow, repetitions
+):
+    workflow, env = manual_profile_workflow
+    assert "workflow_dispatch:" in workflow and "pull_request:" not in workflow
+    assert "push:" not in workflow and "continue-on-error:" not in workflow
+    for reference in re.findall(r"uses: ([^\s#]+)", workflow):
+        assert reference.startswith("./") or re.fullmatch(r"[^@]+@[a-f0-9]{40}", reference)
+    result = _workflow_shell(
+        _workflow_script(workflow, "Validate comparison inputs"),
+        env | {"REPETITIONS": repetitions},
     )
-    assert result.returncode == int(fail), result.stdout + result.stderr
-    commands = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert [command[command.index("--test-workers") + 1] for command in commands] == [
-        "2",
-        "4",
-        "8",
-        "8",
-        "4",
-        "2",
+    assert result.returncode == 0, result.stdout + result.stderr
+    key, value = Path(env["GITHUB_OUTPUT"]).read_text().strip().split("=", 1)
+    assert key == "repetitions"
+    rounds = json.loads(value)
+    assert rounds == list(range(1, int(repetitions) + 1))
+    assert "repetitions: ${{ steps.inputs.outputs.repetitions }}" in workflow
+    assert "repetition: ${{ fromJSON(needs.collection.outputs.repetitions) }}" in workflow
+    [lanes] = re.findall(r"        lane: (\[.*\])", workflow)
+    [workers] = re.findall(r"        workers: (\[.*\])", workflow)
+    assert json.loads(lanes) == ["general-1", "postgres-conformance-1"]
+    assert json.loads(workers) == [2, 4, 8]
+    assert "fail-fast: false" in workflow and "max-parallel: 2" in workflow
+    benchmark = workflow.split("  benchmark:\n", 1)[1]
+    [job_timeout] = re.findall(r"^    timeout-minutes: (\d+)$", benchmark, re.MULTILINE)
+    step_timeouts = [
+        int(value)
+        for value in re.findall(r"^        timeout-minutes: (\d+)$", benchmark, re.MULTILINE)
     ]
-    assert all(
-        command[:5] == ["scripts/run_ci.py", "--lane", "general", "--shard", "1"]
-        for command in commands
+    assert int(job_timeout) <= 55
+    assert int(job_timeout) >= sum(step_timeouts)
+    assert "timeout-minutes: 45" in benchmark
+    upload = workflow.split("      - name: Retain", 1)[1]
+    assert "if: always()" in upload and "timeout-minutes: 5" in upload
+    assert "overwrite:" not in upload and "if-no-files-found: error" in upload
+    [artifact_name] = re.findall(r"          name: (execution-profile-.*)", upload)
+    artifact_names = set()
+    commands_expected = []
+    script = _workflow_script(workflow, "Profile one worker count on the assigned tests")
+    for lane in json.loads(lanes):
+        for count in json.loads(workers):
+            for repetition in rounds:
+                result = _workflow_shell(script, env | {"LANE": lane, "WORKERS": str(count)})
+                assert result.returncode == 0, result.stdout + result.stderr
+                selection = (
+                    ["--lane", "general", "--shard", "1"]
+                    if lane == "general-1"
+                    else ["--lane", "specialist", "--specialist-lane", lane]
+                )
+                commands_expected.append(
+                    [
+                        "scripts/run_ci.py",
+                        *selection,
+                        "--test-manifest",
+                        str(Path(env["RUNNER_TEMP"]) / "profile-manifest.json"),
+                        "--test-workers",
+                        str(count),
+                        "--profile-tests",
+                        str(Path(env["RUNNER_TEMP"]) / "ci-profiles"),
+                    ]
+                )
+                for attempt in (1, 2):
+                    name = artifact_name
+                    for field, value in {
+                        "matrix.lane": lane,
+                        "matrix.workers": count,
+                        "matrix.repetition": repetition,
+                        "github.run_attempt": attempt,
+                    }.items():
+                        name = name.replace("${{ " + field + " }}", str(value))
+                    assert "${{" not in name and name not in artifact_names
+                    artifact_names.add(name)
+    commands = [json.loads(line) for line in Path(env["CALLS"]).read_text().splitlines()]
+    assert commands == commands_expected
+    assert len(commands) == 6 * int(repetitions)
+
+
+@pytest.mark.parametrize("lane", ["general-1", "postgres-conformance-1"])
+def test_manual_workflow_preserves_test_failure_and_log(manual_profile_workflow, lane):
+    workflow, env = manual_profile_workflow
+    result = _workflow_shell(
+        _workflow_script(workflow, "Profile one worker count on the assigned tests"),
+        env | {"LANE": lane, "WORKERS": "4", "SAMPLE_FAIL": "1"},
     )
-    assert len({command[command.index("--profile-tests") + 1] for command in commands}) == 6
+    assert result.returncode == 13, result.stdout + result.stderr
+    assert len(Path(env["CALLS"]).read_text().splitlines()) == 1
+    assert (Path(env["RUNNER_TEMP"]) / "ci-profiles/run.log").read_text() == "retained run output\n"
+
+
+@pytest.mark.parametrize(
+    ("revision", "repetitions"),
+    [("main", "2"), ("a" * 39, "2"), ("a" * 40, "0"), ("a" * 40, "3")],
+)
+def test_manual_workflow_rejects_invalid_inputs(manual_profile_workflow, revision, repetitions):
+    workflow, env = manual_profile_workflow
+    result = _workflow_shell(
+        _workflow_script(workflow, "Validate comparison inputs"),
+        env | {"REVISION": revision, "REPETITIONS": repetitions},
+    )
+    assert result.returncode != 0
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+    assert not Path(env["CALLS"]).exists()
