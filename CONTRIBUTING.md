@@ -315,14 +315,14 @@ before regenerating the source bundle.
 
 ### Pull request verification
 
-Every pull request runs repository-wide static checks and the Python 3.14 regression
-suite without coverage instrumentation. The PR gate targets approximately ten minutes; test
-jobs allow twenty minutes for general shards (including setup and collection),
-fifteen minutes for specialist lanes, and ten minutes for package verification. A small fail-open path selector additionally
+Every ready pull request runs repository-wide static checks and the Python 3.14 regression
+suite without coverage instrumentation. The PR gate targets approximately ten minutes;
+configured job timeouts are ceilings, not measured completion times. See
+`.github/workflows/ci.yml` for current limits. A small fail-open path selector additionally
 runs the retained SQLite cancellation, package/sidecar, and dashboard gates whenever their
-contracts can change. `main` runs every retained gate.
+contracts can change. Release tags and manual CI dispatch run every retained gate.
 Duration-balanced general tests run across 32 jobs, and Postgres conformance
-runs across eight jobs. Each PR shard uses two pytest workers with file-level scheduling
+runs across twelve jobs. General and Postgres shards use two pytest workers with file-level scheduling
 to preserve module fixture isolation. Ordinary process recovery regressions remain in the PR gate.
 Tests marked `stress` or `qualification`, including full-scale evidence and capacity checks,
 run separately across eight shards in `qualification.yml`, daily and on manual dispatch.
@@ -332,6 +332,9 @@ than 5% of collected tests lack timings. Run it locally with
 `python3 scripts/run_ci.py --lane collection` (no Docker daemon required). Record new test
 timings with `uv run pytest <changed-test-paths> --store-durations`; this preserves the
 existing snapshot entries. Use the full refresh command above when replacing the snapshot.
+
+Use the [CI timing reporter](docs/ci-timing.md) to compare completed workflows,
+including retries, job waiting and individual step durations.
 
 Deadline and cancellation tests should wait for the intended operation to start before
 triggering their fault. Use explicit readiness signals or a controlled clock for unit
