@@ -333,6 +333,26 @@ than 5% of collected tests lack timings. Run it locally with
 timings with `uv run pytest <changed-test-paths> --store-durations`; this preserves the
 existing snapshot entries. Use the full refresh command above when replacing the snapshot.
 
+Hosted collection also writes a test manifest. Each shard downloads it and collects only
+files containing its assigned tests. The manifest retains pytest's marker selection,
+`least_duration` assignments, original test order and `loadfile` worker scheduling.
+Workers reject changed source, Python/pytest versions, timing snapshots, collected node IDs
+or routing markers. The duration freshness percentage is checked against the full preflight
+inventory. Worker collection time is printed when each worker finishes.
+
+To use the same handoff locally, start from a clean source and test checkout:
+
+```bash
+python3 scripts/run_ci.py --lane collection --test-manifest /tmp/cayu-tests.json
+python3 scripts/run_ci.py --lane general --shard 1 --test-manifest /tmp/cayu-tests.json
+```
+
+Omitting `--test-manifest` retains ordinary full collection for a standalone lane. The complete
+local verification command below generates and uses a manifest automatically. Hosted manifests
+are retained for seven days; rerun collection with the dependent jobs if that artifact expires.
+CI and qualification use separate artifact names, including when release CI calls qualification.
+This reduces repeated collection work; it does not establish an end-to-end CI completion target.
+
 Use the [CI timing reporter](docs/ci-timing.md) to compare completed workflows,
 including retries, job waiting and individual step durations.
 

@@ -70,7 +70,15 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Validate collection before starting test workers
-        run: python3 scripts/run_ci.py --lane collection
+        run: python3 scripts/run_ci.py --lane collection --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
+      - name: Share validated test assignments
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-test-manifest
+          path: ${{ runner.temp }}/ci-tests/manifest.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
 
   test_shards:
     needs: test-collection
@@ -97,8 +105,13 @@ jobs:
         with:
           packages: ripgrep ffmpeg
           commands: rg ffmpeg
+      - name: Download validated test assignments
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-test-manifest
+          path: ${{ runner.temp }}/ci-tests
       - name: Test duration-balanced shard
-        run: python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"
+        run: python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}" --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
 
   test_specialists:
     needs: test-collection
@@ -143,10 +156,16 @@ jobs:
         with:
           packages: ripgrep
           commands: rg
+      - name: Download validated test assignments
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-test-manifest
+          path: ${{ runner.temp }}/ci-tests
       - name: Test specialist lane
         run: >-
           python3 scripts/run_ci.py --lane specialist
           --specialist-lane "${{ matrix.lane }}"
+          --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})

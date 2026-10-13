@@ -85,7 +85,7 @@ def test_duration_snapshot_rejects_more_than_five_percent_unknown_tests(
 
     with pytest.raises(pytest.UsageError, match="2 of 21 collected tests lack timings"):
         _require_current_test_durations(
-            SimpleNamespace(rootpath=tmp_path),
+            SimpleNamespace(rootpath=tmp_path, getoption=lambda *_args: None),
             items,
         )
 
@@ -100,6 +100,6 @@ def test_duration_snapshot_allows_a_small_new_test_tail(
     monkeypatch.setenv("CAYU_REQUIRE_CURRENT_TEST_DURATIONS", "1")
 
     _require_current_test_durations(
-        SimpleNamespace(rootpath=tmp_path),
+        SimpleNamespace(rootpath=tmp_path, getoption=lambda *_args: None),
         items,
     )

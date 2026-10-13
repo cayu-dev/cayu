@@ -40,6 +40,7 @@ _SPECIALIST_TEST_ENV = {
     "CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT": "1",
 }
 _GENERAL_SHARDS = 32
+_GENERAL_MARKER = "not (stress or qualification or postgres or browser_docker or host_journey)"
 _SPECIALIST_LANES = {
     "browser-docker": ("browser_docker", 1, 1),
     **{f"host-journey-{group}": ("host_journey", 3, group) for group in range(1, 4)},
@@ -583,17 +584,68 @@ def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> No
     )
 
 
-def _run_test_collection(runner: LocalCiRunner) -> bool:
+def _run_test_collection(runner: LocalCiRunner, *, manifest: Path | None = None) -> bool:
     # Keep collection errors on the controller: xdist can mask a UsageError as
     # an internal worker-finished assertion before any test has executed.
     return runner.run(
         "Python 3.14 test collection and duration snapshot",
-        ("uv", "run", "--no-sync", "pytest", "--collect-only", "-qq", "-n", "0"),
+        (
+            "uv",
+            "run",
+            "--no-sync",
+            "pytest",
+            "--collect-only",
+            "-qq",
+            "-n",
+            "0",
+            *(
+                (
+                    "--rootdir",
+                    ".",
+                    "-c",
+                    "pyproject.toml",
+                    "-p",
+                    "scripts.ci_test_manifest",
+                    "--ci-write-manifest",
+                    str(manifest),
+                )
+                if manifest is not None
+                else ()
+            ),
+        ),
         env={"CAYU_REQUIRE_CURRENT_TEST_DURATIONS": "1"},
     )
 
 
-def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
+def _test_selection(
+    marker: str, splits: int, group: int, lane: str, manifest: Path | None
+) -> tuple[str, ...]:
+    if manifest is not None:
+        return (
+            "--rootdir",
+            ".",
+            "-c",
+            "pyproject.toml",
+            "-p",
+            "scripts.ci_test_manifest",
+            "--ci-manifest",
+            str(manifest),
+            "--ci-lane",
+            lane,
+        )
+    return (
+        "-m",
+        marker,
+        "--splits",
+        str(splits),
+        "--group",
+        str(group),
+        "--splitting-algorithm",
+        "least_duration",
+    )
+
+
+def _run_general_shard(runner: LocalCiRunner, shard: int, *, manifest: Path | None = None) -> None:
     if shard not in range(1, _GENERAL_SHARDS + 1):
         raise ValueError(f"general shard must be between 1 and {_GENERAL_SHARDS}")
     runner.run("Verify recording encoder prerequisite", ("ffmpeg", "-version"))
@@ -605,14 +657,7 @@ def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
             "--no-sync",
             "pytest",
             "-q",
-            "-m",
-            "not (stress or qualification or postgres or browser_docker or host_journey)",
-            "--splits",
-            str(_GENERAL_SHARDS),
-            "--group",
-            str(shard),
-            "--splitting-algorithm",
-            "least_duration",
+            *_test_selection(_GENERAL_MARKER, _GENERAL_SHARDS, shard, f"general-{shard}", manifest),
             "-n",
             "2",
             "--dist",
@@ -631,7 +676,7 @@ def _install_playwright_chromium(runner: LocalCiRunner) -> None:
     runner.run("Install Playwright Chromium", tuple(playwright_command))
 
 
-def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
+def _run_specialist_lane(runner: LocalCiRunner, lane: str, *, manifest: Path | None = None) -> None:
     try:
         marker, splits, group = _SPECIALIST_LANES[lane]
     except KeyError as exc:
@@ -644,14 +689,7 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
             "--no-sync",
             "pytest",
             "-q",
-            "-m",
-            marker,
-            "--splits",
-            str(splits),
-            "--group",
-            str(group),
-            "--splitting-algorithm",
-            "least_duration",
+            *_test_selection(marker, splits, group, lane, manifest),
             "-n",
             # Capacity fixtures already create their own concurrent workers.
             "1" if lane.startswith(("qualification-", "host-journey-")) else "2",
@@ -663,12 +701,12 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
     )
 
 
-def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
+def _run_general_shards(runner: LocalCiRunner, *, jobs: int, manifest: Path | None = None) -> None:
     if jobs not in range(1, _GENERAL_SHARDS + 1):
         raise ValueError(f"local general-shard jobs must be between 1 and {_GENERAL_SHARDS}")
     if runner.dry_run or jobs == 1:
         for shard in range(1, _GENERAL_SHARDS + 1):
-            _run_general_shard(runner, shard)
+            _run_general_shard(runner, shard, manifest=manifest)
         return
 
     shard_runners = {
@@ -678,7 +716,7 @@ def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
     failures: list[str] = []
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="cayu-ci-shard") as executor:
         futures = {
-            shard: executor.submit(_run_general_shard, shard_runner, shard)
+            shard: executor.submit(_run_general_shard, shard_runner, shard, manifest=manifest)
             for shard, shard_runner in shard_runners.items()
         }
         for shard, future in futures.items():
@@ -698,14 +736,15 @@ def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
 
 def _run_python_suite(runner: LocalCiRunner, *, jobs: int) -> None:
     _sync_python_test_environment(runner, browser=False)
-    if not _run_test_collection(runner):
+    manifest = runner.root / ".pytest_cache" / "ci-test-manifest.json"
+    if not _run_test_collection(runner, manifest=manifest):
         return
     _run_docker_prerequisite(runner)
-    _run_general_shards(runner, jobs=jobs)
+    _run_general_shards(runner, jobs=jobs, manifest=manifest)
     _sync_python_test_environment(runner, browser=True)
     _install_playwright_chromium(runner)
     for lane in _SPECIALIST_LANES:
-        _run_specialist_lane(runner, lane)
+        _run_specialist_lane(runner, lane, manifest=manifest)
 
 
 def _run_sqlite_cancellation_version(runner: LocalCiRunner, python_version: str) -> None:
@@ -1060,6 +1099,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--package-group", choices=_PACKAGE_GROUPS)
     parser.add_argument("--package-artifacts", type=Path)
     parser.add_argument(
+        "--test-manifest",
+        type=Path,
+        help="write in the collection lane; consume in general/specialist lanes",
+    )
+    parser.add_argument(
         "--python-version",
         choices=_SQLITE_PYTHON_VERSIONS,
         help="SQLite cancellation lane Python version",
@@ -1119,13 +1163,13 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
             _run_static(runner)
         elif args.lane == "collection":
             _sync_python_test_environment(runner, browser=False)
-            _run_test_collection(runner)
+            _run_test_collection(runner, manifest=args.test_manifest)
         elif args.lane == "general":
             if args.shard is None:
                 raise ValueError("--lane general requires --shard")
             _run_docker_prerequisite(runner)
             _sync_python_test_environment(runner, browser=False)
-            _run_general_shard(runner, args.shard)
+            _run_general_shard(runner, args.shard, manifest=args.test_manifest)
         elif args.lane == "specialist":
             if args.specialist_lane is None:
                 raise ValueError("--lane specialist requires --specialist-lane")
@@ -1133,7 +1177,7 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
             _sync_python_test_environment(runner, browser=True)
             if args.specialist_lane.startswith("qualification-"):
                 _install_playwright_chromium(runner)
-            _run_specialist_lane(runner, args.specialist_lane)
+            _run_specialist_lane(runner, args.specialist_lane, manifest=args.test_manifest)
         elif args.lane == "sqlite-cancellation":
             if args.python_version is None:
                 raise ValueError("--lane sqlite-cancellation requires --python-version")

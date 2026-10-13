@@ -43,7 +43,9 @@ def pytest_configure(config: pytest.Config) -> None:
             "open, so the SQLite tests cannot run. Unset it; set "
             f"{_REQUIRE_POSTGRES_ENV_VAR}=1 to require the Postgres test tier."
         )
-    if os.environ.get("GITHUB_ACTIONS") != "true" or not config.getoption("splits", None):
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not (
+        config.getoption("splits", None) or config.getoption("ci_manifest", None)
+    ):
         return
     owner = os.environ.setdefault("CAYU_CI_REPORT_OWNER_PID", str(os.getpid()))
     _CI_FAILURE_LOGGING = owner == str(os.getpid())
@@ -224,6 +226,10 @@ def _require_current_test_durations(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
+    # Manifest workers validate the exact snapshot that passed the full-suite
+    # gate. Reapplying its percentage to a smaller scope can reject valid shards.
+    if config.getoption("ci_manifest", None):
+        return
     required = (
         os.environ.get(_REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR, "").strip().lower()
         in _TRUTHY_ENV_VALUES

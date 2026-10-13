@@ -92,7 +92,8 @@ def test_collection_failure_prevents_local_fanout_even_with_keep_going(monkeypat
         namespace, "_sync_python_test_environment", lambda *_args, **_kwargs: phases.append("sync")
     )
 
-    def failed_collection(_runner):
+    def failed_collection(_runner, *, manifest):
+        assert manifest.name == "ci-test-manifest.json"
         phases.append("collection")
         return False
 
@@ -116,6 +117,7 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
     assert len(runner.evidence) == 2
     assert runner.evidence[0].command == "ffmpeg -version"
     assert "--splits 32 --group 4" in runner.evidence[-1].command
+    assert "--splitting-algorithm least_duration" in runner.evidence[-1].command
     assert (
         "not (stress or qualification or postgres or browser_docker or host_journey)"
         in runner.evidence[-1].command
@@ -125,6 +127,7 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
     _run_specialist_lane(specialist, "postgres-conformance-2")
     assert len(specialist.evidence) == 1
     assert "--splits 12 --group 2" in specialist.evidence[0].command
+    assert "--splitting-algorithm least_duration" in specialist.evidence[0].command
     assert (
         "postgres and not (stress or qualification or host_journey)"
         in specialist.evidence[0].command
@@ -138,6 +141,7 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
         command = journey.evidence[0].command
         assert "-m host_journey" in command
         assert f"--splits 3 --group {group}" in command
+        assert "--splitting-algorithm least_duration" in command
         assert "-n 1" in command
 
     with pytest.raises(ValueError, match="between 1 and 32"):
@@ -146,12 +150,65 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
         _run_specialist_lane(_dry_runner(), "unknown")
 
 
+def test_manifest_handoff_preserves_workers_and_required_test_environment(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    collection = _dry_runner()
+    _run_test_collection(collection, manifest=manifest)
+    assert f"--ci-write-manifest {manifest}" in collection.evidence[0].command
+    for lane, workers in (
+        ("general-4", 2),
+        ("postgres-conformance-2", 2),
+        ("qualification-1", 1),
+        ("host-journey-1", 1),
+    ):
+        runner = _dry_runner()
+        if lane == "general-4":
+            _run_general_shard(runner, 4, manifest=manifest)
+        else:
+            _run_specialist_lane(runner, lane, manifest=manifest)
+        command = runner.evidence[-1].command
+        assert f"--ci-manifest {manifest} --ci-lane {lane}" in command
+        assert f"-n {workers} --dist loadfile" in command
+        assert "--rootdir . -c pyproject.toml" in command
+        assert "CAYU_REQUIRE_POSTGRES_TESTS=1" in command
+        assert "CAYU_REQUIRE_CURRENT_TEST_DURATIONS=1" in command
+        assert "--splits" not in command
+
+
+def test_hosted_manifest_artifacts_connect_each_producer_to_its_consumers():
+    import re
+
+    for filename, name, consumers in (
+        ("ci.yml", "ci-test-manifest", ("test_shards", "test_specialists")),
+        ("qualification.yml", "qualification-test-manifest", ("qualification",)),
+    ):
+        workflow = (_ROOT / ".github/workflows" / filename).read_text()
+        jobs = dict(
+            re.findall(
+                r"^  ([a-z_-]+):\n(.*?)(?=^  [a-z_-]+:|\Z)", workflow, re.MULTILINE | re.DOTALL
+            )
+        )
+        producer = jobs["test-collection"]
+        assert "actions/upload-artifact@" in producer
+        assert f"name: {name}\n" in producer
+        assert "overwrite: true" in producer
+        assert "if-no-files-found: error" in producer
+        assert "path: ${{ runner.temp }}/ci-tests/manifest.json" in producer
+        assert '--test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"' in producer
+        for consumer in consumers:
+            job = jobs[consumer]
+            assert "actions/download-artifact@" in job
+            assert f"name: {name}\n" in job
+            assert "path: ${{ runner.temp }}/ci-tests\n" in job
+            assert '--test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"' in job
+
+
 def test_local_general_shards_use_bounded_parallel_workers(monkeypatch) -> None:
     from threading import Barrier
 
     rendezvous = Barrier(2)
 
-    def fake_shard(runner, shard: int) -> None:
+    def fake_shard(runner, shard: int, *, manifest=None) -> None:
         rendezvous.wait(timeout=2)
         runner.evidence.append(
             CommandEvidence(

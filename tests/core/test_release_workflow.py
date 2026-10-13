@@ -130,7 +130,6 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     )
     assert 'scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"' in shards
     assert '"not (stress or qualification or postgres or browser_docker or host_journey)"' in runner
-    assert '"--splitting-algorithm",\n            "least_duration"' in runner
     assert "_GENERAL_SHARDS = 32" in runner
     assert "-n 2" not in runner
     assert "--cov" not in runner
