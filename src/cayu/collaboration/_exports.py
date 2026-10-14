@@ -1,6 +1,8 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "HandoffIntent": ("cayu.collaboration._contracts", "HandoffIntent"),
+    "HandoffSlot": ("cayu.collaboration._contracts", "HandoffSlot"),
     "ContinuationConflict": ("cayu.sessions._session_continuation", "ContinuationConflict"),
     "ContinuationUnavailable": ("cayu.sessions._session_continuation", "ContinuationUnavailable"),
     "ContinuationDiscoveryPage": (

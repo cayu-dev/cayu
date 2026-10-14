@@ -5,6 +5,9 @@ from cayu.runtime._exception_detail import ExceptionCause as ExceptionCause
 from cayu.runtime._exception_detail import ExceptionDetail as ExceptionDetail
 from cayu.runtime._exception_detail import ExceptionLeaf as ExceptionLeaf
 from cayu.runtime._exception_detail import exception_detail as exception_detail
+from cayu.sessions._access_rules import SessionAccessRule as SessionAccessRule
+from cayu.sessions._access_rules import SessionAccessScope as SessionAccessScope
+from cayu.sessions._access_rules import SessionAccessSelector as SessionAccessSelector
 from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation as RuntimePublicationCheckpointOperation,
 )
@@ -23,6 +26,21 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._checkpoint_publication import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
+from cayu.sessions._execution_profile_checkpoint import (
+    EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile as ActiveInvocationExecutionProfile,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionExecutionProfiles as SessionExecutionProfiles,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionInvocationExecutionProfile as SessionInvocationExecutionProfile,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    session_execution_profiles as session_execution_profiles,
+)
 from cayu.sessions._execution_profile_rules import SessionModelTransition as SessionModelTransition
 from cayu.sessions._interaction_transitions import (
     InteractionTransitionReceiptResult as InteractionTransitionReceiptResult,
@@ -35,6 +53,41 @@ from cayu.sessions._interaction_transitions import (
 )
 from cayu.sessions._interaction_transitions import (
     SessionInvocationAdmission as SessionInvocationAdmission,
+)
+from cayu.sessions._invocation_lifecycle import (
+    INVOCATION_LIFECYCLE_COMMAND_VERSION as INVOCATION_LIFECYCLE_COMMAND_VERSION,
+)
+from cayu.sessions._invocation_lifecycle import AdmitInvocationCommand as AdmitInvocationCommand
+from cayu.sessions._invocation_lifecycle import (
+    AdmittedInvocationBinding as AdmittedInvocationBinding,
+)
+from cayu.sessions._invocation_lifecycle import CreateInvocationCommand as CreateInvocationCommand
+from cayu.sessions._invocation_lifecycle import (
+    InvocationCheckpointPatch as InvocationCheckpointPatch,
+)
+from cayu.sessions._invocation_lifecycle import (
+    InvocationLifecycleCommand as InvocationLifecycleCommand,
+)
+from cayu.sessions._invocation_lifecycle import (
+    InvocationLifecycleCommandConflict as InvocationLifecycleCommandConflict,
+)
+from cayu.sessions._invocation_lifecycle import (
+    InvocationLifecycleCommandKind as InvocationLifecycleCommandKind,
+)
+from cayu.sessions._invocation_lifecycle import (
+    InvocationLifecycleResult as InvocationLifecycleResult,
+)
+from cayu.sessions._invocation_lifecycle import InvocationMutationResult as InvocationMutationResult
+from cayu.sessions._invocation_lifecycle import InvocationReleaseResult as InvocationReleaseResult
+from cayu.sessions._invocation_lifecycle import (
+    PreparedInvocationBinding as PreparedInvocationBinding,
+)
+from cayu.sessions._invocation_lifecycle import RebindInvocationCommand as RebindInvocationCommand
+from cayu.sessions._invocation_lifecycle import RejectInvocationCommand as RejectInvocationCommand
+from cayu.sessions._invocation_lifecycle import ReleaseInvocationCommand as ReleaseInvocationCommand
+from cayu.sessions._invocation_lifecycle import SettleInvocationCommand as SettleInvocationCommand
+from cayu.sessions._invocation_lifecycle import (
+    copy_invocation_lifecycle_command as copy_invocation_lifecycle_command,
 )
 from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition as ModelCompletionStageDisposition,
@@ -101,6 +154,16 @@ from cayu.sessions._runtime_publication import (
 from cayu.sessions._runtime_publication import (
     runtime_publication_event_reference as runtime_publication_event_reference,
 )
+from cayu.sessions._session_continuation import ContinuationConsumption as ContinuationConsumption
+from cayu.sessions._session_continuation import ContinuationLatch as ContinuationLatch
+from cayu.sessions._session_continuation import (
+    ContinuationLatchReceiver as ContinuationLatchReceiver,
+)
+from cayu.sessions._session_continuation import ContinuationNamespace as ContinuationNamespace
+from cayu.sessions._session_continuation import ContinuationPreparation as ContinuationPreparation
+from cayu.sessions._session_continuation import ContinuationRetirement as ContinuationRetirement
+from cayu.sessions._session_continuation import ContinuationTicket as ContinuationTicket
+from cayu.sessions._session_continuation import ContinuationWait as ContinuationWait
 from cayu.sessions.authority import CheckpointRootFieldGuard as CheckpointRootFieldGuard
 from cayu.sessions.authority import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
@@ -495,7 +558,9 @@ __all__ = [
     "DEFAULT_RECOVERY_CLEANUP_MAX_SUPERVISED_TASKS",
     "DEFAULT_RECOVERY_CLEANUP_OVERALL_TIMEOUT_SECONDS",
     "DEFAULT_RECOVERY_CLEANUP_STEP_TIMEOUT_SECONDS",
+    "EXECUTION_PROFILE_METADATA_KEY",
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY",
+    "INVOCATION_LIFECYCLE_COMMAND_VERSION",
     "MAX_CHILD_SESSION_RESULT_MAX_CHARS",
     "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     "MAX_PENDING_ACTION_RESULT_BYTES",
@@ -518,7 +583,10 @@ __all__ = [
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES",
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES",
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS",
+    "ActiveInvocationExecutionProfile",
     "ActiveModelCompletionStage",
+    "AdmitInvocationCommand",
+    "AdmittedInvocationBinding",
     "CheckpointCompatibilityError",
     "CheckpointRootFieldGuard",
     "CheckpointRootFieldProjection",
@@ -548,6 +616,7 @@ __all__ = [
     "ContextViewSelectionReceipt",
     "ContextViewSelectionRequest",
     "ContinuationRecoveryExpectation",
+    "CreateInvocationCommand",
     "DeferredInteractionInput",
     "DelegatedActionReference",
     "EnqueueSessionMessageRequest",
@@ -579,9 +648,16 @@ __all__ = [
     "InteractionTransitionResult",
     "InteractionTransitionSpec",
     "InterruptSessionRequest",
+    "InvocationCheckpointPatch",
+    "InvocationLifecycleCommand",
+    "InvocationLifecycleCommandConflict",
+    "InvocationLifecycleCommandKind",
+    "InvocationLifecycleResult",
+    "InvocationMutationResult",
     "InvocationOrigin",
     "InvocationOriginClaim",
     "InvocationOriginTrust",
+    "InvocationReleaseResult",
     "LabelSelectorOperator",
     "LabelSelectorRequirement",
     "McpManifestBaseline",
@@ -616,9 +692,11 @@ __all__ = [
     "PersistedEventSideEffectClaimLost",
     "PersistedEventSideEffectDelivery",
     "PersistedEventSideEffectStatus",
+    "PreparedInvocationBinding",
     "ProducerRecoveryExpectation",
     "ProfiledSessionForkResult",
     "PromptAnatomyTransitionReceipt",
+    "RebindInvocationCommand",
     "RecipientSessionCreationReceipt",
     "RecipientSessionCreationRequest",
     "RecoveryBlockerCode",
@@ -654,6 +732,8 @@ __all__ = [
     "RecoveryRegistrationEvidence",
     "RecoveryRegistrationStatus",
     "RecoveryTaskClaimEvidence",
+    "RejectInvocationCommand",
+    "ReleaseInvocationCommand",
     "ResumeRequest",
     "RunOutcome",
     "RunRequest",
@@ -667,11 +747,15 @@ __all__ = [
     "RuntimePublicationResult",
     "SerializedRecordSummary",
     "Session",
+    "SessionAccessRule",
+    "SessionAccessScope",
+    "SessionAccessSelector",
     "SessionAggregateFilter",
     "SessionBudgetInspection",
     "SessionDebugState",
     "SessionExecutionConfig",
     "SessionExecutionInProgress",
+    "SessionExecutionProfiles",
     "SessionExecutionSource",
     "SessionExecutionState",
     "SessionExportBoundary",
@@ -686,6 +770,7 @@ __all__ = [
     "SessionInvocation",
     "SessionInvocationAdmission",
     "SessionInvocationBinding",
+    "SessionInvocationExecutionProfile",
     "SessionInvocationSnapshot",
     "SessionLineageNode",
     "SessionLineageOrigin",
@@ -720,6 +805,7 @@ __all__ = [
     "SessionTopologyNode",
     "SessionTopologyQuery",
     "SessionTopologyStoreResult",
+    "SettleInvocationCommand",
     "StaleRecoveryPlanError",
     "StartupRecoveryBlockedSession",
     "StartupRecoveryResult",
@@ -743,6 +829,7 @@ __all__ = [
     "TranscriptSnapshot",
     "UsageRollupQuery",
     "checkpoint_root_field_projection_from_storage",
+    "copy_invocation_lifecycle_command",
     "copy_recovery_cleanup_policy",
     "copy_session_user_metadata",
     "exception_detail",
@@ -754,6 +841,7 @@ __all__ = [
     "runtime_publication_checkpoint_value_digest",
     "runtime_publication_event_reference",
     "runtime_publication_operation_record_value_digest",
+    "session_execution_profiles",
     "session_fork_profile_relationship",
     "session_invocation_for_run_request",
     "session_invocation_from_task",

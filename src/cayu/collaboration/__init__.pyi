@@ -84,6 +84,8 @@ from cayu.collaboration._clarification_state import (
 from cayu.collaboration._contracts import CollaborationConflict as CollaborationConflict
 from cayu.collaboration._contracts import CollaborationContractError as CollaborationContractError
 from cayu.collaboration._contracts import ExpectedOperation as ExpectedOperation
+from cayu.collaboration._contracts import HandoffIntent as HandoffIntent
+from cayu.collaboration._contracts import HandoffSlot as HandoffSlot
 from cayu.collaboration._contracts import InitiatorBinding as InitiatorBinding
 from cayu.collaboration._contracts import ObjectRef as ObjectRef
 from cayu.collaboration._contracts import OperationRef as OperationRef
@@ -500,6 +502,8 @@ __all__ = [
     "ForkRecipientPreparation",
     "FreshRecipientAdmissionTarget",
     "FreshRecipientPreparation",
+    "HandoffIntent",
+    "HandoffSlot",
     "HostClarificationMaintenanceSource",
     "HostClarificationRule",
     "HostContinuationRule",

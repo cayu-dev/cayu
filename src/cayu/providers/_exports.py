@@ -194,6 +194,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.providers.openai",
         "preflight_openai_native_structured_output_schema",
     ),
+    "RetryDecision": ("cayu.providers._retry_decision", "RetryDecision"),
+    "RetryDisposition": ("cayu.providers._retry_decision", "RetryDisposition"),
+    "RetryReason": ("cayu.providers._retry_decision", "RetryReason"),
+    "RetrySuppression": ("cayu.providers._retry_decision", "RetrySuppression"),
 }
 
 PUBLIC_NAMES = [
@@ -309,4 +313,8 @@ PUBLIC_NAMES = [
     "openai_embedding_result",
     "openai_response_events",
     "preflight_openai_native_structured_output_schema",
+    "RetryDecision",
+    "RetryDisposition",
+    "RetryReason",
+    "RetrySuppression",
 ]

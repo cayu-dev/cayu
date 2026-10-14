@@ -395,6 +395,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.knowledge_transition",
         "require_empty_knowledge_revision_transition",
     ),
+    "BrowserRecordingStore": ("cayu._browser_recording_store", "BrowserRecordingStore"),
+    "BrowserRecordingUnavailable": ("cayu._browser_recording_store", "BrowserRecordingUnavailable"),
 }
 
 PUBLIC_NAMES = [
@@ -579,4 +581,6 @@ PUBLIC_NAMES = [
     "prepare_knowledge_publication",
     "prepare_knowledge_relations",
     "require_empty_knowledge_revision_transition",
+    "BrowserRecordingStore",
+    "BrowserRecordingUnavailable",
 ]

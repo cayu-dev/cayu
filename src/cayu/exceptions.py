@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from cayu._resource_access_errors import ResourceAccessDenied as ResourceAccessDenied
 from cayu._validation import DurableValueError as DurableValueError
+from cayu._validation import extract_durable_value_error as extract_durable_value_error
 from cayu.deadlines import ExecutionDeadlineExceeded as ExecutionDeadlineExceeded
 from cayu.events import Event, copy_event
 
@@ -10,7 +12,9 @@ __all__ = [
     "DurableValueError",
     "ExecutionDeadlineExceeded",
     "InteractionLifecyclePublicationRejected",
+    "ResourceAccessDenied",
     "TerminalEventPublicationUncertain",
+    "extract_durable_value_error",
 ]
 
 
