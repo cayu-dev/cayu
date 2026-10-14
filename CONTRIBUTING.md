@@ -292,8 +292,7 @@ barriers; the scope's bounded thread polling is cleanup machinery, not a test or
 
 ### Dashboard
 
-Dashboard changes require Node.js ≥ 22.18.0 and npm. Run the complete dashboard job
-from the `dashboard/` directory:
+Dashboard source checks require Node.js ≥ 22.18.0 and npm. Run them from `dashboard/`:
 
 ```bash
 npm ci
@@ -301,17 +300,25 @@ npm run lint
 npm run test
 npm run typecheck
 npm run check:api:repo
-npm run build:package
+npm run build
 cd ..
-uv run python scripts/build_dashboard_source_bundle.py
+uv run python scripts/build_dashboard.py
+uv run python scripts/build_dashboard.py --check
 ```
 
-`build:package` regenerates `src/cayu/server/dashboard/`. Commit those packaged assets
-when dashboard source changes. The bundle command then regenerates the deterministic editable
-source shipped in wheel and source distributions. Commit both outputs; CI fails when the compiled
-assets, API baseline, license inventory, release metadata, or source bundle is stale. If a reviewed
-dependency license changes, update `dashboard/THIRD_PARTY_LICENSES.md` from the finalized build
-before regenerating the source bundle.
+The canonical build requires a Git checkout and Docker with Linux/amd64 support.
+It runs the existing `build:package` and license finalization in an immutable Node/npm environment, then
+uses the existing source-bundle writer and release validator. The pinned image,
+toolchain versions and input/output declarations live in `cayu._dashboard_artifacts`.
+See [dashboard build instructions](dashboard/README.md) for the environment and inputs.
+Commit both `src/cayu/server/dashboard/` and `src/cayu/data/dashboard_source/` when
+dashboard source changes. `--check` rebuilds in isolation and reports stale outputs
+without modifying the checkout. Local development and ejected applications still
+use `npm run build` directly.
+
+After a Python contract or release-version change, run `npm run generate:api:repo`
+before the canonical build. If a reviewed dependency license changes, update
+`dashboard/THIRD_PARTY_LICENSES.md` from the finalized build before regenerating.
 
 ### Pull request verification
 

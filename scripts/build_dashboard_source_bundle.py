@@ -11,6 +11,9 @@ import zipfile
 from pathlib import Path
 
 from cayu._dashboard_artifacts import (
+    BUILD_IGNORED_NAMES,
+    BUILD_IGNORED_PARTS,
+    BUILD_INPUT_FILES,
     BUNDLE_GLOB,
     BUNDLE_MANIFEST_NAME,
     BUNDLE_PACKAGE_ROOT,
@@ -28,11 +31,7 @@ from cayu.cli.dashboard import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DASHBOARD_ROOT = REPO_ROOT / SOURCE_ROOT
-COMPILED_DASHBOARD_ROOT = REPO_ROOT / "src" / "cayu" / COMPILED_PACKAGE_ROOT
 BUNDLE_ROOT = REPO_ROOT / "src" / "cayu" / BUNDLE_PACKAGE_ROOT
-_IGNORED_PARTS = {"__pycache__", "dist", "node_modules"}
-_IGNORED_NAMES = {".DS_Store"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,10 +43,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    cayu_version = _project_version()
+    cayu_version = project_version(REPO_ROOT)
     bundle_name = source_bundle_name(cayu_version)
     expected_path = BUNDLE_ROOT / bundle_name
-    expected = _build_bundle(cayu_version=cayu_version)
+    expected = build_bundle(cayu_version=cayu_version, repo_root=REPO_ROOT)
     existing = sorted(BUNDLE_ROOT.glob(BUNDLE_GLOB))
 
     if args.check:
@@ -69,8 +68,9 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _build_bundle(*, cayu_version: str) -> bytes:
-    contents = _dashboard_contents()
+def build_bundle(*, cayu_version: str, repo_root: Path) -> bytes:
+    """Render and validate a source bundle from one staged repository tree."""
+    contents = _dashboard_contents(repo_root)
     expected_release_metadata = render_release_metadata(
         cayu_version=cayu_version, server_contract_version=SERVER_CONTRACT_VERSION
     )
@@ -80,7 +80,9 @@ def _build_bundle(*, cayu_version: str) -> bytes:
             f"{release_metadata_path} must match Cayu {cayu_version} and server contract "
             f"v{SERVER_CONTRACT_VERSION}"
         )
-    compiled_digest = contents_digest(_tree_contents(COMPILED_DASHBOARD_ROOT))
+    compiled_digest = contents_digest(
+        tree_contents(repo_root / "src" / "cayu" / COMPILED_PACKAGE_ROOT)
+    )
     manifest = render_dashboard_source_manifest(
         contents,
         cayu_version=cayu_version,
@@ -105,24 +107,27 @@ def _build_bundle(*, cayu_version: str) -> bytes:
     return bundle
 
 
-def _dashboard_contents() -> dict[str, bytes]:
-    contents = _tree_contents(DASHBOARD_ROOT)
+def _dashboard_contents(repo_root: Path) -> dict[str, bytes]:
+    contents = tree_contents(repo_root / SOURCE_ROOT, ignore_build_products=True)
     package = json.loads(contents["package.json"])
     del package["scripts"]["build:package"]
     contents["package.json"] = (json.dumps(package, indent=2) + "\n").encode()
-    contents["LICENSE"] = (REPO_ROOT / "LICENSE").read_bytes()
-    contents["NOTICE"] = (REPO_ROOT / "NOTICE").read_bytes()
+    for name in BUILD_INPUT_FILES:
+        contents[name] = (repo_root / name).read_bytes()
     return contents
 
 
-def _tree_contents(root: Path) -> dict[str, bytes]:
-    if not root.is_dir():
+def tree_contents(root: Path, *, ignore_build_products: bool = False) -> dict[str, bytes]:
+    """Read ordinary files, optionally excluding declared local build products."""
+    if root.is_symlink() or not root.is_dir():
         raise ValueError(f"source directory is missing: {root}")
     contents: dict[str, bytes] = {}
     casefolded: set[str] = set()
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
-        if _IGNORED_PARTS.intersection(relative.parts) or path.name in _IGNORED_NAMES:
+        if ignore_build_products and (
+            BUILD_IGNORED_PARTS.intersection(relative.parts) or path.name in BUILD_IGNORED_NAMES
+        ):
             continue
         if path.is_symlink():
             raise ValueError(f"source tree must not contain symlinks: {path}")
@@ -138,8 +143,9 @@ def _tree_contents(root: Path) -> dict[str, bytes]:
     return contents
 
 
-def _project_version() -> str:
-    with (REPO_ROOT / "pyproject.toml").open("rb") as project_file:
+def project_version(repo_root: Path) -> str:
+    """Read the repository-owned version used in the editable bundle name."""
+    with (repo_root / "pyproject.toml").open("rb") as project_file:
         value = tomllib.load(project_file)["project"]["version"]
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ValueError("pyproject.toml contains an invalid project version")

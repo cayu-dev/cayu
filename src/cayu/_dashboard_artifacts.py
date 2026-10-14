@@ -12,6 +12,20 @@ import re
 from collections.abc import Iterable, Mapping
 
 SOURCE_ROOT = "dashboard"
+# The canonical command builds this input tree plus the root redistribution
+# documents. Python's bundle writer uses stored ZIP entries with fixed metadata;
+# only the frontend compiler needs the pinned execution environment.
+BUILD_INPUT_FILES = ("LICENSE", "NOTICE")
+BUILD_IGNORED_PARTS = frozenset({"__pycache__", "dist", "node_modules"})
+BUILD_IGNORED_NAMES = frozenset({".DS_Store"})
+BUILD_PLATFORM = "linux/amd64"
+BUILD_IMAGE = (
+    "node:22.18.0-bookworm-slim@"
+    "sha256:0d130e2ee18e88e1561375276daced6bff032539200173f2daf48c2e33f38ff5"
+)
+BUILD_NODE_VERSION = "22.18.0"
+BUILD_NPM_VERSION = "10.9.3"
+BUILD_ENVIRONMENT = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC"}
 COMPILED_PACKAGE_ROOT = "server/dashboard"
 COMPILED_REQUIRED_FILES = frozenset(
     {"LICENSE", "NOTICE", "REDISTRIBUTION.md", "THIRD_PARTY_LICENSES.md", "index.html"}

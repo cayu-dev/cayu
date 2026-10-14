@@ -419,6 +419,30 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
     return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
 
 
+def validate_dashboard_build(
+    compiled: dict[str, bytes],
+    bundle: bytes,
+    *,
+    package_version: str,
+) -> None:
+    """Apply the release checks to a staged dashboard before publishing it."""
+    label = Path(COMPILED_PACKAGE_ROOT)
+    missing = sorted(COMPILED_REQUIRED_FILES - compiled.keys())
+    if missing:
+        _fail(f"{label}: missing required dashboard files: {', '.join(missing)}")
+    _validate_third_party_licenses(compiled["THIRD_PARTY_LICENSES.md"], archive=label)
+    _validate_dashboard_source(
+        {
+            **{f"{COMPILED_PACKAGE_ROOT}/{name}": content for name, content in compiled.items()},
+            f"{BUNDLE_PACKAGE_ROOT}/{source_bundle_name(package_version)}": bundle,
+        },
+        archive=label,
+        package_version=package_version,
+        bundle_prefix=BUNDLE_PACKAGE_ROOT,
+        compiled_prefix=COMPILED_PACKAGE_ROOT,
+    )
+
+
 def _validate_dashboard_source(
     archive_contents: dict[str, bytes],
     *,

@@ -32,8 +32,37 @@ npm run check:api:repo
 npm run build
 ```
 
-Normal development builds support Node.js 22.18.0 or newer. Byte-for-byte release asset
-reproduction is verified with exactly Node.js 22.18.0 and the committed `package-lock.json`.
+Normal development builds support Node.js 22.18.0 or newer. In the Cayu repository,
+regenerate the assets shipped in Python packages from the repository root with:
+
+```bash
+uv run python scripts/build_dashboard.py
+uv run python scripts/build_dashboard.py --check
+```
+
+These commands require a Git checkout and Docker with Linux/amd64 support.
+The canonical frontend build uses the immutable Node 22.18.0 Debian Bookworm image declared in
+`cayu._dashboard_artifacts`, including npm 10.9.3 and the committed lockfile.
+It fixes locale and timezone and normalizes CRLF in UTF-8 inputs declared as text
+by Git attributes. Binary assets retain their bytes, including files marked
+`-text` or `binary` in `.gitattributes`. Each build installs dependencies in a
+disposable Docker environment; it does not use or modify the checkout's `node_modules`.
+
+The command reads the dashboard source tree and root `LICENSE` and `NOTICE`,
+excluding local build products declared in `cayu._dashboard_artifacts`. It owns
+`src/cayu/server/dashboard/` and `src/cayu/data/dashboard_source/`. After the
+frontend build and license finalization, the existing Python bundle writer creates
+the source ZIP with fixed metadata and uncompressed entries. Release validation
+checks the bundle and compiled digest before any checkout output is written.
+`--check` lists added, removed and changed output files and leaves the checkout
+untouched. Regenerate and commit both output trees when this check reports drift.
+
+API generation remains a separate explicit step: use `npm run generate:api:repo`
+after changing Python contracts or release versions, then run the canonical build.
+When dependencies change, review the finalized license inventory and update
+`dashboard/THIRD_PARTY_LICENSES.md` before regenerating the bundle.
+Ejected dashboards continue to use the local `npm run build` command above;
+Docker is required only for authoritative Cayu package regeneration.
 
 `npm run check:api:repo` compares the generated client and `server-openapi.json` with the
 repository-root `.venv` and fails if that environment is absent. `CAYU_PYTHON` remains the
