@@ -1,7 +1,18 @@
 # Release notes
 
-## Unreleased
+## v0.11.2
 
+Cayu improves recovery across upgrades, bounds stalled task continuations, and
+strengthens dashboard artifact validation.
+
+- Back off repeated interrupted-task continuations that make no progress and
+  fail stalled tasks at the configured limit. Pending approvals, user input,
+  delegated actions, and manual tool recovery remain protected.
+- Share evaluation authoring text limits between the server and dashboard, and
+  reject missing or undeclared generated dashboard files during packaging.
+- Reuse canonical collaboration contract bytes during preparation and improve
+  in-memory session storage organization without changing public interfaces.
+- Keep in-memory session creation state out of exception diagnostics.
 - Existing sessions continue after a Cayu upgrade. When the only change to a
   session's execution profile is the `runtime` component, `resume` adopts it
   without an `ExecutionProfilePolicy` and records a system-attributed
