@@ -46,6 +46,16 @@ from the evaluation corpus domain. Suite/case name and description limits count
 Unicode scalar values. Update the Python definitions and regenerate the client
 when changing these limits; the dashboard retains its existing text validators.
 
+The installed Cayu module `cayu._dashboard_artifacts` owns generated-source paths,
+required source files, package output locations, and release-metadata rendering.
+API generation and source-bundle validation consume that declaration. When adding
+a generated output, update the declaration and its generator together, then run
+the existing API and bundle checks. Files under `src/lib/generated/` must belong
+to the declared output inventory; place custom dashboard code outside that tree.
+The bundle manifest continues to record all source files and the compiled-assets
+digest. Its version-1 `generated_api_digest` covers OpenAPI and server API types;
+the full source digest also covers release metadata and evaluation text limits.
+
 Serve `dist/` with `DashboardConfig(directory=...)`, `mount_cayu(..., dashboard_dir=...)`, or
 `mount_dashboard(..., dashboard_dir=...)`. Cayu injects the configured base path and API URL,
 including for non-root mounts and React-router deep links.

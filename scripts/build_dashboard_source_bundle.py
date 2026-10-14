@@ -10,6 +10,16 @@ import tomllib
 import zipfile
 from pathlib import Path
 
+from cayu._dashboard_artifacts import (
+    BUNDLE_GLOB,
+    BUNDLE_MANIFEST_NAME,
+    BUNDLE_PACKAGE_ROOT,
+    COMPILED_PACKAGE_ROOT,
+    RELEASE_METADATA_FILE,
+    SOURCE_ROOT,
+    render_release_metadata,
+    source_bundle_name,
+)
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli.dashboard import (
     contents_digest,
@@ -18,10 +28,9 @@ from cayu.cli.dashboard import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DASHBOARD_ROOT = REPO_ROOT / "dashboard"
-COMPILED_DASHBOARD_ROOT = REPO_ROOT / "src" / "cayu" / "server" / "dashboard"
-BUNDLE_ROOT = REPO_ROOT / "src" / "cayu" / "data" / "dashboard_source"
-MANIFEST_NAME = "cayu-dashboard-source.json"
+DASHBOARD_ROOT = REPO_ROOT / SOURCE_ROOT
+COMPILED_DASHBOARD_ROOT = REPO_ROOT / "src" / "cayu" / COMPILED_PACKAGE_ROOT
+BUNDLE_ROOT = REPO_ROOT / "src" / "cayu" / BUNDLE_PACKAGE_ROOT
 _IGNORED_PARTS = {"__pycache__", "dist", "node_modules"}
 _IGNORED_NAMES = {".DS_Store"}
 
@@ -36,10 +45,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cayu_version = _project_version()
-    bundle_name = f"cayu-dashboard-source-{cayu_version}.zip"
+    bundle_name = source_bundle_name(cayu_version)
     expected_path = BUNDLE_ROOT / bundle_name
     expected = _build_bundle(cayu_version=cayu_version)
-    existing = sorted(BUNDLE_ROOT.glob("cayu-dashboard-source-*.zip"))
+    existing = sorted(BUNDLE_ROOT.glob(BUNDLE_GLOB))
 
     if args.check:
         if existing != [expected_path] or expected_path.read_bytes() != expected:
@@ -62,11 +71,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def _build_bundle(*, cayu_version: str) -> bytes:
     contents = _dashboard_contents()
-    expected_release_metadata = (
-        f'export const DASHBOARD_SOURCE_CAYU_VERSION = "{cayu_version}"\n'
-        f'export const SUPPORTED_SERVER_CONTRACT_VERSION = "{SERVER_CONTRACT_VERSION}"\n'
-    ).encode()
-    release_metadata_path = "src/lib/release-metadata.ts"
+    expected_release_metadata = render_release_metadata(
+        cayu_version=cayu_version, server_contract_version=SERVER_CONTRACT_VERSION
+    )
+    release_metadata_path = RELEASE_METADATA_FILE
     if contents.get(release_metadata_path) != expected_release_metadata:
         raise ValueError(
             f"{release_metadata_path} must match Cayu {cayu_version} and server contract "
@@ -79,7 +87,7 @@ def _build_bundle(*, cayu_version: str) -> bytes:
         server_contract_version=SERVER_CONTRACT_VERSION,
         compiled_dashboard_digest=compiled_digest,
     )
-    archive_contents = {**contents, MANIFEST_NAME: manifest}
+    archive_contents = {**contents, BUNDLE_MANIFEST_NAME: manifest}
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
         for name, content in sorted(archive_contents.items()):

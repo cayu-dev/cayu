@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from cayu._dashboard_artifacts import API_TYPE_FILES, API_TYPES_ROOT
 from cayu.evals import corpus
 
 _ROOT = Path(__file__).parents[2]
@@ -32,9 +33,11 @@ def test_dashboard_api_command_generates_and_checks_text_limits(tmp_path, monkey
     def generate(*, schema_path, output_dir):
         assert schema_path.read_text() == "{}\n"
         output_dir.mkdir(parents=True)
-        (output_dir / "index.ts").write_text("export {}\n")
+        for path in API_TYPE_FILES:
+            (output_dir / Path(path).relative_to(API_TYPES_ROOT)).write_text("export {}\n")
 
     replacements = {
+        "GENERATED_SOURCE_ROOT": generated.parent,
         "GENERATED_DIR": generated,
         "OPENAPI_BASELINE": tmp_path / "openapi.json",
         "RELEASE_METADATA": tmp_path / "release-metadata.ts",

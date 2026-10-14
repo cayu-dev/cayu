@@ -17,6 +17,7 @@ from typing import Any, cast
 
 import pytest
 
+from cayu._dashboard_artifacts import BUNDLE_MANIFEST_NAME, REQUIRED_SOURCE_FILES
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli import _guarded_tree_publication as publication_cli
 from cayu.cli import _version, main
@@ -142,26 +143,7 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
 
     assert main(["dashboard", "eject", str(destination)]) == 0
 
-    for relative in (
-        "README.md",
-        "LICENSE",
-        "NOTICE",
-        "REDISTRIBUTION.md",
-        "cayu-dashboard-source.json",
-        "package.json",
-        "package-lock.json",
-        "vite.config.ts",
-        "tsconfig.json",
-        "biome.json",
-        "server-openapi.json",
-        "scripts/finalize-third-party-licenses.mjs",
-        "scripts/generate-api-types.py",
-        "scripts/run-python.mjs",
-        "src/main.tsx",
-        "src/lib/generated/server-api/types.gen.ts",
-        "tests/dashboard-capabilities.test.mjs",
-        "third_party/shadcn-ui.LICENSE",
-    ):
+    for relative in REQUIRED_SOURCE_FILES | {BUNDLE_MANIFEST_NAME}:
         assert (destination / relative).is_file(), relative
 
     manifest = json.loads((destination / "cayu-dashboard-source.json").read_text(encoding="utf-8"))

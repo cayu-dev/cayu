@@ -14,11 +14,15 @@ from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Never
 
+from cayu._dashboard_artifacts import (
+    BUNDLE_PACKAGE_ROOT,
+    COMPILED_PACKAGE_ROOT,
+    COMPILED_REQUIRED_FILES,
+    source_bundle_name,
+)
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli.dashboard import (
-    _REQUIRED_SOURCE_FILES,
     DashboardSourceError,
-    ValidatedDashboardSource,
     contents_digest,
     validate_dashboard_source_bundle,
 )
@@ -47,9 +51,8 @@ _REMOVED_LAYOUT_PATHS = {
 _SIDECAR_MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
 _SDIST_SIDECAR_PREFIX = "examples/aws/lambda_microvm_sidecar"
 _WHEEL_SIDECAR_PREFIX = "cayu/data/lambda_microvm_sidecar"
-_SDIST_DASHBOARD_SOURCE_PREFIX = "src/cayu/data/dashboard_source"
-_WHEEL_DASHBOARD_SOURCE_PREFIX = "cayu/data/dashboard_source"
-_DASHBOARD_SOURCE_REQUIRED = _REQUIRED_SOURCE_FILES
+_SDIST_DASHBOARD_SOURCE_PREFIX = f"src/cayu/{BUNDLE_PACKAGE_ROOT}"
+_WHEEL_DASHBOARD_SOURCE_PREFIX = f"cayu/{BUNDLE_PACKAGE_ROOT}"
 _GUIDE_FILES = {filename for filename, _description in _GUIDES.values()}
 _SDIST_REQUIRED = {
     *{"src/" + name for name in _PUBLIC_LAYOUT_REQUIRED},
@@ -67,10 +70,7 @@ _SDIST_REQUIRED = {
     *{f"src/cayu/guides/{filename}" for filename in _GUIDE_FILES},
     "src/cayu/server/browser_client/client.js",
     "src/cayu/server/browser_client/client.d.ts",
-    "src/cayu/server/dashboard/LICENSE",
-    "src/cayu/server/dashboard/NOTICE",
-    "src/cayu/server/dashboard/REDISTRIBUTION.md",
-    "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
+    *{f"src/cayu/{COMPILED_PACKAGE_ROOT}/{name}" for name in COMPILED_REQUIRED_FILES},
     f"{_SDIST_SIDECAR_PREFIX}/{_SIDECAR_MANIFEST}",
 }
 _SDIST_ALLOWED_ROOTS = {
@@ -96,11 +96,7 @@ _WHEEL_REQUIRED = {
     *{f"cayu/guides/{filename}" for filename in _GUIDE_FILES},
     "cayu/server/browser_client/client.js",
     "cayu/server/browser_client/client.d.ts",
-    "cayu/server/dashboard/LICENSE",
-    "cayu/server/dashboard/NOTICE",
-    "cayu/server/dashboard/REDISTRIBUTION.md",
-    "cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
-    "cayu/server/dashboard/index.html",
+    *{f"cayu/{COMPILED_PACKAGE_ROOT}/{name}" for name in COMPILED_REQUIRED_FILES},
     f"{_WHEEL_SIDECAR_PREFIX}/{_SIDECAR_MANIFEST}",
 }
 _THIRD_PARTY_LICENSE_MARKERS = {
@@ -296,7 +292,7 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
         archive=archive,
         guide_prefix="src/cayu/guides",
     )
-    notice_name = "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
+    notice_name = f"src/cayu/{COMPILED_PACKAGE_ROOT}/THIRD_PARTY_LICENSES.md"
     _validate_third_party_licenses(contents_by_relative_name[notice_name], archive=archive)
     package_version = _metadata_version(
         contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
@@ -320,7 +316,7 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
         archive=archive,
         package_version=package_version,
         bundle_prefix=_SDIST_DASHBOARD_SOURCE_PREFIX,
-        compiled_prefix="src/cayu/server/dashboard",
+        compiled_prefix=f"src/cayu/{COMPILED_PACKAGE_ROOT}",
     )
     return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
 
@@ -362,15 +358,15 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
         guide_prefix="cayu/guides",
     )
     _validate_third_party_licenses(
-        file_contents["cayu/server/dashboard/THIRD_PARTY_LICENSES.md"], archive=archive
+        file_contents[f"cayu/{COMPILED_PACKAGE_ROOT}/THIRD_PARTY_LICENSES.md"], archive=archive
     )
     if not any(
-        name.startswith("cayu/server/dashboard/assets/") and name.endswith(".js")
+        name.startswith(f"cayu/{COMPILED_PACKAGE_ROOT}/assets/") and name.endswith(".js")
         for name in name_set
     ):
         _fail(f"{archive}: packaged dashboard JavaScript is missing")
     if not any(
-        name.startswith("cayu/server/dashboard/assets/") and name.endswith(".css")
+        name.startswith(f"cayu/{COMPILED_PACKAGE_ROOT}/assets/") and name.endswith(".css")
         for name in name_set
     ):
         _fail(f"{archive}: packaged dashboard CSS is missing")
@@ -418,7 +414,7 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
         archive=archive,
         package_version=package_version,
         bundle_prefix=_WHEEL_DASHBOARD_SOURCE_PREFIX,
-        compiled_prefix="cayu/server/dashboard",
+        compiled_prefix=f"cayu/{COMPILED_PACKAGE_ROOT}",
     )
     return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
 
@@ -431,7 +427,7 @@ def _validate_dashboard_source(
     bundle_prefix: str,
     compiled_prefix: str,
 ) -> bytes:
-    expected_name = f"{bundle_prefix}/cayu-dashboard-source-{package_version}.zip"
+    expected_name = f"{bundle_prefix}/{source_bundle_name(package_version)}"
     bundle_names = sorted(
         name
         for name in archive_contents
@@ -453,7 +449,6 @@ def _validate_dashboard_source(
         )
     except DashboardSourceError as exc:
         raise ValueError(f"{archive}: invalid dashboard source bundle: {exc}") from exc
-    _validate_dashboard_source_inventory(artifact, archive=archive)
 
     compiled_prefix = f"{compiled_prefix}/"
     compiled_contents = {
@@ -468,16 +463,6 @@ def _validate_dashboard_source(
             f"expected {artifact.manifest.compiled_dashboard_digest}, found {compiled_digest}"
         )
     return bundle
-
-
-def _validate_dashboard_source_inventory(
-    artifact: ValidatedDashboardSource,
-    *,
-    archive: Path,
-) -> None:
-    missing = sorted(_DASHBOARD_SOURCE_REQUIRED - artifact.contents.keys())
-    if missing:
-        _fail(f"{archive}: dashboard source bundle is incomplete: {', '.join(missing)}")
 
 
 def validate_sidecar_equivalence(

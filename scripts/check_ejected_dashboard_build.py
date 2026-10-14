@@ -8,13 +8,15 @@ from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath
 
+from cayu._dashboard_artifacts import COMPILED_PACKAGE_ROOT
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dashboard_build", type=Path)
     args = parser.parse_args(argv)
 
-    expected = _resource_contents(files("cayu").joinpath("server", "dashboard"))
+    expected = _resource_contents(files("cayu").joinpath(*COMPILED_PACKAGE_ROOT.split("/")))
     actual = _directory_contents(args.dashboard_build)
     missing = sorted(expected.keys() - actual.keys())
     unexpected = sorted(actual.keys() - expected.keys())

@@ -20,6 +20,18 @@ from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 
+from cayu._dashboard_artifacts import (
+    BUNDLE_MANIFEST_NAME,
+    BUNDLE_NAME_PATTERN,
+    BUNDLE_PACKAGE_ROOT,
+    COMPILED_PACKAGE_ROOT,
+    RELEASE_METADATA_FILE,
+    REQUIRED_SOURCE_FILES,
+    generated_api_contents,
+    render_release_metadata,
+    source_bundle_name,
+    validate_generated_source_inventory,
+)
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli import _guarded_tree_publication as _tree_publication
 from cayu.cli._guarded_tree_publication import (
@@ -30,9 +42,6 @@ from cayu.cli._guarded_tree_publication import (
     validate_guarded_tree_files,
 )
 
-_BUNDLE_DIRECTORY = "dashboard_source"
-_BUNDLE_NAME_PATTERN = re.compile(r"cayu-dashboard-source-(?P<version>[^/]+)\.zip\Z")
-_MANIFEST_NAME = "cayu-dashboard-source.json"
 _MANIFEST_KEYS = {
     "artifact_version",
     "cayu_version",
@@ -49,30 +58,6 @@ _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _MAX_ARCHIVE_FILES = 4096
 _MAX_ARCHIVE_FILE_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
-_REQUIRED_SOURCE_FILES = {
-    "LICENSE",
-    "NOTICE",
-    "README.md",
-    "REDISTRIBUTION.md",
-    "THIRD_PARTY_LICENSES.md",
-    "biome.json",
-    "package-lock.json",
-    "package.json",
-    "scripts/check-third-party-licenses.mjs",
-    "scripts/finalize-third-party-licenses.mjs",
-    "scripts/generate-api-types.py",
-    "scripts/run-python.mjs",
-    "server-openapi.json",
-    "src/lib/generated/server-api/index.ts",
-    "src/lib/generated/server-api/types.gen.ts",
-    "src/lib/release-metadata.ts",
-    "src/main.tsx",
-    "tests/dashboard-capabilities.test.mjs",
-    "tests/run-python.test.mjs",
-    "third_party/shadcn-ui.LICENSE",
-    "tsconfig.json",
-    "vite.config.ts",
-}
 
 
 class DashboardSourceError(RuntimeError):
@@ -346,9 +331,9 @@ def validate_dashboard_source_bundle(
                 raise DashboardSourceError(f"dashboard source archive size mismatch: {path}")
             contents[path] = content
 
-    raw_manifest = contents.pop(_MANIFEST_NAME, None)
+    raw_manifest = contents.pop(BUNDLE_MANIFEST_NAME, None)
     if raw_manifest is None:
-        raise DashboardSourceError(f"dashboard source manifest is missing: {_MANIFEST_NAME}")
+        raise DashboardSourceError(f"dashboard source manifest is missing: {BUNDLE_MANIFEST_NAME}")
     manifest = _parse_manifest(raw_manifest)
     if manifest.cayu_version != expected_cayu_version:
         raise DashboardSourceError(
@@ -374,11 +359,15 @@ def validate_dashboard_source_bundle(
         raise DashboardSourceError(
             f"dashboard source bundle contains unexpected files: {', '.join(unexpected)}"
         )
-    required_missing = sorted(_REQUIRED_SOURCE_FILES - actual_paths)
+    required_missing = sorted(REQUIRED_SOURCE_FILES - actual_paths)
     if required_missing:
         raise DashboardSourceError(
             f"dashboard source bundle is incomplete: {', '.join(required_missing)}"
         )
+    try:
+        validate_generated_source_inventory(contents)
+    except ValueError as exc:
+        raise DashboardSourceError(str(exc)) from exc
     for item in manifest.files:
         content = contents[item.path]
         if len(content) != item.size:
@@ -399,7 +388,7 @@ def validate_dashboard_source_bundle(
             "dashboard source aggregate digest mismatch: "
             f"expected {manifest.source_digest}, found {source_digest}"
         )
-    generated_api = _generated_api_contents(contents)
+    generated_api = generated_api_contents(contents)
     generated_api_digest = _contents_digest(generated_api)
     if generated_api_digest != manifest.generated_api_digest:
         raise DashboardSourceError(
@@ -407,7 +396,7 @@ def validate_dashboard_source_bundle(
             f"expected {manifest.generated_api_digest}, found {generated_api_digest}"
         )
     _validate_release_metadata(contents, manifest=manifest)
-    contents[_MANIFEST_NAME] = raw_manifest
+    contents[BUNDLE_MANIFEST_NAME] = raw_manifest
     return ValidatedDashboardSource(manifest=manifest, contents=contents)
 
 
@@ -423,7 +412,7 @@ def render_dashboard_source_manifest(
         DashboardSourceFile(path=path, size=len(contents[path]), sha256=_sha256(contents[path]))
         for path in sorted(contents)
     ]
-    generated_api = _generated_api_contents(contents)
+    generated_api = generated_api_contents(contents)
     manifest = {
         "artifact_version": 1,
         "cayu_version": cayu_version,
@@ -442,16 +431,8 @@ def contents_digest(contents: dict[str, bytes]) -> str:
     return _contents_digest(contents)
 
 
-def _generated_api_contents(contents: dict[str, bytes]) -> dict[str, bytes]:
-    return {
-        path: content
-        for path, content in contents.items()
-        if path == "server-openapi.json" or path.startswith("src/lib/generated/server-api/")
-    }
-
-
 def _dashboard_source_resource() -> _BundleResource:
-    root = files("cayu.data").joinpath(_BUNDLE_DIRECTORY)
+    root = files("cayu").joinpath(*BUNDLE_PACKAGE_ROOT.split("/"))
     if _is_symlink(root) or not root.is_dir():
         raise DashboardSourceError("the installed Cayu distribution omits dashboard source")
     try:
@@ -459,7 +440,7 @@ def _dashboard_source_resource() -> _BundleResource:
             (
                 child
                 for child in root.iterdir()
-                if child.is_file() and _BUNDLE_NAME_PATTERN.fullmatch(child.name) is not None
+                if child.is_file() and BUNDLE_NAME_PATTERN.fullmatch(child.name) is not None
             ),
             key=lambda child: child.name,
         )
@@ -477,7 +458,7 @@ def _dashboard_source_resource() -> _BundleResource:
         raise DashboardSourceError(
             "the packaged dashboard source cannot be verified without Cayu distribution metadata"
         ) from exc
-    expected_name = f"cayu-dashboard-source-{installed_version}.zip"
+    expected_name = source_bundle_name(installed_version)
     if candidates[0].name != expected_name:
         raise DashboardSourceError(
             f"dashboard source bundle filename mismatch: expected {expected_name}, "
@@ -591,7 +572,7 @@ def _validate_manifest_path(value: Any, *, index: int) -> str:
     if not isinstance(value, str):
         raise DashboardSourceError(f"invalid dashboard source manifest path at index {index}")
     path = _validate_archive_path(value)
-    if path == _MANIFEST_NAME:
+    if path == BUNDLE_MANIFEST_NAME:
         raise DashboardSourceError("dashboard source manifest must not list itself")
     return path
 
@@ -611,14 +592,13 @@ def _validate_release_metadata(
     *,
     manifest: DashboardSourceManifest,
 ) -> None:
-    path = "src/lib/release-metadata.ts"
+    path = RELEASE_METADATA_FILE
     content = contents.get(path)
     if content is None:
         raise DashboardSourceError(f"dashboard release metadata is missing: {path}")
-    expected = (
-        f'export const DASHBOARD_SOURCE_CAYU_VERSION = "{manifest.cayu_version}"\n'
-        f'export const SUPPORTED_SERVER_CONTRACT_VERSION = "{manifest.server_contract_version}"\n'
-    ).encode()
+    expected = render_release_metadata(
+        cayu_version=manifest.cayu_version, server_contract_version=manifest.server_contract_version
+    )
     if content != expected:
         raise DashboardSourceError("dashboard release metadata does not match its bundle manifest")
 
@@ -700,7 +680,7 @@ def _require_existing_destination_parent(parent: Path) -> None:
 
 
 def _packaged_compiled_dashboard_digest() -> str:
-    root = files("cayu").joinpath("server", "dashboard")
+    root = files("cayu").joinpath(*COMPILED_PACKAGE_ROOT.split("/"))
     if _is_symlink(root) or not root.is_dir():
         raise DashboardSourceError(
             "the installed Cayu distribution omits compiled dashboard assets"

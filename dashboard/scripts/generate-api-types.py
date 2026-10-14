@@ -14,11 +14,23 @@ import sys
 import tempfile
 from pathlib import Path
 
+from cayu._dashboard_artifacts import (
+    API_TYPE_FILES,
+    API_TYPES_ROOT,
+    EVAL_TEXT_LIMITS_FILE,
+    GENERATED_ROOT,
+    OPENAPI_FILE,
+    RELEASE_METADATA_FILE,
+    render_release_metadata,
+    validate_generated_source_inventory,
+)
+
 DASHBOARD_ROOT = Path(__file__).resolve().parents[1]
-GENERATED_DIR = DASHBOARD_ROOT / "src" / "lib" / "generated" / "server-api"
-OPENAPI_BASELINE = DASHBOARD_ROOT / "server-openapi.json"
-RELEASE_METADATA = DASHBOARD_ROOT / "src" / "lib" / "release-metadata.ts"
-EVAL_TEXT_LIMITS = DASHBOARD_ROOT / "src" / "lib" / "generated" / "eval-text-limits.ts"
+GENERATED_SOURCE_ROOT = DASHBOARD_ROOT / GENERATED_ROOT
+GENERATED_DIR = DASHBOARD_ROOT / API_TYPES_ROOT
+OPENAPI_BASELINE = DASHBOARD_ROOT / OPENAPI_FILE
+RELEASE_METADATA = DASHBOARD_ROOT / RELEASE_METADATA_FILE
+EVAL_TEXT_LIMITS = DASHBOARD_ROOT / EVAL_TEXT_LIMITS_FILE
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,8 +54,16 @@ def main(argv: list[str] | None = None) -> int:
         if not args.check and output_dir.exists():
             shutil.rmtree(output_dir)
         _run_generator(schema_path=schema_path, output_dir=output_dir)
+        expected_api_files = {Path(path).relative_to(API_TYPES_ROOT) for path in API_TYPE_FILES}
+        actual_api_files = _relative_files(output_dir)
+        if actual_api_files != expected_api_files:
+            raise SystemExit(
+                "Dashboard API generator outputs do not match Cayu's declared files; "
+                f"missing: {sorted(map(str, expected_api_files - actual_api_files))}; "
+                f"unexpected: {sorted(map(str, actual_api_files - expected_api_files))}"
+            )
         if args.check:
-            if RELEASE_METADATA.read_bytes() != release_metadata:
+            if not RELEASE_METADATA.is_file() or RELEASE_METADATA.read_bytes() != release_metadata:
                 raise SystemExit(
                     "Dashboard release metadata is stale; run `npm run generate:api` "
                     "with the intended Cayu Python environment."
@@ -59,6 +79,19 @@ def main(argv: list[str] | None = None) -> int:
             RELEASE_METADATA.write_bytes(release_metadata)
             EVAL_TEXT_LIMITS.parent.mkdir(parents=True, exist_ok=True)
             EVAL_TEXT_LIMITS.write_bytes(eval_text_limits)
+        try:
+            validate_generated_source_inventory(
+                [
+                    OPENAPI_FILE,
+                    RELEASE_METADATA_FILE,
+                    *(
+                        f"{GENERATED_ROOT}/{path.as_posix()}"
+                        for path in _relative_files(GENERATED_SOURCE_ROOT)
+                    ),
+                ]
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     return 0
 
 
@@ -105,10 +138,9 @@ def _release_metadata() -> bytes:
     from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 
     cayu_version = importlib.metadata.version("cayu")
-    return (
-        f'export const DASHBOARD_SOURCE_CAYU_VERSION = "{cayu_version}"\n'
-        f'export const SUPPORTED_SERVER_CONTRACT_VERSION = "{SERVER_CONTRACT_VERSION}"\n'
-    ).encode()
+    return render_release_metadata(
+        cayu_version=cayu_version, server_contract_version=SERVER_CONTRACT_VERSION
+    )
 
 
 def _eval_text_limits() -> bytes:
@@ -131,6 +163,11 @@ def _eval_text_limits() -> bytes:
 def _assert_expected_cayu_import() -> None:
     import cayu
 
+    if not RELEASE_METADATA.is_file():
+        raise SystemExit(
+            "Dashboard release metadata is missing; run `npm run generate:api` "
+            "with the intended Cayu Python environment."
+        )
     committed = RELEASE_METADATA.read_text(encoding="utf-8")
     match = re.search(r'DASHBOARD_SOURCE_CAYU_VERSION = "([^"]+)"', committed)
     if match is None:
