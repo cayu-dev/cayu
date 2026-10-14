@@ -297,7 +297,7 @@ def _registration(adapter=None, generation="source"):
 
 
 @pytest.mark.parametrize("failure", ["preflight", "deadline", "cancel"])
-def test_unsubmitted_capture_is_dropped_and_retryable(tmp_path, backend, failure):
+def test_unsubmitted_capture_is_dropped_and_retryable(tmp_path, backend, failure, monkeypatch):
     async def run():
         class Gated(FakeAdapter):
             async def preflight_capture(self, policy):
@@ -308,17 +308,52 @@ def test_unsubmitted_capture_is_dropped_and_retryable(tmp_path, backend, failure
                     self.entered.set()
                     await self.release.wait()
 
-        policy = ExecutionSnapshotPolicy(timeout_seconds=1)
+        policy = ExecutionSnapshotPolicy()
         async with setup(tmp_path, backend, policy=policy) as (store, session, _, controller):
             adapter = Gated(fail="preflight" if failure == "preflight" else "wait")
             if failure == "cancel":
                 work = asyncio.create_task(capture(controller, session, adapter))
-                await adapter.entered.wait()
-                work.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await work
+                try:
+                    await asyncio.wait_for(adapter.entered.wait(), timeout=policy.timeout_seconds)
+                    work.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await work
+                finally:
+                    work.cancel()
+                    await asyncio.gather(work, return_exceptions=True)
+            elif failure == "deadline":
+                caller = asyncio.current_task()
+                real_wait = asyncio.wait
+
+                async def expire_preflight(
+                    tasks, *, timeout=None, return_when=asyncio.ALL_COMPLETED
+                ):
+                    if asyncio.current_task() is caller:
+                        assert timeout == policy.timeout_seconds
+                        entered = asyncio.create_task(adapter.entered.wait())
+                        try:
+                            # Expire the real wait only after storage has reserved
+                            # the intent and preflight is blocked, before submission.
+                            done, _ = await real_wait(
+                                {*tasks, entered},
+                                timeout=timeout,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            assert entered in done and not done.intersection(tasks)
+                        finally:
+                            entered.cancel()
+                            await asyncio.gather(entered, return_exceptions=True)
+                        timeout = 0
+                    return await real_wait(tasks, timeout=timeout, return_when=return_when)
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(asyncio, "wait", expire_preflight)
+                    with pytest.raises(
+                        ExecutionSnapshotOutcomeUnknown, match="Snapshot deadline expired"
+                    ):
+                        await capture(controller, session, adapter)
             else:
-                with pytest.raises(ExecutionSnapshotError):
+                with pytest.raises(ExecutionSnapshotError, match=r"^Workspace is not eligible\.$"):
                     await capture(controller, session, adapter)
             state = await controller.inspect(session.id, "sandbox")
             assert state["operations"] == [] and state["binding"] is None
