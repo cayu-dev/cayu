@@ -1,9 +1,5 @@
-import {
-  invalidDurableText,
-  MAX_LABEL_KEY_LENGTH,
-  MAX_LABEL_VALUE_LENGTH,
-  unicodeScalarLength,
-} from "./durable-text.ts"
+import { invalidDurableText, unicodeScalarLength } from "./durable-text.ts"
+import { LABEL_LIMITS } from "./generated/label-limits.ts"
 import type {
   LabelSelectorRequirement,
   PriceBook,
@@ -24,9 +20,6 @@ export type UsageRollupRequestState =
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
 const MAX_WINDOW_SECONDS = 366n * 24n * 60n * 60n
-const MAX_LABEL_FILTERS = 50
-const MAX_LABEL_SELECTORS = 25
-const MAX_LABEL_SELECTOR_VALUES = 100
 
 const RANGE_DURATION_MS: Record<Exclude<UsageRange, "custom">, number> = {
   "24h": DAY_MS,
@@ -325,35 +318,35 @@ function parseExactLabels(values: string[] | undefined): Record<string, string> 
     if (separator <= 0) {
       throw new Error(`Label filter ${JSON.stringify(expression)} must use key=value.`)
     }
-    const key = cleanBoundedText(expression.slice(0, separator), "Label key", MAX_LABEL_KEY_LENGTH)
+    const key = cleanBoundedText(expression.slice(0, separator), "Label key", LABEL_LIMITS.key)
     const value = cleanBoundedText(
       expression.slice(separator + 1),
       `Label ${key}`,
-      MAX_LABEL_VALUE_LENGTH,
+      LABEL_LIMITS.value,
     )
     if (labels.has(key)) {
       throw new Error(`Duplicate label filter: ${key}.`)
     }
     labels.set(key, value)
   }
-  if (labels.size > MAX_LABEL_FILTERS) {
-    throw new Error(`Usage filters cannot contain more than ${MAX_LABEL_FILTERS} exact labels.`)
+  if (labels.size > LABEL_LIMITS.filters) {
+    throw new Error(`Usage filters cannot contain more than ${LABEL_LIMITS.filters} exact labels.`)
   }
   return Object.fromEntries(labels)
 }
 
 function parseLabelSelectors(values: string[] | undefined): LabelSelectorRequirement[] {
   const selectors = (values ?? []).flatMap(splitLabelSelector).map(parseLabelSelector)
-  if (selectors.length > MAX_LABEL_SELECTORS) {
-    throw new Error(`Usage filters cannot contain more than ${MAX_LABEL_SELECTORS} selectors.`)
+  if (selectors.length > LABEL_LIMITS.selectors) {
+    throw new Error(`Usage filters cannot contain more than ${LABEL_LIMITS.selectors} selectors.`)
   }
   const valueCount = selectors.reduce(
     (count, selector) => count + (selector.values?.length ?? 0),
     0,
   )
-  if (valueCount > MAX_LABEL_SELECTOR_VALUES) {
+  if (valueCount > LABEL_LIMITS.selectorValues) {
     throw new Error(
-      `Usage filters cannot contain more than ${MAX_LABEL_SELECTOR_VALUES} selector values.`,
+      `Usage filters cannot contain more than ${LABEL_LIMITS.selectorValues} selector values.`,
     )
   }
   return selectors
@@ -415,7 +408,7 @@ function parseLabelSelector(expression: string): LabelSelectorRequirement {
         cleanBoundedText(
           expression.slice(separator + operatorText.length).trim(),
           "Label selector value",
-          MAX_LABEL_VALUE_LENGTH,
+          LABEL_LIMITS.value,
         ),
       ])
     }
@@ -429,7 +422,7 @@ function selectorRequirement(
   values: string[] = [],
 ): LabelSelectorRequirement {
   return {
-    key: cleanBoundedText(key.trim(), "Label selector key", MAX_LABEL_KEY_LENGTH),
+    key: cleanBoundedText(key.trim(), "Label selector key", LABEL_LIMITS.key),
     operator,
     values,
   }
@@ -443,7 +436,7 @@ function selectorValues(value: string): string[] {
   const values = trimmed
     .slice(1, -1)
     .split(",")
-    .map((item) => cleanBoundedText(item.trim(), "Label selector value", MAX_LABEL_VALUE_LENGTH))
+    .map((item) => cleanBoundedText(item.trim(), "Label selector value", LABEL_LIMITS.value))
   if (new Set(values).size !== values.length) {
     throw new Error("Label selector values must be distinct.")
   }

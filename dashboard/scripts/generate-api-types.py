@@ -19,6 +19,7 @@ from cayu._dashboard_artifacts import (
     API_TYPES_ROOT,
     EVAL_TEXT_LIMITS_FILE,
     GENERATED_ROOT,
+    LABEL_LIMITS_FILE,
     OPENAPI_FILE,
     RELEASE_METADATA_FILE,
     render_release_metadata,
@@ -31,6 +32,7 @@ GENERATED_DIR = DASHBOARD_ROOT / API_TYPES_ROOT
 OPENAPI_BASELINE = DASHBOARD_ROOT / OPENAPI_FILE
 RELEASE_METADATA = DASHBOARD_ROOT / RELEASE_METADATA_FILE
 EVAL_TEXT_LIMITS = DASHBOARD_ROOT / EVAL_TEXT_LIMITS_FILE
+LABEL_LIMITS = DASHBOARD_ROOT / LABEL_LIMITS_FILE
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = temp_dir / "server-api" if args.check else GENERATED_DIR
         release_metadata = _release_metadata()
         eval_text_limits = _eval_text_limits()
+        label_limits = _label_limits()
         schema_path.write_text(_openapi_json(), encoding="utf-8", newline="\n")
         if not args.check and output_dir.exists():
             shutil.rmtree(output_dir)
@@ -75,10 +78,16 @@ def main(argv: list[str] | None = None) -> int:
                     "Dashboard evaluation text limits are stale; run `npm run generate:api` "
                     "with the intended Cayu Python environment."
                 )
+            if not LABEL_LIMITS.is_file() or LABEL_LIMITS.read_bytes() != label_limits:
+                raise SystemExit(
+                    "Dashboard label limits are stale; run `npm run generate:api` "
+                    "with the intended Cayu Python environment."
+                )
         else:
             RELEASE_METADATA.write_bytes(release_metadata)
             EVAL_TEXT_LIMITS.parent.mkdir(parents=True, exist_ok=True)
             EVAL_TEXT_LIMITS.write_bytes(eval_text_limits)
+            LABEL_LIMITS.write_bytes(label_limits)
         try:
             validate_generated_source_inventory(
                 [
@@ -156,6 +165,27 @@ def _eval_text_limits() -> bytes:
         f'  unit: "{EVAL_CORPUS_TEXT_LENGTH_UNIT}",\n'
         f"  name: {EVAL_CORPUS_MAX_NAME_CHARS},\n"
         f"  description: {EVAL_CORPUS_MAX_DESCRIPTION_CHARS},\n"
+        "} as const\n"
+    ).encode()
+
+
+def _label_limits() -> bytes:
+    from cayu._validation import LABEL_MAX_KEY_CHARS, LABEL_MAX_VALUE_CHARS, LABEL_TEXT_LENGTH_UNIT
+    from cayu.sessions.queries import (
+        MAX_AGGREGATE_LABEL_FILTERS,
+        MAX_AGGREGATE_LABEL_SELECTOR_VALUES,
+        MAX_AGGREGATE_LABEL_SELECTORS,
+    )
+
+    return (
+        "// Generated from cayu._validation and cayu.sessions.queries by npm run generate:api.\n"
+        "export const LABEL_LIMITS = {\n"
+        f'  unit: "{LABEL_TEXT_LENGTH_UNIT}",\n'
+        f"  key: {LABEL_MAX_KEY_CHARS},\n"
+        f"  value: {LABEL_MAX_VALUE_CHARS},\n"
+        f"  filters: {MAX_AGGREGATE_LABEL_FILTERS},\n"
+        f"  selectors: {MAX_AGGREGATE_LABEL_SELECTORS},\n"
+        f"  selectorValues: {MAX_AGGREGATE_LABEL_SELECTOR_VALUES},\n"
         "} as const\n"
     ).encode()
 

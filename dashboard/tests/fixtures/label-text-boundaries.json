@@ -1,0 +1,114 @@
+[
+  {
+    "id": "key-ascii-at",
+    "field": "key",
+    "text": "x",
+    "repeat": 128,
+    "accepted": true
+  },
+  {
+    "id": "key-ascii-over",
+    "field": "key",
+    "text": "x",
+    "repeat": 129,
+    "accepted": false
+  },
+  {
+    "id": "key-astral-at",
+    "field": "key",
+    "text": "\ud83d\ude00",
+    "repeat": 128,
+    "accepted": true
+  },
+  {
+    "id": "key-astral-over",
+    "field": "key",
+    "text": "\ud83d\ude00",
+    "repeat": 129,
+    "accepted": false
+  },
+  {
+    "id": "key-combining-at",
+    "field": "key",
+    "text": "e\u0301",
+    "repeat": 64,
+    "accepted": true
+  },
+  {
+    "id": "key-combining-over",
+    "field": "key",
+    "text": "e\u0301",
+    "repeat": 65,
+    "accepted": false
+  },
+  {
+    "id": "key-nul",
+    "field": "key",
+    "text": "word\u0000",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "key-surrogate",
+    "field": "key",
+    "text": "word\ud800",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "value-ascii-at",
+    "field": "value",
+    "text": "x",
+    "repeat": 512,
+    "accepted": true
+  },
+  {
+    "id": "value-ascii-over",
+    "field": "value",
+    "text": "x",
+    "repeat": 513,
+    "accepted": false
+  },
+  {
+    "id": "value-astral-at",
+    "field": "value",
+    "text": "\ud83d\ude00",
+    "repeat": 512,
+    "accepted": true
+  },
+  {
+    "id": "value-astral-over",
+    "field": "value",
+    "text": "\ud83d\ude00",
+    "repeat": 513,
+    "accepted": false
+  },
+  {
+    "id": "value-combining-at",
+    "field": "value",
+    "text": "e\u0301",
+    "repeat": 256,
+    "accepted": true
+  },
+  {
+    "id": "value-combining-over",
+    "field": "value",
+    "text": "e\u0301",
+    "repeat": 257,
+    "accepted": false
+  },
+  {
+    "id": "value-nul",
+    "field": "value",
+    "text": "word\u0000",
+    "repeat": 1,
+    "accepted": false
+  },
+  {
+    "id": "value-surrogate",
+    "field": "value",
+    "text": "word\ud800",
+    "repeat": 1,
+    "accepted": false
+  }
+]

@@ -42,8 +42,9 @@ API_TYPES_ROOT = f"{GENERATED_ROOT}/server-api"
 API_TYPE_FILES = frozenset(f"{API_TYPES_ROOT}/{name}" for name in ("index.ts", "types.gen.ts"))
 RELEASE_METADATA_FILE = "src/lib/release-metadata.ts"
 EVAL_TEXT_LIMITS_FILE = f"{GENERATED_ROOT}/eval-text-limits.ts"
+LABEL_LIMITS_FILE = f"{GENERATED_ROOT}/label-limits.ts"
 GENERATED_SOURCE_FILES = frozenset(
-    {OPENAPI_FILE, RELEASE_METADATA_FILE, EVAL_TEXT_LIMITS_FILE, *API_TYPE_FILES}
+    {OPENAPI_FILE, RELEASE_METADATA_FILE, EVAL_TEXT_LIMITS_FILE, LABEL_LIMITS_FILE, *API_TYPE_FILES}
 )
 REQUIRED_SOURCE_FILES = GENERATED_SOURCE_FILES | frozenset(
     {
@@ -74,8 +75,10 @@ def source_bundle_name(cayu_version: str) -> str:
 
 
 def render_release_metadata(*, cayu_version: str, server_contract_version: str) -> bytes:
-    """Render the existing TypeScript version contract without changing its bytes."""
+    """Render dashboard versions from the package and server contract owners."""
     return (
+        "// Generated from Cayu package metadata and cayu._server_contract_version.\n"
+        "// Regenerate with npm run generate:api in the intended Cayu environment.\n"
         f'export const DASHBOARD_SOURCE_CAYU_VERSION = "{cayu_version}"\n'
         f'export const SUPPORTED_SERVER_CONTRACT_VERSION = "{server_contract_version}"\n'
     ).encode()

@@ -1,11 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query"
 import type { SessionDetail, SessionUpdate } from "./api.ts"
-import {
-  invalidDurableText,
-  MAX_LABEL_KEY_LENGTH,
-  MAX_LABEL_VALUE_LENGTH,
-  unicodeScalarLength,
-} from "./durable-text.ts"
+import { invalidDurableText, unicodeScalarLength } from "./durable-text.ts"
+import { LABEL_LIMITS } from "./generated/label-limits.ts"
 
 const RESERVED_LABEL_PREFIX = "cayu:"
 const RUNTIME_METADATA_KEYS = new Set(["subagent"])
@@ -109,10 +105,10 @@ export function parseSessionLabelsDraft(
         message: `Label key ${JSON.stringify(key)} cannot start or end with whitespace.`,
       }
     }
-    if (unicodeScalarLength(key) > MAX_LABEL_KEY_LENGTH) {
+    if (unicodeScalarLength(key) > LABEL_LIMITS.key) {
       return {
         ok: false,
-        message: `Label key ${JSON.stringify(key)} exceeds ${MAX_LABEL_KEY_LENGTH} characters.`,
+        message: `Label key ${JSON.stringify(key)} exceeds ${LABEL_LIMITS.key} characters.`,
       }
     }
     if (key.startsWith(RESERVED_LABEL_PREFIX)) {
@@ -133,10 +129,10 @@ export function parseSessionLabelsDraft(
         message: `Label ${JSON.stringify(key)} cannot start or end with whitespace.`,
       }
     }
-    if (unicodeScalarLength(value) > MAX_LABEL_VALUE_LENGTH) {
+    if (unicodeScalarLength(value) > LABEL_LIMITS.value) {
       return {
         ok: false,
-        message: `Label ${JSON.stringify(key)} exceeds ${MAX_LABEL_VALUE_LENGTH} characters.`,
+        message: `Label ${JSON.stringify(key)} exceeds ${LABEL_LIMITS.value} characters.`,
       }
     }
     labels.push([key, value])

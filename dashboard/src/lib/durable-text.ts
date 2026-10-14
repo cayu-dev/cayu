@@ -1,6 +1,3 @@
-export const MAX_LABEL_KEY_LENGTH = 128
-export const MAX_LABEL_VALUE_LENGTH = 512
-
 export function unicodeScalarLength(value: string): number {
   return Array.from(value).length
 }

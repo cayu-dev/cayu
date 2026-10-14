@@ -42,6 +42,7 @@ def test_dashboard_api_command_generates_and_checks_text_limits(tmp_path, monkey
         "OPENAPI_BASELINE": tmp_path / "openapi.json",
         "RELEASE_METADATA": tmp_path / "release-metadata.ts",
         "EVAL_TEXT_LIMITS": limits,
+        "LABEL_LIMITS": generated.parent / "label-limits.ts",
         "_openapi_json": lambda: "{}\n",
         "_run_generator": generate,
         "_assert_expected_cayu_import": lambda: None,

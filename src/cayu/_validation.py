@@ -10,12 +10,13 @@ from enum import Enum
 from itertools import islice
 from math import isfinite
 from types import MappingProxyType
-from typing import Any, Never, cast
+from typing import Any, Literal, Never, cast
 
 from pydantic import BaseModel, ValidationError
 
-_MAX_LABEL_KEY_LENGTH = 128
-_MAX_LABEL_VALUE_LENGTH = 512
+LABEL_MAX_KEY_CHARS = 128
+LABEL_MAX_VALUE_CHARS = 512
+LABEL_TEXT_LENGTH_UNIT: Literal["unicode_scalar_values"] = "unicode_scalar_values"
 _RESERVED_LABEL_PREFIX = "cayu:"
 
 EXECUTION_UNIT_ID_MAX_CHARS = 70
@@ -1341,9 +1342,9 @@ def copy_label_map(
             require_durable_text(key, f"{field_name} key"),
             f"{field_name} key",
         )
-        if len(clean_key) > _MAX_LABEL_KEY_LENGTH:
+        if len(clean_key) > LABEL_MAX_KEY_CHARS:
             raise ValueError(
-                f"`{field_name}` keys must be at most {_MAX_LABEL_KEY_LENGTH} characters."
+                f"`{field_name}` keys must be at most {LABEL_MAX_KEY_CHARS} characters."
             )
         if not allow_reserved and clean_key.startswith(_RESERVED_LABEL_PREFIX):
             raise ValueError(
@@ -1356,9 +1357,9 @@ def copy_label_map(
             require_durable_text(item, f"{field_name} value"),
             f"{field_name} value",
         )
-        if len(clean_value) > _MAX_LABEL_VALUE_LENGTH:
+        if len(clean_value) > LABEL_MAX_VALUE_CHARS:
             raise ValueError(
-                f"`{field_name}` values must be at most {_MAX_LABEL_VALUE_LENGTH} characters."
+                f"`{field_name}` values must be at most {LABEL_MAX_VALUE_CHARS} characters."
             )
         copied[clean_key] = clean_value
     return copied

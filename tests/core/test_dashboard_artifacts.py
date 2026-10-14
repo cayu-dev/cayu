@@ -16,6 +16,7 @@ from cayu._dashboard_artifacts import (
     BUNDLE_PACKAGE_ROOT,
     EVAL_TEXT_LIMITS_FILE,
     GENERATED_SOURCE_FILES,
+    LABEL_LIMITS_FILE,
     OPENAPI_FILE,
     RELEASE_METADATA_FILE,
     generated_api_contents,
@@ -115,9 +116,11 @@ def test_release_validation_rejects_invalid_generated_source(damage, tmp_path):
         )
 
 
-def test_shared_release_renderer_preserves_existing_bytes_and_api_digest_scope():
+def test_shared_release_renderer_preserves_version_values_and_api_digest_scope():
     metadata = render_release_metadata(cayu_version="2.3.4", server_contract_version="99")
     assert metadata == (
+        b"// Generated from Cayu package metadata and cayu._server_contract_version.\n"
+        b"// Regenerate with npm run generate:api in the intended Cayu environment.\n"
         b'export const DASHBOARD_SOURCE_CAYU_VERSION = "2.3.4"\n'
         b'export const SUPPORTED_SERVER_CONTRACT_VERSION = "99"\n'
     )
@@ -125,6 +128,7 @@ def test_shared_release_renderer_preserves_existing_bytes_and_api_digest_scope()
         OPENAPI_FILE: b"{}\n",
         **{path: b"export {}\n" for path in API_TYPE_FILES},
         EVAL_TEXT_LIMITS_FILE: b"limits",
+        LABEL_LIMITS_FILE: b"label limits",
         RELEASE_METADATA_FILE: metadata,
     }
     assert generated_api_contents(contents) == {
@@ -163,6 +167,7 @@ def test_api_command_rejects_output_inventory_drift(tmp_path, monkeypatch, check
     (tmp_path / OPENAPI_FILE).write_text("{}\n")
     (tmp_path / RELEASE_METADATA_FILE).write_bytes(namespace["_release_metadata"]())
     (tmp_path / EVAL_TEXT_LIMITS_FILE).write_bytes(namespace["_eval_text_limits"]())
+    (tmp_path / LABEL_LIMITS_FILE).write_bytes(namespace["_label_limits"]())
     if damage == "extra-generated":
         (generated.parent / "unexpected.ts").write_text("export {}\n")
     for key, value in {
@@ -171,6 +176,7 @@ def test_api_command_rejects_output_inventory_drift(tmp_path, monkeypatch, check
         "OPENAPI_BASELINE": tmp_path / OPENAPI_FILE,
         "RELEASE_METADATA": tmp_path / RELEASE_METADATA_FILE,
         "EVAL_TEXT_LIMITS": tmp_path / EVAL_TEXT_LIMITS_FILE,
+        "LABEL_LIMITS": tmp_path / LABEL_LIMITS_FILE,
         "_assert_expected_cayu_import": lambda: None,
         "_openapi_json": lambda: "{}\n",
         "_run_generator": generate,

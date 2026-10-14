@@ -290,6 +290,31 @@ late-suite SQLite timeout had the same cause. Expand migration only when diagnos
 identify another concrete ownership gap. Correctness tests use readiness events and
 barriers; the scope's bounded thread polling is cleanup machinery, not a test oracle.
 
+### Repository declarations
+
+Change shared facts in their domain owner, then regenerate or validate their
+consumers. Keep the owners small and independent.
+
+| Fact | Canonical declaration | Derived consumers and checks |
+| --- | --- | --- |
+| Optional dependencies and the exact union for `all` | `pyproject.toml`: `project.optional-dependencies` and `tool.cayu.optional-dependency-policy` | Package metadata; `tests/core/test_optional_dependency_policy.py` derives the union, classification and support-bundle package inventory. Declare a reason for every exclusion. |
+| Installed guide topics, filenames and descriptions | `src/cayu/cli/guide.py`: `_GUIDES` | CLI listing/help; required wheel/sdist files in `scripts/check_release_artifacts.py`; registry-driven CLI smoke and missing-guide tests. Import the registry directly without constructing the other CLI commands. |
+| Package version | `pyproject.toml`: `project.version` | Installed distribution metadata; dashboard API generation reads that metadata, while the repository bundle writer reads TOML. The source-only fallback in `_version.py` is checked against TOML by `tests/cli/test_console.py`. |
+| Server contract version | `src/cayu/_server_contract_version.py`: `SERVER_CONTRACT_VERSION` | Server discovery, generated dashboard release metadata, source-bundle manifest and release validation. |
+| Durable label text bounds and unit | `src/cayu/_validation.py`: `LABEL_MAX_KEY_CHARS`, `LABEL_MAX_VALUE_CHARS`, `LABEL_TEXT_LENGTH_UNIT` | Python label/selector validation; generated `label-limits.ts`; dashboard label editing and Usage filtering. Shared boundary fixtures cover scalar text in both languages. |
+| Aggregate label filter counts | `src/cayu/sessions/queries.py`: `MAX_AGGREGATE_LABEL_*` | Python aggregate filters and generated `label-limits.ts` for dashboard Usage filtering. |
+| Evaluation suite/case text bounds and unit | `src/cayu/evals/corpus.py`: `EVAL_CORPUS_MAX_*_CHARS`, `EVAL_CORPUS_TEXT_LENGTH_UNIT` | Corpus, authoring, catalog and HTTP validation; generated `eval-text-limits.ts`; dashboard evaluation editors. |
+| Dashboard inputs, toolchain, output roots and required generated files | `src/cayu/_dashboard_artifacts.py` | API generation, canonical build, source-bundle writer, installed bundle validation, release checks and ejected-build comparison. |
+| Dashboard source inventory and digests | `src/cayu/cli/dashboard.py`: `render_dashboard_source_manifest`, `contents_digest` | The bundle writer records the actual source inventory and compiled digest; installed/release validation checks it against archive contents. Tests derive required generated paths from `_dashboard_artifacts.py`. |
+
+For dashboard declarations, run the API generation and canonical build commands
+below. Generated TypeScript has provenance headers; the dashboard README records
+canonical sources and regeneration commands, including JSON outputs that cannot
+carry a comment header. The editable source ZIP includes that README and its inventory
+manifest. Check generation with `npm run check:api:repo` and
+`uv run python scripts/build_dashboard_source_bundle.py --check`; validate built
+archives with `uv run python scripts/check_release_artifacts.py dist/*`.
+
 ### Dashboard
 
 Dashboard source checks require Node.js ≥ 22.18.0 and npm. Run them from `dashboard/`:
