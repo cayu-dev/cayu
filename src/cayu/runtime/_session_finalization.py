@@ -304,7 +304,9 @@ from cayu.sessions.interactions import (
     InteractionSummaryEvidence,
     interaction_usage_summary,
 )
+from cayu.sessions.pending_actions import _pending_tool_action_kind
 from cayu.sessions.records import (
+    PendingActionKind,
     Session,
     SessionStatus,
     SessionStatusConflict,
@@ -1167,15 +1169,26 @@ def _pending_interaction_action_kind(
     if foreground_child_state_from_checkpoint(checkpoint)[0] is not None:
         return "waiting_on_child_action"
 
-    if pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None:
-        return "tool_approval"
-    if (
-        user_input_lifecycle_authority_from_checkpoint(checkpoint, current_run_epoch=run_epoch)[0]
-        is not None
-    ):
-        return "user_input"
-    if pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is not None:
+    # Preserve short-circuit reads: lower-priority checkpoint state must not
+    # change the existing lifecycle summary or its validation/error order.
+    approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
+    pending_input = None
+    pending_round = None
+    if approval is None:
+        pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint, current_run_epoch=run_epoch
+        )
+        if pending_input is None:
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
+    kind = _pending_tool_action_kind(
+        approval=approval, user_input=pending_input, tool_round=pending_round
+    )
+    if kind is PendingActionKind.MANUAL_RECOVERY:
+        # The published lifecycle label also covers automatically replayable
+        # rounds. Only the richer projector can require manual intervention.
         return "tool_recovery"
+    if kind is not None:
+        return kind.value
     from cayu.sessions._session_continuation_store import has_unparked_external_interaction
 
     if has_unparked_external_interaction(checkpoint, run_epoch=run_epoch):

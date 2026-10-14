@@ -160,6 +160,27 @@ def pending_action_evidence_round_from_checkpoint(
     return _pending_action_evidence_round(approval, pending_input, pending_round)
 
 
+def _pending_tool_action_kind(
+    *,
+    approval: PendingToolApproval | None,
+    user_input: PendingUserInput | None,
+    tool_round: pending_rounds.PendingToolRound | None,
+) -> PendingActionKind | None:
+    """Classify parsed candidates: approval, then input, then tool recovery.
+
+    This is a headline, not recovery authority. Callers retain conflict, epoch
+    and event validation. A tool round is only a recovery candidate: its ledger
+    may prove automatic replay safe without a manual action.
+    """
+    if approval is not None:
+        return PendingActionKind.TOOL_APPROVAL
+    if user_input is not None:
+        return PendingActionKind.USER_INPUT
+    if tool_round is not None:
+        return PendingActionKind.MANUAL_RECOVERY
+    return None
+
+
 def _pending_action_evidence_round(
     approval: PendingToolApproval | None,
     pending_input: PendingUserInput | None,
@@ -187,15 +208,20 @@ def _pending_action_evidence_round(
     ]
     if len(candidates) > 1:
         raise ValueError("Checkpoint contains more than one pending tool-round state.")
-    if not candidates:
+    kind = _pending_tool_action_kind(
+        approval=approval, user_input=pending_input, tool_round=pending_round
+    )
+    if kind is None:
         return None
-    candidate = candidates[0]
-    if type(candidate) is pending_rounds.PendingToolRound:
-        return candidate
-    if type(candidate) is PendingToolApproval:
-        return pending_approval_reader.planned_tool_round_from_pending_approval(candidate)
-    if type(candidate) is not PendingUserInput:
+    if kind is PendingActionKind.MANUAL_RECOVERY:
+        assert type(pending_round) is pending_rounds.PendingToolRound
+        return pending_round
+    if kind is PendingActionKind.TOOL_APPROVAL:
+        assert type(approval) is PendingToolApproval
+        return pending_approval_reader.planned_tool_round_from_pending_approval(approval)
+    if type(pending_input) is not PendingUserInput:
         raise AssertionError("Pending-action candidate has an unsupported type.")
+    candidate = pending_input
     return pending_rounds.PendingToolRound(
         tool_round_id=candidate.tool_round_id,
         model_step_id=candidate.model_step_id,

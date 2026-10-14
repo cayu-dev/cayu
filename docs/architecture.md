@@ -725,6 +725,14 @@ The stores retain atomic admission, status checks and checkpoint publication.
 `sessions/interactions.py` retains lightweight lifecycle summaries without
 loading invocation admission, execution profiles or checkpoint mutation rules.
 
+The pending-action owner shares typed headline classification with lifecycle
+finalization: approval takes precedence over user input, then tool recovery.
+The lifecycle adapter retains its published `tool_recovery` label and separate
+child, external-wait and provider-operation states. A headline never authorizes
+resolution: the pending-action projector still validates all checkpoint candidates,
+rejects contradictions and matches event/ledger evidence before exposing an action.
+A pending tool round may be automatically replayable and need no manual action.
+
 `sessions/_invocation_scope.py` owns task-local run fences, transferable fence
 ownership, interaction attribution and retained settlement context. Its context
 variables move with their readers and writers, preserving exact owner identity
