@@ -111,6 +111,8 @@ def test_exported_models_use_exported_collaboration_contract_types(package_name)
         ("cayu", "SQLiteSessionStore", "PostgresSessionStore"),
         ("cayu.storage", "SQLiteSessionStore", "SQLiteProductOperationStore"),
         ("cayu.collaboration", "SQLiteCollaborationStore", "PostgresCollaborationStore"),
+        ("cayu.runtime", "RunRequest", "ContinuationTicket"),
+        ("cayu.sessions", "RunRequest", "ParticipantSessionExecutionRequest"),
     ],
 )
 def test_optional_exports_have_matching_wildcard_and_explicit_types(

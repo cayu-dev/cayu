@@ -46741,5 +46741,19 @@
     "tests/core/test_dashboard_artifacts.py::test_source_bundle_requires_every_generated_output_even_with_matching_manifest[src/lib/generated/server-api/index.ts]": 0.011532166972756386,
     "tests/core/test_dashboard_artifacts.py::test_source_bundle_requires_every_generated_output_even_with_matching_manifest[src/lib/generated/server-api/types.gen.ts]": 0.010660332976840436,
     "tests/core/test_dashboard_artifacts.py::test_source_bundle_requires_every_generated_output_even_with_matching_manifest[src/lib/release-metadata.ts]": 0.011329959030263126,
-    "tests/core/test_dashboard_artifacts.py::test_source_bundle_still_accepts_non_generated_source_extensions": 0.015837956976611167
+    "tests/core/test_dashboard_artifacts.py::test_source_bundle_still_accepts_non_generated_source_extensions": 0.015837956976611167,
+    "tests/core/test_public_api_generation.py::test_check_detects_drift_without_writing[extra_name]": 0.251,
+    "tests/core/test_public_api_generation.py::test_check_detects_drift_without_writing[missing]": 0.277,
+    "tests/core/test_public_api_generation.py::test_check_detects_drift_without_writing[wrong_target]": 0.267,
+    "tests/core/test_public_api_generation.py::test_formatting_failure_leaves_checked_in_stubs_untouched": 0.107,
+    "tests/core/test_public_api_generation.py::test_generated_public_api_stubs_are_current": 0.249,
+    "tests/core/test_public_api_generation.py::test_generation_is_deterministic_and_does_not_rewrite_current_files": 0.21,
+    "tests/core/test_public_api_generation.py::test_generation_preserves_aliases_and_runtime_wildcards_without_imports": 0.238,
+    "tests/core/test_public_api_generation.py::test_generation_rejects_incomplete_package_inventory[duplicate]": 0.002,
+    "tests/core/test_public_api_generation.py::test_generation_rejects_incomplete_package_inventory[empty]": 0.002,
+    "tests/core/test_public_api_generation.py::test_generation_rejects_incomplete_package_inventory[missing]": 0.002,
+    "tests/core/test_public_api_generation.py::test_generation_rejects_incomplete_package_inventory[unlisted]": 0.002,
+    "tests/core/test_public_api_generation.py::test_generation_uses_current_shared_optional_policy": 0.072,
+    "tests/test_public_api_migration.py::test_optional_exports_have_matching_wildcard_and_explicit_types[cayu.runtime-RunRequest-ContinuationTicket]": 1.07,
+    "tests/test_public_api_migration.py::test_optional_exports_have_matching_wildcard_and_explicit_types[cayu.sessions-RunRequest-ParticipantSessionExecutionRequest]": 0.394
 }

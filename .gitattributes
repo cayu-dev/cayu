@@ -5,3 +5,6 @@ dashboard/** text=auto eol=lf
 src/cayu/server/dashboard/** text=auto eol=lf
 /examples/aws/lambda_microvm_sidecar/** text=auto eol=lf
 src/cayu/data/dashboard_source/*.zip binary
+
+# Generated public typing declarations have identical bytes on every platform.
+src/cayu/**/__init__.pyi text eol=lf
