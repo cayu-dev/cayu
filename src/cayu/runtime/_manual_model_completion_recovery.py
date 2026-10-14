@@ -632,6 +632,13 @@ class ManualModelCompletionRecovery:
             raise SessionRunFenced("Model terminalization selected another active stage.")
         source_profile = require_terminalization_checkpoint(session, checkpoint)
         decision: InvocationTerminalDecision | None = None
+        from cayu.runtime._runtime_upgrade import is_takeover_of
+
+        terminal_reason = (
+            "continuation_recovered_abandoned_execution"
+            if is_takeover_of(session)
+            else "operator_model_outcome_unknown"
+        )
 
         def claim_transform(current: Session, updated: dict[str, Any] | None) -> dict[str, Any]:
             if updated is None:
@@ -684,7 +691,7 @@ class ManualModelCompletionRecovery:
                 terminal_event_id=event_ids[1],
                 observed_at=observed,
                 terminal_payload={
-                    "reason": "operator_model_outcome_unknown",
+                    "reason": terminal_reason,
                     "terminalization_only": True,
                 },
                 interruption_request_id=source_id

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Existing sessions continue after a Cayu upgrade. When the only change to a
+  session's execution profile is the `runtime` component, `resume` adopts it
+  without an `ExecutionProfilePolicy` and records a system-attributed
+  `session.execution_profile.decided` event (`cayu:runtime-upgrade-adoption:v1`).
+  Before, every in-progress conversation was rejected with
+  `ExecutionProfileMismatchError` until the application adopted the new
+  profile. Applications with a configured policy keep deciding these changes; a
+  policy that rejects them keeps sessions pinned. Other profile changes still
+  need adoption. Execution-profile admission prediction gains an `adopted`
+  outcome.
+- A conversation whose process died mid-turn continues when a different Cayu
+  build handles its next message. The takeover settles a lost model call from
+  its durable record (terminalization), including after a completed tool round
+  with a matching durable publication receipt. It closes a lost `NONE` or `IDEMPOTENT`
+  tool call with the unknown-outcome result without replaying it, and the next
+  turn adopts the new runtime. `EXTERNAL` calls keep their explicit
+  reconciliation, which needs the build that started them.
 - `CayuApp.recover_abandoned_sessions(inactive_for_seconds=3600)` recovers
   sessions left `running` by a dead process that no continuation has resumed,
   such as conversations an application finished from its own records after a

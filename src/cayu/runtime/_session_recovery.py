@@ -596,10 +596,21 @@ class SessionRecovery:
                 expected_session_instance_id=session.instance_id,
                 terminal_status=SessionStatus.INTERRUPTED,
                 inactive_for_seconds=0,
+                # A claimed sweep already validated its exact active profile. Only
+                # an unclaimed takeover can acquire terminalization's own claim
+                # to close a lost dispatch from a different runtime build.
+                terminalization_only=(
+                    invocation_context is None and await self._invocation_runtime_changed(session)
+                ),
             ),
             invocation_context=invocation_context,
         )
         return result.budget_events
+
+    async def _invocation_runtime_changed(self, session: Session) -> bool:
+        from cayu.runtime._runtime_upgrade import invocation_runtime_changed
+
+        return await invocation_runtime_changed(self.session_store, session)
 
     async def recover_incomplete_session(
         self,

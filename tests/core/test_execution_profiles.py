@@ -6068,6 +6068,110 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
     asyncio.run(exercise())
 
 
+def _use_runtime_build(monkeypatch, version: str, marker: str) -> RuntimeBuildProvenance:
+    build = RuntimeBuildProvenance.from_artifact_digest(
+        origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+        artifact_kind=RuntimeBuildArtifactKind.OTHER,
+        artifact_digest=marker * 64,
+        source_revision=f"revision-{marker}",
+    )
+    monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: version)
+    for provenance_owner in (
+        session_engine_module,
+        session_preparation_module,
+        _session_execution_profile,
+    ):
+        monkeypatch.setattr(provenance_owner, "current_runtime_build_provenance", lambda: build)
+    return build
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("change", ["runtime_only", "runtime_and_tools", "strict_policy"])
+def test_runtime_only_upgrade_is_adopted_without_an_application_policy(
+    monkeypatch,
+    tmp_path,
+    store_kind: str,
+    change: str,
+) -> None:
+    async def exercise() -> None:
+        _use_runtime_build(monkeypatch, "0.4.0", "a")
+        store = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "runtime-upgrade.sqlite")
+        )
+        try:
+            original_app = CayuApp(session_store=store, enable_logging=False)
+            original_app.register_provider(_completed_provider(), default=True)
+            original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await _collect(
+                original_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="runtime-upgrade",
+                        messages=[Message.text("user", "first")],
+                    )
+                )
+            )
+
+            build_b = _use_runtime_build(monkeypatch, "0.4.1", "b")
+            policy = (
+                RecordingExecutionProfilePolicy(
+                    ExecutionProfilePolicyResult(
+                        action=ExecutionProfilePolicyAction.REJECT,
+                        reason="Sessions stay on the build that started them.",
+                    )
+                )
+                if change == "strict_policy"
+                else None
+            )
+            provider = _completed_provider()
+            upgraded_app = CayuApp(
+                session_store=store,
+                execution_profile_policy=policy,
+                enable_logging=False,
+            )
+            upgraded_app.register_provider(provider, default=True)
+            upgraded_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[RecordingTool("added")] if change == "runtime_and_tools" else [],
+            )
+            resume = upgraded_app.resume(
+                ResumeRequest(
+                    session_id="runtime-upgrade",
+                    messages=[Message.text("user", "second")],
+                )
+            )
+            if change != "runtime_only":
+                # A configured policy decides, and any other change still needs adoption.
+                with pytest.raises(ExecutionProfileMismatchError):
+                    await _collect(resume)
+                assert provider.requests == []
+                return
+
+            events = await _collect(resume)
+            decision = events[0]
+            assert decision.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+            assert decision.payload["decision"] == ExecutionProfileDecisionKind.ADOPTED
+            assert decision.payload["changed_component_classes"] == ["runtime"]
+            assert decision.payload["policy_identity"] == "cayu:runtime-upgrade-adoption:v1"
+            assert decision.payload["actor"]["subject"] == "cayu:runtime-upgrade-adoption"
+            assert len(provider.requests) == 1
+            after = await store.load("runtime-upgrade")
+            assert after is not None
+            assert after.runtime_version == "0.4.1"
+            assert after.runtime_build_provenance == build_b
+            assert (
+                after.metadata[EXECUTION_PROFILE_METADATA_KEY]["expected"]
+                == decision.payload["candidate_profile"]
+            )
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resumes(
     monkeypatch,
@@ -7932,7 +8036,7 @@ def test_explicit_policy_can_classify_non_authority_drift_as_compatible(
     asyncio.run(exercise())
 
 
-def test_versioned_policy_can_replace_prior_default_rejection(
+def test_versioned_policy_can_replace_prior_policy_rejection(
     monkeypatch,
 ) -> None:
     async def exercise() -> None:
@@ -7956,7 +8060,17 @@ def test_versioned_policy_can_replace_prior_default_rejection(
         monkeypatch.setattr(
             execution_profile_continuation, "_runtime_version", lambda: "new-runtime"
         )
-        rejected_app = CayuApp(session_store=store, enable_logging=False)
+        # Without a policy, a runtime-only change is adopted; a strict v1 policy rejects it.
+        rejected_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.REJECT,
+                    reason="Policy version one pins the runtime.",
+                ),
+            ),
+            enable_logging=False,
+        )
         rejected_app.register_provider(_completed_provider(), default=True)
         rejected_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         with pytest.raises(ExecutionProfileMismatchError):

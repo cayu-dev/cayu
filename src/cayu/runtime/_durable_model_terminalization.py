@@ -21,6 +21,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._model_stage import (
     ActiveModelCompletionStage,
+    ModelCompletionStage,
 )
 from cayu.sessions._model_stage_rules import (
     _validate_model_completion_stage_dispatch,
@@ -60,6 +61,26 @@ _ALLOWED_KEYS = {
 }
 
 
+def _completed_step_pointer_key(checkpoint: dict[str, Any] | None) -> set[str]:
+    """Admit the pointer to an earlier, fully published step of the same turn.
+
+    A turn that crashes in a later model call still records its last published
+    step. The deferred flag describes its original publication, not whether its
+    tool round is still open. Pending work is excluded by the checkpoint keys;
+    inspect_terminalization also requires durable proof that a tool round closed.
+    """
+
+    from cayu.sessions._model_completion_publication import (
+        LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+        model_step_publication_from_checkpoint,
+    )
+
+    pointer = model_step_publication_from_checkpoint(checkpoint)
+    if pointer is None:
+        return set()
+    return {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+
+
 def require_terminalization_checkpoint(
     session: Session, checkpoint: dict[str, Any] | None
 ) -> ActiveInvocationExecutionProfile:
@@ -69,7 +90,7 @@ def require_terminalization_checkpoint(
         or session.invocation.source
         not in {SessionExecutionSource.SDK_RUN, SessionExecutionSource.HTTP_RUN}
         or not checkpoint
-        or set(checkpoint) - _ALLOWED_KEYS
+        or set(checkpoint) - _ALLOWED_KEYS - _completed_step_pointer_key(checkpoint)
     ):
         raise ModelCompletionManualRecoveryRequired(
             "Terminalization-only recovery requires a standalone model invocation without dependent work."
@@ -97,6 +118,7 @@ async def inspect_terminalization(
             "Model terminalization requires an in-flight stage."
         )
     stage = active.stage
+    await _require_completed_tool_publication(store, session, checkpoint, stage)
     context = model_completion_recovery_context_from_stage(stage)
     # Automatic compaction can carry borrowed accounting and pending context
     # publication; it remains on exact-profile recovery until separately proven.
@@ -128,3 +150,35 @@ async def inspect_terminalization(
         )
     _validate_model_completion_stage_dispatch(dispatch, stage)
     return active
+
+
+async def _require_completed_tool_publication(
+    store: SessionStore,
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    stage: ModelCompletionStage,
+) -> None:
+    """Require immutable closure evidence for an earlier deferred tool step."""
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
+
+    pointer = model_step_publication_from_checkpoint(checkpoint)
+    if pointer is None or pointer.tool_round_id is None:
+        return
+    publication_id = f"tool-round:{pointer.tool_round_id}"
+    receipt = await store.load_runtime_publication_receipt(session.id, publication_id)
+    expected_end = pointer.transcript_end_cursor + (2 if pointer.assistant_message_deferred else 1)
+    if (
+        receipt is None
+        or receipt.publication_id != publication_id
+        or receipt.kind != "tool-round"
+        or receipt.transcript_start_cursor != pointer.transcript_end_cursor
+        or receipt.transcript_end_cursor != expected_end
+        or receipt.intent.get("round_id") != pointer.tool_round_id
+        or receipt.intent.get("tool_round_id") != pointer.tool_round_id
+        or receipt.intent.get("model_step_id") != pointer.logical_step_id
+        or stage.logical_step_id == pointer.logical_step_id
+        or stage.source_transcript_cursor < expected_end
+    ):
+        raise ModelCompletionManualRecoveryRequired(
+            "Model terminalization requires durable closure of the preceding tool round."
+        )

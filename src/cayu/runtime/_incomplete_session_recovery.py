@@ -43,6 +43,7 @@ from cayu.events import (
     event_with_runtime_generated_id,
 )
 from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
     ExecutionProfileIdentity,
 )
 from cayu.messages import detach_message
@@ -169,6 +170,7 @@ from cayu.runtime._work_attempt_session_mutation import record_work_attempt_exec
 from cayu.runtime._workspace_observation_recovery import (
     WorkspaceObservationRecovery,
 )
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -1826,42 +1828,74 @@ class IncompleteSessionRecovery:
                     )
                 execution_profile_snapshot = active_invocation_profile
             else:
-                execution_profile_snapshot = await self._execution_profile_continuation.validate(
-                    session=session,
-                    checkpoint=checkpoint,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    budget_policy=budget_policy_snapshot,
-                    request_loop_policies=(
-                        None
-                        if execution_to_wait is None
-                        else execution_to_wait.request_loop_policies
-                    ),
-                    require_open_interaction=not (
-                        execution_to_wait is not None
-                        or (
-                            active_model_completion is not None
-                            and active_model_completion.stage.purpose == "auxiliary-inference"
-                            and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
-                        )
-                        or (
-                            (terminal_repair_required or bool(pending_allocations))
-                            and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
-                        )
-                        or pending_provider_disposition_effect_is_durable
-                        or (
-                            pending_disposition is not None
-                            and pending_disposition.action is ProviderOperationResolutionAction.FAIL
-                            and session.status is SessionStatus.FAILED
-                        )
-                    ),
-                    additional_profile_fingerprints=(
-                        ()
-                        if pending_disposition is None
-                        else (pending_disposition.execution_profile_fingerprint,)
-                    ),
-                    record_rejection=record_profile_rejection,
+
+                async def validate_continuation(*, record_rejection: bool):
+                    return await self._execution_profile_continuation.validate(
+                        session=session,
+                        checkpoint=checkpoint,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        budget_policy=budget_policy_snapshot,
+                        request_loop_policies=(
+                            None
+                            if execution_to_wait is None
+                            else execution_to_wait.request_loop_policies
+                        ),
+                        require_open_interaction=not (
+                            execution_to_wait is not None
+                            or (
+                                active_model_completion is not None
+                                and active_model_completion.stage.purpose == "auxiliary-inference"
+                                and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
+                            )
+                            or (
+                                (terminal_repair_required or bool(pending_allocations))
+                                and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
+                            )
+                            or pending_provider_disposition_effect_is_durable
+                            or (
+                                pending_disposition is not None
+                                and pending_disposition.action
+                                is ProviderOperationResolutionAction.FAIL
+                                and session.status is SessionStatus.FAILED
+                            )
+                        ),
+                        additional_profile_fingerprints=(
+                            ()
+                            if pending_disposition is None
+                            else (pending_disposition.execution_profile_fingerprint,)
+                        ),
+                        record_rejection=record_rejection,
+                    )
+
+                from cayu.runtime._runtime_upgrade import (
+                    invocation_runtime_changed,
+                    is_takeover_of,
                 )
+
+                upgrade_takeover = (
+                    active_invocation_profile is not None
+                    and is_takeover_of(session)
+                    and await invocation_runtime_changed(self._session_store, session)
+                )
+                try:
+                    execution_profile_snapshot = await validate_continuation(
+                        record_rejection=record_profile_rejection and not upgrade_takeover
+                    )
+                except ExecutionProfileMismatchError as mismatch:
+                    if not upgrade_takeover or tuple(mismatch.changed_component_classes) != (
+                        ExecutionProfileComponentClass.RUNTIME,
+                    ):
+                        if upgrade_takeover and record_profile_rejection:
+                            await validate_continuation(record_rejection=True)
+                        raise
+                    # Only Cayu's runtime changed, and a takeover's recovery closes the
+                    # lost invocation without dispatching a provider or a tool (replay is
+                    # never elected across builds). Keep the invocation's frozen identity,
+                    # as pending completion finalization does, so its evidence stays bound
+                    # to the profile that started it; the next turn adopts the new runtime.
+                    assert active_invocation_profile is not None
+                    execution_profile_snapshot = active_invocation_profile
             if pending_completion_finalization is not None:
                 expected_terminal_status = (
                     SessionStatus.INTERRUPTED

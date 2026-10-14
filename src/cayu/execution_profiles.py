@@ -1100,6 +1100,7 @@ class ExecutionProfilePredictionOutcome(StrEnum):
     """Predicted decision class, or why it cannot be decided without the app."""
 
     EXACT_REUSE = "exact_reuse"
+    ADOPTED = "adopted"
     REJECTED = "rejected"
     POLICY_DEPENDENT = "policy_dependent"
     NOT_COMPARABLE = "not_comparable"
@@ -1276,14 +1277,43 @@ def predict_execution_profile_admission(
             possible=(ExecutionProfileDecisionKind.REJECTED,),
             reason="Pending work requires exact reuse of its active invocation profile.",
         )
+    changed_set = frozenset(changed)
+    if changed_set == {ExecutionProfileComponentClass.RUNTIME}:
+        if policy_configured is False:
+            return compared(
+                ExecutionProfilePredictionOutcome.ADOPTED,
+                admits=True,
+                possible=(ExecutionProfileDecisionKind.ADOPTED,),
+                reason=(
+                    "Without an ExecutionProfilePolicy, Runtime adopts a change to only "
+                    "its own runtime."
+                ),
+            )
+        if policy_configured is None:
+            return compared(
+                ExecutionProfilePredictionOutcome.POLICY_DEPENDENT,
+                admits=None,
+                possible=(
+                    ExecutionProfileDecisionKind.ADOPTED,
+                    ExecutionProfileDecisionKind.COMPATIBLE_REUSE,
+                    ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                    ExecutionProfileDecisionKind.REJECTED,
+                ),
+                reason=(
+                    "Without a policy, Runtime adopts a runtime-only change; a configured "
+                    "ExecutionProfilePolicy decides instead."
+                ),
+            )
     if policy_configured is False:
         return compared(
             ExecutionProfilePredictionOutcome.REJECTED,
             admits=False,
             possible=(ExecutionProfileDecisionKind.REJECTED,),
-            reason="Without an ExecutionProfilePolicy, Runtime rejects every change.",
+            reason=(
+                "Without an ExecutionProfilePolicy, Runtime rejects every change other than "
+                "its own runtime."
+            ),
         )
-    changed_set = frozenset(changed)
     if changed_set <= _POLICY_COMPATIBLE_COMPONENT_CLASSES:
         return compared(
             ExecutionProfilePredictionOutcome.POLICY_DEPENDENT,

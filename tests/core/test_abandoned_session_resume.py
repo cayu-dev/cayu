@@ -44,6 +44,7 @@ from cayu import (
 )
 from cayu.observability.hooks import BeforeToolCallDecision, RuntimeHook
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.storage.migrations import SchemaMode
 
 _PROPOSAL_ARGUMENTS = {"body": "Replacement proposal with private customer details"}
@@ -1056,6 +1057,83 @@ def test_failed_resume_after_takeover_keeps_round_for_next_continuation(
             assert "replayed_after_recovery" not in failed.payload
 
     asyncio.run(scenario())
+
+
+def _runtime_build(marker):
+    from cayu.build_provenance import (
+        RuntimeBuildArtifactKind,
+        RuntimeBuildProvenance,
+        RuntimeBuildProvenanceOrigin,
+    )
+
+    return RuntimeBuildProvenance.from_artifact_digest(
+        origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+        artifact_kind=RuntimeBuildArtifactKind.OTHER,
+        artifact_digest=marker * 64,
+        source_revision=f"revision-{marker}",
+    ).model_dump_json()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+@pytest.mark.parametrize("effect", [ToolEffect.IDEMPOTENT, ToolEffect.EXTERNAL])
+def test_tool_call_lost_across_an_upgrade_is_closed_without_replay(
+    backend, effect, request, sqlite_resources, tmp_path, monkeypatch
+):
+    from cayu.build_provenance import (
+        RUNTIME_BUILD_PROVENANCE_ENV,
+        current_runtime_build_provenance,
+    )
+
+    # The process that dies runs build A; the one that takes over runs build B.
+    monkeypatch.setenv(RUNTIME_BUILD_PROVENANCE_ENV, _runtime_build("a"))
+    current_runtime_build_provenance.cache_clear()
+
+    async def scenario():
+        async with _stores(backend, request, sqlite_resources) as (store, reopen):
+            receipt = tmp_path / "upgrade-receipt"
+            sid = "upgrade-" + uuid4().hex
+            await _crash_child(
+                _child(store, backend, request, receipt, sid, effect, "crash", keyed=True)
+            )
+            monkeypatch.setenv(RUNTIME_BUILD_PROVENANCE_ENV, _runtime_build("b"))
+            current_runtime_build_provenance.cache_clear()
+            provider = _replay_provider()
+            app = _proposal_app(
+                reopen(), _Proposal(effect, receipt, keyed=True), provider, lease_seconds=1.5
+            )
+            resume = app.resume(
+                ResumeRequest(session_id=sid, messages=[Message.text("user", "Any update?")])
+            )
+            if effect is ToolEffect.EXTERNAL:
+                # An external effect keeps its explicit reconciliation, which continues
+                # the original invocation and so needs the build that started it. The
+                # takeover still fences the run and records the unknown outcome.
+                with pytest.raises(ExecutionProfileMismatchError):
+                    await _consume(resume)
+            else:
+                await _consume(resume)
+            # Another build never re-runs the call: it gets the unknown-outcome result.
+            assert len(receipt.with_suffix(".calls").read_text().splitlines()) == 1
+            stored = await app.session_store.load_events(sid)
+            current = await app.session_store.load(sid)
+            if effect is ToolEffect.EXTERNAL:
+                assert current.status is SessionStatus.INTERRUPTED
+                assert any(e.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for e in stored)
+                return
+            assert current.status is SessionStatus.COMPLETED
+            failed = next(e for e in stored if e.type is EventType.TOOL_CALL_FAILED)
+            assert failed.payload["result"]["structured"]["outcome_unknown"] is True
+            assert not any(e.payload.get("replayed_after_recovery") for e in stored)
+            assert any(
+                e.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+                and e.payload["policy_identity"] == "cayu:runtime-upgrade-adoption:v1"
+                for e in stored
+            )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        current_runtime_build_provenance.cache_clear()
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

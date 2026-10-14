@@ -31,6 +31,7 @@ _EXACT_PROFILE_POLICY_ID = "cayu:execution-profile-exact-reuse:v1"
 _DEFAULT_PROFILE_POLICY_ID = "cayu:execution-profile-default-reject:v1"
 _MODEL_TARGET_PROFILE_POLICY_ID = "cayu:model-target-adoption:v1"
 _TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = "cayu:tool-capability-ceiling-narrowing:v1"
+_RUNTIME_UPGRADE_PROFILE_POLICY_ID = "cayu:runtime-upgrade-adoption:v1"
 _MODEL_TARGET_AND_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = (
     "cayu:model-target-and-tool-capability-ceiling-adoption:v1"
 )
@@ -59,6 +60,13 @@ def _tool_capability_ceiling_profile_actor() -> ResolutionActor:
 def _model_target_and_tool_capability_ceiling_profile_actor() -> ResolutionActor:
     return ResolutionActor(
         subject="cayu:model-target-and-tool-capability-ceiling-adoption",
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
+def _runtime_upgrade_profile_actor() -> ResolutionActor:
+    return ResolutionActor(
+        subject="cayu:runtime-upgrade-adoption",
         source=ResolutionActorSource.SYSTEM,
     )
 
@@ -160,6 +168,16 @@ class ExecutionProfileClassifier:
             and changed_component_set
             <= _MODEL_TARGET_BUILT_IN_COMPONENTS | {ExecutionProfileComponentClass.TOOL_VIEW_GRANTS}
         )
+        # Only Cayu itself changed: the application's agent, provider target, tools,
+        # policies and environment are identical. Without an application policy, adopt
+        # the new runtime between invocations so an upgrade doesn't strand every
+        # session; a configured policy decides instead, and can reject it.
+        built_in_runtime_upgrade = (
+            self._execution_profile_policy is None
+            and not force_authority_review
+            and not target_changed
+            and changed_component_set == frozenset({ExecutionProfileComponentClass.RUNTIME})
+        )
         if built_in_model_target_and_ceiling_adoption:
             fallback_actor = _model_target_and_tool_capability_ceiling_profile_actor()
             fallback_reason = (
@@ -175,6 +193,13 @@ class ExecutionProfileClassifier:
             fallback_actor = _tool_capability_ceiling_profile_actor()
             fallback_reason = "The caller explicitly narrowed the durable tool capability ceiling."
             policy_identity = _TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID
+        elif built_in_runtime_upgrade:
+            fallback_actor = _runtime_upgrade_profile_actor()
+            fallback_reason = (
+                "Only the Cayu runtime changed; the application's execution profile is "
+                "otherwise unchanged."
+            )
+            policy_identity = _RUNTIME_UPGRADE_PROFILE_POLICY_ID
         else:
             fallback_actor = None
             fallback_reason = "The execution profile changed without authorized adoption."
@@ -184,6 +209,7 @@ class ExecutionProfileClassifier:
             built_in_model_target_adoption
             or built_in_ceiling_narrowing
             or built_in_model_target_and_ceiling_adoption
+            or built_in_runtime_upgrade
         )
         authority_decision = (
             ExecutionProfileAuthorityDecision.AUTHORIZED
@@ -332,6 +358,7 @@ class ExecutionProfileClassifier:
                 or model_target_only
                 or built_in_ceiling_narrowing
                 or built_in_model_target_and_ceiling_adoption
+                or built_in_runtime_upgrade
                 or automatic_egress_narrowing
             )
             authority_is_sufficient = (

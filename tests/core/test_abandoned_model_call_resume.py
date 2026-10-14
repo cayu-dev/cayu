@@ -25,24 +25,68 @@ from cayu import (
     SessionStatus,
     SQLiteBudgetLedger,
     SQLiteSessionStore,
+    Tool,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
 )
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.build_provenance import (
+    RUNTIME_BUILD_PROVENANCE_ENV,
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+    current_runtime_build_provenance,
+)
 from cayu.runtime._run_limits import UNKNOWN_POST_DISPATCH_BUDGET_REASON
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.storage.migrations import SchemaMode
 
 
 class _LostProvider(VersionedFakeProvider):
-    """Same provider identity in both processes; the first process dies mid-call."""
+    """Same provider identity in both processes; the first process dies mid-call.
+
+    With ``CAYU_MODEL_CRASH_TEST_AFTER_TOOL``, its first call asks for a lookup and
+    the process dies in the next call, after a published tool round of the same turn.
+    """
+
+    calls = 0
 
     async def stream(self, request):
         if os.environ.get("CAYU_MODEL_CRASH_TEST_CRASH") == "1":
+            _LostProvider.calls += 1
+            if os.environ.get("CAYU_MODEL_CRASH_TEST_AFTER_TOOL") == "1" and self.calls == 1:
+                yield ModelStreamEvent.tool_call(id="lookup", name="lookup", arguments={})
+                yield ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                )
+                return
             os._exit(137)
         if os.environ.get("CAYU_MODEL_CRASH_TEST_CRASH") == "block":
             print("dispatched", flush=True)
             await asyncio.Event().wait()
         async for event in super().stream(request):
             yield event
+
+
+class _Lookup(Tool):
+    def __init__(self):
+        self.spec = ToolSpec(
+            name="lookup",
+            description="Look up the order.",
+            input_schema={"type": "object", "properties": {}},
+            effect=ToolEffect.NONE,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:model-crash-lookup", behavior_version="1", implementation_version="1"
+            ),
+        )
+
+    async def run(self, context, arguments):
+        return ToolResult(content="Order O1 is lost.")
 
 
 def _app(store, ledger, provider):
@@ -72,7 +116,7 @@ def _app(store, ledger, provider):
         ),
     )
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[_Lookup()])
     return app
 
 
@@ -114,8 +158,26 @@ def _run_child():
     asyncio.run(crash())
 
 
+def _build(marker: str) -> str:
+    return RuntimeBuildProvenance.from_artifact_digest(
+        origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+        artifact_kind=RuntimeBuildArtifactKind.OTHER,
+        artifact_digest=marker * 64,
+        source_revision=f"revision-{marker}",
+    ).model_dump_json()
+
+
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
-def test_resume_recovers_process_death_during_model_call(backend, request, tmp_path):
+@pytest.mark.parametrize("upgraded", [False, True])
+@pytest.mark.parametrize("after_tool", [False, True])
+def test_resume_recovers_process_death_during_model_call(
+    backend, upgraded, after_tool, request, tmp_path, monkeypatch
+):
+    # With ``upgraded``, the process that dies runs one Cayu build and the one that
+    # takes over runs another, as when a deploy restarts the application.
+    monkeypatch.setenv(RUNTIME_BUILD_PROVENANCE_ENV, _build("a"))
+    current_runtime_build_provenance.cache_clear()
+
     async def scenario():
         location = (
             str(tmp_path / "model-crash")
@@ -135,6 +197,8 @@ def test_resume_recovers_process_death_during_model_call(backend, request, tmp_p
                 "CAYU_MODEL_CRASH_TEST_STORE": location,
                 "CAYU_MODEL_CRASH_TEST_SESSION": sid,
                 "CAYU_MODEL_CRASH_TEST_CRASH": "1",
+                RUNTIME_BUILD_PROVENANCE_ENV: _build("a"),
+                "CAYU_MODEL_CRASH_TEST_AFTER_TOOL": "1" if after_tool else "0",
             },
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -148,6 +212,9 @@ def test_resume_recovers_process_death_during_model_call(backend, request, tmp_p
                 child.kill()
                 await asyncio.to_thread(child.wait)
 
+        if upgraded:
+            monkeypatch.setenv(RUNTIME_BUILD_PROVENANCE_ENV, _build("b"))
+            current_runtime_build_provenance.cache_clear()
         store, ledger = _open(backend, location)
         try:
             original = await store.load(sid)
@@ -180,18 +247,18 @@ def test_resume_recovers_process_death_during_model_call(backend, request, tmp_p
             current = await store.load(sid)
             assert current.status is SessionStatus.COMPLETED
             assert current.run_epoch > original.run_epoch
-            assert any(
-                event.type is EventType.SESSION_RUN_FENCED
-                and event.payload["reason"] == "continuation_recovered_abandoned_execution"
-                for event in events
-            )
-            # The interruption names the takeover, as a tool-call takeover's does.
-            [interrupted] = [
-                event
-                for event in await store.load_events(sid)
-                if event.type is EventType.SESSION_INTERRUPTED
-            ]
+            stored = await store.load_events(sid)
+            [interrupted] = [e for e in stored if e.type is EventType.SESSION_INTERRUPTED]
             assert interrupted.payload["reason"] == "continuation_recovered_abandoned_execution"
+            if upgraded:
+                # A lost call from another build is terminalized from its durable record.
+                assert interrupted.payload["terminalization_only"] is True
+            else:
+                assert any(
+                    event.type is EventType.SESSION_RUN_FENCED
+                    and event.payload["reason"] == "continuation_recovered_abandoned_execution"
+                    for event in events
+                )
             settlement = await store.load_model_completion_stage_settlement(
                 sid, active.stage.stage_id
             )
@@ -202,8 +269,19 @@ def test_resume_recovers_process_death_during_model_call(backend, request, tmp_p
             assert lost and all(record.status == "reconciled" for record in lost)
             assert all(record.reason == UNKNOWN_POST_DISPATCH_BUDGET_REASON for record in lost)
             assert all(record.actual_amount == record.reserved_amount for record in lost)
+            adoptions = [
+                event
+                for event in stored
+                if event.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+                and event.payload["policy_identity"] == "cayu:runtime-upgrade-adoption:v1"
+            ]
+            # The lost call is settled from its record; the next turn adopts the build.
+            assert len(adoptions) == (1 if upgraded else 0)
         finally:
             await store.close()
             await ledger.close()
 
-    asyncio.run(scenario())
+    try:
+        asyncio.run(scenario())
+    finally:
+        current_runtime_build_provenance.cache_clear()

@@ -3967,7 +3967,7 @@ baseline but cannot be rewritten in place as governed egress profiles.
 | `structured_output` | Strategy, retry controls, and schema identity governing structured output | Reject as authority-changing. |
 | `finalization` | Step limits, retry/final-output controls, and terminal model-loop semantics | Reject as authority-changing. |
 
-The default policy rejects every changed or unverifiable required component. Equality requires the same component class, strength, availability, and fingerprint; two unavailable values do not become equal merely because both lack evidence. A custom `ExecutionProfilePolicy` cannot return `compatible_reuse` for provider-target or authority-bearing changes. A configured policy may return `adopt` without caller intent only when `egress_authority` is the sole changed component and its typed comparison proves a strict narrowing; Cayu records an attributable system policy actor and still requires exact backend cutover evidence before admission. Every other authority-bearing adoption requires explicit caller intent, and widening or incomparable egress changes additionally require `authority_decision="authorized"`.
+Without a configured policy, `resume` adopts a change to only the `runtime` component, which an upgrade of the Cayu package produces, recording a system-attributed decision under `cayu:runtime-upgrade-adoption:v1`. Active invocation profiles still require exact reuse, except that a continuation's takeover of a dead execution started by a different runtime build closes the lost invocation without dispatch: a lost model call is terminalized from its durable record, and recovery keeps the invocation's frozen profile while it closes a lost `NONE` or `IDEMPOTENT` tool call with the unknown-outcome result and never elects a replay. The default policy rejects every other changed or unverifiable required component. Equality requires the same component class, strength, availability, and fingerprint; two unavailable values do not become equal merely because both lack evidence. A custom `ExecutionProfilePolicy` cannot return `compatible_reuse` for provider-target or authority-bearing changes. A configured policy may return `adopt` without caller intent only when `egress_authority` is the sole changed component and its typed comparison proves a strict narrowing; Cayu records an attributable system policy actor and still requires exact backend cutover evidence before admission. Every other authority-bearing adoption requires explicit caller intent, and widening or incomparable egress changes additionally require `authority_decision="authorized"`.
 
 ### Immutable runtime build provenance
 
@@ -4262,13 +4262,13 @@ the comparison and decision rules above:
 
 Use the session's reported `boundary` and the profile that row names.
 
-`outcome` is `exact_reuse`, `rejected`, `policy_dependent`, or
+`outcome` is `exact_reuse`, `adopted`, `rejected`, `policy_dependent`, or
 `not_comparable`. `possible_decisions` lists the Runtime decision classes that
 can follow, and `admits` is `true` when work will be admitted, `false` when no
 possible decision admits it, and `null` when a policy decides or the profiles
-cannot be compared. With a configured policy (or `application_policy_configured=None`,
-meaning unknown), a `resume` whose only changes are `runtime` can become
-`compatible_reuse`; one whose only change is a strictly narrower
+cannot be compared. A `resume` whose only change is `runtime` is `adopted`
+without a policy (`application_policy_configured=False`); with a configured
+policy (or `None`, meaning unknown) it can also become `compatible_reuse`; one whose only change is a strictly narrower
 `egress_authority` can be `adopted`; any other authority-bearing change can only
 become `migration_required` or `rejected` without explicit adoption intent.
 `not_comparable` means the candidate was resolved for a different provider

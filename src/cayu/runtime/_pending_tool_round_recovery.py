@@ -1446,7 +1446,14 @@ class PendingToolRoundRecovery:
         if not self._session_control.execution_presence.config.replay_interrupted_tool_calls:
             return {}
         if incomplete_recovery_claimed:
-            if not elect_replay or not abandoned_running_execution(session):
+            from cayu.runtime._runtime_upgrade import invocation_runtime_changed
+
+            # Another Cayu build never re-runs a call the previous build started.
+            if (
+                not elect_replay
+                or not abandoned_running_execution(session)
+                or await invocation_runtime_changed(self._session_store, session)
+            ):
                 return {}
         elif (
             session.status is not SessionStatus.RUNNING

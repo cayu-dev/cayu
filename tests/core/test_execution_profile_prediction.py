@@ -185,12 +185,20 @@ def test_runtime_only_change_depends_on_the_application_policy() -> None:
     assert unknown.outcome is Outcome.POLICY_DEPENDENT
     assert unknown.admits is None
     assert unknown.possible_decisions == (
+        Decision.ADOPTED,
         Decision.COMPATIBLE_REUSE,
         Decision.MIGRATION_REQUIRED,
         Decision.REJECTED,
     )
-    assert without_policy.outcome is Outcome.REJECTED
-    assert without_policy.possible_decisions == (Decision.REJECTED,)
+    # Without a policy, Runtime adopts a change to only its own runtime.
+    assert without_policy.outcome is Outcome.ADOPTED
+    assert without_policy.admits is True
+    assert without_policy.possible_decisions == (Decision.ADOPTED,)
+    with_policy = predict_execution_profile_admission(
+        expected, candidate, boundary="resume", application_policy_configured=True
+    )
+    assert with_policy.outcome is Outcome.POLICY_DEPENDENT
+    assert Decision.ADOPTED not in with_policy.possible_decisions
 
 
 def test_only_strictly_narrower_egress_can_be_adopted_without_intent() -> None:

@@ -57,6 +57,24 @@ the session's existing transcript remains authoritative—including its original
 system prompt. Changing `AgentSpec.system_prompt` does not silently rewrite that
 history.
 
+Upgrading the Cayu package changes only the session's `runtime` profile
+component. Without an `ExecutionProfilePolicy`, the next `resume` of an existing
+session adopts the new runtime and records a `session.execution_profile.decided`
+event attributed to `cayu:runtime-upgrade-adoption`, so in-progress
+conversations continue after an upgrade. Any other change still needs explicit
+adoption. A configured policy decides runtime-only changes instead; one that
+returns `ExecutionProfilePolicyAction.REJECT` keeps sessions on the build that
+started them.
+
+A turn that was mid-invocation when its process stopped is closed by the next
+message under the new build: a lost model call is settled from its durable
+record with an unknown outcome and its reservations charged in full, and a lost
+`NONE` or `IDEMPOTENT` tool call gets the unknown-outcome result. A different
+build never re-runs a call the previous build started. An `EXTERNAL` call keeps
+its explicit reconciliation, which continues the original invocation and so
+needs the build that started it, or an operator decision through a recovery
+plan.
+
 When a new agent body must inherit conversation history but install its current
 prompt anatomy, create an explicit descendant instead:
 

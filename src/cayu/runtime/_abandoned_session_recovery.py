@@ -121,6 +121,16 @@ async def recover_abandoned_execution(
         # unknown, so settle it as interrupted (charging its budget reservations in full)
         # before ordinary recovery fences the run.
         settled = () if settle_model_dispatch is None else await settle_model_dispatch(session)
+        current = await store.load(session.id)
+        if (
+            current is not None
+            and current.instance_id == session.instance_id
+            and current.run_epoch > session.run_epoch
+            and current.status not in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+        ):
+            # The settlement ran its own fenced recovery (a lost call from another
+            # Cayu build is terminalized from its record), which already ended the run.
+            return settled
         result = await recover(
             IncompleteSessionRecoveryRequest(
                 session_id=session.id,
