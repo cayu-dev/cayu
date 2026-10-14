@@ -1119,7 +1119,7 @@ def _project_staged_terminal_event(
 ) -> Event:
     """Progressively sanitize one private terminal without changing its identity."""
 
-    controls, _references = tool_results.runtime_tool_event_boundary_controls(
+    controls, _projection = tool_results.runtime_tool_event_boundary_controls(
         event.payload,
         include_terminal_controls=event.type
         in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
@@ -1273,7 +1273,7 @@ def restore_staged_terminal_authority(
     restored = _event_with_tool_round_authority(restored, identity, *additional_fields)
     if restored.interaction_id is not None:
         restored = event_with_runtime_envelope_authority(restored, "interaction_id")
-    controls, _references = tool_results.runtime_tool_event_boundary_controls(
+    controls, _projection = tool_results.runtime_tool_event_boundary_controls(
         restored.payload,
         include_terminal_controls=restored.type
         in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},

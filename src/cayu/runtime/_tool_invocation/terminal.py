@@ -583,7 +583,7 @@ class ToolTerminalPublisher:
                     if field_name in event.payload
                 ),
             )
-        boundary_controls, _boundary_references = tool_results.runtime_tool_event_boundary_controls(
+        boundary_controls, _projection = tool_results.runtime_tool_event_boundary_controls(
             event.payload,
             include_terminal_controls=event.type
             in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},

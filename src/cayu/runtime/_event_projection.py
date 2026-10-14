@@ -36,6 +36,10 @@ from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._tool_identity import tool_idempotency_key
+from cayu.runtime._tool_result_projection import (
+    PreparedToolResultProjection,
+    ValidatedToolResultProjection,
+)
 from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -66,7 +70,6 @@ from cayu.tools.catalogue import SEARCH_TOOLS_NAME
 from cayu.tools.discovery import minimized_tool_discovery_result
 from cayu.tools.result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
-    reestimate_tool_result_projection_tokens,
 )
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
@@ -94,7 +97,7 @@ _ENVELOPE_ALIAS_FIELD_BY_NESTED_PATH: Mapping[tuple[str, ...], str] = {
 @dataclass(frozen=True, slots=True)
 class _ToolEventBoundary:
     controls: dict[str, Any]
-    projection_references: dict[int, dict[str, Any]]
+    projection: ValidatedToolResultProjection | None = None
     malformed: bool = False
 
 
@@ -1138,9 +1141,8 @@ def _prepare_runtime_event(
         trust_persisted_projection=False,
         redactor=redactor,
     )
-    projection_references = (
-        {} if tool_event_boundary is None else tool_event_boundary.projection_references
-    )
+    projection = None if tool_event_boundary is None else tool_event_boundary.projection
+    projection_references = {} if projection is None else projection.references()
     _require_no_secret_payload_keys(
         event.payload,
         policy=policy,
@@ -1218,10 +1220,10 @@ def _prepare_runtime_event(
         redacted_payload=redacted_payload,
         redactor=redactor,
     )
-    _restore_runtime_tool_result_projection(
-        event,
+    prepared_projection = _restore_runtime_tool_result_projection(
         redacted_payload=redacted_payload,
-        references=projection_references,
+        projection=projection,
+        controls=controls,
         redactor=redactor,
     )
     restore_attested_event_result(
@@ -1250,6 +1252,7 @@ def _prepare_runtime_event(
     _synchronize_runtime_tool_result_projection_record(
         redacted_payload,
         controls=controls,
+        prepared=prepared_projection,
     )
     return _copy_projected_event(
         event,
@@ -1513,9 +1516,8 @@ def _project_runtime_event(
         trust_persisted_projection=trust_persisted_projection,
         redactor=redactor,
     )
-    projection_references = (
-        {} if tool_event_boundary is None else tool_event_boundary.projection_references
-    )
+    projection = None if tool_event_boundary is None else tool_event_boundary.projection
+    projection_references = {} if projection is None else projection.references()
     controls = _recognized_controls(
         event,
         reject_malformed=False,
@@ -1587,10 +1589,10 @@ def _project_runtime_event(
         redacted_payload=redacted_payload,
         controls=controls,
     )
-    _restore_runtime_tool_result_projection(
-        event,
+    prepared_projection = _restore_runtime_tool_result_projection(
         redacted_payload=redacted_payload,
-        references=projection_references,
+        projection=projection,
+        controls=controls,
         redactor=redactor,
     )
     restore_attested_event_result(
@@ -1650,6 +1652,7 @@ def _project_runtime_event(
     _synchronize_runtime_tool_result_projection_record(
         redacted_payload,
         controls=controls,
+        prepared=prepared_projection,
     )
     _fail_closed_public_terminal_tool_argument_projection(
         event,
@@ -2977,7 +2980,7 @@ def _recognized_tool_event_boundary(
     if event.type not in _TOOL_EVENT_TYPES:
         return None
     try:
-        controls, references = tool_results.runtime_tool_event_boundary_controls(
+        controls, projection = tool_results.runtime_tool_event_boundary_controls(
             event.payload,
             include_terminal_controls=event.type
             in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
@@ -2988,7 +2991,6 @@ def _recognized_tool_event_boundary(
             raise
         return _ToolEventBoundary(
             controls={},
-            projection_references={},
             malformed=True,
         )
     if "tool_result_projection" not in event_schema.event_payload_policy(event.type).owned_keys or (
@@ -2999,10 +3001,10 @@ def _recognized_tool_event_boundary(
         )
     ):
         controls.pop("tool_result_projection", None)
-        references = {}
+        projection = None
     return _ToolEventBoundary(
         controls=controls,
-        projection_references=references,
+        projection=projection,
     )
 
 
@@ -3189,65 +3191,49 @@ def _public_authority_aliases(
 
 
 def _restore_runtime_tool_result_projection(
-    event: Event,
     *,
     redacted_payload: dict[str, Any],
-    references: Mapping[int, dict[str, Any]],
+    projection: ValidatedToolResultProjection | None,
+    controls: Mapping[str, Any],
     redactor: SecretRedactor,
-) -> None:
-    """Rebuild model-facing text while preserving one validated runtime reference."""
+) -> PreparedToolResultProjection | None:
+    """Reinsert prepared projection fields at their existing publication stage."""
 
-    if not references:
-        return
-    original_result = event.payload.get("result")
+    if projection is None:
+        return None
+    if "tool_result_projection" not in controls and not projection.references():
+        # Exposure can discard controls after parsing a valid projection when
+        # another legacy control is malformed. Preserve its inline fallback;
+        # strict externalized references still need content reconstruction.
+        return None
     redacted_result = redacted_payload.get("result")
-    if type(original_result) is not dict or type(redacted_result) is not dict:
+    if type(redacted_result) is not dict:
         raise AssertionError("Validated projection lost its result object.")
-    projected_content, projected_artifacts = tool_results.project_runtime_tool_result_for_boundary(
-        original_content=original_result.get("content"),
-        redacted_artifacts=redacted_result.get("artifacts"),
-        references=dict(references),
-        redactor=redactor,
+    prepared = PreparedToolResultProjection(
+        projection, redacted_result=redacted_result, redactor=redactor
     )
-    redacted_result["content"] = projected_content
-    redacted_result["artifacts"] = projected_artifacts
+    redacted_result["content"] = prepared.content
+    if "artifacts" in redacted_result:
+        redacted_result["artifacts"] = prepared.artifact_payload()
+    return prepared
 
 
 def _synchronize_runtime_tool_result_projection_record(
     payload: dict[str, Any],
     *,
     controls: Mapping[str, Any],
+    prepared: PreparedToolResultProjection | None,
 ) -> None:
-    """Keep validated projection evidence aligned with boundary-redacted content."""
+    """Finish accounting after all other terminal-result policies have run."""
 
     if type(controls.get("tool_result_projection")) is not dict:
         return
     result = payload.get("result")
-    trusted_record = controls.get("tool_result_projection")
     record = payload.get("tool_result_projection")
-    if type(result) is not dict or type(trusted_record) is not dict or type(record) is not dict:
+    if type(result) is not dict or type(record) is not dict or prepared is None:
         raise AssertionError("Validated projection lost its result or evidence record.")
-    # The complete record was validated together with its strict artifact
-    # reference before it entered ``controls``.  Restore that runtime-owned
-    # evidence as one unit: individual hashes and artifact identities must not
-    # be rewritten merely because a later tool resolves an overlapping secret.
-    trusted_record_copy = copy_durable_json_value(
-        trusted_record,
-        "tool_result_projection",
-    )
     record.clear()
-    record.update(trusted_record_copy)
-    content = result.get("content")
-    if type(content) is not str:
-        raise AssertionError("Validated projection lost its content.")
-    record["projected_bytes"] = len(content.encode("utf-8"))
-    (
-        record["projected_token_estimate"],
-        record["token_estimation_method"],
-    ) = reestimate_tool_result_projection_tokens(
-        content,
-        token_estimation_method=record.get("token_estimation_method"),
-    )
+    record.update(prepared.record_for_content(result.get("content")))
 
 
 def _restore_policy_denial_truncation_markers(

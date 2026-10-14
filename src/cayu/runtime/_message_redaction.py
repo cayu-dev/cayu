@@ -5,6 +5,7 @@ from typing import Any, cast
 from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
 from cayu.messages import Message
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime._tool_result_projection import prepare_runtime_reference_content
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools import _web_access_results as web_access_results
@@ -285,13 +286,11 @@ def _redact_message_for_boundary(
         if type(redacted_part) is not dict:
             raise AssertionError("Message part redaction returned a non-object.")
         if projection_references:
-            projected_content, projected_artifacts = (
-                tool_results.project_runtime_tool_result_for_boundary(
-                    original_content=part.get("content"),
-                    redacted_artifacts=redacted_part.get("artifacts"),
-                    references=projection_references,
-                    redactor=redactor,
-                )
+            projected_content, projected_artifacts = prepare_runtime_reference_content(
+                original_content=part.get("content"),
+                redacted_artifacts=redacted_part.get("artifacts"),
+                references=projection_references,
+                redactor=redactor,
             )
             redacted_part["content"] = projected_content
             redacted_part["artifacts"] = projected_artifacts
