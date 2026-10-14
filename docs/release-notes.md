@@ -1,5 +1,17 @@
 # Release notes
 
+## Unreleased
+
+- `CayuApp.recover_abandoned_sessions(inactive_for_seconds=3600)` recovers
+  sessions left `running` by a dead process that no continuation has resumed,
+  such as conversations an application finished from its own records after a
+  crash. It uses paginated recovery for running and interrupting sessions,
+  skips live owners, and returns per-session results. Ordinary model calls
+  lost after dispatch are settled as unknown, including their reserved budgets,
+  without calling the provider again.
+  Applications that use `CayuApp` directly can call it at startup or on a
+  schedule; `cayu serve` keeps its `startup_recovery_statuses` sweep.
+
 ## v0.11.1
 
 Cayu refreshes bundled model metadata and pricing against official provider

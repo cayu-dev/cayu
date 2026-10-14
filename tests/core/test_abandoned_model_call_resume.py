@@ -38,6 +38,9 @@ class _LostProvider(VersionedFakeProvider):
     async def stream(self, request):
         if os.environ.get("CAYU_MODEL_CRASH_TEST_CRASH") == "1":
             os._exit(137)
+        if os.environ.get("CAYU_MODEL_CRASH_TEST_CRASH") == "block":
+            print("dispatched", flush=True)
+            await asyncio.Event().wait()
         async for event in super().stream(request):
             yield event
 

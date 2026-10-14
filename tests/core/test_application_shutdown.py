@@ -38,6 +38,7 @@ GATED_ENTRANCES = frozenset(
         "reconcile_tool_effect",
         "recover_collaboration_wait",
         "recover_incomplete_session",
+        "recover_abandoned_sessions",
         "recover_incomplete_sessions",
         "recover_model_completion_stage",
         "recover_persisted_event_side_effects",

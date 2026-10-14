@@ -23,7 +23,7 @@ from cayu.runtime._durable_model_terminalization import (
 from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
-from cayu.runtime._invocation_lifecycle import _authenticated_invocation_context
+from cayu.runtime._invocation_lifecycle import InvocationContext, _authenticated_invocation_context
 from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
     model_completion_recovery_context_from_stage,
@@ -113,18 +113,27 @@ class ManualModelCompletionRecovery:
     async def recover_model_completion_stage(
         self,
         request: ModelCompletionManualRecoveryRequest,
+        *,
+        invocation_context: InvocationContext | None = None,
     ) -> ModelCompletionManualRecoveryResult:
         """Conservatively settle one ambiguous model dispatch before clearing it."""
 
         request = copy_model_completion_manual_recovery_request(request)
+        if invocation_context is not None and type(invocation_context) is not InvocationContext:
+            raise TypeError("Model recovery requires an authenticated InvocationContext.")
         if request.terminalization_only:
+            if invocation_context is not None:
+                raise ValueError("Terminalization-only recovery cannot borrow an invocation.")
             return await self._terminalize_dispatched_model(request)
-        return await self._recover_model_completion_stage(request)
+        return await self._recover_model_completion_stage(
+            request, invocation_context=invocation_context
+        )
 
     async def _recover_model_completion_stage(
         self,
         request: ModelCompletionManualRecoveryRequest,
         *,
+        invocation_context: InvocationContext | None = None,
         terminalization: tuple[_IncompleteRecoveryClaim, InvocationTerminalDecision, Event]
         | None = None,
     ) -> ModelCompletionManualRecoveryResult:
@@ -294,6 +303,23 @@ class ManualModelCompletionRecovery:
                     session
                 ),
             )
+        if invocation_context is not None:
+            invocation_context._validate()
+            if (
+                invocation_context.recovery_claim_id is None
+                or invocation_context.binding.session_id != session.id
+                or invocation_context.binding.session_instance_id != session.instance_id
+                or invocation_context.binding.run_epoch != session.run_epoch
+                or invocation_context.active_profile != active_profile
+            ):
+                raise SessionRunFenced("Model recovery lost its claimed invocation authority.")
+        recovery_claim_id = (
+            terminalization[0].claim_id
+            if terminalization is not None
+            else None
+            if invocation_context is None
+            else invocation_context.recovery_claim_id
+        )
         if prior is not None:
             budget_events = await self._run_limit_controller.recover_pending_budget_settlements(
                 session_id=request.session_id
@@ -439,9 +465,7 @@ class ManualModelCompletionRecovery:
                     expected_session_instance_id=current.instance_id,
                     expected_run_epoch=current.run_epoch,
                     expected_active_profile=active_profile,
-                    recovery_claim_id=None
-                    if terminalization is None
-                    else terminalization[0].claim_id,
+                    recovery_claim_id=recovery_claim_id,
                     terminalization_only=terminalization is not None,
                     terminalization_plan_ownership=terminalization_plan_owner()
                     if terminalization is not None

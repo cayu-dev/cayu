@@ -321,6 +321,7 @@ class _RecoveryPreflightMutationRequired(RuntimeError):
 
 
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
+AbandonedModelRecoveryHook = Callable[[Session, InvocationContext], Awaitable[tuple[Event, ...]]]
 
 IncompleteRecoveryResultHook = Callable[
     [IncompleteSessionRecoveryResult, InvocationContext | None],
@@ -885,6 +886,7 @@ class IncompleteSessionRecovery:
         before_mutation: IncompleteRecoveryScopeHook | None = None,
         after_recovery: IncompleteRecoveryScopeHook | None = None,
         reconcile_result: IncompleteRecoveryResultHook | None = None,
+        recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
     ) -> IncompleteSessionsRecoveryPage:
         """Fault-isolate one bounded, resumable recovery page."""
         requested_statuses = tuple(
@@ -982,6 +984,7 @@ class IncompleteSessionRecovery:
                             before_mutation=before_mutation,
                             after_recovery=after_recovery,
                             reconcile_result=reconcile_result,
+                            recover_abandoned_model=recover_abandoned_model,
                         )
                     if result is not None and not (
                         terminal_status
@@ -1128,6 +1131,7 @@ class IncompleteSessionRecovery:
         before_mutation: IncompleteRecoveryScopeHook | None,
         after_recovery: IncompleteRecoveryScopeHook | None,
         reconcile_result: IncompleteRecoveryResultHook | None,
+        recover_abandoned_model: AbandonedModelRecoveryHook | None,
     ) -> IncompleteSessionRecoveryResult:
         retained_invocation_context: InvocationContext | None = None
 
@@ -1149,6 +1153,7 @@ class IncompleteSessionRecovery:
                     inactive_for_seconds=request.inactive_for_seconds,
                     reason=request.reason,
                     metadata=request.metadata,
+                    recover_abandoned_model=recover_abandoned_model,
                     before_mutation=(
                         None if before_mutation is None else lambda: before_mutation(session.id)
                     ),
@@ -1221,6 +1226,7 @@ class IncompleteSessionRecovery:
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
 
@@ -1257,6 +1263,7 @@ class IncompleteSessionRecovery:
                 )
 
         return await self._recover_incomplete_session_owned(
+            recover_abandoned_model=recover_abandoned_model,
             execution_to_wait=execution_to_wait,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
@@ -1298,6 +1305,7 @@ class IncompleteSessionRecovery:
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
 
         external_recovery_record = None
@@ -2304,6 +2312,7 @@ class IncompleteSessionRecovery:
                         )
                         raise
                 recovered = await self._recover_incomplete_session(
+                    recover_abandoned_model=recover_abandoned_model,
                     retain_cleanup_context=retain_cleanup_context,
                     preserve_interaction_id=preserve_interaction_id,
                     participant_context=participant_context,
@@ -2947,6 +2956,7 @@ class IncompleteSessionRecovery:
         participant_context: CollaborationAccessContext | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
+        recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         if (execution_profile_snapshot is None) != (invocation_context is None):
             raise RuntimeError(
@@ -3340,6 +3350,22 @@ class IncompleteSessionRecovery:
                     message="Finished the accepted provider-operation fallback.",
                 )
 
+        model_interrupted = False
+        if (
+            recover_abandoned_model is not None
+            and invocation_context is not None
+            and session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+        ):
+            # The native recovery claim has checked inactivity and fenced the old
+            # owner. Settle only eligible ordinary dispatches under that same claim,
+            # before generic recovery encounters their missing terminal response.
+            events.extend(await recover_abandoned_model(session, invocation_context))
+            session = await self._recovery_ownership.require_session(session.id)
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            model_interrupted = session.status is SessionStatus.INTERRUPTED
+            if model_interrupted:
+                actions.append(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED)
+
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES and (
             await self.terminal_finalization.repair_required(
                 session=session,
@@ -3350,8 +3376,12 @@ class IncompleteSessionRecovery:
 
             repaired = await self.terminal_finalization.repair(
                 session=session,
-                terminal_run_epoch=session_before_fence.run_epoch,
-                terminal_timestamp=session_before_fence.updated_at,
+                terminal_run_epoch=(
+                    session.run_epoch if model_interrupted else session_before_fence.run_epoch
+                ),
+                terminal_timestamp=(
+                    session.updated_at if model_interrupted else session_before_fence.updated_at
+                ),
                 previous_status=previous_status,
                 claim_id=claim_id,
                 # A takeover that already settled the lost model call reports

@@ -543,7 +543,9 @@ class SessionRecovery:
             replays_tool_calls=replays_tool_calls,
         )
 
-    async def _settle_abandoned_model_dispatch(self, session: Session) -> tuple[Event, ...]:
+    async def _settle_abandoned_model_dispatch(
+        self, session: Session, *, invocation_context: InvocationContext | None = None
+    ) -> tuple[Event, ...]:
         """Interrupt an assistant model call whose owning process is gone.
 
         Only an ordinary dispatched call qualifies: no terminal response, no provider
@@ -594,7 +596,8 @@ class SessionRecovery:
                 expected_session_instance_id=session.instance_id,
                 terminal_status=SessionStatus.INTERRUPTED,
                 inactive_for_seconds=0,
-            )
+            ),
+            invocation_context=invocation_context,
         )
         return result.budget_events
 
@@ -818,6 +821,8 @@ class SessionRecovery:
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
+        *,
+        recover_abandoned_models: bool = False,
     ) -> IncompleteSessionsRecoveryPage:
         request = copy_incomplete_sessions_recovery_request(request)
         active_through_by_session: dict[str, datetime] = {}
@@ -888,8 +893,16 @@ class SessionRecovery:
                 )
             return reconciled
 
+        async def settle_abandoned_model(
+            session: Session, invocation_context: InvocationContext
+        ) -> tuple[Event, ...]:
+            return await self._settle_abandoned_model_dispatch(
+                session, invocation_context=invocation_context
+            )
+
         recovery = self._incomplete_recovery.recover_incomplete_sessions(
             request,
+            recover_abandoned_model=settle_abandoned_model if recover_abandoned_models else None,
             before_recovery=admit_and_activate_interaction,
             before_mutation=admit_before_mutation,
             after_recovery=deactivate_interaction,

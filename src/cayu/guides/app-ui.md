@@ -183,6 +183,23 @@ recovery. A process crash can leave up to 60 seconds of the default lease.
 Explicit operator interruption retains its existing cancellation contract;
 execution presence does not authorize forced takeover.
 
+An application that uses `CayuApp` directly has no such sweep. The next
+`run` or `resume` of a conversation recovers its own session when it takes it
+over, but a session the application never continues stays `running` with an
+`owner_lost` execution, for example when the application finished a crashed
+write from its own records instead of resuming the conversation. Call
+`await app.recover_abandoned_sessions()` at startup or on a schedule. It uses
+paginated incomplete-session recovery for running and interrupting sessions
+inactive for `inactive_for_seconds` (default 3600), skips sessions with a live
+owner, and returns the per-session results. Keep the window longer than the gap
+after which a conversation's next message would still take its session over:
+that takeover replays interrupted `NONE` and `IDEMPOTENT` calls, while the sweep
+closes them with an unknown outcome. The sweep also settles ordinary model calls
+lost after dispatch, charging their reserved budgets as unknown usage without
+calling the provider again. Background provider operations and contracted tasks
+retain their existing recovery paths; inspect the per-session results for work
+that needs an explicit decision.
+
 Transient renewal errors do not release the row, and the heartbeat keeps retrying
 for as long as the run is active, even after a store outage outlasts the lease.
 Once the store answers again, the expired lease cannot be renewed, so the same

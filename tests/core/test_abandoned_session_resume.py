@@ -1059,6 +1059,71 @@ def test_failed_resume_after_takeover_keeps_round_for_next_continuation(
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_recover_abandoned_sessions_sweeps_only_stale_lost_owners(
+    backend, request, sqlite_resources, tmp_path
+):
+    async def scenario():
+        async with _stores(backend, request, sqlite_resources) as (store, reopen):
+            receipt = tmp_path / "sweep-receipt"
+            sid = "sweep-" + uuid4().hex
+            await _crash_child(
+                _child(store, backend, request, receipt, sid, ToolEffect.IDEMPOTENT, "crash")
+            )
+            app = _proposal_app(
+                reopen(),
+                _Proposal(ToolEffect.IDEMPOTENT, receipt),
+                VersionedFakeProvider([]),
+                lease_seconds=1.5,
+            )
+            assert (await app.inspect_session_execution(sid)).state == "owner_lost"
+
+            # A recently active conversation is left for its next message to take over.
+            assert await app.recover_abandoned_sessions() == ()
+            assert (await app.session_store.load(sid)).status is SessionStatus.RUNNING
+
+            [result] = await app.recover_abandoned_sessions(inactive_for_seconds=0)
+            assert result.session_id == sid
+            assert result.status is SessionStatus.INTERRUPTED
+            assert (await app.session_store.load(sid)).status is SessionStatus.INTERRUPTED
+            # The sweep closes the round; it never runs the tool again.
+            assert receipt.with_suffix(".calls").read_text().count("\n") == 1
+            assert await app.recover_abandoned_sessions(inactive_for_seconds=0) == ()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_recover_abandoned_sessions_leaves_live_executor_alone(
+    backend, request, sqlite_resources, tmp_path
+):
+    async def scenario():
+        async with _stores(backend, request, sqlite_resources) as (store, reopen):
+            receipt = tmp_path / "sweep-live-receipt"
+            sid = "sweep-live-" + uuid4().hex
+            child = _child(store, backend, request, receipt, sid, ToolEffect.IDEMPOTENT, "block")
+            try:
+                assert (
+                    await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 30)
+                    == "committed\n"
+                )
+                app = _proposal_app(
+                    reopen(),
+                    _Proposal(ToolEffect.IDEMPOTENT, receipt),
+                    VersionedFakeProvider([]),
+                    lease_seconds=1.5,
+                )
+                await app.recover_abandoned_sessions(inactive_for_seconds=0)
+                assert (await store.load(sid)).status is SessionStatus.RUNNING
+                assert (await app.inspect_session_execution(sid)).state == "executing"
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                await asyncio.to_thread(child.wait)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 def test_resume_refuses_live_executor_in_another_process(
     backend, request, sqlite_resources, tmp_path
 ):

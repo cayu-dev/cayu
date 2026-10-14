@@ -623,6 +623,7 @@ from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import (
     EventRecord,
     Session,
+    SessionStatus,
     SessionStatusConflict,
     _fork_source_session_instance_fingerprint,
     copy_session,
@@ -7699,6 +7700,51 @@ class CayuApp:
         if type(request) is not RecoveryExecutionRequest:
             raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
         return await self._recovery_plan_coordinator.execute_recovery(request)
+
+    @_admitted_entrance
+    @execution_owned_by("recovery")
+    async def recover_abandoned_sessions(
+        self,
+        *,
+        inactive_for_seconds: int = 3600,
+    ) -> tuple[IncompleteSessionRecoveryResult, ...]:
+        """Recover running sessions whose process died and that nothing has resumed since.
+
+        A continuation recovers its own session when it takes it over, so this
+        is for conversations an application never returns to: run it at startup
+        or on a schedule. It uses paginated incomplete-session recovery for
+        running and interrupting sessions inactive for ``inactive_for_seconds``,
+        which skips sessions with a live execution owner. Ordinary lost model
+        calls are settled as unknown without redispatch, including their budget
+        reservations; provider operations and contracted tasks keep their own
+        recovery paths. Keep the window longer than the gap after which a
+        conversation's next message would still take
+        its session over, so that message's takeover replays interrupted calls.
+        """
+
+        if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
+            raise ValueError("inactive_for_seconds must be a non-negative integer.")
+        results: list[IncompleteSessionRecoveryResult] = []
+        cursor: str | None = None
+        while True:
+            page = await self._session_recovery.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(
+                    statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                    inactive_for_seconds=inactive_for_seconds,
+                    cursor=cursor,
+                    reason="abandoned_session_recovered",
+                ),
+                recover_abandoned_models=True,
+            )
+            for result in page.results:
+                results.append(
+                    await self._project_incomplete_recovery_result_for_public_api(result)
+                )
+            if page.next_cursor is None:
+                return tuple(results)
+            if page.next_cursor == cursor:
+                raise RuntimeError("Abandoned-session recovery returned a repeated cursor.")
+            cursor = page.next_cursor
 
     @_admitted_entrance
     @execution_owned_by("recovery")
