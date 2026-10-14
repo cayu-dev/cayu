@@ -1,4 +1,5 @@
 {
+    "tests/core/test_optional_dependency_policy.py::test_optional_dependency_policy_classifies_every_extra_once": 0.000799583038315177,
     "tests/core/test_abandoned_model_sweep.py::test_abandoned_model_sweep_preserves_live_dispatch_and_budget[postgres]": 4.758248540922068,
     "tests/core/test_abandoned_model_sweep.py::test_abandoned_model_sweep_preserves_live_dispatch_and_budget[sqlite]": 2.8858509169658646,
     "tests/core/test_abandoned_model_sweep.py::test_abandoned_model_sweep_settles_only_after_native_inactivity_check[postgres]": 12.31437141704373,

@@ -137,6 +137,7 @@ all = [
 ]
 
 [tool.cayu.optional-dependency-policy]
+# Classify every extra except the derived `all` aggregate exactly once.
 all-runtime-extras = [
   "aws",
   "console",
@@ -147,11 +148,13 @@ all-runtime-extras = [
   "oidc",
   "otel",
   "postgres",
+  "recording",
   "server",
   "server-settings",
   "vertex",
 ]
 excluded-from-all = { browser = "Dashboard and browser verification tooling is opt-in." }
+non-runtime-extras = { dev = "Contributor test and development tools are not runtime extras." }
 
 [project.urls]
 Homepage = "https://cayu.dev"
