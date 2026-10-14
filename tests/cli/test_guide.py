@@ -18,6 +18,29 @@ from cayu import (
     ToolPolicyRequest,
 )
 from cayu.cli import main
+from cayu.cli.guide import _GUIDES
+
+
+@pytest.mark.parametrize("topic", _GUIDES)
+def test_every_registered_guide_is_listed_and_readable(topic: str, capsys) -> None:
+    filename, description = _GUIDES[topic]
+    assert main(["guide", "--json"]) == 0
+    listing = json.loads(capsys.readouterr().out)
+    entries = [entry for entry in listing["topics"] if entry["topic"] == topic]
+    assert len(entries) == 1
+    assert entries[0]["summary"] == description
+    assert entries[0]["package_source"] == f"cayu.guides/{filename}"
+
+    assert main(["guide", topic]) == 0
+    text = capsys.readouterr().out
+    assert text.startswith("# ")
+    assert "<!-- cayu-guide-include:" not in text
+
+    assert main(["guide", topic, "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["topic"] == topic
+    assert document["package_source"] == entries[0]["package_source"]
+    assert document["content"].strip() == text.strip()
 
 
 def test_durable_service_guide_discovery_and_executable_injection(capsys) -> None:

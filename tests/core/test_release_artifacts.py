@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import runpy
 import shutil
 import stat
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from cayu.cli.guide import _GUIDES
 from cayu.cli.lambda_microvm import _render_manifest
 from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 
@@ -103,27 +105,10 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/cli/console.py",
         "cayu/examples/__init__.py",
         "cayu/examples/order_support.py",
-        "cayu/guides/order-support.md",
         "cayu/data/__init__.py",
         "cayu/data/default_model_catalog.json",
         "cayu/data/default_price_book.json",
-        "cayu/guides/application-anatomy.md",
-        "cayu/guides/app-ui.md",
-        "cayu/guides/applications.md",
-        "cayu/guides/authoring.md",
-        "cayu/guides/diagnostics.md",
-        "cayu/guides/durable-operations.md",
-        "cayu/guides/durable-service-tools.md",
-        "cayu/guides/evals-ai-quality.md",
-        "cayu/guides/evals-first.md",
-        "cayu/guides/evals-production.md",
-        "cayu/guides/human-attention.md",
-        "cayu/guides/providers.md",
-        "cayu/guides/references.md",
-        "cayu/guides/structured-output.md",
-        "cayu/guides/thinking.md",
-        "cayu/guides/tool-effects.md",
-        "cayu/guides/verified-work.md",
+        *{f"cayu/guides/{filename}" for filename, _description in _GUIDES.values()},
         "cayu/server/browser_client/client.js",
         "cayu/server/browser_client/client.d.ts",
         _WHEEL_DASHBOARD_SOURCE,
@@ -196,6 +181,7 @@ def _write_sdist(
     *,
     sidecar: dict[str, bytes] | None = None,
     additional_names: set[str] | None = None,
+    omitted_names: set[str] | None = None,
     contents_by_name: dict[str, str | bytes] | None = None,
 ) -> None:
     sidecar = sidecar or _canonical_sidecar()
@@ -209,7 +195,7 @@ def _write_sdist(
         | {f"{prefix}/{name}" for name in sidecar}
         | {_SDIST_DASHBOARD_SOURCE}
         | {f"src/cayu/server/dashboard/{name}" for name in compiled_dashboard}
-    )
+    ) - (omitted_names or set())
     with tarfile.open(path, "w:gz") as archive:
         for relative_name in names:
             content: str | bytes = ""
@@ -268,6 +254,25 @@ def _dashboard_bundle_with_manifest_value(field: str, value: str) -> bytes:
                 content = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
             target.writestr(member, content)
     return output.getvalue()
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    "filename", [pytest.param(filename, id=topic) for topic, (filename, _) in _GUIDES.items()]
+)
+def test_release_requires_every_registered_guide(tmp_path: Path, kind: str, filename: str) -> None:
+    if kind == "wheel":
+        archive = tmp_path / "missing-guide.whl"
+        member = f"cayu/guides/{filename}"
+        _write_wheel(archive, _valid_wheel_names() - {member})
+        validator = validate_wheel
+    else:
+        archive = tmp_path / "missing-guide.tar.gz"
+        member = f"src/cayu/guides/{filename}"
+        _write_sdist(archive, omitted_names={member})
+        validator = validate_sdist
+    with pytest.raises(ValueError, match=rf"missing required .*files: .*{re.escape(member)}"):
+        validator(archive)
 
 
 def test_validate_wheel_requires_application_anatomy_guide(tmp_path: Path) -> None:
