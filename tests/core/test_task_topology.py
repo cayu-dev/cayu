@@ -10,7 +10,8 @@ from tests.core.task_topology_conformance import (
     assert_task_topology_store_conformance,
 )
 
-from cayu import InMemoryTaskStore, SQLiteTaskStore, TaskCreate, TaskStore
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStore
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH,
     TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,

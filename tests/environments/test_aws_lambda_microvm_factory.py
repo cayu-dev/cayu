@@ -7,14 +7,14 @@ from typing import Any
 import pytest
 from tests.runners.lambda_microvm_harness import OwnerFencedTransport, guest_lifecycle_hook
 
-from cayu import (
+from cayu.environments import (
     EnvironmentAllocationUnsupportedError,
     EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
-    RunnerWorkspace,
 )
 from cayu.runners import LambdaMicroVMProtocolError
 from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
+from cayu.workspaces import RunnerWorkspace
 
 _EXAMPLE = (
     Path(__file__).resolve().parents[2] / "examples" / "aws" / "environments" / "lambda_microvm.py"

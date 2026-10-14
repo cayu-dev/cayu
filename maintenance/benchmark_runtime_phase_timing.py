@@ -19,20 +19,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    InMemorySessionStore,
-    Message,
-    ModelProvider,
-    ModelStreamEvent,
-    RunRequest,
-    SQLiteSessionStore,
-    Tool,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolResult, ToolSpec
+from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
 
 _CONFIGURATIONS = ("disabled", "enabled")
 
@@ -74,7 +65,7 @@ async def run_once(configuration, backend, path):
     if configuration == "baseline":
         app = CayuApp(session_store=store, enable_logging=False)
     else:
-        from cayu import RuntimeTimingConfig
+        from cayu.observability import RuntimeTimingConfig
 
         app = CayuApp(
             session_store=store,

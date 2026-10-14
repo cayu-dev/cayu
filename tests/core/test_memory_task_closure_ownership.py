@@ -16,7 +16,8 @@ from tests.core.test_verified_work_contracts import (
     _verifier_profile_fingerprint,
 )
 
-from cayu import CayuApp, InMemoryTaskStore, TaskCreate
+from cayu import CayuApp
+from cayu.tasks import InMemoryTaskStore, TaskCreate
 from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,

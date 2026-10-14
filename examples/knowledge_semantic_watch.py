@@ -6,20 +6,20 @@ import asyncio
 import json
 from typing import TypedDict
 
-from cayu import (
-    KNOWLEDGE_LEXICAL_CHANNEL,
-    KNOWLEDGE_SEMANTIC_CHANNEL,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeRecallSource,
+from cayu.knowledge.semantic_watch import (
     KnowledgeSemanticWatchConfig,
     KnowledgeSemanticWatchDecision,
     KnowledgeSemanticWatchDisposition,
     KnowledgeSemanticWatchEvaluator,
-    RecallEngine,
+)
+from cayu.memory import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    KnowledgeRecallSource,
     WeightedReciprocalRankFusionConfig,
 )
+from cayu.memory.recall import RecallEngine
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 
 
 class ReleasePolicy:

@@ -11,9 +11,10 @@ from tests.core.test_durable_subagents import (
 from tests.core.test_model_policy_runtime import Channel, make_app
 from tests.core.test_model_policy_runtime import store_factory as store_factory
 
-from cayu import CayuApp, InMemorySessionStore, Message, RunRequest
+from cayu import CayuApp, Message, RunRequest
 from cayu.model_policy import ModelPolicy, ModelPolicyController, ModelPolicyStore
 from cayu.server import ServerConfig, create_server
+from cayu.sessions import InMemorySessionStore
 from cayu.sessions.outcomes import run_to_completion
 from cayu.storage.migrations import SchemaMode
 from cayu.tasks.dispatch import TaskStoreDispatcher
@@ -124,8 +125,9 @@ async def test_participant_execution_retains_creation_policy_after_restart(
     from tests.core.test_model_policy_runtime import CatalogProvider
     from tests.core.test_participant_identity import CONTEXT, create, registration
 
-    from cayu import AgentSpec, ModelStreamEvent
+    from cayu import AgentSpec
     from cayu.collaboration.memory import InMemoryCollaborationStore
+    from cayu.providers import ModelStreamEvent
     from cayu.sessions.context_views import (
         ParticipantSessionCreationRequest,
         ParticipantSessionExecutionRequest,

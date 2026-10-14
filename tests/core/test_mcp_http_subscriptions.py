@@ -12,9 +12,8 @@ import pytest
 from tests.core.test_mcp_http import CancellationResistantMcpServerMessageStream
 from tests.core.test_mcp_http_modern import ModernMcpHttpServer, _client, _server_spec
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, ToolContext
+from cayu.mcp import (
     HttpMcpClient,
     McpProtocolEra,
     McpProtocolError,
@@ -22,7 +21,6 @@ from cayu import (
     McpToolsetRefreshState,
     McpToolsetUnavailable,
     McpTransportLimits,
-    ToolContext,
     connect_mcp_toolset,
 )
 from cayu.mcp._subscriptions import ModernToolSubscription, SubscriptionEvent

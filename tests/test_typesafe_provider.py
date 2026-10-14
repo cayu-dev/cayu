@@ -185,7 +185,8 @@ def test_invalid_configuration_fails_before_dispatch(native):
 
 
 def test_decision_is_persisted_by_cayu(sqlite_resources):
-    from cayu import AgentSpec, CayuApp, RunRequest, SQLiteSessionStore
+    from cayu import AgentSpec, CayuApp, RunRequest
+    from cayu.storage import SQLiteSessionStore
 
     async def run():
         async with sqlite_resources as resources:

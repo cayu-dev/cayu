@@ -304,12 +304,12 @@ def test_cli_check_rejects_a_symlinked_application_package_before_import(
     registration = external_agents / "registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "from pathlib import Path\n\n"
                 'Path("symlink-side-effect.txt").write_text('
                 '"executed\\n", encoding="utf-8")\n\n'
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -492,11 +492,11 @@ def test_cli_check_rejects_import_side_effects_without_executing_them(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "from pathlib import Path\n\n"
                 f"{statement}\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -536,12 +536,12 @@ def test_cli_check_rejects_project_local_imported_class_hooks_before_import(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 f"from {package}.import_hook import ImportBase\n\n"
                 "class Imported(ImportBase):\n"
                 "    pass\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -577,7 +577,7 @@ def test_cli_check_tracks_decorator_imports_inside_class_control_flow(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "class Decorated:\n"
                 "    if True:\n"
@@ -585,7 +585,7 @@ def test_cli_check_tracks_decorator_imports_inside_class_control_flow(
                 "    @property\n"
                 "    def value(self):\n"
                 "        return None\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -621,14 +621,14 @@ def test_cli_check_tracks_decorator_imports_inside_module_control_flow(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "if True:\n"
                 "    from vendor.module_decorator import import_decorator as property\n\n"
                 "@property\n"
                 "def value():\n"
                 "    return None\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -661,11 +661,11 @@ def test_cli_check_requires_literal_generated_collection_receivers(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "import domain.effect_collection as _SYSTEM_PROMPT_PARTS\n\n"
                 '_SYSTEM_PROMPT_PARTS.append("safe-looking")\n\n'
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -699,12 +699,12 @@ def test_cli_check_rejects_executable_generated_collection_arguments(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "import domain.effect_attribute as effect_attribute\n\n"
                 "_SYSTEM_PROMPT_PARTS: list[str] = []\n"
                 "_SYSTEM_PROMPT_PARTS.append(effect_attribute.trigger)\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -738,11 +738,11 @@ def test_cli_check_rejects_project_local_module_attribute_access_before_import(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "import domain.effect_attribute as effect_attribute\n\n"
                 "IMPORT_RESULT = effect_attribute.trigger\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -821,10 +821,10 @@ def test_cli_check_rejects_project_local_import_from_hooks_before_import(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "from domain.effect_from import trigger\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -862,10 +862,10 @@ def test_cli_check_rejects_import_time_assignment_targets_before_import(
     registration = project / "agents/registration.py"
     registration.write_text(
         registration.read_text(encoding="utf-8").replace(
-            "from cayu import AgentSpec, CayuApp, ModelProvider\n",
+            "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n",
             (
                 "from domain.effect_from import trigger\n\n"
-                "from cayu import AgentSpec, CayuApp, ModelProvider\n"
+                "from cayu import AgentSpec, CayuApp\nfrom cayu.providers import ModelProvider\n"
             ),
         ),
         encoding="utf-8",
@@ -986,7 +986,7 @@ def test_source_check_validates_every_selected_plan_axis(
     )
 
 
-_LEGACY_SQLITE_STORAGE = """from cayu import SQLiteSessionStore, SQLiteTaskStore
+_LEGACY_SQLITE_STORAGE = """from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 
 
 def build_stores(**kwargs):

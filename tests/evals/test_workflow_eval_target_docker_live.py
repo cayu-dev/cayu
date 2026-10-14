@@ -12,30 +12,27 @@ from typing import NoReturn
 import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, RunRequest
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
-    DockerRunner,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
+)
+from cayu.evals import (
     EvalCase,
     EvalStatus,
     EvalSuite,
-    ExecCommand,
     FinalOutputContains,
-    LocalWorkspace,
-    RunRequest,
     ScriptedModelProvider,
-    WorkflowBase,
     WorkflowEvalExecution,
     WorkflowEvalInstanceScope,
     WorkflowEvalResult,
     WorkflowEvalTarget,
-    WorkflowSpec,
     run_workflow_eval_suite,
 )
+from cayu.runners import DockerImageIdentity, DockerRunner, ExecCommand
+from cayu.workflows import WorkflowBase, WorkflowSpec
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.process
 

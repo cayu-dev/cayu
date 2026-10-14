@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
-import cayu
+import cayu.approvals
+import cayu.execution_profiles
+import cayu.sessions
 from cayu import execution_profiles as contracts
 from cayu.approvals import actors
 from cayu.approvals import tools as approval_tools
@@ -65,14 +67,6 @@ def test_profile_consumers_share_the_canonical_contracts_and_checkpoint_rules():
     for name in _CONTRACT_CLASSES:
         assert getattr(legacy, name) is getattr(contracts, name)
     for name in (
-        "ExecutionProfileIdentity",
-        "ExecutionProfileDecision",
-        "ExecutionProfilePolicyRequest",
-        "ExecutionProfilePolicyResult",
-    ):
-        assert getattr(cayu, name) is getattr(contracts, name)
-        assert getattr(cayu.runtime, name) is getattr(contracts, name)
-    for name in (
         "ActiveInvocationExecutionProfile",
         "EXECUTION_PROFILE_METADATA_KEY",
         "active_invocation_execution_profile_from_checkpoint",
@@ -86,7 +80,8 @@ def test_profile_consumers_share_the_canonical_contracts_and_checkpoint_rules():
     ):
         assert getattr(legacy, name) is getattr(checkpoint, name)
     assert (
-        cayu.runtime.ActiveInvocationExecutionProfile is checkpoint.ActiveInvocationExecutionProfile
+        cayu.sessions.ActiveInvocationExecutionProfile
+        is checkpoint.ActiveInvocationExecutionProfile
     )
     assert (
         legacy.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
@@ -109,7 +104,7 @@ def test_legacy_pickled_profile_classes_resolve_to_the_canonical_owner(name):
 def test_legacy_approval_actor_imports_and_pickles_keep_the_shared_identity(name):
     model = getattr(actors, name)
     assert getattr(approval_tools, name) is model
-    assert getattr(cayu, name) is model
+    assert getattr(cayu.approvals, name) is model
     encoded = pickle.dumps(model, protocol=0)
     historical = encoded.replace(actors.__name__.encode(), approval_tools.__name__.encode())
     assert historical != encoded
@@ -167,7 +162,8 @@ class RejectRuntimeAndStores(importlib.abc.MetaPathFinder):
             raise AssertionError(f"Profile contracts imported {fullname}")
 
 sys.meta_path.insert(0, RejectRuntimeAndStores())
-from cayu import ExecutionProfileIdentity, ResolutionActor, ResolutionActorSource
+from cayu.execution_profiles import ExecutionProfileIdentity
+from cayu.approvals import ResolutionActor, ResolutionActorSource
 from cayu import execution_profiles as contracts
 from cayu.approvals import actors
 from cayu.sessions import _execution_profile_checkpoint as checkpoint

@@ -9,25 +9,18 @@ import sys
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileMismatchError,
-    Message,
-    ModelStreamEvent,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.budgets.run_limits import RunLimits
+from cayu.evals import ScriptedModelProvider
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
+from cayu.providers import ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
+from cayu.runtime import ExecutionProfileMismatchError
 from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.memory import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
 
 
 def application(store, **kwargs):
@@ -109,7 +102,7 @@ def test_resume_inheritance_and_explicit_changes(sqlite_resources, backend, over
 def test_resume_nondefault_controls_in_new_process(tmp_path):
     script = """
 import asyncio, sys
-from cayu import SQLiteSessionStore
+from cayu.storage import SQLiteSessionStore
 from tests.core.test_resume_configuration import application, start, resume
 async def run():
     store = SQLiteSessionStore(sys.argv[1])

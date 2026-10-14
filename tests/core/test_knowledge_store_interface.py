@@ -52,7 +52,7 @@ class _ReadOnlyStore(KnowledgeStore):
     load_change_consumer_state = _unsupported
 
 
-@pytest.mark.parametrize("module_name", ("cayu", "cayu.storage", "cayu.knowledge.base"))
+@pytest.mark.parametrize("module_name", ("cayu.storage", "cayu.knowledge.base"))
 def test_custom_knowledge_store_composes_without_builtin_backends(module_name):
     result = subprocess.run(
         [
@@ -109,7 +109,7 @@ def test_knowledge_store_preserves_import_identity_subclasses_and_annotations():
         assert backend.__abstractmethods__ == frozenset()
     with pytest.raises(TypeError, match="abstract"):
         KnowledgeStore()
-    for package in (cayu, storage):
+    for package in (storage,):
         assert package.KnowledgeStore is KnowledgeStore
         exports = importlib.import_module(package.__name__ + "._exports").EXPORTS
         assert exports["KnowledgeStore"] == ("cayu.knowledge.base", "KnowledgeStore")

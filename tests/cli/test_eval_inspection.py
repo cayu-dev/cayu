@@ -10,25 +10,20 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
+from cayu import Event, EventType, Message, RunRequest, SessionStatus
+from cayu.cli import main
+from cayu.evals import (
     EvalCaseResult,
     EvalRun,
     EvalStatus,
     EvalSuiteTrialPolicyV1,
     EvalTrialResult,
-    Event,
-    EventType,
-    InMemorySessionStore,
-    Message,
-    RunRequest,
-    SessionIdentity,
-    SessionStatus,
-    SQLiteSessionStore,
     export_process_eval_run,
     inspect_eval_sessions,
     inspect_process_eval_run,
 )
-from cayu.cli import main
+from cayu.sessions import InMemorySessionStore, SessionIdentity
+from cayu.storage import SQLiteSessionStore
 
 
 def _write(path: Path, value) -> None:

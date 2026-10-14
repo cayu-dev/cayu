@@ -80,27 +80,40 @@ def _annotation_classes(annotation: object) -> set[type]:
     return classes
 
 
-@pytest.mark.parametrize("package_name", ["cayu", "cayu.collaboration"])
-def test_exported_models_use_exported_collaboration_contract_types(package_name):
+def test_exported_models_use_exported_collaboration_contract_types():
     """Public models must be constructible from public imports alone."""
 
-    manifest = importlib.import_module(package_name + "._exports")
-    exported: set[object] = set()
+    targets = {
+        target
+        for package in _PACKAGES
+        for target in importlib.import_module(package + "._exports").EXPORTS.values()
+    }
+    # Include specialized public modules that do not use lazy export manifests.
+    replacements = json.loads((_ROOT / "docs/public-api-imports.json").read_text())
+    targets.update(tuple(path.rsplit(".", 1)) for path in replacements.values())
     models: dict[str, type[BaseModel]] = {}
-    for name, (module_name, symbol) in manifest.EXPORTS.items():
+    for module_name, symbol in sorted(targets):
         try:
             value = getattr(importlib.import_module(module_name), symbol)
         except ImportError:
             continue
-        exported.add(value)
         if isinstance(value, type) and issubclass(value, BaseModel):
-            models[name] = value
+            models[f"{module_name}.{symbol}"] = value
+    collaboration = importlib.import_module("cayu.collaboration")
+    public_contracts = {
+        getattr(collaboration, name)
+        for name, (module, _symbol) in importlib.import_module(
+            "cayu.collaboration._exports"
+        ).EXPORTS.items()
+        if module == "cayu.collaboration._contracts"
+    }
     missing = {
         f"{model_name}.{field_name}: {referenced.__qualname__}"
         for model_name, model in models.items()
         for field_name, field in model.model_fields.items()
         for referenced in _annotation_classes(field.annotation)
-        if referenced.__module__ == "cayu.collaboration._contracts" and referenced not in exported
+        if referenced.__module__ == "cayu.collaboration._contracts"
+        and referenced not in public_contracts
     }
     assert not missing, sorted(missing)
 
@@ -108,10 +121,10 @@ def test_exported_models_use_exported_collaboration_contract_types(package_name)
 @pytest.mark.parametrize(
     ("package_name", "core_name", "optional_name"),
     [
-        ("cayu", "SQLiteSessionStore", "PostgresSessionStore"),
+        ("cayu.storage", "SQLiteSessionStore", "PostgresSessionStore"),
         ("cayu.storage", "SQLiteSessionStore", "SQLiteProductOperationStore"),
         ("cayu.collaboration", "SQLiteCollaborationStore", "PostgresCollaborationStore"),
-        ("cayu.runtime", "RunRequest", "ContinuationTicket"),
+        ("cayu.sessions", "RunRequest", "ContinuationTicket"),
         ("cayu.sessions", "RunRequest", "ParticipantSessionExecutionRequest"),
     ],
 )

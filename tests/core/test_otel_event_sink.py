@@ -19,24 +19,11 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 
-from cayu import (
-    AgentSpec,
-    AuxiliaryInferencePolicy,
-    CayuApp,
-    InferenceLimits,
-    Message,
-    OpenTelemetryEventSink,
-    RunRequest,
-    SubagentSpec,
-    SubagentTool,
-    Tool,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolResult, ToolSpec
 from cayu.budgets.base import InMemoryBudgetStore
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import Event, EventType, event_with_durable_sequence
-from cayu.observability import otel
+from cayu.observability import OpenTelemetryEventSink, otel
 from cayu.observability.events import EventSink, _EventSinkDelivery
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
 from cayu.providers.retry_policy import RetryPolicy
@@ -44,6 +31,7 @@ from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter, _emit_event_sink
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.tools import AuxiliaryInferencePolicy, InferenceLimits, SubagentSpec, SubagentTool
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 REMOTE_TRACE_ID = "11111111111111111111111111111111"
@@ -53,7 +41,7 @@ REMOTE_TRACEPARENT = f"00-{REMOTE_TRACE_ID}-2222222222222222-01"
 def test_runtime_phase_records_remain_children_after_tool_and_session_end(sqlite_resources):
     from tests.core.test_runtime_phase_timing import _app, _run
 
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     exporter, sink = _make_sink()
 
@@ -102,7 +90,7 @@ def test_runtime_phase_record_waits_for_its_tool_span_instead_of_becoming_a_root
 ):
     from tests.core.test_runtime_phase_timing import _app, _run
 
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     exporter, sink = _make_sink()
     held = []
@@ -141,7 +129,7 @@ def test_close_runtime_timing_exports_records_still_waiting_for_their_spans(
 ):
     from tests.core.test_runtime_phase_timing import _app, _run
 
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     exporter, sink = _make_sink()
 
@@ -1733,7 +1721,7 @@ def test_import_cayu_works_without_opentelemetry_installed() -> None:
                 del sys.modules[mod]
 
         import cayu
-        from cayu import OpenTelemetryEventSink
+        from cayu.observability import OpenTelemetryEventSink
 
         try:
             OpenTelemetryEventSink()

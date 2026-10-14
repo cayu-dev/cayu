@@ -13,31 +13,26 @@ from pathlib import Path
 import pytest
 from tests.faults.test_workspace_sync_failure import FailOnceWriteWorkspace
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, Tool, ToolResult, ToolSpec
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    EventType,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
+    SyncBinding,
+)
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.sessions import (
     RecoveryDecision,
     RecoveryExecutionRequest,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    SyncBinding,
-    Tool,
-    ToolResult,
-    ToolSpec,
 )
+from cayu.storage import SQLiteSessionStore
+from cayu.workspaces import LocalWorkspace
 
 
 async def _child(

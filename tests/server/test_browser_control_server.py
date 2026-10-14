@@ -52,8 +52,8 @@ def test_documented_operator_setup_builds_a_protected_server():
 
 
 def test_protected_server_requires_application_and_authentication():
-    from cayu import BrowserControlConfig as PublicBrowserControlConfig
     from cayu.server import BrowserControlServerConfig as PublicTransportConfig
+    from cayu.tools import BrowserControlConfig as PublicBrowserControlConfig
 
     assert PublicBrowserControlConfig is BrowserControlConfig
     assert PublicTransportConfig is BrowserControlServerConfig

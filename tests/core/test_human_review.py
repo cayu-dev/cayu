@@ -11,18 +11,8 @@ from tests.core.test_approval_lifecycle_execution_identities import (
 )
 from tests.core.test_user_input import _ScriptedProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    Message,
-    RunRequest,
-    SQLiteSessionStore,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    UserInputResponse,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
 from cayu.approvals.review import (
     HumanReviewContext,
     HumanReviewDenied,
@@ -32,8 +22,10 @@ from cayu.approvals.review import (
     HumanReviewSource,
     build_review,
 )
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.environments.factory import EnvironmentFactory, EnvironmentFactoryResult
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor
 

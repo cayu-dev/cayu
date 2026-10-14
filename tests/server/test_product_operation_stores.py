@@ -13,7 +13,6 @@ from uuid import uuid4
 import pytest
 from psycopg.errors import UniqueViolation
 
-from cayu import PostgresProductOperationStore, SQLiteProductOperationStore
 from cayu.cli import main
 from cayu.server import (
     ProductExecutionClaimLost,
@@ -25,6 +24,7 @@ from cayu.server import (
     ProductResultReceiptConflict,
     ServiceIdentityStoreKind,
 )
+from cayu.storage import PostgresProductOperationStore, SQLiteProductOperationStore
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
@@ -578,7 +578,7 @@ def fresh_postgres_dsn(postgres_dsn):
 def test_cayu_storage_migrate_upgrades_postgres_to_the_product_revision(
     fresh_postgres_dsn, monkeypatch
 ):
-    from cayu import PostgresSessionStore
+    from cayu.storage import PostgresSessionStore
 
     revisions = schema.REVISIONS
 

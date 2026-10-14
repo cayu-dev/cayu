@@ -8,19 +8,17 @@ from decimal import Decimal
 import pytest
 from tests.core.test_coding_products import _request
 
-from cayu import (
-    Event,
-    EventType,
-    ResolutionActor,
-    ResolutionActorSource,
-    SQLiteTaskStore,
+from cayu import Event, EventType
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.guides.coding_host import BusinessStore, Reservation, SettlementConflict
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import (
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
     TaskCancellationReconciliationRequest,
     TaskCreate,
     TaskStatus,
 )
-from cayu.guides.coding_host import BusinessStore, Reservation, SettlementConflict
 
 
 def _events():
@@ -61,7 +59,7 @@ def _events():
 
 
 def reservation():
-    from cayu import ModelPrice, PriceBook
+    from cayu.budgets import ModelPrice, PriceBook
 
     return Reservation(
         tenant="example-tenant",
@@ -322,19 +320,16 @@ def test_historical_readback_is_distinct_from_current_source_bytes(tmp_path):
     """Real artifact and workspace APIs; candidate evidence is a controlled fixture."""
     from tests.core.test_coding_products import _check_event, _terminal_events
 
-    from cayu import (
-        CayuApp,
-        CodingProductArtifactRepository,
-        CodingProductRunner,
-        InMemoryTaskStore,
-        TaskQuery,
-        complete_managed_task,
-        run_task_worker,
-    )
+    from cayu import CayuApp
     from cayu.artifacts import LocalArtifactStore
     from cayu.budgets.pricing import ModelPrice, PriceBook
-    from cayu.coding_products import compile_coding_product_candidate
+    from cayu.coding_products import (
+        CodingProductArtifactRepository,
+        CodingProductRunner,
+        compile_coding_product_candidate,
+    )
     from cayu.guides.coding_host import project_result, require_current_source, settle_completed
+    from cayu.tasks import InMemoryTaskStore, TaskQuery, complete_managed_task, run_task_worker
     from cayu.workspaces import LocalWorkspace
     from cayu.workspaces.revisions import (
         WorkspaceRevisionObservationLimits,

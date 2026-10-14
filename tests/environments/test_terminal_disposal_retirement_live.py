@@ -14,31 +14,26 @@ import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 from tests.environments.test_docker_coding_live import _configuration_or_skip
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest, Tool, ToolResult, ToolSpec
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
     EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
     ImmutableInputStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
+    inspect_local_immutable_input,
+)
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import (
     RecoveryDecision,
     RecoveryExecutionRequest,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    Tool,
-    ToolResult,
-    ToolSpec,
-    inspect_local_immutable_input,
 )
+from cayu.storage import SQLiteSessionStore
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.process
 

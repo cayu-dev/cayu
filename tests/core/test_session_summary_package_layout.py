@@ -52,12 +52,12 @@ def test_session_summary_public_imports_and_historical_pickle_globals():
     for name in ("SessionOperationalSnapshot", "EventSummary", "SessionOutcome"):
         canonical = getattr(summaries, name)
         assert getattr(base, name) is canonical
-        for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+        for module in ("cayu.sessions",):
             assert getattr(importlib.import_module(module), name) is canonical
         assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_session_summaries_project_durable_records_without_stores(public_module):
     _assert_store_independent(
         """
@@ -123,12 +123,12 @@ def test_session_usage_public_imports_and_historical_pickle_global():
     from cayu.sessions import base, usage
 
     assert base.UsageRollupQuery is usage.UsageRollupQuery
-    for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+    for module in ("cayu.sessions",):
         assert importlib.import_module(module).UsageRollupQuery is usage.UsageRollupQuery
     assert pickle.loads(b"ccayu.sessions.base\nUsageRollupQuery\n.") is usage.UsageRollupQuery
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_session_usage_aggregates_bounded_records_without_stores(public_module):
     _assert_store_independent(
         """
@@ -207,12 +207,12 @@ def test_session_inspection_public_imports_and_historical_pickle_globals():
         for name in names:
             canonical = getattr(owner, name)
             assert getattr(base, name) is canonical
-            for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+            for module in ("cayu.sessions",):
                 assert getattr(importlib.import_module(module), name) is canonical
             assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_session_inspection_bounds_and_folds_records_without_stores(public_module):
     _assert_store_independent(
         """

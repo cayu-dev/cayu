@@ -13,7 +13,7 @@ from typing import get_type_hints
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
-import cayu
+import cayu.storage
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.support_bundles import _store_schema_readiness
 
@@ -34,8 +34,8 @@ def test_postgres_owner_preserves_public_imports_and_pickled_class(module_name, 
     store_type = getattr(owner, class_name)
     public_stores = importlib.import_module("cayu.storage.postgres")
     assert getattr(public_stores, class_name) is store_type
-    assert getattr(cayu, class_name) is store_type
-    assert class_name not in cayu.__all__
+    assert getattr(cayu.storage, class_name) is store_type
+    assert class_name not in cayu.storage.__all__
     storage = importlib.import_module("cayu.storage")
     assert getattr(storage, class_name) is store_type
     assert class_name not in storage.__all__
@@ -74,7 +74,7 @@ class MissingPostgresDriver(importlib.abc.MetaPathFinder):
             raise ModuleNotFoundError(fullname)
 
 sys.meta_path.insert(0, MissingPostgresDriver())
-import cayu
+import cayu; import cayu.storage
 assert "cayu.storage.postgres" not in sys.modules
 try:
     importlib.import_module("cayu.storage." + sys.argv[1])
@@ -107,7 +107,7 @@ else:
 )
 @pytest.mark.parametrize("scenario", ["healthy", "invalid", "writable", "subclass", "cancelled"])
 def test_postgres_schema_readiness_preserves_validation_boundary(class_name, scenario, monkeypatch):
-    builtin = getattr(cayu, class_name)
+    builtin = getattr(cayu.storage, class_name)
     store_type = type("CustomStore", (builtin,), {}) if scenario == "subclass" else builtin
     options = {}
     if class_name == "PostgresEmbeddingKnowledgeStore":

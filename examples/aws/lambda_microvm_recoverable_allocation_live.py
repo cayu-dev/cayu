@@ -27,7 +27,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from cayu import ExecCommand, LambdaMicroVMRunner
 from cayu.egress import VirtualEgressAllocationPreparation, VirtualEgressAllocationReap
 from cayu.egress.aws_lambda_microvm_adapter import (
     LambdaMicroVMEgressAdapter,
@@ -35,7 +34,12 @@ from cayu.egress.aws_lambda_microvm_adapter import (
     _verify_agent_privilege_boundary,
 )
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
-from cayu.runners import LambdaMicroVMClientTokenConflict, LambdaMicroVMOwnershipSuperseded
+from cayu.runners import (
+    ExecCommand,
+    LambdaMicroVMClientTokenConflict,
+    LambdaMicroVMOwnershipSuperseded,
+    LambdaMicroVMRunner,
+)
 from cayu.runners.aws_lambda_microvm import _control_client, run_microvm_with_client_token
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="

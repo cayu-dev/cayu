@@ -24,15 +24,6 @@ from examples.aws.lambda_microvm_agent.runtime import (
     INTERNAL_SERVICE_TOKEN,
 )
 
-from cayu import (
-    BoundWorkspace,
-    ExecCommand,
-    LocalWorkspace,
-    RunnerWorkspace,
-    SecretRef,
-    SecretsManagerVault,
-    SyncBinding,
-)
 from cayu.egress import (
     EgressBinding,
     HttpEgressPolicy,
@@ -47,6 +38,10 @@ from cayu.egress.aws_lambda_microvm_adapter import (
     LambdaMicroVMMetadataIsolationMode,
 )
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
+from cayu.environments import BoundWorkspace, SyncBinding
+from cayu.runners import ExecCommand
+from cayu.vaults import SecretRef, SecretsManagerVault
+from cayu.workspaces import LocalWorkspace, RunnerWorkspace
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 EVIDENCE_SCHEMA = "cayu.aws_lambda_microvm_metadata_isolation.v1"

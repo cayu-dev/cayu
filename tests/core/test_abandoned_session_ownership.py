@@ -10,15 +10,9 @@ from tests.core.test_abandoned_session_resume import _child, _Proposal
 from tests.core.test_session_execution_presence import _app, _consume, _stores
 from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
-from cayu import (
-    Message,
-    ModelStreamEvent,
-    ResumeRequest,
-    RunRequest,
-    SessionExecutionInProgress,
-    SessionStatus,
-    ToolEffect,
-)
+from cayu import Message, ResumeRequest, RunRequest, SessionStatus, ToolEffect
+from cayu.providers import ModelStreamEvent
+from cayu.sessions import SessionExecutionInProgress
 from cayu.sessions import _process_liveness as processes
 from cayu.sessions.execution import _ExecutionOwner
 from cayu.sessions.records import SessionIdentity

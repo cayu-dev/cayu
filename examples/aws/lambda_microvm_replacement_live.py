@@ -22,11 +22,11 @@ import time
 import uuid
 from pathlib import Path
 
-from cayu import LambdaMicroVMRunner
 from cayu.artifacts import LocalArtifactStore
 from cayu.egress import VirtualEgressAllocationPreparation, VirtualEgressAllocationReap
 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter, _client_token
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
+from cayu.runners import LambdaMicroVMRunner
 from cayu.runners.aws_lambda_microvm import terminate_microvm_confirmed
 from cayu.workspaces import RunnerWorkspace
 from cayu.workspaces.checkpoints import (

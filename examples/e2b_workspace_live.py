@@ -9,21 +9,12 @@ from _workspace_conformance import (
     verify_portable_workspace_path_safety,
     verify_portable_workspace_round_trip,
 )
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    E2BRunner,
-    E2BWorkspace,
-    Environment,
-    EnvironmentSpec,
-    ExecCommandTool,
-    ListFilesTool,
-    Message,
-    ReadFileTool,
-    RunRequest,
-    WriteFileTool,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners import E2BRunner
+from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.workspaces import E2BWorkspace
 
 
 class FakeProvider(ModelProvider):

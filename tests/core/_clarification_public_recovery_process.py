@@ -33,7 +33,7 @@ async def recover(value):
     try:
         assert await application.initialize_collaboration() == initial
         if value.get("kind") == "question":
-            from cayu import ClarificationExpiryRequest
+            from cayu.collaboration import ClarificationExpiryRequest
 
             expiry = ClarificationExpiryRequest.model_validate(value["expiry"])
             first = await application.expire_clarification_question(expiry, context=CONTEXT)

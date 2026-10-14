@@ -9,14 +9,15 @@ from tests.core.test_session_export_runtime import RuntimePolicy
 from tests.core.test_session_exports import CONTEXT, harness, published
 from tests.core.test_session_exports import backend as backend
 
-from cayu import AuxiliaryInferencePolicy, InferenceLimits, ModelRequest
 from cayu.agents import AgentSpec
 from cayu.collaboration.exports import SessionExportDenied
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
+from cayu.providers import ModelRequest
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.sessions.requests import RunRequest
+from cayu.tools import AuxiliaryInferencePolicy, InferenceLimits
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 
 

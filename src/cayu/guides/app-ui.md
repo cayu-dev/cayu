@@ -108,7 +108,7 @@ the session in the Cayu server process while an application worker has no local
 task for it. A model stream or tool may also run silently for minutes.
 
 ```python
-from cayu import SessionExecutionConfig
+from cayu.sessions import SessionExecutionConfig
 
 # Optional when constructing CayuApp; these are the defaults.
 execution_config = SessionExecutionConfig(

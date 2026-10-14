@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-import cayu
+import cayu.providers
+import cayu.workspaces
 from cayu import _event_schema as schema
 from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
 
@@ -42,13 +43,15 @@ class RejectExecution(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, RejectExecution())
 importlib.import_module(sys.argv[1])
 import cayu
+import cayu.providers
+import cayu.workspaces
 from cayu import _event_schema as schema
 from cayu.events import Event, EventType
 from cayu.providers import _retry_decision as retry
 from cayu.workspaces import _revision_records as workspace
 
-assert cayu.RetryDecision is retry.RetryDecision
-assert cayu.WorkspacePathRevision is workspace.WorkspacePathRevision
+assert cayu.providers.RetryDecision is retry.RetryDecision
+assert cayu.workspaces.WorkspacePathRevision is workspace.WorkspacePathRevision
 assert set(schema.EVENT_PAYLOAD_POLICIES) == set(EventType)
 event = Event(type=EventType.SESSION_INTERRUPTED, session_id='session', payload={
     'tool_round_id': 'round', 'approval': {'tool_round_id': 'round', 'tool_call_id': 'call'}
@@ -127,9 +130,8 @@ def test_public_data_imports_and_saved_pickle_paths_share_one_definition(
 ):
     expected = getattr(importlib.import_module(canonical), name)
     assert getattr(importlib.import_module(public_module), name) is expected
-    assert getattr(cayu, name) is expected
     namespace = importlib.import_module(
-        "cayu.runtime" if name.startswith("Retry") else "cayu.workspaces"
+        "cayu.providers" if name.startswith("Retry") else "cayu.workspaces"
     )
     assert getattr(namespace, name) is expected
     assert pickle.loads(f"c{public_module}\n{name}\n.".encode()) is expected

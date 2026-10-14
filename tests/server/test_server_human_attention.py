@@ -6,7 +6,9 @@ from examples.human_attention.app import build
 from examples.human_attention.server import create_demo_server
 from fastapi.testclient import TestClient
 
-from cayu import HumanAttentionRequest, Message, PendingActionQuery, RunRequest
+from cayu import Message, RunRequest
+from cayu.runtime import HumanAttentionRequest
+from cayu.sessions import PendingActionQuery
 
 
 def test_optional_server_attention_uses_protected_current_resolution(tmp_path, monkeypatch):

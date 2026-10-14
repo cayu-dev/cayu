@@ -343,7 +343,9 @@ def test_worker_redacts_one_forbidden_collector_and_preserves_safe_sections(
 ) -> None:
     _write_project(
         tmp_path,
-        """from cayu import AggregateAccuracy, CayuApp, InMemorySessionStore
+        """from cayu.budgets import AggregateAccuracy
+from cayu import CayuApp
+from cayu.sessions import InMemorySessionStore
 
 
 class UnsafeSnapshotStore(InMemorySessionStore):
@@ -402,7 +404,8 @@ path = "data/cayu.db"
     )
     _write_project(
         tmp_path,
-        """from cayu import CayuApp, SQLiteSessionStore, SQLiteTaskStore
+        """from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 
 
 def build_app():
@@ -1186,7 +1189,8 @@ def test_worker_keeps_partial_bundle_when_sqlite_task_snapshot_times_out(
         tmp_path,
         """import time
 
-from cayu import CayuApp, SQLiteTaskStore
+from cayu import CayuApp
+from cayu.storage import SQLiteTaskStore
 
 
 def slow_progress():
@@ -1255,7 +1259,8 @@ def test_doctor_explicit_session_uses_sqlite_bounded_safe_tail(
     asyncio.run(seed_store())
     _write_project(
         tmp_path,
-        """from cayu import CayuApp, SQLiteSessionStore
+        """from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore
 
 
 def build_app():
@@ -1330,16 +1335,11 @@ service_factory = "service_project:build_service"
 
 from fastapi import HTTPException, Request
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    S3ArtifactStore,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-)
+from cayu import AgentSpec, CayuApp
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.artifacts import S3ArtifactStore
+from cayu.evals import ScriptedModelProvider
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,

@@ -12,7 +12,7 @@ from tests.core.test_approval_lifecycle_execution_identities import (
 )
 from tests.external_wait_support import CONTEXT, Policy, registration, reservation, stores
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.approvals.tools import (
     PendingToolApprovalEventView,
     ToolApprovalDecision,
@@ -21,6 +21,7 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import UserInputResponse
 from cayu.budgets import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.evals import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.external_wait_host import ExternalWaitHost
 from cayu.external_waits import ExternalEventWaits

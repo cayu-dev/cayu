@@ -11,18 +11,30 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    InMemorySessionStore,
-    Message,
-    ModelStreamEvent,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    SecretRef,
-    SQLiteSessionStore,
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.observability.hooks import (
+    AfterToolCallDecision,
+    BeforeToolCallDecision,
+    BeforeToolCallHookContext,
+    RuntimeHook,
+    ToolCallHookContext,
+)
+from cayu.providers import ModelStreamEvent
+from cayu.proxies import CredentialProxy, ProxyAuthorizationResult
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentityStrength,
+    execution_profile_from_session_metadata,
+)
+from cayu.sessions import InMemorySessionStore
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions.event_queries import EventQuery
+from cayu.storage import SQLiteSessionStore
+from cayu.tools import (
     WebAccessCircuitPolicy,
     WebAccessEvidenceSource,
     WebAccessOutcome,
@@ -33,26 +45,9 @@ from cayu import (
     WebBridge,
     WebBridgeCredentialAuthority,
     WebBridgeRoute,
+    WebFetchAdapterRequest,
     WebFetchTool,
 )
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.events import EventType
-from cayu.observability.hooks import (
-    AfterToolCallDecision,
-    BeforeToolCallDecision,
-    BeforeToolCallHookContext,
-    RuntimeHook,
-    ToolCallHookContext,
-)
-from cayu.proxies import CredentialProxy, ProxyAuthorizationResult
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass,
-    ExecutionProfileIdentityStrength,
-    execution_profile_from_session_metadata,
-)
-from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.event_queries import EventQuery
-from cayu.tools import WebFetchAdapterRequest
 from cayu.tools.base import (
     ToolContext,
     ToolResult,
@@ -60,7 +55,7 @@ from cayu.tools.base import (
 )
 from cayu.tools.web import HttpxWebFetchTransport, SystemWebFetchResolver, WebFetchHttpResponse
 from cayu.tools.web_access import classify_http_access, web_destination_fingerprint
-from cayu.vaults import ResolvedSecret, SecretRedactor
+from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef
 
 _ROUTE_ENVIRONMENT_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="routed-web-access-test-environment",
@@ -2605,7 +2600,7 @@ def test_auth_operator_action_is_bounded_and_omits_protected_url() -> None:
 
 def test_access_evidence_model_rejects_non_rate_limit_retry_timing() -> None:
     with pytest.raises(ValueError, match="Only rate-limit"):
-        from cayu import WebAccessEvidence
+        from cayu.tools import WebAccessEvidence
 
         WebAccessEvidence(
             outcome=WebAccessOutcome.CONSENT_REQUIRED,

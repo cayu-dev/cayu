@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from tests.core.test_startup_recovery_isolation import _app, _seed, _state
 
-from cayu import InMemorySessionStore, SessionStatus
+from cayu import SessionStatus
 from cayu.server import (
     AuthContext,
     AuthenticatedAccess,
@@ -17,6 +17,7 @@ from cayu.server import (
     create_server,
     mount_cayu,
 )
+from cayu.sessions import InMemorySessionStore
 
 
 async def _authenticate(request):

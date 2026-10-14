@@ -1,6 +1,6 @@
 """Accept a nested response from its actual completed provider turn."""
 
-from cayu import ClarificationReplyRequest
+from cayu.collaboration import ClarificationReplyRequest
 from cayu.collaboration._contracts import ObjectRef, OwnerRef
 from cayu.collaboration._request_coordinator import _initiator
 from cayu.collaboration._request_store import operation_key

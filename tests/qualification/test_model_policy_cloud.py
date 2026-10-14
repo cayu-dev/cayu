@@ -12,8 +12,9 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.model_policy import HttpPolicyChannel, ModelPolicy, ModelPolicyController
+from cayu.providers import ModelStreamEvent
 from cayu.sessions.outcomes import run_to_completion
 from tests.core.test_model_policy_runtime import VECTORS, CatalogProvider
 from tests.core.test_model_policy_runtime import store_factory as store_factory

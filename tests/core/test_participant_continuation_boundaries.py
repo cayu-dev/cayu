@@ -9,13 +9,8 @@ import pytest
 from tests.core.test_context_view_admission import _close, _factory, _selection
 from tests.core.test_participant_identity import CONTEXT, app, create, registration
 
-from cayu import (
-    AlwaysRequireApprovalToolPolicy,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    UserInputResponse,
-)
 from cayu.agents import AgentSpec
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
 from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.context import CheckpointCompactionContextPolicy
@@ -31,6 +26,7 @@ from cayu.sessions.context_views import (
     ParticipantSessionExecutionRequest,
 )
 from cayu.sessions.requests import CompactSessionRequest, ResumeRequest, RunRequest
+from cayu.tools import AlwaysRequireApprovalToolPolicy
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 from cayu.tools.user_input import UserInputTool
 

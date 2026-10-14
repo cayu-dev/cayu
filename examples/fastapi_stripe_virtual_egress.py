@@ -19,17 +19,11 @@ import shutil
 import subprocess
 from typing import Any
 
-from cayu import (
-    EnvironmentFactoryRequest,
-    Event,
-    EventType,
-    HttpEgressPolicy,
-    SecretRef,
-    StaticVault,
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-)
+from cayu import Event, EventType
+from cayu.egress import HttpEgressPolicy, VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.vaults import SecretRef, StaticVault
 
 DEMO_REAL_SECRET = "sk_test_51DemoRealFastApiKeyHeldOnlyByBroker"
 IMAGE = "cayu-egress-fastapi-stripe:demo"

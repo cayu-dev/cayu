@@ -27,7 +27,7 @@ def test_generated_starter_accepts_effective_composite_coverage(
     )
     policy.write_text(
         source
-        + "\nfrom cayu import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy\n"
+        + "\nfrom cayu.tools import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy\n"
         "\ndef build_tool_policy(external_tool_names):\n"
         '    return GuardedToolPolicy(guards=(RequiredArguments({"ask_user": ("question",)}),), '
         f"then={downstream})\n"

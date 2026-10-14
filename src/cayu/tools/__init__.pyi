@@ -8,7 +8,10 @@ from cayu.tools.base import RunnerHandle as RunnerHandle
 from cayu.tools.base import Tool as Tool
 from cayu.tools.base import ToolContext as ToolContext
 from cayu.tools.base import ToolEffect as ToolEffect
+from cayu.tools.base import ToolExecutableRequirement as ToolExecutableRequirement
+from cayu.tools.base import ToolExecutionRequirement as ToolExecutionRequirement
 from cayu.tools.base import ToolResult as ToolResult
+from cayu.tools.base import ToolRunnerCapabilityRequirement as ToolRunnerCapabilityRequirement
 from cayu.tools.base import ToolSpec as ToolSpec
 from cayu.tools.base import VaultHandle as VaultHandle
 from cayu.tools.base import WorkspaceHandle as WorkspaceHandle

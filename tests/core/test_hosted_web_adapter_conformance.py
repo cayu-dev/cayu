@@ -9,20 +9,18 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
+from cayu import ToolContext
+from cayu.proxies import ProxyAuthorizationResult
+from cayu.tools import (
     ExaWebAdapter,
     ParallelAIWebAdapter,
-    ProxyAuthorizationResult,
-    ResolvedSecret,
-    SecretRedactor,
-    SecretRef,
-    ToolContext,
     WebFetchAdapter,
     WebFetchTool,
     WebSearchAdapter,
     WebSearchRestrictions,
     WebSearchTool,
 )
+from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef
 
 
 class _CredentialProxy:

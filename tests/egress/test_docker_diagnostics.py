@@ -96,7 +96,7 @@ def test_setup_failure_survives_sqlite_environment_and_session_evidence(
     from cayu.evals.testing import ScriptedModelProvider
     from cayu.events import EventType
     from cayu.messages import Message
-    from cayu.runtime import RunRequest
+    from cayu.sessions import RunRequest
     from cayu.storage.sqlite import SQLiteSessionStore
 
     calls = []

@@ -6,13 +6,9 @@ import json
 import pytest
 from tests.artifacts.test_aws_s3 import _S3Client
 
-from cayu import (
-    LocalArtifactStore,
-    LocalWorkspace,
-    S3ArtifactStore,
-    copy_workspace_file_to_artifact,
-)
 from cayu._validation import DURABLE_METADATA_LIMITS, DurableValueError
+from cayu.artifacts import LocalArtifactStore, S3ArtifactStore, copy_workspace_file_to_artifact
+from cayu.workspaces import LocalWorkspace
 
 
 def _metadata_at_limit():

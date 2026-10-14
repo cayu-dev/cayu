@@ -6,25 +6,19 @@ import pytest
 from tests.core.test_openai_optional_search_evidence import response_fixture, stream_fixture
 from tests.core.test_openai_provider import RecordingTransport
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    ModelRequest,
-    OpenAIProvider,
-    OpenAIWebSearch,
-    RetryPolicy,
-    RunRequest,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.providers import (
+    ModelRequest,
     ModelStreamEventType,
     OpenAIProtocolError,
+    OpenAIProvider,
     OpenAIUnsupportedSearchSourceError,
+    OpenAIWebSearch,
     openai_response_events,
 )
 from cayu.providers._openai_protocol import SearchSourceDiagnostic, source_diagnostic_fields
+from cayu.providers.retry_policy import RetryPolicy
+from cayu.storage import SQLiteSessionStore
 
 REASON = "web_search_action_sources_type_is_unsupported"
 VALUES = [

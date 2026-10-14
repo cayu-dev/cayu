@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-from cayu import (
+from cayu.environments import (
     BoundWorkspace,
     Environment,
     EnvironmentAllocationScope,
@@ -16,13 +16,16 @@ from cayu import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    LambdaMicroVMRunner,
     NativeBinding,
-    RunnerWorkspace,
     WorkspaceBinding,
     WorkspaceSnapshot,
 )
-from cayu.runners import LambdaMicroVMEndpointTransport, LambdaMicroVMProtocolError
+from cayu.runners import (
+    LambdaMicroVMEndpointTransport,
+    LambdaMicroVMProtocolError,
+    LambdaMicroVMRunner,
+)
+from cayu.workspaces import RunnerWorkspace
 
 
 class LambdaMicroVMLifecycleBinding(WorkspaceBinding):

@@ -16,7 +16,7 @@ httpx = pytest.importorskip("httpx")
 
 from fastapi import HTTPException, Request
 
-from cayu import CayuApp, PostgresSessionStore, SQLiteSessionStore
+from cayu import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_event_id
@@ -26,6 +26,7 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import EventRecord, SessionIdentity, SessionStateSnapshot, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor
 

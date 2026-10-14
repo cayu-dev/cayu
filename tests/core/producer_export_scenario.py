@@ -3,7 +3,7 @@
 from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import ProducerOutputProposal
+from cayu.collaboration import ProducerOutputProposal
 from cayu.collaboration._contracts import ObjectRef, OwnerRef
 from cayu.collaboration.exports import SessionExportAccessContext
 from cayu.collaboration.mandates import ResourceSelector

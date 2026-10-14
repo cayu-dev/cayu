@@ -24,7 +24,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from cayu import (
+from cayu.snapshots import (
     AGENT_BUNDLE_INDEX_FILENAME,
     AgentBundle,
     AgentBundleCoordinator,

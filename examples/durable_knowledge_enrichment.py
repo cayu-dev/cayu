@@ -20,26 +20,30 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cayu import (
-    KnowledgeAccessScope,
+from cayu.knowledge.curator import (
     KnowledgeCurator,
     KnowledgeCuratorConfig,
-    KnowledgeEnrichmentJobStatus,
-    KnowledgeEnrichmentQueue,
-    KnowledgeEnrichmentRequest,
-    KnowledgeEnrichmentTrigger,
-    KnowledgeEnrichmentWorker,
-    KnowledgeQuery,
-    KnowledgeStatus,
     LearningBatch,
     LearningCandidate,
     LearningDecision,
     LearningSignal,
     LearningSourceReference,
     LearningVerdict,
+)
+from cayu.knowledge.enrichment import (
+    KnowledgeEnrichmentJobStatus,
+    KnowledgeEnrichmentQueue,
+    KnowledgeEnrichmentRequest,
+    KnowledgeEnrichmentTrigger,
+    KnowledgeEnrichmentWorker,
+)
+from cayu.sessions import TaskExecutionSource
+from cayu.storage import (
+    KnowledgeAccessScope,
+    KnowledgeQuery,
+    KnowledgeStatus,
     SQLiteKnowledgeStore,
     SQLiteTaskStore,
-    TaskExecutionSource,
 )
 
 _NAMESPACE = "project:cayu"

@@ -270,7 +270,7 @@ def build_maintenance_app() -> CayuApp:
         "operations/maintenance_requests.py"
     ] = '''"""Host-owned capture of the accepted coding configuration; read-only."""
 
-from cayu import LocalWorkspace
+from cayu.workspaces import LocalWorkspace
 from domain.coding_product import CodingProductTask
 from domain.maintenance_case import SEED_BASE_REVISION, corpus_fingerprint
 from domain.maintenance_request import (
@@ -313,7 +313,9 @@ async def capture_accepted_request(application, task):
 
 from contextlib import aclosing
 
-from cayu import CodingProductArtifactRepository, EventType, complete_managed_task
+from cayu.coding_products import CodingProductArtifactRepository
+from cayu import EventType
+from cayu.tasks import complete_managed_task
 from domain.maintenance_acceptance import MaintenanceAcceptanceRejected
 from domain.maintenance_request import decode_request
 from operations.maintenance_intake import load_claimed_coding_identity
@@ -359,18 +361,8 @@ async def handle_coding_task(application, reservations, claimed, worker_id):
         "workflows/maintenance_delivery.py"
     ] = '''"""Verified host-side Git handoff; no automatic approval or merge."""
 
-from cayu import (
-    CodingProductPublication,
-    GitHubDeliveryApproval,
-    GitHubDeliveryPublication,
-    GitHubPullRequestConnector,
-    GitHubPullRequestDeliveryRequest,
-    RemoteGitDeliveryApproval,
-    RemoteGitDeliveryBroker,
-    RemoteGitDeliveryPublication,
-    RemoteGitDeliveryRequest,
-    RemoteGitPreparedIntent,
-)
+from cayu.coding_products import CodingProductPublication
+from cayu.delivery import GitHubDeliveryApproval, GitHubDeliveryPublication, GitHubPullRequestConnector, GitHubPullRequestDeliveryRequest, RemoteGitDeliveryApproval, RemoteGitDeliveryBroker, RemoteGitDeliveryPublication, RemoteGitDeliveryRequest, RemoteGitPreparedIntent
 from domain.coding_product import CodingProductTask
 from workflows.coding_product import CodingProductApplication
 

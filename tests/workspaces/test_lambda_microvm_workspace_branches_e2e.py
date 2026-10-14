@@ -23,9 +23,8 @@ from tests.workspaces.remote_branch_live_support import (
     FileWorkspaceBranchAuthorityProvider,
 )
 
-from cayu import (
-    ExecCommand,
-    LambdaMicroVMRunner,
+from cayu.runners import ExecCommand, LambdaMicroVMRunner
+from cayu.workspaces import (
     RunnerWorkspace,
     WorkspaceBranchAuthority,
     WorkspaceBranchBindingAuthority,

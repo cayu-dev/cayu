@@ -5,10 +5,10 @@ import asyncio
 import pytest
 from tests.evals.test_browser_acceptance_operator_trust import certificate_and_key
 
-from cayu import SQLiteSessionStore
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.internal.browser_acceptance import build
 from cayu.evals.internal.browser_acceptance_operator_server import operator_fixture_setup
+from cayu.storage import SQLiteSessionStore
 
 
 @pytest.mark.parametrize("phase", ["profile", "construction", "early_exit"])

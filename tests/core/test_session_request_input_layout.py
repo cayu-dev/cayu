@@ -29,7 +29,7 @@ def test_input_evidence_historical_public_identity(name):
     canonical = getattr(owner, name)
     assert getattr(importlib.import_module("cayu.sessions.base"), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
-    for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+    for module in ("cayu.sessions",):
         exports = importlib.import_module(module + "._exports").EXPORTS
         if name in exports:
             assert exports[name] == ("cayu.sessions.transcript_input", name)

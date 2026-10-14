@@ -6,7 +6,7 @@ from tests.core.test_collaboration_request_foundation import public_setup
 from tests.core.test_collaboration_waits import wait_for
 from tests.core.test_participant_identity import CONTEXT
 
-from cayu import WaitDiscoveryCursor
+from cayu.collaboration import WaitDiscoveryCursor
 from cayu.collaboration._contracts import ExactConflict, ExactMatch, ExactNotFound
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationAccessDenied
 

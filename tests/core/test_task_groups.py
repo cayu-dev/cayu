@@ -7,8 +7,11 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import (
     TaskCreate,
     TaskGraphCreate,
     TaskGraphNode,
@@ -16,9 +19,6 @@ from cayu import (
     TaskGroupPolicy,
     TaskGroupStatus,
 )
-from cayu.storage.migrations import SchemaMode
-from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus

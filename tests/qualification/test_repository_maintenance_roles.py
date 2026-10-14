@@ -138,7 +138,8 @@ def build_maintenance_app():
     import asyncio
     from pathlib import Path
     from types import SimpleNamespace
-    from cayu import CayuApp, InMemoryTaskStore
+    from cayu import CayuApp
+    from cayu.tasks import InMemoryTaskStore
     from operations import maintenance_roles
 
     app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)

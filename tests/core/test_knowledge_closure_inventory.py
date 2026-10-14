@@ -20,7 +20,8 @@ from cayu.storage.memory import (
 def test_knowledge_artifact_references_survive_partial_closure_retry(tmp_path):
     from tests.core.session_closure_conformance import create_closure_session
 
-    from cayu import CayuApp, LocalArtifactStore
+    from cayu import CayuApp
+    from cayu.artifacts import LocalArtifactStore
     from cayu.runtime.session_closure import ArtifactSessionClosureStore
 
     class FailingArtifacts(LocalArtifactStore):

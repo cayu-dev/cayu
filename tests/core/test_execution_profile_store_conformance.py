@@ -5,7 +5,6 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import EXECUTION_PROFILE_METADATA_KEY, SQLiteSessionStore
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.events import Event, EventType, event_with_runtime_envelope_authority
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
@@ -33,6 +32,7 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     execution_profile_decision_payload,
 )
+from cayu.sessions import EXECUTION_PROFILE_METADATA_KEY
 from cayu.sessions._interaction_transitions import (
     InteractionTransitionSpec,
     SessionInvocationAdmission,
@@ -42,6 +42,7 @@ from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest, run_request_with_runtime_session_instance_authority
 from cayu.sessions.store import SessionStore
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.exposure import ToolCapabilityCeiling
 
 
@@ -726,7 +727,7 @@ def test_execution_profile_rejection_is_atomic_in_local_stores(
 
 def test_execution_profile_rejection_is_atomic_in_postgres(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         store = PostgresSessionStore(

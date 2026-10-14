@@ -6,16 +6,8 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    McpServerSpec,
-    Message,
-    RunRequest,
-    StdioMcpClient,
-    StdioMcpProcessLifetime,
-    connect_mcp_toolset,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.mcp import McpServerSpec, StdioMcpClient, StdioMcpProcessLifetime, connect_mcp_toolset
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 

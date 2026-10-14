@@ -20,14 +20,11 @@ from tests.core.verified_worker_fixtures import (
     verified_worker_store_factory as verified_worker_store_factory,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CompletionDecisionApplicationRequest,
+from cayu import AgentSpec, CayuApp
+from cayu.tasks import CompletionDecisionApplicationRequest, TaskCreate, TaskStatus
+from cayu.verification import (
     CompletionResultResolutionRequest,
     CompletionVerifierExecutionRequest,
-    TaskCreate,
-    TaskStatus,
     VerifiedTaskWorker,
 )
 

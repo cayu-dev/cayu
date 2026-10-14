@@ -9,15 +9,12 @@ import httpx
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
+from cayu import AgentSpec, CayuApp
+from cayu.mcp import (
     DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S,
     DEFAULT_HTTP_MCP_TIMEOUT_S,
-    AgentSpec,
-    CayuApp,
     HttpMcpClient,
     McpIdleTimeoutError,
-    McpManifestPolicy,
-    McpManifestPolicyAction,
     McpProtocolError,
     McpServerSpec,
     McpToolset,
@@ -36,6 +33,7 @@ from cayu.mcp.http import (
     _decode_jsonrpc,
 )
 from cayu.mcp.tools import _default_client_for
+from cayu.runtime import McpManifestPolicy, McpManifestPolicyAction
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 _DEFAULT_TOOLS = [

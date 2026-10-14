@@ -216,7 +216,7 @@ async def test_finite_broadcast_repairs_only_unresolved_recipient(
     if second_expires == "unprepared":
         from tests.core.producer_broadcast_cleanup import settle_broadcast
 
-        from cayu import ProducerDeliveryRecovery
+        from cayu.collaboration import ProducerDeliveryRecovery
 
         pending = await app.pending_producer_outputs(
             proposal.admission.prepared.recipient, context=CONTEXT

@@ -4,11 +4,11 @@ import asyncio
 
 import pytest
 
-from cayu import PublicWebEgressPolicy
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
     HttpxUpstream,
+    PublicWebEgressPolicy,
     TransparentEgressBroker,
     VirtualCredentialRegistry,
 )

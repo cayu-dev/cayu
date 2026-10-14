@@ -13,20 +13,18 @@ import json
 
 from cayu import (
     AgentSpec,
-    AuxiliaryInferencePolicy,
     CayuApp,
     EventType,
-    InferenceLimits,
     Message,
-    ModelRequest,
-    ModelStreamEvent,
     RunRequest,
-    ScriptedModelProvider,
     Tool,
     ToolContext,
     ToolResult,
     ToolSpec,
 )
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelRequest, ModelStreamEvent
+from cayu.tools import AuxiliaryInferencePolicy, InferenceLimits
 
 MODEL = "demo-model"
 LIMITS = InferenceLimits(max_input_tokens=100, max_output_tokens=50, timeout_seconds=10)

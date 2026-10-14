@@ -38,11 +38,10 @@ from tests.runners.lambda_microvm_harness import (
 )
 
 import cayu.runners.aws_lambda_microvm as runner_module
-from cayu import ExecCommand, LambdaMicroVMRunner
 from cayu.cli.lambda_microvm import _export_sidecar
 from cayu.egress._remote_adapter import PROXY_TRANSPORT_TOKEN_ENV
 from cayu.egress.proxy_server import TransparentEgressProxyServer
-from cayu.runners import LambdaMicroVMBrowserWorkloadError
+from cayu.runners import ExecCommand, LambdaMicroVMBrowserWorkloadError, LambdaMicroVMRunner
 from cayu.runners.aws_lambda_microvm import (
     LAMBDA_MICROVM_MAX_OUTPUT_BYTES,
     LAMBDA_MICROVM_MAX_STDIN_BYTES,

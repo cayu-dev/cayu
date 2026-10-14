@@ -25,17 +25,10 @@ from examples.repo_maintainer_tournament.candidate_gates import (
     write_baseline,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileAdoptionIntent,
-    Message,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    StructuredOutputSpec,
-)
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.context import StructuredOutputSpec
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.providers import ModelProvider
 
 CANDIDATE_SCHEMA: dict[str, Any] = {

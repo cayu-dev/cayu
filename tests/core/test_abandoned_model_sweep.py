@@ -8,7 +8,8 @@ import sys
 import pytest
 from tests.core.test_abandoned_model_call_resume import _app, _consume, _LostProvider, _open
 
-from cayu import EventType, Message, ModelStreamEvent, ResumeRequest, SessionStatus
+from cayu import EventType, Message, ResumeRequest, SessionStatus
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._run_limits import UNKNOWN_POST_DISPATCH_BUDGET_REASON
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction
 

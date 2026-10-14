@@ -5,24 +5,14 @@ import sys
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    NamedCheck,
-    ProcessCommandPolicy,
-    RunCheckTool,
-    RunRequest,
-    ScriptedModelProvider,
-    StaticToolPolicy,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import ExecCommand, LocalRunner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools import NamedCheck, ProcessCommandPolicy, RunCheckTool, StaticToolPolicy
+from cayu.workspaces import LocalWorkspace
 
 
 @pytest.mark.parametrize("grouped", [False, True])

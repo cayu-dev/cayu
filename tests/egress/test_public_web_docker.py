@@ -11,13 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from cayu import BrowserSessionTool, PublicWebEgressPolicy, ToolContext
-from cayu.egress import HttpxUpstream
+from cayu import ToolContext
+from cayu.egress import HttpxUpstream, PublicWebEgressPolicy
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
 from cayu.evals.browser_acceptance_fixture import _fixture_address
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.tools import BrowserSessionTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import SecretRedactor
@@ -226,20 +227,14 @@ def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch, large_
 
 def test_public_web_normal_run_navigates(tmp_path):
     """Exercise public profile admission and inspect actual native tool output."""
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        EnvironmentSpec,
-        ExecutionProfileBehaviorIdentity,
-        InMemorySessionStore,
-        LocalArtifactStore,
-        Message,
-        ModelStreamEvent,
-        RunRequest,
-        ScriptedModelProvider,
-        WebBridge,
-        run_to_completion,
-    )
+    from cayu import AgentSpec, CayuApp, Message, RunRequest, run_to_completion
+    from cayu.artifacts import LocalArtifactStore
+    from cayu.environments import EnvironmentSpec
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+    from cayu.sessions import InMemorySessionStore
+    from cayu.tools import WebBridge
 
     async def scenario():
         repo = Path(__file__).resolve().parents[2]

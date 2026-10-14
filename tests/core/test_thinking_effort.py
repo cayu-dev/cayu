@@ -8,20 +8,17 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    AgentSpec,
-    AnthropicProvider,
-    CayuConfig,
-    ChatCompletionsProvider,
-    Message,
-    OpenAIProvider,
-    ResumeRequest,
-    RunDefaults,
-    RunRequest,
-    ThinkingConfig,
-)
+from cayu import AgentSpec, CayuConfig, Message, ResumeRequest, RunRequest
+from cayu.configuration import RunDefaults
+from cayu.context import ThinkingConfig
 from cayu.context.thinking import ThinkingEffort
-from cayu.providers import ModelRequest, ModelStreamEventType
+from cayu.providers import (
+    AnthropicProvider,
+    ChatCompletionsProvider,
+    ModelRequest,
+    ModelStreamEventType,
+    OpenAIProvider,
+)
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.bedrock import BedrockProvider, build_bedrock_converse_payload
 from cayu.providers.chat_completions import HttpxChatCompletionsTransport

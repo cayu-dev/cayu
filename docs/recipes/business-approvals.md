@@ -48,7 +48,7 @@ the adapter never guesses it. You provide a callback (sync or async; it may
 hit your database) and `TieredApprovalPolicy` standardizes the carrier:
 
 ```python
-from cayu import BusinessApprovalRouting, TieredApprovalPolicy
+from cayu.approvals import BusinessApprovalRouting, TieredApprovalPolicy
 
 async def compute_routing(request):
     if request.tool_name != "route_package":
@@ -80,7 +80,7 @@ The pause is Cayu's ordinary durable approval interrupt: a
 routing rides along — an approval inbox reads it straight off the event:
 
 ```python
-from cayu import BUSINESS_APPROVAL_ROUTING_METADATA_KEY, BusinessApprovalRouting
+from cayu.approvals import BUSINESS_APPROVAL_ROUTING_METADATA_KEY, BusinessApprovalRouting
 
 approval = approval_requested_event.payload["approval"]
 routing = BusinessApprovalRouting.model_validate(
@@ -95,7 +95,7 @@ tier this approval needs.
 ## 3. Resolve with the tier gate and three outcomes
 
 ```python
-from cayu import BusinessApprovalOutcome, resolve_business_approval
+from cayu.approvals import BusinessApprovalOutcome, resolve_business_approval
 
 events = await resolve_business_approval(
     app,
@@ -156,7 +156,7 @@ The stamped record lands durably on the `tool.call.approved` /
 projection of the event log — no side table to keep consistent:
 
 ```python
-from cayu import business_approval_audit
+from cayu.approvals import business_approval_audit
 
 records = business_approval_audit(await store.load_events(session_id))
 for r in records:

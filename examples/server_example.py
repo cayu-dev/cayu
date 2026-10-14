@@ -24,22 +24,15 @@ from pathlib import Path
 
 import uvicorn
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    ListFilesTool,
-    LocalRunner,
-    LocalWorkspace,
-    ReadFileTool,
-    RecentTurnsContextPolicy,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    WriteFileTool,
-    public_authority_alias_codec_from_environment,
-)
+from cayu import AgentSpec, CayuApp
+from cayu.context import RecentTurnsContextPolicy
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runners import LocalRunner
+from cayu.runtime import public_authority_alias_codec_from_environment
 from cayu.server import BasicAuth, ServerConfig, create_server
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.workspaces import LocalWorkspace
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "server"
 DATA_DIR = WORKSPACE / "data"
@@ -100,19 +93,19 @@ def _server_auth() -> BasicAuth:
 
 def _register_provider(app: CayuApp) -> str:
     if os.environ.get("OPENAI_API_KEY"):
-        from cayu import OpenAIProvider
+        from cayu.providers import OpenAIProvider
 
         app.register_provider(OpenAIProvider(), default=True)
         return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.6")
 
     if os.environ.get("ANTHROPIC_API_KEY"):
-        from cayu import AnthropicProvider
+        from cayu.providers import AnthropicProvider
 
         app.register_provider(AnthropicProvider(), default=True)
         return os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
     if os.environ.get("GEMINI_API_KEY"):
-        from cayu import ChatCompletionsProvider
+        from cayu.providers import ChatCompletionsProvider
 
         app.register_provider(
             ChatCompletionsProvider(

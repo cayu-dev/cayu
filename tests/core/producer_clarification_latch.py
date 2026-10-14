@@ -7,7 +7,8 @@ from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_participant_identity import app as make_app
 from tests.core.test_peer_content import QualifiedPeerProvider
 
-from cayu import AgentSpec, ProducerOutputProposal
+from cayu import AgentSpec
+from cayu.collaboration import ProducerOutputProposal
 from cayu.collaboration._clarification_state import clarification_commitment
 from cayu.collaboration._contracts import ObjectRef, OwnerRef
 from cayu.collaboration._producer_acceptance import ProducerOutputAcceptanceReader

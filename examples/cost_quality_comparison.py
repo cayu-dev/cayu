@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from decimal import Decimal
 
-from cayu import (
+from cayu.budgets import (
     ComparableGenerationSettings,
     ComparableOutputBudget,
     ComparisonCostLineItem,

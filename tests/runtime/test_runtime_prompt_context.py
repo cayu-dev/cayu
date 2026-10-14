@@ -434,7 +434,8 @@ def test_attach_file_rejects_image_over_decoded_size_limit(tmp_path):
 
     from PIL import Image
 
-    from cayu import CayuConfig, ToolExecutionConfig
+    from cayu import CayuConfig
+    from cayu.configuration import ToolExecutionConfig
 
     buffer = io.BytesIO()
     Image.new("RGB", (15, 10), "white").save(buffer, format="PNG")

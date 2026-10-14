@@ -6,10 +6,10 @@ import json
 import pytest
 from tests.core.test_tool_result_projection import _collect, _ReadbackProvider, _ResultTool
 
-from cayu import ArtifactScope, Environment, EnvironmentSpec, SecretRedactor
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
-from cayu.artifacts import ArtifactStore, LocalArtifactStore
+from cayu.artifacts import ArtifactScope, ArtifactStore, LocalArtifactStore
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
@@ -17,6 +17,7 @@ from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.files import ReadFileTool
 from cayu.tools.result_projection import ArtifactExternalizingToolResultPolicy
+from cayu.vaults import SecretRedactor
 
 
 def _page_text(result):

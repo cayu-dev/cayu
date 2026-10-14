@@ -6,19 +6,13 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Message,
-    RunRequest,
-    ThinkingConfig,
-    ThinkingPart,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.budgets.usage import normalize_usage_metrics
+from cayu.context import ThinkingConfig
 from cayu.context.thinking import MIN_THINKING_BUDGET_TOKENS, thinking_config_payload
 from cayu.events import Event, EventType
 from cayu.execution_units import new_model_step_identity
-from cayu.messages import MessageRole, ProviderStatePart, TextPart, copy_message_part
+from cayu.messages import MessageRole, ProviderStatePart, TextPart, ThinkingPart, copy_message_part
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from cayu.providers.anthropic import (
     _anthropic_message,

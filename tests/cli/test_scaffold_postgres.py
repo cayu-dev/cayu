@@ -6,17 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    PostgresKnowledgeStore,
-    PostgresSessionStore,
-    PostgresTaskStore,
-    SessionQuery,
-    TaskCreate,
-    TaskQuery,
-)
 from cayu.cli import main
 from cayu.cli.project import project_context
+from cayu.sessions import SessionQuery
+from cayu.storage import PostgresKnowledgeStore, PostgresSessionStore, PostgresTaskStore
 from cayu.storage.migrations import SchemaMode
+from cayu.tasks import TaskCreate, TaskQuery
 
 
 @pytest.mark.parametrize("preset", ["agent", "service", "coding"])
@@ -84,8 +79,10 @@ def test_generated_service_settles_product_operations_on_postgres(
 ) -> None:
     import httpx
 
-    from cayu import ModelStreamEvent, PostgresProductOperationStore, ScriptedModelProvider
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
     from cayu.server import ServiceMode
+    from cayu.storage import PostgresProductOperationStore
 
     assert main(["new", "pgservice", "--preset", "service", "--dir", str(tmp_path), "--json"]) == 0
     capsys.readouterr()

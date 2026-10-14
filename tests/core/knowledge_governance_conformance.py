@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
-from cayu import (
+from cayu._validation import canonical_durable_json_bytes
+from cayu.knowledge.governance import decide_knowledge_activation
+from cayu.storage import (
     MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES,
     MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
     KnowledgeAccessDenied,
@@ -22,10 +24,8 @@ from cayu import (
     KnowledgeRevisionConflict,
     KnowledgeStatus,
     KnowledgeStore,
-    decide_knowledge_activation,
     prepare_knowledge_activation_request,
 )
-from cayu._validation import canonical_durable_json_bytes
 
 _NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 

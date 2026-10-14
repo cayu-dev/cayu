@@ -4,23 +4,18 @@ import asyncio
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
+from cayu import AgentSpec, CayuApp, CayuConfig, Message, RunRequest
+from cayu.configuration import EvalConfig
+from cayu.evals import (
     EvalCase,
-    EvalConfig,
     EvalPlan,
     EvalSuite,
     EvalSuiteTrialPolicyV1,
     FinalOutputContains,
-    Message,
-    ModelProvider,
-    ModelStreamEvent,
-    RunRequest,
     run_eval_plan,
     run_eval_suite,
 )
+from cayu.providers import ModelProvider, ModelStreamEvent
 
 
 class _ConcurrentProvider(ModelProvider):

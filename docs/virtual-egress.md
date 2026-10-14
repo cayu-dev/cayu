@@ -23,7 +23,7 @@ That is a convenience mode, not a security boundary.
 | `trusted_tool` | No | Host-side bounded actions (send one email, create one invoice). |
 | `virtual_egress` | No | Normal apps under development that need provider SDKs to work unchanged. |
 
-See `cayu.CredentialMode`. `raw_env` remains fully supported and
+See `cayu.egress.CredentialMode`. `raw_env` remains fully supported and
 backward-compatible; it is simply labeled as *raw secret injection*.
 
 ## Security invariant
@@ -183,7 +183,7 @@ untrusted preset's `available` default while requiring the deny-by-default
 network preflight to remain live and fresh:
 
 ```python
-from cayu import ExecutionEvidenceOverride, ExecutionRequirements
+from cayu.environments import ExecutionEvidenceOverride, ExecutionRequirements
 
 execution_requirements = ExecutionRequirements.untrusted(
     evidence_overrides=(
@@ -252,12 +252,12 @@ secret is resolved. Use the explicit upstream route mapping when a logical
 credential hostname must reach a private service origin.
 
 ```python
-from cayu import (
-    AgentSpec, CayuApp, EnvironmentSpec, ExecutionProfileBehaviorIdentity,
-    ExecutionRequirements, HttpEgressPolicy, SecretRef, StaticVault,
-    VirtualCredentialSpec, VirtualEgressEnvironmentFactory,
-)
-from cayu.runtime import VIRTUAL_EGRESS_EVENT_TYPES
+from cayu import AgentSpec, CayuApp
+from cayu.environments import EnvironmentSpec, ExecutionRequirements
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.egress import HttpEgressPolicy, VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.vaults import SecretRef, StaticVault
+from cayu.egress import VIRTUAL_EGRESS_EVENT_TYPES
 
 app = CayuApp()
 vault = StaticVault({"stripe_test_key": "sk_test_..."})
@@ -324,18 +324,11 @@ access through the same adapter boundary:
 ```python
 import asyncio
 
-from cayu import (
-    ApprovedEgressDestination,
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    ExecCommandTool,
-    HttpEgressPolicy,
-    Message,
-    OpenAIProvider,
-    RunRequest,
-    VirtualEgressEnvironmentFactory,
-)
+from cayu.egress import ApprovedEgressDestination, HttpEgressPolicy, VirtualEgressEnvironmentFactory
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import EnvironmentSpec
+from cayu.tools import ExecCommandTool
+from cayu.providers import OpenAIProvider
 
 app = CayuApp()
 factory = VirtualEgressEnvironmentFactory(
@@ -497,19 +490,11 @@ fails closed. Chromium-ignored frame subtrees remain inside frame, network, and
 DOM-node limits but are excluded from representation selection and output.
 
 ```python
-from cayu import (
-    ApprovedEgressDestination,
-    AgentSpec,
-    BrowserEgressPolicy,
-    BrowserWebFetchAdapter,
-    CayuApp,
-    EnvironmentSpec,
-    ExecutionRequirements,
-    S3ArtifactStore,
-    ScreenshotPageTool,
-    VirtualEgressEnvironmentFactory,
-    WebFetchTool,
-)
+from cayu.egress import ApprovedEgressDestination, BrowserEgressPolicy, VirtualEgressEnvironmentFactory
+from cayu import AgentSpec, CayuApp
+from cayu.tools import BrowserWebFetchAdapter, ScreenshotPageTool, WebFetchTool
+from cayu.environments import EnvironmentSpec, ExecutionRequirements
+from cayu.artifacts import S3ArtifactStore
 from cayu.egress.docker_adapter import DockerEgressAdapter
 
 browser_hosts = ("docs.example.com", "static.example.com")
@@ -715,16 +700,11 @@ sandboxes and untrusted peers.
 > Microsandbox identities can still use the reconnect contract below.
 
 ```python
-from cayu import (
-    CayuApp,
-    EnvironmentSpec,
-    HttpEgressPolicy,
-    MicrosandboxWorkspace,
-    SecretRef,
-    StaticVault,
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-)
+from cayu import CayuApp
+from cayu.environments import EnvironmentSpec
+from cayu.egress import HttpEgressPolicy, VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.workspaces import MicrosandboxWorkspace
+from cayu.vaults import SecretRef, StaticVault
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 
 app = CayuApp()
@@ -839,11 +819,7 @@ and before invocation admission. The handler persists the authorization and asks
 *target* factory to install its configuration on the retained environment:
 
 ```python
-from cayu import (
-    EgressAuthorityAdoptionHandler,
-    authorized_egress_authority_transition,
-    egress_authority_owner_fingerprint,
-)
+from cayu.egress import EgressAuthorityAdoptionHandler, authorized_egress_authority_transition, egress_authority_owner_fingerprint
 
 class BillingEgressAdoption(EgressAuthorityAdoptionHandler):
     async def adopt(
@@ -1035,7 +1011,7 @@ Enable reconnect explicitly on every worker using the same **private host-local*
 state directory and the same factory execution-profile declaration:
 
 ```python
-from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.egress.docker_adapter import DockerEgressAdapter
 
 adapter = DockerEgressAdapter(
@@ -1214,7 +1190,7 @@ parked allocations. A fresh process uses the durable create-or-lookup path,
 not the process-local parked handle.
 
 ```python
-from cayu import E2BWorkspace
+from cayu.workspaces import E2BWorkspace
 from cayu.egress import EgressAdapterRegistry
 from cayu.egress.e2b_adapter import E2BEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy, ProxyExposure
@@ -1605,7 +1581,7 @@ Applications may explicitly admit public HTTPS research without enumerating futu
 hosts. Keep this environment separate from credentialed integrations:
 
 ```python
-from cayu import PublicWebEgressPolicy, VirtualEgressEnvironmentFactory
+from cayu.egress import PublicWebEgressPolicy, VirtualEgressEnvironmentFactory
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
 
 research = VirtualEgressEnvironmentFactory(

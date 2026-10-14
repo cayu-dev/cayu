@@ -7,10 +7,9 @@ import warnings
 
 import pytest
 
-import cayu
 import cayu.collaboration
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.collaboration import (
     CollaborationAccessContext,
     CollaborationHost,
     HostOwnershipLimits,
@@ -54,15 +53,14 @@ async def test_host_continuation_rejects_mutated_resume_without_diagnostic_discl
 
     from tests.core.test_session_continuation import _ready_continuation
 
-    from cayu import (
+    from cayu import Message, ResumeRequest
+    from cayu._exception_groups import iter_exception_tree
+    from cayu.collaboration import (
         ContinuationRecovery,
         ContinuationService,
         HostContinuationRule,
-        Message,
         ParticipantSessionReference,
-        ResumeRequest,
     )
-    from cayu._exception_groups import iter_exception_tree
     from cayu.runtime._session_continuation import continuation_operation_key
 
     store, ticket, latch = await _ready_continuation()
@@ -135,9 +133,8 @@ async def test_host_continuation_rejects_mutated_resume_without_diagnostic_discl
 @pytest.mark.parametrize("name", PUBLIC_HOST_NAMES)
 def test_public_host_exports_use_one_native_type(name):
     module = importlib.import_module("cayu.collaboration.host")
-    assert name in vars(cayu)["__all__"]
     assert name in vars(cayu.collaboration)["__all__"]
-    assert getattr(cayu, name) is getattr(cayu.collaboration, name) is getattr(module, name)
+    assert getattr(cayu.collaboration, name) is getattr(module, name)
 
 
 @pytest.mark.parametrize(
@@ -154,9 +151,9 @@ def test_public_host_exports_use_one_native_type(name):
     ),
 )
 def test_public_host_reconstruction_contracts_are_exported(name):
-    assert name in vars(cayu)["__all__"]
     assert name in vars(cayu.collaboration)["__all__"]
-    assert getattr(cayu, name) is getattr(cayu.collaboration, name)
+    assert name in dir(cayu.collaboration)
+    assert getattr(cayu.collaboration, name) is not None
 
 
 @pytest.mark.parametrize("registered", [False, True])

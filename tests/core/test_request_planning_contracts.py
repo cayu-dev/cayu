@@ -42,7 +42,7 @@ def test_planning_schema_fences_unqualified_older_writers():
 
 
 def test_planning_public_exports_share_the_native_types():
-    import cayu
+    import cayu.collaboration
     import cayu.collaboration as collaboration
 
     for name in (
@@ -76,9 +76,10 @@ def test_planning_public_exports_share_the_native_types():
         "RequestPlanningPage",
         "planning_policy_commitment",
     ):
-        assert name in cayu.__all__ and name in collaboration.__all__
-        assert getattr(cayu, name) is getattr(collaboration, name)
-    assert cayu.RequestPlanningDefer is RequestPlanningDefer
+        assert name in collaboration.__all__
+        assert name in dir(collaboration)
+        assert getattr(collaboration, name) is not None
+    assert cayu.collaboration.RequestPlanningDefer is RequestPlanningDefer
 
 
 def _policy():

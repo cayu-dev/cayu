@@ -18,16 +18,10 @@ retain their own list/read behavior.
 ```python
 from hashlib import sha256
 
-from cayu import (
-    DockerCodingCommandAuthority,
-    DockerCodingDependencyInput,
-    DockerCodingEnvironmentFactory,
-    DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    LocalWorkspace,
-    RunCommandTool,
-    StructuredCommandToolPolicy,
-)
+from cayu.environments import DockerCodingCommandAuthority, DockerCodingDependencyInput, DockerCodingEnvironmentFactory, DockerCodingToolchainProfile
+from cayu.runners import DockerImageIdentity
+from cayu.workspaces import LocalWorkspace
+from cayu.tools import RunCommandTool, StructuredCommandToolPolicy
 
 lock = workspace_root.joinpath("Cargo.lock").read_bytes()
 profile = DockerCodingToolchainProfile(

@@ -7,7 +7,7 @@ transient controller or memory state. The conversation drives the provider
 directly with ``ModelRequest``, as a custom agent bridge does.
 
 Each turn records the provider-reported input, cache-read, cache-write and
-uncached input tokens, and a cost estimate from ``cayu.default_price_book()``.
+uncached input tokens, and a cost estimate from ``cayu.budgets.default_price_book()``.
 """
 
 from __future__ import annotations
@@ -19,12 +19,8 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from cayu import (
-    Message,
-    default_price_book,
-    estimate_model_step_cost,
-    normalize_usage_metrics,
-)
+from cayu import Message
+from cayu.budgets import default_price_book, estimate_model_step_cost, normalize_usage_metrics
 from cayu.providers import ModelProvider, ModelRequest
 
 SCENARIO = "late_system_message_caching"

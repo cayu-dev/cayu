@@ -9,32 +9,21 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
-    AgentSpec,
-    AllowlistProxy,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, ToolContext, ToolResult
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.proxies import AllowlistProxy, ProxyAuthorizationResult
+from cayu.sessions import InMemorySessionStore
+from cayu.tools import (
     ExaWebAdapter,
-    InMemorySessionStore,
-    Message,
-    ModelStreamEvent,
-    ProxyAuthorizationResult,
-    ResolvedSecret,
-    RunRequest,
-    ScriptedModelProvider,
-    SecretRedactor,
-    SecretRef,
-    StaticVault,
-    ToolContext,
-    ToolResult,
     WebBridge,
     WebBridgeCredentialAuthority,
     WebFetchTool,
     WebSearchRestrictions,
     WebSearchTool,
 )
+from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
 
 _API_KEY = "exa-test-secret-value"
 _API_KEY_REF = SecretRef(name="exa_api_key")

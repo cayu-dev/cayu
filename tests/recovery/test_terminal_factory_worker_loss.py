@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 from tests.recovery.test_named_check_durable_recovery import build_app, wait_file
 
-from cayu import InterruptSessionRequest
-from cayu.runtime import (
+from cayu.sessions import (
+    InterruptSessionRequest,
     RecoveryDecision,
     RecoveryExecutionRequest,
     RecoveryPlanAction,

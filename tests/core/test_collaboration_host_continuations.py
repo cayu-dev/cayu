@@ -12,8 +12,8 @@ from tests.core.test_collaboration_waits import wait_for
 from tests.core.test_participant_identity import CONTEXT, app
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import ContinuationConflict
 from cayu.agents import AgentSpec
+from cayu.collaboration import ContinuationConflict
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationAccessDenied
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
@@ -136,7 +136,12 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
         assert len(provider.requests) == 1
         # The replacement host receives the election through the native latch
         # owner; discovery alone does not execute the parked invocation.
-        from cayu import CollaborationHost, HostOwnershipLimits, HostRegistration, HostWaitRule
+        from cayu.collaboration import (
+            CollaborationHost,
+            HostOwnershipLimits,
+            HostRegistration,
+            HostWaitRule,
+        )
         from cayu.collaboration.requests import RequestControl
 
         await application.control_collaboration_request(
@@ -233,7 +238,7 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
         assert host.inspect().failed == 0
         assert retained.ticket.state == "WAITING"
         assert len(provider.requests) == 1
-        from cayu import ContinuationService, HostContinuationRule
+        from cayu.collaboration import ContinuationService, HostContinuationRule
         from cayu.sessions import ResumeRequest
 
         other.register_provider(provider, default=True)
@@ -514,7 +519,7 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
                     pass
             assert len(provider.requests) == 2
         if not cancel_observer and not disable_before_reconcile:
-            from cayu import ContinuationRecoveryExpectation
+            from cayu.sessions import ContinuationRecoveryExpectation
             from cayu.sessions._session_continuation_store import digest
             from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
 

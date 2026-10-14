@@ -9,10 +9,11 @@ from uuid import uuid4
 import pytest
 from tests.core.test_task_group_quiescence import request as group_request
 
-from cayu import CayuApp, TaskCreate, TaskGraphNode
+from cayu import CayuApp
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import TaskCreate, TaskGraphNode
 
 pytestmark = pytest.mark.process
 
@@ -20,7 +21,8 @@ _CHILD = r"""
 import asyncio
 import sys
 from pathlib import Path
-from cayu import CayuApp, TaskGroupEventType, TaskGroupQuiescenceStatus
+from cayu import CayuApp
+from cayu.tasks import TaskGroupEventType, TaskGroupQuiescenceStatus
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.tasks.queries import TaskQuery

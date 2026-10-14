@@ -9,7 +9,7 @@ from tests.core.test_prepared_admission_public import native_stores as native_st
 from tests.core.test_producer_output_contracts import output_scenario
 from tests.core.test_request_planning_public import complete_plan, scenario
 
-from cayu import CollaborationHost, HostOwnershipLimits, HostRegistration
+from cayu.collaboration import CollaborationHost, HostOwnershipLimits, HostRegistration
 from cayu.collaboration._host import _PlanningRule, _ProducerRegistrationRule
 from cayu.collaboration._host_planned_producer import HostPlannedProducer, _PlannedProducerRule
 

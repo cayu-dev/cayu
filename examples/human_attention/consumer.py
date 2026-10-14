@@ -13,8 +13,10 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from cayu import CayuApp, Event, HumanAttentionReference, HumanAttentionRequest, PendingActionQuery
+from cayu import CayuApp, Event
 from cayu.observability.events import EventSink
+from cayu.runtime import HumanAttentionReference, HumanAttentionRequest
+from cayu.sessions import PendingActionQuery
 
 REFRESH_EVENTS = frozenset(
     {

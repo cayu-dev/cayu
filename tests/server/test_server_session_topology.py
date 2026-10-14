@@ -11,13 +11,8 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import (
-    REDACTED_SECRET,
-    CayuApp,
-    Message,
-    SecretRedactor,
-    default_price_book,
-)
+from cayu import CayuApp, Message
+from cayu.budgets import default_price_book
 from cayu.events import Event, EventType
 from cayu.server import ServerConfig, create_server
 from cayu.server import routes as server_routes
@@ -26,6 +21,7 @@ from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.topology import SessionTopologyQuery
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 def _identity() -> SessionIdentity:

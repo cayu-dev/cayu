@@ -8,26 +8,28 @@ from tests.core.test_knowledge_maintenance_persistence import (
     _publisher,
 )
 
-from cayu import (
+from cayu.knowledge.maintenance_governance import (
+    KnowledgeMaintenanceGovernanceAuthority,
+    KnowledgeMaintenanceGovernanceDecision,
+    KnowledgeMaintenanceGovernanceDisposition,
+    KnowledgeMaintenanceGovernor,
+    decide_knowledge_maintenance_governance,
+    load_knowledge_maintenance_governance_receipt,
+    maintenance_decision_from_governance,
+    prepare_knowledge_maintenance_governance_request,
+)
+from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeGovernanceConfig,
     KnowledgeGovernanceMode,
     KnowledgeMaintenanceConflict,
     KnowledgeMaintenanceDecision,
     KnowledgeMaintenanceDecisionKind,
-    KnowledgeMaintenanceGovernanceAuthority,
-    KnowledgeMaintenanceGovernanceDecision,
-    KnowledgeMaintenanceGovernanceDisposition,
-    KnowledgeMaintenanceGovernor,
     KnowledgeMaintenanceOutcome,
     KnowledgeReviewWorkflow,
     KnowledgeStatus,
     KnowledgeStore,
-    decide_knowledge_maintenance_governance,
-    load_knowledge_maintenance_governance_receipt,
-    prepare_knowledge_maintenance_governance_request,
 )
-from cayu.knowledge.maintenance_governance import maintenance_decision_from_governance
 
 
 class MaintenanceGovernancePolicy:

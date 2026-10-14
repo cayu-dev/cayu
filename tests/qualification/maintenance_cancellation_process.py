@@ -17,11 +17,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from cayu import ExecCommand, LocalRunner
 from cayu.cli.project import project_context
 from cayu.coding_products import CodingProductRunner
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelStreamEvent
+from cayu.runners import ExecCommand, LocalRunner
 from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.tasks.queries import TaskQuery

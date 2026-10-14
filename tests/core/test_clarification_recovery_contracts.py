@@ -3,7 +3,7 @@
 import pytest
 from tests.core.test_clarification_service_api import service_request
 
-from cayu import (
+from cayu.collaboration import (
     ClarificationDeliveryRecovery,
     ClarificationDueQuestion,
     ClarificationDueQuestionPage,

@@ -4,24 +4,12 @@ import asyncio
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    AuxiliaryInferencePolicy,
-    CayuApp,
-    CayuConfig,
-    EventType,
-    IncompleteSessionRecoveryRequest,
-    InferenceLimits,
-    Message,
-    ModelRequest,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    Tool,
-    ToolExecutionConfig,
-    ToolSpec,
-)
-from cayu.providers import ModelProviderError
+from cayu import AgentSpec, CayuApp, CayuConfig, EventType, Message, RunRequest, Tool, ToolSpec
+from cayu.configuration import ToolExecutionConfig
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelProviderError, ModelRequest, ModelStreamEvent
+from cayu.sessions import IncompleteSessionRecoveryRequest
+from cayu.tools import AuxiliaryInferencePolicy, InferenceLimits
 
 
 def test_stream_close_during_scope_drain_preserves_generator_exit(monkeypatch):

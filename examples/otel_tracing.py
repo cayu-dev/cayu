@@ -5,22 +5,13 @@ import os
 import sys
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ChatCompletionsProvider,
-    Environment,
-    EnvironmentSpec,
-    ExecCommandTool,
-    ListFilesTool,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    OpenTelemetryEventSink,
-    ReadFileTool,
-    RunRequest,
-    WriteFileTool,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.observability import OpenTelemetryEventSink
+from cayu.providers import ChatCompletionsProvider
+from cayu.runners import LocalRunner
+from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.workspaces import LocalWorkspace
 
 # Wire an OpenTelemetryEventSink so a cayu session is exported as a trace:
 #   cayu.session  ──  chat <model>  ──  execute_tool <tool>

@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.budgets import (
     ComparableGenerationSettings,
     ComparableOutputBudget,
     ComparisonCostLineItem,
@@ -27,7 +28,6 @@ from cayu import (
     SavingsPercentageState,
     compare_paired_cost_quality,
 )
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.pricing import (
     ModelPrice,

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 
-from cayu import ModelInfo, ModelPrice
+from cayu.budgets import ModelInfo, ModelPrice
 from maintenance.model_catalog.policy import VERIFY_MAX_AGE_DAYS
 
 

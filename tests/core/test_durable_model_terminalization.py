@@ -9,7 +9,8 @@ from tests.core.test_model_completion_recovery import (
     _stage_in_flight_model_boundary,
 )
 
-from cayu import CayuApp, EventQuery, EventType
+from cayu import CayuApp, EventType
+from cayu.sessions import EventQuery
 from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
@@ -21,7 +22,7 @@ def _store_for_backend(backend, database, request):
         return InMemorySessionStore()
     if backend == "sqlite":
         return SQLiteSessionStore(database)
-    from cayu import PostgresSessionStore
+    from cayu.storage import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
 
     return PostgresSessionStore(
@@ -36,7 +37,7 @@ def test_terminalization_without_registrations_publishes_one_outcome(
 ):
     async def exercise():
         if backend == "postgres":
-            from cayu import PostgresSessionStore
+            from cayu.storage import PostgresSessionStore
             from cayu.storage.migrations import SchemaMode
 
             store = PostgresSessionStore(
@@ -87,7 +88,7 @@ def test_terminalization_without_registrations_publishes_one_outcome(
 def test_terminalizer_settles_between_other_owners_preflight_reads(
     tmp_path, backend, request, monkeypatch
 ):
-    from cayu import SessionRunFenced
+    from cayu.sessions import SessionRunFenced
 
     async def exercise():
         store = _store_for_backend(backend, tmp_path / "preflight-race.db", request)
@@ -152,7 +153,7 @@ def test_terminalizer_settles_between_other_owners_preflight_reads(
 
 
 def test_recovery_plan_executes_terminalization_without_registrations(tmp_path):
-    from cayu import (
+    from cayu.sessions import (
         RecoveryDecision,
         RecoveryExecutionRequest,
         RecoveryItemExecutionStatus,
@@ -256,19 +257,19 @@ def test_terminalization_conservatively_settles_budget_and_retries_partial_failu
 ):
     from decimal import Decimal
 
-    from cayu import (
+    from cayu.budgets import (
         BudgetLimit,
         BudgetReservation,
         InMemoryBudgetLedger,
-        ModelAttemptIdentity,
         ModelPrice,
         PriceBook,
-        SQLiteBudgetLedger,
     )
     from cayu.budgets.base import (
         BudgetReservationRecoveryContext,
         budget_reservation_authority_sha256,
     )
+    from cayu.execution_units import ModelAttemptIdentity
+    from cayu.storage import SQLiteBudgetLedger
 
     class PartialLedger(InMemoryBudgetLedger):
         def __init__(self):
@@ -469,7 +470,7 @@ def test_terminalization_reconciles_commit_before_acknowledgement_loss(
 def test_plan_owner_change_at_publication_cannot_terminalize(
     tmp_path, monkeypatch, backend, request, authority
 ):
-    from cayu import (
+    from cayu.sessions import (
         RecoveryDecision,
         RecoveryExecutionRequest,
         RecoveryPlanAction,
@@ -600,7 +601,7 @@ def test_replanned_terminalization_resumes_elected_disposition(
 ):
     import contextvars
 
-    from cayu import (
+    from cayu.sessions import (
         RecoveryDecision,
         RecoveryExecutionRequest,
         RecoveryItemExecutionStatus,

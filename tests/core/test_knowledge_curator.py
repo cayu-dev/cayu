@@ -7,22 +7,11 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu.knowledge.curator import (
     CandidatePolicyDisposition,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeActivationDecision,
-    KnowledgeActivationDisposition,
-    KnowledgeActivationRequest,
     KnowledgeCandidatePolicyDecision,
     KnowledgeCurator,
     KnowledgeCuratorConfig,
-    KnowledgeGovernanceConfig,
-    KnowledgeGovernanceMode,
-    KnowledgeListQuery,
-    KnowledgeQuery,
-    KnowledgeReviewWorkflow,
-    KnowledgeStatus,
     LearningBatch,
     LearningBatchOutcome,
     LearningBatchResult,
@@ -35,8 +24,21 @@ from cayu import (
     LearningSignalResult,
     LearningSourceReference,
     LearningVerdict,
-    SQLiteKnowledgeStore,
     group_learning_signals,
+)
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeActivationDecision,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationRequest,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
+    KnowledgeListQuery,
+    KnowledgeQuery,
+    KnowledgeReviewWorkflow,
+    KnowledgeStatus,
+    SQLiteKnowledgeStore,
 )
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()

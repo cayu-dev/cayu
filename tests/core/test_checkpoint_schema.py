@@ -18,12 +18,6 @@ from tests.core.checkpoint_schema_conformance import (
 )
 
 import cayu._validation as validation
-from cayu import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    CheckpointCompatibilityError,
-    SQLiteSessionStore,
-)
 from cayu._validation import canonical_durable_json_bytes
 from cayu.approvals.user_input import (
     AmbiguousUserInputPauseAuthorityError,
@@ -34,6 +28,11 @@ from cayu.context.base import _compaction_checkpoint
 from cayu.runtime import _session_operation_state
 from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
+)
+from cayu.sessions import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    CheckpointCompatibilityError,
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
@@ -57,6 +56,7 @@ from cayu.sessions.checkpoints import (
     runtime_checkpoint_writer_view,
 )
 from cayu.sessions.memory import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     WorkspaceObservationArtifact,

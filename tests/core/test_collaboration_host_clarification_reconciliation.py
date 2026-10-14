@@ -6,7 +6,12 @@ import pytest
 from tests.core.test_collaboration_host_clarifications import drive_pending_maintenance
 from tests.core.test_participant_identity import CONTEXT
 
-from cayu import CollaborationHost, HostClarificationRule, HostOwnershipLimits, HostRegistration
+from cayu.collaboration import (
+    CollaborationHost,
+    HostClarificationRule,
+    HostOwnershipLimits,
+    HostRegistration,
+)
 from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationAccessDenied
 from cayu.collaboration.participants import CollaborationUnavailable

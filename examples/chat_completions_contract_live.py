@@ -10,24 +10,18 @@ from typing import Any
 from uuid import uuid4
 
 from _live_checks import require, require_equal
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
+from cayu.context import StructuredOutputSpec
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.messages import ProviderStatePart
+from cayu.providers import (
     ChatCompletionsProvider,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventType,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    ProviderStatePart,
-    ReadFileTool,
-    RunRequest,
-    StructuredOutputSpec,
-    WriteFileTool,
+    ChatCompletionsTransport,
+    HttpxChatCompletionsTransport,
 )
-from cayu.providers import ChatCompletionsTransport, HttpxChatCompletionsTransport
+from cayu.runners import LocalRunner
+from cayu.tools import ReadFileTool, WriteFileTool
+from cayu.workspaces import LocalWorkspace
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 

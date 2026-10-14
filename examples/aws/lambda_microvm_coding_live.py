@@ -20,11 +20,12 @@ from collections.abc import AsyncIterator
 
 from examples._live_checks import require
 
-from cayu import AgentSpec, CayuApp, ExecCommand, LambdaMicroVMRunner, Message, RunRequest
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runners import ExecCommand, LambdaMicroVMRunner
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.tools.commands import CommandPolicy, CommandPolicyDecision, CommandPolicyResult
 from cayu.tools.files import EditFileTool, WriteFileTool
 from cayu.tools.git import GitChangesTool

@@ -13,7 +13,8 @@ import httpx
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
+from cayu import ToolContext
+from cayu.mcp import (
     MCP_PROTOCOL_VERSION,
     HttpMcpClient,
     HttpMcpSession,
@@ -28,10 +29,6 @@ from cayu import (
     McpToolDefinition,
     McpToolset,
     McpTransportLimits,
-    SecretRedactor,
-    SecretRef,
-    StaticVault,
-    ToolContext,
     connect_mcp_toolset,
 )
 from cayu.mcp import http as mcp_http_module
@@ -42,7 +39,7 @@ from cayu.mcp.http import (
     _http_settlement_task,
     _HttpCallBudget,
 )
-from cayu.vaults import REDACTED_SECRET
+from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 
 def _limits(

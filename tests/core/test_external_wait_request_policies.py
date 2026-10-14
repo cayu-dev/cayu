@@ -7,8 +7,10 @@ from uuid import uuid4
 import pytest
 from tests.external_wait_support import CONTEXT, Policy, registration, reservation, stores
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import ScriptedModelProvider
 from cayu.external_waits import ExternalEventWaits
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError

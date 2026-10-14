@@ -11,16 +11,8 @@ from types import ModuleType
 import pytest
 from jsonschema import Draft202012Validator
 
-from cayu import (
-    CacheBreakpoint,
-    CachePolicy,
-    Event,
-    EventType,
-    Message,
-    ScriptedModelProvider,
-    ThinkingConfig,
-    ToolEffect,
-)
+from cayu import Event, EventType, Message, ToolEffect
+from cayu.context import ThinkingConfig
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.embeddings import (
     TextEmbedding,
@@ -28,7 +20,10 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
+from cayu.evals import ScriptedModelProvider
 from cayu.providers import (
+    CacheBreakpoint,
+    CachePolicy,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,

@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from cayu import ModelInfo, ModelPrice, PriceSchedule, PriceTier, Provenance
+from cayu.budgets import ModelInfo, ModelPrice, PriceSchedule, PriceTier, Provenance
 from maintenance.model_catalog.policy import HOSTED_WEB_SEARCH_PROVIDERS
 from maintenance.model_catalog.verify import VerifyOutcome
 

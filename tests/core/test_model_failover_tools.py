@@ -16,19 +16,10 @@ from tests.core.test_targeted_tool_grants import (
 )
 from tests.core.test_tool_discovery import _RememberKnowledgeTool
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    MessageRole,
-    ModelFailoverPolicy,
-    ModelTarget,
-    RequestFootprintConfig,
-    RunRequest,
-    ScriptedModelProvider,
-    TargetedToolGrant,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.context import RequestFootprintConfig
+from cayu.evals import ScriptedModelProvider
+from cayu.messages import MessageRole
 from cayu.providers.base import (
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
     ModelProviderError,
@@ -36,6 +27,8 @@ from cayu.providers.base import (
 )
 from cayu.providers.openai import OpenAITransport
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
+from cayu.tools import TargetedToolGrant
 from cayu.tools.exposure import StaticToolExposurePolicy
 from cayu.tools.targeted_projection import targeted_tool_projection_marker_id
 

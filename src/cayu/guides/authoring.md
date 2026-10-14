@@ -99,11 +99,17 @@ from cayu.sessions import RunRequest
 from cayu.tools import Tool, ToolSpec
 ```
 
-Root imports such as `from cayu import CayuApp` remain supported. Package
-`_exports.py` files identify the defining modules; matching `__init__.pyi` files
-provide static declarations. `cayu.runtime` coordinates execution. The prerelease
-migration removes legacy module aliases; use current concept paths for new
-imports and generated code. Same-build recovery remains supported; old import
+The root API covers app/agent composition, messages/events, custom tool contracts,
+and run/resume requests and outcomes. Root imports such as
+`from cayu import CayuApp, AgentSpec, Message, RunRequest` remain supported.
+Import providers, stores, policies and other specialized components from their
+public owners. `cayu.runtime` exports its execution and lifecycle contracts;
+session requests and stores come from `cayu.sessions`.
+
+Package `_exports.py` files identify the defining modules; matching
+`__init__.pyi` files provide static declarations. The prerelease migration removes
+legacy module aliases and specialized root/runtime re-exports. Use current
+concept paths for imports and generated code. Same-build recovery remains supported; old import
 paths and cross-build execution-profile continuity are not compatibility promises.
 
 The [complete source ownership and migration map](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md)
@@ -216,7 +222,7 @@ Never clear an existing attachment merely to make a task claimable.
 For example, after authenticating and resolving the original durable reservation:
 
 ```python
-from cayu import TaskCreate
+from cayu.tasks import TaskCreate
 
 
 async def enqueue_reserved_coding_task(app, reservation):
@@ -241,7 +247,7 @@ and independently validate its exact artifact and cleanup evidence. It is not an
 agent-text parser or a substitute for an independent verifier:
 
 ```python
-from cayu import complete_managed_task
+from cayu.tasks import complete_managed_task
 
 
 async def handle_coding_task(app, claimed, worker_id):
@@ -733,7 +739,7 @@ content, tool call and tool result `content`) or
 `model_facing_tool_result(result)`:
 
 ```python
-from cayu import model_facing_text
+from cayu.evals import model_facing_text
 
 seen = model_facing_text(provider.requests[1])
 assert "tool audit_csv: 3 blank rows in data.csv" in seen
@@ -797,7 +803,7 @@ environment name, path, or naming convention.
 
 ```python
 from pydantic import BaseModel
-from cayu import WorkspaceReferenceBinding
+from cayu.workspaces import WorkspaceReferenceBinding
 
 class Inventory(BaseModel):
     binding: WorkspaceReferenceBinding

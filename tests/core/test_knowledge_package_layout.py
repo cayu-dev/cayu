@@ -13,7 +13,7 @@ from typing import get_type_hints
 
 import pytest
 
-import cayu
+import cayu.knowledge
 
 _MODULES = (
     ("curator", "LearningSignal"),
@@ -43,15 +43,15 @@ _RELATION_CLASSES = (
 
 
 @pytest.mark.parametrize(("module_name", "symbol"), _MODULES)
-def test_root_exports_share_canonical_identity(module_name, symbol):
+def test_public_modules_own_their_capability_types(module_name, symbol):
     canonical = importlib.import_module(f"cayu.knowledge.{module_name}")
-    assert getattr(cayu, symbol) is getattr(canonical, symbol)
+    assert symbol in dir(canonical)
+    assert getattr(canonical, symbol).__module__ == canonical.__name__
 
 
 @pytest.mark.parametrize(
     ("record_module", "scope_module"),
     (
-        ("cayu", "cayu"),
         ("cayu.storage", "cayu.storage"),
         ("cayu.knowledge.records", "cayu.knowledge.scopes"),
     ),
@@ -120,9 +120,7 @@ def test_record_contracts_preserve_public_and_legacy_class_identity():
     ):
         for name in names:
             canonical = getattr(owner, name)
-            assert (
-                getattr(cayu, name) is getattr(storage, name) is getattr(legacy, name) is canonical
-            )
+            assert getattr(storage, name) is getattr(legacy, name) is canonical
             assert canonical.__module__ == owner.__name__
             # Protocol 0 GLOBAL records model the original persisted class path.
             assert pickle.loads(f"ccayu.storage.memory\n{name}\n.".encode()) is canonical
@@ -157,7 +155,7 @@ def test_record_values_support_pickle_round_trips():
         assert restored.model_dump(mode="json") == value.model_dump(mode="json")
 
 
-@pytest.mark.parametrize("module_name", ("cayu", "cayu.storage", "cayu.knowledge.relations"))
+@pytest.mark.parametrize("module_name", ("cayu.storage", "cayu.knowledge.relations"))
 def test_relation_contracts_do_not_load_storage_implementations(module_name):
     result = subprocess.run(
         [
@@ -242,7 +240,7 @@ def test_relation_contracts_preserve_type_hints_stubs_and_helper_identity():
         assert getattr(legacy, name) is function
         get_type_hints(function)
 
-    for package in (cayu, storage):
+    for package in (storage,):
         manifest = importlib.import_module(f"{package.__name__}._exports").EXPORTS
         stub = ast.parse(Path(package.__file__).with_suffix(".pyi").read_text())
         imports = {

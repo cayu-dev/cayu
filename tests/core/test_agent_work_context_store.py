@@ -19,7 +19,17 @@ from tests.core.work_context_store_conformance import (
     recall_delivery,
 )
 
-from cayu import (
+from cayu.memory import AgentRecallProcessingRequest, AutomaticRecallPolicy
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    SQLiteAgentWorkContextStore,
+    SQLiteKnowledgeStore,
+)
+from cayu.storage import _sqlite_schema_history as sqlite_schema_history
+from cayu.storage import migrations as schema_migrations
+from cayu.storage.migrations import SchemaMode
+from cayu.work_context import (
     AgentRecallCheckpoint,
     AgentRecallCheckpointKey,
     AgentRecallCheckpointMode,
@@ -27,7 +37,6 @@ from cayu import (
     AgentRecallDeliveryConflict,
     AgentRecallDeliveryEvidenceKind,
     AgentRecallDeliveryState,
-    AgentRecallProcessingRequest,
     AgentRecallSubscription,
     AgentRecallSubscriptionConflict,
     AgentRecallSubscriptionEvaluationOutcome,
@@ -36,17 +45,9 @@ from cayu import (
     AgentWorkContext,
     AgentWorkContextConflict,
     AgentWorkContextPublicationReceipt,
-    AutomaticRecallPolicy,
     InMemoryAgentWorkContextStore,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    SQLiteAgentWorkContextStore,
-    SQLiteKnowledgeStore,
     agent_recall_facet_aspect,
 )
-from cayu.storage import _sqlite_schema_history as sqlite_schema_history
-from cayu.storage import migrations as schema_migrations
-from cayu.storage.migrations import SchemaMode
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,7 @@ def work_context_store_case(request, tmp_path: Path) -> _StoreCase:
     postgres_dsn = request.getfixturevalue("postgres_dsn")
 
     async def open_postgres():
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         return PostgresAgentWorkContextStore(
             postgres_dsn,
@@ -1691,7 +1692,7 @@ def test_postgres_recall_delivery_stage_cancellation_rolls_back_every_material_b
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         lock_key = 7_505_119_600_004
         await _drop_postgres_schema(postgres_dsn)
@@ -1774,7 +1775,7 @@ def test_postgres_recall_subscription_cancellation_rolls_back_atomic_wake(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         lock_key = 7_505_119_600_072
         clock = _ManualClock(datetime(2026, 8, 28, 9, 0, tzinfo=UTC))
@@ -1946,7 +1947,7 @@ def test_postgres_recall_delivery_rejects_corrupt_denormalized_identity(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         store = PostgresAgentWorkContextStore(
@@ -1990,7 +1991,7 @@ def test_postgres_cancellation_rolls_back_context_and_checkpoint_head_updates(
         import psycopg
         from psycopg_pool import AsyncConnectionPool
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         context_lock_key = 7_505_119_600_001
         checkpoint_lock_key = 7_505_119_600_002
@@ -2165,7 +2166,7 @@ def test_postgres_context_publication_fences_stale_checkpoint(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         context_lock_key = 7_505_119_600_003
         await _drop_postgres_schema(postgres_dsn)
@@ -2292,7 +2293,7 @@ def test_postgres_context_publication_fences_stale_checkpoint(
 def test_postgres_work_context_store_rejects_autocommit_pool_and_configuration_drift() -> None:
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresAgentWorkContextStore
+    from cayu.storage import PostgresAgentWorkContextStore
 
     autocommit_pool = AsyncConnectionPool(
         "",
@@ -2653,7 +2654,7 @@ def test_postgres_revision_73_rejects_pre_stream_checkpoint_schema_before_mutati
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
         from cayu.storage import _postgres_schema_history as postgres_schema_history
 
         await _drop_postgres_schema(postgres_dsn)
@@ -2933,7 +2934,7 @@ def test_postgres_revision_69_adds_empty_work_context_storage_without_backfill(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore, PostgresKnowledgeStore
+        from cayu.storage import PostgresAgentWorkContextStore, PostgresKnowledgeStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -3008,7 +3009,7 @@ def test_postgres_revision_69_rejects_malformed_work_context_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresAgentWorkContextStore(
@@ -3053,7 +3054,7 @@ def test_postgres_revision_69_rejects_missing_checkpoint_revision_constraint(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresAgentWorkContextStore(
@@ -3188,7 +3189,7 @@ def test_postgres_revision_71_adds_empty_delivery_storage_without_backfill(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         published = context(revision=1, operation_id="revision-71:postgres:context")
@@ -3268,7 +3269,7 @@ def test_postgres_revision_71_rejects_malformed_delivery_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresAgentWorkContextStore(
@@ -3491,7 +3492,7 @@ def test_postgres_revision_73_adds_empty_subscription_storage_without_inference(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         published = context(revision=1, operation_id="revision-73:postgres:context")
@@ -3604,7 +3605,7 @@ def test_postgres_revision_73_rejects_malformed_subscription_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresAgentWorkContextStore(
@@ -3649,7 +3650,7 @@ def test_postgres_revision_73_rejects_populated_pre_contract_deliveries(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresAgentWorkContextStore
+        from cayu.storage import PostgresAgentWorkContextStore
 
         await _drop_postgres_schema(postgres_dsn)
         published = context(

@@ -7,14 +7,10 @@ from io import BytesIO
 import pytest
 from PIL import Image, ImageDraw
 
-from cayu import (
-    CayuApp,
-    CayuConfig,
-    Environment,
-    EnvironmentSpec,
-    LocalArtifactStore,
-    ToolExecutionConfig,
-)
+from cayu import CayuApp, CayuConfig
+from cayu.artifacts import LocalArtifactStore
+from cayu.configuration import ToolExecutionConfig
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.tools.base import ToolContext
 from cayu.tools.files import ReadFileTool
 
@@ -138,14 +134,10 @@ def test_app_attachment_uses_host_image_policy(tmp_path):
 
 
 def test_native_runtime_delivers_configured_region_with_source_identity(tmp_path):
-    from cayu import (
-        AgentSpec,
-        Message,
-        ModelStreamEvent,
-        RunRequest,
-        ScriptedModelProvider,
-        ToolResultPart,
-    )
+    from cayu import AgentSpec, Message, RunRequest
+    from cayu.evals import ScriptedModelProvider
+    from cayu.messages import ToolResultPart
+    from cayu.providers import ModelStreamEvent
 
     async def run():
         content = image_bytes()
@@ -211,7 +203,7 @@ def test_native_runtime_delivers_configured_region_with_source_identity(tmp_path
 
 
 def test_region_uses_original_workspace_snapshot_after_source_changes(tmp_path):
-    from cayu import LocalWorkspace
+    from cayu.workspaces import LocalWorkspace
 
     async def run():
         content = image_bytes((20, 20))

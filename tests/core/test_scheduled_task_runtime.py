@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest, TaskCreate, TaskQuery, TaskStatus
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
@@ -14,6 +14,7 @@ from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, TaskStatus
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.scheduling import TaskScheduleEventType, TaskSchedulePolicy
 from cayu.tasks.worker import run_task_worker

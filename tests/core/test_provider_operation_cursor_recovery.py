@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-from cayu import SQLiteSessionStore
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.usage import session_usage_summary
@@ -59,6 +58,7 @@ from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling, resolved_tool_exposure_authority
 from cayu.tools.policy import AllowAllToolPolicy

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-import cayu
+import cayu.sessions
 from cayu.build_provenance import (
     RuntimeBuildArtifactKind,
     RuntimeBuildProvenance,
@@ -78,8 +78,8 @@ def test_legacy_invocation_contract_imports_and_pickles_share_the_canonical_owne
         "_RELEASE_STORE_AUTHORITY_TOKEN",
     ):
         assert getattr(runtime, name) is getattr(contracts, name)
-    assert cayu.SessionRunFenced is SessionRunFenced
-    assert cayu.runtime.CreateInvocationCommand is contracts.CreateInvocationCommand
+    assert cayu.sessions.SessionRunFenced is SessionRunFenced
+    assert cayu.sessions.CreateInvocationCommand is contracts.CreateInvocationCommand
     assert cayu.runtime.InvocationContext is runtime.InvocationContext
 
 
@@ -130,7 +130,7 @@ class RejectLiveExecution(importlib.abc.MetaPathFinder):
         if fullname in blocked:
             raise AssertionError(f"Invocation contracts imported {fullname}")
 sys.meta_path.insert(0, RejectLiveExecution())
-from cayu.runtime import AdmitInvocationCommand
+from cayu.sessions import AdmitInvocationCommand
 from cayu.sessions import _invocation_lifecycle as contracts
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
 from cayu.sessions._session_continuation import (
@@ -186,7 +186,7 @@ class RejectRuntimeAndStores(importlib.abc.MetaPathFinder):
                 or fullname == "cayu.sessions.base"):
             raise AssertionError(f"Durable authority imported {fullname}")
 sys.meta_path.insert(0, RejectRuntimeAndStores())
-from cayu import SessionRunFenced
+from cayu.sessions import SessionRunFenced
 from cayu.sessions.authority import checkpoint_value_authority
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnershipState
 from cayu.sessions.invocation_release import InvocationReleaseEvidence

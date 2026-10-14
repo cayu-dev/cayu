@@ -9,7 +9,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import CayuApp, CayuConfig, OperationsConfig
+from cayu import CayuApp, CayuConfig
+from cayu.configuration import OperationsConfig
 from cayu.messages import Message
 from cayu.runtime._recovery_ownership import _run_recovery_cleanup_steps
 from cayu.sessions.cleanup import (
@@ -1224,7 +1225,9 @@ def test_cleanup_history_is_bounded_and_scoped_drain_excludes_siblings():
 
 @pytest.mark.anyio
 async def test_runtime_cancellation_cleanup_has_admitted_session_identity(monkeypatch):
-    from cayu import AgentSpec, EventType, ModelStreamEvent, ScriptedModelProvider
+    from cayu import AgentSpec, EventType
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
 
     app = CayuApp(enable_logging=False)
     app.register_provider(

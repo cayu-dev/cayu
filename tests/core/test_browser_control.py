@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-from cayu import RunRequest, SQLiteSessionStore
+from cayu import RunRequest
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.runtime._browser_control_model import validate_browser_model_publication
 from cayu.runtime._browser_control_publication import BrowserControlPublication
@@ -31,6 +31,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
     BrowserControlConflict,

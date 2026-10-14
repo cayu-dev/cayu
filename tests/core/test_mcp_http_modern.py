@@ -10,7 +10,7 @@ import httpx
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
+from cayu.mcp import (
     DEFAULT_MCP_CLIENT_VERSION,
     MCP_MODERN_PROTOCOL_VERSION,
     HttpMcpClient,

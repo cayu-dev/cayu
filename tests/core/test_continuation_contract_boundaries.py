@@ -30,7 +30,7 @@ def test_legacy_continuation_imports_and_pickles_share_canonical_definitions(mod
             module_name == "_session_continuation" and name.startswith("CONTINUATION_")
         ) or name == "ServiceReleasedSessionStatus":
             assert getattr(legacy, name) is value
-    for namespace in (cayu, cayu.collaboration, cayu.runtime):
+    for namespace in (cayu.collaboration,):
         assert (
             namespace.ContinuationRecord is cayu.sessions._session_continuation.ContinuationRecord
         )
@@ -57,7 +57,7 @@ class RejectRuntimeAndStores(importlib.abc.MetaPathFinder):
             raise AssertionError(f"Continuation contracts imported {fullname}")
 sys.meta_path.insert(0, RejectRuntimeAndStores())
 
-from cayu import ContinuationRecord
+from cayu.collaboration import ContinuationRecord
 from cayu.collaboration import ContinuationConflict
 from cayu.sessions._session_continuation import (
     ContinuationTicket, continuation_digest, continuation_operation_key,

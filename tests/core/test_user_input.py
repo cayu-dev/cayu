@@ -1398,7 +1398,8 @@ def test_user_input_recovery_preserves_process_exit_after_primary_failure(cancel
 import asyncio
 import sys
 from tests.core.test_user_input import _build, _collect, _drain
-from cayu import EventType, Message, RunRequest, UserInputResponse
+from cayu import EventType, Message, RunRequest
+from cayu.approvals import UserInputResponse
 
 async def run():
     owner = asyncio.current_task()

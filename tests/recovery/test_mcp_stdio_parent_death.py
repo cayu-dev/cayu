@@ -19,13 +19,7 @@ import pytest
 from pydantic import SecretStr
 
 import cayu.mcp.stdio as stdio_module
-from cayu import (
-    McpProtocolError,
-    McpServerSpec,
-    ResolvedSecret,
-    SecretRef,
-    StdioMcpClient,
-)
+from cayu.mcp import McpProtocolError, McpServerSpec, StdioMcpClient
 from cayu.mcp._stdio_containment import _rendezvous_address
 from cayu.mcp._stdio_process import (
     ContainedStdioMcpProcess,
@@ -34,6 +28,7 @@ from cayu.mcp._stdio_process import (
     preflight_stdio_mcp_parent_death_containment,
     stdio_mcp_parent_death_containment_platform_candidate,
 )
+from cayu.vaults import ResolvedSecret, SecretRef
 
 pytestmark = [
     pytest.mark.process,

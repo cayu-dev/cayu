@@ -9,13 +9,13 @@ from urllib.parse import urlencode
 
 import pytest
 
-from cayu import PostgresSessionStore, SQLiteSessionStore
 from cayu.cli import main
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
+from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 
 

@@ -7,7 +7,8 @@ import os
 import sys
 from pathlib import Path
 
-from cayu import SQLiteTaskStore, TaskInterruptedHandoffRequest
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import TaskInterruptedHandoffRequest
 
 
 async def _commit_and_exit(
@@ -18,7 +19,7 @@ async def _commit_and_exit(
     if backend == "sqlite":
         store = SQLiteTaskStore(Path(location))
     elif backend == "postgres":
-        from cayu import PostgresTaskStore
+        from cayu.storage import PostgresTaskStore
         from cayu.storage.migrations import SchemaMode
 
         dsn = os.environ["CAYU_TEST_INTERRUPTED_HANDOFF_POSTGRES_DSN"]

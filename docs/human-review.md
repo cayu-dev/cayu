@@ -103,9 +103,7 @@ continue to quarantine pre-execution arguments.
 ## Small application policy
 
 ```python
-from cayu import (
-    HumanReviewDisclosure, HumanReviewField, HumanReviewPolicy,
-)
+from cayu.approvals import HumanReviewDisclosure, HumanReviewField, HumanReviewPolicy
 
 class DeliveryReview(HumanReviewPolicy):
     version = "delivery-v1"

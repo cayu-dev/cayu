@@ -10,20 +10,19 @@ from examples._live_checks import require
 
 from cayu import (
     AgentSpec,
-    BedrockProvider,
     CayuApp,
     Event,
     EventType,
     Message,
     RunRequest,
-    StructuredOutputSpec,
     Tool,
     ToolContext,
     ToolEffect,
     ToolResult,
     ToolSpec,
 )
-from cayu.providers import ModelRequest
+from cayu.context import StructuredOutputSpec
+from cayu.providers import BedrockProvider, ModelRequest
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 

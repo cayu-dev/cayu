@@ -11,7 +11,8 @@ from typing import Any
 
 import boto3  # ty: ignore[unresolved-import]
 
-from cayu import ArtifactScope, S3ArtifactStore, SecretsManagerVault
+from cayu.artifacts import ArtifactScope, S3ArtifactStore
+from cayu.vaults import SecretsManagerVault
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 

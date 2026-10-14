@@ -7,9 +7,8 @@ from pathlib import Path
 import pytest
 from tests.core.test_mcp_stdio_modern import _client, _expected_request_meta, _requests
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, ToolContext
+from cayu.mcp import (
     McpIdleTimeoutError,
     McpProtocolEra,
     McpProtocolError,
@@ -18,7 +17,6 @@ from cayu import (
     McpToolsetUnavailable,
     McpTransportLimits,
     StdioMcpClient,
-    ToolContext,
     connect_mcp_toolset,
 )
 from cayu.mcp._stdio_process import stdio_mcp_parent_death_containment_platform_candidate

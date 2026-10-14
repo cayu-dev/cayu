@@ -6,21 +6,18 @@ import pytest
 from tests.core.test_openai_optional_search_evidence import response_fixture, stream_fixture
 from tests.core.test_openai_provider import RecordingTransport
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    HostedToolCallPart,
-    Message,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.messages import HostedToolCallPart, ProviderStatePart
+from cayu.providers import (
     ModelRequest,
+    OpenAIProtocolError,
     OpenAIProvider,
     OpenAIWebSearch,
-    ProviderStatePart,
-    RunRequest,
-    SQLiteSessionStore,
+    build_openai_payload,
+    openai_response_events,
 )
-from cayu.providers import OpenAIProtocolError, build_openai_payload, openai_response_events
 from cayu.providers.openai import _normalized_web_search_call
+from cayu.storage import SQLiteSessionStore
 
 
 @pytest.mark.anyio

@@ -37,7 +37,7 @@ _HELPERS = (
 )
 
 
-@pytest.mark.parametrize("module_name", ("cayu", "cayu.storage", "cayu.knowledge.changes"))
+@pytest.mark.parametrize("module_name", ("cayu.storage", "cayu.knowledge.changes"))
 def test_change_feed_contracts_work_without_storage_implementations(module_name):
     result = subprocess.run(
         [
@@ -131,7 +131,7 @@ def test_change_contracts_preserve_exports_stubs_and_runtime_annotations():
                 if inspect.isfunction(method):
                     get_type_hints(method)
 
-    for package in (cayu, storage):
+    for package in (storage,):
         manifest = importlib.import_module(package.__name__ + "._exports").EXPORTS
         stub = ast.parse(Path(package.__file__).with_suffix(".pyi").read_text())
         imports = {

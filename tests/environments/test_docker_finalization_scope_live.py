@@ -11,30 +11,22 @@ from pydantic import SecretStr
 from tests.docker_toolchain import docker_toolchain_profile
 from tests.environments.test_docker_coding_live import _configuration_or_skip
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
-    EnvironmentSpec,
-    EventQuery,
-    EventType,
-    ExecCommandTool,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    ProcessCommandPolicy,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.environments import DockerCodingEnvironmentFactory, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity, DockerRunner
+from cayu.runtime import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
-    RunRequest,
     RuntimeEvidenceRequest,
-    ScriptedModelProvider,
-    SecretRedactor,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
     runtime_evidence,
 )
-from cayu.runners import DockerRunner
+from cayu.sessions import EventQuery
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tools import ExecCommandTool, ProcessCommandPolicy
+from cayu.vaults import SecretRedactor
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.process
 

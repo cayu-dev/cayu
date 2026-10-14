@@ -19,13 +19,14 @@ from tests.core.test_cli_storage import (
     _configure_alias_environment,
 )
 
-from cayu import AgentSpec, CayuApp, SQLiteSessionStore, SQLiteTaskStore
+from cayu import AgentSpec, CayuApp
 from cayu.cli import main
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.requests import ResumeRequest, RunRequest
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.storage import _sqlite_functions as sqlite_functions
 from cayu.storage import _sqlite_public_authority as public_authority_ops
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history

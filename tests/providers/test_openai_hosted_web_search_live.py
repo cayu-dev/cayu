@@ -10,18 +10,9 @@ import os
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CitationPart,
-    EventType,
-    HostedToolCallPart,
-    Message,
-    OpenAIProvider,
-    OpenAISubscriptionProvider,
-    OpenAIWebSearch,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.messages import CitationPart, HostedToolCallPart
+from cayu.providers import OpenAIProvider, OpenAISubscriptionProvider, OpenAIWebSearch
 from cayu.providers.openai_subscription import (
     OpenAISubscriptionAuth,
     OpenAISubscriptionAuthError,

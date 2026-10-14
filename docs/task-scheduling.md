@@ -10,7 +10,7 @@ Supply an explicit task identity, an aware timestamp, and a schedule policy:
 
 ```python
 from datetime import UTC, datetime
-from cayu import TaskCreate, TaskSchedulePolicy
+from cayu.tasks import TaskCreate, TaskSchedulePolicy
 
 request = TaskCreate(
     task_id="customer-42-followup-1",
@@ -36,7 +36,7 @@ unmanaged tasks remain separate.
 ## Edit or cancel with a revision
 
 ```python
-from cayu import TaskRescheduleRequest, TaskScheduleCancelRequest
+from cayu.tasks import TaskRescheduleRequest, TaskScheduleCancelRequest
 
 receipt = await app.reschedule_task(TaskRescheduleRequest(
     task_id=task.id,

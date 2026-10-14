@@ -8,7 +8,7 @@ from typing import TypedDict, cast
 import pytest
 from examples.knowledge_semantic_watch import main as semantic_watch_example
 
-import cayu
+import cayu.knowledge.semantic_watch
 from cayu.knowledge.semantic_watch import (
     MAX_KNOWLEDGE_SEMANTIC_WATCH_POLICY_REQUEST_BYTES,
     KnowledgeSemanticWatchAuthority,
@@ -339,7 +339,7 @@ def test_semantic_watch_rejects_evidence_from_a_different_recall_situation() -> 
             knowledge_namespace=config.knowledge_namespace,
         )
         result = await _engine(store).recall(situation)
-        evidence = cayu.project_knowledge_semantic_watch_evidence(
+        evidence = cayu.knowledge.semantic_watch.project_knowledge_semantic_watch_evidence(
             result,
             max_candidates=config.max_candidates,
         )
@@ -435,7 +435,7 @@ def test_semantic_watch_rejects_evidence_from_a_different_recall_situation() -> 
         )
         mismatched_policy = _DecisionPolicy(KnowledgeSemanticWatchDisposition.EMIT)
         with pytest.raises(KnowledgeSemanticWatchPolicyError) as mismatched_profile:
-            await cayu.decide_knowledge_semantic_watch(
+            await cayu.knowledge.semantic_watch.decide_knowledge_semantic_watch(
                 request,
                 config=_config(watch_identity="different-watch"),
                 policy=mismatched_policy,
@@ -895,8 +895,8 @@ def test_public_semantic_watch_exports_are_stable() -> None:
         "prepare_knowledge_semantic_watch_invocation",
         "project_knowledge_semantic_watch_evidence",
     ):
-        assert name in cayu.__all__
-        assert getattr(cayu, name) is not None
+        assert name in dir(cayu.knowledge.semantic_watch)
+        assert getattr(cayu.knowledge.semantic_watch, name) is not None
 
 
 def test_deterministic_semantic_watch_example(capsys) -> None:

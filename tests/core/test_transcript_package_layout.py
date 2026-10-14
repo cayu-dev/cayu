@@ -48,7 +48,7 @@ public = importlib.import_module(sys.argv[1])
 
 def _assert_public_identity(owner: str, name: str) -> None:
     canonical = getattr(importlib.import_module(owner), name)
-    for module in ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.base"):
+    for module in ("cayu.sessions", "cayu.sessions.base"):
         assert getattr(importlib.import_module(module), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
@@ -57,9 +57,7 @@ def test_transcript_snapshot_public_imports_and_historical_pickle_global():
     _assert_public_identity("cayu.sessions.transcript_queries", "TranscriptSnapshot")
 
 
-@pytest.mark.parametrize(
-    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.transcript_queries")
-)
+@pytest.mark.parametrize("public_module", ("cayu.sessions", "cayu.sessions.transcript_queries"))
 def test_transcript_snapshot_and_fork_validation_without_stores(public_module):
     _assert_store_independent(
         """
@@ -126,9 +124,7 @@ def test_deferred_input_public_imports_and_historical_pickle_global():
     _assert_public_identity("cayu.sessions.transcript_input", "DeferredInteractionInput")
 
 
-@pytest.mark.parametrize(
-    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.transcript_input")
-)
+@pytest.mark.parametrize("public_module", ("cayu.sessions", "cayu.sessions.transcript_input"))
 def test_deferred_input_payload_and_replacement_without_stores(public_module):
     _assert_store_independent(
         """

@@ -9,7 +9,7 @@ from tests.core.knowledge_maintenance_conformance import (
     maintenance_proposal,
 )
 
-import cayu
+import cayu.storage
 from cayu.storage import (
     MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES,
     MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
@@ -41,8 +41,8 @@ def test_knowledge_maintenance_public_contract_is_exported() -> None:
         "KnowledgeMaintenanceStale",
         "prepare_knowledge_maintenance_decision",
     ):
-        assert name in cayu.__all__
-        assert getattr(cayu, name) is not None
+        assert name in dir(cayu.storage)
+        assert getattr(cayu.storage, name) is not None
 
 
 def test_knowledge_maintenance_models_copy_and_fingerprint_nested_material() -> None:

@@ -1670,10 +1670,11 @@ def test_builtin_file_tools_use_runner_workspace(tmp_path) -> None:
 def test_command_manifest_bulk_operation_count_and_identities(tmp_path, file_count):
     from tests.core.test_structured_commands import _AdmittedRunner, _profile, _run
 
-    from cayu import RunCommandTool, SecretRedactor
+    from cayu.tools import RunCommandTool
     from cayu.tools._redaction import InvocationRedactorSnapshot
     from cayu.tools._resources import InvocationWorkspaceHandle
     from cayu.tools.structured_commands import _capture_workspace_command_manifest
+    from cayu.vaults import SecretRedactor
 
     class CountingRunner(LocalRunner):
         calls = 0

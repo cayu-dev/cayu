@@ -8,19 +8,9 @@ import os
 import re
 
 from _live_checks import require, require_positive_model_usage, require_successful_terminal
-from cayu import (
-    AgentSpec,
-    AnthropicProvider,
-    CayuApp,
-    Event,
-    EventType,
-    Message,
-    OpenAIProvider,
-    RunRequest,
-    StructuredOutputSpec,
-    StructuredOutputStrategy,
-)
-from cayu.providers import ModelProvider
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
+from cayu.context import StructuredOutputSpec, StructuredOutputStrategy
+from cayu.providers import AnthropicProvider, ModelProvider, OpenAIProvider
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 

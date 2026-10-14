@@ -10,7 +10,6 @@ from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
 
-from cayu import SQLiteSessionStore
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
@@ -29,6 +28,7 @@ from cayu.sessions.topology import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
+from cayu.storage import SQLiteSessionStore
 
 
 def test_session_lineage_page_requires_portable_identifier_order() -> None:

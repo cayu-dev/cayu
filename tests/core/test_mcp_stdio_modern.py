@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
+from cayu import ToolContext
+from cayu.mcp import (
     DEFAULT_MCP_CLIENT_VERSION,
     MCP_MODERN_PROTOCOL_VERSION,
     McpCallDeadlineExceededError,
@@ -25,7 +26,6 @@ from cayu import (
     StdioMcpClient,
     StdioMcpProcessLifetime,
     StdioMcpSession,
-    ToolContext,
     connect_mcp_toolset,
 )
 from cayu.mcp._stdio_process import (

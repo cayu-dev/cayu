@@ -7,25 +7,18 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, SessionStatus
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    EventType,
-    InMemorySessionStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionQuery,
-    SessionStatus,
-    SubagentSpec,
-    SubagentTool,
 )
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.sessions import InMemorySessionStore, SessionQuery
+from cayu.tools import SubagentSpec, SubagentTool
 
 _TASK = "Edit your own checkout."
 

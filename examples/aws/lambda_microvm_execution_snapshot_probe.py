@@ -23,7 +23,7 @@ from typing import Any
 
 from examples.execution_snapshot_probe import ROOT, load, write_private, write_private_bytes
 
-from cayu import ExecCommand, LambdaMicroVMRunner
+from cayu.runners import ExecCommand, LambdaMicroVMRunner
 
 COMMAND_LIMIT = 24 * 1024 * 1024
 

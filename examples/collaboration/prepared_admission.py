@@ -7,8 +7,8 @@ MandateResolver and its production budget-binding receiver. See
 docs/collaboration-requests.md for registration and input-revision semantics.
 """
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.collaboration import (
     CollaborationAccessContext,
     MandateAccessContext,
     RecipientContinuationRequest,

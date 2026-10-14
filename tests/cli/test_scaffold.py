@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -798,6 +799,14 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
     mutate_during_build = False
     substitute_tag = False
     captured_build_contexts: list[dict[str, bytes]] = []
+    generated_environment = dict(os.environ)
+    source_root = str(Path(__file__).resolve().parents[2] / "src")
+    inherited_pythonpath = generated_environment.get("PYTHONPATH")
+    generated_environment["PYTHONPATH"] = (
+        source_root
+        if inherited_pythonpath is None
+        else os.pathsep.join((source_root, inherited_pythonpath))
+    )
 
     def fake_run(command, **kwargs):
         del kwargs
@@ -830,6 +839,18 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
         if argv[1] == "run":
             image_argument = argv.index("--entrypoint") + 2
             assert argv[image_argument] == built_image_id
+            # Exercise the generated Python probe even when Docker is mocked.
+            # An invalid import must not masquerade as a successful image check.
+            probe = shlex.split(argv[-1])
+            assert probe[-3:-1] == ["/opt/cayu-project/.venv/bin/python", "-c"]
+            checked = real_subprocess_run(
+                [sys.executable, "-c", probe[-1]],
+                env=generated_environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert checked.returncode == 0, checked.stdout + checked.stderr
             return subprocess.CompletedProcess(command, 0)
         raise AssertionError(f"unexpected Docker command: {argv}")
 
@@ -850,14 +871,6 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
             for path, limit in builder._BUILD_CONTEXT_INPUT_LIMITS.items()
         }
     ]
-    generated_environment = dict(os.environ)
-    source_root = str(Path(__file__).resolve().parents[2] / "src")
-    inherited_pythonpath = generated_environment.get("PYTHONPATH")
-    generated_environment["PYTHONPATH"] = (
-        source_root
-        if inherited_pythonpath is None
-        else os.pathsep.join((source_root, inherited_pythonpath))
-    )
     configured_self_test = real_subprocess_run(
         [
             sys.executable,
@@ -2012,7 +2025,7 @@ def test_scaffold_subscription_mode_selects_a_compatible_model(
         ],
         name="openai_subscription",
     )
-    monkeypatch.setattr("cayu.OpenAISubscriptionProvider", lambda: provider)
+    monkeypatch.setattr("cayu.providers.OpenAISubscriptionProvider", lambda: provider)
 
     spec = importlib.util.spec_from_file_location("subscription_scaffold_app", project / "app.py")
     assert spec is not None and spec.loader is not None
@@ -2052,7 +2065,7 @@ def test_scaffold_applies_provider_settings_made_after_import(
         ],
         name="openai_subscription",
     )
-    monkeypatch.setattr("cayu.OpenAISubscriptionProvider", lambda: provider)
+    monkeypatch.setattr("cayu.providers.OpenAISubscriptionProvider", lambda: provider)
 
     spec = importlib.util.spec_from_file_location("late_provider_scaffold_app", project / "app.py")
     assert spec is not None and spec.loader is not None
@@ -2118,9 +2131,9 @@ def test_scaffold_provider_env_explicitly_overrides_scaffold_default(
     monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
-    monkeypatch.setattr("cayu.AnthropicProvider", lambda *, api_key: provider)
+    monkeypatch.setattr("cayu.providers.AnthropicProvider", lambda *, api_key: provider)
     monkeypatch.setattr(
-        "cayu.OpenAIProvider",
+        "cayu.providers.OpenAIProvider",
         lambda **kwargs: pytest.fail("credential presence must not override CAYU_PROVIDER"),
     )
 
@@ -2858,7 +2871,8 @@ def test_generated_presets_apply_runtime_configuration(tmp_path, monkeypatch, pr
     runtime_path = project / "configuration" / "runtime.py"
     source = runtime_path.read_text()
     source = source.replace(
-        "from cayu import CayuConfig,", "from cayu import CayuConfig, RunDefaults,"
+        "from cayu import CayuConfig\n",
+        "from cayu import CayuConfig\nfrom cayu.configuration import RunDefaults\n",
     )
     source = source.replace(
         "config=CayuConfig(),", "config=CayuConfig(run=RunDefaults(max_steps=96)),"

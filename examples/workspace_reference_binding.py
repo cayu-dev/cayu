@@ -8,22 +8,14 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
+from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolContext, ToolResult, ToolSpec
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.workspaces import (
     LocalWorkspace,
-    Message,
-    RunRequest,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
     WorkspaceReferenceBinding,
     WorkspaceReferenceBindingError,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 
 class Inventory(BaseModel):

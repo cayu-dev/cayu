@@ -195,7 +195,7 @@ references are diagnostic leads, not authoritative successful trajectories.
 Attach the same EvalStore and application target to the existing dashboard:
 
 ```python
-from cayu import SQLiteEvalStore
+from cayu.storage import SQLiteEvalStore
 from cayu.server import EvalsConfig
 from cayu.storage.migrations import SchemaMode
 

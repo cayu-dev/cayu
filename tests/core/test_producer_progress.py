@@ -4,7 +4,7 @@ import pytest
 from tests.core.producer_export_scenario import completed_export_scenario
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import ProducerProgressOccurrence
+from cayu.collaboration import ProducerProgressOccurrence
 from cayu.collaboration._contracts import CollaborationConflict, CollaborationContractError
 from cayu.collaboration._request_arbitration import progress_in_transaction
 from cayu.collaboration._request_store import operation_key

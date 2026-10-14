@@ -11,11 +11,12 @@ pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 from fastapi.testclient import TestClient
 
-from cayu import CayuApp, InMemoryTaskStore, TaskCreate, TaskSchedulePolicy, TaskStatus
+from cayu import CayuApp
 from cayu.server import ServerConfig, create_server
 from cayu.server.auth import BasicAuth
 from cayu.server.config import AuthenticatedAccess
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskSchedulePolicy, TaskStatus
 from cayu.vaults.redaction import SecretRedactor
 
 

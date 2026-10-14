@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-from cayu import ModelInfo, ModelPrice, Provenance
+from cayu.budgets import ModelInfo, ModelPrice, Provenance
 
 
 @dataclass(frozen=True)

@@ -76,11 +76,11 @@ if component == "evidence":
     values.append(ledger)
 
 if component == "publication":
-    from cayu import ToolPolicyEvidence
+    from cayu.tools import ToolPolicyEvidence
     from cayu.approvals.tools import ToolPolicyEvidence as ApprovalEvidence
     from cayu.events import Event, EventType
     from cayu.messages import Message
-    from cayu.runtime import ToolPolicyEvidence as RuntimeEvidence
+    from cayu.tools import ToolPolicyEvidence as RuntimeEvidence
     from cayu.sessions import _assistant_tool_round_publication as publication
     from cayu.tools._policy_evidence import ToolPolicyEvidence as CanonicalEvidence
 

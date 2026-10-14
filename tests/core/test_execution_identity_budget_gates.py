@@ -10,12 +10,13 @@ from uuid import UUID
 import pytest
 
 import cayu.budgets.base as budgets_module
-from cayu import CayuConfig, RunDefaults
+from cayu import CayuConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
 from cayu.budgets.pricing import ModelPrice, PriceBook, Provenance
+from cayu.configuration import RunDefaults
 from cayu.context.base import (
     ContextBuildResult,
     ContextRecallTelemetry,

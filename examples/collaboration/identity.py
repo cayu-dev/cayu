@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.collaboration import (
     CollaborationAccessContext,
     CollaborationAccessDenied,
     CollaborationAccessGrant,

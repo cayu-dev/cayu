@@ -11,10 +11,9 @@ from tests.evals.test_workflow_eval_target import (
     _TwoChildWorkflow,
 )
 
-from cayu import (
+from cayu.evals import (
     EvalAssertion,
     FinalOutputContains,
-    ModelStreamEvent,
     SessionTrajectoryBounds,
     capture_workflow_eval_attempt,
     run_workflow_eval_suite,
@@ -25,6 +24,7 @@ from cayu.evals.execution import _copy_corpus_target
 from cayu.evals.models import EvalOutcome, EvalStatus
 from cayu.evals.trajectory import SessionTrajectoryError
 from cayu.evals.workflow_target import WorkflowEvalResult
+from cayu.providers import ModelStreamEvent
 
 
 def _setup(bounds=None, *, chunks=1):
@@ -183,7 +183,8 @@ def test_recovery_identity_mismatch_fails_closed(mismatch):
 def test_aggregate_default_rejection_recovers_same_paid_attempt():
     from tests.evals.test_session_trajectory import _create_running_session, _finish_session
 
-    from cayu import Event, WorkflowBase, WorkflowSpec
+    from cayu import Event
+    from cayu.workflows import WorkflowBase, WorkflowSpec
 
     async def exercise():
         app = _register_app()
@@ -235,7 +236,7 @@ def test_aggregate_default_rejection_recovers_same_paid_attempt():
 
 
 def test_legacy_import_is_explicit_and_does_not_replace_existing_anchor():
-    from cayu import import_workflow_eval_attempt
+    from cayu.evals import import_workflow_eval_attempt
     from cayu.evals.models import EvalRun
 
     async def exercise():
@@ -289,7 +290,7 @@ def test_legacy_import_is_explicit_and_does_not_replace_existing_anchor():
 def test_corpus_report_scores_output_with_partial_capture_evidence():
     from tests.evals.test_workflow_eval_target import _corpus
 
-    from cayu import (
+    from cayu.evals import (
         corpus_execution_result_from_json,
         corpus_execution_result_to_json,
         render_corpus_execution_html,
@@ -350,7 +351,8 @@ def test_corpus_report_scores_output_with_partial_capture_evidence():
 def _large_child_record_target(app, *, payload_bytes: int):
     from tests.evals.test_session_trajectory import _create_running_session, _finish_session
 
-    from cayu import Event, WorkflowBase, WorkflowSpec
+    from cayu import Event
+    from cayu.workflows import WorkflowBase, WorkflowSpec
 
     class LargeChildRecordWorkflow(WorkflowBase):
         spec = WorkflowSpec(name="large-child-record")
@@ -418,7 +420,7 @@ def test_oversized_child_record_scores_output_with_partial_evidence(expected, st
 
 
 def test_partial_capture_leaves_child_tree_assertions_unavailable():
-    from cayu import ChildSessionCompleted, EventNotOccurred, ToolNotCalled
+    from cayu.evals import ChildSessionCompleted, EventNotOccurred, ToolNotCalled
 
     async def exercise():
         target = _large_child_record_target(_register_app(), payload_bytes=8192)
@@ -553,8 +555,8 @@ def test_unsettled_child_capture_rejection_stays_unavailable(monkeypatch):
 
 
 def test_recovery_rejects_deleted_child_and_model_judge(tmp_path, monkeypatch):
-    from cayu import SQLiteSessionStore
     from cayu.evals.corpus import ModelJudgeAssertionSpec
+    from cayu.storage import SQLiteSessionStore
 
     async def exercise():
         store = SQLiteSessionStore(tmp_path / "saved.sqlite3")

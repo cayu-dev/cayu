@@ -2,8 +2,10 @@
 
 import asyncio
 
-from cayu import LocalWorkspace, Message, ToolContext, WriteFileTool
+from cayu import Message, ToolContext
 from cayu.providers import ModelRequest, build_openai_payload
+from cayu.tools import WriteFileTool
+from cayu.workspaces import LocalWorkspace
 
 
 def test_write_file_model_visible_revisions_support_guarded_overwrites(tmp_path):

@@ -24,13 +24,15 @@ from tests.core.test_completion_verifier_adapters import (
     _TestCompletionVerifier,
 )
 
-from cayu import CompletionResultUnavailable, Event, InMemorySessionStore
+from cayu import Event
 from cayu.applications import CayuApp
 from cayu.runtime.completion_result_resolvers import CompletionResultResolver
 from cayu.runtime.completion_verifiers import CompletionVerifierExecutionError
+from cayu.sessions import InMemorySessionStore
 from cayu.sessions.records import Session, StoreTimeCheckpointTransform
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults import SecretRedactor
+from cayu.verification import CompletionResultUnavailable
 
 
 class _OwnedTaskStore(InMemoryTaskStore):

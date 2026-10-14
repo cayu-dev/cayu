@@ -6,18 +6,12 @@ import pytest
 from tests.evals.test_session_trajectory import _create_running_session, _finish_session
 from tests.evals.test_workflow_eval_target import _register_app, _suite, _target
 
-from cayu import (
-    Event,
-    FinalOutputContains,
-    InMemorySessionStore,
-    SessionStatus,
-    SessionTrajectoryBounds,
-    SQLiteSessionStore,
-    WorkflowBase,
-    WorkflowSpec,
-    run_workflow_eval_suite,
-)
+from cayu import Event, SessionStatus
+from cayu.evals import FinalOutputContains, SessionTrajectoryBounds, run_workflow_eval_suite
 from cayu.evals.workflow_target import WorkflowEvalExecution
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
+from cayu.workflows import WorkflowBase, WorkflowSpec
 
 
 def _lifecycle_target(store, *, bounds, unfinished=False, nested=False, close=None):

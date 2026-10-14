@@ -177,8 +177,8 @@ def test_native_cost_snapshot_matches_reference(backend, auxiliary, tmp_path, re
     import asyncio
     from uuid import uuid4
 
+    from cayu.applications import CayuApp
     from cayu.messages import Message
-    from cayu.runtime import CayuApp
     from cayu.sessions.memory import InMemorySessionStore
     from cayu.sessions.records import SessionIdentity
     from cayu.sessions.requests import RunRequest

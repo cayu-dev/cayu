@@ -2,8 +2,9 @@ import asyncio
 
 from examples.runtime_auxiliary_inference import LIMITS, MODEL, Summarize, run_demo
 
-from cayu import AgentSpec, CayuApp, EventType, Message, ModelStreamEvent, RunRequest
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 
 
 def test_managed_auxiliary_example_counts_usage_without_an_extra_agent_step() -> None:

@@ -311,12 +311,8 @@ fresh = "real_workers:fresh"
     (tmp_path / "real_workers.py").write_text(
         """from pathlib import Path
 
-from cayu import (
-    CayuApp,
-    InMemoryTaskStore,
-    TaskStoreDispatcher,
-    run_task_worker,
-)
+from cayu import CayuApp
+from cayu.tasks import InMemoryTaskStore, TaskStoreDispatcher, run_task_worker
 
 
 def build_app():

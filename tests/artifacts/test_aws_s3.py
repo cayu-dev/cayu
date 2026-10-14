@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from cayu import (
+from cayu.artifacts import (
     ArtifactScope,
     ArtifactStoreUnavailableError,
     ArtifactWriteSettlementFailureCode,

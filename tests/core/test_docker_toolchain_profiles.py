@@ -7,16 +7,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu.environments import (
     DockerCodingCommandAuthority,
     DockerCodingDependencyInput,
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    LocalWorkspace,
     verify_docker_coding_toolchain_dependencies,
     verify_local_docker_coding_toolchain_dependencies,
 )
+from cayu.runners import DockerImageIdentity
+from cayu.workspaces import LocalWorkspace
 
 
 def _digest(content: bytes) -> str:

@@ -41,10 +41,10 @@ restore destination must be empty. Cayu never clears an existing workspace to
 make restoration fit.
 
 ```python
-from cayu import (
-    DmtcpExecutionSnapshotAdapter, Environment, EnvironmentSpec,
-    ExecCommand, LocalArtifactStore, RunnerWorkspace,
-)
+from cayu.environments import DmtcpExecutionSnapshotAdapter, Environment, EnvironmentSpec
+from cayu.runners import ExecCommand
+from cayu.artifacts import LocalArtifactStore
+from cayu.workspaces import RunnerWorkspace
 
 # runner is an owned DockerRunner or LambdaMicroVMRunner. Provision this
 # directory in the image or through the runner before constructing the adapter.

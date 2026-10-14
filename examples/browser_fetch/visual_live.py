@@ -14,27 +14,22 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
-from cayu import (
-    AgentSpec,
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.artifacts import LocalArtifactStore
+from cayu.budgets import RunLimits
+from cayu.egress import (
     ApprovedEgressDestination,
     BrowserEgressPolicy,
-    BrowserVisualPolicy,
-    CayuApp,
-    ChatCompletionsProvider,
-    EnvironmentSpec,
-    LocalArtifactStore,
-    Message,
-    RunLimits,
-    RunRequest,
+    HttpxUpstream,
     VirtualEgressEnvironmentFactory,
-    WebBridge,
 )
-from cayu.egress import HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.environments import EnvironmentSpec
 from cayu.evals.browser_acceptance_fixture import _fixture_address
-from cayu.providers.retry_policy import RetryPolicy
+from cayu.providers import ChatCompletionsProvider, RetryPolicy
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import BrowserVisualPolicy, WebBridge
 
 ROOT = Path(__file__).resolve().parents[2]
 HOST = "visual-shop.browser.test"

@@ -11,13 +11,13 @@ from pathlib import Path
 
 import pytest
 
-import cayu
+import cayu.knowledge.maintenance_contracts
 from cayu.knowledge import changes as change_rules
 from cayu.knowledge import maintenance_contracts
 from cayu.knowledge import records as identity_rules
 
 
-@pytest.mark.parametrize("module", ["cayu", "cayu.storage", "cayu.storage.memory"])
+@pytest.mark.parametrize("module", ["cayu.storage", "cayu.storage.memory"])
 @pytest.mark.parametrize("name", ["InMemoryKnowledgeStore", "InMemoryEmbeddingKnowledgeStore"])
 def test_memory_backend_public_imports_and_saved_class_globals_share_identity(module, name):
     from cayu.storage import memory
@@ -29,7 +29,7 @@ def test_memory_backend_public_imports_and_saved_class_globals_share_identity(mo
 
 
 def test_memory_embedding_backend_preserves_inheritance():
-    from cayu import InMemoryEmbeddingKnowledgeStore, InMemoryKnowledgeStore, KnowledgeStore
+    from cayu.storage import InMemoryEmbeddingKnowledgeStore, InMemoryKnowledgeStore, KnowledgeStore
 
     assert InMemoryEmbeddingKnowledgeStore.__bases__ == (InMemoryKnowledgeStore,)
     assert InMemoryKnowledgeStore.__bases__ == (KnowledgeStore,)
@@ -78,13 +78,13 @@ def test_memory_shared_change_time_reads_clock_only_for_absent_values(monkeypatc
 
 
 def test_memory_governance_metadata_key_preserves_public_value():
-    import cayu
+    import cayu.knowledge.maintenance_contracts
     from cayu.knowledge import maintenance_governance
     from cayu.storage import memory
 
     key = maintenance_contracts.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
     assert key == "cayu_knowledge_maintenance_governance"
-    assert key is cayu.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
+    assert key is cayu.knowledge.maintenance_contracts.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
     assert key is memory.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
     assert key is maintenance_governance.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
 
@@ -92,7 +92,6 @@ def test_memory_governance_metadata_key_preserves_public_value():
 @pytest.mark.parametrize(
     "statement,allowed",
     [
-        ("from cayu import InMemoryKnowledgeStore; InMemoryKnowledgeStore()", ["knowledge_memory"]),
         (
             "from cayu.storage import InMemoryKnowledgeStore; InMemoryKnowledgeStore()",
             ["knowledge_memory"],
@@ -102,16 +101,18 @@ def test_memory_governance_metadata_key_preserves_public_value():
             ["knowledge_memory"],
         ),
         (
-            "from cayu import InMemoryEmbeddingKnowledgeStore",
+            "from cayu.storage import InMemoryEmbeddingKnowledgeStore",
             ["knowledge_memory", "knowledge_embedding_memory"],
         ),
-        ("from cayu import KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY", []),
+        (
+            "from cayu.knowledge.maintenance_contracts import KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY",
+            [],
+        ),
         ("import cayu.knowledge.maintenance_governance", []),
         ("import cayu.storage.knowledge_sqlite", []),
         ("import cayu.storage.postgres", []),
     ],
     ids=[
-        "root",
         "storage",
         "ordinary",
         "embedding",
@@ -137,7 +138,7 @@ def test_memory_backend_import_order_preserves_canonical_identity(first):
 import importlib
 importlib.import_module("cayu.storage.{first}")
 from cayu.storage import memory, knowledge_memory, knowledge_embedding_memory
-from cayu import InMemoryKnowledgeStore, InMemoryEmbeddingKnowledgeStore
+from cayu.storage import InMemoryKnowledgeStore, InMemoryEmbeddingKnowledgeStore
 assert InMemoryKnowledgeStore is memory.InMemoryKnowledgeStore is knowledge_memory.InMemoryKnowledgeStore
 assert InMemoryEmbeddingKnowledgeStore is memory.InMemoryEmbeddingKnowledgeStore is knowledge_embedding_memory.InMemoryEmbeddingKnowledgeStore
 assert InMemoryEmbeddingKnowledgeStore.__bases__ == (InMemoryKnowledgeStore,)
@@ -197,8 +198,8 @@ def test_memory_backend_declarations_have_one_owner():
 def test_memory_backend_support_schema_readiness_preserves_exact_builtin_detection(
     embedding, custom
 ):
-    from cayu import InMemoryEmbeddingKnowledgeStore, InMemoryKnowledgeStore
     from cayu.embeddings import TextEmbeddingProvider
+    from cayu.storage import InMemoryEmbeddingKnowledgeStore, InMemoryKnowledgeStore
     from cayu.support_bundles import _store_schema_readiness
 
     class UnusedProvider(TextEmbeddingProvider):

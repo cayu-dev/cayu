@@ -11,7 +11,6 @@ from cayu import (
     CayuApp,
     EventType,
     Message,
-    OpenAIProvider,
     RunRequest,
     Tool,
     ToolContext,
@@ -19,6 +18,7 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
+from cayu.providers import OpenAIProvider
 
 
 class _HostedContractTool(Tool):

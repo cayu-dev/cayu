@@ -79,14 +79,9 @@ When a new agent body must inherit conversation history but install its current
 prompt anatomy, create an explicit descendant instead:
 
 ```python
-from cayu import (
-    ExecutionProfileAdoptionIntent,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    ForkSystemPromptPolicy,
-    ResolutionActor,
-    ResolutionActorSource,
-)
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
+from cayu.sessions import ForkExecutionProfileSelection, ForkSessionRequest, ForkSystemPromptPolicy
+from cayu.approvals import ResolutionActor, ResolutionActorSource
 
 events = [
     event
@@ -173,15 +168,9 @@ resources it wants closed with it:
 from contextlib import aclosing
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Message,
-    ModelProvider,
-    RunRequest,
-    configured_database_url,
-    open_application_stores,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.providers import ModelProvider
+from cayu.storage import configured_database_url, open_application_stores
 
 
 async def main(provider: ModelProvider) -> None:

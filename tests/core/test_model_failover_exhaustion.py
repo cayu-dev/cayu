@@ -9,23 +9,12 @@ import pytest
 from tests.core.test_model_failover_recovery import _RecoveryProvider
 from tests.core.test_model_failover_stages import _StageMemoryStore, _StageSQLiteStore
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    ModelFailoverPolicy,
-    ModelTarget,
-    RunRequest,
-    Tool,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, Tool, ToolResult, ToolSpec
 from cayu.providers.base import ModelProviderError, ModelStreamEvent
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _model_step_executor as model_executor
-from cayu.sessions import EventQuery
+from cayu.sessions import EventQuery, ModelFailoverPolicy, ModelTarget
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

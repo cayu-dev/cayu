@@ -7,16 +7,7 @@ import warnings
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    ModelFailoverPolicy,
-    ModelTarget,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelProviderError, ModelStreamEvent
 from cayu.providers.retry_policy import RetryPolicy
@@ -26,6 +17,7 @@ from cayu.runtime.work_attempt_semantics import (
     copy_work_attempt_run_semantics,
 )
 from cayu.server.routes import ResumeBody, RunBody
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import copy_resume_request, copy_run_request
 from cayu.tasks.dispatch import (

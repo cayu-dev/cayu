@@ -15,11 +15,11 @@ from tests.runners.lambda_microvm_harness import (
 )
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
-from cayu import LambdaMicroVMRunner
 from cayu.runners import (
     LambdaMicroVMAllocationTerminated,
     LambdaMicroVMClientTokenConflict,
     LambdaMicroVMError,
+    LambdaMicroVMRunner,
     LambdaMicroVMSubmissionClosed,
 )
 from cayu.runners.aws_lambda_microvm import (

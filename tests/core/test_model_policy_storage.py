@@ -138,7 +138,7 @@ async def test_release_replay_never_releases_replacement_owner(factory):
 async def test_application_store_assembly_owns_policy_store(
     backend, request, tmp_path, monkeypatch
 ):
-    from cayu import open_application_stores
+    from cayu.storage.application import open_application_stores
 
     monkeypatch.delenv("CAYU_REQUIRE_POSTGRES", raising=False)
     dsn = None

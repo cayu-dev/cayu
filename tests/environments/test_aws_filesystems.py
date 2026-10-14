@@ -4,15 +4,13 @@ import asyncio
 
 import pytest
 
-from cayu import (
+from cayu.environments import (
     BoundWorkspace,
     EFSAccessPointBinding,
-    ExecCommand,
-    ExecResult,
     S3FilesAccessPointBinding,
     WorkspaceMountError,
 )
-from cayu.runners import Runner
+from cayu.runners import ExecCommand, ExecResult, Runner
 from cayu.workspaces import RunnerWorkspace
 
 

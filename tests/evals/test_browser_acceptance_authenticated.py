@@ -135,9 +135,11 @@ def test_canonical_example_builds_with_real_authorities_without_model_or_docker_
                 retired = True
 
         async def inspect(args, *, plan):
-            from cayu import AgentSpec, BrowserProfileBinding, BrowserProfileScope, WebBridge
+            from cayu import AgentSpec
+            from cayu.browser_profiles import BrowserProfileBinding, BrowserProfileScope
             from cayu.evals import BrowserAcceptanceAuthenticationCollector, run_browser_acceptance
             from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+            from cayu.tools import WebBridge
 
             _require_browser_acceptance_execution_limits(plan)
             _require_authenticated_plan_authority(plan)
@@ -293,7 +295,8 @@ def test_example_post_yield_cancellation_preserves_signal_and_attempts_all_close
     import uvicorn
     from examples.browser_acceptance import local_authenticated as example
 
-    from cayu import ChatCompletionsProvider, SQLiteBrowserProfileStore
+    from cayu.browser_profiles import SQLiteBrowserProfileStore
+    from cayu.providers import ChatCompletionsProvider
 
     cert, key = certificate_and_key()
     (tmp_path / "trust").mkdir()

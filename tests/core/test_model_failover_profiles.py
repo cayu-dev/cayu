@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import pytest
 
-from cayu import ModelFailoverPolicy, ModelTarget
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.operations import ProviderOperationMode
 from cayu.runtime._execution_profile_admission import (
@@ -25,6 +24,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_with_tool_capability_ceiling,
     inherited_execution_profile_component_changes,
 )
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._model_failover import ModelFailoverCandidate, ModelFailoverPlan
 from cayu.vaults.redaction import SecretRedactor
 

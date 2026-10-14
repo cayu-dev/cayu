@@ -14,16 +14,8 @@ import json
 import os
 
 from _live_checks import require, require_positive_model_usage, require_successful_terminal
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ContextCountingConfig,
-    ContextCountingMode,
-    Event,
-    EventType,
-    Message,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
+from cayu.context import ContextCountingConfig, ContextCountingMode
 from cayu.providers import (
     AnthropicProvider,
     InputTokenCountConfidence,

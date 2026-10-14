@@ -12,7 +12,7 @@ import os
 import sys
 from urllib.parse import urlsplit
 
-from cayu import HttpMcpClient, McpProtocolEra, McpServerSpec
+from cayu.mcp import HttpMcpClient, McpProtocolEra, McpServerSpec
 
 SCENARIOS = frozenset(
     {

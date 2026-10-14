@@ -11,7 +11,8 @@ pytest.importorskip("sse_starlette")
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
-from cayu import CayuApp, default_price_book
+from cayu import CayuApp
+from cayu.budgets import default_price_book
 from cayu.server import (
     AuthenticatedAccess,
     BasicAuth,

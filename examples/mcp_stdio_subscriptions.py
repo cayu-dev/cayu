@@ -12,9 +12,8 @@ import argparse
 import asyncio
 import math
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp
+from cayu.mcp import (
     McpProtocolEra,
     McpServerSpec,
     McpToolsetRefreshState,

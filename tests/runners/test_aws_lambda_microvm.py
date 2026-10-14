@@ -14,16 +14,18 @@ import pytest
 from tests.runners.lambda_microvm_harness import OwnerFencedTransport, guest_lifecycle_hook
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
-from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
 from cayu.runners import (
+    ExecCommand,
     HttpxLambdaMicroVMEndpointTransport,
     LambdaMicroVMEndpointTransientError,
     LambdaMicroVMEndpointUnauthorized,
     LambdaMicroVMError,
     LambdaMicroVMProtocolError,
+    LambdaMicroVMRunner,
 )
 from cayu.testing.base import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.workspaces import RunnerWorkspace
 
 SUPERVISOR_PATH = (
     Path(__file__).resolve().parents[2]

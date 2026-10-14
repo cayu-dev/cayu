@@ -222,7 +222,8 @@ def test_recording_process_loss_never_replays_capture(tmp_path, boundary):
         store, selected, _, recording, _ = await prepared(tmp_path)
         program = r"""
 import asyncio, os, sys
-from cayu import BrowserRecordingStore, BrowserRecordingPolicy
+from cayu.storage import BrowserRecordingStore
+from cayu.browser_recording import BrowserRecordingPolicy
 from tests.core.test_browser_recording import png
 async def main():
     store = BrowserRecordingStore(sys.argv[1])

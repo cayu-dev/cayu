@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-from cayu import Workspace
+from cayu.workspaces import Workspace
 
 CONFORMANCE_PATH = ".cayu-conformance/workspace.txt"
 

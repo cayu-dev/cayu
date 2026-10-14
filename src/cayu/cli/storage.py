@@ -869,7 +869,7 @@ def _migrate_sqlite_locked(
     pending_receipt_path: Path,
     durable_receipt_path: Path,
 ) -> int:
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     if path.is_symlink():
         raise ValueError("SQLite migration target must not be a symbolic link.")
@@ -1203,7 +1203,7 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
     receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
 
     async def run() -> schema.SchemaState:
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
 
         store = PostgresSessionStore(
             args.postgres,
@@ -2303,14 +2303,14 @@ async def _ensure_store_ready_for_export(store: Any) -> None:
 def _session_store(args: argparse.Namespace) -> Any:
     # Export reads; validate (don't create) so it never mutates the database.
     if args.sqlite is not None:
-        from cayu import SQLiteSessionStore
+        from cayu.storage import SQLiteSessionStore
 
         return SQLiteSessionStore(
             args.sqlite,
             schema_mode=schema.SchemaMode.VALIDATE,
             public_authority_alias_codec=public_authority_alias_codec_from_environment(),
         )
-    from cayu import PostgresSessionStore
+    from cayu.storage import PostgresSessionStore
 
     return PostgresSessionStore(
         args.postgres,
@@ -2321,9 +2321,9 @@ def _session_store(args: argparse.Namespace) -> Any:
 
 def _task_store(args: argparse.Namespace) -> Any:
     if args.sqlite is not None:
-        from cayu import SQLiteTaskStore
+        from cayu.storage import SQLiteTaskStore
 
         return SQLiteTaskStore(args.sqlite, schema_mode=schema.SchemaMode.VALIDATE)
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     return PostgresTaskStore(args.postgres, schema_mode=schema.SchemaMode.VALIDATE)

@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import TaskCreate, TaskQuery, TaskSchedulePolicy
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, TaskSchedulePolicy
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

@@ -7,7 +7,8 @@ from typing import NoReturn
 import pytest
 from pydantic import ValidationError
 
-import cayu
+import cayu.knowledge.relations
+import cayu.storage
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -111,8 +112,8 @@ def test_knowledge_relation_public_vocabulary_is_closed_and_exported() -> None:
         "KnowledgeLineageRole",
         "prepare_knowledge_relations",
     ):
-        assert name in cayu.__all__
-        assert getattr(cayu, name) is not None
+        assert name in dir(cayu.knowledge.relations)
+        assert getattr(cayu.knowledge.relations, name) is not None
 
 
 def test_knowledge_relation_models_reject_ambiguous_or_unbounded_material() -> None:
@@ -313,7 +314,7 @@ def test_knowledge_relation_result_revalidates_page_truth() -> None:
 
 def test_in_memory_relation_publication_stages_the_complete_batch(monkeypatch) -> None:
     async def run() -> None:
-        store = InMemoryKnowledgeStore(access_scope=cayu.KnowledgeAccessScope.privileged())
+        store = InMemoryKnowledgeStore(access_scope=cayu.storage.KnowledgeAccessScope.privileged())
         for entry_id in ("stage-a", "stage-b", "stage-c"):
             await store.create_entry(KnowledgeEntry(id=entry_id, text=entry_id))
         relations = [
@@ -346,7 +347,7 @@ def test_in_memory_relation_publication_stages_the_complete_batch(monkeypatch) -
 
 def test_in_memory_relation_endpoint_index_serves_reads_and_deletes() -> None:
     async def run() -> None:
-        store = InMemoryKnowledgeStore(access_scope=cayu.KnowledgeAccessScope.privileged())
+        store = InMemoryKnowledgeStore(access_scope=cayu.storage.KnowledgeAccessScope.privileged())
         for entry_id in ("anchor", "target", "unrelated-a", "unrelated-b"):
             await store.create_entry(KnowledgeEntry(id=entry_id, text=entry_id))
         anchor_relation = _relation("anchor-relation", subject="anchor", object_="target")
@@ -394,7 +395,7 @@ def test_embedding_worker_acknowledges_relation_changes_without_index_work() -> 
             embedding_provider=provider,
             embedding_model="relation-test",
             embedding_dimensions=2,
-            access_scope=cayu.KnowledgeAccessScope.privileged(),
+            access_scope=cayu.storage.KnowledgeAccessScope.privileged(),
         )
         for entry_id in ("embedding-subject", "embedding-object"):
             await store.create_entry(KnowledgeEntry(id=entry_id, text=entry_id))

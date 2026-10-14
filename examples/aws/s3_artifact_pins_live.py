@@ -23,7 +23,7 @@ from typing import Any
 
 import boto3  # ty: ignore[unresolved-import]
 
-from cayu import ArtifactScope, ArtifactStoreUnavailableError, S3ArtifactStore
+from cayu.artifacts import ArtifactScope, ArtifactStoreUnavailableError, S3ArtifactStore
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _CONDITIONAL_CODES = frozenset({"PreconditionFailed", "ConditionalRequestConflict"})

@@ -10,7 +10,12 @@ from tests.core.test_prepared_admission_public import native_stores as native_st
 from tests.core.test_producer_budget_refusal import authorize_execution
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import CollaborationHost, HostOwnershipLimits, HostRegistration, HostWaitRule
+from cayu.collaboration import (
+    CollaborationHost,
+    HostOwnershipLimits,
+    HostRegistration,
+    HostWaitRule,
+)
 from cayu.collaboration._host import _ProducerExecutionRule, _ProducerSource
 from cayu.collaboration._host_producer_execution import HostProducerExecution
 from cayu.collaboration.requests import RequestControl
@@ -23,7 +28,11 @@ pytestmark = pytest.mark.anyio
 async def test_competing_request_close_excludes_host_publication_turn(
     native_stores, monkeypatch, action
 ):
-    from cayu import HostProducerMaintenance, HostProducerMaintenanceRule, HostProducerSource
+    from cayu.collaboration import (
+        HostProducerMaintenance,
+        HostProducerMaintenanceRule,
+        HostProducerSource,
+    )
     from cayu.collaboration import _host_producer_maintenance as maintenance
     from cayu.collaboration._contracts import ExactMatch
     from cayu.collaboration._producer_registration import register_producer_output

@@ -9,7 +9,7 @@ from functools import wraps
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu.snapshots import (
     AgentSnapshot,
     AgentSnapshotAccess,
     AgentSnapshotAuthorityRef,

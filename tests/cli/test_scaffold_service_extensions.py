@@ -55,7 +55,7 @@ def _wire_extension(project, capability):
             project,
             "tools/registration.py",
             "from cayu import Tool\n",
-            "from cayu import ListArtifactsTool, Tool\n",
+            "from cayu.tools import ListArtifactsTool\nfrom cayu import Tool\n",
         )
         _edit(
             project,
@@ -93,9 +93,10 @@ def _wire_extension(project, capability):
         _edit(
             project,
             "agents/registration.py",
-            "from cayu import ContextPolicy",
-            "from cayu import ContextPolicy, SubagentTool, SubagentResultTool, "
-            "ExecutionProfileBehaviorIdentity",
+            "from cayu.context import ContextPolicy",
+            "from cayu.context import ContextPolicy\n"
+            "from cayu.tools import SubagentTool, SubagentResultTool\n"
+            "from cayu.runtime import ExecutionProfileBehaviorIdentity",
         )
         _edit(
             project,

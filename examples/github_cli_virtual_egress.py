@@ -18,23 +18,19 @@ import asyncio
 import shutil
 import subprocess
 
-from cayu import (
-    EnvironmentFactoryRequest,
-    Event,
-    EventType,
-    HttpEgressPolicy,
-    SecretRef,
-    StaticVault,
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-)
+from cayu import Event, EventType
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
     EgressUpstreamLimits,
     EgressUpstreamOperation,
+    HttpEgressPolicy,
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
 )
+from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners.base import ExecCommand
+from cayu.vaults import SecretRef, StaticVault
 
 GH_VERSION = "2.86.0"
 IMAGE = f"cayu-egress-github-cli:{GH_VERSION}"

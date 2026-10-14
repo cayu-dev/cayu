@@ -5,7 +5,8 @@ import asyncio
 import pytest
 from tests.evals.test_workflow_eval_target import _register_app
 
-from cayu import Environment, EnvironmentSpec, RunRequest
+from cayu import RunRequest
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals.runner import (
     _inspect_settled_execution_profile,
     _ProfileRevalidationSettlementUnproven,

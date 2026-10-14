@@ -8,10 +8,11 @@ an independent failure record so one denied or malformed page does not erase
 the others.
 
 ```python
-from cayu import (
-    Environment, EnvironmentSpec, ExaWebAdapter,
-    ExecutionProfileBehaviorIdentity, SecretRef, ToolContext, WebBridge,
-)
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.tools import ExaWebAdapter, WebBridge
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.vaults import SecretRef
+from cayu import ToolContext
 from examples.webbridge.research import browse_extract_verify, register_researcher
 
 hosted_environment_identity = ExecutionProfileBehaviorIdentity(
@@ -74,11 +75,12 @@ setup; the factory declares pre-create admission and the exact pinned workload,
 then the tools revalidate the materialized runner on every dispatch.
 
 ```python
-from cayu import (
-    AgentSpec, ApprovedEgressDestination, BrowserEgressPolicy, EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
-    LocalArtifactStore, VirtualEgressEnvironmentFactory, WebBridge,
-)
+from cayu import AgentSpec
+from cayu.egress import ApprovedEgressDestination, BrowserEgressPolicy, VirtualEgressEnvironmentFactory
+from cayu.environments import EnvironmentSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.artifacts import LocalArtifactStore
+from cayu.tools import WebBridge
 
 artifacts = LocalArtifactStore(".cayu/browser-artifacts")
 policy = BrowserEgressPolicy(

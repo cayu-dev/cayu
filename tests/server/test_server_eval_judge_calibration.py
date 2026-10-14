@@ -14,9 +14,8 @@ from fastapi import HTTPException, Request
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp
+from cayu.evals import (
     CorpusUserMessageSpec,
     EvalCaseDraftV2,
     EvalJudgeCalibrationCriterionLabelV1,
@@ -25,7 +24,6 @@ from cayu import (
     EvalSimpleInputStimulusV1,
     EvalSuiteDraftV2,
     ModelJudgeTarget,
-    ModelStreamEvent,
     PublicJudgeReferenceDraftV1,
     RunInputSpec,
     ScriptedModelProvider,
@@ -36,6 +34,7 @@ from cayu import (
 )
 from cayu.evals.calibration import compile_eval_judge_calibration_draft
 from cayu.evals.store import EvalStoreResultTooLarge
+from cayu.providers import ModelStreamEvent
 from cayu.server import (
     AuthContext,
     DashboardConfig,

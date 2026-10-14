@@ -7,18 +7,18 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu import RunRequest
+from cayu.sessions import (
     InMemorySessionStore,
     InvocationOriginClaim,
     InvocationOriginTrust,
-    RunRequest,
     SessionExecutionSource,
     SessionIdentity,
     SessionInvocation,
-    SQLiteSessionStore,
 )
 from cayu.sessions.forks import fork_session_invocation
 from cayu.sessions.requests import run_request_with_runtime_invocation
+from cayu.storage import SQLiteSessionStore
 
 
 def _identity() -> SessionIdentity:

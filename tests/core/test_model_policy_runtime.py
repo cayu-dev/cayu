@@ -9,13 +9,15 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import ScriptedModelProvider
 from cayu.model_policy import (
     InMemoryModelPolicyStore,
     ModelPolicy,
     ModelPolicyController,
     PolicyChannel,
 )
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._policy_wire import canonical, decode
 from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.outcomes import run_to_completion
@@ -470,7 +472,7 @@ async def test_fresh_process_restores_installed_default_and_pending_report(tmp_p
     await store.close()
     script = """
 import asyncio, json, sys
-from cayu import ScriptedModelProvider
+from cayu.evals import ScriptedModelProvider
 from cayu.model_policy import ModelPolicyController
 from cayu.storage.model_policy_sqlite import SQLiteModelPolicyStore
 async def main():

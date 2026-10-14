@@ -6,7 +6,7 @@ from pathlib import Path
 from examples._advanced_support import ScenarioResult, completed_batch
 from examples.tainted_incident_response.scenario import run_scenario
 
-from cayu import ScriptedModelProvider
+from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 
 

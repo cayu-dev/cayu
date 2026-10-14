@@ -11,7 +11,10 @@ import pytest
 from examples.agent_snapshot_stateful_evaluation import run_reference_experiment
 from pydantic import ValidationError
 
-from cayu import (
+from cayu import AgentSpec, CayuApp
+from cayu.evals import Trajectory
+from cayu.runtime import build_execution_profile_identity
+from cayu.snapshots import (
     AgentSnapshot,
     AgentSnapshotAccess,
     AgentSnapshotAuthorityRef,
@@ -48,23 +51,21 @@ from cayu import (
     AgentSnapshotTrialBinding,
     AgentSnapshotTrialStateMode,
     AgentSnapshotVerificationError,
-    AgentSpec,
-    CayuApp,
     InMemoryAgentSnapshotStore,
     MemoryStateRef,
     SQLiteAgentSnapshotStore,
-    Trajectory,
+    agent_snapshot_from_json,
+    agent_snapshot_to_json,
+    app_body_snapshot_ref,
+    execution_profile_snapshot_ref,
+    trajectory_snapshot_ref,
+    workspace_snapshot_ref,
+)
+from cayu.workspaces import (
     WorkspaceIdentity,
     WorkspacePathRevision,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationStatus,
-    agent_snapshot_from_json,
-    agent_snapshot_to_json,
-    app_body_snapshot_ref,
-    build_execution_profile_identity,
-    execution_profile_snapshot_ref,
-    trajectory_snapshot_ref,
-    workspace_snapshot_ref,
 )
 
 

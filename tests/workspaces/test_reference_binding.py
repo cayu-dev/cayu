@@ -12,22 +12,21 @@ from examples.workspace_reference_binding import (
 )
 from pydantic import ValidationError
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Message, RunRequest, ToolContext
+from cayu.environments import (
     Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryResult,
     EnvironmentSpec,
-    LocalWorkspace,
-    Message,
-    RunRequest,
     SyncBinding,
-    ToolContext,
+)
+from cayu.runners import LocalRunner
+from cayu.workspaces import (
+    LocalWorkspace,
+    RunnerWorkspace,
     WorkspaceReferenceBinding,
     WorkspaceReferenceBindingError,
 )
-from cayu.environments import EnvironmentFactory, EnvironmentFactoryResult
-from cayu.runners import LocalRunner
-from cayu.workspaces import RunnerWorkspace
 
 
 def test_roundtrip_and_replacement(tmp_path):

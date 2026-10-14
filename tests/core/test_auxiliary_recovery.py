@@ -8,7 +8,7 @@ import pytest
 from tests.core._auxiliary_inference_crash import SESSION_ID, build_app
 
 from cayu.events import EventType
-from cayu.runtime import (
+from cayu.sessions import (
     IncompleteSessionRecoveryRequest,
     RecoveryBlockerCode,
     RecoveryDecision,
@@ -23,7 +23,8 @@ from cayu.runtime import (
 def test_public_parent_cancellation_leaves_recoverable_auxiliary_accounting():
     from tests.core._auxiliary_inference_crash import BOUNDS
 
-    from cayu import AgentSpec, CayuApp, Message, RunRequest, ScriptedModelProvider
+    from cayu import AgentSpec, CayuApp, Message, RunRequest
+    from cayu.evals import ScriptedModelProvider
     from cayu.providers import ModelRequest, ModelStreamEvent
     from cayu.tools.base import Tool, ToolSpec
     from cayu.tools.inference import AuxiliaryInferencePolicy
@@ -117,7 +118,8 @@ def test_public_parent_cancellation_leaves_recoverable_auxiliary_accounting():
 def test_unattested_store_rejects_public_auxiliary_request_before_dispatch():
     from tests.core._auxiliary_inference_crash import BOUNDS
 
-    from cayu import AgentSpec, CayuApp, Message, RunRequest, ScriptedModelProvider
+    from cayu import AgentSpec, CayuApp, Message, RunRequest
+    from cayu.evals import ScriptedModelProvider
     from cayu.providers import ModelRequest, ModelStreamEvent
     from cayu.sessions.memory import InMemorySessionStore
     from cayu.tools.base import Tool, ToolResult, ToolSpec

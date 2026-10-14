@@ -10,8 +10,11 @@ from uuid import uuid4
 import pytest
 from tests.core.test_task_groups import anyio_backend as anyio_backend
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import (
     TaskCreate,
     TaskGraphCreate,
     TaskGraphNode,
@@ -22,9 +25,6 @@ from cayu import (
     TaskGroupQuiescencePolicy,
     TaskGroupQuiescenceStatus,
 )
-from cayu.storage.migrations import SchemaMode
-from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupQuiescenceResolution
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
@@ -314,7 +314,7 @@ async def test_hold_resume_cannot_bypass_finalizer_gate(
 
 
 async def retry_group(app, *, policy="first_success"):
-    from cayu import TaskRetryPolicy
+    from cayu.tasks import TaskRetryPolicy
 
     creation = request(policy=policy)
     nodes = tuple(
@@ -343,7 +343,7 @@ async def retry_group(app, *, policy="first_success"):
 
 
 async def schedule_retry(store, task, key):
-    from cayu import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
+    from cayu.tasks import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 
     return await store.settle_task_retry_attempt(
         TaskRetrySettlementRequest(
@@ -396,7 +396,7 @@ async def test_decisive_retry_failure_fences_its_newborn_successor_atomically(st
 
 
 async def test_running_retry_descendant_drains_before_finalizer(store):
-    from cayu import TaskRetryAttemptDisposition, TaskRetryAttemptReport
+    from cayu.tasks import TaskRetryAttemptDisposition, TaskRetryAttemptReport
     from cayu.tasks.worker import run_task_worker
 
     app = CayuApp(task_store=store, enable_logging=False)
@@ -1700,11 +1700,12 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
         _task_result,
     )
 
-    from cayu import AgentSpec, CompletionResultResolutionRequest
+    from cayu import AgentSpec
     from cayu.runtime.completion_result_resolvers import CompletionResultResolverExecutionError
     from cayu.runtime.verified_task_worker import VerifiedTaskWorker
     from cayu.tasks.records import TaskClaimLost
     from cayu.vaults import SecretRedactor
+    from cayu.verification import CompletionResultResolutionRequest
 
     entered, release = threading.Event(), threading.Event()
     secret = "group-settlement-retry-secret-canary"
@@ -2364,13 +2365,9 @@ async def test_ownerless_session_release_advances_group_only_after_runtime_clean
 ):
     from tests.core.test_verified_task_worker import _RecordingProvider
 
-    from cayu import (
-        AgentSpec,
-        InterruptSessionRequest,
-        Message,
-        RunRequest,
-        TaskGroupInvocationSettlementPending,
-    )
+    from cayu import AgentSpec, Message, RunRequest
+    from cayu.sessions import InterruptSessionRequest
+    from cayu.tasks import TaskGroupInvocationSettlementPending
     from cayu.tasks.records import TaskSessionClosureClaim
 
     deleted = publication == "deleted_ack_loss"
@@ -4213,7 +4210,7 @@ async def test_caller_cancellation_does_not_acknowledge_a_running_thread(store):
 async def test_terminal_task_does_not_release_a_handler_still_finalizing(
     store, monkeypatch, blocked_acknowledgement
 ):
-    from cayu import TaskExecutionSettlementPending
+    from cayu.tasks import TaskExecutionSettlementPending
     from cayu.tasks.worker import fail_managed_task, run_task_worker
 
     app = CayuApp(task_store=store, enable_logging=False)

@@ -9,12 +9,8 @@ from tests.core.test_context_view_admission import _close, _factory
 from tests.core.test_participant_continuation_boundaries import CountingTool, activate, collect
 from tests.core.test_participant_identity import CONTEXT, app, create, registration
 
-from cayu import (
-    AlwaysRequireApprovalToolPolicy,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-)
 from cayu.agents import AgentSpec
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
 from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.collaboration.memory import InMemoryCollaborationStore
@@ -28,6 +24,7 @@ from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessage
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ResumeRequest, RunRequest
+from cayu.tools import AlwaysRequireApprovalToolPolicy
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

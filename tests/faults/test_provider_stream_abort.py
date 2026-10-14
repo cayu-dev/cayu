@@ -11,7 +11,6 @@ from cayu import (
     CayuApp,
     EventType,
     Message,
-    RetryPolicy,
     RunRequest,
     Tool,
     ToolContext,
@@ -19,6 +18,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.providers import ChatCompletionsProvider
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.records import SessionStatus
 from cayu.storage import SQLiteSessionStore
 

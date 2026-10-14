@@ -8,29 +8,17 @@ from hashlib import sha256
 import pytest
 from test_automatic_recall_context import _admission, _CountingSessionStore, _fusion
 
-from cayu import (
-    AgentSpec,
-    AutomaticRecallContextPolicy,
-    AutomaticRecallSourceConfig,
-    AutomaticRecallSourceDescriptor,
-    AutomaticRecallSourceRegistration,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    MemoryDeltaPolicy,
-    Message,
-    ModelStreamEvent,
-    RequestFootprintConfig,
-    RunRequest,
-    ScriptedModelProvider,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.context import RequestFootprintConfig
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
     CompactionResult,
     ContextPolicy,
     TranscriptDigestCompactor,
 )
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.memory import AutomaticRecallContextPolicy, AutomaticRecallSourceConfig, MemoryDeltaPolicy
 from cayu.memory.evidence import RecallEvidenceQuery
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
@@ -40,6 +28,8 @@ from cayu.memory.recall import (
     RecallSourceResult,
 )
 from cayu.messages import TextPart, copy_message
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import AutomaticRecallSourceDescriptor, AutomaticRecallSourceRegistration
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 

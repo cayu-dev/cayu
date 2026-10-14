@@ -283,48 +283,41 @@ async def _setup(startup_cleanups):
     from fastapi import Request
     from pydantic import SecretBytes, SecretStr
 
-    from cayu import (
+    from cayu import AgentSpec, CayuApp, Message, RunRequest
+    from cayu.artifacts import LocalArtifactStore
+    from cayu.browser_profiles import (
         AESGCMBrowserProfileKeyAuthority,
-        AgentSpec,
-        ApprovedEgressDestination,
         BrowserProfileBinding,
         BrowserProfileDestinationPolicy,
         BrowserProfileScope,
-        BudgetLimit,
-        BudgetReservation,
-        CayuApp,
-        ChatCompletionsProvider,
-        EnvironmentSpec,
-        EvalCase,
-        EvalPlan,
-        EvalSuite,
-        HttpEgressPolicy,
-        LocalArtifactStore,
-        Message,
-        ModelPrice,
-        PriceBook,
-        RunLimits,
-        RunRequest,
-        RuntimeHook,
-        SecretRedactor,
-        SessionCompleted,
         SQLiteBrowserProfileStore,
-        SQLiteSessionStore,
-        VirtualEgressEnvironmentFactory,
-        WebBridge,
     )
-    from cayu.egress import HttpxUpstream
+    from cayu.budgets import BudgetLimit, BudgetReservation, ModelPrice, PriceBook, RunLimits
+    from cayu.egress import (
+        ApprovedEgressDestination,
+        HttpEgressPolicy,
+        HttpxUpstream,
+        VirtualEgressEnvironmentFactory,
+    )
+    from cayu.environments import EnvironmentSpec
     from cayu.evals import (
         BrowserAcceptanceAuthenticatedConfigV1,
         BrowserAcceptanceAuthenticationCollector,
         BrowserAcceptancePlanV1,
+        EvalCase,
+        EvalPlan,
+        EvalSuite,
+        SessionCompleted,
         live_authenticated_browser_acceptance_manifest,
     )
+    from cayu.observability import RuntimeHook
+    from cayu.providers import ChatCompletionsProvider, RetryPolicy
     from cayu.providers._http import aclose_transport
-    from cayu.providers.retry_policy import RetryPolicy
     from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
     from cayu.server import BasicAuth, BrowserControlServerConfig, ServerConfig, create_server
+    from cayu.storage import SQLiteSessionStore
+    from cayu.tools import WebBridge
     from cayu.tools.browser_control import (
         BrowserControlPolicy,
         BrowserControlPolicyResult,
@@ -335,6 +328,7 @@ async def _setup(startup_cleanups):
         BROWSER_SESSION_PROTOCOL_VERSION,
         BROWSER_SESSION_WORKER_VERSION,
     )
+    from cayu.vaults import SecretRedactor
 
     class Site(LocalMfa):
         login_seen = mfa_seen = member_reads = 0

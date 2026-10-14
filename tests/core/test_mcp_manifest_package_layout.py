@@ -74,14 +74,12 @@ baseline = public.McpManifestBaseline(
 )
 def test_manifest_public_imports_and_historical_pickle_globals(name):
     canonical = getattr(importlib.import_module("cayu.sessions.mcp_manifest_history"), name)
-    for module in ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.base"):
+    for module in ("cayu.sessions", "cayu.sessions.base"):
         assert getattr(importlib.import_module(module), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize(
-    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.mcp_manifest_history")
-)
+@pytest.mark.parametrize("public_module", ("cayu.sessions", "cayu.sessions.mcp_manifest_history"))
 def test_manifest_values_and_hash_evidence_without_stores(public_module):
     _without_stores(
         """

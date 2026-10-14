@@ -1,5 +1,20 @@
 # Release notes
 
+## Unreleased
+
+- **Breaking Python import change:** `cayu` now exposes common app/agent,
+  message/event, tool and run/resume contracts. Import specialized capabilities
+  from their public owners, such as `cayu.providers.OpenAIProvider` and
+  `cayu.storage.SQLiteSessionStore`. `cayu.runtime` exports runtime-owned
+  contracts; session requests, providers and other capabilities use their own
+  packages. Existing applications and generated projects need import updates.
+  The [migration guide](public-concepts.md#migrate-older-root-and-runtime-imports)
+  and [complete replacement map](public-api-imports.json) cover removed imports.
+  Removed names raise `ImportError` with their replacement statement, including
+  attribute access. `cayu check` reports `SCAFFOLD_IMPORT_REMOVED` before loading
+  a declared project with outdated imports. These diagnostics ship in the package.
+  Class identities, execution behavior and durable formats remain unchanged.
+
 ## v0.11.2
 
 Cayu improves recovery across upgrades, bounds stalled task continuations, and
@@ -2997,7 +3012,7 @@ Applications that intentionally relied on implicit unrestricted networking
 must opt in visibly:
 
 ```python
-from cayu import MicrosandboxRunner
+from cayu.runners import MicrosandboxRunner
 from microsandbox import Network
 
 runner = await MicrosandboxRunner.create(

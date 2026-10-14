@@ -124,7 +124,7 @@ For application validation plus maintained authorization, use a narrowing
 composition:
 
 ```python
-from cayu import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy
+from cayu.tools import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy
 
 policy = GuardedToolPolicy(
     guards=(RequiredArguments({"ask_user": ("question",)}), application_guard),

@@ -9,26 +9,19 @@ import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import (
-    AgentSpec,
-    Environment,
-    EnvironmentSpec,
-    LocalArtifactStore,
-    LocalWorkspace,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-    WorkspaceReadResult,
-)
+from cayu import AgentSpec, RunRequest, Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.applications import CayuApp
-from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactScope
+from cayu.artifacts import (
+    ArtifactListResult,
+    ArtifactMetadata,
+    ArtifactReadResult,
+    ArtifactScope,
+    LocalArtifactStore,
+)
 from cayu.budgets.usage import session_usage_summary
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.corpus import (
     ArtifactAssertionSpec,
     CorpusUserMessageSpec,
@@ -75,7 +68,9 @@ from cayu.evals.published import (
 from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.runner import _capture_probes
 from cayu.events import Event, EventType
+from cayu.providers import ModelStreamEvent
 from cayu.sessions.records import Session, SessionStatus
+from cayu.workspaces import LocalWorkspace, WorkspaceReadResult
 
 _STRUCTURAL_CONTENT = b'{"source":"structural-eval","status":"ready"}\n'
 
@@ -1165,11 +1160,8 @@ def test_structural_assertions_run_publish_present_report_and_compare_safely(tmp
 def test_captured_session_scores_reviewed_structural_assertions_without_private_identity() -> None:
     from tests.evals.test_session_promotion import _run_trajectory
 
-    from cayu import (
-        InMemorySessionStore,
-        build_captured_evaluation_candidate,
-        score_captured_evaluation_candidate,
-    )
+    from cayu.evals import build_captured_evaluation_candidate, score_captured_evaluation_candidate
+    from cayu.sessions import InMemorySessionStore
 
     app, base_trajectory = asyncio.run(_run_trajectory(InMemorySessionStore()))
     assert base_trajectory.session is not None

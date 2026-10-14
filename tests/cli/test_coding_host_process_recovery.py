@@ -17,16 +17,25 @@ _WORKER = r"""
 import asyncio, json, os, sys
 from pathlib import Path
 from hashlib import sha256
-from cayu import (
-    AgentSpec, CayuApp, Environment, EnvironmentSpec, ExecCommand,
-    ExecutionProfileBehaviorIdentity, LocalRunner, LocalWorkspace,
-    ModelStreamEvent, NamedCheck, ProcessCommandPolicy, RunCheckTool,
-    RunRequest, Message, ScriptedModelProvider, SQLiteSessionStore, SQLiteTaskStore,
-    TaskCreate, TaskQuery, run_task_worker, ResolutionActor, ResolutionActorSource,
-    PriceBook, ModelPrice,
-)
+from cayu import AgentSpec, CayuApp, RunRequest, Message
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runners import ExecCommand, LocalRunner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.workspaces import LocalWorkspace
+from cayu.providers import ModelStreamEvent
+from cayu.tools import NamedCheck, ProcessCommandPolicy, RunCheckTool
+from cayu.evals import ScriptedModelProvider
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, run_task_worker
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.budgets import PriceBook, ModelPrice
 from cayu.artifacts import LocalArtifactStore
-from cayu.coding_products import CodingProductRunner, CodingProductArtifactRepository
+from cayu.coding_products import (
+    CodingProductAdmissionError,
+    CodingProductArtifactRepository,
+    CodingProductReconstructionRequiredError,
+    CodingProductRunner,
+)
 from cayu.guides.coding_host import BusinessStore, Reservation, SettlementConflict, settle_cancelled
 from cayu.workspaces.revisions import observe_deterministic_workspace, WorkspaceRevisionObservationLimits
 from decimal import Decimal
@@ -45,7 +54,7 @@ async def main():
         from domain.coding_product import CodingProductTask
         from operations import coding as composition
         from cayu.guides.coding_host import extend_generated_application
-        from cayu import CodingSettlementPolicy
+        from cayu.coding_products import CodingSettlementPolicy
         from cayu.runners.docker_workload import DockerImageIdentity
         workspace_options = dict(
             excluded_directory_names=composition._SOURCE_EXCLUDED_DIRECTORY_NAMES,
@@ -84,7 +93,7 @@ async def main():
             name="example-local-environment", behavior_version="1", implementation_version="1")),
         workspace=workspace, runner=LocalRunner(source),
     ))
-    from cayu import ListFilesTool
+    from cayu.tools import ListFilesTool
     app.register_agent(AgentSpec(name="coder", model="fixture"),
         tools=[*([ListFilesTool()] if listing else []), check])
     repository = CodingProductArtifactRepository(LocalArtifactStore(root / "artifacts", store_id="example"))
@@ -212,13 +221,13 @@ async def main():
                     result = await wrapped.settle_cancelled(recovery_task, **kwargs)
                 else:
                     result = await settle_cancelled(runner, business, expected, **kwargs)
-            except __import__("cayu").CodingProductAdmissionError:
+            except CodingProductAdmissionError:
                 assert generated and action == "request-conflict"
                 result = {"classification":"conflict_refused"}
             except SettlementConflict:
                 assert action in {"identity-conflict", "basis-conflict"}
                 result = {"classification":"conflict_refused"}
-            except __import__("cayu").CodingProductReconstructionRequiredError:
+            except CodingProductReconstructionRequiredError:
                 assert action == "unknown"
                 assert business.read(expected) is None and business.pending(expected) is None
                 task = await tasks.load_task(request.task.task_id)

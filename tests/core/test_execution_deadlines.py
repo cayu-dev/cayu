@@ -337,7 +337,7 @@ def test_process_roundtrip_uses_absolute_expiry():
         [
             sys.executable,
             "-c",
-            "from cayu import ExecutionDeadline; import sys; d=ExecutionDeadline.model_validate_json(sys.argv[1]); print(d.remaining_seconds())",
+            "from cayu.deadlines import ExecutionDeadline; import sys; d=ExecutionDeadline.model_validate_json(sys.argv[1]); print(d.remaining_seconds())",
             expired.model_dump_json(),
         ],
         check=True,
@@ -693,8 +693,8 @@ def test_isolated_context_projection_carries_only_portable_deadline():
     assert "monotonic" not in json.dumps(payload)
     assert "remaining_seconds" not in json.dumps(payload)
     code = (
-        "import sys; from cayu.tools.isolated import ProcessIsolatedToolContext; "
-        "from cayu.deadlines import bind_execution_deadline; from cayu import RunRequest; "
+        "import sys\nfrom cayu.tools.isolated import ProcessIsolatedToolContext; "
+        "from cayu.deadlines import bind_execution_deadline\nfrom cayu import RunRequest; "
         "ctx=ProcessIsolatedToolContext.model_validate_json(sys.argv[1]); "
         "scope=bind_execution_deadline(ctx.execution_deadline); scope.__enter__(); "
         "r=RunRequest(agent_name='child',messages=[]); "

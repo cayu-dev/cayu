@@ -8,7 +8,7 @@ from tests.core.test_clarification_public import (
 )
 from tests.core.test_participant_identity import CONTEXT
 
-from cayu import (
+from cayu.collaboration import (
     CollaborationHost,
     HostClarificationMaintenanceSource,
     HostOwnershipLimits,

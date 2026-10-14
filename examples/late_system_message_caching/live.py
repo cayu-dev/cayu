@@ -17,9 +17,9 @@ from examples.late_system_message_caching.scenario import (
     summarize,
 )
 
-from cayu import AnthropicProvider, OpenAIProvider
+from cayu.providers import AnthropicProvider, OpenAIProvider
 
-# Price-book model IDs, so every turn is priced by cayu.default_price_book().
+# Price-book model IDs, so every turn is priced by cayu.budgets.default_price_book().
 _MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-4-5"}
 _OPTIONS = {
     "openai": {"openai": {"reasoning": {"effort": "low"}, "max_output_tokens": 400}},

@@ -17,18 +17,14 @@ import pytest
 from tests.core.test_openai_subscription_provider import StaticSubscriptionAuth
 
 import cayu.entrypoint as entrypoint_module
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ModelStreamEvent,
-    ScriptedModelProvider,
-    run_project_entrypoint,
-)
+from cayu import AgentSpec, CayuApp
 from cayu.cli import _build_parser
 from cayu.cli import main as cayu_main
 from cayu.cli.project import project_context
 from cayu.configuration import MAX_STEPS
-from cayu.providers import HttpxOpenAITransport, OpenAISubscriptionProvider
+from cayu.entrypoint import run_project_entrypoint
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import HttpxOpenAITransport, ModelStreamEvent, OpenAISubscriptionProvider
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

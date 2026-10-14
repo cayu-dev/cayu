@@ -7,13 +7,9 @@ Use it when the application knows the exact deterministic checks that are safe
 to offer for a trusted workspace.
 
 ```python
-from cayu import (
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
-    NamedCheck,
-    ProcessCommandPolicy,
-    RunCheckTool,
-)
+from cayu.runners import ExecCommand
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.tools import NamedCheck, ProcessCommandPolicy, RunCheckTool
 
 unit = NamedCheck(
     name="test",

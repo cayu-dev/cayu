@@ -16,8 +16,9 @@ import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
 from tests._session_provenance import fixture_session_invocation
 
-import cayu
+import cayu.artifacts
 import cayu.artifacts.local as artifact_local_module
+import cayu.exceptions
 import cayu.runners._subprocess as runner_subprocess_module
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -1316,8 +1317,8 @@ def test_durable_value_error_is_public_and_pickle_safe():
 
     restored = pickle.loads(pickle.dumps(raised.value))
 
-    assert cayu.DurableValueError is DurableValueError
-    assert cayu.extract_durable_value_error is extract_durable_value_error
+    assert cayu.exceptions.DurableValueError is DurableValueError
+    assert cayu.exceptions.extract_durable_value_error is extract_durable_value_error
     assert type(restored) is DurableValueError
     assert restored.code == raised.value.code
     assert restored.field_name == raised.value.field_name

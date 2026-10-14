@@ -14,7 +14,7 @@ from tests.core.test_producer_budget_refusal import authorize_execution
 from tests.core.test_producer_budget_refusal import refusal_ledger as refusal_ledger
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import (
+from cayu.collaboration import (
     CollaborationHost,
     HostOwnershipLimits,
     HostProducerExecution,

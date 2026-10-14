@@ -3,17 +3,9 @@ from __future__ import annotations
 import asyncio
 import os
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CitationPart,
-    HostedToolCallPart,
-    Message,
-    OpenAIProvider,
-    OpenAIWebSearch,
-    RunRequest,
-    WebSearchSource,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.messages import CitationPart, HostedToolCallPart, WebSearchSource
+from cayu.providers import OpenAIProvider, OpenAIWebSearch
 
 
 async def main() -> None:

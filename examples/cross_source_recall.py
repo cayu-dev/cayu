@@ -9,25 +9,22 @@ from __future__ import annotations
 
 import asyncio
 
-from cayu import (
+from cayu.memory import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     TRANSCRIPT_LEXICAL_CHANNEL,
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
     KnowledgeRecallSource,
-    RecallEngine,
-    RecallSituation,
     TranscriptRecallSource,
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.memory.base import AutomaticRecallContributor, AutomaticRecallPolicy
+from cayu.memory.recall import RecallEngine, RecallSituation
 from cayu.messages import Message, MessageRole
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 
 
 async def main() -> None:

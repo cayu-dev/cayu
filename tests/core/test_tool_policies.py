@@ -5,14 +5,15 @@ import asyncio
 import pytest
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import (
+from cayu import AgentSpec
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.records import Session, SessionStatus
+from cayu.tools import (
     ANY_TAINT_LABEL,
     TAINT_LABELS_METADATA_KEY,
-    AgentSpec,
     AllowlistRule,
     DenyPatternRule,
     EveryCallRule,
-    ExecutionProfileBehaviorIdentity,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
     RequiredFieldRule,
@@ -22,7 +23,6 @@ from cayu import (
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
-from cayu.sessions.records import Session, SessionStatus
 
 
 def _request(

@@ -15,14 +15,9 @@ from typing import Any
 
 import pytest
 
-from cayu import (
-    ApprovedEgressDestination,
-    ArtifactScope,
-    BrowserSessionTool,
-    LocalArtifactStore,
-    ToolContext,
-)
-from cayu.egress import HttpEgressPolicy, HttpxUpstream
+from cayu import ToolContext
+from cayu.artifacts import ArtifactScope, LocalArtifactStore
+from cayu.egress import ApprovedEgressDestination, HttpEgressPolicy, HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.environments import EnvironmentFactoryRequest
@@ -34,6 +29,7 @@ from cayu.evals.internal.browser_acceptance import (
     _install_browser_crash_fault,
 )
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand
+from cayu.tools import BrowserSessionTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import SecretRedactor
@@ -482,10 +478,12 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
 
 
 async def _run_rendered_text_model(factory, artifact_store, tmp_path):
-    from cayu import AgentSpec, CayuApp, EnvironmentSpec, Message, RunRequest, SQLiteSessionStore
+    from cayu import AgentSpec, CayuApp, Message, RunRequest
+    from cayu.environments import EnvironmentSpec
     from cayu.evals.testing import ScriptedModelProvider
     from cayu.providers.base import ModelStreamEvent
     from cayu.sessions.outcomes import run_to_completion
+    from cayu.storage import SQLiteSessionStore
 
     step = 0
 

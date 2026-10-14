@@ -12,7 +12,8 @@ from tests.core.test_model_completion_recovery import (
 )
 from tests.core.test_recovery_composition import _run_without_owners
 
-from cayu import AgentSpec, CayuApp, EventQuery, EventType
+from cayu import AgentSpec, CayuApp, EventType
+from cayu.sessions import EventQuery
 from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus

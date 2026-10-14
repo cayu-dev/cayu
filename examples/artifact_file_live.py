@@ -10,23 +10,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from _live_checks import require, require_positive_model_usage, require_successful_terminal
-from cayu import (
-    AgentSpec,
-    AnthropicProvider,
-    ArtifactScope,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventType,
-    ListArtifactsTool,
-    LocalArtifactStore,
-    Message,
-    OpenAIProvider,
-    ReadFileTool,
-    RunRequest,
-    file_attachment_from_payload,
-)
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
+from cayu.artifacts import ArtifactScope, LocalArtifactStore, file_attachment_from_payload
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.providers import AnthropicProvider, OpenAIProvider
+from cayu.tools import ListArtifactsTool, ReadFileTool
 
 TINY_PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"

@@ -11,7 +11,8 @@ from tests.core.session_closure_conformance import (
     create_closure_session,
 )
 
-from cayu import CayuApp, SessionClosureExportIncomplete
+from cayu import CayuApp
+from cayu.runtime import SessionClosureExportIncomplete
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_closure import (
     ArtifactSessionClosureStore,

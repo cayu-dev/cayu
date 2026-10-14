@@ -6,7 +6,7 @@ forwards a budget update, or invokes sinks/watchers. A failed read raises an err
 it does not alter delivery state or stop independent recovery.
 
 ```python
-from cayu import PersistedEventSideEffectQuery
+from cayu.sessions.event_delivery import PersistedEventSideEffectQuery
 
 health = await app.get_persisted_event_side_effect_health()
 page = await app.query_persisted_event_side_effect_deliveries(

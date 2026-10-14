@@ -115,7 +115,8 @@ def test_docker_runner_reopens_authenticated_result_without_redispatch(tmp_path,
         assert recovered == result
         from tests.docker_toolchain import docker_toolchain_profile
 
-        from cayu import DockerCodingEnvironmentFactory, LocalWorkspace
+        from cayu.environments import DockerCodingEnvironmentFactory
+        from cayu.workspaces import LocalWorkspace
 
         factory = DockerCodingEnvironmentFactory(
             source_workspace=LocalWorkspace(tmp_path),

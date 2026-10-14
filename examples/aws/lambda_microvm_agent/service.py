@@ -13,12 +13,9 @@ from examples.aws.lambda_microvm_agent.runtime import (
     build_runtime,
 )
 
-from cayu import (
-    PostgresSessionStore,
-    PostgresTaskStore,
-    public_authority_alias_codec_from_environment,
-)
+from cayu.runtime import public_authority_alias_codec_from_environment
 from cayu.server import BasicAuth, ServerConfig, create_server
+from cayu.storage import PostgresSessionStore, PostgresTaskStore
 from cayu.storage.migrations import SchemaMode
 
 

@@ -12,61 +12,46 @@ from pathlib import Path
 import pytest
 from tests.core.postgres_contention_support import drop_cayu_tables
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest, SessionStatus
+from cayu.artifacts import file_attachment
+from cayu.budgets import ModelPrice, PriceBook, session_usage_summary
+from cayu.context import StructuredOutputSpec
+from cayu.evals import (
     EvaluationEvidencePolicySpec,
-    Event,
-    EventType,
-    FilePart,
-    InMemorySessionStore,
     MaxEstimatedCostAssertionSpec,
-    Message,
-    MessageRole,
-    ModelPrice,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    PostgresSessionStore,
-    PriceBook,
     PromotionCandidateV1,
     PromotionWarningCode,
     RootStatusAssertionSpec,
-    RunRequest,
     ScriptedModelProvider,
-    SessionIdentity,
     SessionPromotionError,
     SessionPromotionErrorCode,
-    SessionStatus,
-    SessionStore,
-    SQLiteSessionStore,
-    StructuredOutputSpec,
-    TextPart,
-    ToolResultPart,
     Trajectory,
     TrialRequestSpec,
     build_captured_evaluation_candidate,
     build_promotion_candidate,
+    corpus,
     corpus_from_captured_evaluation_candidate,
     corpus_from_promotion_candidate,
     eval_corpus_from_json,
     export_promotion_corpus,
-    file_attachment,
     promotable_run_input,
+    promotion,
     runnable_promotion_candidate,
     score_captured_evaluation_candidate,
     score_promotion_candidate,
     scripted_structured_output,
-    session_usage_summary,
     trajectory_from_session,
 )
-from cayu.evals import corpus, promotion
 from cayu.evals.models import _trajectory_promotion_capture_sha256
+from cayu.messages import FilePart, MessageRole, TextPart, ToolResultPart
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions import InMemorySessionStore, SessionIdentity, SessionStore
 from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     parse_session_input_contract_evidence,
     session_input_messages_sha256,
 )
+from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage import _postgres_event_delivery as postgres_event_delivery
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -996,7 +981,7 @@ def test_promotion_export_is_canonical_across_processes_and_omits_preview_eviden
     )
     script = (
         "import sys\n"
-        "from cayu import PromotionCandidateV1, export_promotion_corpus\n"
+        "from cayu.evals import PromotionCandidateV1, export_promotion_corpus\n"
         "candidate = PromotionCandidateV1.model_validate_json(sys.stdin.read())\n"
         "sys.stdout.buffer.write(export_promotion_corpus(candidate))\n"
     )

@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import E2BGuestProvisioner, E2BRunner, ExecCommand
+from cayu.runners import E2BGuestProvisioner, E2BRunner, ExecCommand
 
 e2b = pytest.importorskip("e2b")
 

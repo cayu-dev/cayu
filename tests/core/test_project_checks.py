@@ -3,35 +3,31 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    AgentAuthoringState,
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.agents import AgentAuthoringState
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    ExecCommandTool,
-    LocalRunner,
-    LocalWorkspace,
-    ParameterConstrainedToolPolicy,
-    ProcessCommandPolicy,
-    ProjectDiagnostic,
-    RequiredFieldRule,
-    ScriptedModelProvider,
-    Tool,
-    ToolEffect,
-    ToolPolicyDecision,
-    ToolPolicyResult,
-    ToolResult,
-    ToolSpec,
-    WriteFileTool,
-    check_manifest,
 )
+from cayu.evals import ScriptedModelProvider
+from cayu.runners import LocalRunner
+from cayu.runtime import ProjectDiagnostic, check_manifest
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES, ProjectControlPlaneCheckEvidence
 from cayu.runtime.service_manifest import PublicServiceManifest
+from cayu.tools import (
+    AlwaysRequireApprovalToolPolicy,
+    ExecCommandTool,
+    ParameterConstrainedToolPolicy,
+    ProcessCommandPolicy,
+    RequiredFieldRule,
+    ToolPolicyDecision,
+    ToolPolicyResult,
+    WriteFileTool,
+)
+from cayu.workspaces import LocalWorkspace
 
 
 class _ExternalTool(Tool):
@@ -640,8 +636,10 @@ def test_diagnostic_parameters_are_copied_read_only_json() -> None:
 
 
 def test_default_policy_accepts_read_file_and_ask_user_but_not_implicit_writes() -> None:
-    from cayu import AgentSpec, CayuApp, ScriptedModelProvider, StaticToolPolicy
+    from cayu import AgentSpec, CayuApp
+    from cayu.evals import ScriptedModelProvider
     from cayu.runtime.checks import check_manifest
+    from cayu.tools import StaticToolPolicy
     from cayu.tools.files import ReadFileTool, WriteFileTool
     from cayu.tools.user_input import UserInputTool
 
@@ -666,8 +664,10 @@ def test_default_policy_accepts_read_file_and_ask_user_but_not_implicit_writes()
 
 
 def test_explicit_allow_is_not_published_in_the_manifest() -> None:
-    from cayu import AgentSpec, CayuApp, ScriptedModelProvider, StaticToolPolicy
+    from cayu import AgentSpec, CayuApp
+    from cayu.evals import ScriptedModelProvider
     from cayu.runtime.manifest import AppManifest
+    from cayu.tools import StaticToolPolicy
     from cayu.tools.files import WriteFileTool
 
     app = CayuApp(enable_logging=False)

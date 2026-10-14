@@ -6,31 +6,28 @@ from itertools import repeat
 
 import pytest
 
-from cayu import (
-    AgentSpec,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.context import RequestFootprintConfig
+from cayu.context.base import ContextBuildError
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.memory import (
     AutomaticRecallContextPolicy,
     AutomaticRecallSourceConfig,
-    AutomaticRecallSourceContext,
-    AutomaticRecallSourceDescriptor,
-    AutomaticRecallSourceRegistration,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
     MemoryDeltaPolicy,
-    Message,
-    ModelStreamEvent,
     RecallEngineConfig,
-    RequestFootprintConfig,
-    RunRequest,
-    ScriptedModelProvider,
 )
-from cayu.context.base import ContextBuildError
 from cayu.memory.evidence import ContextExposureState, RecallEvidenceQuery
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     RecallSituation,
+)
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import (
+    AutomaticRecallSourceContext,
+    AutomaticRecallSourceDescriptor,
+    AutomaticRecallSourceRegistration,
 )
 from cayu.runtime._memory_evidence import MemoryEvidenceKey, memory_evidence_key_scope
 

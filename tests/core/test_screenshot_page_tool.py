@@ -12,23 +12,18 @@ from typing import Any
 
 import pytest
 
-from cayu import (
+from cayu import ToolContext, ToolEffect
+from cayu.artifacts import ArtifactScope, ArtifactStore, LocalArtifactStore
+from cayu.environments import ExecutionCapabilityClaim, ExecutionCapabilityEvidence
+from cayu.environments.admission import ExecutionAdmissionCandidate
+from cayu.runners import ExecCommand, ExecResult
+from cayu.tools import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     BROWSER_FETCH_PROTOCOL_VERSION,
     BROWSER_FETCH_WORKER_VERSION,
-    ArtifactScope,
-    ExecCommand,
-    ExecutionCapabilityClaim,
-    ExecutionCapabilityEvidence,
-    LocalArtifactStore,
     ScreenshotPageTool,
-    ToolContext,
-    ToolEffect,
     WebAccessOutcome,
 )
-from cayu.artifacts import ArtifactStore
-from cayu.environments.admission import ExecutionAdmissionCandidate
-from cayu.runners import ExecResult
 from cayu.tools import _browser_guest as guest
 
 

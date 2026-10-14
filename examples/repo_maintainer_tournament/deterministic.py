@@ -6,7 +6,7 @@ from pathlib import Path
 from examples._advanced_support import ScenarioResult, completed_batch, structured_batch
 from examples.repo_maintainer_tournament.scenario import run_scenario
 
-from cayu import ScriptedModelProvider
+from cayu.evals import ScriptedModelProvider
 
 
 async def run(root: Path) -> ScenarioResult:

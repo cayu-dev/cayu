@@ -44,8 +44,9 @@ async def measure(repo: Path, samples: int, *, isolate_gc: bool = False) -> dict
     )
     from tests.core.test_completion_verifier_adapters import _contract as verifier_contract
 
-    from cayu import CayuApp, InMemoryTaskStore
+    from cayu import CayuApp
     from cayu.build_provenance import current_runtime_build_provenance
+    from cayu.tasks import InMemoryTaskStore
 
     async def batch(kind: str, size: int, *, counted: bool = False):
         operations = []

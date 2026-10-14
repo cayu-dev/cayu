@@ -7,7 +7,24 @@ from typing import Any, cast
 
 import pytest
 
-from cayu import (
+from cayu.memory import (
+    AgentRecallProcessingRequest,
+    AgentRecallProcessingResult,
+    AgentRecallProcessor,
+    WeightedReciprocalRankFusionConfig,
+)
+from cayu.memory.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    RecallSituation,
+)
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeChunk,
+    KnowledgeEntry,
+)
+from cayu.work_context import (
     DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
     AgentRecallCheckpoint,
     AgentRecallCheckpointMode,
@@ -15,20 +32,10 @@ from cayu import (
     AgentRecallDeliveryConflict,
     AgentRecallDeliveryEvidenceKind,
     AgentRecallDeliveryState,
-    AgentRecallProcessingRequest,
-    AgentRecallProcessingResult,
-    AgentRecallProcessor,
     AgentWorkContext,
     AgentWorkContextConflict,
     AgentWorkContextStore,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeChunk,
-    KnowledgeEntry,
-    RecallSituation,
-    WeightedReciprocalRankFusionConfig,
 )
-from cayu.memory.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL
 
 _ACCESS_POLICY_SHA256 = "a" * 64
 _OTHER_ACCESS_POLICY_SHA256 = "b" * 64

@@ -10,7 +10,6 @@ import pytest
 from pydantic import ValidationError
 
 import cayu.sessions.base as sessions_module
-from cayu import SQLiteSessionStore
 from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -57,6 +56,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionsRecoveryRequest,
 )
 from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
+from cayu.storage import SQLiteSessionStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus

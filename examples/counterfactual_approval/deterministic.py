@@ -6,7 +6,7 @@ from pathlib import Path
 from examples._advanced_support import ScenarioResult, completed_batch, structured_batch
 from examples.counterfactual_approval.scenario import run_scenario
 
-from cayu import ScriptedModelProvider
+from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 
 

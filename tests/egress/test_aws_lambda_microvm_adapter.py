@@ -11,7 +11,6 @@ import pytest
 from tests.runners.lambda_microvm_harness import OwnerFencedTransport
 
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
-from cayu import ExecCommand, ExecResult
 from cayu.egress import (
     HttpEgressPolicy,
     TransparentEgressBroker,
@@ -28,7 +27,7 @@ from cayu.environments import (
     ExecutionToolRequirement,
     evaluate_execution_admission,
 )
-from cayu.runners import Runner
+from cayu.runners import ExecCommand, ExecResult, Runner
 from cayu.vaults import SecretRef, StaticVault
 
 

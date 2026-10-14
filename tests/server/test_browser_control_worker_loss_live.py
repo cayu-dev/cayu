@@ -16,7 +16,6 @@ from tests.core.test_browser_control_transport import control_tls as _control_tl
 from websockets.asyncio.server import serve
 from websockets.typing import Subprotocol
 
-from cayu import SQLiteSessionStore
 from cayu.runtime._browser_control_channel import (
     BrowserGuestCommandOwner,
     bind_browser_guest_channel,
@@ -24,6 +23,7 @@ from cayu.runtime._browser_control_channel import (
 )
 from cayu.runtime._browser_control_model import browser_model_control_admission
 from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
+from cayu.storage import SQLiteSessionStore
 from cayu.tools._browser_control_guest import GuestControlChannel, GuestControlFence
 from cayu.tools._browser_control_transport import CONTROL_SUBPROTOCOL, open_guest_control_channel
 from cayu.tools._browser_guest import _GuestFailure, _InteractiveDaemon, _InteractivePage

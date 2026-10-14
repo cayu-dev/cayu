@@ -9,13 +9,12 @@ import pytest
 from pydantic import ValidationError
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
-from cayu import (
+from cayu import Event, EventType
+from cayu.budgets import (
     BillingIdentity,
     BudgetLimit,
     BudgetReservation,
     ContextualPricingRequirement,
-    Event,
-    EventType,
     InMemoryBudgetLedger,
     ModelPrice,
     PriceBook,
@@ -23,9 +22,9 @@ from cayu import (
     PricingContextSelector,
     ResolvedBillingIdentity,
     estimate_session_cost,
-    extract_durable_value_error,
 )
 from cayu.budgets.billing import completed_billing_identity, copy_billing_identity
+from cayu.exceptions import extract_durable_value_error
 
 
 def _identity(*, contexts: tuple[PricingContext, ...]) -> BillingIdentity:

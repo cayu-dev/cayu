@@ -11,18 +11,13 @@ from examples.forked_session_knowledge import (
     run_demo,
 )
 
-from cayu import (
-    AlwaysRequireApprovalToolPolicy,
-    EventType,
-    KnowledgeActorType,
-    KnowledgeReviewWorkflow,
-    KnowledgeStatus,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-)
+from cayu import EventType
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
 from cayu.providers import ModelRequest
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.openai import build_openai_payload
+from cayu.storage import KnowledgeActorType, KnowledgeReviewWorkflow, KnowledgeStatus
+from cayu.tools import AlwaysRequireApprovalToolPolicy
 from cayu.tools.grants import TARGETED_TOOL_TRANSCRIPT_REFERENCE
 
 _TARGETED_CONTEXT_SCHEMA = "cayu.targeted-tool-context.v1"

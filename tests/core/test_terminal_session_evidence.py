@@ -10,7 +10,9 @@ from tests.core.postgres_contention_support import drop_cayu_tables
 
 import cayu.sessions.terminal_evidence as terminal_evidence_module
 import cayu.storage._sqlite_records as sqlite_records
-from cayu import (
+from cayu import Event, EventType, Message, RunRequest, SessionStatus
+from cayu._validation import compact_json_utf8_size
+from cayu.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
@@ -19,18 +21,12 @@ from cayu import (
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
-    Event,
     EventQuery,
     EventRecord,
-    EventType,
     InMemorySessionStore,
-    Message,
-    RunRequest,
     Session,
     SessionIdentity,
-    SessionStatus,
     SessionStore,
-    SQLiteSessionStore,
     TerminalPublicationMarker,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
@@ -38,7 +34,6 @@ from cayu import (
     TerminalSessionEvidenceLimits,
     TranscriptRecord,
 )
-from cayu._validation import compact_json_utf8_size
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -51,6 +46,7 @@ from cayu.sessions.terminal_evidence import (
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,
 )
+from cayu.storage import SQLiteSessionStore
 
 
 def _session(
@@ -1753,7 +1749,7 @@ def test_postgres_terminal_evidence_survives_restart_with_the_exact_boundary(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         await _reset_postgres(postgres_dsn)
@@ -1826,7 +1822,7 @@ def test_postgres_terminal_evidence_survives_restart_with_the_exact_boundary(
 
 def test_postgres_terminal_evidence_acceptance_matrix(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         await _reset_postgres(postgres_dsn)
@@ -1911,7 +1907,7 @@ def test_postgres_terminal_evidence_queries_use_bounded_ordering_indexes(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         await _reset_postgres(postgres_dsn)

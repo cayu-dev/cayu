@@ -4,7 +4,8 @@ import asyncio
 
 from examples.durable_file_workflow.demo import build_app, run_demo
 
-from cayu import TaskStatus, check_manifest
+from cayu.runtime import check_manifest
+from cayu.tasks import TaskStatus
 
 
 def test_demo_recovers_then_verifies_completion_and_blocks_missing_input(

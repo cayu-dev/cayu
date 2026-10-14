@@ -136,7 +136,9 @@ from hashlib import sha256
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from cayu import CayuApp, EventQuery, TaskCreate
+from cayu import CayuApp
+from cayu.sessions import EventQuery
+from cayu.tasks import TaskCreate
 
 router = APIRouter(prefix="/product")
 cayu_app = CayuApp(...)  # process-scoped runtime and stores

@@ -7,25 +7,20 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp, RunRequest
+from cayu.sessions import (
     InMemorySessionStore,
-    InMemoryTaskStore,
     InvocationOriginClaim,
     InvocationOriginTrust,
-    RunRequest,
     SessionExecutionSource,
     SessionInvocationBinding,
-    SQLiteTaskStore,
-    TaskCreate,
     TaskExecutionSource,
-    TaskStatus,
     session_invocation_from_task,
-    task_create_with_execution_source,
 )
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import run_request_with_task_invocation
-from cayu.storage import migrations
+from cayu.storage import SQLiteTaskStore, migrations
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, task_create_with_execution_source
 from cayu.vaults import SecretRedactor
 
 

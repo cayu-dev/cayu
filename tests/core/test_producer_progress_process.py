@@ -8,7 +8,7 @@ import pytest
 from tests.core.producer_export_scenario import completed_export_scenario
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import ProducerProgressOccurrence
+from cayu.collaboration import ProducerProgressOccurrence
 from cayu.collaboration.requests import RequestProgressReceipt
 
 

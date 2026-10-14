@@ -10,16 +10,29 @@ import pytest
 from pydantic import SecretStr
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import (
-    AgentSpec,
-    BeforeStopDecision,
+from cayu import AgentSpec, Message, RunRequest, ToolContext
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
+from cayu.context import ContextPressureOverhead, ContextRequest
+from cayu.egress import VirtualCredentialGrant
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+    TextEmbeddingUsage,
+)
+from cayu.environments import (
     BoundWorkspace,
-    ContextPressureOverhead,
-    ContextRequest,
     Environment,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
+    SyncBindingContext,
+    WorkspaceInstructions,
+    WorkspaceInstructionsConfig,
+    WorkspaceSnapshot,
+    copy_environment_factory_request,
+)
+from cayu.evals import (
     EvalAssertionResult,
     EvalCase,
     EvalCaseComparison,
@@ -30,32 +43,16 @@ from cayu import (
     EvalStatus,
     EvalSuite,
     EvalTrialResult,
-    LocalWorkspace,
-    Message,
-    ProxyAuthorizationResult,
-    ResolvedSecret,
-    RunRequest,
-    SecretEnv,
-    SecretRef,
-    Session,
-    StepRunOptions,
-    SubagentSpec,
-    SyncBindingContext,
-    TextEmbedding,
-    TextEmbeddingRequest,
-    TextEmbeddingResult,
-    TextEmbeddingUsage,
-    ToolContext,
     Trajectory,
-    WorkflowSpec,
-    WorkspaceInstructions,
-    WorkspaceInstructionsConfig,
-    WorkspaceSnapshot,
-    copy_environment_factory_request,
-    extract_durable_value_error,
 )
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
-from cayu.egress import VirtualCredentialGrant
+from cayu.exceptions import extract_durable_value_error
+from cayu.proxies import ProxyAuthorizationResult
+from cayu.runtime import BeforeStopDecision
+from cayu.sessions import Session
+from cayu.tools import SubagentSpec
+from cayu.vaults import ResolvedSecret, SecretEnv, SecretRef
+from cayu.workflows import StepRunOptions, WorkflowSpec
+from cayu.workspaces import LocalWorkspace
 
 _SENSITIVE_CANARY = "private-runtime-value-canary"
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)

@@ -14,10 +14,9 @@ or automatic isolation for arbitrary application tools with their own credential
 ## Admission and policy
 
 ```python
-from cayu import (
-    CayuApp, ResourceAccessPolicy, ResourceAccessGrant, ResourceAccessDecision,
-    SessionAccessScope, SessionAccessRule, SessionAccessSelector,
-)
+from cayu import CayuApp
+from cayu.resource_access import ResourceAccessPolicy, ResourceAccessGrant, ResourceAccessDecision
+from cayu.sessions import SessionAccessScope, SessionAccessRule, SessionAccessSelector
 
 
 def rule(**labels):

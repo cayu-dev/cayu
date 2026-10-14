@@ -26,7 +26,6 @@ from cayu.collaboration.request_access import PreparedAdmissionRegistration, Req
 
 
 def test_producer_contracts_have_matching_public_exports():
-    import cayu
     import cayu.collaboration as collaboration
 
     for name in (
@@ -53,8 +52,9 @@ def test_producer_contracts_have_matching_public_exports():
         "ProducerExportCleanupStatus",
         "ProducerOutputAcceptanceReader",
     ):
-        assert name in cayu.__all__ and name in collaboration.__all__
-        assert getattr(cayu, name) is getattr(collaboration, name)
+        assert name in collaboration.__all__
+        assert name in dir(collaboration)
+        assert getattr(collaboration, name) is not None
 
 
 @pytest.mark.anyio

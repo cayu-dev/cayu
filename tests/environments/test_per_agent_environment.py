@@ -12,7 +12,7 @@ import asyncio
 import importlib.util
 from pathlib import Path
 
-from cayu import EnvironmentFactoryRequest
+from cayu.environments import EnvironmentFactoryRequest
 
 _EXAMPLE = (
     Path(__file__).resolve().parents[2] / "examples" / "environments" / "per_agent_environment.py"

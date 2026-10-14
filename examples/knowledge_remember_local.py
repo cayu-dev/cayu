@@ -5,7 +5,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from cayu import (
+from cayu import ToolContext
+from cayu.storage import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeActivationDecision,
@@ -15,11 +16,8 @@ from cayu import (
     KnowledgeGovernanceMode,
     KnowledgeReviewWorkflow,
     KnowledgeStatus,
-    RememberKnowledgePolicy,
-    RememberKnowledgeTool,
-    SearchKnowledgeTool,
-    ToolContext,
 )
+from cayu.tools import RememberKnowledgePolicy, RememberKnowledgeTool, SearchKnowledgeTool
 
 
 class DemoActivationPolicy:

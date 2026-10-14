@@ -165,13 +165,12 @@ def populated_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_workspace_branch_contracts_are_top_level_public_exports() -> None:
-    import cayu
+def test_workspace_branch_contracts_are_public_exports() -> None:
     import cayu.workspaces as workspaces
 
     for name in _BRANCH_PUBLIC_EXPORTS:
-        assert getattr(cayu, name) is getattr(workspaces, name)
-        assert name in cayu.__all__
+        assert name in dir(workspaces)
+        assert getattr(workspaces, name) is not None
         assert name in workspaces.__all__
 
 

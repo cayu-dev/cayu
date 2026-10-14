@@ -7,8 +7,9 @@ import asyncio
 import pytest
 from tests.core.test_recovery_composition import _run_without_owners
 
-from cayu import AgentSpec, CayuApp, EventType, InterruptSessionRequest, RunRequest
+from cayu import AgentSpec, CayuApp, EventType, RunRequest
 from cayu._exception_groups import iter_exception_tree
+from cayu.sessions import InterruptSessionRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus

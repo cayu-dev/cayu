@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import ExecCommand
+from cayu.runners import ExecCommand
 from cayu.runners.base import runner_workspace_mutation_settlement
 
 _EXAMPLE_PATH = Path(__file__).resolve().parents[2] / "examples" / "modal_runner.py"

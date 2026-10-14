@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from cayu import (
-    Event,
-    EventType,
+from cayu import Event, EventType
+from cayu.approvals import (
     PendingToolApproval,
     PendingToolApprovalEventView,
     PendingToolCallApproval,

@@ -818,7 +818,7 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         f"from tools.{tool_name} import {', '.join(tool_imports)}",
     ]
     if effect == "external" and registration_relative != "app.py":
-        import_lines.append("from cayu import AlwaysRequireApprovalToolPolicy")
+        import_lines.append("from cayu.tools import AlwaysRequireApprovalToolPolicy")
     agent_constant = f"{_constant_name(name)}_AGENT"
     tool_instance = f"{_class_name(tool_name)}Tool()"
     provider_variable = "provider_override" if registration_relative != "app.py" else "provider"
@@ -1748,6 +1748,36 @@ def _generated_path(root: Path, relative: str) -> Path:
     return target
 
 
+def _tracer_imports(names: set[str]) -> str:
+    """Render only the public imports used by a generated test or evaluation."""
+
+    owners = {
+        "cayu": {"EventType", "Message", "RunRequest", "SessionStatus", "run_to_completion"},
+        "cayu.evals": {
+            "EvalCase",
+            "EvalPlan",
+            "EvalSuite",
+            "EventOccurred",
+            "FinalOutputContains",
+            "ScriptedModelProvider",
+            "SessionCompleted",
+            "SessionInterrupted",
+            "ToolCalled",
+        },
+        "cayu.providers": {"ModelStreamEvent"},
+        "cayu.sessions": {"InMemorySessionStore"},
+        "cayu.tasks": {"InMemoryTaskStore"},
+    }
+    unknown = names - set().union(*owners.values())
+    if unknown:
+        raise ValueError(f"Unknown tracer imports: {sorted(unknown)}")
+    return "\n".join(
+        f"from {module} import (\n" + "".join(f"    {name},\n" for name in sorted(selected)) + ")"
+        for module, available in owners.items()
+        if (selected := names & available)
+    )
+
+
 def _slice_files(*, name: str, tool_name: str, effect: str) -> dict[str, str]:
     agent_constant = f"{_constant_name(name)}_AGENT"
     tool_name_constant = f"{_constant_name(tool_name)}_TOOL_NAME"
@@ -1770,39 +1800,34 @@ def _slice_files(*, name: str, tool_name: str, effect: str) -> dict[str, str]:
                         FinalOutputContains("sample"),"""
         test_effect_imports = set()
         eval_effect_imports = {"FinalOutputContains", "SessionCompleted", "ToolCalled"}
-    test_imports = "\n".join(
-        f"    {import_name},"
-        for import_name in sorted(
-            {
-                "InMemorySessionStore",
-                "InMemoryTaskStore",
-                "Message",
-                "ModelStreamEvent",
-                "RunRequest",
-                "ScriptedModelProvider",
-                "run_to_completion",
-                *test_effect_imports,
-            }
-        )
+    test_imports = _tracer_imports(
+        {
+            "InMemorySessionStore",
+            "InMemoryTaskStore",
+            "Message",
+            "ModelStreamEvent",
+            "RunRequest",
+            "ScriptedModelProvider",
+            "run_to_completion",
+            *test_effect_imports,
+        }
     )
-    eval_imports = "\n".join(
-        f"    {import_name},"
-        for import_name in sorted(
-            {
-                "EvalCase",
-                "EvalPlan",
-                "EvalSuite",
-                "InMemorySessionStore",
-                "InMemoryTaskStore",
-                "Message",
-                "ModelStreamEvent",
-                "RunRequest",
-                "ScriptedModelProvider",
-                *eval_effect_imports,
-            }
-        )
+    eval_imports = _tracer_imports(
+        {
+            "EvalCase",
+            "EvalPlan",
+            "EvalSuite",
+            "InMemorySessionStore",
+            "InMemoryTaskStore",
+            "Message",
+            "ModelStreamEvent",
+            "RunRequest",
+            "ScriptedModelProvider",
+            *eval_effect_imports,
+        }
     )
-    agent = f'''from cayu import AgentAuthoringState, AgentSpec
+    agent = f'''from cayu.agents import AgentAuthoringState
+from cayu import AgentSpec
 
 from configuration import configured_model, configured_provider_name
 
@@ -1818,14 +1843,8 @@ from tools.{tool_name} import {tool_name_constant}
     authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
 )
 '''
-    tool = f'''from cayu import (
-    ExecutionProfileBehaviorIdentity,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+    tool = f'''from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
 {tool_name_constant} = "{tool_name}"
@@ -1858,9 +1877,7 @@ class {tool_class}(Tool):
 
 import asyncio
 
-from cayu import (
 {test_imports}
-)
 
 from app import build_app
 from tools.{tool_name} import {tool_name_constant}
@@ -1898,9 +1915,7 @@ def test_{name}_slice_runs_through_public_runtime_seams() -> None:
     )
 {test_assertions}
 '''
-    eval_source = f'''from cayu import (
-{eval_imports}
-)
+    eval_source = f'''{eval_imports}
 
 from app import build_app
 from tools.{tool_name} import {tool_name_constant}
@@ -1977,46 +1992,34 @@ def _first_tool_files(*, agent_name: str, tool_name: str, effect: str) -> dict[s
                         FinalOutputContains("sample"),"""
         test_effect_imports = set()
         eval_effect_imports = {"FinalOutputContains", "SessionCompleted", "ToolCalled"}
-    test_imports = "\n".join(
-        f"    {import_name},"
-        for import_name in sorted(
-            {
-                "InMemorySessionStore",
-                "InMemoryTaskStore",
-                "Message",
-                "ModelStreamEvent",
-                "RunRequest",
-                "ScriptedModelProvider",
-                "run_to_completion",
-                *test_effect_imports,
-            }
-        )
+    test_imports = _tracer_imports(
+        {
+            "InMemorySessionStore",
+            "InMemoryTaskStore",
+            "Message",
+            "ModelStreamEvent",
+            "RunRequest",
+            "ScriptedModelProvider",
+            "run_to_completion",
+            *test_effect_imports,
+        }
     )
-    eval_imports = "\n".join(
-        f"    {import_name},"
-        for import_name in sorted(
-            {
-                "EvalCase",
-                "EvalPlan",
-                "EvalSuite",
-                "InMemorySessionStore",
-                "InMemoryTaskStore",
-                "Message",
-                "ModelStreamEvent",
-                "RunRequest",
-                "ScriptedModelProvider",
-                *eval_effect_imports,
-            }
-        )
+    eval_imports = _tracer_imports(
+        {
+            "EvalCase",
+            "EvalPlan",
+            "EvalSuite",
+            "InMemorySessionStore",
+            "InMemoryTaskStore",
+            "Message",
+            "ModelStreamEvent",
+            "RunRequest",
+            "ScriptedModelProvider",
+            *eval_effect_imports,
+        }
     )
-    tool = f'''from cayu import (
-    ExecutionProfileBehaviorIdentity,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+    tool = f'''from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
 {tool_name_constant} = "{tool_name}"
@@ -2049,9 +2052,7 @@ class {tool_class}(Tool):
 
 import asyncio
 
-from cayu import (
 {test_imports}
-)
 
 from app import build_app
 from tools.{tool_name} import {tool_name_constant}
@@ -2089,9 +2090,7 @@ def test_{tool_name}_runs_through_public_runtime_seams() -> None:
     )
 {test_assertions}
 '''
-    eval_source = f'''from cayu import (
-{eval_imports}
-)
+    eval_source = f'''{eval_imports}
 
 from app import build_app
 from tools.{tool_name} import {tool_name_constant}

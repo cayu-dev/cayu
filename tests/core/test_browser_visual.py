@@ -12,7 +12,8 @@ from tests.core.browser_guest_support import (
     _interactive_request,
 )
 
-from cayu import BrowserSessionTool, BrowserVisualPolicy, ToolContext
+from cayu import ToolContext
+from cayu.tools import BrowserSessionTool, BrowserVisualPolicy
 from cayu.tools._browser_visual_guest import visual_policy_from_json
 from cayu.tools.browser_session import _validated_request
 from cayu.tools.browser_visual import BrowserVisualGeometry, canonical_visual_point

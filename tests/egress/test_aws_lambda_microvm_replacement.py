@@ -24,17 +24,7 @@ from tests.egress.test_aws_lambda_microvm_recoverable_allocation import (
 from tests.runners.lambda_microvm_harness import ClientTokenLambdaModel, SupervisorTransport
 
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    EventType,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SessionStatus,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest, SessionStatus
 from cayu.artifacts import LocalArtifactStore
 from cayu.egress import (
     HttpEgressPolicy,
@@ -46,12 +36,14 @@ from cayu.egress import (
 )
 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
+from cayu.environments import EnvironmentSpec
 from cayu.environments.bindings import BoundWorkspace
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY as RECONNECT,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.storage import SQLiteSessionStore
 from cayu.vaults import SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, RunnerWorkspace
 from cayu.workspaces.checkpoint_lifecycle import WORKSPACE_CHECKPOINTS_KEY
@@ -293,7 +285,7 @@ def test_incompatible_predecessor_fails_before_provider_mutation(
 
 def test_writer_isolation_follows_the_owner_fence(tmp_path: Path) -> None:
     async def scenario() -> None:
-        from cayu import LambdaMicroVMRunner
+        from cayu.runners import LambdaMicroVMRunner
 
         model = ClientTokenLambdaModel()
         sidecar = SupervisorTransport(tmp_path)

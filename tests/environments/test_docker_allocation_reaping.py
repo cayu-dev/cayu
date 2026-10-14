@@ -9,23 +9,21 @@ from pathlib import Path
 import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 
-from cayu import (
+from cayu import Message, RunRequest
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
     EnvironmentAllocationState,
     EnvironmentFactoryRequest,
     ImmutableInputStore,
-    InMemorySessionStore,
-    LocalWorkspace,
-    Message,
-    RunRequest,
     inspect_local_immutable_input,
 )
 from cayu.environments.docker_coding import _docker_coding_reconnect_metadata
-from cayu.runners import DockerRunner, ExecResult
+from cayu.runners import DockerImageIdentity, DockerRunner, ExecResult
 from cayu.runtime._environment_allocation import EnvironmentAllocationCoordinator
+from cayu.sessions import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.vaults import SecretRedactor
+from cayu.workspaces import LocalWorkspace
 
 _ID = "a" * 64
 _OTHER_ID = "b" * 64

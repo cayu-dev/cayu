@@ -5,8 +5,9 @@ import asyncio
 import pytest
 from examples.runtime_auxiliary_inference import MODEL, Summarize
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.assertions import MaxEstimatedCost
 from cayu.evals.corpus import EvaluationEvidencePolicySpec, MaxEstimatedCostAssertionSpec
 from cayu.evals.evidence import project_assertion_evidence_view
@@ -15,6 +16,7 @@ from cayu.evals.portable_assertions import compile_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_spec
 from cayu.evals.runner import evaluate_assertions
 from cayu.evals.trajectory import trajectory_from_session
+from cayu.providers import ModelStreamEvent
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

@@ -69,7 +69,7 @@ from cayu.evals.internal.browser_acceptance_operator import perform_fixture_hand
 from cayu.events import EventType
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners.workloads import PINNED_BROWSER_FETCH_IMAGE, PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.server import BasicAuth, BrowserControlServerConfig, ServerConfig, create_server
 from cayu.server.browser_recording import BrowserRecordingServer
 from cayu.storage.sqlite import SQLiteSessionStore

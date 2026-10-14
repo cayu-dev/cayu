@@ -18,7 +18,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 if TYPE_CHECKING:
     from tests.sqlite_resources import SQLiteResourceScope
 
-from cayu import EventQuery, PendingActionQuery, SQLiteSessionStore
+from cayu.sessions import EventQuery, PendingActionQuery
+from cayu.storage import SQLiteSessionStore
 
 ROOT = Path(__file__).resolve().parents[2]
 

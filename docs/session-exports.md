@@ -18,7 +18,7 @@ state does not survive process restart.
 
 ## Registration and public entrances
 
-Import the user-facing contracts from `cayu` or `cayu.collaboration`.
+Import the user-facing contracts from `cayu.collaboration`.
 Register trusted host implementations with
 `CayuApp(session_store=store, session_exports=registration)`, where
 `registration` is a `SessionExportRegistration` containing an owner, policy,

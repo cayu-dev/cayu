@@ -12,31 +12,26 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    DockerImageIdentity,
-    EventType,
-    InMemoryKnowledgeStore,
-    InMemoryTaskStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeListQuery,
-    KnowledgeStatus,
-    Message,
-    ModelStreamEvent,
-    PendingToolApprovalEventView,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteKnowledgeStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    run_to_completion,
-)
+from cayu import EventType, Message, RunRequest, run_to_completion
+from cayu.approvals import PendingToolApprovalEventView, ToolApprovalDecision, ToolApprovalRequest
 from cayu.cli import main
 from cayu.cli.project import project_context
 from cayu.cli.scaffold import project_files
 from cayu.cli.scaffold_check import check_scaffold_capabilities
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeListQuery,
+    KnowledgeStatus,
+    SQLiteKnowledgeStore,
+    SQLiteSessionStore,
+    SQLiteTaskStore,
+)
+from cayu.tasks import InMemoryTaskStore
 
 
 @pytest.fixture(autouse=True)
@@ -411,7 +406,7 @@ def test_cli_reports_live_capability_drift(tmp_path, capsys, monkeypatch, comman
     source = tools.read_text()
     if add:
         # Disabled capabilities generate no imports, so wiring one adds its own.
-        source = source.replace('"""\n\n', '"""\n\nfrom cayu import UserInputTool\n', 1)
+        source = source.replace('"""\n\n', '"""\n\nfrom cayu.tools import UserInputTool\n', 1)
     tools.write_text(
         source.replace(
             "    return tuple(tools)",

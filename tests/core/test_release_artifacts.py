@@ -108,6 +108,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/data/__init__.py",
         "cayu/data/default_model_catalog.json",
         "cayu/data/default_price_book.json",
+        "cayu/data/public_api_imports.json",
         *{f"cayu/guides/{filename}" for filename, _description in _GUIDES.values()},
         "cayu/server/browser_client/client.js",
         "cayu/server/browser_client/client.d.ts",
@@ -269,6 +270,22 @@ def test_release_requires_every_registered_guide(tmp_path: Path, kind: str, file
     else:
         archive = tmp_path / "missing-guide.tar.gz"
         member = f"src/cayu/guides/{filename}"
+        _write_sdist(archive, omitted_names={member})
+        validator = validate_sdist
+    with pytest.raises(ValueError, match=rf"missing required .*files: .*{re.escape(member)}"):
+        validator(archive)
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_release_requires_import_migration_inventory(tmp_path: Path, kind: str) -> None:
+    if kind == "wheel":
+        archive = tmp_path / "missing-migrations.whl"
+        member = "cayu/data/public_api_imports.json"
+        _write_wheel(archive, _valid_wheel_names() - {member})
+        validator = validate_wheel
+    else:
+        archive = tmp_path / "missing-migrations.tar.gz"
+        member = "src/cayu/data/public_api_imports.json"
         _write_sdist(archive, omitted_names={member})
         validator = validate_sdist
     with pytest.raises(ValueError, match=rf"missing required .*files: .*{re.escape(member)}"):

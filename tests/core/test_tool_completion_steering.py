@@ -14,17 +14,11 @@ from tests.core.test_tool_round_publication_failure_matrix import (
 )
 from tests.core.test_tool_round_publication_failure_matrix import store_factory as store_factory
 
-from cayu import (
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    EventType,
-    IncompleteSessionRecoveryRequest,
-    SessionStatus,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-)
+from cayu import CayuApp, EventType, SessionStatus
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
+from cayu.sessions import EnqueueSessionMessageRequest, IncompleteSessionRecoveryRequest
 
 
 async def accept_stop(store, session_id, *, queued):

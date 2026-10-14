@@ -7,7 +7,7 @@ import pytest
 from examples._advanced_support import ScenarioResult, live_provider
 from examples._advanced_support.cli import run_cli
 
-from cayu import AnthropicProvider, ChatCompletionsProvider, OpenAIProvider
+from cayu.providers import AnthropicProvider, ChatCompletionsProvider, OpenAIProvider
 
 
 @pytest.mark.parametrize(

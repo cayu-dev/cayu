@@ -73,13 +73,11 @@ assert not any(name in sys.modules for name in blocked)
 
 
 def test_run_limit_public_imports_and_historical_class_pickle_keep_identity():
-    import cayu.runtime
     from cayu.runtime import stop_policy
 
     for name in ("RunLimits", "copy_run_limits", "has_run_limits"):
         canonical = getattr(run_limits, name)
         assert canonical.__module__ == run_limits.__name__
-        assert getattr(cayu, name) is getattr(cayu.runtime, name) is canonical
         assert getattr(stop_policy, name) is canonical
         get_type_hints(canonical)
     # Protocol 0 GLOBAL from the original public owner must still resolve.

@@ -13,17 +13,13 @@ from typing import Any
 
 import pytest
 
-from cayu import AgentSpec, Event, EventType, Message, SQLiteSessionStore, ToolResultPart
+from cayu import AgentSpec, Event, EventType, Message
+from cayu.applications import CayuApp
+from cayu.messages import ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    InMemorySessionStore,
-    RunRequest,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-)
+from cayu.sessions import InMemorySessionStore, RunRequest
+from cayu.storage import SQLiteSessionStore
+from cayu.tools import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 
 

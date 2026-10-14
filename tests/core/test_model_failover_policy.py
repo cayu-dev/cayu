@@ -6,7 +6,6 @@ from dataclasses import replace
 
 import pytest
 
-from cayu import ModelFailoverPolicy, ModelTarget
 from cayu.providers.base import ModelProviderError
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._model_failover import (
@@ -16,6 +15,7 @@ from cayu.runtime._model_failover import (
     decide_model_failover,
 )
 from cayu.runtime.retry_policy import RetrySuppression, retry_decision
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._model_failover import copy_model_failover_policy
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
-from cayu import TaskCreate, TaskStore
+from cayu.tasks import TaskCreate, TaskStore
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,

@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 from tests.evals.test_browser_acceptance_execution import _plan
 
-from cayu import ScriptedModelProvider, SQLiteSessionStore
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.browser_acceptance import (
     BrowserAcceptanceManifestV1,
     inspect_browser_acceptance_runtime_identity,
@@ -15,6 +15,7 @@ from cayu.evals.browser_acceptance import (
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.internal.browser_acceptance import _ENVIRONMENT_EXECUTION_PROFILE_IDENTITY, build
 from cayu.evals.runner import EvalPlan
+from cayu.storage import SQLiteSessionStore
 
 
 def _provider(plan, name="scripted"):

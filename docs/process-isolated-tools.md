@@ -37,7 +37,9 @@ closure, a lambda, a live `Tool`, or an object captured from the parent.
 # my_app/isolated_handlers.py
 from typing import Any
 
-from cayu import ExecutionProfileBehaviorIdentity, ProcessIsolatedToolContext, ToolResult
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.tools import ProcessIsolatedToolContext
+from cayu import ToolResult
 
 
 class SearchHandler:
@@ -67,15 +69,9 @@ build_search_handler.execution_profile_identity = ExecutionProfileBehaviorIdenti
 Register the adapter as an ordinary agent tool:
 
 ```python
-from cayu import (
-    ExecutionProfileBehaviorIdentity,
-    ProcessIsolatedTool,
-    ProcessIsolatedToolContextProjection,
-    ProcessIsolatedToolFactoryRef,
-    ProcessIsolatedToolLimits,
-    ToolEffect,
-    ToolSpec,
-)
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.tools import ProcessIsolatedTool, ProcessIsolatedToolContextProjection, ProcessIsolatedToolFactoryRef, ProcessIsolatedToolLimits
+from cayu import ToolEffect, ToolSpec
 
 search = ProcessIsolatedTool(
     ToolSpec(

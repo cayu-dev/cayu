@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-from cayu import (
+from cayu.egress import (
     EgressAuthorityAdoptionHandler,
     EgressAuthorityAdoptionResult,
     EgressAuthorityTransitionCoordinator,
-    EnvironmentFactoryResult,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileDecision,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    ModelStreamEvent,
     VirtualEgressEnvironmentFactory,
     authorized_egress_authority_transition,
     egress_authority_owner_fingerprint,
 )
+from cayu.environments import EnvironmentFactoryResult
+from cayu.execution_profiles import (
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileDecision,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+)
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import ExecutionProfilePolicy
 from tests.core._workload_secret_support import FakeProvider
 
 

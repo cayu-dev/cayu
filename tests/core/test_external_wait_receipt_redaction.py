@@ -10,8 +10,10 @@ from pydantic import SecretStr
 from tests.core.test_tool_completion import FinalTool, call
 from tests.external_wait_support import CONTEXT, Policy, registration, reservation, stores
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import ScriptedModelProvider
 from cayu.external_waits import ExternalEventWaits
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.session_external_waits import SessionExternalWaitAdapter

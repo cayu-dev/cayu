@@ -26,7 +26,8 @@ or provider failure, missing capability, and egress denial never cause fallback
 to host-process fetching or another provider.
 
 ```python
-from cayu import AgentSpec, WebBridge
+from cayu import AgentSpec
+from cayu.tools import WebBridge
 
 bridge = WebBridge.trusted_local()
 app.register_agent(
@@ -80,16 +81,9 @@ Applications may explicitly assemble a finite ordered policy over already
 validated bridges:
 
 ```python
-from cayu import (
-    AgentSpec,
-    ExecutionProfileBehaviorIdentity,
-    WebAccessOutcome,
-    WebAccessRouteAction,
-    WebAccessRoutePolicy,
-    WebAccessRouteRule,
-    WebBridge,
-    WebBridgeRoute,
-)
+from cayu import AgentSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.tools import WebAccessOutcome, WebAccessRouteAction, WebAccessRoutePolicy, WebAccessRouteRule, WebBridge, WebBridgeRoute
 
 hosted_provider_bridge = WebBridge.hosted(
     adapter=hosted_adapter,
@@ -175,7 +169,8 @@ public HTTPS page. It uses direct HTTP from the Cayu application process. It
 does not require a browser executable, Playwright, or a hosted search provider.
 
 ```python
-from cayu import AgentSpec, WebFetchTool
+from cayu import AgentSpec
+from cayu.tools import WebFetchTool
 
 app.register_agent(
     AgentSpec(name="researcher", model="your-model"),
@@ -321,7 +316,7 @@ and artifact publication failure remain distinct bounded errors without worker
 stderr or exception text.
 
 ```python
-from cayu import BrowserWebFetchAdapter, ScreenshotPageTool, WebFetchTool
+from cayu.tools import BrowserWebFetchAdapter, ScreenshotPageTool, WebFetchTool
 
 tools = [
     WebFetchTool(adapter=BrowserWebFetchAdapter()),
@@ -343,7 +338,7 @@ Fetched text is untrusted input. Mark `web_fetch` as a taint source when later
 tools can publish data or perform sensitive actions:
 
 ```python
-from cayu import TaintAwareToolPolicy, ToolPolicyDecision
+from cayu.tools import TaintAwareToolPolicy, ToolPolicyDecision
 
 web_policy = TaintAwareToolPolicy(
     taint_sources={"web_fetch": ["web"]},
@@ -372,7 +367,8 @@ OpenAI's Responses API can execute `web_search` inside a model turn. Enable it
 as typed registration authority, separately from Cayu-executed tools:
 
 ```python
-from cayu import AgentSpec, OpenAIWebSearch
+from cayu import AgentSpec
+from cayu.providers import OpenAIWebSearch
 
 app.register_agent(
     AgentSpec(name="researcher", model="gpt-5.6-luna"),
@@ -456,17 +452,11 @@ application wiring, not the model-facing `web_search` or `web_fetch` names and
 arguments:
 
 ```python
-from cayu import (
-    AgentSpec,
-    AllowlistProxy,
-    Environment,
-    EnvironmentSpec,
-    ExaWebAdapter,
-    LocalEnvVault,
-    SecretRef,
-    WebFetchTool,
-    WebSearchTool,
-)
+from cayu import AgentSpec
+from cayu.proxies import AllowlistProxy
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.tools import ExaWebAdapter, WebFetchTool, WebSearchTool
+from cayu.vaults import LocalEnvVault, SecretRef
 
 vault = LocalEnvVault({"exa_api_key": "EXA_API_KEY"})
 proxy = AllowlistProxy(vault, allowed_destinations=["api.exa.ai"])
@@ -532,13 +522,8 @@ result fields:
 ```python
 from datetime import date
 
-from cayu import (
-    ParallelAIWebAdapter,
-    SecretRef,
-    WebFetchTool,
-    WebSearchRestrictions,
-    WebSearchTool,
-)
+from cayu.tools import ParallelAIWebAdapter, WebFetchTool, WebSearchRestrictions, WebSearchTool
+from cayu.vaults import SecretRef
 
 parallel = ParallelAIWebAdapter(
     api_key_ref=SecretRef(name="parallel_api_key"),

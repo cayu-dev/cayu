@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from cayu import (
+from cayu.artifacts import (
     ArtifactScope,
     LocalArtifactStore,
-    LocalWorkspace,
     copy_artifact_to_workspace,
     copy_workspace_file_to_artifact,
 )
+from cayu.workspaces import LocalWorkspace
 
 
 async def main() -> None:

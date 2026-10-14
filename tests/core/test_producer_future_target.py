@@ -11,7 +11,8 @@ from tests.core.test_participant_identity import app as make_app
 from tests.core.test_peer_content import QualifiedPeerProvider
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import AgentSpec, ProducerDeliveryRecovery
+from cayu import AgentSpec
+from cayu.collaboration import ProducerDeliveryRecovery
 from cayu.collaboration._producer_contracts import ProducerOutputRegistration
 from cayu.collaboration._session_export_store import digest
 from cayu.collaboration.participants import CollaborationUnavailable

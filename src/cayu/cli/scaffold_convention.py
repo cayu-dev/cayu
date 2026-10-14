@@ -20,14 +20,12 @@ in their owning packages, then connect them through the explicit registration
 seams imported here.
 """
 
-from cayu import (
-    ArtifactStore,
-    CayuApp,
-    KnowledgeStore,
-    ModelProvider,
-    SessionStore,
-    TaskStore,
-)
+from cayu.artifacts import ArtifactStore
+from cayu import CayuApp
+from cayu.storage import KnowledgeStore
+from cayu.providers import ModelProvider
+from cayu.sessions import SessionStore
+from cayu.tasks import TaskStore
 from cayu.model_policy import configured_model_policy
 
 from agents.registration import register_agents
@@ -119,16 +117,16 @@ __all__ = [
 
 _PROVIDERS_PY = '''"""Explicit provider construction for this application."""
 
-from cayu import (
+from cayu.providers import (
     AnthropicProvider,
-    CayuApp,
     ChatCompletionsProvider,
     GatewayProvider,
     ModelProvider,
     OpenAIProvider,
     OpenAISubscriptionProvider,
-    ScriptedModelProvider,
 )
+from cayu import CayuApp
+from cayu.evals import ScriptedModelProvider
 
 from configuration.settings import (
     configured_anthropic_api_key,
@@ -249,8 +247,8 @@ _SETTINGS_PY = '''"""Validated source-controlled defaults and environment overri
 import os
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
+from cayu import AgentSpec
+from cayu.runtime import (
     PublicAuthorityAliasCodec,
     public_authority_alias_codec_from_environment,
 )
@@ -414,15 +412,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cayu import (
+from cayu.storage import (
     ApplicationStores,
     KnowledgeAccessScope,
     KnowledgeStore,
-    SessionStore,
-    TaskStore,
     configured_database_url,
     open_application_stores,
 )
+from cayu.sessions import SessionStore
+from cayu.tasks import TaskStore
 
 from configuration.settings import configured_public_authority_alias_codec
 from cayu.model_policy import model_policy_enabled
@@ -538,17 +536,17 @@ SYSTEM_PROMPT_PARTS: tuple[str, ...] = (__CAPABILITY_PROMPTS__)
 
 _TOOLS_REGISTRATION_PY = '''"""Native model-callable tools selected for the starter agent."""
 
-from cayu import (
-    ExecutionProfileBehaviorIdentity,
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.tools import (
     ListArtifactsTool,
     ListKnowledgeTool,
     ReadKnowledgeTool,
     RememberKnowledgePolicy,
     RememberKnowledgeTool,
     SearchKnowledgeTool,
-    Tool,
     UserInputTool,
 )
+from cayu import Tool
 
 from knowledge.retrieval import KNOWLEDGE_NAMESPACE
 
@@ -605,10 +603,9 @@ def external_effect_tool_names() -> tuple[str, ...]:
 
 _TOOL_POLICY_PY = '''"""Tool exposure and authorization policy for registered agents."""
 
-from cayu import (
+from cayu.tools import (
     DenyPatternRule,
     EveryCallRule,
-    ExecutionProfileBehaviorIdentity,
     ParameterConstrainedToolPolicy,
     RequiredFieldRule,
     StaticToolExposurePolicy,
@@ -617,6 +614,7 @@ from cayu import (
     ToolPolicy,
     ToolPolicyDecision,
 )
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 
 _TOOL_POLICY_IDENTITY = (
     ExecutionProfileBehaviorIdentity(
@@ -665,7 +663,8 @@ _RUNTIME_PY = '''"""Application-wide runtime policy and collaborator constructio
 
 from dataclasses import dataclass
 
-from cayu import CayuConfig, RequestFootprintConfig
+from cayu import CayuConfig
+from cayu.context import RequestFootprintConfig
 
 from configuration.settings import (
     configured_memory_evidence_key,
@@ -705,8 +704,9 @@ def _request_footprint_config() -> RequestFootprintConfig:
 
 _AGENT_REGISTRATION_PY = '''"""Explicit agent, tool, policy, and runtime registration seam."""
 
-from cayu import AgentSpec, CayuApp, ModelProvider
-from cayu import ContextPolicy
+from cayu import AgentSpec, CayuApp
+from cayu.providers import ModelProvider
+from cayu.context import ContextPolicy
 
 from agents.agent import AGENT
 from configuration import resolve_configured_agent
@@ -757,7 +757,7 @@ def register_agents(
 
 _KNOWLEDGE_RETRIEVAL_PY = '''"""Scoped reviewed knowledge configuration for this project."""
 
-from cayu import KnowledgeAccessScope, KnowledgeStatus
+from cayu.storage import KnowledgeAccessScope, KnowledgeStatus
 
 KNOWLEDGE_NAMESPACE = "project:__PROJECT_NAME__:agent:__AGENT_NAME__"
 
@@ -775,16 +775,16 @@ def build_knowledge_scope() -> KnowledgeAccessScope | None:
 
 _MEMORY_CONTEXT_PY = '''"""Bounded automatic recall and durable attribution policy."""
 
-from cayu import (
+from cayu.memory import (
     AutomaticRecallContextPolicy,
     AutomaticRecallPolicy,
     AutomaticRecallSourceConfig,
-    ContextPolicy,
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     WeightedReciprocalRankFusionConfig,
 )
+from cayu.context import ContextPolicy
 
 from knowledge.retrieval import KNOWLEDGE_NAMESPACE
 
@@ -831,15 +831,10 @@ _LOCAL_ENVIRONMENT_PY = '''"""Safe local artifacts and knowledge environment."""
 
 from pathlib import Path
 
-from cayu import (
-    ArtifactStore,
-    Environment,
-    EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
-    KnowledgeAccessScope,
-    KnowledgeStore,
-    LocalArtifactStore,
-)
+from cayu.artifacts import ArtifactStore, LocalArtifactStore
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.storage import KnowledgeAccessScope, KnowledgeStore
 
 _PROJECT_ROOT = Path(__file__).parents[1]
 _LOCAL_ENVIRONMENT_IDENTITY = (
@@ -903,20 +898,18 @@ import json
 import shutil
 from pathlib import Path
 
-from cayu import (
-    ArtifactStore,
+from cayu.artifacts import ArtifactStore
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
     DockerCodingToolchainProfile,
-    DockerImageIdentity,
     Environment,
     EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
-    KnowledgeAccessScope,
-    KnowledgeStore,
-    LocalWorkspace,
-    Runner,
-    ToolContext,
 )
+from cayu.runners import DockerImageIdentity, Runner
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.storage import KnowledgeAccessScope, KnowledgeStore
+from cayu.workspaces import LocalWorkspace
+from cayu import ToolContext
 
 _PROJECT_ROOT = Path(__file__).parents[1]
 # Hermetic tests set this to False (tests/conftest.py) so no container starts.
@@ -1129,11 +1122,8 @@ import asyncio
 import os
 
 import pytest
-from cayu import (
-    EnvironmentFactoryReleaseAction,
-    EnvironmentFactoryRequest,
-    ExecCommand,
-)
+from cayu.environments import EnvironmentFactoryReleaseAction, EnvironmentFactoryRequest
+from cayu.runners import ExecCommand
 
 from environments import sandbox
 
@@ -1203,11 +1193,9 @@ _SANDBOX_IMAGE_CONFIG = """{
 
 _TEST_APPLICATION_PY = '''"""Composition-root contract tests."""
 
-from cayu import (
-__TEST_KNOWLEDGE_IMPORT__    InMemorySessionStore,
-    InMemoryTaskStore,
-    ScriptedModelProvider,
-)
+__TEST_KNOWLEDGE_IMPORT__from cayu.evals import ScriptedModelProvider
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
 
 from app import build_app
 
@@ -1236,22 +1224,19 @@ _TEST_MEMORY_PY = '''"""Hermetic acceptance for scoped automatic knowledge recal
 
 import asyncio
 
-from cayu import (
-    ContextExposureState,
+from cayu.memory import ContextExposureState, RecallEvidenceQuery
+from cayu.storage import (
     InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeStatus,
-    Message,
-    ModelStreamEvent,
-    RecallEvidenceQuery,
-    RunRequest,
-    ScriptedModelProvider,
-    TextPart,
-    run_to_completion,
 )
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu import Message, RunRequest, run_to_completion
+from cayu.providers import ModelStreamEvent
+from cayu.evals import ScriptedModelProvider
+from cayu.messages import TextPart
 
 from app import build_app
 from knowledge.retrieval import KNOWLEDGE_NAMESPACE
@@ -1347,23 +1332,21 @@ _TEST_STANDARD_CAPABILITIES_PY = '''"""Hermetic acceptance for the standard loca
 
 import asyncio
 
-from cayu import (
-    EventType,
+from cayu import EventType, Message, RunRequest
+from cayu.sessions import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
-    InMemoryKnowledgeStore,
     InMemorySessionStore,
-    InMemoryTaskStore,
-    KnowledgeQuery,
-    KnowledgeStatus,
-    Message,
-    ModelStreamEvent,
+)
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeQuery, KnowledgeStatus
+from cayu.tasks import InMemoryTaskStore
+from cayu.providers import ModelStreamEvent
+from cayu.approvals import (
     PendingToolApprovalEventView,
-    RunRequest,
-    ScriptedModelProvider,
     ToolApprovalDecision,
     ToolApprovalRequest,
 )
+from cayu.evals import ScriptedModelProvider
 
 from app import build_app
 from knowledge.retrieval import KNOWLEDGE_NAMESPACE, build_knowledge_scope
@@ -1794,7 +1777,9 @@ def convention_files(
             "__ENABLE_LOGGING__": repr("observability" in selected),
             "__PUBLIC_APP_FACTORIES__": public_app_factories,
             "__TEST_KNOWLEDGE_IMPORT__": (
-                "    InMemoryKnowledgeStore,\n" if "knowledge" in selected else ""
+                "from cayu.storage import InMemoryKnowledgeStore\n"
+                if "knowledge" in selected
+                else ""
             ),
             "__TEST_KNOWLEDGE_SETUP__": (
                 "    knowledge = InMemoryKnowledgeStore()\n" if "knowledge" in selected else ""
@@ -1978,7 +1963,8 @@ a runner and sandboxed tools fail closed.
 A tool runs a fixed command like this:
 
 ```python
-from cayu import ExecCommand, ToolResult
+from cayu.runners import ExecCommand
+from cayu import ToolResult
 
 from environments.sandbox import require_sandbox_runner
 

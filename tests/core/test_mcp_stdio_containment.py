@@ -13,19 +13,18 @@ from pydantic import SecretStr
 
 import cayu.mcp._stdio_process as stdio_process
 import cayu.mcp.stdio as stdio_module
-from cayu import (
+from cayu.mcp import (
     McpProtocolError,
     McpServerSpec,
     McpToolset,
     McpTransportLimits,
-    ResolvedSecret,
-    SecretRef,
     StdioMcpClient,
     StdioMcpProcessLifetime,
 )
 from cayu.mcp import _stdio_containment as containment
 from cayu.mcp._stdio_process import ContainedStdioMcpProcess
 from cayu.mcp.stdio import StdioMcpSession
+from cayu.vaults import ResolvedSecret, SecretRef
 
 _FAKE_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
 

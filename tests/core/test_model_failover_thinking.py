@@ -10,27 +10,17 @@ import pytest
 from tests.core.test_model_failover_stages import _StageMemoryStore, _StageSQLiteStore
 from tests.core.test_vertex_provider import _provider as vertex_provider
 
-from cayu import (
-    AgentSpec,
-    AnthropicProvider,
-    CayuApp,
-    ChatCompletionsProvider,
-    EventQuery,
-    EventType,
-    Message,
-    ModelFailoverPolicy,
-    ModelTarget,
-    OpenAIProvider,
-    RunRequest,
-    ScriptedModelProvider,
-    ThinkingConfig,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.context import ThinkingConfig
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.runtime_replay import _RecordedProvider
+from cayu.providers import AnthropicProvider, ChatCompletionsProvider, OpenAIProvider
 from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelStreamEvent
 from cayu.providers.bedrock import BedrockProvider
 from cayu.providers.openai_subscription import OpenAISubscriptionProvider
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.sessions import EventQuery, ModelFailoverPolicy, ModelTarget
 
 
 class _NoAccess:

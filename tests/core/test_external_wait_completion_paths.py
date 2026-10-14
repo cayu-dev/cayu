@@ -8,20 +8,13 @@ import pytest
 from tests.core.test_tool_completion import FinalTool
 from tests.external_wait_support import CONTEXT, Policy, registration, reservation, stores
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionStatus,
-    StructuredOutputSpec,
-    ToolCompletionPolicy,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, SessionStatus
+from cayu.context import StructuredOutputSpec
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.testing import scripted_structured_output
 from cayu.external_waits import ExternalEventWaits
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import ToolCompletionPolicy
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.session_external_waits import SessionExternalWaitAdapter
 from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitUnavailable

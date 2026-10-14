@@ -64,13 +64,8 @@ are private/no-store and use bounded, non-disclosing errors.
 ## Python API
 
 ```python
-from cayu import (
-    EnqueueSessionMessageRequest,
-    SessionMessageAccessContext,
-    SessionMessageActionRequest,
-    SessionMessageConditions,
-    SessionMessageQuery,
-)
+from cayu.sessions import EnqueueSessionMessageRequest
+from cayu.sessions.messaging import SessionMessageAccessContext, SessionMessageActionRequest, SessionMessageConditions, SessionMessageQuery
 
 # principal has already been authenticated by the application.
 context = SessionMessageAccessContext(

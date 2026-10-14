@@ -7,10 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from cayu import InMemorySessionStore, ScriptedModelProvider
 from cayu.cli import main
 from cayu.cli.project import project_context
+from cayu.evals import ScriptedModelProvider
 from cayu.model_policy import configured_model_policy, model_policy_enabled
+from cayu.sessions import InMemorySessionStore
 
 
 @pytest.mark.parametrize("injected", [False, True])

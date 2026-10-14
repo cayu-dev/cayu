@@ -7,25 +7,18 @@ import hashlib
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    DefaultContextPolicy,
+from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolContext, ToolResult, ToolSpec
+from cayu.artifacts import LocalArtifactStore
+from cayu.context import DefaultContextPolicy
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    LocalWorkspace,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
 )
-from cayu.artifacts import LocalArtifactStore
+from cayu.evals import ScriptedModelProvider
+from cayu.workspaces import LocalWorkspace
 
 
 class _UncalledEnvironmentFactory(EnvironmentFactory):

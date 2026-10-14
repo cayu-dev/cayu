@@ -171,7 +171,8 @@ def test_workflow_claims_preserve_per_trial_instance_isolation(
     _project(
         tmp_path,
         f"""
-from cayu import WorkflowEvalTarget,WorkflowEvalExecution,WorkflowEvalResult,WorkflowSpec,EvaluationEvidencePolicySpec
+from cayu.evals import WorkflowEvalTarget, WorkflowEvalExecution, WorkflowEvalResult, EvaluationEvidencePolicySpec
+from cayu.workflows import WorkflowSpec
 from cayu.workflows import WorkflowBase,step
 class Workflow(WorkflowBase):
     spec=WorkflowSpec(name='process-workflow')
@@ -243,7 +244,8 @@ def test_workflow_failure_does_not_cancel_later_claims(tmp_path, concurrency, fa
     _project(
         tmp_path,
         f"""
-from cayu import WorkflowEvalTarget,WorkflowEvalExecution,WorkflowEvalResult,WorkflowSpec,EvaluationEvidencePolicySpec
+from cayu.evals import WorkflowEvalTarget, WorkflowEvalExecution, WorkflowEvalResult, EvaluationEvidencePolicySpec
+from cayu.workflows import WorkflowSpec
 from cayu.workflows import WorkflowBase
 class Workflow(WorkflowBase):
     spec=WorkflowSpec(name='process-workflow')
@@ -327,8 +329,9 @@ def test_dynamic_slot_stop_retains_claim_and_settles_case(
 ):
     from types import SimpleNamespace
 
-    from cayu import EvalCase, EvalSuite, Message, RunRequest
+    from cayu import Message, RunRequest
     from cayu.cli import _eval_processes
+    from cayu.evals import EvalCase, EvalSuite
     from cayu.evals._process_claims import initialize_claims
 
     launch = {

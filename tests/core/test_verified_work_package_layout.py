@@ -66,12 +66,12 @@ def test_verifier_profiles_preserve_public_imports_and_legacy_pickle_names():
     from cayu.runtime import completion_verifier_profiles as legacy
     from cayu.tasks import completion_verifier_profiles as profiles
 
-    public = [importlib.import_module(name) for name in ("cayu", "cayu.runtime")]
+    public = [importlib.import_module(name) for name in ("cayu.tasks",)]
     assert legacy.__all__ == profiles.__all__
     for name in profiles.__all__:
         value = getattr(profiles, name)
         assert getattr(legacy, name) is value
-        if name in cayu.__all__:
+        if name in importlib.import_module("cayu.tasks").__all__:
             assert all(getattr(module, name) is value for module in public)
         if isinstance(value, type):
             assert value.__module__ == profiles.__name__

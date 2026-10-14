@@ -940,7 +940,7 @@ def test_cycle_and_empty_graph_rejected() -> None:
 
 async def test_public_sdk_graph_creation_and_inspection(store: TaskStore) -> None:
     from cayu import CayuApp
-    from cayu import TaskGraphCreate as PublicGraphCreate
+    from cayu.tasks import TaskGraphCreate as PublicGraphCreate
 
     assert PublicGraphCreate is TaskGraphCreate
     app = CayuApp(task_store=store, enable_logging=False)

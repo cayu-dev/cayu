@@ -4,14 +4,9 @@ import asyncio
 
 import pytest
 
-from cayu import (
-    AllowlistProxy,
-    CredentialProxy,
-    PassthroughProxy,
-    ProxyAuthorizationResult,
-    WebBridgeCredentialAuthority,
-)
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
+from cayu.proxies import AllowlistProxy, CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
+from cayu.tools import WebBridgeCredentialAuthority
 from cayu.tools.base import ToolContext
 from cayu.vaults import SecretNotFound, SecretRef, StaticVault
 

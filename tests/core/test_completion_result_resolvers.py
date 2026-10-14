@@ -27,40 +27,34 @@ from tests.core.test_completion_decision_application import (
 )
 
 import cayu.verification._completion_result_resolver_coordinator as resolver_coordinator_module
-from cayu import (
-    CayuApp,
+from cayu import CayuApp, Event, EventType, Message, RunRequest
+from cayu.sessions import EventQuery, InMemorySessionStore, Session, SessionIdentity
+from cayu.sessions.records import CheckpointTransform, StoreTimeCheckpointTransform
+from cayu.sessions.requests import run_request_with_task_invocation
+from cayu.sessions.store import SessionStore
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks import (
     CompletionDecisionApplicationRequest,
-    CompletionResultResolutionRequest,
-    CompletionResultResolver,
-    CompletionResultResolverExecutionError,
     CompletionResultResolverRef,
-    CompletionResultResolverRequest,
-    CompletionResultResolverUnavailable,
-    CompletionResultUnavailable,
     CompletionVerdict,
-    Event,
-    EventQuery,
-    EventType,
-    InMemorySessionStore,
     InMemoryTaskStore,
-    Message,
-    RunRequest,
-    Session,
-    SessionIdentity,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
     Task,
     TaskCreate,
     TaskInvocationSnapshot,
     TaskStatus,
     WorkCompletionConflict,
 )
-from cayu.sessions.records import CheckpointTransform, StoreTimeCheckpointTransform
-from cayu.sessions.requests import run_request_with_task_invocation
-from cayu.sessions.store import SessionStore
 from cayu.tasks.store import TaskStore
 from cayu.tasks.work_receipts import CompletionDecisionApplicationReceipt
 from cayu.vaults import SecretRedactor
+from cayu.verification import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+    CompletionResultResolverExecutionError,
+    CompletionResultResolverRequest,
+    CompletionResultResolverUnavailable,
+    CompletionResultUnavailable,
+)
 
 
 class _Resolver(CompletionResultResolver):

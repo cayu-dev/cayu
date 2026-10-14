@@ -9836,7 +9836,8 @@ def test_profile_resolution_failure_does_not_admit_resume(monkeypatch) -> None:
     ],
 )
 def test_public_web_identity_admits_normal_run_and_remains_conservative(change) -> None:
-    from cayu import PublicWebEgressPolicy, run_to_completion
+    from cayu import run_to_completion
+    from cayu.egress import PublicWebEgressPolicy
 
     async def exercise() -> None:
         adapter = _AdoptionHandoffAdapter()
@@ -9890,7 +9891,7 @@ def test_public_web_identity_admits_normal_run_and_remains_conservative(change) 
 
 
 def test_custom_opaque_policy_identity_still_unavailable() -> None:
-    from cayu import ApprovedEgressDestination
+    from cayu.egress import ApprovedEgressDestination
     from cayu.runtime.execution_profiles import _egress_authority_component
 
     class CustomPolicy(HttpEgressPolicy):
@@ -9920,7 +9921,8 @@ def test_custom_opaque_policy_identity_still_unavailable() -> None:
 
 
 def test_same_public_web_profile_resumes_without_adoption() -> None:
-    from cayu import PublicWebEgressPolicy, run_to_completion
+    from cayu import run_to_completion
+    from cayu.egress import PublicWebEgressPolicy
 
     async def exercise():
         authority = VirtualEgressEnvironmentFactory(

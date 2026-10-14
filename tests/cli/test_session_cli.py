@@ -9,7 +9,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from cayu import SQLiteSessionStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
 from cayu.approvals.user_input import PendingUserInput
@@ -26,6 +25,7 @@ from cayu.messages import (
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.storage import SQLiteSessionStore
 
 
 def _budget_limit_id(value: int) -> str:

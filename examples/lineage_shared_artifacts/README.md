@@ -11,11 +11,7 @@ materialize the handoff. The environment must expose a durable `ArtifactStore`;
 production restart recovery also requires a durable `SessionStore`.
 
 ```python
-from cayu import (
-    MaterializeSharedArtifactTool,
-    PublishWorkspaceArtifactTool,
-    SharedArtifactPolicy,
-)
+from cayu.tools import MaterializeSharedArtifactTool, PublishWorkspaceArtifactTool, SharedArtifactPolicy
 
 policy = SharedArtifactPolicy(
     publish_path_prefixes=("handoff",),

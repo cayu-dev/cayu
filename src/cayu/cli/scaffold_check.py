@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+from cayu._import_migration import import_replacement, replacement_import
 from cayu.cli.scaffold_convention import local_database_path
 from cayu.cli.scaffold_plan import (
     ApplicationPlan,
@@ -141,6 +142,7 @@ IMPORT_BLOCKING_CODES = frozenset(
         "SCAFFOLD_CONVENTION_UNSUPPORTED",
         "SCAFFOLD_IMPORT_SIDE_EFFECT",
         "SCAFFOLD_MODULE_SOURCE_INVALID",
+        "SCAFFOLD_IMPORT_REMOVED",
     }
 )
 
@@ -830,6 +832,11 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 tags=_IMPORT_SAFETY_TAGS,
             ),
         )
+    diagnostics.extend(
+        finding
+        for path in sorted(declaration_proofs.migrations)
+        for finding in declaration_proofs.migrations[path]
+    )
     for relative in _APPLICATION_SOURCE_DIRECTORIES:
         package = root / relative
         if package.is_symlink():
@@ -845,6 +852,10 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 )
             )
     for path in _application_module_paths(root):
+        # Repair invalid imports before attempting to prove their declarations.
+        # The migration finding blocks application loading on its own.
+        if path in declaration_proofs.migrations:
+            continue
         relative = path.relative_to(root).as_posix()
         if path.is_symlink():
             diagnostics.append(
@@ -944,6 +955,8 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
     # concern directories. A missing inheritance proof must not hide the cause.
     reported = {diagnostic.path for diagnostic in diagnostics}
     for path, failures in sorted(declaration_proofs.failures.items()):
+        if path in declaration_proofs.migrations:
+            continue
         relative = path.relative_to(root).as_posix()
         for unsafe_node in failures:
             location = f"{relative}:{_narrowed_unsafe_node(unsafe_node).lineno}"
@@ -965,6 +978,47 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 )
             )
     return tuple(diagnostics)
+
+
+def _removed_import_diagnostics(
+    root: Path, path: Path, tree: ast.Module
+) -> tuple[ProjectDiagnostic, ...]:
+    findings: list[ProjectDiagnostic] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module in {"cayu", "cayu.runtime"}
+        ):
+            continue
+        local, _ = _project_local_import_module_path(
+            root, importing_path=path, module=node.module, level=0
+        )
+        if local:
+            continue
+        for alias in node.names:
+            replacement = import_replacement(node.module, alias.name)
+            if replacement is None:
+                continue
+            statement = replacement_import(replacement)
+            if alias.asname:
+                statement += f" as {alias.asname}"
+            findings.append(
+                _diagnostic(
+                    code="SCAFFOLD_IMPORT_REMOVED",
+                    path=f"{path.relative_to(root).as_posix()}:{alias.lineno}",
+                    message=f"Import `{node.module}.{alias.name}` was removed.",
+                    hint=f"Replace it with `{statement}`.",
+                    parameters={
+                        "removed": f"{node.module}.{alias.name}",
+                        "replacement": replacement,
+                    },
+                    severity=DiagnosticSeverity.ERROR,
+                    tags=_IMPORT_SAFETY_TAGS,
+                    documentation_anchor="cayu guide diagnostics#scaffold-import-removed",
+                )
+            )
+    return tuple(findings)
 
 
 _EFFECT_MODULES = frozenset(
@@ -1099,6 +1153,12 @@ def _demonstrated_effect(node: ast.expr | ast.stmt) -> bool:
 
 
 _DECLARATION_CONSTRUCTORS = frozenset({"ExecutionProfileBehaviorIdentity", "ToolSpec"})
+_EXECUTION_PROFILE_IDENTITY_IMPORTS = frozenset(
+    {
+        ("cayu.runtime", "ExecutionProfileBehaviorIdentity"),
+        ("cayu.runtime.execution_identity", "ExecutionProfileBehaviorIdentity"),
+    }
+)
 
 
 def _narrowed_unsafe_node(node: ast.expr | ast.stmt) -> ast.expr | ast.stmt:
@@ -1517,7 +1577,10 @@ def _stdlib_declaration_is_inert(
                 for keyword in call.keywords
             )
         )
-    if binding == ("cayu", "RetryPolicy"):
+    if binding in {
+        ("cayu.providers", "RetryPolicy"),
+        ("cayu.providers.retry_policy", "RetryPolicy"),
+    }:
         return not call.args and all(
             keyword.arg
             in {
@@ -2344,7 +2407,7 @@ def _identity_call_is_inert(
     return (
         isinstance(value, ast.Call)
         and _trusted_symbol(value.func, imports, rebound, root)
-        == ("cayu", "ExecutionProfileBehaviorIdentity")
+        in _EXECUTION_PROFILE_IDENTITY_IMPORTS
         and all(_literal_collection_is_data_only(arg) for arg in value.args)
         and all(
             keyword.arg is not None and _literal_collection_is_data_only(keyword.value)
@@ -2475,6 +2538,7 @@ class _DeclarationGraph:
     structural: dict[Path, dict[str, _DeclarativeBinding]]
     failures: dict[Path, tuple[ast.expr | ast.stmt, ...]]
     blockers: dict[Path, frozenset[Path]]
+    migrations: dict[Path, tuple[ProjectDiagnostic, ...]]
 
 
 def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
@@ -2668,7 +2732,13 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
     }
     for path, imports in invalid_imports.items():
         failures[path] = tuple(dict.fromkeys((*failures.get(path, ()), *imports)))
+    migrations = {
+        path: findings
+        for path, tree in trees.items()
+        if (findings := _removed_import_diagnostics(root, path, tree))
+    }
     invalid.update(failures)
+    invalid.update(migrations)
     blockers = {path: {path} if path in invalid else set() for path in trees.keys() | invalid}
     while True:
         changed = False
@@ -2684,6 +2754,7 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
         proofs,
         failures,
         {path: frozenset(causes) for path, causes in blockers.items() if causes},
+        migrations,
     )
 
 
@@ -3363,7 +3434,7 @@ def _declarative_identity_lines(
 
     if (
         import_bindings.get("ExecutionProfileBehaviorIdentity")
-        != ("cayu", "ExecutionProfileBehaviorIdentity")
+        not in _EXECUTION_PROFILE_IDENTITY_IMPORTS
         or "ExecutionProfileBehaviorIdentity" in rebound_names
     ):
         return {}
@@ -3720,12 +3791,10 @@ def _import_call_is_declarative(
             return False
         if name in {"frozenset", "list", "tuple"}:
             return name not in import_bindings
+        if name == "ExecutionProfileBehaviorIdentity":
+            return import_bindings.get(name) in _EXECUTION_PROFILE_IDENTITY_IMPORTS
         expected_imports = {
             "AgentSpec": ("cayu", "AgentSpec"),
-            "ExecutionProfileBehaviorIdentity": (
-                "cayu",
-                "ExecutionProfileBehaviorIdentity",
-            ),
             "Path": ("pathlib", "Path"),
             "dataclass": ("dataclasses", "dataclass"),
         }
@@ -3817,6 +3886,7 @@ def _diagnostic(
     parameters: Mapping[str, object],
     severity: DiagnosticSeverity = DiagnosticSeverity.WARNING,
     tags: tuple[str, ...] = ("authoring", "configuration", "deploy"),
+    documentation_anchor: str = _DOCS,
 ) -> ProjectDiagnostic:
     return ProjectDiagnostic(
         code=code,
@@ -3827,7 +3897,7 @@ def _diagnostic(
         hint=hint,
         tags=tags,
         parameters=parameters,
-        documentation_anchor=_DOCS,
+        documentation_anchor=documentation_anchor,
         verification_command=_VERIFY,
     )
 

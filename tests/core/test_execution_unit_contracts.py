@@ -12,7 +12,7 @@ from typing import get_type_hints
 
 import pytest
 
-import cayu
+import cayu.execution_units
 from cayu import execution_units as identities
 
 
@@ -32,15 +32,16 @@ class RejectExecution(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, RejectExecution())
 importlib.import_module(sys.argv[1])
-import cayu
+import cayu; import cayu.execution_units
+import cayu.execution_units
 from cayu import execution_units as units
 
-step = cayu.new_model_step_identity()
+step = cayu.execution_units.new_model_step_identity()
 attempt = step.new_attempt()
 round_ = attempt.new_tool_round()
 assert type(step) is units.ModelStepIdentity
-assert type(attempt) is cayu.ModelAttemptIdentity is units.ModelAttemptIdentity
-assert type(round_) is cayu.ToolRoundIdentity is units.ToolRoundIdentity
+assert type(attempt) is cayu.execution_units.ModelAttemptIdentity is units.ModelAttemptIdentity
+assert type(round_) is cayu.execution_units.ToolRoundIdentity is units.ToolRoundIdentity
 assert round_.model_step_id == step.model_step_id
 assert round_.model_attempt_id == attempt.model_attempt_id
 assert units.copy_tool_round_identity(round_) == round_
@@ -51,7 +52,7 @@ payload = {**round_.payload(), 'budget_limit_id': 'forged', 'reservation_id': 'f
            'tool_call_id': 'call', 'custom': {'keep': True}}
 units.strip_runtime_owned_execution_identity(payload)
 assert payload == {'tool_call_id': 'call', 'custom': {'keep': True}}
-assert cayu.BudgetLimitIdentity(budget_limit_id='blim_' + 'a' * 64).payload() == {
+assert cayu.execution_units.BudgetLimitIdentity(budget_limit_id='blim_' + 'a' * 64).payload() == {
     'budget_limit_id': 'blim_' + 'a' * 64
 }
 """
@@ -85,12 +86,6 @@ def test_public_execution_unit_imports_share_canonical_objects(name):
     expected = getattr(identities, name)
     assert getattr(runtime_path, name) is expected
     assert pickle.loads(f"ccayu.runtime.execution_units\n{name}\n.".encode()) is expected
-    if name not in {
-        "RUNTIME_OWNED_EXECUTION_IDENTITY_FIELDS",
-        "strip_runtime_owned_execution_identity",
-    }:
-        assert getattr(cayu, name) is expected
-        assert getattr(importlib.import_module("cayu.runtime"), name) is expected
 
 
 def test_execution_unit_inheritance_and_forward_annotations_share_canonical_classes():

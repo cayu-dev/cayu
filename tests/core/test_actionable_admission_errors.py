@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionRejected,
     ExecutionProfileComponentClass,

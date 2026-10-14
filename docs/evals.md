@@ -227,20 +227,8 @@ starting `cayu eval run` again creates a new launch and never resumes the old on
 ### Single-process SDK example
 
 ```python
-from cayu import (
-    AgentSpec,
-    EXTERNAL_CONTAINER_RESET_CONTRACT_REVISION,
-    EXTERNAL_CONTAINER_RUNNER_REVISION,
-    CayuApp,
-    EvalCase,
-    EvalSuite,
-    FinalOutputContains,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionCompleted,
-    run_eval_suite,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import EXTERNAL_CONTAINER_RESET_CONTRACT_REVISION, EXTERNAL_CONTAINER_RUNNER_REVISION, EvalCase, EvalSuite, FinalOutputContains, ScriptedModelProvider, SessionCompleted, run_eval_suite
 from cayu.providers import ModelStreamEvent
 
 
@@ -290,7 +278,7 @@ result. Assert on these so a tool that hides its findings in `structured`
 fails the test instead of the live model:
 
 ```python
-from cayu import model_facing_text
+from cayu.evals import model_facing_text
 
 seen = model_facing_text(provider.requests[1])
 assert "tool audit_csv: 3 blank rows in data.csv" in seen
@@ -647,7 +635,7 @@ contain JSON** and **Tool result contains JSON**; they are available in new
 evaluations, suite edits and duplication, and captured-session promotion.
 
 ```python
-from cayu import ToolArgumentsContainAssertionSpec, ToolResultContainsAssertionSpec
+from cayu.evals import ToolArgumentsContainAssertionSpec, ToolResultContainsAssertionSpec
 
 arguments = ToolArgumentsContainAssertionSpec(
     id="search-query",
@@ -705,7 +693,7 @@ range; optionally require a whole-artifact SHA-256 digest or bounded text; and
 enforce a minimum and optional maximum matching count.
 
 ```python
-from cayu import ArtifactAssertionSpec, WorkspaceFileAssertionSpec
+from cayu.evals import ArtifactAssertionSpec, WorkspaceFileAssertionSpec
 
 workspace_output = WorkspaceFileAssertionSpec(
     id="workspace-report",
@@ -773,7 +761,7 @@ aliases are public-safe correlation aids, not stable case or expectation
 identity, and the assertion never matches on them.
 
 ```python
-from cayu import MemoryAttributionAssertionSpec
+from cayu.evals import MemoryAttributionAssertionSpec
 
 memory_reached_provider = MemoryAttributionAssertionSpec(
     id="memory-reached-provider",
@@ -823,7 +811,7 @@ filtered sequence, including duplicates, to match exactly. Other runtime events
 do not affect that selected protocol check.
 
 ```python
-from cayu import ProcessEventAssertionSpec, ProcessEventsInOrderAssertionSpec
+from cayu.evals import ProcessEventAssertionSpec, ProcessEventsInOrderAssertionSpec
 
 approval_required = ProcessEventAssertionSpec(
     id="approval-required",
@@ -882,17 +870,8 @@ A corpus deliberately contains no executable application authority. Local SDK
 and CLI execution resolves that authority from the project-owned eval target:
 
 ```python
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CorpusTarget,
-    EvalPlan,
-    EvaluationEvidencePolicySpec,
-    Message,
-    ModelJudgeAssertionSpec,
-    ModelJudgeTarget,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import CorpusTarget, EvalPlan, EvaluationEvidencePolicySpec, ModelJudgeAssertionSpec, ModelJudgeTarget
 
 
 def build_eval() -> EvalPlan:
@@ -972,12 +951,7 @@ candidate under evaluation. It reuses the same `EvalSuite`, corpus compiler,
 assertions, scheduler, stores, reports, CLI, and server execution path:
 
 ```python
-from cayu import (
-    EvalPlan,
-    WorkflowEvalExecution,
-    WorkflowEvalResult,
-    WorkflowEvalTarget,
-)
+from cayu.evals import EvalPlan, WorkflowEvalExecution, WorkflowEvalResult, WorkflowEvalTarget
 
 
 def build_execution(invocation):
@@ -1101,14 +1075,8 @@ their order and exact contract instead of inferring lineage from a container or
 session name.
 
 ```python
-from cayu import (
-    AgentSpec,
-    ExternalBodyReleaseV1,
-    ExternalContainerOperationAdapter,
-    ExternalProcessModelProvider,
-    ExternalProcessTargetIdentityV1,
-    external_container_environment_revision,
-)
+from cayu import AgentSpec
+from cayu.evals import ExternalBodyReleaseV1, ExternalContainerOperationAdapter, ExternalProcessModelProvider, ExternalProcessTargetIdentityV1, external_container_environment_revision
 
 image = "registry.example/candidate@sha256:" + image_digest
 body = ExternalBodyReleaseV1.from_directory(
@@ -1239,15 +1207,7 @@ model, the profile must explicitly set `allow_same_model=True`; successful
 results then retain `candidate_route_relation="same_model"`.
 
 ```python
-from cayu import (
-    EvalJudgeEvidenceSelectionV1,
-    ModelJudgeTarget,
-    PublicJudgeReferenceV1,
-    StructuredModelJudgeAssertionSpec,
-    StructuredRubricCriterionV1,
-    StructuredRubricV1,
-    model_judge_profile,
-)
+from cayu.evals import EvalJudgeEvidenceSelectionV1, ModelJudgeTarget, PublicJudgeReferenceV1, StructuredModelJudgeAssertionSpec, StructuredRubricCriterionV1, StructuredRubricV1, model_judge_profile
 
 judge = ModelJudgeTarget(
     key="quality-judge",
@@ -1612,7 +1572,7 @@ On partial evidence those other fields describe only the workflow root, so an
 assertion that reads them under this declaration can report a wrong result.
 
 ```python
-from cayu import EvalAssertion
+from cayu.evals import EvalAssertion
 
 
 class ExactAnswer(EvalAssertion):
@@ -2068,13 +2028,7 @@ promotion. See [Bounded runtime-evidence projection](runtime-contracts.md#bounde
 tree into the same `Trajectory` assertion substrate used by fresh eval runs:
 
 ```python
-from cayu import (
-    SessionCompleted,
-    ToolsCalledInOrder,
-    evaluate_assertions,
-    trajectory_from_session,
-    write_trajectory_json,
-)
+from cayu.evals import SessionCompleted, ToolsCalledInOrder, evaluate_assertions, trajectory_from_session, write_trajectory_json
 
 trajectory = await trajectory_from_session(app, session_id)
 outcomes = await evaluate_assertions(
@@ -2347,14 +2301,7 @@ that need more than one initial user message. A scenario can contain:
   without their values or handles.
 
 ```python
-from cayu import (
-    EvalScenarioDocumentV2,
-    ScenarioInitialInputEventV2,
-    ScenarioInputV2,
-    ScenarioTextPartV2,
-    ScenarioUserMessageV2,
-    compile_eval_scenario,
-)
+from cayu.evals import EvalScenarioDocumentV2, ScenarioInitialInputEventV2, ScenarioInputV2, ScenarioTextPartV2, ScenarioUserMessageV2, compile_eval_scenario
 
 message = ScenarioUserMessageV2.create((ScenarioTextPartV2(text="Start checkout"),))
 scenario = EvalScenarioDocumentV2.create(
@@ -2514,7 +2461,8 @@ workload secret or redaction failure rejects before any write; the store never
 retains the redaction function or secret registry.
 
 ```python
-from cayu import EvalRunFailureCode, EvalRunRequest, EvalRunStatus, SQLiteEvalStore
+from cayu.evals import EvalRunFailureCode, EvalRunRequest, EvalRunStatus
+from cayu.storage import SQLiteEvalStore
 from cayu.evals.execution import run_corpus_suite
 from cayu.storage.migrations import SchemaMode
 
@@ -2604,12 +2552,7 @@ Fresh publication writes its origin-aware record in the same transaction as
 the existing terminal run result.
 
 ```python
-from cayu import (
-    CapturedEvaluationResultV1,
-    EvalBaselineKey,
-    EvalBaselineUpdate,
-    EvalResultTargetIdentityV1,
-)
+from cayu.evals import CapturedEvaluationResultV1, EvalBaselineKey, EvalBaselineUpdate, EvalResultTargetIdentityV1
 
 captured = CapturedEvaluationResultV1.create(
     corpus=corpus,
@@ -2785,7 +2728,8 @@ An embedded authenticated Cayu server can attach exactly one trusted
 `EvalsConfig` is complete programmatic V1 wiring and is off by default:
 
 ```python
-from cayu import EvalExecutionCapacity, SQLiteEvalStore
+from cayu.evals import EvalExecutionCapacity
+from cayu.storage import SQLiteEvalStore
 from cayu.server import BasicAuth, EvalsConfig, ServerConfig, create_server
 from cayu.storage.migrations import SchemaMode
 
@@ -2807,7 +2751,7 @@ configuration. An application may enable repeated or concurrent trials only
 when it owns a real reset boundary and publishes that promise explicitly:
 
 ```python
-from cayu import EvalExecutionProfilePolicyV1
+from cayu.evals import EvalExecutionProfilePolicyV1
 from cayu.server import EvalsConfig
 
 evals = EvalsConfig(
@@ -2837,7 +2781,8 @@ For a host-owned FastAPI application, pass the same complete wiring directly to 
 mount. The `CorpusTarget.app` must be the exact `CayuApp` being mounted:
 
 ```python
-from cayu import EvalExecutionCapacity, SQLiteEvalStore
+from cayu.evals import EvalExecutionCapacity
+from cayu.storage import SQLiteEvalStore
 from cayu.server import AuthenticatedAccess, EvalsConfig, mount_cayu
 from cayu.storage.migrations import SchemaMode
 
@@ -3382,7 +3327,9 @@ continuous 0..1 scale against a rubric, and that score flows into the case/run s
 score-first format (`score >= threshold` decides pass/fail).
 
 ```python
-from cayu import AgentSpec, AnthropicProvider, CayuApp, EvalCase, LLMJudge
+from cayu import AgentSpec, CayuApp
+from cayu.providers import AnthropicProvider
+from cayu.evals import EvalCase, LLMJudge
 
 # A judging runtime — typically a stronger / different model than the agent under test.
 judge_app = CayuApp()
@@ -3444,9 +3391,7 @@ Because it is serializable, a run can be saved and re-checked later **without a 
 runtime** — the replay loop:
 
 ```python
-from cayu import (
-    run_eval_case, write_trajectory_json, load_trajectory, evaluate_assertions,
-)
+from cayu.evals import run_eval_case, write_trajectory_json, load_trajectory, evaluate_assertions
 
 # 1. Run, asking the runner to retain the probe-complete trajectory it built.
 result = await run_eval_case(app, case, suite_id="suite", retain_trajectory=True)
@@ -3515,7 +3460,7 @@ still construct the same model requests, authorize the same tool path, and reach
 terminal outcome?
 
 ```python
-from cayu import RuntimeReplayDisposition, RuntimeReplayRequest, trajectory_from_session
+from cayu.evals import RuntimeReplayDisposition, RuntimeReplayRequest, trajectory_from_session
 
 # Capture an exact runtime-attested trajectory from the durable source store.
 trajectory = await trajectory_from_session(source_app, session_id)

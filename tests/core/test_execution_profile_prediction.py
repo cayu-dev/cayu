@@ -8,14 +8,6 @@ from decimal import Decimal
 
 import pytest
 
-from cayu import (
-    CandidateExecutionProfile,
-    ExecutionProfileAdmissionBoundary,
-    ExecutionProfilePredictionOutcome,
-    SessionExecutionProfiles,
-    predict_execution_profile_admission,
-    session_execution_profiles,
-)
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
@@ -30,8 +22,14 @@ from cayu.egress import (
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    ExecutionProfileAdmissionBoundary,
+    ExecutionProfilePredictionOutcome,
+    predict_execution_profile_admission,
+)
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
+from cayu.runtime import CandidateExecutionProfile
 from cayu.runtime.build_provenance import (
     RuntimeBuildArtifactKind,
     RuntimeBuildProvenance,
@@ -47,6 +45,7 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     execution_profile_with_egress_authority,
 )
+from cayu.sessions import SessionExecutionProfiles, session_execution_profiles
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     execution_profile_session_metadata,

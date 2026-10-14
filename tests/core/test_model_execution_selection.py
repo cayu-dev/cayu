@@ -23,9 +23,6 @@ from cayu import (
     CayuApp,
     EventType,
     Message,
-    ModelFailoverPolicy,
-    ModelTarget,
-    RecentTurnsContextPolicy,
     ResumeRequest,
     RunRequest,
     Tool,
@@ -34,6 +31,7 @@ from cayu import (
 )
 from cayu._exception_groups import iter_exception_tree
 from cayu.budgets.run_limits import RunLimits
+from cayu.context import RecentTurnsContextPolicy
 from cayu.context.counting import ContextCountingConfig, ContextCountingMode
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.execution_units import ModelStepIdentity, new_model_step_identity
@@ -62,6 +60,7 @@ from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._runtime_records import RegisteredProvider
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.retry_policy import retry_decision
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 
 
 async def _selection():

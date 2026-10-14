@@ -11,7 +11,7 @@ from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_participant_identity import app as make_app
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import ProducerDeliveryRecovery
+from cayu.collaboration import ProducerDeliveryRecovery
 from cayu.collaboration._producer_export_cleanup import ProducerExportCleanupStatus
 from cayu.collaboration._session_export_store import digest
 from cayu.collaboration.access import CollaborationAccessDenied

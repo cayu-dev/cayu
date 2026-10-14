@@ -7,8 +7,8 @@ from pathlib import Path
 from examples._advanced_support import ScenarioResult, live_provider
 from examples.cache_aware_research_council.scenario import run_scenario
 
-from cayu import CacheBreakpoint, CachePolicy
 from cayu.budgets.pricing import load_price_book
+from cayu.providers import CacheBreakpoint, CachePolicy
 
 # Cache the conversation prefix explicitly so the source's warm request can be
 # reused by the cache-aware compactor. The system prompt alone is below the

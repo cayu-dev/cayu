@@ -11,8 +11,8 @@ from tests.core.test_producer_budget_refusal import authorize_execution
 from tests.core.test_producer_budget_refusal import refusal_ledger as refusal_ledger
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import ProducerDeliveryRecovery
 from cayu.budgets.base import InMemoryBudgetLedger
+from cayu.collaboration import ProducerDeliveryRecovery
 from cayu.collaboration.participants import CollaborationUnavailable
 
 

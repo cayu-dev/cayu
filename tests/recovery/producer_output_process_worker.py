@@ -111,7 +111,7 @@ def binding(scope):
 
 async def main():
     material = json.loads(sys.stdin.read())
-    from cayu import UserInputResponse
+    from cayu.approvals import UserInputResponse
     from cayu.events import EventType
     from cayu.tools.user_input import UserInputTool
 

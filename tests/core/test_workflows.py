@@ -15,18 +15,13 @@ from typing import Any
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ScriptedModelProvider,
-    WorkflowSpec,
-)
+from cayu import AgentSpec, CayuApp, EventType
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputStrategy,
 )
+from cayu.evals import ScriptedModelProvider
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
@@ -40,6 +35,7 @@ from cayu.workflows import (
     StepResult,
     StepRunOptions,
     WorkflowBase,
+    WorkflowSpec,
     gated_loop,
     normalize_gate_outcome,
     parallel,

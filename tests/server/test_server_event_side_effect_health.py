@@ -4,7 +4,7 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
-from cayu.runtime import CayuApp
+from cayu.applications import CayuApp
 from cayu.server import BasicAuth, DashboardConfig, ServerConfig, create_server
 from cayu.server._event_side_effect_health import EventSideEffectRecoveryLoop
 

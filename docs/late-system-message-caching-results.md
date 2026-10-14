@@ -19,7 +19,7 @@ one short question per turn. There are two variants:
 Each conversation starts with a unique nonce, so turn 1 can't read a cache
 written by another trial or by the other variant. Token counts are the
 provider-reported usage, normalized by `normalize_usage_metrics`. Costs come from
-`cayu.default_price_book()` (version 2026-10-01), using the price-book model IDs
+`cayu.budgets.default_price_book()` (version 2026-10-01), using the price-book model IDs
 `gpt-6-luna` ($0.10/M input, $0.01/M cache read, $0.125/M cache write) and
 `claude-haiku-4-5` ($1/M input, $0.10/M cache read, $1.25/M 5-minute cache write).
 

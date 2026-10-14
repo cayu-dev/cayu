@@ -10,7 +10,7 @@ from examples.github_pr_reviewer.github_tools import GITHUB_API, DemoPRDiffTool
 from examples.github_pr_reviewer.reviewer_app import build_app, build_provider
 from examples.github_pr_reviewer.worker import enqueue_pr_review, run_pr_review_worker_once
 
-from cayu import ScriptedModelProvider
+from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 
 

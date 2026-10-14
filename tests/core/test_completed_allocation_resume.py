@@ -12,18 +12,8 @@ from tests.core.test_environment_allocation_recovery import (
 )
 from tests.core.test_human_review import identity
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentFactoryOperation,
-    EnvironmentSpec,
-    EventType,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SessionStatus,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest, SessionStatus
+from cayu.environments import EnvironmentFactoryOperation, EnvironmentSpec
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY as OWNERS,
@@ -34,6 +24,7 @@ from cayu.runtime._environment_lifecycle import (
 from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY as RECONNECT,
 )
+from cayu.storage import SQLiteSessionStore
 
 
 @pytest.mark.parametrize("restart", [False, True])

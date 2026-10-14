@@ -9,7 +9,7 @@ path, or safety limit.
 Use the interactive WebBridge profile at application setup:
 
 ```python
-from cayu import DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE, WebBridge
+from cayu.tools import DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE, WebBridge
 
 browser = WebBridge.sandboxed_browser(
     environment=browser_environment_factory,
@@ -169,7 +169,7 @@ instructions or authority to change policy.
 Enable pixel publication explicitly at application setup:
 
 ```python
-from cayu import BrowserVisualPolicy, WebBridge
+from cayu.tools import BrowserVisualPolicy, WebBridge
 
 browser = WebBridge.sandboxed_browser(
     environment=browser_environment_factory,
@@ -363,11 +363,7 @@ explicit post-navigation `click`, `fill`, `select`, `press`, or `wait`; initial
 the pre-document guard closed. For example:
 
 ```python
-from cayu import (
-    DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
-    BrowserPopupPolicy,
-    WebBridge,
-)
+from cayu.tools import DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE, BrowserPopupPolicy, WebBridge
 
 browser = WebBridge.sandboxed_browser(
     environment=browser_environment_factory,
@@ -619,16 +615,8 @@ select or switch profiles, stores, keys, tenants, generations, merge behavior,
 or checkpoint policy.
 
 ```python
-from cayu import (
-    AESGCMBrowserProfileKeyAuthority,
-    BrowserProfileBinding,
-    BrowserProfileCheckpointPolicy,
-    BrowserProfileDestinationPolicy,
-    BrowserProfileScope,
-    DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
-    SQLiteBrowserProfileStore,
-    WebBridge,
-)
+from cayu.browser_profiles import AESGCMBrowserProfileKeyAuthority, BrowserProfileBinding, BrowserProfileCheckpointPolicy, BrowserProfileDestinationPolicy, BrowserProfileScope, SQLiteBrowserProfileStore
+from cayu.tools import DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE, WebBridge
 from cayu.tools.browser_session import (
     BROWSER_SESSION_PROTOCOL_VERSION,
     BROWSER_SESSION_WORKER_VERSION,

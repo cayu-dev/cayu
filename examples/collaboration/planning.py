@@ -6,8 +6,8 @@ complete RequestPlanningRequest; neither a policy nor a request is authority.
 See docs/collaboration-requests.md for exact identity and recovery requirements.
 """
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.collaboration import (
     ConfiguredRequestPlanningPolicy,
     ForkRecipientPreparation,
     FreshRecipientPreparation,

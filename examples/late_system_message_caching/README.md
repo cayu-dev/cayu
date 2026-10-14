@@ -19,7 +19,7 @@ three variants:
   prefix-cache breakers found on the τ³ banking agent.
 
 Each turn records provider-reported input, cache-read, cache-write and uncached
-input tokens, and a cost from `cayu.default_price_book()`. The first two variants
+input tokens, and a cost from `cayu.budgets.default_price_book()`. The first two variants
 drive the provider with `ModelRequest` directly, as a custom agent bridge does;
 `recall_exposure` reads usage from the runtime's `model.completed` events. Providers
 are constructed with defaults, so the numbers show what an application gets

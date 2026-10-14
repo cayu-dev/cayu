@@ -18,15 +18,11 @@ from pathlib import Path
 import pytest
 from tests.core.task_invocation_fixtures import unattributed_task_invocation
 
-from cayu import (
-    EnvironmentFactoryRequest,
-    PassthroughProxy,
-    ScriptedModelProvider,
-    Task,
-    TaskStatus,
-    ToolContext,
-    ToolEffect,
-)
+from cayu import ToolContext, ToolEffect
+from cayu.environments import EnvironmentFactoryRequest
+from cayu.evals import ScriptedModelProvider
+from cayu.proxies import PassthroughProxy
+from cayu.tasks import Task, TaskStatus
 from cayu.vaults import StaticVault
 
 _EXAMPLE_PATH = (

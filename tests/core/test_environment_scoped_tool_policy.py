@@ -5,28 +5,23 @@ import asyncio
 import pytest
 from tests.core.test_tool_policies import _request
 
-from cayu import (
-    AgentSpec,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import check_manifest
+from cayu.runtime._execution_profile_admission import _cayu_policy_material
+from cayu.tools import (
     AllowAllToolPolicy,
     BrowserSessionTool,
-    CayuApp,
-    Environment,
     EnvironmentScopedToolPolicy,
-    EnvironmentSpec,
-    EventType,
     ExecCommandTool,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
     ReadFileTool,
-    RunRequest,
-    ScriptedModelProvider,
     StaticToolPolicy,
     ToolPolicyDecision,
     WriteFileTool,
-    check_manifest,
 )
-from cayu.runtime._execution_profile_admission import _cayu_policy_material
+from cayu.workspaces import LocalWorkspace
 
 
 @pytest.mark.parametrize("environment", [None, "local", "research", "other"])
@@ -174,7 +169,8 @@ def test_scope_configuration_participates_in_maintained_identity():
 
 @pytest.mark.parametrize("tool", [ExecCommandTool(), BrowserSessionTool()])
 def test_scope_does_not_admit_incompatible_native_environment(tmp_path, tool):
-    from cayu import ExecutionRequirements, LocalRunner
+    from cayu.environments import ExecutionRequirements
+    from cayu.runners import LocalRunner
 
     app = CayuApp(enable_logging=False)
     app.register_provider(ScriptedModelProvider([]), default=True)
@@ -203,7 +199,8 @@ def test_scope_does_not_admit_incompatible_native_environment(tmp_path, tool):
 
 
 def test_manifest_scope_redaction_and_default_denial():
-    from cayu import AppManifest, SecretRedactor
+    from cayu.runtime import AppManifest
+    from cayu.vaults import SecretRedactor
 
     app = CayuApp(enable_logging=False, secret_redactor=SecretRedactor("private-scope"))
     app.register_agent(
@@ -228,7 +225,8 @@ def test_manifest_scope_redaction_and_default_denial():
 def test_scoped_native_command_preserves_command_policy(tmp_path, command_allowed):
     import sys
 
-    from cayu import LocalRunner, ProcessCommandPolicy
+    from cayu.runners import LocalRunner
+    from cayu.tools import ProcessCommandPolicy
 
     app = CayuApp(enable_logging=False)
     app.register_provider(

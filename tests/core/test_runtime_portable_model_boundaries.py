@@ -15,12 +15,13 @@ from tests.runtime.runtime_provider_support import (
 )
 from tests.runtime.runtime_session_support import collect_events
 
-from cayu import CayuConfig, RunDefaults
+from cayu import CayuConfig
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetWindow, InMemoryBudgetStore
 from cayu.budgets.billing import BillingIdentity
+from cayu.configuration import RunDefaults
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
     CompactionRequest,

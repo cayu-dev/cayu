@@ -17,7 +17,8 @@ from tests.core.test_mcp import (
 )
 
 import cayu
-from cayu import AgentSpec, CayuApp, McpToolset
+from cayu import AgentSpec, CayuApp
+from cayu.mcp import McpToolset
 
 
 def test_agent_registry_composes_without_application_controllers() -> None:
@@ -39,10 +40,10 @@ class RejectControllers(importlib.abc.MetaPathFinder):
             raise AssertionError(f"Registry imported {fullname}")
 
 sys.meta_path.insert(0, RejectControllers())
-from cayu import (
-    AgentSpec, InMemorySessionStore, McpInitializeResult, McpServerSpec,
-    McpSession, McpToolDefinition, McpToolset, SecretRedactor,
-)
+from cayu import AgentSpec
+from cayu.sessions import InMemorySessionStore
+from cayu.mcp import McpInitializeResult, McpServerSpec, McpSession, McpToolDefinition, McpToolset
+from cayu.vaults import SecretRedactor
 from cayu._application_agent_registry import ApplicationAgentRegistry
 from cayu.runtime.application_lifecycle import ApplicationAdmission, ApplicationAdmissionsSealed
 

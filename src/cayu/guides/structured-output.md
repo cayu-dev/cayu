@@ -11,16 +11,9 @@ attempt followed by a valid repair:
 ```python
 import asyncio
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-    StructuredOutputSpec,
-    run_to_completion,
-    scripted_structured_output,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest, run_to_completion
+from cayu.evals import ScriptedModelProvider, scripted_structured_output
+from cayu.context import StructuredOutputSpec
 
 provider = ScriptedModelProvider(
     [

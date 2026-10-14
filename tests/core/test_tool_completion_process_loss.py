@@ -16,7 +16,9 @@ from tests.core.test_tool_completion import CrashStore, FinalTool, app_for, call
 from tests.core.test_tool_round_publication_failure_matrix import _TwoCallProvider
 
 import cayu
-from cayu import EventType, IncompleteSessionRecoveryRequest, SessionStatus, SQLiteSessionStore
+from cayu import EventType, SessionStatus
+from cayu.sessions import IncompleteSessionRecoveryRequest
+from cayu.storage import SQLiteSessionStore
 
 
 @pytest.mark.parametrize(

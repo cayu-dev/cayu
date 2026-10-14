@@ -57,7 +57,7 @@ those extras are installed.
 
 Those names remain supported explicit imports and retain their type information.
 For example, install `cayu[postgres]` to use
-`from cayu import PostgresSessionStore`. Product operation stores also require
+`from cayu.storage import PostgresSessionStore`. Product operation stores also require
 `cayu[server]`; the Postgres product operation store needs both extras. Without
 the required dependencies, explicit access reports the relevant installation
 hint.
@@ -116,7 +116,7 @@ More specific modules own the rest: `tasks/worker.py`, `budgets/pricing.py`,
 
 `tools/inference.py` owns the optional tool inference capability contracts:
 `AuxiliaryInferencePolicy`, `InferenceLimits`, and `InferenceInvoker`. Import them
-from `cayu.tools` (or the root API). `providers/response.py` owns the detached
+from `cayu.tools`. `providers/response.py` owns the detached
 `ModelResponse`; private runtime modules coordinate invocation and accounting.
 
 The workspace branch/checkpoint contracts retain `workspaces/branches.py` and
@@ -165,11 +165,70 @@ The initializer loads and caches only the requested object. Use `dir()` or
 `__all__` to discover exports; `vars()` contains only exports already loaded.
 There is no filesystem scanning or registration by directory name.
 
-The root `cayu` API provides convenient public exports.
-Common imports such as `from cayu import CayuApp, AgentSpec` still work. For
-specialized capabilities, prefer the concept package. Importing agent/message
-contracts no longer initializes the application runtime, evals, or optional
-provider/server adapters.
+The root `cayu` API covers the shared contracts for common authoring workflows.
+Adapters, storage helpers, run limits and other capability choices belong to
+their public packages. Keep common helpers available from those packages so
+application authors can use them without knowing their defining source modules.
+
+| Workflow | Root exports |
+| --- | --- |
+| Compose an application | `Agent`, `AgentSpec`, `CayuApp`, `CayuConfig` |
+| Exchange messages and events | `Message`, `Event`, `EventType` |
+| Define a custom tool | `Tool`, `ToolSpec`, `ToolContext`, `ToolEffect`, `ToolResult` |
+| Run and resume | `RunRequest`, `ResumeRequest`, `RunOutcome`, `StructuredOutputResult`, `SessionStatus`, `run_to_completion` |
+| Identify the installed release | `__version__` |
+
+Use the owning public package or module for specialized capabilities. For example:
+
+```python
+from cayu import AgentSpec, CayuApp, Message, RunRequest, run_to_completion
+from cayu.providers import OpenAIProvider
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import configured_database_url, open_application_stores
+```
+
+Use `cayu.budgets.RunLimits` to bound a run and
+`cayu.runtime.ExecutionProfileBehaviorIdentity` to declare the stable behavior
+of custom components. These package exports resolve to the existing classes;
+their defining modules remain public.
+
+`cayu.runtime` exports execution, lifecycle, policy, evidence and diagnostic
+contracts owned by the runtime. Session requests and stores belong to
+`cayu.sessions`; providers belong to `cayu.providers`; verification belongs to
+`cayu.verification`. Specialized components remain usable independently.
+Importing agent/message contracts does not initialize the application runtime,
+evals, or optional provider/server adapters.
+
+### Migrate older root and runtime imports
+
+This is a breaking import change. Specialized names previously exported by
+`cayu`, and cross-domain names previously exported by `cayu.runtime`, must be
+imported from their public owners. There are no fallback aliases. The
+[complete import replacement map](public-api-imports.json) maps each removed
+qualified name to its replacement. The older
+[module replacement map](public-api-migration.json) covers module relocations.
+
+For example, replace `cayu.OpenAIProvider` with `cayu.providers.OpenAIProvider`
+and `cayu.runtime.RunRequest` with `cayu.sessions.RunRequest`. Update imports in
+applications, tests and generated projects, including monkeypatch targets and
+strings passed to dynamic import helpers. Existing generated projects need the
+same migration; newly generated projects use the public owners automatically.
+The classes, execution behavior and durable data formats are unchanged.
+
+Known removed names raise `ImportError` with the replacement statement for both
+`from ... import ...` and attribute access. Unknown names retain `AttributeError`.
+The installed package includes the replacement inventory and does not load the
+replacement implementation to produce an error. Resolving a declared export
+does not load the inventory.
+
+For declared projects, `cayu check` reports `SCAFFOLD_IMPORT_REMOVED` at each
+outdated import before loading the application. Follow its replacement hints,
+then rerun the check. The same check covers explicitly imported local helpers.
+
+When updating the replacement table, run
+`uv run python scripts/generate_import_migrations.py` to refresh its compact
+package copy. Tests require exact agreement with the documented table, and
+release validation requires the copy in both distribution formats.
 
 When adding a public capability:
 

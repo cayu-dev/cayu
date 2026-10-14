@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from cayu import AgentSpec, EnvironmentSpec
+from cayu import AgentSpec
+from cayu.environments import EnvironmentSpec
 
 
 def test_agentspec_tools_kwarg_points_to_register_agent() -> None:

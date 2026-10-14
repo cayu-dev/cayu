@@ -3285,7 +3285,7 @@ def test_worker_persists_safe_causal_failure_across_restart(
             "-c",
             """
 import asyncio, sys
-from cayu import SQLiteEvalStore
+from cayu.storage import SQLiteEvalStore
 async def read():
     store = SQLiteEvalStore(sys.argv[1])
     try:

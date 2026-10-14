@@ -14,7 +14,7 @@ is no plan or CLI override with competing precedence. The same target is used by
 server targets. Configure a target with a larger event allowance as follows:
 
 ```python
-from cayu import SessionTrajectoryBounds, WorkflowEvalTarget
+from cayu.evals import SessionTrajectoryBounds, WorkflowEvalTarget
 
 workflow_target = WorkflowEvalTarget(
     # ... existing target configuration ...
@@ -249,10 +249,7 @@ usage remain unchanged; recovery creates a separate receipt.
 
 ```python
 from pathlib import Path
-from cayu import (
-    SessionTrajectoryBounds,
-    capture_workflow_eval_attempt, score_workflow_eval_capture,
-)
+from cayu.evals import SessionTrajectoryBounds, capture_workflow_eval_attempt, score_workflow_eval_capture
 from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
 
 # source_trial comes from the original saved EvalRun, which remains unchanged.
@@ -323,7 +320,7 @@ completion event IDs read from the saved journal. This validates the determinist
 root ID and exact current completion; it never selects the latest unrelated run.
 
 ```python
-from cayu import import_workflow_eval_attempt
+from cayu.evals import import_workflow_eval_attempt
 
 source_trial = await import_workflow_eval_attempt(
     original_target,

@@ -15,7 +15,7 @@ from typing import Any
 import boto3  # ty: ignore[unresolved-import]
 from examples.aws.lambda_microvm_agent.package_microvm import _package_with_sidecar_provenance
 
-from cayu import ExecCommand, LambdaMicroVMRunner
+from cayu.runners import ExecCommand, LambdaMicroVMRunner
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _IMAGE_TIMEOUT_SECONDS = 15 * 60

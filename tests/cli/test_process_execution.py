@@ -31,8 +31,10 @@ stubborn = "process_project:run_stubborn"
     (root / "process_project.py").write_text(
         """import asyncio,json,os,time
 from pathlib import Path
-from cayu import AgentSpec,CayuApp,EvalCase,EvalPlan,EvalSuite,FinalOutputContains,Message,RunRequest
-from cayu import ModelProvider,ModelStreamEvent,ExecutionProfileBehaviorIdentity
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import EvalCase, EvalPlan, EvalSuite, FinalOutputContains
+from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 class Provider(ModelProvider):
     name = "process-proof"
@@ -385,7 +387,7 @@ def test_high_concurrency_process_eval_receipts_can_be_inspected_and_exported(
     import asyncio
     import zipfile
 
-    from cayu import export_process_eval_run, inspect_process_eval_run
+    from cayu.evals import export_process_eval_run, inspect_process_eval_run
 
     _project(tmp_path)
     process = _start(
@@ -493,7 +495,8 @@ def test_named_workers_share_durable_task_claims_without_duplicates(tmp_path):
     _project(
         tmp_path,
         """
-from cayu import SQLiteTaskStore,TaskQuery
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import TaskQuery
 async def run_claims(app,stop):
     store=SQLiteTaskStore(Path('tasks.sqlite'))
     worker=f'worker-{os.getpid()}'
@@ -614,7 +617,8 @@ def test_process_workflow_eval_keeps_native_child_evidence(tmp_path):
     _project(
         tmp_path,
         """
-from cayu import WorkflowEvalTarget,WorkflowEvalExecution,WorkflowEvalResult,WorkflowSpec,EvaluationEvidencePolicySpec
+from cayu.evals import WorkflowEvalTarget, WorkflowEvalExecution, WorkflowEvalResult, EvaluationEvidencePolicySpec
+from cayu.workflows import WorkflowSpec
 from cayu.workflows import WorkflowBase,step
 class Workflow(WorkflowBase):
     spec=WorkflowSpec(name='process-workflow')
@@ -686,7 +690,7 @@ def test_process_eval_status_observes_active_sqlite_cases_without_loading_target
     _project(
         tmp_path,
         """
-from cayu import SQLiteSessionStore
+from cayu.storage import SQLiteSessionStore
 def build_app():
     Path(f"factory-{os.getpid()}.json").write_text('{}')
     app=CayuApp(enable_logging=False,session_store=SQLiteSessionStore(Path(f"store-{os.getpid()}.db")))

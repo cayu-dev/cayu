@@ -17,15 +17,15 @@ from tempfile import TemporaryDirectory
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    InMemorySessionStore,
+from cayu import RunRequest, SessionStatus
+from cayu._validation import canonical_durable_json_bytes
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.sessions import InMemorySessionStore, SessionIdentity, SessionRunFenced
+from cayu.sessions._runtime_publication import _OwnedOffThreadSessionCommitGuard
+from cayu.storage import SQLiteSessionStore
+from cayu.workspaces import (
     LocalWorkspace,
-    RunRequest,
-    SessionIdentity,
-    SessionRunFenced,
-    SessionStatus,
     SessionWorkspaceBranchStore,
-    SQLiteSessionStore,
     WorkspaceBranchAuthority,
     WorkspaceBranchBindingAuthority,
     WorkspaceBranchBindingAuthorityClaim,
@@ -49,9 +49,6 @@ from cayu import (
     WorkspaceBranchStoreDurability,
     WorkspaceRevisionObservationLimits,
 )
-from cayu._validation import canonical_durable_json_bytes
-from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.sessions._runtime_publication import _OwnedOffThreadSessionCommitGuard
 from cayu.workspaces.branches import workspace_branch_change_set_digest
 from cayu.workspaces.revisions import WorkspaceIdentity, observe_deterministic_workspace
 
@@ -2297,14 +2294,12 @@ def test_session_workspace_branch_store_requires_declared_store_durability() -> 
 
 
 def test_session_workspace_branch_store_is_a_public_runtime_adapter() -> None:
-    import cayu
-    import cayu.runtime as runtime
+    import cayu.workspaces
 
-    assert cayu.SessionWorkspaceBranchStore is runtime.SessionWorkspaceBranchStore
-    assert "SessionWorkspaceBranchStore" in cayu.__all__
-    assert "SessionWorkspaceBranchStore" in runtime.__all__
-    assert cayu.WorkspaceBranchStoreDurability is WorkspaceBranchStoreDurability
-    assert "WorkspaceBranchStoreDurability" in cayu.__all__
+    assert cayu.workspaces.SessionWorkspaceBranchStore is SessionWorkspaceBranchStore
+    assert "SessionWorkspaceBranchStore" in cayu.workspaces.__all__
+    assert cayu.workspaces.WorkspaceBranchStoreDurability is WorkspaceBranchStoreDurability
+    assert "WorkspaceBranchStoreDurability" in cayu.workspaces.__all__
 
 
 def test_creation_failure_is_durable_and_exactly_replayed(

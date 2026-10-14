@@ -3,15 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 
-from cayu import (
-    AgentSpec,
-    AnthropicProvider,
-    CayuApp,
-    Message,
-    RunRequest,
-    ThinkingConfig,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.context import ThinkingConfig
 from cayu.events import EventType
+from cayu.providers import AnthropicProvider
 
 
 async def main() -> None:

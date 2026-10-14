@@ -240,7 +240,7 @@ def _check_delegated_discovery(
                     if event.type == "session.interrupted"
                 ],
             )
-            from cayu import HumanAttentionRequest
+            from cayu.runtime import HumanAttentionRequest
 
             assert action.attention_id is None
             assert HumanAttentionRequest.from_pending_action(action) is None

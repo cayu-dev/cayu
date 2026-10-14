@@ -268,7 +268,7 @@ def test_patch_input_evidence_survives_sqlite_reopen(tmp_path: Path, case: str) 
                 "-c",
                 """
 import asyncio, json, sys
-from cayu import SQLiteSessionStore
+from cayu.storage import SQLiteSessionStore
 from pydantic import SecretStr
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 async def read():

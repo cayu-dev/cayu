@@ -109,16 +109,14 @@ def test_fork_historical_imports_and_pickle_globals(name):
     canonical = getattr(importlib.import_module("cayu.sessions.forks"), name)
     assert getattr(importlib.import_module("cayu.sessions.base"), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
-    for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+    for module in ("cayu.sessions",):
         exports = importlib.import_module(module + "._exports").EXPORTS
         if name in exports:
             assert exports[name] == ("cayu.sessions.forks", name)
             assert getattr(importlib.import_module(module), name) is canonical
 
 
-@pytest.mark.parametrize(
-    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.forks")
-)
+@pytest.mark.parametrize("public_module", ("cayu.sessions", "cayu.sessions.forks"))
 def test_fork_evidence_without_implementations(public_module):
     _without_stores(
         """
@@ -187,9 +185,7 @@ else:
     )
 
 
-@pytest.mark.parametrize(
-    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.forks")
-)
+@pytest.mark.parametrize("public_module", ("cayu.sessions", "cayu.sessions.forks"))
 def test_prompt_transition_and_replacement_without_implementations(public_module):
     _without_stores(
         """

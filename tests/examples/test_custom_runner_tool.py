@@ -9,20 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    run_to_completion,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, run_to_completion
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import LocalRunner
+from cayu.workspaces import LocalWorkspace
 
 _EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "custom_runner_tool.py"
 

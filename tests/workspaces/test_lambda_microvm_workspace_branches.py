@@ -18,8 +18,7 @@ from tests.workspaces.branch_conformance import (
 )
 from tests.workspaces.test_runner_workspace_branches import _request
 
-from cayu import LambdaMicroVMRunner
-from cayu.runners import DockerRunner, RemoteWorkspaceBranchCapability
+from cayu.runners import DockerRunner, LambdaMicroVMRunner, RemoteWorkspaceBranchCapability
 from cayu.workspaces import (
     RunnerWorkspace,
     WorkspaceBranchBindingAuthority,

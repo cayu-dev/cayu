@@ -4,27 +4,23 @@ from __future__ import annotations
 
 import asyncio
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import (
     EvalCase,
     EvalPlan,
     EvalRun,
     EvalStatus,
     EvalSuite,
     FinalOutputContains,
-    Message,
-    MessageRole,
-    RunRequest,
     ScriptedModelProvider,
-    WorkflowBase,
     WorkflowEvalExecution,
     WorkflowEvalInstanceScope,
     WorkflowEvalResult,
     WorkflowEvalTarget,
-    WorkflowSpec,
     run_eval_plan,
 )
+from cayu.messages import MessageRole
+from cayu.workflows import WorkflowBase, WorkflowSpec
 
 _REVISION = "sha256:" + "1" * 64
 

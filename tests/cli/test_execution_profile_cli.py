@@ -10,17 +10,10 @@ from cayu.cli import main
 _PROJECT = """import os
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    Tool,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.evals import ScriptedModelProvider
+from cayu.storage import SQLiteSessionStore
 
 
 class LookupTool(Tool):

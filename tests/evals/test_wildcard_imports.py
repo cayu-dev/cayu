@@ -63,15 +63,15 @@ def test_optional_extra_names_stay_importable_by_name_with_a_hint():
     completed = _run(
         """
 import importlib
-import cayu
+import cayu.storage
 
-assert 'SQLiteSessionStore' in cayu.__all__
+assert 'SQLiteSessionStore' in cayu.storage.__all__
 for package_name, name, extra in (
-    ('cayu', 'PostgresSessionStore', 'postgres'),
+    ('cayu.storage', 'PostgresSessionStore', 'postgres'),
     ('cayu.storage', 'PostgresTaskStore', 'postgres'),
     ('cayu.collaboration', 'PostgresCollaborationStore', 'postgres'),
-    ('cayu', 'PostgresEvalStore', 'postgres'),
-    ('cayu', 'PostgresProductOperationStore', 'postgres'),
+    ('cayu.storage', 'PostgresEvalStore', 'postgres'),
+    ('cayu.storage', 'PostgresProductOperationStore', 'postgres'),
     ('cayu.storage', 'SQLiteProductOperationStore', 'server'),
 ):
     package = importlib.import_module(package_name)

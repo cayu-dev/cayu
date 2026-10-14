@@ -5,23 +5,17 @@ import sys
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import ExecCommand, LocalRunner
+from cayu.tools import (
     CommandPolicy,
     CommandPolicyDecision,
     CommandRequest,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    ExecCommand,
     ExecCommandTool,
-    LocalRunner,
-    Message,
-    ModelStreamEvent,
     ProcessCommandPolicy,
-    RunRequest,
-    ScriptedModelProvider,
 )
 from cayu.tools import ProcessCommandPolicy as ToolsProcessCommandPolicy
 from cayu.tools.base import ToolContext
@@ -537,7 +531,7 @@ def test_environment_denial_records_safe_name_not_values(name):
 
 
 def test_environment_denial_survives_sqlite_reload_without_secret_values(tmp_path):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     async def scenario():
         path = tmp_path / "denial.sqlite"

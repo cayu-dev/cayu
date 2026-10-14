@@ -11,9 +11,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp
+from cayu.mcp import (
     HttpMcpClient,
     McpProtocolEra,
     McpServerSpec,

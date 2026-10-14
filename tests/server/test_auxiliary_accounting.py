@@ -5,8 +5,10 @@ import asyncio
 import pytest
 from examples.runtime_auxiliary_inference import MODEL, Summarize
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 
 pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")

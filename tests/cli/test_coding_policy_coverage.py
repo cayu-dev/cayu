@@ -6,36 +6,25 @@ import importlib
 import pytest
 from tests.core.test_structured_commands import _profile
 
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    AppManifest,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    GuardedToolPolicy,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    ParameterConstrainedToolPolicy,
-    RequiredAllowlistRule,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteTaskStore,
-    StaticToolPolicy,
-    StructuredCommandToolPolicy,
-    TaskCreate,
-    TaskQuery,
-    Tool,
-    ToolEffect,
-    ToolSpec,
-    WriteFileTool,
-    check_manifest,
-    complete_managed_task,
-    run_task_worker,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolEffect, ToolSpec
 from cayu.cli import main
 from cayu.cli.project import project_context
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import AppManifest, check_manifest
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, complete_managed_task, run_task_worker
+from cayu.tools import (
+    AlwaysRequireApprovalToolPolicy,
+    GuardedToolPolicy,
+    ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
+    StaticToolPolicy,
+    StructuredCommandToolPolicy,
+    WriteFileTool,
+)
+from cayu.workspaces import LocalWorkspace
 
 
 class _ExternalTool(Tool):

@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
-from cayu import Message, ModelStreamEvent, ScriptedModelProvider
+from cayu import Message
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     provider_cancellation_failures,

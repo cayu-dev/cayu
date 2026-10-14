@@ -3,18 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from cayu import (
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
     GitRepositoryBinding,
-    LocalEnvVault,
-    LocalRunner,
-    LocalWorkspace,
-    PassthroughProxy,
 )
+from cayu.proxies import PassthroughProxy
+from cayu.runners import LocalRunner
+from cayu.vaults import LocalEnvVault
+from cayu.workspaces import LocalWorkspace
 
 _shared_vault = LocalEnvVault({"github_token": "GITHUB_TOKEN"})
 _shared_proxy = PassthroughProxy(_shared_vault)

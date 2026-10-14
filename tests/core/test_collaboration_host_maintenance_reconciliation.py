@@ -7,7 +7,7 @@ from tests.core.producer_export_scenario import completed_export_scenario
 from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import (
+from cayu.collaboration import (
     CollaborationHost,
     HostOwnershipLimits,
     HostProducerMaintenance,

@@ -73,7 +73,8 @@ auth directory and will not be redirected to a replacement directory.
 ## Register the provider
 
 ```python
-from cayu import AgentSpec, CayuApp, OpenAISubscriptionProvider
+from cayu import AgentSpec, CayuApp
+from cayu.providers import OpenAISubscriptionProvider
 
 app = CayuApp()
 app.register_provider(OpenAISubscriptionProvider(), default=True)
@@ -99,7 +100,7 @@ The experimental adapter also supports the same typed native hosted-search
 authority as `OpenAIProvider` while the Codex backend continues to accept it:
 
 ```python
-from cayu import OpenAIWebSearch
+from cayu.providers import OpenAIWebSearch
 
 app.register_agent(
     AgentSpec(name="researcher", model="gpt-5.6-luna"),

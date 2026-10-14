@@ -6,7 +6,11 @@ from pathlib import Path
 
 from tests.environments.test_docker_coding import _LocalDockerRunner
 
-from cayu import BoundWorkspace, DockerCodingWorkspaceBinding, DockerWorkspaceTransferLimits
+from cayu.environments import (
+    BoundWorkspace,
+    DockerCodingWorkspaceBinding,
+    DockerWorkspaceTransferLimits,
+)
 from cayu.workspaces import RunnerWorkspace
 from cayu.workspaces.revisions import WorkspaceRevisionObservationLimits
 

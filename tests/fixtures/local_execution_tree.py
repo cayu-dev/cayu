@@ -224,7 +224,7 @@ async def _root(
     with_isolated_tool: bool,
     with_playwright: bool,
 ) -> None:
-    from cayu import ExecCommand, LocalRunner
+    from cayu.runners import ExecCommand, LocalRunner
 
     _publish(root, "root")
     runner = LocalRunner(root)

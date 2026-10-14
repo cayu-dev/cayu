@@ -5,9 +5,8 @@ from typing import Literal
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -15,21 +14,17 @@ from cayu import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    ExecutionProfileComponentClass,
-    Message,
-    ModelStreamEvent,
-    PassthroughProxy,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    StaticVault,
 )
+from cayu.evals import ScriptedModelProvider
+from cayu.execution_profiles import ExecutionProfileComponentClass
+from cayu.providers import ModelStreamEvent
+from cayu.proxies import PassthroughProxy
 from cayu.runtime._invocation_secrets import (
     registered_environment_secret_resolution_scope,
     require_continuation_secret_resolution_compatibility,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.vaults import StaticVault
 
 
 class _Factory(EnvironmentFactory):

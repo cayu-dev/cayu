@@ -32,9 +32,10 @@ def main() -> None:
         f"core import: {elapsed:.3f}s; Cayu modules: {sum(n.startswith('cayu') for n in sys.modules)}"
     )
 
-    from cayu import CayuApp, WorkflowEvalTarget
+    from cayu import CayuApp
     from cayu.evals import (
         BrowserAcceptanceFixtureV1,
+        WorkflowEvalTarget,
         deterministic_browser_acceptance_manifest,
         run_causal_memory_reference_campaign,
     )

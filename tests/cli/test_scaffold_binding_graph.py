@@ -31,7 +31,7 @@ from pydantic import Field, computed_field
 from domain import Entry, Other, Configured, Mode, LIMIT, entry_factory
 from datetime import timedelta
 from asyncio import Future
-from cayu import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 
 Choice = Annotated[Entry | Other, Field(discriminator="mode")]
 ModelT = TypeVar("ModelT", bound=Configured)
@@ -150,8 +150,8 @@ def test_external_package_identity_shadowing(tmp_path, shadow):
     "source",
     [
         "from pydantic import BaseModel\nclass Model(BaseModel):\n    pass\ninstance = Model()\n",
-        "from cayu import RetryPolicy\npolicy = RetryPolicy(**unknown)\n",
-        "from cayu import RetryPolicy\npolicy = RetryPolicy(max_attempts=construct())\n",
+        "from cayu.providers.retry_policy import RetryPolicy\npolicy = RetryPolicy(**unknown)\n",
+        "from cayu.providers.retry_policy import RetryPolicy\npolicy = RetryPolicy(max_attempts=construct())\n",
         "from datetime import timedelta\nvalue = timedelta(seconds=unknown)\n",
         "from asyncio import Future\nFuture = unknown\nvalue: Future[int]\n",
         "from pydantic import BaseModel, Field\nclass Model(BaseModel):\n    value: list[str] = Field(default_factory=lambda arg=construct(): [])\n",

@@ -49,7 +49,7 @@ public = importlib.import_module(sys.argv[1])
 def test_session_query_public_imports_and_historical_pickle_globals():
     from cayu.sessions import base, queries, records
 
-    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    surfaces = [importlib.import_module(name) for name in ("cayu.sessions",)]
     for owner, names in (
         (records, ("PendingActionSession", "MAX_SESSION_ID_BYTES")),
         (
@@ -76,7 +76,7 @@ def test_session_query_public_imports_and_historical_pickle_globals():
                 assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_session_queries_filter_and_page_without_loading_stores(public_module):
     _assert_store_independent(
         """
@@ -141,7 +141,7 @@ else:
 def test_event_query_public_imports_and_historical_pickle_globals():
     from cayu.sessions import base, event_queries
 
-    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    surfaces = [importlib.import_module(name) for name in ("cayu.sessions",)]
     for name in ("EventOrder", "EventQuery", "EventQueryResultTooLarge"):
         canonical = getattr(event_queries, name)
         assert getattr(base, name) is canonical
@@ -149,7 +149,7 @@ def test_event_query_public_imports_and_historical_pickle_globals():
         assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_event_queries_select_records_without_loading_stores(public_module):
     _assert_store_independent(
         """
@@ -192,7 +192,7 @@ assert error.max_bytes == 64 and str(error) == "Event query exceeds the 64-byte 
 def test_transcript_query_public_imports_and_historical_pickle_globals():
     from cayu.sessions import base, transcript_queries
 
-    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    surfaces = [importlib.import_module(name) for name in ("cayu.sessions",)]
     for name in (
         "TranscriptQuery",
         "TranscriptPage",
@@ -206,7 +206,7 @@ def test_transcript_query_public_imports_and_historical_pickle_globals():
         assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_transcript_queries_filter_and_search_without_loading_stores(public_module):
     _assert_store_independent(
         """

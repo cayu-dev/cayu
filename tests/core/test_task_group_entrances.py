@@ -9,8 +9,8 @@ from tests.core.test_task_groups import anyio_backend as anyio_backend
 from tests.core.test_task_groups import group_request, require_group
 from tests.core.test_task_groups import store as store
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.tasks import (
     TaskCreate,
     TaskGraphCreate,
     TaskGraphNode,

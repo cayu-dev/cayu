@@ -10,8 +10,11 @@ import pytest
 from tests.core.test_dispatch import _SecretFreeDispatchRuntime, _test_dispatch_envelope
 from tests.core.test_task_group_quiescence import store as store
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.invocation import TaskExecutionSource
+from cayu.tasks import (
     TaskCreate,
     TaskExecutionSettlementPending,
     TaskGraphCreate,
@@ -23,9 +26,6 @@ from cayu import (
     TaskRetryAttemptReport,
     TaskRetryPolicy,
 )
-from cayu.events import Event, EventType
-from cayu.messages import Message
-from cayu.sessions.invocation import TaskExecutionSource
 from cayu.tasks.creation import task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (
     DispatchRequest,

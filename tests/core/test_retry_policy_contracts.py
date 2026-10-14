@@ -12,7 +12,8 @@ from typing import get_args, get_type_hints
 
 import pytest
 
-import cayu
+import cayu.providers
+import cayu.providers.retry_policy
 from cayu.providers import retry_policy as policies
 
 
@@ -32,12 +33,13 @@ class RejectExecution(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, RejectExecution())
 importlib.import_module(sys.argv[1])
-import cayu
+import cayu; import cayu.providers
+import cayu.providers.retry_policy
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 
-policy = cayu.RetryPolicy(max_attempts=3, initial_delay_s=0.0, jitter_s=0.0)
+policy = cayu.providers.retry_policy.RetryPolicy(max_attempts=3, initial_delay_s=0.0, jitter_s=0.0)
 assert type(policy) is RetryPolicy
-assert cayu.copy_retry_policy is copy_retry_policy
+assert cayu.providers.retry_policy.copy_retry_policy is copy_retry_policy
 assert copy_retry_policy(policy) is policy
 assert copy_retry_policy(None) == RetryPolicy()
 assert RetryPolicy.model_validate_json(policy.model_dump_json()) == policy
@@ -65,9 +67,6 @@ def test_public_retry_policy_imports_share_canonical_objects(name):
     expected = getattr(policies, name)
     assert getattr(importlib.import_module("cayu.runtime.retry_policy"), name) is expected
     assert pickle.loads(f"ccayu.runtime.retry_policy\n{name}\n.".encode()) is expected
-    if name != "DEFAULT_RETRYABLE_STATUS_CODES":
-        assert getattr(cayu, name) is expected
-        assert getattr(importlib.import_module("cayu.runtime"), name) is expected
 
 
 @pytest.mark.parametrize(

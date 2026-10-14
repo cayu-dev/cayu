@@ -7,16 +7,10 @@ import asyncio
 import pytest
 from tests.core.test_recovery_composition import _run_without_owners
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ForkSessionRequest,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.evals import ScriptedModelProvider
 from cayu.providers.base import ModelStreamEvent
+from cayu.sessions import ForkSessionRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import session_fork_profile_relationship
 

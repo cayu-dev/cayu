@@ -14,7 +14,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import (
     ToolEffectReceipt,
     ToolEffectReconcilerSpec,

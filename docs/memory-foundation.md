@@ -599,12 +599,7 @@ requires the destination state and every other destination attribute to satisfy
 the scope.
 
 ```python
-from cayu import (
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeQuery,
-    KnowledgeVisibility,
-)
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeQuery, KnowledgeVisibility
 
 scope = KnowledgeAccessScope.for_namespace(
     "acme-support",
@@ -712,12 +707,7 @@ identity. Relations cannot connect two revisions of the same logical entry;
 ordinary revision order already represents that case.
 
 ```python
-from cayu import (
-    KnowledgeRelation,
-    KnowledgeRelationKind,
-    KnowledgeRelationQuery,
-    KnowledgeRevisionRef,
-)
+from cayu.storage import KnowledgeRelation, KnowledgeRelationKind, KnowledgeRelationQuery, KnowledgeRevisionRef
 
 relation = KnowledgeRelation(
     id="reviewed-replacement-2026-08",
@@ -774,7 +764,7 @@ not widened. The in-memory, SQLite, and PostgreSQL implementations evaluate the
 projection in one bounded store snapshot.
 
 ```python
-from cayu import KnowledgeLineageQuery, KnowledgeRevisionRef
+from cayu.storage import KnowledgeLineageQuery, KnowledgeRevisionRef
 
 lineage = await store.inspect_lineage(
     KnowledgeLineageQuery(
@@ -914,13 +904,8 @@ justify spending a later bounded evaluation budget on the candidate set.
 ```python
 from datetime import UTC, datetime
 
-from cayu import (
-    KnowledgeMaintenanceCandidateSignal,
-    KnowledgeMaintenanceRouter,
-    KnowledgeMaintenanceRoutingRequest,
-    KnowledgeMaintenanceSignalKind,
-    KnowledgeRevisionRef,
-)
+from cayu.knowledge.maintenance import KnowledgeMaintenanceCandidateSignal, KnowledgeMaintenanceRouter, KnowledgeMaintenanceRoutingRequest, KnowledgeMaintenanceSignalKind
+from cayu.storage import KnowledgeRevisionRef
 
 now = datetime.now(UTC)
 request = KnowledgeMaintenanceRoutingRequest(
@@ -1046,11 +1031,7 @@ evaluation, so retry policy never has to infer infrastructure failure from a sem
 rejection.
 
 ```python
-from cayu import (
-    KnowledgeMaintenancePlanningConfig,
-    KnowledgeMaintenancePlanningOutcome,
-    KnowledgeMaintenancePlanningWorkflow,
-)
+from cayu.knowledge.maintenance_planning import KnowledgeMaintenancePlanningConfig, KnowledgeMaintenancePlanningOutcome, KnowledgeMaintenancePlanningWorkflow
 
 workflow = KnowledgeMaintenancePlanningWorkflow(
     store,
@@ -1142,10 +1123,7 @@ hashes inside the same transaction. An advance after evaluation therefore create
 replacement, proposal, evidence, chunk, or outbox residue.
 
 ```python
-from cayu import (
-    KnowledgeMaintenanceProposalPublisher,
-    KnowledgeMaintenanceProposalPublisherConfig,
-)
+from cayu.knowledge.maintenance_persistence import KnowledgeMaintenanceProposalPublisher, KnowledgeMaintenanceProposalPublisherConfig
 
 publisher = KnowledgeMaintenanceProposalPublisher(
     store,
@@ -1212,11 +1190,8 @@ cannot later be automatically re-authorized; explicit review remains separately 
 and never overwrites the routing evidence.
 
 ```python
-from cayu import (
-    KnowledgeGovernanceConfig,
-    KnowledgeGovernanceMode,
-    KnowledgeMaintenanceGovernor,
-)
+from cayu.storage import KnowledgeGovernanceConfig, KnowledgeGovernanceMode
+from cayu.knowledge.maintenance_governance import KnowledgeMaintenanceGovernor
 
 governor = KnowledgeMaintenanceGovernor(
     knowledge_store,
@@ -1272,7 +1247,7 @@ route to review. Candidate limits, fused-head omissions, and result-byte omissio
 also retained and make the evidence incomplete.
 
 ```python
-from cayu import KnowledgeSemanticWatchConfig, KnowledgeSemanticWatchEvaluator
+from cayu.knowledge.semantic_watch import KnowledgeSemanticWatchConfig, KnowledgeSemanticWatchEvaluator
 
 watch = KnowledgeSemanticWatchEvaluator(
     knowledge_store,

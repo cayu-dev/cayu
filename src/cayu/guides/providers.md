@@ -155,7 +155,8 @@ Native structured-output support remains model/upstream dependent.
 The SDK takes the endpoint explicitly:
 
 ```python
-from cayu import AgentSpec, CayuApp, GatewayProvider
+from cayu import AgentSpec, CayuApp
+from cayu.providers import GatewayProvider
 
 provider = GatewayProvider(base_url="https://YOUR_GATEWAY/v1")
 app = CayuApp()
@@ -206,7 +207,7 @@ Load a price snapshot at application startup, before accepting work:
 
 ```python
 from decimal import Decimal
-from cayu import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
 
 prices = await provider.price_book()
 app.budget_policy = BudgetPolicy(limits=(BudgetLimit(
@@ -259,7 +260,8 @@ Fireworks, Baseten Model APIs, OpenCode Go, and other compatible endpoints work
 through Cayu's generic adapter. Register it and route the agent to its name:
 
 ```python
-from cayu import AgentSpec, CayuApp, ChatCompletionsProvider
+from cayu import AgentSpec, CayuApp
+from cayu.providers import ChatCompletionsProvider
 
 provider = ChatCompletionsProvider(
     name="fireworks",

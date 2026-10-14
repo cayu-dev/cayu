@@ -6,10 +6,10 @@ import warnings
 
 import pytest
 
-from cayu import CayuApp, ProducerRecoveryExpectation
+from cayu import CayuApp
 from cayu.collaboration._contracts import CollaborationContractError
 from cayu.collaboration.access import CollaborationAccessContext
-from cayu.sessions import SessionStatus
+from cayu.sessions import ProducerRecoveryExpectation, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryExecutionRequest,
     RecoveryPlanBounds,

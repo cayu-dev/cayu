@@ -1,6 +1,6 @@
 """Database target parsing and environment selection shared by apps and the CLI.
 
-Application factories (through :func:`cayu.open_application_stores`) and the
+Application factories (through :func:`cayu.storage.application.open_application_stores`) and the
 storage-aware CLI commands read the same variables through this module, so the
 two cannot select different stores from the same configuration:
 

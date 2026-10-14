@@ -7,7 +7,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-import cayu
+import cayu.knowledge.maintenance_planning
+import cayu.storage
 from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRoutedCandidate,
@@ -309,13 +310,13 @@ def test_public_planning_surface_is_exported() -> None:
         "KnowledgeMaintenancePlanningWorkflow",
     }
 
-    assert all(hasattr(cayu, name) for name in expected)
+    assert all(hasattr(cayu.knowledge.maintenance_planning, name) for name in expected)
 
 
 def test_plan_contract_is_canonical_strict_and_defensively_copied() -> None:
     async def run():
         _store, request, result = await _prepared("a", "b")
-        planner_input = cayu.KnowledgeMaintenancePlannerInput(
+        planner_input = cayu.knowledge.maintenance_planning.KnowledgeMaintenancePlannerInput(
             snapshot=_snapshot(request, result),
             configuration_fingerprint=_config().fingerprint,
             allowed_replacement_kinds=("fact",),
@@ -505,7 +506,10 @@ def test_workflow_accepts_only_after_three_currentness_checks_and_independent_ev
     assert isinstance(planner.inputs[0].budget, KnowledgeMaintenancePlannerBudget)
     assert planner.inputs[0].budget.max_evidence_mappings == 100
     assert planner.inputs[0].budget.max_replacement_text_bytes == 64 * 1024
-    assert planner.inputs[0].budget.max_claim_bytes == cayu.MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES
+    assert (
+        planner.inputs[0].budget.max_claim_bytes
+        == cayu.storage.MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES
+    )
     assert planner.inputs[0].budget.allowed_model_ids == ("test-model",)
     assert evaluator.inputs[0].budget.allowed_model_ids == ("test-model",)
     planner_payload = planner.inputs[0].model_dump_json()

@@ -14,7 +14,6 @@ from tests.core._workload_secret_support import (
 )
 
 import cayu.runtime.execution_profiles as execution_profiles_module
-from cayu import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import (
@@ -29,6 +28,7 @@ from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.sessions import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

@@ -10,14 +10,8 @@ from cayu.cli import main
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 
 _ACCEPTED = {
-    "toolspec_nested_identity": """from cayu import (
-    ExecutionProfileBehaviorIdentity,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+    "toolspec_nested_identity": """from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
 class AuditCsv(Tool):
@@ -34,7 +28,8 @@ class AuditCsv(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult(content="ok")
 """,
-    "toolspec_identity_constant": """from cayu import ExecutionProfileBehaviorIdentity, Tool, ToolEffect, ToolSpec
+    "toolspec_identity_constant": """from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu import Tool, ToolEffect, ToolSpec
 
 _IDENTITY = ExecutionProfileBehaviorIdentity(
     name="probe.tool", behavior_version="1", implementation_version="1"
@@ -52,7 +47,8 @@ class Probe(Tool):
 """,
     "toolspec_annotated_identity_constant": """from typing import Final
 
-from cayu import ExecutionProfileBehaviorIdentity, Tool, ToolEffect, ToolSpec
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu import Tool, ToolEffect, ToolSpec
 
 _IDENTITY: Final[ExecutionProfileBehaviorIdentity]
 _IDENTITY = ExecutionProfileBehaviorIdentity(
@@ -84,6 +80,18 @@ class Probe(Tool):
         "def second(key: str) -> str:\n    return key\n"
     ),
 }
+
+# Both public entry points must preserve the same declaration proof.
+_ACCEPTED.update(
+    {
+        name + "_public_package": source.replace(
+            "from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity",
+            "from cayu.runtime import ExecutionProfileBehaviorIdentity",
+        )
+        for name, source in _ACCEPTED.items()
+        if name.startswith("toolspec_")
+    }
+)
 
 _REJECTED = {
     "subprocess": (
@@ -138,7 +146,7 @@ _REJECTED = {
     ),
     # An identity constant counts only after its assignment...
     "identity_constant_before_assignment": (
-        "from cayu import ExecutionProfileBehaviorIdentity, Tool, ToolEffect, ToolSpec\n\n\n"
+        "from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity\nfrom cayu import Tool, ToolEffect, ToolSpec\n\n\n"
         "class Probe(Tool):\n    spec = ToolSpec(\n        name='probe',\n"
         "        description='d',\n        input_schema={'type': 'object'},\n"
         "        effect=ToolEffect.NONE,\n        execution_profile_identity=_IDENTITY,\n    )\n"
@@ -149,7 +157,7 @@ _REJECTED = {
     ),
     # ...and only while nothing else can rebind the name.
     "identity_constant_rebound": (
-        "from cayu import ExecutionProfileBehaviorIdentity, Tool, ToolEffect, ToolSpec\n\n"
+        "from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity\nfrom cayu import Tool, ToolEffect, ToolSpec\n\n"
         "_IDENTITY = ExecutionProfileBehaviorIdentity(\n    name='probe.tool', "
         "behavior_version='1', implementation_version='1'\n)\n"
         "from cayu import ToolResult as _IDENTITY  # noqa: E402\n\n\n"
@@ -160,6 +168,22 @@ _REJECTED = {
         None,
     ),
 }
+
+
+_REJECTED.update(
+    {
+        name + "_public_package": (
+            source.replace(
+                "from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity",
+                "from cayu.runtime import ExecutionProfileBehaviorIdentity",
+            ),
+            reason,
+            construct,
+        )
+        for name, (source, reason, construct) in _REJECTED.items()
+        if name.startswith("identity_constant_")
+    }
+)
 
 
 @pytest.fixture(scope="module")

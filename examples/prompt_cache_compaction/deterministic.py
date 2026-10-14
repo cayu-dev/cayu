@@ -7,13 +7,9 @@ from typing import TYPE_CHECKING
 
 from examples.prompt_cache_compaction.scenario import run_scenario
 
-from cayu import (
-    ModelPrice,
-    ModelStreamEvent,
-    PriceBook,
-    Provenance,
-    ScriptedModelProvider,
-)
+from cayu.budgets import ModelPrice, PriceBook, Provenance
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 
 if TYPE_CHECKING:
     from examples._advanced_support import ScenarioResult

@@ -2229,7 +2229,7 @@ async def test_public_question_uses_real_assistant_export(
                 accepted.expected, context=actor_a.context
             )
             if public_reply:
-                from cayu import ClarificationReplyRequest
+                from cayu.collaboration import ClarificationReplyRequest
                 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
                 from cayu.sessions._model_completion_publication import (
                     model_step_publication_from_checkpoint,
@@ -2561,7 +2561,7 @@ async def test_public_question_uses_real_assistant_export(
                                 "clarification_services", operation_key(service_request.operation)
                             )
                             assert debt["state"] == "pending"
-                        from cayu import ClarificationServiceRecovery
+                        from cayu.collaboration import ClarificationServiceRecovery
                         from cayu.collaboration._contracts import CollaborationContractError
 
                         with pytest.raises(CollaborationAccessDenied):

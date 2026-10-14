@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from uuid import uuid4
 
-from cayu import (
+from cayu.collaboration import (
     CollaborationAccessDenied,
     CollaborationAccessGrant,
     CollaborationAccessPolicy,

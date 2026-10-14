@@ -6,20 +6,18 @@ import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 from tests.core.test_recovery_plans import _create_running_session
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, SessionStatus
+from cayu.providers.base import ModelProvider
+from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
+from cayu.sessions import (
     InMemorySessionStore,
     RecoveryBlockerCode,
     RecoveryExecutionRequest,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    SessionStatus,
-    SQLiteSessionStore,
 )
-from cayu.providers.base import ModelProvider
-from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
+from cayu.storage import SQLiteSessionStore
 
 
 class _Provider(ModelProvider):
@@ -144,7 +142,7 @@ def test_startup_continues_and_restored_registration_recovers(backend, sqlite_re
 
 def test_postgres_startup_continues_and_restored_registration_recovers(postgres_dsn):
     async def scenario():
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         store = PostgresSessionStore(
@@ -180,7 +178,8 @@ def test_unclassified_preflight_failure_still_fails_startup(monkeypatch, failure
 
 def test_blocked_summary_is_bounded_and_invalid_markers_do_not_stop_the_sweep():
     async def scenario():
-        from cayu import Message, RunRequest, SessionIdentity
+        from cayu import Message, RunRequest
+        from cayu.sessions import SessionIdentity
 
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
@@ -270,7 +269,7 @@ def startup_store(request):
     async def acquire():
         async with sqlite_resources as resources:
             if dsn is not None:
-                from cayu import PostgresSessionStore
+                from cayu.storage import PostgresSessionStore
                 from cayu.storage.migrations import SchemaMode
 
                 store = PostgresSessionStore(

@@ -9,7 +9,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from cayu import WebhookSignatureError, verify_webhook_signature, webhook_task_id
+from cayu.webhooks import WebhookSignatureError, verify_webhook_signature, webhook_task_id
 
 
 def _github_sig(secret: str, body: bytes) -> str:

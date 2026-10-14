@@ -924,7 +924,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         "conformance_duplicate_terminal",
     }
 
-    from cayu import HumanAttentionRequest
+    from cayu.runtime import HumanAttentionRequest
 
     for action in manual.actions:
         attention = HumanAttentionRequest.from_pending_action(action)

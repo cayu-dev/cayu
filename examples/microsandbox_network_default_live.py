@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
-from cayu import ExecCommand, ExecResult, MicrosandboxRunner
+from cayu.runners import ExecCommand, ExecResult, MicrosandboxRunner
 
 _IPV4_PROBE = """
 import socket

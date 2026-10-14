@@ -5,7 +5,8 @@ System One API with Cayu model sessions, normalized deadlines, events and
 usage accounting. It requires no new dependency beyond Cayu's HTTP client.
 
 ```python
-from cayu import AgentSpec, CayuApp, Message, RunRequest, SQLiteSessionStore
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.storage import SQLiteSessionStore
 from cayu.experimental.typesafe import TypeSafeProvider
 
 app = CayuApp(session_store=SQLiteSessionStore("decisions.sqlite3"))

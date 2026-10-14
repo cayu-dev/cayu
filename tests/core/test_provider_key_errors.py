@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from cayu import AnthropicProvider, ChatCompletionsProvider, OpenAIProvider
+from cayu.providers import AnthropicProvider, ChatCompletionsProvider, OpenAIProvider
 
 
 def test_openai_error_names_env_var(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -26,12 +26,6 @@ from tests.egress.test_aws_lambda_microvm_recoverable_allocation import (
 from tests.runners.lambda_microvm_harness import ClientTokenLambdaModel, FakeLambdaClientError
 
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
-from cayu import (
-    EnvironmentFactoryOperation,
-    ExecCommand,
-    ExecResult,
-    InMemorySessionStore,
-)
 from cayu.egress import (
     InvalidEgressReconnectMetadataError,
     TransparentEgressBroker,
@@ -39,9 +33,10 @@ from cayu.egress import (
     VirtualCredentialRegistry,
 )
 from cayu.egress.runtime import _build_reconnect_metadata
-from cayu.environments import EnvironmentFactoryRequest
-from cayu.runners import LambdaMicroVMRunner
+from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
+from cayu.runners import ExecCommand, ExecResult, LambdaMicroVMRunner
 from cayu.runtime._environment_lifecycle import ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY
+from cayu.sessions import InMemorySessionStore
 from cayu.vaults import StaticVault
 
 __all__ = ["_skip_guest_preflight", "clock"]

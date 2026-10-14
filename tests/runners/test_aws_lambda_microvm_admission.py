@@ -21,14 +21,13 @@ from tests.runners.lambda_microvm_harness import (
 )
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
-from cayu import LambdaMicroVMRunner
 from cayu.environments.admission import (
     EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
     ExecutionRequirements,
     ExecutionToolRequirement,
     evaluate_execution_admission,
 )
-from cayu.runners import LambdaMicroVMError, LambdaMicroVMOwnershipSuperseded
+from cayu.runners import LambdaMicroVMError, LambdaMicroVMOwnershipSuperseded, LambdaMicroVMRunner
 from cayu.runners.base import ExecCommand
 from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement
 

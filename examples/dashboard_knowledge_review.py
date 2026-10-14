@@ -13,8 +13,10 @@ from pathlib import Path
 
 import uvicorn
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.runtime import public_authority_alias_codec_from_environment
+from cayu.server import ServerConfig, create_server
+from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
@@ -23,9 +25,7 @@ from cayu import (
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
-    public_authority_alias_codec_from_environment,
 )
-from cayu.server import ServerConfig, create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-knowledge-review"
 DATA_DIR = WORKSPACE / "data"

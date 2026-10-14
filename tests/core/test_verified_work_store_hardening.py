@@ -14,8 +14,10 @@ from tests.core.task_invocation_fixtures import (
 )
 
 import cayu.tasks.creation as tasks_module
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.storage import _postgres_verified_work as postgres_verified_work
+from cayu.storage._postgres_verified_work import PostgresVerifiedWorkMixin
+from cayu.tasks import (
     CompletionCriterionOutcome,
     CompletionDecision,
     CompletionDecisionApplicationRequest,
@@ -47,8 +49,6 @@ from cayu import (
     completion_result_sha256,
     work_contract_from_draft,
 )
-from cayu.storage import _postgres_verified_work as postgres_verified_work
-from cayu.storage._postgres_verified_work import PostgresVerifiedWorkMixin
 from cayu.vaults import SecretRedactor
 
 
@@ -616,7 +616,7 @@ def test_postgres_task_store_rejects_unproven_mutation_connection_class() -> Non
     from psycopg import AsyncConnection
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     class CancellationResistantConnection(AsyncConnection):
         pass
@@ -637,7 +637,7 @@ def test_postgres_task_store_rejects_unproven_mutation_connection_class() -> Non
 def test_postgres_task_store_rejects_unproven_mutation_pool_subclass() -> None:
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     class CancellationResistantPool(AsyncConnectionPool):
         pass
@@ -666,7 +666,7 @@ def test_postgres_task_store_rejects_unproven_pool_callbacks(
 ) -> None:
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     async def callback(_owner) -> None:
         await asyncio.Event().wait()
@@ -685,7 +685,7 @@ def test_postgres_task_store_rejects_connection_behavior_factories() -> None:
     from psycopg import AsyncCursor
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     class CancellationResistantCursor(AsyncCursor):
         pass
@@ -703,7 +703,7 @@ def test_postgres_task_store_rejects_connection_behavior_factories() -> None:
 def test_postgres_task_store_revalidates_pool_before_lazy_readiness() -> None:
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     pool = AsyncConnectionPool("", open=False)
     store = PostgresTaskStore(pool=pool)
@@ -723,7 +723,7 @@ def test_postgres_task_store_revalidates_pool_before_lazy_readiness() -> None:
 def test_postgres_task_store_accepts_static_nonbehavioral_pool_options() -> None:
     from psycopg_pool import AsyncConnectionPool
 
-    from cayu import PostgresTaskStore
+    from cayu.storage import PostgresTaskStore
 
     pool = AsyncConnectionPool(
         "",

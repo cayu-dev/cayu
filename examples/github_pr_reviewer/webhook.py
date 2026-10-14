@@ -4,7 +4,8 @@ import json
 
 from examples.github_pr_reviewer.worker import enqueue_pr_review
 
-from cayu import SQLiteTaskStore, verify_webhook_signature, webhook_task_id
+from cayu.storage import SQLiteTaskStore
+from cayu.webhooks import verify_webhook_signature, webhook_task_id
 
 try:
     from fastapi import FastAPI, HTTPException, Request

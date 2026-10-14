@@ -13,16 +13,10 @@ from tests.core.session_store_conformance.support import (
     session_store_case,
 )
 
-from cayu import (
-    HumanAttentionRequest,
-    InterruptSessionRequest,
-    Message,
-    PendingActionQuery,
-    RunRequest,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    UserInputResponse,
-)
+from cayu import Message, RunRequest
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
+from cayu.runtime import HumanAttentionRequest
+from cayu.sessions import InterruptSessionRequest, PendingActionQuery
 
 
 @pytest.mark.parametrize("kind", ["user_input", "tool_approval"])
@@ -204,7 +198,8 @@ def test_attention_reconciliation_pages_and_concurrent_consumers(tmp_path):
         _tool_round_identity_payload,
     )
 
-    from cayu import CayuApp, Event, EventType, InMemorySessionStore, SessionIdentity, SessionStatus
+    from cayu import CayuApp, Event, EventType, SessionStatus
+    from cayu.sessions import InMemorySessionStore, SessionIdentity
 
     async def run():
         store = InMemorySessionStore()
@@ -264,7 +259,7 @@ def test_attention_manual_recovery_remains_runtime_owned(session_store_case, out
         private_events_for_public_events,
     )
 
-    from cayu import ToolApprovalRecoveryOutcome, UserInputRecoveryRequest
+    from cayu.approvals import ToolApprovalRecoveryOutcome, UserInputRecoveryRequest
     from cayu.tools.user_input import UserInputTool
 
     async def run():
@@ -371,13 +366,10 @@ def test_attention_manual_recovery_remains_runtime_owned(session_store_case, out
 def test_attention_expiry_is_confirmed_by_runtime_closure():
     from examples.human_attention.app import ApprovalTool
 
-    from cayu import (
-        AgentSpec,
-        AlwaysRequireApprovalToolPolicy,
-        CayuApp,
-        ModelStreamEvent,
-        ScriptedModelProvider,
-    )
+    from cayu import AgentSpec, CayuApp
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.tools import AlwaysRequireApprovalToolPolicy
 
     async def run():
         app = CayuApp(enable_logging=False)

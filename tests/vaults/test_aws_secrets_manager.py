@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-from cayu import SecretNotFound, SecretRef, SecretsManagerVault, VaultError
 from cayu._validation import DURABLE_METADATA_LIMITS, DurableValueError
+from cayu.vaults import SecretNotFound, SecretRef, SecretsManagerVault, VaultError
 
 
 def test_oversized_merged_metadata_rejects_before_secret_lookup() -> None:

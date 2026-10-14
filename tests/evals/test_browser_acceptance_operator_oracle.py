@@ -7,7 +7,7 @@ import pytest
 from tests.core.test_browser_control_audit import acquired_record
 from tests.evals.test_browser_acceptance_execution import _plan
 
-from cayu import InMemorySessionStore, ScriptedModelProvider, SQLiteSessionStore
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.browser_acceptance import (
     BrowserAcceptanceCaseCategory,
     BrowserAcceptanceCaseV1,
@@ -22,6 +22,8 @@ from cayu.evals.browser_acceptance import (
 )
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.runner import EvalPlan
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.browser_control import BrowserControlPageAudit
 
 

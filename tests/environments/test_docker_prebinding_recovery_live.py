@@ -11,26 +11,22 @@ import sys
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
+    DockerCodingToolchainProfile,
     EnvironmentAllocationContext,
     EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
     ImmutableInputStore,
-    IncompleteSessionRecoveryRequest,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
     inspect_local_immutable_input,
 )
-from cayu.environments import DockerCodingToolchainProfile
-from cayu.runners import DockerWorkloadRestrictions
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity, DockerWorkloadRestrictions
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import IncompleteSessionRecoveryRequest
+from cayu.storage import SQLiteSessionStore
+from cayu.workspaces import LocalWorkspace
 
 
 async def _child(

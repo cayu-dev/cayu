@@ -4402,6 +4402,7 @@ __all__ = [
     "CodingProductCandidate",
     "CodingProductCompletionVerifier",
     "CodingProductEvidenceError",
+    "CodingProductExecutionInspection",
     "CodingProductPublication",
     "CodingProductReconstructionRequiredError",
     "CodingProductRequest",

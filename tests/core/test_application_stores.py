@@ -9,23 +9,18 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import (
-    ApplicationStores,
-    KnowledgeAccessScope,
-    KnowledgeQuery,
-    SessionQuery,
-    TaskCreate,
-    TaskQuery,
-    configured_database_url,
-    open_application_stores,
-)
+from cayu.sessions import SessionQuery
+from cayu.storage import KnowledgeAccessScope, KnowledgeQuery
+from cayu.storage.application import ApplicationStores, open_application_stores
 from cayu.storage.targets import (
     PostgresRequiredError,
     SessionStoreBackend,
     SessionStoreTargetError,
     configured_database_pool_max,
+    configured_database_url,
     require_sqlite_store_allowed,
 )
+from cayu.tasks import TaskCreate, TaskQuery
 
 _SCOPE = KnowledgeAccessScope(allowed_namespaces=["project:app"])
 
@@ -42,11 +37,13 @@ def _clear_database_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _sqlite_store_constructors(path: Path):
-    from cayu import (
-        SQLiteAgentSnapshotStore,
+    from cayu.browser_profiles import SQLiteBrowserProfileStore
+    from cayu.collaboration import SQLiteCollaborationStore
+    from cayu.memory.execution import SQLiteMemoryInterventionExecutionStore
+    from cayu.snapshots import SQLiteAgentSnapshotStore
+    from cayu.storage import (
         SQLiteAgentWorkContextStore,
         SQLiteBudgetLedger,
-        SQLiteCollaborationStore,
         SQLiteEvalStore,
         SQLiteEventWatcherStore,
         SQLiteKnowledgeStore,
@@ -54,8 +51,6 @@ def _sqlite_store_constructors(path: Path):
         SQLiteSessionStore,
         SQLiteTaskStore,
     )
-    from cayu.browser_profiles import SQLiteBrowserProfileStore
-    from cayu.memory.execution import SQLiteMemoryInterventionExecutionStore
 
     return {
         "SQLiteSessionStore": lambda: SQLiteSessionStore(path),
@@ -106,7 +101,7 @@ def test_sqlite_stores_open_normally_without_the_postgres_requirement(
 ) -> None:
     if value is not None:
         monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", value)
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     async def scenario() -> None:
         store = SQLiteSessionStore(tmp_path / "cayu.db")
@@ -126,14 +121,14 @@ def test_unrecognized_postgres_requirement_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", value)
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     with pytest.raises(PostgresRequiredError, match="must be 1"):
         SQLiteSessionStore(tmp_path / "cayu.db")
 
 
 def test_default_application_stores_use_sqlite_at_the_absolute_path(tmp_path: Path) -> None:
-    from cayu import SQLiteKnowledgeStore, SQLiteSessionStore, SQLiteTaskStore
+    from cayu.storage import SQLiteKnowledgeStore, SQLiteSessionStore, SQLiteTaskStore
 
     database = tmp_path / "data" / "cayu.db"
 
@@ -176,7 +171,7 @@ def test_optional_application_stores_follow_the_selected_capabilities(tmp_path: 
 def test_product_operation_store_is_opt_in_and_shares_the_sqlite_database(
     tmp_path: Path,
 ) -> None:
-    from cayu import SQLiteProductOperationStore
+    from cayu.storage import SQLiteProductOperationStore
 
     database = tmp_path / "data" / "cayu.db"
 
@@ -301,7 +296,7 @@ def test_postgres_stores_share_one_lazy_pool_without_connecting(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from cayu import PostgresKnowledgeStore, PostgresSessionStore, PostgresTaskStore
+    from cayu.storage import PostgresKnowledgeStore, PostgresSessionStore, PostgresTaskStore
     from cayu.storage.migrations import SchemaMode
 
     monkeypatch.setenv("CAYU_DATABASE_POOL_MAX", "3")
@@ -337,7 +332,7 @@ def test_postgres_product_store_shares_the_pool_without_extra_connections(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from cayu import PostgresProductOperationStore
+    from cayu.storage import PostgresProductOperationStore
     from cayu.storage.migrations import SchemaMode
 
     monkeypatch.setenv("CAYU_DATABASE_POOL_MAX", "3")
@@ -389,7 +384,7 @@ def _named(url: str, application_name: str) -> str:
 
 @pytest.fixture(scope="module")
 def migrated_postgres_url(postgres_dsn: str, postgres_url: str) -> str:
-    from cayu import PostgresSessionStore
+    from cayu.storage import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
 
     async def create_schema() -> None:

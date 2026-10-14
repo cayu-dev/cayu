@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-import cayu
 import cayu.artifacts as artifacts
 import cayu.artifacts.settlement as settlement_module
 from cayu.artifacts._settlement import (
@@ -123,9 +122,9 @@ def test_artifact_write_settlement_public_surface_is_exported() -> None:
     }
 
     for name in names:
-        assert name in cayu.__all__
         assert name in artifacts.__all__
-        assert getattr(cayu, name) is getattr(artifacts, name)
+        assert name in dir(artifacts)
+        assert getattr(artifacts, name) is not None
 
 
 def test_owned_sync_call_preserves_contextvars() -> None:

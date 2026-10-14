@@ -11,16 +11,11 @@ from __future__ import annotations
 
 import asyncio
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ScriptedModelProvider,
-    WorkflowSpec,
-)
+from cayu import AgentSpec, CayuApp, EventType
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
-from cayu.workflows import EventStoreJournal, WorkflowBase, parallel, pipeline, step
+from cayu.workflows import EventStoreJournal, WorkflowBase, WorkflowSpec, parallel, pipeline, step
 
 COUNT_SCHEMA = {
     "type": "object",

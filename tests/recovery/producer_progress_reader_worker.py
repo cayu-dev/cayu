@@ -7,7 +7,7 @@ import sys
 from tests.core.test_participant_identity import app, registration
 from tests.core.test_prepared_admission_public import PreparationResolver
 
-from cayu import ProducerOutputRegistration, ProducerProgressOccurrence
+from cayu.collaboration import ProducerOutputRegistration, ProducerProgressOccurrence
 from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.request_access import PreparedAdmissionRegistration, RequestRegistration
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore

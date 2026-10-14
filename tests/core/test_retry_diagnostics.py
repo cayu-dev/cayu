@@ -239,7 +239,8 @@ def test_durable_retry_explanation_survives_fresh_process(tmp_path, stream_error
         assert {k: error.payload[k] for k in keys} == {k: retry.payload[k] for k in keys}
     script = """
 import asyncio, json, sys
-from cayu import SQLiteSessionStore, EventType
+from cayu.storage import SQLiteSessionStore
+from cayu import EventType
 async def read():
     events = await SQLiteSessionStore(sys.argv[1]).load_events("retry-diagnostics")
     print(json.dumps([e.payload for e in events if e.type is EventType.MODEL_ERROR]))

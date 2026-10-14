@@ -3,8 +3,8 @@
 import json
 import re
 
-from cayu import ExecutionProfileBehaviorIdentity
 from cayu.providers.openai import OpenAIProvider
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 
 
 class OfflineProvider(OpenAIProvider):

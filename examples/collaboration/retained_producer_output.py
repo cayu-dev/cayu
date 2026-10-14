@@ -9,8 +9,8 @@ policy, grants access, schedules recovery, or resolves a replacement operation.
 
 from contextlib import aclosing
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.collaboration import (
     CollaborationAccessContext,
     MandateAccessContext,
     ProducerCompletionRecord,

@@ -5,14 +5,13 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from cayu import (
+from cayu import Event, EventType
+from cayu.budgets import (
     ComparableGenerationSettings,
     ComparableOutputBudget,
     ComparisonCostLineItem,
     ComparisonPricingCatalog,
     CostQualityAttemptOperation,
-    Event,
-    EventType,
     ModelPrice,
     PairedCostAttempt,
     PairedCostQualityComparisonRequest,

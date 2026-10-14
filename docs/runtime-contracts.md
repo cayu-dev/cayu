@@ -51,7 +51,8 @@ deadlines, and explicit token/tool limits still apply independently. Configure
 alternatives directly in Python:
 
 ```python
-from cayu import CayuApp, CayuConfig, EvalConfig, RunDefaults
+from cayu import CayuApp, CayuConfig
+from cayu.configuration import EvalConfig, RunDefaults
 
 app = CayuApp(config=CayuConfig(
     run=RunDefaults(max_steps=10000),
@@ -125,7 +126,7 @@ terminal outcomes use the child-tree completeness contract.
 
 The target contract for payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data is portable durable JSON. Portable values contain only objects, arrays, strings, signed 64-bit integers, finite floats, booleans, and null, with at most 64 nested object/array levels. Strings and object keys may contain ordinary Unicode but not NUL or lone UTF-16 surrogate code points. JSON has one number domain, so Cayu normalizes every finite integral float in the signed 64-bit range to an integer (including negative zero); non-integral floats retain their value. Tuples, arbitrary Python objects, non-string object keys, circular references, raw decimals, NaN, and Infinity are not portable; integral floats outside the signed 64-bit range are rejected, and larger exact numbers use a field-specific canonical string format. Task input, result, error, and metadata fields remain top-level JSON objects.
 
-Core message parts, tool results, events, model requests, session/task stores, checkpoints, durable message queues, and JSONL import/export apply portable-value validation while taking their defensive copy. The bundled in-memory, SQLite, and PostgreSQL session/task stores therefore accept, reject, and reload the same representations. Provider stream events remain ephemeral, untrusted observations so terminal accounting can be retained; the runtime validates them strictly before producing a durable event, transcript message, or checkpoint value. Direct validation failures raise the public `cayu.DurableValueError`, a `ValueError` subtype with stable `code`, `field_name`, and input-value-independent `path` fields. Model validators may wrap it in their ordinary validation error; `cayu.extract_durable_value_error(error)` safely recovers the typed failure from either form without rendering rejected input. Migrated producer models hide Pydantic input values, and the bounded ASCII durable-value diagnostic never includes the rejected value or an object key.
+Core message parts, tool results, events, model requests, session/task stores, checkpoints, durable message queues, and JSONL import/export apply portable-value validation while taking their defensive copy. The bundled in-memory, SQLite, and PostgreSQL session/task stores therefore accept, reject, and reload the same representations. Provider stream events remain ephemeral, untrusted observations so terminal accounting can be retained; the runtime validates them strictly before producing a durable event, transcript message, or checkpoint value. Direct validation failures raise the public `cayu.exceptions.DurableValueError`, a `ValueError` subtype with stable `code`, `field_name`, and input-value-independent `path` fields. Model validators may wrap it in their ordinary validation error; `cayu.exceptions.extract_durable_value_error(error)` safely recovers the typed failure from either form without rendering rejected input. Migrated producer models hide Pydantic input values, and the bounded ASCII durable-value diagnostic never includes the rejected value or an object key.
 
 Public specifications, runtime decisions and contexts, workspace bindings, environment factory inputs and results, eval and embedding records, secret references, proxy decisions, and virtual credential grants apply the same portable-value contract to their metadata and options at construction. These constructors normalize integral floats and take an owned copy immediately, so invalid or subsequently mutated extension data cannot enter runtime state through an otherwise valid public value object.
 
@@ -223,7 +224,7 @@ atomic publications, transcript/checkpoint transforms, forks, and JSONL
 export/import.
 
 An unsupported future, too-old, malformed-version, or non-object root fails
-closed with `cayu.CheckpointCompatibilityError` before session status changes
+closed with `cayu.sessions.CheckpointCompatibilityError` before session status changes
 or provider, tool, effect, compactor, or policy work begins. Its safe evidence
 contains only checkpoint kind, observed and supported versions, session id,
 reason, recovery disposition, and whether the checkpoint is resumable in place;
@@ -1510,7 +1511,7 @@ inference, or recovery lifecycle. Do not hide an agent loop inside the handle.
 `GuardedToolPolicy` composes application validation with maintained enforcement:
 
 ```python
-from cayu import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy
+from cayu.tools import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy
 
 policy = GuardedToolPolicy(
     guards=(RequiredArguments({"ask_user": ("question",)}), application_guard),
@@ -1589,7 +1590,7 @@ For unattended, pre-authorized execution, use `EnvironmentScopedToolPolicy` with
 explicit tool-to-environment scopes:
 
 ```python
-from cayu import EnvironmentScopedToolPolicy
+from cayu.tools import EnvironmentScopedToolPolicy
 
 policy = EnvironmentScopedToolPolicy(allow={
     "read_file": ("local", "research"),
@@ -3638,7 +3639,8 @@ bypass `ToolPolicy`, approval, environment, effect, secret, budget, hook,
 idempotency, or recovery checks.
 
 ```python
-from cayu import Message, ResumeRequest, TargetedToolGrant
+from cayu import Message, ResumeRequest
+from cayu.tools import TargetedToolGrant
 
 # The agent must have been registered with targeted_tool_mode="call_tool" before its
 # session began. The registered target tool can remain outside direct exposure.
@@ -3700,7 +3702,9 @@ identity. Changing any of them is semantic drift, not an automatic retry
 fallback.
 
 ```python
-from cayu import AgentSpec, OpenAIProvider, StaticToolExposurePolicy
+from cayu import AgentSpec
+from cayu.providers import OpenAIProvider
+from cayu.tools import StaticToolExposurePolicy
 
 verified_model = "the-exact-model-id-verified-for-this-endpoint"
 app.register_provider(
@@ -4036,7 +4040,8 @@ An execution profile and a request footprint are deliberately different records.
 Applications version custom behavior with the public `ExecutionProfileBehaviorIdentity` value. `name` identifies the logical component, `behavior_version` changes when externally observable semantics or authority changes, and `implementation_version` changes for every deployed implementation revision, even when the public behavior contract is intended to stay stable:
 
 ```python
-from cayu import ExecutionProfileBehaviorIdentity, ToolSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu import ToolSpec
 
 remember_identity = ExecutionProfileBehaviorIdentity(
     name="acme:remember-knowledge",
@@ -5169,7 +5174,8 @@ or sibling barrier exists: one completed child can be discovered and consumed
 while any number of siblings remain admitted or running.
 
 ```python
-from cayu import AgentSpec, ChildSessionContextContributor
+from cayu import AgentSpec
+from cayu.sessions import ChildSessionContextContributor
 from cayu.tools import ChildSessionResultTool
 
 app.register_agent(
@@ -6204,7 +6210,7 @@ run. The application supplies its read-only candidate
 reader; the registered verifier, not that reader, decides acceptance.
 
 ```python
-from cayu import VerifiedTaskWorker
+from cayu.verification import VerifiedTaskWorker
 
 # app, handler, and the enqueued contract-bound task are application-owned.
 async def process_one(app, handler):
@@ -8975,7 +8981,8 @@ independent: callers that require a strictly root-only report must also leave
 `include_causal_budget=False`.
 
 ```python
-from cayu import MemoryAttributionBounds, RuntimeEvidenceRequest, runtime_evidence
+from cayu.memory import MemoryAttributionBounds
+from cayu.runtime import RuntimeEvidenceRequest, runtime_evidence
 
 report = await runtime_evidence(
     app,
@@ -12017,7 +12024,7 @@ inherit the narrower tools' argument or output policies.
 Register search explicitly; Cayu does not add it to every agent:
 
 ```python
-from cayu import GitChangesTool, ReadFileTool, SearchTextTool
+from cayu.tools import GitChangesTool, ReadFileTool, SearchTextTool
 
 app.register_agent(
     agent_spec,
@@ -12106,7 +12113,7 @@ first child begins. `WorkflowBase.run` remains the application-authored generato
 owned streams; time spent between pulls still consumes the original allowance.
 
 ```python
-from cayu import ExecutionDeadline
+from cayu.deadlines import ExecutionDeadline
 
 boundary = ExecutionDeadline.after(300, source="application", scope="workflow")
 async for event in workflow.execute("run-123", execution_deadline=boundary):
@@ -12397,7 +12404,7 @@ cancellation, confirmed cleanup, and at least
 while accepting integration-validated isolation and lifecycle guarantees:
 
 ```python
-from cayu import ExecutionEvidenceOverride, ExecutionRequirements
+from cayu.environments import ExecutionEvidenceOverride, ExecutionRequirements
 
 ExecutionRequirements.untrusted(
     evidence_overrides=(
@@ -13442,7 +13449,8 @@ directory for isolated development/live verification. Cayu never deletes,
 downgrades, or rewrites that database as remediation.
 
 ```python
-from cayu import Environment, EnvironmentSpec, MicrosandboxRunner
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runners import MicrosandboxRunner
 
 async with await MicrosandboxRunner.create(
     "agent-session-123",
@@ -13465,7 +13473,7 @@ Applications that intentionally need unrestricted guest networking must make
 that choice visible:
 
 ```python
-from cayu import MicrosandboxRunner
+from cayu.runners import MicrosandboxRunner
 from microsandbox import Network
 
 runner = await MicrosandboxRunner.create(
@@ -14034,7 +14042,9 @@ attributes force Git to label binary bytes as text.
 workspace contract:
 
 ```python
-from cayu import Environment, EnvironmentSpec, MicrosandboxRunner, MicrosandboxWorkspace
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runners import MicrosandboxRunner
+from cayu.workspaces import MicrosandboxWorkspace
 
 runner = await MicrosandboxRunner.create("session-123")
 environment = Environment(
@@ -14273,11 +14283,8 @@ Applications that want a bounded terminal result can configure the built-in
 policy and make the ordinary bounded `read_file` tool available:
 
 ```python
-from cayu import (
-    ArtifactExternalizingToolResultPolicy,
-    CayuApp,
-    ReadFileTool,
-)
+from cayu.tools import ArtifactExternalizingToolResultPolicy, ReadFileTool
+from cayu import CayuApp
 
 app = CayuApp(
     tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
@@ -14466,7 +14473,8 @@ A region read still decodes and validates the original image under the host poli
 Example host configuration for a source requiring approximately 100 MiB of raster work:
 
 ```python
-from cayu import CayuApp, CayuConfig, ToolExecutionConfig
+from cayu import CayuApp, CayuConfig
+from cayu.configuration import ToolExecutionConfig
 
 app = CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(
     image_max_frame_bytes=128 * 1024 * 1024,
@@ -14505,11 +14513,7 @@ Applications opt in by constructing one immutable `SharedArtifactPolicy` and
 registering tools that carry the same policy fingerprint:
 
 ```python
-from cayu import (
-    MaterializeSharedArtifactTool,
-    PublishWorkspaceArtifactTool,
-    SharedArtifactPolicy,
-)
+from cayu.tools import MaterializeSharedArtifactTool, PublishWorkspaceArtifactTool, SharedArtifactPolicy
 
 handoff_policy = SharedArtifactPolicy(
     publish_path_prefixes=("handoff",),
@@ -14621,7 +14625,7 @@ complete application and operator sequence.
 The artifact store is not the agent's mutable filesystem. The workspace is not the durable upload/output store. Move files between them explicitly:
 
 ```python
-from cayu import copy_artifact_to_workspace, copy_workspace_file_to_artifact
+from cayu.artifacts import copy_artifact_to_workspace, copy_workspace_file_to_artifact
 
 await copy_artifact_to_workspace(
     artifact_store,
@@ -14686,7 +14690,8 @@ To avoid re-uploading the same file bytes on every later turn, built-in context 
 `ReadFileTool` is extensible through artifact readers. Workspace text reads remain built in. Workspace image/PDF path reads are captured as artifacts and then use the same artifact-reader chain. The common extension path is additive: pass `extra_artifact_readers` to run app-owned readers before Cayu's defaults, while keeping the built-in text, image, and PDF readers available as fallbacks.
 
 ```python
-from cayu import ArtifactReadRequest, ReadFileTool, ToolResult
+from cayu.tools import ArtifactReadRequest, ReadFileTool
+from cayu import ToolResult
 
 
 class InvoiceOcrReader:
@@ -16210,11 +16215,7 @@ required/optional status, candidate limit and an application-controlled
 its existing `RecallSource` without taking over the runtime memory lifecycle:
 
 ```python
-from cayu import (
-    AutomaticRecallSourceContext,
-    AutomaticRecallSourceDescriptor,
-    AutomaticRecallSourceRegistration,
-)
+from cayu.runtime import AutomaticRecallSourceContext, AutomaticRecallSourceDescriptor, AutomaticRecallSourceRegistration
 
 async def enterprise_source(context: AutomaticRecallSourceContext):
     # Application implementation; construction is read-only and request-scoped.
@@ -16310,17 +16311,7 @@ cutting serialized JSON.
 A typical knowledge-plus-transcript policy is configured explicitly:
 
 ```python
-from cayu import (
-    AutomaticRecallContextPolicy,
-    AutomaticRecallPolicy,
-    AutomaticRecallSourceConfig,
-    KNOWLEDGE_LEXICAL_CHANNEL,
-    KNOWLEDGE_SEMANTIC_CHANNEL,
-    MemoryDeltaPolicy,
-    TRANSCRIPT_LEXICAL_CHANNEL,
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
-    WeightedReciprocalRankFusionConfig,
-)
+from cayu.memory import AutomaticRecallContextPolicy, AutomaticRecallPolicy, AutomaticRecallSourceConfig, KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL, MemoryDeltaPolicy, TRANSCRIPT_LEXICAL_CHANNEL, WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION, WeightedReciprocalRankFusionConfig
 
 fusion_version = "app-recall-v1"
 policy = AutomaticRecallContextPolicy(
@@ -16358,7 +16349,8 @@ non-secret key ID together. Cayu derives a purpose-separated memory evidence key
 and never persists either secret value.
 
 ```python
-from cayu import CayuApp, RequestFootprintConfig
+from cayu import CayuApp
+from cayu.context import RequestFootprintConfig
 
 app = CayuApp(
     session_store=session_store,
@@ -18185,8 +18177,8 @@ and refuses newly observed truncation rather than trusting an earlier inspection
 ## Explicit collaboration host
 
 `CollaborationHost(app, registration)` services finite application-selected
-collaboration responsibilities. Import it and `HostRegistration` from `cayu`,
-`cayu.collaboration`, or `cayu.collaboration.host`. Registration and construction
+collaboration responsibilities. Import it and `HostRegistration` from
+`cayu.collaboration` or `cayu.collaboration.host`. Registration and construction
 are inert: they snapshot configuration without starting a worker, reading a
 store, invoking a policy, or calling a model. Application code still owns roles,
 routing, iteration and business acceptance. The host does not invent another

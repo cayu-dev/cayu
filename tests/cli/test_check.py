@@ -50,7 +50,9 @@ service_factory = "service_project:build_service"
     (tmp_path / "service_project.py").write_text(
         """from fastapi import HTTPException, Request
 
-from cayu import AgentSpec, CayuApp, ScriptedModelProvider, SQLiteSessionStore, SQLiteTaskStore
+from cayu import AgentSpec, CayuApp
+from cayu.evals import ScriptedModelProvider
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,
@@ -150,7 +152,8 @@ service_factory = "unsafe_service:build_service"
         encoding="utf-8",
     )
     (tmp_path / "unsafe_service.py").write_text(
-        """from cayu import AgentSpec, CayuApp, ScriptedModelProvider
+        """from cayu import AgentSpec, CayuApp
+from cayu.evals import ScriptedModelProvider
 from cayu.server import DevelopmentProductAccess, OpenAccess, ServiceIdentityStoreKind, create_agent_service
 
 
@@ -273,7 +276,9 @@ service_factory = "tampered_service:build_service"
         encoding="utf-8",
     )
     (tmp_path / "tampered_service.py").write_text(
-        """from cayu import AgentSpec, CayuApp, InMemoryTaskStore, ScriptedModelProvider
+        """from cayu import AgentSpec, CayuApp
+from cayu.tasks import InMemoryTaskStore
+from cayu.evals import ScriptedModelProvider
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,

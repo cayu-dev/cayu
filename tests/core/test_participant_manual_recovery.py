@@ -10,8 +10,8 @@ from tests.core.test_participant_continuation_boundaries import activate, collec
 from tests.core.test_participant_identity import CONTEXT, app, create, registration
 from tests.core.test_tool_effect_reconciliation_registration import _spec
 
-from cayu import AlwaysRequireApprovalToolPolicy, ToolApprovalDecision, ToolApprovalRequest
 from cayu.agents import AgentSpec
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.tools import ToolApprovalRecoveryRequest
 from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.collaboration.lifecycle import ParticipantLifecycleChange
@@ -29,6 +29,7 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import AlwaysRequireApprovalToolPolicy
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.rounds import ToolRoundRecoveryRequest
 from cayu.tools.user_input import UserInputTool

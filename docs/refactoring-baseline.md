@@ -54,15 +54,16 @@ regular source blob. Ordinary inventory reports retain their original behavior.
 ### Assessed exceptions
 
 At revision `dccef301f`, all twelve original large implementation files are below
-10,000 lines. Two other maintained Python files exceed that threshold:
+10,000 lines. The original assessment retained two size exceptions. The later public import
+migration removed the root export manifest exception; only the browser worker
+remains above that threshold:
 
 | File | Maximum lines | Retained responsibility |
 | --- | ---: | --- |
-| `src/cayu/_exports.py` | 10,316 | One literal lazy-export map and public-name list. These declarations preserve the root import surface; distributing them would add composition without moving behavior to a clearer owner. |
 | `src/cayu/tools/_browser_guest.py` | 10,002 | The standalone worker shipped into the versioned browser image. Request decoding, browser lifetime, interactive execution and observations currently share its guest protocol and process state. |
 
-These are explicit caps at the measured sizes, with reasons in the policy file.
-The export manifest remains maintained source. Browser request decoding and
+The browser worker has an explicit cap at its measured size, with its reason in
+the policy file. Browser request decoding and
 observation remain candidates for future ownership work, but that work needs
 its own isolated-entry-point, sibling deployment, protocol and browser tests.
 The size check introduces no changes to either implementation.

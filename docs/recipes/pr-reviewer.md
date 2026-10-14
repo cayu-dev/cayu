@@ -170,7 +170,8 @@ If no proxy is configured the tool **fails closed** — it never reaches the net
 **b) The GitHub MCP server** — zero custom tool code:
 
 ```python
-from cayu import HttpMcpClient, LocalEnvVault, McpServerSpec, SecretRef, connect_mcp_toolset
+from cayu.mcp import HttpMcpClient, McpServerSpec, connect_mcp_toolset
+from cayu.vaults import LocalEnvVault, SecretRef
 
 vault = LocalEnvVault({"github_token": "GITHUB_TOKEN"})
 toolset = await connect_mcp_toolset(
@@ -245,7 +246,7 @@ After the run reaches a terminal event, use the canonical bounded evidence read 
 to confirm what happened in the Git-backed review workspace:
 
 ```python
-from cayu import RuntimeEvidenceRequest, runtime_evidence
+from cayu.runtime import RuntimeEvidenceRequest, runtime_evidence
 
 evidence = await runtime_evidence(
     app,

@@ -1,8 +1,11 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ApplicationStores": ("cayu.storage.application", "ApplicationStores"),
     "ArtifactRetentionPolicy": ("cayu.storage.retention", "ArtifactRetentionPolicy"),
     "BUILTIN_KNOWLEDGE_KINDS": ("cayu.knowledge.records", "BUILTIN_KNOWLEDGE_KINDS"),
+    "BrowserRecordingStore": ("cayu._browser_recording_store", "BrowserRecordingStore"),
+    "BrowserRecordingUnavailable": ("cayu._browser_recording_store", "BrowserRecordingUnavailable"),
     "DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES": (
         "cayu.storage.retention",
         "DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES",
@@ -372,12 +375,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.knowledge_transition",
         "assess_knowledge_revision_transition",
     ),
+    "configured_database_url": ("cayu.storage.targets", "configured_database_url"),
     "copy_knowledge_revision_refs": ("cayu.knowledge.records", "copy_knowledge_revision_refs"),
     "knowledge_access_scope_sha256": ("cayu.knowledge.scopes", "knowledge_access_scope_sha256"),
     "knowledge_chunk_embedding_identity": (
         "cayu.knowledge.indexing",
         "knowledge_chunk_embedding_identity",
     ),
+    "open_application_stores": ("cayu.storage.application", "open_application_stores"),
     "prepare_knowledge_activation_request": (
         "cayu.knowledge.activation_contracts",
         "prepare_knowledge_activation_request",
@@ -395,13 +400,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.knowledge_transition",
         "require_empty_knowledge_revision_transition",
     ),
-    "BrowserRecordingStore": ("cayu._browser_recording_store", "BrowserRecordingStore"),
-    "BrowserRecordingUnavailable": ("cayu._browser_recording_store", "BrowserRecordingUnavailable"),
 }
 
 PUBLIC_NAMES = [
+    "ApplicationStores",
     "ArtifactRetentionPolicy",
     "BUILTIN_KNOWLEDGE_KINDS",
+    "BrowserRecordingStore",
+    "BrowserRecordingUnavailable",
     "DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES",
     "DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES",
     "DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES",
@@ -573,14 +579,14 @@ PUBLIC_NAMES = [
     "StorageRetentionTarget",
     "WorkspaceRetentionPolicy",
     "assess_knowledge_revision_transition",
+    "configured_database_url",
     "copy_knowledge_revision_refs",
     "knowledge_access_scope_sha256",
     "knowledge_chunk_embedding_identity",
+    "open_application_stores",
     "prepare_knowledge_activation_request",
     "prepare_knowledge_maintenance_decision",
     "prepare_knowledge_publication",
     "prepare_knowledge_relations",
     "require_empty_knowledge_revision_transition",
-    "BrowserRecordingStore",
-    "BrowserRecordingUnavailable",
 ]

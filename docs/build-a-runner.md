@@ -67,12 +67,11 @@ class Runner(ABC):
   resolver accepts its own canonical output on every invocation.
   Revalidate the stored effective default on every call so post-construction mutation
   cannot carry non-portable text into secret lookup or backend preparation.
-- **`Runner` is exported from `cayu.runners`, not the top-level `cayu`** (only the
-  concrete runners are re-exported at the top level):
+- Import **`Runner`** and its concrete implementations from `cayu.runners`:
 
   ```python
   from cayu.runners import Runner
-  from cayu import ExecCommand, ExecResult, DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
+  from cayu.runners import ExecCommand, ExecResult, DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
   from cayu.runners import attach_cancellation_artifacts
   ```
 
@@ -330,7 +329,8 @@ A runner attaches to an `Environment` (which validates
 `isinstance(runner, Runner)`), and the environment registers on the app:
 
 ```python
-from cayu import CayuApp, Environment, EnvironmentSpec
+from cayu import CayuApp
+from cayu.environments import Environment, EnvironmentSpec
 
 runner = await ModalRunner.create(app=modal_app, image=modal.Image.debian_slim())
 app = CayuApp()

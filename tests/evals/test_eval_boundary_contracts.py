@@ -9,8 +9,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp, Message, RunRequest
+from cayu.context import StructuredOutputError, StructuredOutputValidation
+from cayu.evals import (
     EvalAssertionResult,
     EvalCase,
     EvalCaseComparison,
@@ -23,18 +24,13 @@ from cayu import (
     EvalStatus,
     EvalSuite,
     EvalTrialResult,
-    Message,
-    MessageRole,
-    RunRequest,
-    StructuredOutputError,
-    StructuredOutputValidation,
-    ToolCallPart,
     Trajectory,
     TrajectoryProbes,
     run_eval_case,
     run_eval_suite,
 )
 from cayu.evals.models import WorkspaceFileProbe
+from cayu.messages import MessageRole, ToolCallPart
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 

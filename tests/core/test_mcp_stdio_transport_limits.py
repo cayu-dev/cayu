@@ -14,7 +14,8 @@ import pytest
 from pydantic import ValidationError
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
+from cayu import ToolContext
+from cayu.mcp import (
     DEFAULT_MCP_MAX_MESSAGE_BYTES,
     DEFAULT_MCP_MAX_RESPONSE_BYTES,
     HttpMcpClient,
@@ -27,22 +28,16 @@ from cayu import (
     McpToolDefinition,
     McpToolset,
     McpTransportLimits,
-    SecretRedactor,
-    SecretRef,
-    StaticVault,
     StdioMcpProcessLifetime,
     StdioMcpSession,
-    ToolContext,
 )
-from cayu import (
-    StdioMcpClient as _StdioMcpClient,
-)
+from cayu.mcp import StdioMcpClient as _StdioMcpClient
 from cayu.mcp import stdio as mcp_stdio_module
 from cayu.mcp import tools as mcp_tools_module
 from cayu.mcp._stdio_process import stdio_mcp_parent_death_containment_platform_candidate
 from cayu.mcp.base import _mcp_session_close_task
 from cayu.mcp.stdio import _StdioPendingTiming
-from cayu.vaults import REDACTED_SECRET
+from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 _FAKE_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
 

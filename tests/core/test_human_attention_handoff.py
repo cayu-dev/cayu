@@ -11,28 +11,19 @@ import httpx
 import pytest
 from examples.human_attention.app import ApprovalPolicy, ApprovalTool
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InterruptSessionRequest,
-    Message,
-    ModelStreamEvent,
-    PendingActionKind,
-    PendingActionQuery,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    UserInputResponse,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
+from cayu.evals import ScriptedModelProvider
 from cayu.human_attention_handoff import (
     PROTOCOL,
     HumanAttentionHandoff,
     HumanAttentionHandoffError,
     HumanAttentionReceiver,
 )
+from cayu.providers import ModelStreamEvent
 from cayu.runtime.human_attention import HumanAttentionReference
+from cayu.sessions import InterruptSessionRequest, PendingActionKind, PendingActionQuery
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
 
 TERMINAL = {"resolved", "cancelled", "superseded", "expired"}

@@ -13,7 +13,7 @@ objects. Runtime code never fetches or updates either resource.
 ```python
 from decimal import Decimal
 
-from cayu import BudgetLimit, default_model_catalog, default_price_book
+from cayu.budgets import BudgetLimit, default_model_catalog, default_price_book
 
 models = default_model_catalog()
 prices = default_price_book()
@@ -41,7 +41,7 @@ control plane must deliberately publish either Cayu's bundled, dated public snap
 one complete application-owned book:
 
 ```python
-from cayu import default_price_book
+from cayu.budgets import default_price_book
 from cayu.server import AuthenticatedAccess, mount_cayu
 
 mount_cayu(
@@ -94,7 +94,7 @@ one-off books. Choose a narrow stable prefix or set `match="exact"` for one lite
 ```python
 from decimal import Decimal
 
-from cayu import ModelPrice, PriceBook
+from cayu.budgets import ModelPrice, PriceBook
 
 prices = PriceBook(
     prices=(
@@ -137,7 +137,8 @@ message is kept with known secrets removed. The bundled catalog is used by defau
 with the bundled snapshot, so declare every model whose support you want decided locally:
 
 ```python
-from cayu import ModelCatalog, ModelInfo, OpenAIProvider, Provenance
+from cayu.budgets import ModelCatalog, ModelInfo, Provenance
+from cayu.providers import OpenAIProvider
 
 catalog = ModelCatalog(
     catalog_version="app-2026-09-30",

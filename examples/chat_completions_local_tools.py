@@ -5,21 +5,12 @@ import os
 import sys
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ChatCompletionsProvider,
-    Environment,
-    EnvironmentSpec,
-    ExecCommandTool,
-    ListFilesTool,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    ReadFileTool,
-    RunRequest,
-    WriteFileTool,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.providers import ChatCompletionsProvider
+from cayu.runners import LocalRunner
+from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.workspaces import LocalWorkspace
 
 # ChatCompletionsProvider targets any OpenAI-compatible /v1/chat/completions
 # service. This example runs against Google Gemini (AI Studio) because it has a

@@ -6,7 +6,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from cayu import AgentSpec, CayuApp, ToolContext, WebBridge
+from cayu import AgentSpec, CayuApp, ToolContext
+from cayu.tools import WebBridge
 
 
 @dataclass(frozen=True, slots=True)

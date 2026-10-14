@@ -84,7 +84,8 @@ server configuration. With an already configured application policy, auth
 dependency and dedicated signing key, the wiring is:
 
 ```python
-from cayu import BrowserControlConfig, BrowserOperatorPurpose, CayuApp
+from cayu.tools import BrowserControlConfig, BrowserOperatorPurpose
+from cayu import CayuApp
 from cayu.server import BrowserControlServerConfig, ServerConfig, create_server
 
 cayu_app = CayuApp(

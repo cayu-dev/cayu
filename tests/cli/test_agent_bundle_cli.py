@@ -9,14 +9,14 @@ import pytest
 from tests.core.test_agent_bundle_containers import _export_directory
 from tests.core.test_agent_bundles import _portable_fixture
 
-from cayu import (
+from cayu.cli import main
+from cayu.snapshots import (
     AgentSnapshotAccess,
     AgentSnapshotCaptureRequest,
     AgentSnapshotComponentSelector,
     AgentSnapshotCoordinator,
     SQLiteAgentSnapshotStore,
 )
-from cayu.cli import main
 
 
 def test_agent_bundle_cli_help_exposes_single_file_workflow(capsys) -> None:

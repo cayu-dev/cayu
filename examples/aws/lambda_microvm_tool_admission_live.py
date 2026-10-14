@@ -19,7 +19,7 @@ import os
 
 from examples._live_checks import require
 
-from cayu import AgentSpec, CayuApp, LambdaMicroVMRunner, Message, RunRequest
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.environments import (
     EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
     ExecutionRequirements,
@@ -30,6 +30,7 @@ from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
+from cayu.runners import LambdaMicroVMRunner
 from cayu.tools.base import (
     Tool,
     ToolExecutableRequirement,

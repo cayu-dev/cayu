@@ -7,10 +7,11 @@ from decimal import Decimal
 import pytest
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import AgentSpec, ModelProvider, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, RunRequest
 from cayu.applications import CayuApp
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.budgets.usage import SessionUsageSummary, UsageMetrics, session_usage_summary
+from cayu.evals import ScriptedModelProvider
 from cayu.evals.assertions import (
     ChildSessionCompleted,
     FinalOutputContains,
@@ -57,6 +58,7 @@ from cayu.evals.runner import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart
+from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

@@ -8,45 +8,18 @@ import pytest
 from tests.core._workload_secret_support import FakeProvider
 
 from cayu import (
-    EXECUTION_PROFILE_FINGERPRINT_FIELD,
-    KNOWLEDGE_LEXICAL_CHANNEL,
-    KNOWLEDGE_SEMANTIC_CHANNEL,
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     AgentSpec,
-    AutomaticRecallContextPolicy,
-    AutomaticRecallPolicy,
-    AutomaticRecallSourceConfig,
-    BoundWorkspace,
     CayuApp,
-    DurableValueError,
-    Environment,
-    EnvironmentFactoryReleaseAction,
-    EnvironmentFactoryResult,
-    EnvironmentSpec,
     Event,
     EventType,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    KnowledgeAccessScope,
     Message,
-    ModelStreamEvent,
-    RequestFootprintConfig,
     RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    ScriptedModelProvider,
     SessionStatus,
-    TaskCreate,
-    TaskStatus,
     Tool,
-    ToolCallHookContext,
     ToolContext,
     ToolEffect,
     ToolResult,
     ToolSpec,
-    WeightedReciprocalRankFusionConfig,
-    WorkspaceBinding,
 )
 from cayu._exception_groups import (
     exception_cause,
@@ -54,8 +27,32 @@ from cayu._exception_groups import (
     exception_tree_contains,
     set_exception_cause,
 )
+from cayu.context import RequestFootprintConfig
 from cayu.egress.runtime import _contains_timeout, _split_cleanup_cancellation
-from cayu.environments import EnvironmentFactory, EnvironmentFactoryRequest
+from cayu.environments import (
+    BoundWorkspace,
+    Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryReleaseAction,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+    WorkspaceBinding,
+)
+from cayu.evals import ScriptedModelProvider
+from cayu.exceptions import DurableValueError
+from cayu.execution_profiles import EXECUTION_PROFILE_FINGERPRINT_FIELD
+from cayu.memory import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    AutomaticRecallContextPolicy,
+    AutomaticRecallPolicy,
+    AutomaticRecallSourceConfig,
+    WeightedReciprocalRankFusionConfig,
+)
+from cayu.observability import RuntimeHook, RuntimeHookContext, ToolCallHookContext
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._binding_cleanup import (
     BindingCleanupStatus,
     BindingFinalizeFailure,
@@ -80,6 +77,9 @@ from cayu.runtime._environment_lifecycle import (
 )
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._tool_round_executor import _parallel_tool_round_exception
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

@@ -6,7 +6,7 @@ from typing import cast
 
 from _live_checks import require_cleanup_artifact, require_exec_success
 from _runner_conformance import verify_bounded_output_drain
-from cayu import ExecCommand, MicrosandboxRunner, RunnerCleanupPolicy
+from cayu.runners import ExecCommand, MicrosandboxRunner, RunnerCleanupPolicy
 
 
 async def main() -> None:

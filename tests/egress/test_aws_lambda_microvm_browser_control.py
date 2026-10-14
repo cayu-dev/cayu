@@ -45,13 +45,17 @@ from tests.runners.lambda_microvm_harness import (
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
 import cayu.runners.aws_lambda_microvm as runner_module
 import cayu.tools._browser_control_transport as transport_module
-from cayu import ExecCommand, LambdaMicroVMRunner
 from cayu.browser_recording import browser_recording_capability
 from cayu.egress.aws_lambda_microvm_adapter import (
     LambdaMicroVMBrowserControlRelay,
     LambdaMicroVMEgressAdapter,
 )
-from cayu.runners import ExecResult, LambdaMicroVMOwnershipSuperseded
+from cayu.runners import (
+    ExecCommand,
+    ExecResult,
+    LambdaMicroVMOwnershipSuperseded,
+    LambdaMicroVMRunner,
+)
 from cayu.runners.aws_lambda_microvm import (
     LAMBDA_MICROVM_CONTROL_HOSTNAME,
     LAMBDA_MICROVM_CONTROL_RELAY_PORT,

@@ -163,6 +163,8 @@ from cayu.providers.operations import (
 )
 from cayu.providers.operations import copy_provider_operation_state as copy_provider_operation_state
 from cayu.providers.response import ModelResponse as ModelResponse
+from cayu.providers.retry_policy import RetryPolicy as RetryPolicy
+from cayu.providers.retry_policy import copy_retry_policy as copy_retry_policy
 from cayu.providers.vertex import HttpxVertexTransport as HttpxVertexTransport
 from cayu.providers.vertex import VertexAPIError as VertexAPIError
 from cayu.providers.vertex import VertexContextOverflowError as VertexContextOverflowError

@@ -723,17 +723,8 @@ def test_eval_cli_run_and_report(tmp_path, monkeypatch, capsys):
     report = tmp_path / "report.html"
     module.write_text(
         """
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EvalCase,
-    EvalSuite,
-    FinalOutputContains,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionCompleted,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import EvalCase, EvalSuite, FinalOutputContains, ScriptedModelProvider, SessionCompleted
 from cayu.providers import ModelStreamEvent
 
 
@@ -1927,16 +1918,8 @@ def test_eval_run_exits_nonzero_on_failing_suite(tmp_path, monkeypatch):
     module = tmp_path / "failing_eval.py"
     module.write_text(
         """
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EvalCase,
-    EvalSuite,
-    FinalOutputContains,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import EvalCase, EvalSuite, FinalOutputContains, ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 
 

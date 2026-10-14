@@ -5,10 +5,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import CayuApp, SessionClosurePolicy
+from cayu import CayuApp
 from cayu.events import Event, EventType
 from cayu.memory.evidence import RecallReceipt
 from cayu.messages import Message
+from cayu.runtime import SessionClosurePolicy
 from cayu.runtime.session_closure import SessionClosureRecord
 from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._operation_records import SessionOperationPublication

@@ -7,15 +7,12 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from cayu import (
-    AgentAuthoringState,
-    AgentSpec,
-    AllowlistRule,
-    AppManifest,
-    ArtifactExternalizingToolResultPolicy,
-    CayuApp,
-    CayuConfig,
-    DenyPatternRule,
+from cayu import AgentSpec, CayuApp, CayuConfig, Tool, ToolEffect, ToolResult, ToolSpec
+from cayu._validation import copy_durable_json_object, revalidate_model_input
+from cayu.agents import AgentAuthoringState
+from cayu.configuration import OperationsConfig
+from cayu.context import RequestFootprintConfig
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -23,28 +20,26 @@ from cayu import (
     EnvironmentLifecyclePhase,
     EnvironmentLifecyclePolicy,
     EnvironmentSpec,
+    ExecutionRequirements,
+)
+from cayu.evals import EvaluationTargetIdentity, ScriptedModelProvider
+from cayu.providers import OpenAIWebSearch
+from cayu.runtime import AppManifest
+from cayu.sessions import RecoveryCleanupPolicy
+from cayu.tools import (
+    AllowlistRule,
+    ArtifactExternalizingToolResultPolicy,
+    DenyPatternRule,
     EveryCallRule,
     ExecCommandTool,
-    ExecutionRequirements,
-    LocalWorkspace,
-    OpenAIWebSearch,
-    OperationsConfig,
     ParameterConstrainedToolPolicy,
     ProcessCommandPolicy,
-    RecoveryCleanupPolicy,
-    RequestFootprintConfig,
     RequiredAllowlistRule,
     RequiredFieldRule,
-    ScriptedModelProvider,
-    SecretRedactor,
-    Tool,
-    ToolEffect,
     ToolPolicyDecision,
-    ToolResult,
-    ToolSpec,
 )
-from cayu._validation import copy_durable_json_object, revalidate_model_input
-from cayu.evals import EvaluationTargetIdentity
+from cayu.vaults import SecretRedactor
+from cayu.workspaces import LocalWorkspace
 
 
 class _SchemaTool(Tool):
@@ -456,7 +451,7 @@ def test_manifest_rejects_mutated_branch_capabilities_without_diagnostic_exposur
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from cayu import WorkspaceBranchCapabilities
+    from cayu.workspaces import WorkspaceBranchCapabilities
 
     canary = "mutated-capability-secret"
 
@@ -1027,8 +1022,8 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     ),
 )
 def test_manifest_derives_structured_command_policy_coverage(base, tool_name, expected):
-    from cayu import AlwaysRequireApprovalToolPolicy, StaticToolPolicy
     from cayu.runtime.manifest import _tool_policy_coverage
+    from cayu.tools import AlwaysRequireApprovalToolPolicy, StaticToolPolicy
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     # Coverage reads only the policy type and its base policy, not the toolchain profile.

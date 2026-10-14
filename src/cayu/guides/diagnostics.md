@@ -5,6 +5,19 @@ Run the correction, then rerun `cayu inspect --json` and `cayu check --json`.
 The last section, [request-cost](#request-cost), covers what a running server
 spends on each HTTP route and how to check it.
 
+## scaffold-import-removed
+
+`SCAFFOLD_IMPORT_REMOVED` identifies an outdated `from cayu import ...` or
+`from cayu.runtime import ...` statement in a declared project or an explicitly
+imported local helper. The finding includes the source line and replacement
+import, preserving any local alias. Update every reported import, then rerun
+`cayu check --json`. Cayu does not import the application while these findings
+remain, including when a tag filter would otherwise hide them.
+
+Installed packages also report replacement imports when a removed name is
+accessed directly. These known removed routes raise `ImportError`; unknown
+attributes retain `AttributeError`. No removed route loads its former object.
+
 ## app-no-agents
 
 `APP_NO_AGENTS` means the factory returned an app with no registered agent.

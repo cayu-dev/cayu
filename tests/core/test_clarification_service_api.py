@@ -5,7 +5,7 @@ from tests.core.test_clarification_contracts import operation
 from tests.core.test_clarification_deliveries import delivery_record
 from tests.core.test_temporary_continuation_contracts import selection
 
-from cayu import ClarificationServiceReceipt, ClarificationServiceRequest
+from cayu.collaboration import ClarificationServiceReceipt, ClarificationServiceRequest
 from cayu.collaboration._contracts import CollaborationContractError
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration.clarifications import MAX_CLARIFICATION_TEXT_BYTES

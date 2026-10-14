@@ -8,9 +8,10 @@ from typing import Any
 import pytest
 
 import cayu.mcp.http as mcp_http_module
-from cayu import (
-    Environment,
-    EnvironmentSpec,
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.exceptions import extract_durable_value_error
+from cayu.mcp import (
     HttpMcpClient,
     McpClient,
     McpInitializeResult,
@@ -20,13 +21,11 @@ from cayu import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
-    SecretRef,
     StdioMcpClient,
     connect_mcp_toolset,
-    extract_durable_value_error,
     mcp_tool_manifest_identity,
 )
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
+from cayu.vaults import SecretRef
 
 _SENSITIVE_CANARY = "private-mcp-value-canary"
 

@@ -43,7 +43,8 @@ the configured dispatcher:
 import os
 import socket
 
-from cayu import CayuApp, TaskStoreDispatcher
+from cayu import CayuApp
+from cayu.tasks import TaskStoreDispatcher
 
 
 def worker_id(role: str) -> str:
@@ -66,7 +67,8 @@ A fresh-task worker calls the complementary public loop. Its handler owns the
 domain-specific `RunRequest` and terminal task behavior:
 
 ```python
-from cayu import CayuApp, Task, TaskQuery, complete_managed_task, run_task_worker
+from cayu import CayuApp
+from cayu.tasks import Task, TaskQuery, complete_managed_task, run_task_worker
 
 
 async def handle_task(app: CayuApp, task: Task, claimed_by: str) -> None:

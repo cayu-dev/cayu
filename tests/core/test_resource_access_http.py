@@ -6,8 +6,9 @@ import httpx
 from fastapi import FastAPI
 from tests.core.test_resource_execution_access import Policy
 
-from cayu import CayuApp, RunRequest, SessionIdentity
+from cayu import CayuApp, RunRequest
 from cayu.server.resource_access import create_resource_router
+from cayu.sessions import SessionIdentity
 
 
 def test_http_authentication_is_host_owned_and_foreign_ids_are_hidden():

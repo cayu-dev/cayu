@@ -6,18 +6,11 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ForkSessionRequest,
-    Message,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
 from cayu.providers import OpenAIProvider
 from cayu.runtime._cache_affinity import cache_affinity_key_for_lineage_root
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import ForkSessionRequest
 from cayu.sessions.memory import InMemorySessionStore
 
 _MODEL = "gpt-affinity"

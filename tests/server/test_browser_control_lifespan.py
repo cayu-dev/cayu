@@ -13,11 +13,12 @@ from tests.server.test_browser_control_server import transport
 from websockets.asyncio.client import connect
 from websockets.typing import Origin, Subprotocol
 
-from cayu import BrowserControlConfig, CayuApp
+from cayu import CayuApp
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.server import ServerConfig, create_server
 from cayu.server.auth import BasicAuth
 from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
+from cayu.tools import BrowserControlConfig
 
 control_tls = _control_tls
 

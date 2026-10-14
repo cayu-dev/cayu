@@ -21,9 +21,9 @@ import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-from cayu import (
-    CayuApp,
-    SQLiteTaskStore,
+from cayu import CayuApp
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import (
     Task,
     TaskCreate,
     TaskOrder,

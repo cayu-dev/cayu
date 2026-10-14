@@ -7,28 +7,24 @@ from typing import Any, cast
 
 import pytest
 
-from cayu import (
-    ApprovedEgressDestination,
-    Event,
-    HttpEgressPolicy,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeStatus,
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-)
+from cayu import Event
 from cayu.egress import (
+    ApprovedEgressDestination,
     CapturedRequest,
     CapturedResponse,
     EgressBinding,
     EgressUpstreamLimits,
     EgressUpstreamOperation,
+    HttpEgressPolicy,
     SandboxEgressAdapter,
     TransparentEgressBroker,
     VirtualCredentialRegistry,
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
 )
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners import ExecCommand, ExecResult, Runner
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeStatus
 from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 
 

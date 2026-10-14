@@ -154,7 +154,8 @@ def test_pre_dispatch_settlement_retains_cancellation_count_and_typed_failure(re
 @pytest.mark.parametrize("deadline_scope", ["step", "overall"])
 @pytest.mark.parametrize("cancel_caller", [False, True])
 def test_stuck_pre_dispatch_store_is_bounded_and_remains_supervised(deadline_scope, cancel_caller):
-    from cayu import CayuApp, CayuConfig, OperationsConfig
+    from cayu import CayuApp, CayuConfig
+    from cayu.configuration import OperationsConfig
 
     async def run():
         policy = RecoveryCleanupPolicy(

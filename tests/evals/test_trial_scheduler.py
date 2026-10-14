@@ -4,7 +4,8 @@ import asyncio
 
 import pytest
 
-from cayu import EvalCase, EvalSuite, RunRequest
+from cayu import RunRequest
+from cayu.evals import EvalCase, EvalSuite
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.runner import _schedule_suite_trials
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
@@ -81,7 +82,7 @@ def test_scheduler_parent_cancellation_settles_trial_and_capacity(grouped):
 def test_scheduler_retains_capacity_until_checkpoint_publication_settles(grouped):
     from datetime import UTC, datetime
 
-    from cayu import EvalStatus
+    from cayu.evals import EvalStatus
     from cayu.evals.models import EvalTrialResult
     from cayu.evals.result_contract import (
         EvalTrialDiagnosticCode,

@@ -669,15 +669,11 @@ _TEST_PY = """from __future__ import annotations
 
 import asyncio
 
-from cayu import (
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    run_to_completion,
-)
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu import Message, RunRequest, run_to_completion
+from cayu.providers import ModelStreamEvent
+from cayu.evals import ScriptedModelProvider
 
 from app import build_app
 
@@ -710,19 +706,18 @@ def test_agent_runs_through_the_runtime() -> None:
     assert len(provider.requests) == 1
 """
 
-_EVAL_PY = """from cayu import (
+_EVAL_PY = """from cayu.evals import (
     EvalCase,
     EvalPlan,
     EvalSuite,
     FinalOutputContains,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
     ScriptedModelProvider,
     SessionCompleted,
 )
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu import Message, RunRequest
+from cayu.providers import ModelStreamEvent
 
 from app import build_app
 
@@ -958,7 +953,7 @@ support boundary.
 
 _RUN_PY = """from __future__ import annotations
 
-from cayu import run_project_entrypoint
+from cayu.entrypoint import run_project_entrypoint
 
 from app import build_app, validate_run_configuration
 
@@ -1083,7 +1078,9 @@ import re
 
 from fastapi import HTTPException, Request
 
-from cayu import ModelProvider, SessionStore, TaskStore
+from cayu.providers import ModelProvider
+from cayu.sessions import SessionStore
+from cayu.tasks import TaskStore
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,
@@ -1278,39 +1275,40 @@ import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
-from cayu import (
+from cayu.sessions import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    AgentSpec,
-    CayuApp,
-    Event,
-    EventType,
     InMemorySessionStore,
-    InMemoryTaskStore,
     InteractionStatus,
     InteractionSummaryEvidence,
     InvocationOrigin,
     InvocationOriginTrust,
-    LoopPolicy,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SecretRedactor,
     SessionIdentity,
     SessionInvocationBinding,
+    TaskExecutionSource,
+)
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    Event,
+    EventType,
+    Message,
+    RunRequest,
     SessionStatus,
+)
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskInvocationSnapshot, TaskStatus
+from cayu.runtime import LoopPolicy
+from cayu.providers import ModelStreamEvent
+from cayu.evals import ScriptedModelProvider
+from cayu.vaults import SecretRedactor
+from cayu.storage import (
     SQLiteProductOperationStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
-    TaskCreate,
-    TaskExecutionSource,
-    TaskInvocationSnapshot,
-    TaskStatus,
-    ToolCapabilityCeiling,
-    current_runtime_build_provenance,
 )
-from cayu.runtime import ActiveInvocationExecutionProfile, AdmitInvocationCommand
+from cayu.tools import ToolCapabilityCeiling
+from cayu.build_provenance import current_runtime_build_provenance
+from cayu.sessions import ActiveInvocationExecutionProfile, AdmitInvocationCommand
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime._invocation_lifecycle import invocation_checkpoint_state_sha256
@@ -2931,8 +2929,9 @@ def _rendered_project_files(
             files[relative] = (
                 files[relative]
                 .replace(
-                    "    InMemorySessionStore,\n",
-                    "    InMemoryKnowledgeStore,\n    InMemorySessionStore,\n",
+                    "from cayu.sessions import InMemorySessionStore\n",
+                    "from cayu.sessions import InMemorySessionStore\n"
+                    "from cayu.storage import InMemoryKnowledgeStore\n",
                 )
                 .replace(
                     "        task_store=InMemoryTaskStore(),\n",

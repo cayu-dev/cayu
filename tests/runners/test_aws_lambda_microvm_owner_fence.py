@@ -19,11 +19,12 @@ from tests.runners.lambda_microvm_harness import (
 )
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
-from cayu import ExecCommand, LambdaMicroVMRunner
 from cayu.runners import (
+    ExecCommand,
     LambdaMicroVMLifecycleInProgress,
     LambdaMicroVMOwnershipSuperseded,
     LambdaMicroVMOwnershipUnverified,
+    LambdaMicroVMRunner,
 )
 
 _CLAIM_A = "a" * 64

@@ -9,18 +9,12 @@ from tests.core.test_external_wait_request_policies import RequestStopPolicy
 from tests.core.test_tool_completion import FinalTool, call
 from tests.external_wait_support import CONTEXT, Policy
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    StructuredOutputSpec,
-    ToolCompletionPolicy,
-)
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest
+from cayu.context import StructuredOutputSpec
 from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 from cayu.external_waits import ExternalEventWaits
 from cayu.providers.base import ModelStreamEvent
+from cayu.runtime import ToolCompletionPolicy
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.session_external_waits import SessionExternalWaitAdapter

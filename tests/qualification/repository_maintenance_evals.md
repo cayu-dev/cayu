@@ -97,7 +97,7 @@ reports, captures and prompts in the authorized private evidence location. The
 corpus helper neither redacts nor authenticates caller-supplied input.
 
 ```python
-from cayu import run_eval_plan, compare_eval_results
+from cayu.evals import run_eval_plan, compare_eval_results
 from evals.maintenance import maintenance_coding_corpus, maintenance_eval_plan
 
 # reviewed_source and reviewed_task come from the separately reviewed capture.

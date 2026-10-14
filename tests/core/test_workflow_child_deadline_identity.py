@@ -6,24 +6,14 @@ import contextlib
 import pytest
 from tests.core.test_workflow_failure_evidence import Verifiers
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ExecutionDeadline,
-    InMemorySessionStore,
-    ModelStreamEvent,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    StepError,
-    Tool,
-    ToolResult,
-    ToolSpec,
-    execution_deadline_scope,
-    parallel,
-    step,
-)
+from cayu import AgentSpec, CayuApp, EventType, Tool, ToolResult, ToolSpec
+from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
+from cayu.evals import ScriptedModelProvider
 from cayu.failure_evidence import exception_evidence
+from cayu.providers import ModelStreamEvent
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
+from cayu.workflows import StepError, parallel, step
 
 
 @pytest.mark.anyio
@@ -254,8 +244,8 @@ async def test_deadline_at_create_acknowledgement(tmp_path, monkeypatch, sqlite,
 
 
 def test_failure_group_does_not_borrow_another_child_identity():
-    from cayu import FailureEvidence
     from cayu.failure_evidence import retain_child_failure_identity
+    from cayu.workflows import FailureEvidence
 
     first, second = asyncio.CancelledError(), asyncio.CancelledError()
     retain_child_failure_identity(

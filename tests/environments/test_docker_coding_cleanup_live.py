@@ -10,28 +10,22 @@ import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 from tests.environments.test_docker_coding_live import _configuration_or_skip
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
     DockerCodingWorkspaceBinding,
-    DockerImageIdentity,
-    DockerRunner,
     EnvironmentFactory,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentSpec,
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
     ImmutableInputStore,
-    LocalWorkspace,
-    Message,
-    ModelProvider,
-    ModelStreamEvent,
-    RunRequest,
-    SQLiteSessionStore,
     inspect_local_immutable_input,
 )
+from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.runners import DockerImageIdentity, DockerRunner, ExecCommand
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.storage import SQLiteSessionStore
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.process
 
@@ -463,7 +457,7 @@ def test_real_docker_process_loss_recovers_exact_disposal(
     import os
     import sys
 
-    from cayu import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
+    from cayu.sessions import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 
     docker_path, image, image_id = _configuration_or_skip()
     (tmp_path / "source").mkdir()

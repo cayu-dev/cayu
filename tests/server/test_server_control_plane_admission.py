@@ -11,7 +11,7 @@ pytest.importorskip("sse_starlette")
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from cayu import CayuApp, PostgresSessionStore, SQLiteSessionStore
+from cayu import CayuApp
 from cayu.server import ServerConfig, create_server
 from cayu.server.routes import (
     InterruptSessionBody,
@@ -26,6 +26,7 @@ from cayu.server.routes import (
 )
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.store import SessionStore
+from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 
 CONTROL_PLANE_PROMPT_MAX_BYTES = 960 * 1024

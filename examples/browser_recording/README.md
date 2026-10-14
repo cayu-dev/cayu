@@ -32,7 +32,9 @@ partial coverage, backend requirements, recovery, limits and retention duties.
 The core consent setup is deliberately separate from model arguments:
 
 ```python
-from cayu import BrowserRecordingPolicy, BrowserRecordingStore, BrowserSessionTool
+from cayu.browser_recording import BrowserRecordingPolicy
+from cayu.storage import BrowserRecordingStore
+from cayu.tools import BrowserSessionTool
 
 store = BrowserRecordingStore("/private/application/recordings.sqlite")
 recording = await store.authorize_capture(

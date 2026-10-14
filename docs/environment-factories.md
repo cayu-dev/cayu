@@ -56,7 +56,7 @@ Set `EnvironmentSpec.lifecycle_policy` when operators need a content-free view o
 factory, binding, and finalization work:
 
 ```python
-from cayu import EnvironmentLifecyclePhase, EnvironmentLifecyclePolicy, EnvironmentSpec
+from cayu.environments import EnvironmentLifecyclePhase, EnvironmentLifecyclePolicy, EnvironmentSpec
 
 spec = EnvironmentSpec(
     name="hosted",
@@ -117,14 +117,13 @@ mutation is quiescent.
 `create(request)`. Prefer a factory whenever sessions need isolation — their own sandbox, their
 own per-session directory or git checkout, or a restored snapshot.
 
-A factory subclasses `cayu.EnvironmentFactory` and implements one async method, `create`,
+A factory subclasses `cayu.environments.EnvironmentFactory` and implements one async method, `create`,
 returning an `EnvironmentFactoryResult` that wraps a concrete `Environment`:
 
 ```python
-from cayu import (
-    Environment, EnvironmentFactory, EnvironmentFactoryRequest,
-    EnvironmentFactoryResult, EnvironmentSpec, LocalRunner, LocalWorkspace, NativeBinding,
-)
+from cayu.environments import Environment, EnvironmentFactory, EnvironmentFactoryRequest, EnvironmentFactoryResult, EnvironmentSpec, NativeBinding
+from cayu.runners import LocalRunner
+from cayu.workspaces import LocalWorkspace
 
 
 class LocalNativeFactory(EnvironmentFactory):
@@ -310,7 +309,7 @@ start then binds nothing, and a run whose tools never touch the runner never
 creates it. Build the result from one `DeferredMaterialization`:
 
 ```python
-from cayu import DeferredMaterialization, Environment, EnvironmentFactoryResult
+from cayu.environments import DeferredMaterialization, Environment, EnvironmentFactoryResult
 
 
 async def create(self, request):
@@ -481,7 +480,7 @@ callable, falling back to your cold start when it returns `None`.
   or crashes leaves its idle spares running until another pool on the same host
   reaps them, which happens on that pool's next refill.
 - A backend's `claim_spare` raises `WarmSpareRequirementsUnsatisfied` (exported
-  from `cayu` and `cayu.environments`) when a spare cannot serve the consumer's
+  from `cayu.environments`) when a spare cannot serve the consumer's
   requirements at all, as opposed to a transient failure.
 
 ## Execution admission for custom integrations
@@ -490,7 +489,8 @@ Applications attach provider-neutral workload requirements to the agent, not
 to a factory or `RunRequest`:
 
 ```python
-from cayu import AgentSpec, ExecutionRequirements
+from cayu import AgentSpec
+from cayu.environments import ExecutionRequirements
 
 app.register_agent(
     AgentSpec(name="coding-agent", model="provider/model"),
@@ -509,7 +509,8 @@ describes the candidate before allocation; the runner hook describes the exact
 live candidate that will execute commands:
 
 ```python
-from cayu import EnvironmentFactory, ExecutionAdmissionCandidate, Runner
+from cayu.environments import EnvironmentFactory, ExecutionAdmissionCandidate
+from cayu.runners import Runner
 
 
 class HostedFactory(EnvironmentFactory):
@@ -673,7 +674,7 @@ refusals, and trusted versus untrusted presets.
 
 ## Workspace bindings
 
-A binding subclasses `cayu.WorkspaceBinding` and implements `bind` + `finalize`. `bind`
+A binding subclasses `cayu.environments.WorkspaceBinding` and implements `bind` + `finalize`. `bind`
 returns a `BoundWorkspace` (the workspace + runner the tools will use, plus optional
 `metadata`/`snapshot`); `finalize` optionally returns a `WorkspaceSnapshot`:
 
@@ -717,7 +718,7 @@ working-set capacity. Pass the same `SyncBindingStagingCapacity` instance to a g
 define another capacity domain:
 
 ```python
-from cayu import SyncBinding, SyncBindingStagingCapacity
+from cayu.environments import SyncBinding, SyncBindingStagingCapacity
 
 staging = SyncBindingStagingCapacity(
     max_concurrency=8,
@@ -761,14 +762,9 @@ same host object to each container as a read-only bind mount. The mutable
 ```python
 from hashlib import sha256
 
-from cayu import (
-    DockerCodingEnvironmentFactory,
-    DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    ImmutableInputStore,
-    LocalWorkspace,
-    inspect_local_immutable_input,
-)
+from cayu.environments import DockerCodingEnvironmentFactory, DockerCodingToolchainProfile, ImmutableInputStore, inspect_local_immutable_input
+from cayu.runners import DockerImageIdentity
+from cayu.workspaces import LocalWorkspace
 
 
 def identity(label: str) -> str:
@@ -873,12 +869,11 @@ Two patterns the issue that motivated this guide called out are **not** separate
 
 `Environment`, `EnvironmentSpec`, `EnvironmentFactory`, `WorkspaceBinding`, `BoundWorkspace`,
 `WorkspaceSnapshot`, and the concrete bindings (`NativeBinding`, `NoWorkspaceBinding`,
-`SyncBinding`, `GitRepositoryBinding`, `DeterministicWorkspaceBinding`) plus `SyncTargetWorkspacePlan` are re-exported from the
-top-level `cayu`. The base
-`Workspace` and `Runner` types are **not** — import those from their modules:
+`SyncBinding`, `GitRepositoryBinding`, `DeterministicWorkspaceBinding`) plus `SyncTargetWorkspacePlan` are available from
+`cayu.environments`. Import `Workspace` and `Runner` from their owning packages:
 
 ```python
-from cayu import WorkspaceBinding, BoundWorkspace, WorkspaceSnapshot
+from cayu.environments import WorkspaceBinding, BoundWorkspace, WorkspaceSnapshot
 from cayu.workspaces import Workspace
 from cayu.runners import Runner
 ```

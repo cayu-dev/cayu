@@ -17,31 +17,33 @@ import pytest
 from cayu import (
     AgentSpec,
     CayuApp,
-    DockerCodingEnvironmentFactory,
-    DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    EnvironmentSpec,
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    LocalWorkspace,
     Message,
-    ModelStreamEvent,
     ResumeRequest,
     RunRequest,
-    ScriptedModelProvider,
     SessionStatus,
-    SQLiteSessionStore,
-    StaticToolExposurePolicy,
-    StaticToolPolicy,
     Tool,
     ToolEffect,
     ToolResult,
     ToolSpec,
     run_to_completion,
 )
+from cayu.environments import (
+    DockerCodingEnvironmentFactory,
+    DockerCodingToolchainProfile,
+    EnvironmentSpec,
+)
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity, ExecCommand
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+)
+from cayu.storage import SQLiteSessionStore
+from cayu.tools import StaticToolExposurePolicy, StaticToolPolicy
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.process
 
@@ -248,7 +250,8 @@ _CRASH_DURING_MATERIALIZATION = """
 import asyncio, os, sys
 sys.path[:0] = [{tests!r}, {src!r}]
 from pathlib import Path
-from cayu import Message, RunRequest, SQLiteSessionStore, run_to_completion
+from cayu import Message, RunRequest, run_to_completion
+from cayu.storage import SQLiteSessionStore
 from cayu.environments.docker_coding import DockerCodingWorkspaceBinding
 from tests.environments.test_docker_deferred_live import _app, _factory
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from cayu import ExecCommand, ExecResult, Runner
+from cayu.runners import ExecCommand, ExecResult, Runner
 
 PIPE_PRESSURE_BYTES = 128 * 1024
 CAPTURE_LIMIT_BYTES = 1024

@@ -36,7 +36,7 @@ PUBLIC_EXPORT_NAMES = {
 }
 
 
-@pytest.mark.parametrize("package_name", ["cayu", "cayu.collaboration"])
+@pytest.mark.parametrize("package_name", ["cayu.collaboration"])
 def test_session_export_manifests_stubs_and_runtime_agree(package_name) -> None:
     package = importlib.import_module(package_name)
     manifest = importlib.import_module(package_name + "._exports")
@@ -83,7 +83,7 @@ def test_all_user_facing_export_contract_classes_are_manifested() -> None:
     assert classes | {"SessionExportAction"} == PUBLIC_EXPORT_NAMES
 
 
-@pytest.mark.parametrize("package_name", ["cayu", "cayu.collaboration"])
+@pytest.mark.parametrize("package_name", ["cayu.collaboration"])
 @pytest.mark.parametrize("family", ["mandates", "releases"])
 def test_registered_authority_and_release_contracts_are_public(package_name, family):
     module = importlib.import_module("cayu.collaboration." + family)
@@ -115,7 +115,7 @@ def test_session_export_example_imports_only_public_contracts() -> None:
     for node in ast.walk(example):
         if not isinstance(node, ast.ImportFrom) or not (node.module or "").startswith("cayu"):
             continue
-        assert node.module in {"cayu", "cayu.collaboration"}
+        assert node.module in {"cayu", "cayu.collaboration", "cayu.sessions"}
         package = importlib.import_module(node.module)
         for alias in node.names:
             assert alias.name in package.__all__

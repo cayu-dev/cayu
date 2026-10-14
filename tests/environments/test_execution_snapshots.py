@@ -821,14 +821,9 @@ def test_recovery_claim_ack_loss_preserves_submission(
 @pytest.mark.parametrize("phase", ["capture", "restore", "delete"])
 @pytest.mark.parametrize("failed", [False, True])
 def test_snapshot_recovery_after_blocked_resume(tmp_path, backend, monkeypatch, phase, failed):
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        Message,
-        ModelStreamEvent,
-        ResumeRequest,
-        ScriptedModelProvider,
-    )
+    from cayu import AgentSpec, CayuApp, Message, ResumeRequest
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
 
     async def run():
         async with setup(tmp_path, backend) as (store, _, artifacts, controller):
@@ -981,15 +976,10 @@ def test_snapshot_recovery_after_blocked_resume(tmp_path, backend, monkeypatch, 
 
 @pytest.mark.parametrize("boundary", ["after_preflight", "before_admission"])
 def test_snapshot_resume_rejects_racing_reservation(tmp_path, backend, monkeypatch, boundary):
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        Message,
-        ModelStreamEvent,
-        ResumeRequest,
-        ScriptedModelProvider,
-    )
+    from cayu import AgentSpec, CayuApp, Message, ResumeRequest
     from cayu.environments import snapshot_lifecycle
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
     from cayu.sessions.authority import SessionRunFenced
 
     async def run():

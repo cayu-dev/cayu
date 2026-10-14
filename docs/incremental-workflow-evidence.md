@@ -20,13 +20,7 @@ Create one admission controller for the worker and share it across every capture
 
 ```python
 from pathlib import Path
-from cayu import (
-    IncrementalEvidenceAdmission,
-    IncrementalEvidenceLimits,
-    WorkflowEvalResult,
-    capture_incremental_workflow_eval_attempt,
-    score_incremental_workflow_eval_capture,
-)
+from cayu.evals import IncrementalEvidenceAdmission, IncrementalEvidenceLimits, WorkflowEvalResult, capture_incremental_workflow_eval_attempt, score_incremental_workflow_eval_capture
 from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
 
 admission = IncrementalEvidenceAdmission(

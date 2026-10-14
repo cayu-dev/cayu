@@ -20,7 +20,7 @@ from fastapi.responses import Response
 from tests.core.test_browser_control_transport import control_tls as _control_tls
 from tests.server._browser_control_tls_server import browser_control_tls_server
 
-from cayu import default_price_book
+from cayu.budgets import default_price_book
 from cayu.server.static import DashboardStaticFiles, dashboard_content_security_policy
 
 control_tls = _control_tls

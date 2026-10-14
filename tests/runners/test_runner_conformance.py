@@ -25,7 +25,7 @@ from tests.runners.lambda_microvm_harness import (
     guest_lifecycle_hook,
 )
 
-import cayu
+import cayu.runners
 import cayu.runners as runners_module
 from cayu.runners._cleanup import RunnerCleanupPolicy
 from cayu.runners._subprocess import SubprocessCommand, run_subprocess
@@ -980,7 +980,7 @@ def test_runner_conformance_registry_covers_every_exported_builtin_runner() -> N
 
 
 def test_runner_contract_declares_shared_or_separate_system_execution() -> None:
-    assert cayu.RunnerSystemExecutionMode is RunnerSystemExecutionMode
+    assert cayu.runners.RunnerSystemExecutionMode is RunnerSystemExecutionMode
     assert Runner.system_execution_mode == "shared"
     assert LocalRunner.system_execution_mode == "shared"
     assert LambdaMicroVMRunner.system_execution_mode == "separate"

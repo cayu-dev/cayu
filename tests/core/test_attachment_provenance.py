@@ -10,10 +10,11 @@ from pypdf import PdfWriter
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 from tests.core.test_builtin_tools import FakeProvider
 
-from cayu import ArtifactScope, Environment, EnvironmentSpec, LocalArtifactStore, file_attachment
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.artifacts import ArtifactScope, LocalArtifactStore, file_attachment
 from cayu.context.base import DefaultContextPolicy
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.messages import FilePart, Message
 from cayu.providers import ModelStreamEvent

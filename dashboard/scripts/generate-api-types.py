@@ -105,8 +105,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _openapi_json() -> str:
-    from cayu import AgentSpec, CayuApp, CorpusTarget, RunRequest, SQLiteEvalStore
+    from cayu import AgentSpec, CayuApp, RunRequest
+    from cayu.evals import CorpusTarget
     from cayu.server import EvalsConfig, EvaluationPromotionConfig, ServerConfig, create_server
+    from cayu.storage import SQLiteEvalStore
 
     app = CayuApp()
     app.register_agent(AgentSpec(name="assistant", model="schema-only"))

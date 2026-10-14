@@ -9,12 +9,8 @@ from pathlib import Path
 from examples._advanced_support import ScenarioResult, completed_batch, structured_batch
 from examples.cache_aware_research_council.scenario import run_scenario
 
-from cayu import (
-    ModelPrice,
-    PriceBook,
-    Provenance,
-    ScriptedModelProvider,
-)
+from cayu.budgets import ModelPrice, PriceBook, Provenance
+from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelRequest, ModelStreamEvent
 
 # Deterministic stand-in for a provider tokenizer: about four characters per token.

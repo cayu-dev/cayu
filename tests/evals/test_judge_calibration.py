@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 from tests.evals.test_structured_model_judge import _judge, _judgment, _rubric, _target
 
-from cayu import ModelJudgeTarget
+from cayu.evals import ModelJudgeTarget
 from cayu.evals.calibration import (
     EvalJudgeCalibrationCriterionLabelV1,
     EvalJudgeCalibrationDraftV1,

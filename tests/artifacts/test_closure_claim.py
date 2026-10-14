@@ -8,13 +8,12 @@ from cayu.artifacts import (
 
 
 def test_artifact_closure_contract_is_public():
-    import cayu
     import cayu.artifacts as artifacts
 
     for name in ("ArtifactClosureClaim", "ArtifactClosureItem", "copy_artifact_closure_claim"):
-        assert name in cayu.__all__
         assert name in artifacts.__all__
-        assert getattr(cayu, name) is getattr(artifacts, name)
+        assert name in dir(artifacts)
+        assert getattr(artifacts, name) is not None
 
 
 def test_artifact_closure_claim_detaches_exact_items():

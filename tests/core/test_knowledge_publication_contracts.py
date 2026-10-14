@@ -49,9 +49,7 @@ _EXPORTS = (
 )
 
 
-@pytest.mark.parametrize(
-    "module_name", ("cayu", "cayu.storage", "cayu.knowledge.publication_contracts")
-)
+@pytest.mark.parametrize("module_name", ("cayu.storage", "cayu.knowledge.publication_contracts"))
 def test_publication_contracts_compose_without_storage_implementations(module_name):
     result = subprocess.run(
         [
@@ -161,7 +159,7 @@ def test_publication_contracts_preserve_aliases_stubs_and_annotations():
                         method = method.fget
                     if inspect.isfunction(method):
                         get_type_hints(method)
-    for package in (cayu, storage):
+    for package in (storage,):
         manifest = importlib.import_module(package.__name__ + "._exports").EXPORTS
         stub = ast.parse(Path(package.__file__).with_suffix(".pyi").read_text())
         imports = {

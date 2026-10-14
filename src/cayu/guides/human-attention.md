@@ -17,7 +17,8 @@ lifecycle remains `cayu guide durable-operations`.
 ## Supported entry points
 
 ```python
-from cayu import HumanAttentionRequest, PendingActionQuery
+from cayu.runtime import HumanAttentionRequest
+from cayu.sessions import PendingActionQuery
 
 page = await app.session_store.query_pending_actions(
     PendingActionQuery(limit=100)

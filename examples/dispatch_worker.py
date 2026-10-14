@@ -18,18 +18,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    DispatchRequest,
-    ExecutionProfileBehaviorIdentity,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    RunRequest,
-    TaskStoreDispatcher,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import DispatchRequest, InMemoryTaskStore, TaskStoreDispatcher
 
 
 class FakeProvider(ModelProvider):

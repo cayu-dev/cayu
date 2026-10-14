@@ -8,34 +8,29 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp, Message, RunRequest
+from cayu.context import RequestFootprintConfig
+from cayu.memory import (
     ContextExposure,
     ContextExposureEvidenceKind,
     ContextExposurePage,
     ContextExposureState,
     ContextExposureTransition,
     ContextExposureTransitionRequest,
-    InMemorySessionStore,
     MemoryAttribution,
     MemoryAttributionBounds,
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
-    Message,
     RecallItemExposure,
     RecallReceipt,
     RecallReceiptItem,
     RecallReceiptPage,
     RecallSourceCoverage,
-    RequestFootprintConfig,
-    RunRequest,
-    RuntimeEvidenceReport,
-    RuntimeEvidenceRequest,
-    SessionIdentity,
-    SQLiteSessionStore,
-    runtime_evidence,
 )
 from cayu.memory.evidence import validate_new_context_exposure
+from cayu.runtime import RuntimeEvidenceReport, RuntimeEvidenceRequest, runtime_evidence
+from cayu.sessions import InMemorySessionStore, SessionIdentity
+from cayu.storage import SQLiteSessionStore
 
 
 def _digest(label: str) -> str:

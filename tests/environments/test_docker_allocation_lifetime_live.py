@@ -13,31 +13,28 @@ from tests.environments.test_docker_coding_live import _configuration_or_skip
 from cayu import (
     AgentSpec,
     CayuApp,
-    DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
-    EnvironmentSpec,
     EventType,
-    ExecutionProfileBehaviorIdentity,
-    ImmutableInputStore,
-    LocalWorkspace,
     Message,
-    ModelStreamEvent,
     ResumeRequest,
     RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    TaskCreate,
-    TaskHandlerOutcome,
-    TaskQuery,
-    TaskStatus,
     Tool,
     ToolEffect,
     ToolResult,
     ToolSpec,
-    inspect_local_immutable_input,
-    run_task_worker,
 )
+from cayu.environments import (
+    DockerCodingEnvironmentFactory,
+    EnvironmentSpec,
+    ImmutableInputStore,
+    inspect_local_immutable_input,
+)
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks import TaskCreate, TaskHandlerOutcome, TaskQuery, TaskStatus, run_task_worker
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.process
 
@@ -278,7 +275,7 @@ async def _allocation_process(root: Path, action: str, metadata: dict):
         immutable_input_runtime_compatibility_fingerprint=identity.fingerprint,
         docker_path=docker_path,
     )
-    from cayu import EnvironmentFactoryOperation, EnvironmentFactoryRequest
+    from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
 
     request = EnvironmentFactoryRequest(
         session_id="process-session",

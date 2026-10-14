@@ -4,8 +4,9 @@ import asyncio
 
 import pytest
 
-from cayu import Message, ModelStreamEvent, ScriptedModelProvider
-from cayu.providers import ModelRequest, ModelStreamDeadlineError
+from cayu import Message
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelRequest, ModelStreamDeadlineError, ModelStreamEvent
 from cayu.providers import _credential_boundary as boundary
 from cayu.providers import deadlines as ds
 from cayu.providers._stream_cleanup import _LocalHttpCleanupObserver

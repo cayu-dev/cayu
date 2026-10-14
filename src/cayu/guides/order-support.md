@@ -166,7 +166,7 @@ application then has neither a question nor a proposal to return.
 Pass `RequireFinalTool` on every `RunRequest` and `ResumeRequest` for that agent:
 
 ```python
-from cayu import RequireFinalTool, ToolCompletionPolicy
+from cayu.runtime import RequireFinalTool, ToolCompletionPolicy
 
 names = ("ask_customer", "propose_resolution")
 final_tool = RequireFinalTool(names)

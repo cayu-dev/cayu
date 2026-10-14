@@ -9,8 +9,10 @@ from unittest.mock import patch
 
 import pytest
 
-from cayu import CayuApp, InMemoryTaskStore, SQLiteTaskStore, TaskCreate, TaskQuery, TaskStatus
+from cayu import CayuApp
 from cayu.cli import main
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
 
 
 def test_host_guidance_is_discoverable_and_preserves_application_ownership(capsys):
@@ -106,7 +108,7 @@ def test_coding_host_fragment_uses_managed_completion_and_durable_readback(
                 completed = await store.load_task(claimed.id)
                 assert completed is not None and completed.status is TaskStatus.COMPLETED
 
-        from cayu import run_task_worker
+        from cayu.tasks import run_task_worker
 
         try:
             created = await app.create_task(TaskCreate(task_id="guide-task", type="guide-coding"))

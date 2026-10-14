@@ -7,9 +7,7 @@ groups do not introduce another scheduler, queue, or session orchestration layer
 ## Submit a group
 
 ```python
-from cayu import (
-    TaskCreate, TaskGraphCreate, TaskGraphNode, TaskGroupCreate, TaskGroupPolicy,
-)
+from cayu.tasks import TaskCreate, TaskGraphCreate, TaskGraphNode, TaskGroupCreate, TaskGroupPolicy
 
 request = TaskGroupCreate(
     group_id="report-review",
@@ -115,7 +113,7 @@ the group does not cancel losers or release a finalizer.
 ## Opt in to quiescence and a finalizer
 
 ```python
-from cayu import TaskGroupQuiescencePolicy
+from cayu.tasks import TaskGroupQuiescencePolicy
 
 request = TaskGroupCreate(
     group_id="first-review",
@@ -320,7 +318,7 @@ the finalizer. After all losing work has positively settled, inspect the current
 snapshot and explicitly resolve that exact barrier:
 
 ```python
-from cayu import TaskGroupQuiescenceResolution
+from cayu.tasks import TaskGroupQuiescenceResolution
 
 snapshot = await app.reconcile_task_group("first-review")
 resolved = await app.resolve_task_group_quiescence(TaskGroupQuiescenceResolution(

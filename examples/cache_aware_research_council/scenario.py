@@ -22,28 +22,21 @@ from examples._advanced_support import (
     validated_output,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.budgets import (
     ComparableGenerationSettings,
     ComparableOutputBudget,
     CostQualityAttemptOperation,
-    EventType,
-    ExecutionProfileAdoptionIntent,
-    Message,
     PairedQualityEvidence,
     PriceBook,
-    PromptCacheCompactor,
     QualityEvidenceReference,
     QualityEvidenceStatus,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    SessionStore,
 )
+from cayu.context import CheckpointCompactionContextPolicy, PromptCacheCompactor
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.providers import ModelProvider
+from cayu.sessions import SessionStore
 
 _STRUCTURED_OUTPUT_TEXT_MAX_CHARS = 1024
 # The source compacts its two preparation turns at the cache-deadline turn,

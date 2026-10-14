@@ -10,12 +10,12 @@ from configuration.settings import (  # ty: ignore[unresolved-import]
 )
 from workflows.coding_product import CodingProductApplication  # ty: ignore[unresolved-import]
 
-from cayu import configured_database_url
 from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.targets import configured_database_url
 from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tools.subagents import SubagentTool
 from cayu.workspaces.local import LocalWorkspace

@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from cayu import Message, ModelRequest
+from cayu import Message
+from cayu.providers import ModelRequest
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.bedrock import build_bedrock_converse_payload
 from cayu.providers.chat_completions import build_chat_completions_payload

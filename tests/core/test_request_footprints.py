@@ -7,18 +7,10 @@ from typing import Any
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from cayu import (
-    AnthropicProvider,
-    CacheBreakpoint,
-    CachePolicy,
-    FileAttachmentKind,
-    Message,
-    ModelContextPressureProfile,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    OpenAIProvider,
-    OpenAIWebSearch,
+from cayu import Message
+from cayu.artifacts import FileAttachmentKind
+from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION, file_attachment
+from cayu.context import (
     PromptContributionAvailability,
     PromptContributionKind,
     RequestFingerprintAvailability,
@@ -27,13 +19,10 @@ from cayu import (
     RequestVariant,
     StructuredOutputSpec,
     TargetedToolGrantFootprint,
-    ToolDiscoveryProjectionRequest,
     ToolDiscoveryViewFootprint,
-    ToolExposure,
     build_prompt_contribution_manifest,
     build_request_footprint,
 )
-from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION, file_attachment
 from cayu.context.footprints import (
     analyze_request_context_pressure,
     analyze_request_footprint,
@@ -44,6 +33,18 @@ from cayu.context.structured_output import (
     structured_output_tool_spec,
 )
 from cayu.messages import FilePart, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
+from cayu.providers import (
+    AnthropicProvider,
+    CacheBreakpoint,
+    CachePolicy,
+    ModelContextPressureProfile,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    OpenAIProvider,
+    OpenAIWebSearch,
+    ToolDiscoveryProjectionRequest,
+)
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
@@ -53,6 +54,7 @@ from cayu.providers.base import (
     TargetedToolProjectionRequest,
 )
 from cayu.providers.openai import build_openai_payload
+from cayu.tools import ToolExposure
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.discovery import TOOL_DISCOVERY_ONLY_PROFILE_ID, search_tools_spec
 from cayu.tools.gateway import call_tool_spec

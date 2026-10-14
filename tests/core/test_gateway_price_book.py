@@ -9,21 +9,14 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    GatewayProvider,
-    Message,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
 from cayu.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.budgets.base import InMemoryBudgetLedger
 from cayu.budgets.pricing import PriceBook, estimate_model_step_cost
 from cayu.budgets.usage import UsageMetrics
+from cayu.providers import GatewayProvider
 from cayu.providers.gateway import HttpxGatewayTransport
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions import InMemorySessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger

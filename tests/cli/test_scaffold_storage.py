@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from cayu import SQLiteKnowledgeStore, SQLiteSessionStore, SQLiteTaskStore
 from cayu.cli import main
 from cayu.cli.project import project_context
 from cayu.cli.scaffold import project_files
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 from cayu.cli.session import _open_read_only_store
 from cayu.cli.store_targets import resolve_session_store_target
+from cayu.storage import SQLiteKnowledgeStore, SQLiteSessionStore, SQLiteTaskStore
 from cayu.storage.targets import PostgresRequiredError
 
 _POSTGRES_URL = "postgresql://app:secret@127.0.0.1:1/app"
@@ -243,8 +243,8 @@ def test_service_product_store_lives_in_the_local_cayu_database(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from cayu import SQLiteProductOperationStore
     from cayu.server import ServiceMode
+    from cayu.storage import SQLiteProductOperationStore
 
     project = _generate(tmp_path, "service", capsys)
     assert not (project / "product_store.py").exists()

@@ -11,9 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    CayuApp,
-    InMemoryTaskStore,
+from cayu import CayuApp
+from cayu.runtime import (
     LocalExecutionAttemptConflict,
     LocalExecutionAttemptCoordinator,
     LocalExecutionAttemptEffectOutcome,
@@ -29,10 +28,6 @@ from cayu import (
     LocalExecutionAttemptUnsettled,
     LocalExecutionEffectPolicy,
     LocalExecutionProcessIdentity,
-    SQLiteTaskStore,
-    TaskCreate,
-    TaskRetryPolicy,
-    TaskStatus,
     build_local_execution_attempt_authority,
     local_execution_attempt_capability_evidence,
     local_execution_parent_death_containment_platform_candidate,
@@ -43,7 +38,9 @@ from cayu.runtime.local_execution_attempts import (
     local_execution_boot_id,
     local_execution_host_identity,
 )
+from cayu.storage import SQLiteTaskStore
 from cayu.storage.migrations import LATEST_REVISION, SchemaMode
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskRetryPolicy, TaskStatus
 from cayu.vaults import SecretRedactor
 
 

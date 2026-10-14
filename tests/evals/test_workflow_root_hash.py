@@ -11,17 +11,17 @@ from tests.evals.test_workflow_eval_target import (
     _target,
 )
 
-from cayu import (
+from cayu._validation import (
+    DURABLE_DOCUMENT_LIMITS,
+    DurableValueError,
+    canonical_durable_json_bytes,
+)
+from cayu.evals import (
     FinalOutputContains,
     SessionTrajectoryBounds,
     capture_workflow_eval_attempt,
     run_workflow_eval_suite,
     score_workflow_eval_capture,
-)
-from cayu._validation import (
-    DURABLE_DOCUMENT_LIMITS,
-    DurableValueError,
-    canonical_durable_json_bytes,
 )
 from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
 from cayu.evals.incremental_recovery import (

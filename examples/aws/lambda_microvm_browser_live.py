@@ -36,7 +36,7 @@ from pathlib import Path
 
 from examples._live_checks import require
 
-from cayu import AgentSpec, CayuApp, ExecCommand, Message, RunRequest
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
 from cayu.egress.broker import (
@@ -52,8 +52,9 @@ from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.environments.base import EnvironmentSpec
 from cayu.events import EventType
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners import ExecCommand
 from cayu.runners.workloads import PINNED_BROWSER_FETCH_IMAGE
-from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.tools import WebBridge
 from cayu.tools.base import Tool, ToolResult, ToolSpec
 

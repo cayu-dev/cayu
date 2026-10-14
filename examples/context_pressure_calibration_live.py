@@ -34,15 +34,9 @@ from base64 import standard_b64encode
 from collections.abc import AsyncIterator
 from typing import Any
 
-from cayu import (
-    Message,
-    ObservedDeltaContextEstimator,
-    ToolEffect,
-    ToolSpec,
-    estimate_model_request_context_pressure,
-    file_attachment,
-)
-from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION
+from cayu import Message, ToolEffect, ToolSpec
+from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION, file_attachment
+from cayu.context import ObservedDeltaContextEstimator, estimate_model_request_context_pressure
 from cayu.providers import (
     AnthropicProvider,
     ModelProvider,

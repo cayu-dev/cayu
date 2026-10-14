@@ -28,7 +28,7 @@ under that identity rather than creating new key domains. `OwnerRef` and
 Python object addresses. `InitiatorBinding` retains the original issuer,
 principal, participant, mandate and originating invocation/interaction.
 
-These reference types are public. Import them from `cayu` or
+These reference types are public. Import them from
 `cayu.collaboration` to build or inspect the request and mandate fields that use
 them:
 

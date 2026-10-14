@@ -12,12 +12,10 @@ import pytest
 from tests.evals.test_workflow_capture_recovery import _setup
 from tests.evals.test_workflow_eval_target import _register_app, _suite, _target, _TwoChildWorkflow
 
-from cayu import (
+from cayu.evals import (
     ChildSessionCompleted,
     FinalOutputContains,
-    ModelStreamEvent,
     SessionTrajectoryBounds,
-    SQLiteSessionStore,
     capture_workflow_eval_attempt,
     run_workflow_eval_suite,
     score_workflow_eval_capture,
@@ -30,7 +28,9 @@ from cayu.evals.incremental_recovery import (
 from cayu.evals.models import EvalRun
 from cayu.evals.trajectory import SessionTrajectoryError
 from cayu.evals.workflow_target import RetainedWorkflowEvalOutput, WorkflowEvalResult
+from cayu.providers import ModelStreamEvent
 from cayu.runtime.evidence_spool import IncrementalEvidenceAdmission, IncrementalEvidenceLimits
+from cayu.storage import SQLiteSessionStore
 
 
 def _forbidden(*args, **kwargs):

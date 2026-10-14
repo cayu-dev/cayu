@@ -9,17 +9,12 @@ from pathlib import Path
 import pytest
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import (
-    BrowserVisualPolicy,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    LocalArtifactStore,
-    Message,
-)
-from cayu.artifacts import ArtifactScope, file_attachment
+from cayu import CayuApp, Message
+from cayu.artifacts import ArtifactScope, LocalArtifactStore, file_attachment
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.runtime._model_step_executor import _FileAttachmentUnavailable, _resolved_file_attachments
 from cayu.sessions.records import Session
+from cayu.tools import BrowserVisualPolicy
 
 
 @pytest.mark.parametrize(

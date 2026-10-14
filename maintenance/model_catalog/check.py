@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import date
 
-from cayu import default_model_catalog, default_price_book
+from cayu.budgets import default_model_catalog, default_price_book
 from maintenance.model_catalog.policy import (
     CATALOG_MAX_AGE_DAYS,
     validate_catalog,

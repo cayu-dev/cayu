@@ -12,7 +12,8 @@ from tests.core.test_prepared_admission_public import native_stores as native_st
 from tests.core.test_producer_budget_refusal import authorize_execution
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import (
+from cayu.agents import AgentSpec
+from cayu.collaboration import (
     CollaborationHost,
     ContinuationService,
     HostContinuationRule,
@@ -23,7 +24,6 @@ from cayu import (
     HostRegistration,
     HostWaitRule,
 )
-from cayu.agents import AgentSpec
 from cayu.collaboration._contracts import ExactMatch
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.requests import RequestControl

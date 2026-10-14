@@ -30,12 +30,6 @@ from tests.runners.lambda_microvm_harness import (
 
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
 import cayu.runners.aws_lambda_microvm as runner_module
-from cayu import (
-    EnvironmentAllocationState,
-    EnvironmentFactoryOperation,
-    EnvironmentFactoryRequest,
-    InMemorySessionStore,
-)
 from cayu.egress import (
     HttpEgressPolicy,
     VirtualCredentialSpec,
@@ -51,7 +45,13 @@ from cayu.egress.aws_lambda_microvm_adapter import (
     LambdaMicroVMEgressAdapter,
 )
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
+from cayu.environments import (
+    EnvironmentAllocationState,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryRequest,
+)
 from cayu.runtime._environment_allocation import EnvironmentAllocationCoordinator
+from cayu.sessions import InMemorySessionStore
 from cayu.vaults import SecretRedactor, SecretRef, StaticVault
 
 _NOW = 1_800_000_000

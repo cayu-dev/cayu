@@ -6,8 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from cayu import ApprovedEgressDestination
-from cayu.egress import HttpEgressPolicy
+from cayu.egress import ApprovedEgressDestination, HttpEgressPolicy
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.errors import DockerEgressReconnectError
 from cayu.egress.runtime import VirtualEgressEnvironmentFactory

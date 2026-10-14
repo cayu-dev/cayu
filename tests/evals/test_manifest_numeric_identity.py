@@ -11,7 +11,8 @@ from pydantic import ValidationError
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 from tests.evals.test_sqlite_eval_store import _request
 
-from cayu import CayuApp, CayuConfig, RunDefaults, ToolExecutionConfig
+from cayu import CayuApp, CayuConfig
+from cayu.configuration import RunDefaults, ToolExecutionConfig
 from cayu.evals import EvaluationTargetIdentity
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.execution_reporting import (

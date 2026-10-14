@@ -7,25 +7,15 @@ import json
 import os
 import sys
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Message,
-    ModelCompletionManualRecoveryRequest,
-    ModelProvider,
-    ModelStreamEvent,
-    RunRequest,
-    SessionRunFenced,
-    SQLiteSessionStore,
-    Tool,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolResult, ToolSpec
+from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.sessions import ModelCompletionManualRecoveryRequest, SessionRunFenced
+from cayu.storage import SQLiteSessionStore
 
 
 async def main():
     if sys.argv[-1] == "postgres":
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         store = PostgresSessionStore(sys.argv[2], schema_mode=SchemaMode.MIGRATE)

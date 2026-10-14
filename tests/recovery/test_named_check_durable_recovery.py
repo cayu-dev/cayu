@@ -21,41 +21,36 @@ from pathlib import Path
 import pytest
 from tests.runners.test_docker_durable_commands import install_transport, make_runner
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import (
     DockerCodingCommandAuthority,
     DockerCodingEnvironmentFactory,
     DockerCodingToolchainProfile,
-    DockerImageIdentity,
     Environment,
     EnvironmentSpec,
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    NamedCheck,
-    ProcessCommandPolicy,
-    ReadFileTool,
-    RunCheckTool,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    StaticToolPolicy,
-    TaskCreate,
-    TaskQuery,
-    ToolExecutableRequirement,
-    run_task_worker,
 )
-from cayu.runtime import (
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerImageIdentity, ExecCommand
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import (
     RecoveryDecision,
     RecoveryExecutionRequest,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, run_task_worker
+from cayu.tools import (
+    NamedCheck,
+    ProcessCommandPolicy,
+    ReadFileTool,
+    RunCheckTool,
+    StaticToolPolicy,
+)
+from cayu.tools.base import ToolExecutableRequirement
+from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux supervisor and SIGKILL")
 
@@ -189,7 +184,7 @@ def build_app(root: Path, patch):
         ),
     )
     if (root / "postgres-dsn").exists():
-        from cayu import PostgresSessionStore, PostgresTaskStore
+        from cayu.storage import PostgresSessionStore, PostgresTaskStore
         from cayu.storage.migrations import SchemaMode
 
         dsn = (root / "postgres-dsn").read_text().strip()

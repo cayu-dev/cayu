@@ -12,20 +12,11 @@ from tests.core.test_abandoned_model_call_resume import _build, _consume
 from tests.core.test_execution_profiles import RecordingTool
 from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    ModelStreamEvent,
-    PostgresSessionStore,
-    ResumeRequest,
-    RunRequest,
-    SessionStatus,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest, SessionStatus
 from cayu.build_provenance import RUNTIME_BUILD_PROVENANCE_ENV, current_runtime_build_provenance
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
+from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 
 

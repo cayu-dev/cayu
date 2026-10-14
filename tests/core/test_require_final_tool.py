@@ -11,30 +11,24 @@ import pytest
 
 from cayu import (
     AgentSpec,
-    BeforeStopAction,
-    BeforeStopDecision,
     CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    InMemorySessionStore,
-    LoopPolicy,
     Message,
-    ModelStreamEvent,
-    RequireFinalTool,
     ResumeRequest,
     RunRequest,
-    ScriptedModelProvider,
     SessionStatus,
-    SQLiteSessionStore,
     Tool,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
     ToolContext,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyResult,
     ToolResult,
     ToolSpec,
 )
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import BeforeStopAction, BeforeStopDecision, LoopPolicy, RequireFinalTool
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
+from cayu.tools import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
 
 EMPTY = [ModelStreamEvent.completed({"finish_reason": "stop"})]
 
@@ -413,7 +407,9 @@ def test_reminders_survive_a_new_process(tmp_path) -> None:
             "-c",
             """
 import asyncio, json, sys
-from cayu import SQLiteSessionStore, ScriptedModelProvider, RequireFinalTool
+from cayu.storage import SQLiteSessionStore
+from cayu.evals import ScriptedModelProvider
+from cayu.runtime import RequireFinalTool
 from tests.core.test_require_final_tool import _app, _run, _call, _ApprovalPolicy, EMPTY
 async def run():
     store = SQLiteSessionStore(sys.argv[1])

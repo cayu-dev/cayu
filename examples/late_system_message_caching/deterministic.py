@@ -30,7 +30,7 @@ from examples.late_system_message_caching.scenario import (
     summarize,
 )
 
-from cayu import AnthropicProvider, OpenAIProvider
+from cayu.providers import AnthropicProvider, OpenAIProvider
 
 _CHARS_PER_TOKEN = 4
 _OPENAI_MIN_CACHED_TOKENS = 1024

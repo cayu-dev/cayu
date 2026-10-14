@@ -9,13 +9,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    MAX_KNOWLEDGE_RELATION_BYTES,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeActorType,
-    KnowledgeEntry,
-    KnowledgeEntryReadLimitExceeded,
+from cayu._validation import canonical_durable_json_bytes
+from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRouter,
     KnowledgeMaintenanceRouterConfig,
@@ -24,6 +19,14 @@ from cayu import (
     KnowledgeMaintenanceRoutingRequest,
     KnowledgeMaintenanceRoutingTimeout,
     KnowledgeMaintenanceSignalKind,
+)
+from cayu.storage import (
+    MAX_KNOWLEDGE_RELATION_BYTES,
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeActorType,
+    KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeRelation,
     KnowledgeRelationKind,
     KnowledgeRelationResult,
@@ -32,7 +35,6 @@ from cayu import (
     KnowledgeVisibility,
     SQLiteKnowledgeStore,
 )
-from cayu._validation import canonical_durable_json_bytes
 from cayu.storage.memory import knowledge_entry_payload_bytes
 
 _NOW = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
@@ -739,7 +741,7 @@ def test_router_rejects_a_relation_page_bound_to_another_query() -> None:
             return _entry(entry_id)
 
         async def read_relations(self, query, **_: Any):
-            from cayu import KnowledgeRelationQuery, KnowledgeRelationResult
+            from cayu.storage import KnowledgeRelationQuery, KnowledgeRelationResult
 
             mismatched = KnowledgeRelationQuery(
                 reference=query.reference,

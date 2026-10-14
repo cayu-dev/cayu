@@ -23,8 +23,8 @@ from tests.workspaces.remote_branch_live_support import (
     FileWorkspaceBranchAuthorityProvider,
 )
 
-from cayu import (
-    E2BRunner,
+from cayu.runners import E2BRunner
+from cayu.workspaces import (
     RunnerWorkspace,
     WorkspaceBranchAuthority,
     WorkspaceBranchBindingAuthority,

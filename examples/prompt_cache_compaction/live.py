@@ -7,13 +7,9 @@ from typing import TYPE_CHECKING
 
 from examples.prompt_cache_compaction.scenario import run_scenario
 
-from cayu import (
-    AnthropicProvider,
-    CacheBreakpoint,
-    CachePolicy,
-    ThinkingConfig,
-)
 from cayu.budgets.pricing import load_price_book
+from cayu.context import ThinkingConfig
+from cayu.providers import AnthropicProvider, CacheBreakpoint, CachePolicy
 
 if TYPE_CHECKING:
     from examples._advanced_support import ScenarioResult

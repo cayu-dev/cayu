@@ -9,21 +9,10 @@ import pytest
 from tests.core.test_model_failover_recovery import _RecoveryProvider
 from tests.core.test_model_failover_stages import _StageMemoryStore, _StageSQLiteStore
 
-from cayu import (
-    AgentSpec,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    CayuApp,
-    EventType,
-    Message,
-    ModelFailoverPolicy,
-    ModelPrice,
-    ModelTarget,
-    PriceBook,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.budgets import BudgetLimit, BudgetPolicy, BudgetReservation, ModelPrice, PriceBook
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 
 

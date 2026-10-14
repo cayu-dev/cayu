@@ -13,11 +13,13 @@ from tests.core.test_resource_execution_access import Policy
 from tests.core.test_tool_round_publication_failure_matrix import _WATCHDOG_SECONDS, _finish_tasks
 from tests.core.test_tool_round_publication_failure_matrix import store_factory as store_factory
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
 from cayu.events import EventType
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._tool_execution import tool_idempotency_key
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions._access_rules import SessionAccessScope

@@ -13,20 +13,10 @@ import pytest
 import cayu.providers as providers_module
 import cayu.providers.openai as openai_module
 import tests.providers.registrations as registrations_module
-from cayu import (
-    RESOLVED_FILE_ATTACHMENTS_OPTION,
-    AgentSpec,
-    CayuApp,
-    EventType,
-    FileAttachmentKind,
-    FilePart,
-    Message,
-    RunRequest,
-    TextPart,
-    ToolCallPart,
-    file_attachment,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION, FileAttachmentKind, file_attachment
 from cayu.budgets.usage import normalize_usage_metrics
+from cayu.messages import FilePart, TextPart, ToolCallPart
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,

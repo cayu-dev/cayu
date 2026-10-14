@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from cayu import ProducerOutputRegistration
+from cayu.collaboration import ProducerOutputRegistration
 from cayu.runtime._invocation_lifecycle import prepare_rebind_invocation_command
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,

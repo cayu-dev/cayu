@@ -21,8 +21,14 @@ from examples.collaboration.host_demo_transport import OfflineProvider, OfflineR
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 from tests.core.test_producer_budget_refusal import refusal_ledger as refusal_ledger
 
-from cayu import CayuApp, CollaborationHost, ContinuationService, HostContinuationRule, HostWaitRule
-from cayu.collaboration import _host_producer_maintenance
+from cayu import CayuApp
+from cayu.collaboration import (
+    CollaborationHost,
+    ContinuationService,
+    HostContinuationRule,
+    HostWaitRule,
+    _host_producer_maintenance,
+)
 from cayu.collaboration._contracts import OwnerRef
 from cayu.collaboration.exports import SessionExportDenied
 from cayu.collaboration.participants import CollaborationUnavailable

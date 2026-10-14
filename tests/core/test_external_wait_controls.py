@@ -8,9 +8,10 @@ from uuid import uuid4
 import pytest
 from tests.external_wait_support import CONTEXT, Policy, registration, reservation, stores
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.budgets import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.evals import ScriptedModelProvider
 from cayu.external_waits import ExternalEventWaits
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.stop_policy import RunLimits

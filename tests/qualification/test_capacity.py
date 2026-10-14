@@ -10,25 +10,22 @@ from cayu import (
     AgentSpec,
     CayuApp,
     CayuConfig,
-    EventQuery,
     EventType,
     Message,
     RunRequest,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    TaskCreate,
-    TaskQuery,
     Tool,
     ToolContext,
     ToolEffect,
-    ToolExecutionConfig,
     ToolResult,
     ToolSpec,
-    run_task_worker,
 )
+from cayu.configuration import ToolExecutionConfig
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime._invocation_lifecycle import require_released_invocation_command_authority
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+from cayu.sessions import EventQuery
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, run_task_worker
 
 
 class EvidenceTool(Tool):
@@ -334,7 +331,7 @@ def test_hundred_call_round(tmp_path):
 
 
 def test_long_dynamic_tool_trajectory(tmp_path, record_property):
-    from cayu import StaticToolExposurePolicy
+    from cayu.tools import StaticToolExposurePolicy
 
     class DynamicProvider(ModelProvider):
         name = "dynamic-qualification"

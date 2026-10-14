@@ -13,7 +13,7 @@ from tests.core.test_participant_identity import app as make_app
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import ProducerCleanupReclamation, ProducerProgressOccurrence
+from cayu.collaboration import ProducerCleanupReclamation, ProducerProgressOccurrence
 from cayu.collaboration._producer_store import read_output_registration
 from cayu.collaboration._request_store import operation_key
 from cayu.collaboration._session_export_store import digest
@@ -98,7 +98,7 @@ async def test_public_producer_pruning_restarts_between_bounded_batches(
             context=disclosure,
         )
     elif produced == "rejected":
-        from cayu import ProducerDeliveryRecovery
+        from cayu.collaboration import ProducerDeliveryRecovery
 
         destination = registration.destinations[0]
         projector = app._session_export_coordinator.projectors[destination.projector]

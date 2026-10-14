@@ -26,22 +26,12 @@ settings, not universal confidence thresholds. Evaluate and version your own
 configuration against relevant and misleading matches before deploying it.
 
 ```python
-from cayu import (
-    AgentSpec,
-    AutomaticRecallContextPolicy,
-    AutomaticRecallPolicy,
-    AutomaticRecallSourceConfig,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    KnowledgeAccessScope,
-    Message,
-    ReadKnowledgeTool,
-    RequestFootprintConfig,
-    RunRequest,
-    SearchKnowledgeTool,
-    WeightedReciprocalRankFusionConfig,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.memory import AutomaticRecallContextPolicy, AutomaticRecallPolicy, AutomaticRecallSourceConfig, WeightedReciprocalRankFusionConfig
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.storage import KnowledgeAccessScope
+from cayu.tools import ReadKnowledgeTool, SearchKnowledgeTool
+from cayu.context import RequestFootprintConfig
 
 namespace = "project:example"
 fusion = WeightedReciprocalRankFusionConfig(

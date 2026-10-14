@@ -13,12 +13,17 @@ import pytest
 from pydantic import ValidationError
 from tests.core.postgres_contention_support import drop_cayu_tables
 
-from cayu import (
-    InMemoryKnowledgeStore,
-    InMemoryTaskStore,
-    KnowledgeAccessScope,
+from cayu.knowledge.curator import (
     KnowledgeCurator,
     KnowledgeCuratorConfig,
+    LearningBatch,
+    LearningCandidate,
+    LearningDecision,
+    LearningSignal,
+    LearningSourceReference,
+    LearningVerdict,
+)
+from cayu.knowledge.enrichment import (
     KnowledgeEnrichmentConflict,
     KnowledgeEnrichmentFailureCategory,
     KnowledgeEnrichmentFailureDecision,
@@ -30,24 +35,26 @@ from cayu import (
     KnowledgeEnrichmentRequest,
     KnowledgeEnrichmentTrigger,
     KnowledgeEnrichmentWorker,
-    LearningBatch,
-    LearningCandidate,
-    LearningDecision,
-    LearningSignal,
-    LearningSourceReference,
-    LearningVerdict,
+    _parse_failure_payload,
+    _result_from_task,
+)
+from cayu.sessions import TaskExecutionSource
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     PostgresTaskStore,
     SQLiteTaskStore,
+)
+from cayu.storage.migrations import SchemaMode
+from cayu.tasks import (
+    InMemoryTaskStore,
     TaskClaimLost,
     TaskCreate,
-    TaskExecutionSource,
     TaskRetryPolicy,
     TaskStatus,
     TaskTerminalizationRetryPolicy,
     TaskTerminalizationUncertain,
 )
-from cayu.knowledge.enrichment import _parse_failure_payload, _result_from_task
-from cayu.storage.migrations import SchemaMode
 
 _NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()

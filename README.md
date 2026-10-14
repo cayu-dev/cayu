@@ -293,14 +293,8 @@ module-global app.
 ```python
 import asyncio
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Message,
-    OpenAIProvider,
-    RunRequest,
-    run_to_completion,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest, run_to_completion
+from cayu.providers import OpenAIProvider
 
 
 async def main() -> None:
@@ -533,7 +527,7 @@ cayu auth openai login --headless
 ```
 
 ```python
-from cayu import OpenAISubscriptionProvider
+from cayu.providers import OpenAISubscriptionProvider
 
 app.register_provider(OpenAISubscriptionProvider(), default=True)
 ```

@@ -13,7 +13,7 @@ from cayu.artifacts._s3_closure import S3ArtifactClosureGate
 
 
 def test_publication_gate_preserves_long_artifact_session_identity():
-    from cayu import S3ArtifactStore
+    from cayu.artifacts import S3ArtifactStore
 
     async def run():
         client = _S3Client()
@@ -38,7 +38,8 @@ def test_publication_gate_preserves_long_artifact_session_identity():
 def test_public_s3_closure_resumes_claimed_deletion_after_restart(tmp_path, failure):
     from tests.core.session_closure_conformance import create_closure_session
 
-    from cayu import CayuApp, S3ArtifactStore
+    from cayu import CayuApp
+    from cayu.artifacts import S3ArtifactStore
     from cayu.runtime.session_closure import ArtifactSessionClosureStore, SessionClosurePolicy
     from cayu.storage.sqlite import SQLiteSessionStore
 
@@ -109,7 +110,8 @@ def test_public_s3_closure_resumes_claimed_deletion_after_restart(tmp_path, fail
 def test_reopened_public_closure_recovers_only_durable_write_settlement(failure):
     from tests.core.session_closure_conformance import create_closure_session
 
-    from cayu import CayuApp, S3ArtifactStore
+    from cayu import CayuApp
+    from cayu.artifacts import S3ArtifactStore
     from cayu.runtime.session_closure import ArtifactSessionClosureStore
 
     class Client(_S3Client):
@@ -192,7 +194,7 @@ def test_reopened_public_closure_recovers_only_durable_write_settlement(failure)
 
 
 def test_complete_s3_objects_do_not_prove_publication_owner_has_settled():
-    from cayu import S3ArtifactStore
+    from cayu.artifacts import S3ArtifactStore
 
     committed, release = Event(), Event()
 
@@ -243,7 +245,7 @@ def test_complete_s3_objects_do_not_prove_publication_owner_has_settled():
 
 
 def test_s3_cancellation_retains_reservation_until_dispatched_upload_settles():
-    from cayu import S3ArtifactStore
+    from cayu.artifacts import S3ArtifactStore
 
     dispatched, release = Event(), Event()
 
@@ -295,7 +297,8 @@ def test_s3_cancellation_retains_reservation_until_dispatched_upload_settles():
 def test_public_s3_closure_seals_before_delete_and_replays():
     from tests.core.session_closure_conformance import create_closure_session
 
-    from cayu import CayuApp, S3ArtifactStore
+    from cayu import CayuApp
+    from cayu.artifacts import S3ArtifactStore
     from cayu.runtime.session_closure import ArtifactSessionClosureStore
 
     async def run():
@@ -333,7 +336,7 @@ def test_public_s3_closure_seals_before_delete_and_replays():
 
 
 def test_s3_uncertain_publication_reservation_blocks_closure_after_reopen():
-    from cayu import S3ArtifactStore
+    from cayu.artifacts import S3ArtifactStore
 
     async def run():
         client = _S3Client()

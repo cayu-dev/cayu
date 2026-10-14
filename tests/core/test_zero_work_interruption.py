@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 from tests.core.test_recovery_plans import _app, _create_running_session, _FakeProvider
 
-from cayu import SQLiteSessionStore
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import Event, EventType
@@ -24,6 +23,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanSelection,
 )
 from cayu.sessions.requests import InterruptSessionRequest
+from cayu.storage import SQLiteSessionStore
 
 
 async def _orphan(store):
@@ -346,10 +346,10 @@ def test_fresh_process_terminalization_and_replay(backend, tmp_path, request):
         location = str(tmp_path / "fresh.db")
     script = """
 import asyncio, json, sys
-from cayu import SQLiteSessionStore
+from cayu.storage import SQLiteSessionStore
 from tests.core.test_zero_work_interruption import _orphan, _drifted_app
 from tests.core.test_postgres_session_store import _new_store
-from cayu.runtime import IncompleteSessionRecoveryRequest
+from cayu.sessions import IncompleteSessionRecoveryRequest
 async def main():
     store = SQLiteSessionStore(sys.argv[2]) if sys.argv[1] == 'sqlite' else _new_store(sys.argv[2])
     try:

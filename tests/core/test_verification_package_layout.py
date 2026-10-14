@@ -28,9 +28,7 @@ _COMPATIBILITY = {f"cayu.runtime.{name}": f"cayu.verification.{name}" for name i
 def test_public_verification_imports_and_old_pickle_globals_share_canonical_types(module_name):
     canonical = importlib.import_module(f"cayu.verification.{module_name}")
     legacy = importlib.import_module(f"cayu.runtime.{module_name}")
-    packages = [
-        importlib.import_module(name) for name in ("cayu", "cayu.runtime", "cayu.verification")
-    ]
+    packages = [importlib.import_module(name) for name in ("cayu.verification",)]
     for name, (module, symbol) in EXPORTS.items():
         if module != canonical.__name__:
             continue

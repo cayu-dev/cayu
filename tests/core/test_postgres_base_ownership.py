@@ -58,11 +58,9 @@ if sys.argv[2] in {
     "PostgresAgentWorkContextStore", "PostgresKnowledgeStore",
     "PostgresEmbeddingKnowledgeStore",
 }:
-    import cayu
     import cayu.storage
-    for public in (cayu, cayu.storage):
-        assert getattr(public, sys.argv[2]) is store_type
-        assert sys.argv[2] not in public.__all__
+    assert getattr(cayu.storage, sys.argv[2]) is store_type
+    assert sys.argv[2] not in cayu.storage.__all__
 options = {}
 if sys.argv[2] == "PostgresEmbeddingKnowledgeStore":
     from cayu.embeddings import TextEmbeddingProvider

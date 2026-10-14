@@ -4,7 +4,7 @@ import pytest
 from tests.core.test_collaboration_namespace import rotate
 from tests.core.test_participant_identity import CONTEXT, app
 
-from cayu import ClarificationExpiryRequest, ClarificationQuestionRecovery
+from cayu.collaboration import ClarificationExpiryRequest, ClarificationQuestionRecovery
 from cayu.collaboration._clarification_state import clarification_commitment
 from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration._request_store import operation_key

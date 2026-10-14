@@ -229,51 +229,49 @@ from fnmatch import fnmatchcase
 from hashlib import sha256
 from pathlib import Path
 
-from cayu import (
-    AgentSpec,
+from cayu import AgentSpec, CayuApp
+from cayu.tools import (
     ApplyPatchTool,
-    ArtifactStore,
     BackgroundSubagentTaskRegistry,
-    BudgetLedger,
-    BudgetPolicy,
-    CayuApp,
-    CodingGitBaselineAuthority,
     DeleteFileTool,
     DenyPatternRule,
     EditFileTool,
-    Environment,
-    EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
     GitChangesTool,
-    KnowledgeAccessScope,
-    KnowledgeStatus,
-    KnowledgeStore,
-    KnowledgeVisibility,
     ListArtifactsTool,
     ListFilesTool,
     ListKnowledgeTool,
-    LocalArtifactStore,
-    LocalRunner,
-    LocalWorkspace,
-    ModelProvider,
     ParameterConstrainedToolPolicy,
     ReadFileTool,
     ReadKnowledgeTool,
     RememberKnowledgeTool,
     RequiredAllowlistRule,
     RequiredFieldRule,
-    RunLimits,
     SearchKnowledgeTool,
     SearchTextTool,
-    SessionStore,
     SubagentExecutionMode,
     SubagentResultTool,
     SubagentSpec,
     SubagentTool,
-    TaskStore,
     UserInputTool,
     WriteFileTool,
 )
+from cayu.artifacts import ArtifactStore, LocalArtifactStore
+from cayu.budgets import BudgetLedger, BudgetPolicy
+from cayu.coding_products import CodingGitBaselineAuthority
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.storage import (
+    KnowledgeAccessScope,
+    KnowledgeStatus,
+    KnowledgeStore,
+    KnowledgeVisibility,
+)
+from cayu.runners import LocalRunner
+from cayu.workspaces import LocalWorkspace
+from cayu.providers import ModelProvider
+from cayu.budgets import RunLimits
+from cayu.sessions import SessionStore
+from cayu.tasks import TaskStore
 from agents.registration import register_coding_agents
 from configuration.coding_storage import build_coding_stores
 from configuration.runtime import build_runtime_options
@@ -1452,7 +1450,8 @@ _REVIEWER_AGENT_PY = '''"""Bounded reviewer subagent for __PROJECT_NAME__."""
 
 from configuration import configured_model, configured_provider_name
 
-from cayu import AgentSpec, ExecutionProfileBehaviorIdentity
+from cayu import AgentSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from prompts.coding import REVIEWER_SYSTEM_PROMPT
 
 REVIEWER = AgentSpec(
@@ -1477,15 +1476,10 @@ _CODING_AGENT_REGISTRATION_PY = '''"""Explicit coding-agent registration boundar
 
 from collections.abc import Sequence
 
-from cayu import (
-    AgentSpec,
-    AllRegisteredToolsExposurePolicy,
-    CayuApp,
-    ExecutionRequirements,
-    ModelProvider,
-    Tool,
-    ToolPolicy,
-)
+from cayu import AgentSpec, CayuApp, Tool
+from cayu.tools import AllRegisteredToolsExposurePolicy, ToolPolicy
+from cayu.environments import ExecutionRequirements
+from cayu.providers import ModelProvider
 
 from configuration import resolve_configured_agent
 
@@ -1591,7 +1585,7 @@ def require_coding_tool_inventory(
 
 _CODING_POLICY_PY = '''"""Coding tool-policy identity and validation seam."""
 
-from cayu import ToolPolicy
+from cayu.tools import ToolPolicy
 
 
 def require_coding_tool_policy(policy: ToolPolicy) -> ToolPolicy:
@@ -1663,7 +1657,7 @@ def workspace_candidate(
 
 _CODING_KNOWLEDGE_PY = '''"""Maintained coding knowledge-scope declaration."""
 
-from cayu import KnowledgeAccessScope, KnowledgeStatus
+from cayu.storage import KnowledgeAccessScope, KnowledgeStatus
 
 
 def coding_knowledge_scope() -> KnowledgeAccessScope:
@@ -1696,15 +1690,15 @@ first too, then [tool.cayu.session_store], so both use the same database.
 from dataclasses import dataclass
 from pathlib import Path
 
-from cayu import (
+from cayu.storage import (
     ApplicationStores,
     KnowledgeAccessScope,
     KnowledgeStore,
-    SessionStore,
-    TaskStore,
     configured_database_url,
     open_application_stores,
 )
+from cayu.sessions import SessionStore
+from cayu.tasks import TaskStore
 
 from configuration.settings import configured_public_authority_alias_codec
 
@@ -1950,7 +1944,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cayu import CodingReviewSettlement, CodingSettlementPolicy
+from cayu.coding_products import CodingReviewSettlement, CodingSettlementPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -1979,9 +1973,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from cayu import (
-    ArtifactStore,
-    CayuApp,
+from cayu.artifacts import ArtifactStore
+from cayu import CayuApp, Message, RunRequest
+from cayu.coding_products import (
     CodingGitBaselineAuthority,
     CodingProductArtifactRepository,
     CodingProductPublication,
@@ -1989,13 +1983,11 @@ from cayu import (
     CodingProductRunner,
     CodingRuntimeAuthority,
     CodingSettlementPolicy,
-    DockerCodingToolchainProfile,
-    Message,
-    RunRequest,
-    Workspace,
     admit_or_recover_coding_product_request,
     register_coding_product_contract,
 )
+from cayu.environments import DockerCodingToolchainProfile
+from cayu.workspaces import Workspace
 
 from domain.coding_product import CodingProductTask
 from operations.coding import (
@@ -2188,9 +2180,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cayu import (
-    ArtifactStore,
-    CodingProductArtifactRepository,
+from cayu.artifacts import ArtifactStore
+from cayu.coding_products import CodingProductArtifactRepository
+from cayu.delivery import (
     RemoteGitBrokerProfile,
     RemoteGitDeliveryBroker,
     RemoteGitDeliveryRepository,
@@ -2267,18 +2259,17 @@ writes, deletion, tags, merge, and pull-request effects are forbidden.
 
 _GITHUB_INTEGRATION_PY = '''"""Optional approved GitHub PR, checks, and review boundary."""
 
-from cayu import (
-    ArtifactStore,
+from cayu.artifacts import ArtifactStore
+from cayu.delivery import (
     GitHubConnectorProfile,
     GitHubCredentials,
     GitHubDeliveryRepository,
     GitHubPullRequestConnector,
     GitHubRepositoryConfig,
     GitHubRestTransport,
-    SecretRef,
-    SecretResolver,
     github_connector_behavior_fingerprint,
 )
+from cayu.vaults import SecretRef, SecretResolver
 
 GITHUB_DELIVERY_ENABLED = __GITHUB_ENABLED__
 
@@ -2388,7 +2379,8 @@ deletion, workflow dispatch, release, deployment, or a generic GitHub API seam.
 
 _DOCKER_PRIMARY_AGENT_PY = '''"""Primary Docker coding agent for __PROJECT_NAME__."""
 
-from cayu import AgentSpec, ExecutionProfileBehaviorIdentity
+from cayu import AgentSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 
 from configuration import configured_model, configured_provider_name
 from prompts.coding import PRIMARY_SYSTEM_PROMPT
@@ -3055,8 +3047,9 @@ def main() -> int:
                 "&& command -v sh >/dev/null "
                 "&& command -v sleep >/dev/null "
                 "&& /opt/cayu-project/.venv/bin/python -c "
-                "'from cayu import DockerCodingEnvironmentFactory, "
-                "DockerCodingToolchainProfile, RunCheckTool, RunCommandTool'",
+                "'from cayu.environments import DockerCodingEnvironmentFactory, "
+                "DockerCodingToolchainProfile; "
+                "from cayu.tools import RunCheckTool, RunCommandTool'",
             ],
             cwd=_ROOT,
             stdin=subprocess.DEVNULL,
@@ -4067,20 +4060,18 @@ import build_coding_image
 from app import build_app, build_coding_product_application
 from domain.coding_product import CodingProductTask
 
-from cayu import (
+from cayu.tools import (
     CommandPolicyDecision,
     CommandRequest,
-    CodingGitBaselineAuthority,
-    CodingProductState,
+    RunCheckTool,
+    RunCommandTool,
+)
+from cayu.coding_products import CodingGitBaselineAuthority, CodingProductState
+from cayu.environments import (
     DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
-    DockerRunner,
     Environment,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    EventType,
-    ExecCommand,
-    ExecResult,
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
@@ -4088,23 +4079,23 @@ from cayu import (
     ExecutionExecutableEvidence,
     ExecutionRequirements,
     ExecutionToolRequirementEvidence,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-    LocalRunner,
-    Message,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    RunCheckTool,
-    RunCommandTool,
-    RunRequest,
-    RunnerExecutionAdmissionObserver,
-    RunnerWorkspace,
-    ScriptedModelProvider,
-    ToolContext,
     evaluate_execution_admission,
 )
+from cayu.runners import (
+    DockerImageIdentity,
+    DockerRunner,
+    ExecCommand,
+    ExecResult,
+    LocalRunner,
+    RunnerExecutionAdmissionObserver,
+)
+from cayu import EventType, Message, RunRequest, ToolContext
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu.artifacts import LocalArtifactStore
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.workspaces import RunnerWorkspace
+from cayu.evals import ScriptedModelProvider
 
 _IMAGE_ID = "sha256:" + ("a" * 64)
 
@@ -4999,15 +4990,11 @@ import asyncio
 import subprocess
 from pathlib import Path
 
-from cayu import (
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    run_to_completion,
-)
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu import Message, RunRequest, run_to_completion
+from cayu.providers import ModelStreamEvent
+from cayu.evals import ScriptedModelProvider
 
 from app import build_app
 from operations import coding as composition
@@ -5074,7 +5061,9 @@ _REDUCED_DOCKER_SMOKE_TEST_PY = '''"""Credential-free construction proof; does n
 
 import subprocess
 
-from cayu import DockerImageIdentity, InMemorySessionStore, InMemoryTaskStore
+from cayu.runners import DockerImageIdentity
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
 from app import build_app
 from operations import coding as composition
 from tools.coding import DOCKER_TOOL_NAMES
@@ -5126,31 +5115,23 @@ import pytest
 import run as project_run
 from app import build_app
 
-from cayu import (
-    AgentSpec,
-    ArtifactScope,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
+from cayu import AgentSpec, EventType, Message, RunRequest, SessionStatus
+from cayu.artifacts import ArtifactScope, LocalArtifactStore
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.storage import (
     InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
     KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeStatus,
-    LocalArtifactStore,
-    Message,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    RunRequest,
-    SessionQuery,
-    SessionStatus,
-    ScriptedModelProvider,
     SQLiteKnowledgeStore,
-    UserInputResponse,
 )
+from cayu.sessions import InMemorySessionStore, SessionQuery
+from cayu.tasks import InMemoryTaskStore
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.evals import ScriptedModelProvider
+from cayu.approvals import UserInputResponse
 from environments.command_probe import BoundedCommandResult
 
 _ARTIFACT_ID = "art_11111111111111111111111111111111"
@@ -6084,27 +6065,25 @@ def _docker_composition_source(source: str) -> str:
         ),
         1,
     )
-    source = source.replace("    Environment,\n", "", 1)
     source = source.replace(
-        "    LocalRunner,\n",
+        "from cayu.environments import Environment, EnvironmentSpec\n",
+        "from cayu.environments import EnvironmentSpec\n",
+        1,
+    )
+    source = source.replace(
+        "from cayu.runners import LocalRunner\n",
         (
-            "    CommandPolicy,\n"
-            "    CommandPolicyDecision,\n"
-            "    CommandPolicyResult,\n"
-            "    CommandRequest,\n"
-            "    DockerCodingAdmissionProbe,\n"
-            "    DockerCodingCommandAuthority,\n"
-            "    DockerCodingDependencyInput,\n"
-            "    DockerCodingEnvironmentFactory,\n"
-            "    DockerCodingToolchainProfile,\n"
-            "    DockerImageIdentity,\n"
-            "    DockerWorkspaceTransferLimits,\n"
-            "    ExecCommand,\n"
+            "from cayu.tools import (\n"
+            "    CommandPolicy, CommandPolicyDecision, CommandPolicyResult, CommandRequest,\n"
+            "    NamedCheck, RunCheckTool, RunCommandTool, StructuredCommandToolPolicy,\n"
+            ")\n"
+            "from cayu.environments import (\n"
+            "    DockerCodingAdmissionProbe, DockerCodingCommandAuthority,\n"
+            "    DockerCodingDependencyInput, DockerCodingEnvironmentFactory,\n"
+            "    DockerCodingToolchainProfile, DockerWorkspaceTransferLimits,\n"
             "    ExecutionRequirements,\n"
-            "    NamedCheck,\n"
-            "    RunCheckTool,\n"
-            "    RunCommandTool,\n"
-            "    StructuredCommandToolPolicy,\n"
+            ")\n"
+            "from cayu.runners import DockerImageIdentity, ExecCommand\n"
         ),
         1,
     )

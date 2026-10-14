@@ -7,8 +7,9 @@ import pytest
 from tests.core.test_tool_completion import FinalTool, app_for, call, request
 from tests.core.test_tool_round_publication_failure_matrix import _TwoCallProvider
 
-from cayu import EventType, InMemorySessionStore, SessionStatus
+from cayu import EventType, SessionStatus
 from cayu.server import ServerConfig, create_server
+from cayu.sessions import InMemorySessionStore
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient

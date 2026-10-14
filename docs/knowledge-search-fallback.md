@@ -27,18 +27,11 @@ for the intended evidence lifecycle and rotate its key ID with the secret.
 See the automatic recall configuration in [runtime contracts](runtime-contracts.md).
 
 ```python
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    KnowledgeAccessScope,
-    Message,
-    ReadKnowledgeTool,
-    RequestFootprintConfig,
-    RunRequest,
-    SearchKnowledgeTool,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.storage import KnowledgeAccessScope
+from cayu.tools import ReadKnowledgeTool, SearchKnowledgeTool
+from cayu.context import RequestFootprintConfig
 
 namespace = "project:example"
 app = CayuApp(

@@ -1,127 +1,93 @@
-"""Regression guards for the public ``cayu`` import surface.
-
-These names are load-bearing for developer-facing docs and examples: the README
-imports them directly, and the deep contracts (custom session/task stores, fake
-providers for tests, custom cloud runners/workspaces) all start from these base
-ABCs. They were previously reachable only via submodule imports (e.g.
-``from cayu.runtime import SessionStatus``) even though the README told readers
-to ``from cayu import SessionStatus`` — which raised ``ImportError``. This test
-pins them to the top level so that gap cannot silently reopen.
-"""
+"""Public authoring imports stay small; specialized APIs have explicit owners."""
 
 from __future__ import annotations
 
 import importlib
+import json
 import re
 from pathlib import Path
 
+import pytest
+
 import cayu
-import cayu.runtime as cayu_runtime
 from cayu._exports import EXPORTS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_IMPORT_PATTERN = re.compile(r"from cayu import (\(([^)]*)\)|([^\n(]+))", re.DOTALL)
-
-# The session vocabulary the README's crash-recovery snippet depends on, plus
-# the runtime and workspace capability ABCs builders subclass to extend Cayu.
-REQUIRED_TOP_LEVEL_EXPORTS = (
-    "AgentAuthoringState",
-    "BoundedTarReader",
-    "Session",
+_COMMON_NAMES = {
+    "Agent",
+    "AgentSpec",
+    "CayuApp",
+    "CayuConfig",
+    "Event",
+    "EventType",
+    "Message",
+    "ResumeRequest",
+    "RunOutcome",
+    "RunRequest",
     "SessionStatus",
-    "SessionStore",
-    "InvocationOriginClaim",
-    "SessionInvocation",
-    "session_invocation_for_run_request",
-    "TarWriter",
-    "InMemorySessionStore",
-    "SessionStatusConflict",
-    "ModelProvider",
-    "ModelRequest",
-    "ModelStreamEvent",
-    "OpenAISubscriptionProvider",
-    "NativeStructuredOutputSchemaInvalid",
-    "NativeStructuredOutputUnsupported",
-    "ProviderOperationStartRecoveryRequest",
-    "Runner",
-    "Workspace",
-    "DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS",
-    "MicrosandboxCleanupError",
-    "WorkspaceCheckpointError",
-    "WorkspaceCheckpointManifest",
-    "WorkspaceCheckpointPolicy",
-    "capture_workspace_checkpoint",
-    "load_workspace_checkpoint",
-    "pin_workspace_checkpoint",
-    "release_workspace_checkpoint",
-    "restore_workspace_checkpoint",
-    "ExecutionDeadline",
-    "ExecutionDeadlineExceeded",
-    "current_execution_deadline",
-    "execution_deadline_scope",
-)
-
-MANIFEST_TOP_LEVEL_EXPORTS = (
-    "AppManifest",
-    "DiagnosticSeverity",
-    "ProjectCheckReport",
-    "ProjectDiagnostic",
-    "PublicServiceManifest",
-    "RuntimeStoreDurability",
-    "ServiceCheckEvidence",
-    "check_manifest",
-)
-
-MANIFEST_RUNTIME_ONLY_EXPORTS = (
-    "APP_MANIFEST_SCHEMA_VERSION",
-    "AVAILABLE_CHECK_TAGS",
-    "BUILTIN_DIAGNOSTIC_CODES",
-    "CHECK_REPORT_SCHEMA_VERSION",
-    "AgentManifest",
-    "ApplicationDefaultsManifest",
-    "CapabilityManifest",
-    "EnvironmentManifest",
-    "ProviderManifest",
-    "RegistrationProvenance",
-    "RequestFootprintConfigManifest",
-    "RuntimeManifest",
-    "StoreManifest",
-    "ToolManifest",
-    "ToolResultProjectionPolicyManifest",
-)
+    "StructuredOutputResult",
+    "Tool",
+    "ToolContext",
+    "ToolEffect",
+    "ToolResult",
+    "ToolSpec",
+    "run_to_completion",
+}
 
 
 def test_required_names_are_importable_from_top_level() -> None:
-    for name in REQUIRED_TOP_LEVEL_EXPORTS:
-        assert hasattr(cayu, name), f"cayu.{name} is not exported from the top level"
+    assert set(EXPORTS) == _COMMON_NAMES | {"__version__"}
+    for name, (module, symbol) in EXPORTS.items():
+        assert getattr(cayu, name) is getattr(importlib.import_module(module), symbol)
 
 
-def test_application_store_selection_is_public_at_the_root() -> None:
+def test_required_names_are_declared_in_dunder_all() -> None:
+    assert set(cayu.__all__) == _COMMON_NAMES | {"__version__"}
+
+
+@pytest.mark.parametrize("package_name", ["cayu", "cayu.runtime"])
+def test_removed_imports_have_public_replacements(package_name: str) -> None:
+    replacements = json.loads((_REPO_ROOT / "docs/public-api-imports.json").read_text())
+    package = importlib.import_module(package_name)
+    manifest = importlib.import_module(package_name + "._exports")
+    relevant = {
+        old: new for old, new in replacements.items() if old.rsplit(".", 1)[0] == package_name
+    }
+    assert relevant
+    for old, new in relevant.items():
+        old_name = old.rsplit(".", 1)[1]
+        module, symbol = new.rsplit(".", 1)
+        assert all(not part.startswith("_") for part in module.split("."))
+        assert old_name not in manifest.EXPORTS
+        assert old_name not in package.__all__
+        with pytest.raises(ImportError, match=re.escape(new.rsplit(".", 1)[0])):
+            getattr(package, old_name)
+        owner = importlib.import_module(module)
+        assert getattr(owner, symbol) is not None, new
+
+
+def test_runtime_exports_belong_to_runtime() -> None:
+    from cayu.runtime._exports import EXPORTS as runtime_exports
+
+    assert runtime_exports
+    assert all(module.startswith("cayu.runtime.") for module, _ in runtime_exports.values())
+
+
+def test_application_store_selection_is_public_from_storage() -> None:
+    from cayu import storage
     from cayu.storage import application, targets
 
-    assert cayu.ApplicationStores is application.ApplicationStores
-    assert cayu.open_application_stores is application.open_application_stores
-    assert cayu.configured_database_url is targets.configured_database_url
+    assert storage.ApplicationStores is application.ApplicationStores
+    assert storage.open_application_stores is application.open_application_stores
+    assert storage.configured_database_url is targets.configured_database_url
     for name in ("ApplicationStores", "open_application_stores", "configured_database_url"):
-        assert name in cayu.__all__
+        assert name in storage.__all__
 
 
-def test_execution_deadline_exports_remain_discoverable_from_root_and_runtime() -> None:
-    from cayu import deadlines
-
-    for name in (
-        "ExecutionDeadline",
-        "ExecutionDeadlineExceeded",
-        "current_execution_deadline",
-        "execution_deadline_scope",
-    ):
-        for package in (cayu, cayu_runtime):
-            assert name in package.__all__
-            assert getattr(package, name) is getattr(deadlines, name)
-
-
-def test_verified_task_worker_exports_share_the_runtime_owner() -> None:
-    from cayu.runtime import verified_task_worker
+def test_verified_task_worker_exports_share_the_canonical_owner() -> None:
+    from cayu import verification
+    from cayu.verification import verified_task_worker
 
     for name in (
         "VerifiedTaskHandler",
@@ -131,19 +97,13 @@ def test_verified_task_worker_exports_share_the_runtime_owner() -> None:
         "VerifiedTaskWorker",
         "VerifiedTaskWorkerDraining",
     ):
-        assert getattr(cayu, name) is getattr(cayu_runtime, name)
-        assert getattr(cayu, name) is getattr(verified_task_worker, name)
-        assert name in cayu.__all__ and name in cayu_runtime.__all__
-
-
-def test_required_names_are_declared_in_dunder_all() -> None:
-    # A name reachable via attribute access but absent from __all__ is invisible
-    # to ``from cayu import *`` and to tooling that reads __all__ — pin both.
-    for name in REQUIRED_TOP_LEVEL_EXPORTS:
-        assert name in cayu.__all__, f"{name!r} missing from cayu.__all__"
+        assert getattr(verification, name) is getattr(verified_task_worker, name)
+        assert name in verification.__all__
 
 
 def test_session_message_lifecycle_types_have_matching_public_exports() -> None:
+    from cayu.sessions import messaging
+
     for name in (
         "SessionMessageAccessContext",
         "SessionMessageAccessDenied",
@@ -160,19 +120,7 @@ def test_session_message_lifecycle_types_have_matching_public_exports() -> None:
         "SessionMessageSource",
         "SessionMessageTarget",
     ):
-        assert name in cayu.__all__
-        assert name in cayu_runtime.__all__
-        assert getattr(cayu, name) is getattr(cayu_runtime, name)
-
-
-def test_manifest_api_keeps_structural_types_out_of_the_root_namespace() -> None:
-    for name in MANIFEST_TOP_LEVEL_EXPORTS:
-        assert hasattr(cayu, name), f"cayu.{name} is a supported entry point"
-        assert name in cayu.__all__
-    for name in MANIFEST_RUNTIME_ONLY_EXPORTS:
-        assert hasattr(cayu_runtime, name), f"cayu.runtime.{name} must remain public"
-        assert not hasattr(cayu, name), f"cayu.{name} unnecessarily expands the root API"
-        assert name not in cayu.__all__
+        assert getattr(messaging, name).__module__ == "cayu.sessions.messaging"
 
 
 def test_readme_recovery_snippet_imports_and_constructs() -> None:

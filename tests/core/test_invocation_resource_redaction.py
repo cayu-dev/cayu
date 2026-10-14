@@ -8,10 +8,9 @@ import pytest
 from pydantic import SecretStr
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
-from cayu import LocalArtifactStore, LocalWorkspace
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
-from cayu.artifacts import ArtifactStoreUnavailableError
+from cayu.artifacts import ArtifactStoreUnavailableError, LocalArtifactStore
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.messages import Message
@@ -26,7 +25,7 @@ from cayu.tools._resources import (
 )
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
-from cayu.workspaces import WorkspaceReadResult
+from cayu.workspaces import LocalWorkspace, WorkspaceReadResult
 
 
 def test_invocation_workspace_read_redacts_before_source_page_bound(tmp_path) -> None:

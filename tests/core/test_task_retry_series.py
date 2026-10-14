@@ -3933,7 +3933,8 @@ import asyncio
 import sys
 import time
 from pathlib import Path
-from cayu import SQLiteTaskStore, TaskCreate, TaskRetryPolicy
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import TaskCreate, TaskRetryPolicy
 
 async def setup():
     store = SQLiteTaskStore(Path(sys.argv[1]))
@@ -3977,14 +3978,9 @@ import asyncio
 import sys
 from datetime import datetime
 from pathlib import Path
-from cayu import (
-    ResolutionActor,
-    ResolutionActorSource,
-    SQLiteTaskStore,
-    TaskRetryCancellationReconciliationEvidence,
-    TaskRetryCancellationReconciliationOutcome,
-    TaskRetryCancellationReconciliationRequest,
-)
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import TaskRetryCancellationReconciliationEvidence, TaskRetryCancellationReconciliationOutcome, TaskRetryCancellationReconciliationRequest
 
 async def reconcile():
     store = SQLiteTaskStore(Path(sys.argv[1]))

@@ -7,17 +7,14 @@ from pathlib import Path
 
 from tests.core.test_completion_decision_application import _contract, _result
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp, Event, EventType
+from cayu.sessions.records import Session, StoreTimeCheckpointTransform
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+from cayu.verification import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
     CompletionResultResolverRequest,
-    Event,
-    EventType,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
 )
-from cayu.sessions.records import Session, StoreTimeCheckpointTransform
 
 _PROCESS_LOSS_EXIT_CODE = 86
 

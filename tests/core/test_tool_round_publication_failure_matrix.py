@@ -10,10 +10,11 @@ from typing import Literal
 import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
-from cayu import CayuConfig, ToolExecutionConfig
+from cayu import CayuConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.run_limits import RunLimits
+from cayu.configuration import ToolExecutionConfig
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent

@@ -5,10 +5,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import CayuApp, TaskCreate, TaskQuery, TaskRescheduleRequest, TaskStatus
+from cayu import CayuApp
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import TaskCreate, TaskQuery, TaskRescheduleRequest, TaskStatus
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.scheduling import TaskScheduleEventType, TaskSchedulePolicy
 from cayu.tasks.worker import complete_managed_task, run_task_worker

@@ -222,6 +222,8 @@ from cayu.knowledge.search import KnowledgeListResult as KnowledgeListResult
 from cayu.knowledge.search import KnowledgeQuery as KnowledgeQuery
 from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
+from cayu.storage.application import ApplicationStores as ApplicationStores
+from cayu.storage.application import open_application_stores as open_application_stores
 from cayu.storage.budget_ledger import SQLiteBudgetLedger as SQLiteBudgetLedger
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.evals_postgres import PostgresEvalStore as PostgresEvalStore
@@ -317,6 +319,7 @@ from cayu.storage.retention import StorageRetentionReport as StorageRetentionRep
 from cayu.storage.retention import StorageRetentionTarget as StorageRetentionTarget
 from cayu.storage.retention import WorkspaceRetentionPolicy as WorkspaceRetentionPolicy
 from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
+from cayu.storage.targets import configured_database_url as configured_database_url
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
 from cayu.storage.work_context_postgres import (
@@ -375,6 +378,7 @@ __all__ = [
     "RETENTION_ARTIFACT_SCOPES",
     "RETENTION_TERMINAL_EVAL_RUN_STATUSES",
     "RETENTION_TERMINAL_SESSION_STATUSES",
+    "ApplicationStores",
     "ArtifactRetentionPolicy",
     "BrowserRecordingStore",
     "BrowserRecordingUnavailable",
@@ -492,9 +496,11 @@ __all__ = [
     "StorageRetentionTarget",
     "WorkspaceRetentionPolicy",
     "assess_knowledge_revision_transition",
+    "configured_database_url",
     "copy_knowledge_revision_refs",
     "knowledge_access_scope_sha256",
     "knowledge_chunk_embedding_identity",
+    "open_application_stores",
     "prepare_knowledge_activation_request",
     "prepare_knowledge_maintenance_decision",
     "prepare_knowledge_publication",

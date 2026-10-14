@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 from tests.evals.test_browser_acceptance_execution import _plan
 
-from cayu import AgentSpec, WebBridge
+from cayu import AgentSpec
 from cayu.evals.browser_acceptance import (
     BrowserAcceptanceCaseV1,
     BrowserAcceptanceManifestV1,
@@ -18,6 +18,7 @@ from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.internal.browser_acceptance import _ENVIRONMENT_EXECUTION_PROFILE_IDENTITY
 from cayu.evals.runner import EvalPlan
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.tools import WebBridge
 
 
 @pytest.mark.parametrize("timeout", [float("inf"), float("-inf"), float("nan")])

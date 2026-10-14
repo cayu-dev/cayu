@@ -12,8 +12,9 @@ from typing import Any
 import pytest
 from tests.core.browser_session_support import _context, _durable_context, _FakeBrowserBackend
 
-from cayu import BrowserSessionTool, BrowserVisualPolicy, LocalArtifactStore
+from cayu.artifacts import LocalArtifactStore
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
+from cayu.tools import BrowserSessionTool, BrowserVisualPolicy
 from cayu.tools import _browser_guest as guest
 from cayu.tools.browser_session import BrowserArtifactPayload
 from cayu.tools.browser_visual import BrowserVisualObservation

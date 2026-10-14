@@ -34,13 +34,8 @@ Keep the real credential in the trusted application process or a production
 vault. `LocalEnvVault` is convenient for local development:
 
 ```python
-from cayu import (
-    HttpEgressPolicy,
-    LocalEnvVault,
-    SecretRef,
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-)
+from cayu.egress import HttpEgressPolicy, VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.vaults import LocalEnvVault, SecretRef
 
 OWNER = "acme"
 REPO = "payments"

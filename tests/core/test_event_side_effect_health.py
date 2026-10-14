@@ -14,7 +14,8 @@ from tests.core.session_store_conformance.support import (
 )
 
 from cayu import Event, EventType, Message
-from cayu.runtime import PersistedEventSideEffectQuery, RunRequest, SessionIdentity
+from cayu.sessions import RunRequest, SessionIdentity
+from cayu.sessions.event_delivery import PersistedEventSideEffectQuery
 
 
 @pytest.mark.parametrize("advanced", [None, "failed", "leased", "delivered"])
@@ -325,7 +326,7 @@ def test_health_pagination_beyond_one_batch(session_store_case):
 
 
 def test_skew_and_expired_lease_memory():
-    from cayu.runtime import InMemorySessionStore
+    from cayu.sessions import InMemorySessionStore
     from cayu.sessions.event_delivery import PersistedEventSideEffectDelivery
 
     async def run():
@@ -389,7 +390,7 @@ def test_health_expired_claim_and_acknowledgement_race(session_store_case):
             live = await store.get_persisted_event_side_effect_health()
             assert live.max_outstanding_attempts == 2
             assert live.final_attempt_boundary == 0  # attempt two is still in progress
-            from cayu.runtime import PersistedEventSideEffectClaimLost
+            from cayu.sessions import PersistedEventSideEffectClaimLost
 
             with pytest.raises(PersistedEventSideEffectClaimLost):
                 await store.mark_persisted_event_side_effect_delivered(claim)

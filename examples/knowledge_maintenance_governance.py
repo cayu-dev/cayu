@@ -8,20 +8,27 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cayu import (
-    KnowledgeAccessScope,
-    KnowledgeActorType,
-    KnowledgeEntry,
-    KnowledgeGovernanceConfig,
-    KnowledgeGovernanceMode,
+from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
+    KnowledgeMaintenanceRouter,
+    KnowledgeMaintenanceRouterConfig,
+    KnowledgeMaintenanceRoutingRequest,
+    KnowledgeMaintenanceSignalKind,
+)
+from cayu.knowledge.maintenance_governance import (
+    KnowledgeMaintenanceGovernanceDecision,
+    KnowledgeMaintenanceGovernanceDisposition,
+    KnowledgeMaintenanceGovernor,
+)
+from cayu.knowledge.maintenance_persistence import (
+    KnowledgeMaintenanceProposalPublisher,
+    KnowledgeMaintenanceProposalPublisherConfig,
+)
+from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenanceEvaluationVerdict,
     KnowledgeMaintenanceEvaluatorDecision,
     KnowledgeMaintenanceEvaluatorOutput,
     KnowledgeMaintenanceEvidenceMapping,
-    KnowledgeMaintenanceGovernanceDecision,
-    KnowledgeMaintenanceGovernanceDisposition,
-    KnowledgeMaintenanceGovernor,
     KnowledgeMaintenanceInferenceUsage,
     KnowledgeMaintenancePlanDraft,
     KnowledgeMaintenancePlanEndpoint,
@@ -29,14 +36,15 @@ from cayu import (
     KnowledgeMaintenancePlannerOutput,
     KnowledgeMaintenancePlanningConfig,
     KnowledgeMaintenancePlanningWorkflow,
-    KnowledgeMaintenanceProposalPublisher,
-    KnowledgeMaintenanceProposalPublisherConfig,
     KnowledgeMaintenanceRelationDraft,
     KnowledgeMaintenanceReplacementDraft,
-    KnowledgeMaintenanceRouter,
-    KnowledgeMaintenanceRouterConfig,
-    KnowledgeMaintenanceRoutingRequest,
-    KnowledgeMaintenanceSignalKind,
+)
+from cayu.storage import (
+    KnowledgeAccessScope,
+    KnowledgeActorType,
+    KnowledgeEntry,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
     KnowledgeRelationKind,
     KnowledgeRevisionRef,
     KnowledgeStatus,

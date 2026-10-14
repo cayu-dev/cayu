@@ -40,6 +40,18 @@ def resolve_export(
 ) -> Any:
     target = exports.get(name)
     if target is None:
+        package = namespace["__name__"]
+        if package in {"cayu", "cayu.runtime"} and not name.startswith("_"):
+            from cayu._import_migration import import_replacement, replacement_import
+
+            replacement = import_replacement(package, name)
+            if replacement is not None:
+                # AttributeError is swallowed by Python's from-import machinery.
+                # Known removed routes fail with the same repair in both forms.
+                raise ImportError(
+                    f"{package}.{name} was removed. Use `{replacement_import(replacement)}`.",
+                    name=package,
+                )
         raise AttributeError(f"module {namespace['__name__']!r} has no attribute {name!r}")
     module_name, symbol = target
     value = getattr(import_module(module_name), symbol)

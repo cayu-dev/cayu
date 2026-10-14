@@ -6,25 +6,16 @@ import sys
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventQuery,
-    EventType,
-    ExecCommandTool,
-    ExecutionProfileBehaviorIdentity,
-    LocalRunner,
-    Message,
-    ModelStreamEvent,
-    ProcessCommandPolicy,
-    ResumeRequest,
-    RunRequest,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import LocalRunner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import EventQuery
+from cayu.storage import SQLiteSessionStore
 from cayu.storage.jsonl_export import import_sessions
+from cayu.tools import ExecCommandTool, ProcessCommandPolicy
 
 
 def _identity(name):
@@ -247,7 +238,8 @@ def test_process_denials_survive_tool_round_restart_inspection_export(tmp_path, 
     ],
 )
 def test_process_value_diagnostics_never_publish_values(configuration, override, code):
-    from cayu import CommandRequest, ExecCommand
+    from cayu.runners import ExecCommand
+    from cayu.tools import CommandRequest
     from cayu.tools.base import ToolContext
 
     policy = ProcessCommandPolicy(
@@ -295,10 +287,10 @@ def test_process_publication_configuration_is_bounded(configuration):
 
 
 def test_publication_does_not_grant_execution_and_types_are_public():
-    from cayu import (
+    from cayu.runners import ExecCommand
+    from cayu.tools import (
         CommandPolicyDecision,
         CommandRequest,
-        ExecCommand,
         ProcessCommandCapabilities,
         ProcessCommandDenialCode,
         ProcessCommandDiagnostic,

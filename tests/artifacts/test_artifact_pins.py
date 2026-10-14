@@ -14,8 +14,14 @@ from typing import Any
 import pytest
 from tests.artifacts.test_aws_s3 import _ClientError, _S3Client
 
-from cayu import ArtifactScope, ArtifactStoreUnavailableError, InvalidArtifactIdError
-from cayu.artifacts import LocalArtifactStore, S3ArtifactStore, aws_s3
+from cayu.artifacts import (
+    ArtifactScope,
+    ArtifactStoreUnavailableError,
+    InvalidArtifactIdError,
+    LocalArtifactStore,
+    S3ArtifactStore,
+    aws_s3,
+)
 from cayu.artifacts._s3_pins import S3ArtifactPinState
 
 _PIN_KEY = "/_pins/"

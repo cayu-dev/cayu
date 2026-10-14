@@ -11,10 +11,10 @@ from pydantic import ValidationError
 from tests.core.task_invocation_fixtures import unattributed_task_invocation
 from tests.core.task_store_conformance import assert_task_store_time_conformance
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import (
     InMemoryTaskStore,
-    SQLiteTaskStore,
     Task,
     TaskClaimLost,
     TaskCreate,

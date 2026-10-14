@@ -287,7 +287,7 @@ identity and version fields needed by `ToolEffectReconciliationRequest`. Use the
 round and call identifiers from public runtime events:
 
 ```python
-from cayu import ToolEffectReconciliationRequest
+from cayu.runtime import ToolEffectReconciliationRequest
 
 target = await app.inspect_tool_effect(
     session_id,

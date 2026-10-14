@@ -12,22 +12,20 @@ from cayu import (
     Event,
     EventType,
     Message,
-    ModelStreamEvent,
     ResumeRequest,
     RunOutcome,
     RunRequest,
-    ScriptedModelProvider,
     SessionStatus,
     StructuredOutputResult,
-    StructuredOutputSpec,
     Tool,
     ToolContext,
     ToolResult,
     ToolSpec,
     run_to_completion,
-    scripted_structured_output,
 )
-from cayu.providers import ModelProvider, ModelRequest
+from cayu.context import StructuredOutputSpec
+from cayu.evals import ScriptedModelProvider, scripted_structured_output
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 
 def _request() -> RunRequest:

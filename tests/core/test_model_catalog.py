@@ -6,9 +6,8 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    Event,
-    EventType,
+from cayu import Event, EventType
+from cayu.budgets import (
     ModelCatalog,
     ModelInfo,
     ModelPrice,

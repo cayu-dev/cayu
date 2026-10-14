@@ -6,16 +6,9 @@ import json
 import httpx
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    GatewayProvider,
-    HttpxGatewayTransport,
-    Message,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.context.structured_output import StructuredOutputSpec
+from cayu.providers import GatewayProvider, HttpxGatewayTransport
 from cayu.providers.base import ModelProviderError, ModelRequest, ModelStreamEventType
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.storage.sqlite import SQLiteSessionStore

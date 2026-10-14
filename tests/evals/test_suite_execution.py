@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, CorpusTarget, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, RunRequest
+from cayu.evals import CorpusTarget, ScriptedModelProvider
 from cayu.evals.corpus import CorpusUserMessageSpec, RootStatusAssertionSpec, RunInputSpec
 from cayu.evals.execution import compile_corpus_suite, evaluation_target_identity
 from cayu.evals.store import EvalRunInvocation, EvalScenarioRunInvocation

@@ -880,7 +880,7 @@ def test_runtime_large_tool_result_is_settled_before_durable_event_admission(
 
 @pytest.mark.parametrize("content_bytes", [1024, 3 * 1024 * 1024])
 def test_modifying_hook_sees_original_result_before_projection(tmp_path, content_bytes) -> None:
-    from cayu import AfterToolCallDecision, RuntimeHook
+    from cayu.observability import AfterToolCallDecision, RuntimeHook
 
     content = "x" * content_bytes
     observed: list[str] = []

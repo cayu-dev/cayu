@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
+from cayu.environments import (
     DockerImmutableInputMount,
     ImmutableInputAttachment,
     ImmutableInputAttachmentStateError,
@@ -18,7 +18,6 @@ from cayu import (
     ImmutableInputProjectionCapability,
     ImmutableInputProjectionUnsupportedError,
     ImmutableInputStore,
-    LocalWorkspace,
     NativeBinding,
     NoWorkspaceBinding,
     SyncBinding,
@@ -26,6 +25,7 @@ from cayu import (
     inspect_local_immutable_input,
     require_immutable_input_projection,
 )
+from cayu.workspaces import LocalWorkspace
 
 
 def _digest(character: str) -> str:
@@ -445,7 +445,7 @@ def test_fresh_processes_converge_on_reserved_allocation(tmp_path: Path) -> None
     store = ImmutableInputStore(tmp_path / "store")
     script = """
 import sys
-from cayu import ImmutableInputStore, inspect_local_immutable_input
+from cayu.environments import ImmutableInputStore, inspect_local_immutable_input
 store = ImmutableInputStore(sys.argv[1])
 source = inspect_local_immutable_input(
     sys.argv[2], target_path='/opt/cayu/inputs/runtime',

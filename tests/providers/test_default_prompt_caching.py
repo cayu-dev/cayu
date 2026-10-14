@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from cayu import Message, ToolCallPart
+from cayu import Message
+from cayu.messages import ToolCallPart
 from cayu.providers import (
     AnthropicProvider,
     BedrockProvider,
@@ -209,13 +210,8 @@ def test_bedrock_rejects_an_extended_ttl_it_cannot_map() -> None:
 
 
 def test_bedrock_projects_the_cached_wire_prefix_with_attachment_digests() -> None:
-    from cayu import (
-        RESOLVED_FILE_ATTACHMENTS_OPTION,
-        FileAttachmentKind,
-        FilePart,
-        TextPart,
-        file_attachment,
-    )
+    from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION, FileAttachmentKind, file_attachment
+    from cayu.messages import FilePart, TextPart
 
     attachment = file_attachment(
         artifact_id="image-1",

@@ -14,18 +14,7 @@ from tests.core.test_provider_operation_offline_recovery import (
     _SimulatedProcessLoss,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    IncompleteSessionRecoveryRequest,
-    InterruptSessionRequest,
-    Message,
-    ModelFailoverPolicy,
-    ModelTarget,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.providers.base import ModelProviderError, ModelStreamEvent
 from cayu.providers.deadlines import ProviderStreamDeadlines
@@ -41,6 +30,12 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyResult,
+)
+from cayu.sessions import (
+    IncompleteSessionRecoveryRequest,
+    InterruptSessionRequest,
+    ModelFailoverPolicy,
+    ModelTarget,
 )
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

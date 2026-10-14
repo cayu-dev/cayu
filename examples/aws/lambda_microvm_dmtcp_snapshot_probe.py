@@ -38,7 +38,7 @@ from examples.execution_snapshot_probe import (
     write_private_bytes,
 )
 
-from cayu import ExecCommand, LambdaMicroVMRunner
+from cayu.runners import ExecCommand, LambdaMicroVMRunner
 
 SOURCE_SHA256 = "043410566fd7c09f21e0ec485cf72e9481722629ea877650142b7505e0d7f2d2"
 PREFIX = "/opt/cayu-dmtcp"

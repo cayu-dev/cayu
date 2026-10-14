@@ -21,27 +21,21 @@ from tests.core.test_workspace_mutation_receipts import (
     _SingleToolProvider,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest, SessionStatus
+from cayu.artifacts import LocalArtifactStore
+from cayu.environments import (
     Environment,
     EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    EventType,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SessionStatus,
-    SQLiteSessionStore,
 )
-from cayu.artifacts import LocalArtifactStore
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY as RECONNECT,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.storage import SQLiteSessionStore
 from cayu.workspaces import LocalWorkspace
 from cayu.workspaces.checkpoint_lifecycle import WORKSPACE_CHECKPOINTS_KEY
 from cayu.workspaces.checkpoints import WorkspaceCheckpointPolicy

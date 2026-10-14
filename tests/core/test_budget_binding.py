@@ -603,7 +603,7 @@ def test_bound_public_auxiliary_cancellation_after_dispatch_settles() -> None:
             for record in reservations
         )
         release.set()
-        from cayu.runtime import IncompleteSessionRecoveryRequest
+        from cayu.sessions import IncompleteSessionRecoveryRequest
 
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="bound-aux-cancel")
@@ -733,7 +733,7 @@ def test_bound_public_auxiliary_acknowledgement_loss_recovers_without_redispatch
             ),
         )
         assert lost
-        from cayu.runtime import IncompleteSessionRecoveryRequest
+        from cayu.sessions import IncompleteSessionRecoveryRequest
 
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="bound-aux-ack")

@@ -32,7 +32,7 @@ _POSTGRES_PLACEHOLDER = "postgresql://cayu-unconfigured@127.0.0.1/cayu"
 _POSTGRES_PROOF = r"""\
 import asyncio
 
-from cayu import PostgresSessionStore, PostgresTaskStore
+from cayu.storage import PostgresSessionStore, PostgresTaskStore
 from cayu.storage.migrations import SchemaMode
 
 from app import build_app
@@ -53,7 +53,7 @@ async def main() -> None:
     assert isinstance(application.task_store, PostgresTaskStore)
     stores = [application.session_store, application.task_store]
     if application.knowledge_store is not None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage import PostgresKnowledgeStore
 
         assert isinstance(application.knowledge_store, PostgresKnowledgeStore)
         stores.append(application.knowledge_store)

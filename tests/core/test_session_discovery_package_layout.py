@@ -53,7 +53,7 @@ def _assert_public_identity(owner: str, names: tuple[str, ...]) -> None:
     for name in names:
         canonical = getattr(module, name)
         assert getattr(base, name) is canonical
-        for public_module in ("cayu", "cayu.sessions", "cayu.runtime"):
+        for public_module in ("cayu.sessions",):
             assert getattr(importlib.import_module(public_module), name) is canonical
         assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
@@ -73,7 +73,7 @@ def test_pending_action_public_imports_and_historical_pickle_globals():
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_pending_action_bounds_and_identity_without_stores(public_module):
     _assert_store_independent(
         """
@@ -132,7 +132,7 @@ def test_session_topology_public_imports_and_historical_pickle_globals():
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_session_topology_pages_and_cursors_without_stores(public_module):
     _assert_store_independent(
         """
@@ -188,7 +188,7 @@ def test_session_lineage_public_imports_and_historical_pickle_globals():
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_session_lineage_bounds_and_cursors_without_stores(public_module):
     _assert_store_independent(
         """

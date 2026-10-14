@@ -7,18 +7,10 @@ from decimal import Decimal
 import pytest
 from tests.core._explicit_compaction_fixtures import _create_profiled_session
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    Event,
-    EventType,
-    Message,
-    ModelCompactor,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
 from cayu.budgets.base import BudgetLimit, budget_check_from_events, budget_check_from_totals
 from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
+from cayu.context import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.context.base import ContextBuildError
 from cayu.providers import ModelProvider, ModelProviderError
 from cayu.sessions.event_queries import EventQuery

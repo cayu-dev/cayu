@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from cayu import VirtualCredentialSpec
 from cayu.egress import (
     CapturedRequest,
     EgressRequest,
     HttpEgressPolicy,
     HttpxUpstream,
     VirtualCredentialRegistry,
+    VirtualCredentialSpec,
 )
 from cayu.vaults import SecretRef
 

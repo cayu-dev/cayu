@@ -18,21 +18,13 @@ from tests.core.session_store_conformance.support import (
     session_store_case as session_store_case,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
-    EventType,
-    InterruptSessionRequest,
-    Message,
-    RunRequest,
-    RuntimeHook,
-    SessionStatus,
-    UserInputTool,
-)
+from cayu import AgentSpec, CayuApp, CayuConfig, EventType, Message, RunRequest, SessionStatus
 from cayu.configuration import OperationsConfig
+from cayu.observability import RuntimeHook
 from cayu.runtime._interruption_coordinator import suppress_interruption_cascade
+from cayu.sessions import InterruptSessionRequest
 from cayu.sessions.cleanup import RecoveryCleanupDeadlineExceeded, RecoveryCleanupPolicy
+from cayu.tools import UserInputTool
 
 
 @pytest.mark.parametrize("cancel_count", [0, 1, 2], ids=["close", "cancel", "repeat-cancel"])

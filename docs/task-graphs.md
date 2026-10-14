@@ -7,7 +7,7 @@ application does not need a separate loop to release joins.
 ## Submit and inspect
 
 ```python
-from cayu import TaskCreate, TaskGraphCreate, TaskGraphNode
+from cayu.tasks import TaskCreate, TaskGraphCreate, TaskGraphNode
 
 request = TaskGraphCreate(
     graph_id="report-42",

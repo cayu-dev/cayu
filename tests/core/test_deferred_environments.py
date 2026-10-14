@@ -15,36 +15,24 @@ import pytest
 
 from cayu import (
     AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    EventType,
+    Message,
+    ResumeRequest,
+    RunRequest,
+    Tool,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    run_to_completion,
+)
+from cayu.approvals import PendingToolApprovalEventView, ToolApprovalDecision, ToolApprovalRequest
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    EventType,
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
-    InMemorySessionStore,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    PendingToolApprovalEventView,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    StaticToolExposurePolicy,
-    StaticToolPolicy,
     SyncBinding,
-    Tool,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolEffect,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolResult,
-    ToolSpec,
-    run_to_completion,
 )
 from cayu.environments.admission import ExecutionRequirements
 from cayu.environments.bindings import SyncBindingStagingCapacity, _copy_paths
@@ -52,7 +40,15 @@ from cayu.environments.deferred import (
     DeferredMaterialization,
     EnvironmentMaterializationError,
 )
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runners import ExecCommand, LocalRunner
 from cayu.runners.base import Runner, RunnerBinaryStreamCapability
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import InMemorySessionStore
+from cayu.tools import AlwaysRequireApprovalToolPolicy, StaticToolExposurePolicy, StaticToolPolicy
+from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement
+from cayu.workspaces import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,
@@ -927,7 +923,8 @@ class _CrashingFactory(DeferredLocalFactory):
 
 
 async def _crash_child(root: Path, mode: str) -> None:
-    from cayu import IncompleteSessionRecoveryRequest, SQLiteSessionStore
+    from cayu.sessions import IncompleteSessionRecoveryRequest
+    from cayu.storage import SQLiteSessionStore
 
     source, target = root / "source", root / "target"
     store = SQLiteSessionStore(root / "sessions.db")

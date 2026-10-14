@@ -15,14 +15,7 @@ from tests.egress_authority_public_support import (
     completed_provider,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    ExecutionProfileAdoptionIntent,
-    Message,
-    ResumeRequest,
-)
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.egress import (
     CapturedRequest,
@@ -38,8 +31,9 @@ from cayu.egress.transitions import (
     authorized_egress_authority_transition,
     egress_authority_owner_fingerprint,
 )
-from cayu.environments import EnvironmentFactoryRequest
+from cayu.environments import EnvironmentFactoryRequest, EnvironmentSpec
 from cayu.events import Event, EventType
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runners.base import ExecCommand
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAuthorityDecision,

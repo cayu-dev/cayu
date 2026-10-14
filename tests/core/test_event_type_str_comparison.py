@@ -11,13 +11,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from cayu import (
-    Event,
-    EventType,
-    RunRequest,
-    SessionIdentity,
-    SQLiteSessionStore,
-)
+from cayu import Event, EventType, RunRequest
+from cayu.sessions import SessionIdentity
+from cayu.storage import SQLiteSessionStore
 
 
 def test_event_type_str_form_matches_enum_by_equality_not_identity() -> None:

@@ -26,7 +26,7 @@ execution profile incompatible even when its Python class and tool name match.
 ## Declare component identity
 
 ```python
-from cayu import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 
 reader_identity = ExecutionProfileBehaviorIdentity(
     name="handbook-reader",
@@ -42,7 +42,8 @@ environment declares its own `EnvironmentSpec.execution_profile_identity`.
 Declare each behavior-bearing component, not just the tool:
 
 ```python
-from cayu import EnvironmentSpec, ToolPolicy
+from cayu.environments import EnvironmentSpec
+from cayu.tools import ToolPolicy
 
 class HandbookPolicy(ToolPolicy):
     @property
@@ -84,7 +85,8 @@ required dependency before registering the tool or issuing a provider request:
 
 ```python
 import json
-from cayu import KnowledgeQuery, KnowledgeStore, Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.storage import KnowledgeQuery, KnowledgeStore
+from cayu import Tool, ToolEffect, ToolResult, ToolSpec
 
 class HandbookReader(Tool):
     spec = ToolSpec(
@@ -124,7 +126,7 @@ When tools should consume environment resources, explicitly bind and select the
 environment instead. Given the same supplied bound `store`:
 
 ```python
-from cayu import Environment
+from cayu.environments import Environment
 
 environment = Environment(
     environment_spec,

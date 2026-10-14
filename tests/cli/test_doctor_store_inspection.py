@@ -10,14 +10,10 @@ from pathlib import Path
 import pytest
 
 import cayu.cli.doctor as doctor_cli
-from cayu import (
-    Event,
-    RunRequest,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-)
+from cayu import Event, RunRequest
 from cayu.cli import main
 from cayu.sessions.records import SessionIdentity
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.support_bundles import (
     SupportBundleOutcome,
@@ -61,7 +57,8 @@ def test_doctor_factory_created_sqlite_stores_are_read_only_and_unchanged(
     _write_project(
         tmp_path,
         """from concurrent.futures import ThreadPoolExecutor
-from cayu import CayuApp, SQLiteSessionStore, SQLiteTaskStore
+from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 
 
 def build_app():
@@ -101,7 +98,8 @@ def test_doctor_boots_process_private_in_memory_sqlite_stores(
 ) -> None:
     _write_project(
         tmp_path,
-        """from cayu import CayuApp, SQLiteSessionStore, SQLiteTaskStore
+        """from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 
 
 def build_app():
@@ -139,7 +137,8 @@ def test_doctor_factory_created_sqlite_store_does_not_create_missing_database(
 ) -> None:
     _write_project(
         tmp_path,
-        """from cayu import CayuApp, SQLiteSessionStore
+        """from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore
 
 
 def build_app():
@@ -222,7 +221,8 @@ def test_doctor_reads_committed_live_wal_without_mutating_it(
         wal_before = Path(f"{database}-wal").read_bytes()
         _write_project(
             tmp_path,
-            """from cayu import CayuApp, SQLiteSessionStore
+            """from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore
 
 
 def build_app():
@@ -272,7 +272,8 @@ def test_static_sqlite_snapshot_change_fails_closed(
     asyncio.run(initialize())
     _write_project(
         tmp_path,
-        """from cayu import CayuApp, SQLiteSessionStore
+        """from cayu import CayuApp
+from cayu.storage import SQLiteSessionStore
 
 
 def build_app():
@@ -348,7 +349,7 @@ def test_doctor_factory_created_postgres_store_is_transaction_read_only(
     from psycopg import sql
     from psycopg.conninfo import make_conninfo
 
-    from cayu import PostgresSessionStore
+    from cayu.storage import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
 
     schema_name = f"doctor_{uuid4().hex}"
@@ -409,7 +410,8 @@ def test_doctor_factory_created_postgres_store_is_transaction_read_only(
     try:
         _write_project(
             tmp_path,
-            f"""from cayu import CayuApp, PostgresSessionStore
+            f"""from cayu import CayuApp
+from cayu.storage import PostgresSessionStore
 
 
 def build_app():

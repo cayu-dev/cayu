@@ -84,11 +84,13 @@ def test_scoped_artifacts_have_durable_immutable_classification(tmp_path, backen
 
 @pytest.mark.parametrize("backend", ["local", "s3"])
 def test_model_attachment_reuse_requires_artifact_classification(tmp_path, backend):
-    from cayu import CayuApp, Environment, EnvironmentSpec, Message, RunRequest, SessionIdentity
+    from cayu import CayuApp, Message, RunRequest
     from cayu._resource_access_binding import ResourceExecutionBinding
     from cayu.artifacts import file_attachment
+    from cayu.environments import Environment, EnvironmentSpec
     from cayu.resource_access import ResourceAccessPolicy, encode_scope, execution_access
     from cayu.runtime._model_step_executor import _resolved_file_attachments
+    from cayu.sessions import SessionIdentity
 
     async def run():
         store = (

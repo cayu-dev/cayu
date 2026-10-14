@@ -10,28 +10,17 @@ from pydantic import ValidationError
 from tests.core.test_builtin_tools import FakeProvider
 from tests.runners.test_docker_live import _docker_path_or_skip
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    DockerRunner,
-    Environment,
-    EnvironmentSpec,
-    ExecCommandTool,
-    ExecResult,
-    ExecutionProfileBehaviorIdentity,
-    LocalRunner,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SecretRedactor,
-    ToolContext,
-    ToolResult,
-)
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest, ToolContext, ToolResult
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.providers import ModelStreamEvent
+from cayu.runners import DockerRunner, ExecResult, LocalRunner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import ExecCommandTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
+from cayu.vaults import SecretRedactor
 
 
 class EncodingProvider(FakeProvider):
@@ -322,7 +311,9 @@ def _run_downstream_output(tmp_path, tool_kind, streams, preview_limit=16_384):
     from tests.core.test_named_checks import RecordingRunner, _check, _policy
     from tests.core.test_structured_commands import _AdmittedRunner, _profile
 
-    from cayu import LocalArtifactStore, LocalWorkspace, RunCheckTool, RunCommandTool
+    from cayu.artifacts import LocalArtifactStore
+    from cayu.tools import RunCheckTool, RunCommandTool
+    from cayu.workspaces import LocalWorkspace
 
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="encoding")
     if tool_kind == "check":

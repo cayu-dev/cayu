@@ -89,7 +89,7 @@ async def test_native_absent_export_exclusion_fences_delayed_first_publication(
 
         if ack_loss:
             monkeypatch.setattr(absence, "publish_export_mutation", publish_then_lose_ack)
-        from cayu import ProducerDeliveryRecovery
+        from cayu.collaboration import ProducerDeliveryRecovery
 
         pending = await app.pending_producer_outputs(
             proposal.admission.prepared.recipient, context=CONTEXT

@@ -8,7 +8,7 @@ from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 from tests.core.test_producer_output_contracts import output_scenario
 
-from cayu import ProducerProgressOccurrence
+from cayu.collaboration import ProducerProgressOccurrence
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.providers.base import ModelStreamEvent
 

@@ -25,16 +25,10 @@ from tests.core.verified_worker_fixtures import (
 )
 
 import cayu
-from cayu import (
-    Environment,
-    EnvironmentSpec,
-    LocalWorkspace,
-    SyncBinding,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-    VerifiedTaskWorker,
-)
+from cayu.environments import Environment, EnvironmentSpec, SyncBinding
+from cayu.tasks import TaskCreate, TaskQuery, TaskStatus
+from cayu.verification import VerifiedTaskWorker
+from cayu.workspaces import LocalWorkspace
 
 
 def _app_with_binding(sessions, tasks, root, reason):

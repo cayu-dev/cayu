@@ -6,7 +6,9 @@ import json
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, ModelStreamEvent, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.memory import InMemorySessionStore

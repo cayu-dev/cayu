@@ -5,7 +5,9 @@ import asyncio
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 from tests.core.test_peer_content import QualifiedPeerProvider
 
-from cayu import BeforeStopDecision, CayuConfig, LoopPolicy, Message, OperationsConfig
+from cayu import CayuConfig, Message
+from cayu.configuration import OperationsConfig
+from cayu.runtime import BeforeStopDecision, LoopPolicy
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.cleanup import RecoveryCleanupPolicy
 

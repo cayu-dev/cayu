@@ -6,8 +6,6 @@ from collections.abc import AsyncIterator
 from cayu import (
     AgentSpec,
     CayuApp,
-    Environment,
-    EnvironmentSpec,
     Message,
     RunRequest,
     Tool,
@@ -16,6 +14,7 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import (
     ModelProvider,
     ModelRequest,

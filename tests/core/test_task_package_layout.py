@@ -15,9 +15,7 @@ import cayu
 @pytest.mark.parametrize(
     ("record_module", "topology_module"),
     (
-        ("cayu", "cayu"),
         ("cayu.tasks", "cayu.tasks"),
-        ("cayu.runtime", "cayu.runtime"),
         ("cayu.tasks.records", "cayu.tasks.topology"),
     ),
 )
@@ -88,7 +86,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
         work_receipts,
     )
 
-    public = [importlib.import_module(name) for name in ("cayu", "cayu.tasks", "cayu.runtime")]
+    public = [importlib.import_module(name) for name in ("cayu.tasks",)]
     for owner, names in (
         (
             records,
@@ -183,7 +181,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
             assert pickle.loads(f"ccayu.tasks.base\n{name}\n.".encode()) is canonical
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.tasks", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.tasks",))
 def test_task_terminal_contracts_work_without_loading_stores(public_module):
     result = subprocess.run(
         [

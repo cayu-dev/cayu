@@ -6,8 +6,14 @@ from dataclasses import replace
 import pytest
 from tests.core.test_openai_provider import RecordingTransport
 
-from cayu import Message, ModelRequest, OpenAIProvider
-from cayu.providers import ModelStreamEventType, OpenAIProtocolError, openai_response_events
+from cayu import Message
+from cayu.providers import (
+    ModelRequest,
+    ModelStreamEventType,
+    OpenAIProtocolError,
+    OpenAIProvider,
+    openai_response_events,
+)
 from cayu.providers._openai_citation_offsets import CitationOffsetDiagnostic, citation_offset_fields
 from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers.openai import _OpenAIBackgroundOperationAdapter, _url_citation_event

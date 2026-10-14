@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 import tests.providers.registrations as registrations_module
-from cayu import Message, MessageRole, ProviderStatePart, ToolCallPart
+from cayu import Message
+from cayu.messages import MessageRole, ProviderStatePart, ToolCallPart
 from cayu.providers import (
     CacheBreakpoint,
     CachePolicy,

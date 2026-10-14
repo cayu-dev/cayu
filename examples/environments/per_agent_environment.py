@@ -18,18 +18,18 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-from cayu import (
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
     GitRepositoryBinding,
-    LocalRunner,
-    LocalWorkspace,
     NoWorkspaceBinding,
     WorkspaceBinding,
 )
+from cayu.runners import LocalRunner
+from cayu.workspaces import LocalWorkspace
 
 REPO_URL = "https://github.com/octocat/Hello-World.git"
 

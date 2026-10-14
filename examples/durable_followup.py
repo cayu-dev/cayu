@@ -21,9 +21,16 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cayu import CayuApp, Task, TaskCreate, TaskQuery, TaskSchedulePolicy
+from cayu import CayuApp
 from cayu.storage.tasks_sqlite import SQLiteTaskStore
-from cayu.tasks import complete_managed_task, run_task_worker
+from cayu.tasks import (
+    Task,
+    TaskCreate,
+    TaskQuery,
+    TaskSchedulePolicy,
+    complete_managed_task,
+    run_task_worker,
+)
 
 
 async def run(command: str, database: Path, task_id: str, due: datetime | None) -> None:

@@ -40,11 +40,10 @@ Application-wide policies remain configured on `CayuApp` as usual.
 ## Assemble and reserve before submission
 
 ```python
-from cayu import (
-    ExternalCorrelationRequest, ExternalEventWaits, ExternalWaitAccessPolicy,
-    ExternalWaitContext, ExternalWaitScope, ExternalWaitRegistration,
-    SessionExternalWaitAdapter, ExternalWaitHost,
-)
+from cayu.sessions.external_waits import ExternalCorrelationRequest, ExternalWaitScope, ExternalWaitRegistration
+from cayu.external_waits import ExternalEventWaits, ExternalWaitAccessPolicy, ExternalWaitContext
+from cayu.session_external_waits import SessionExternalWaitAdapter
+from cayu.external_wait_host import ExternalWaitHost
 
 class JobPolicy(ExternalWaitAccessPolicy):
     def authorize(self, context, *, scope, source, action):
@@ -86,7 +85,8 @@ Explicit wait cancellation does not cancel that job.
 ## Park, deliver, and continue
 
 ```python
-from cayu import ExternalEventDelivery, Message, RunRequest
+from cayu.sessions.external_waits import ExternalEventDelivery
+from cayu import Message, RunRequest
 
 parked = await adapter.run_to_wait(
     RunRequest(

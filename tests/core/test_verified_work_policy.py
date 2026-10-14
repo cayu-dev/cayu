@@ -8,11 +8,11 @@ import pytest
 from tests.core.test_verified_work_contracts import assert_completion_rejection_policy
 from tests.core.test_verified_work_store_hardening import _contract, _prepare_decision
 
-from cayu import (
+from cayu.storage import SQLiteTaskStore
+from cayu.tasks import (
     CompletionDecisionApplicationRequest,
     CompletionVerdict,
     InMemoryTaskStore,
-    SQLiteTaskStore,
     TaskStatus,
     TaskTerminalizationConflict,
 )

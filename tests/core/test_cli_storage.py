@@ -178,7 +178,7 @@ def test_storage_migrate_missing_breaking_acknowledgement_is_byte_identical(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "missing-ack.sqlite"
 
@@ -202,7 +202,7 @@ def test_storage_migrate_missing_alias_authority_is_byte_identical(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "missing-authority.sqlite"
 
@@ -237,7 +237,7 @@ def test_storage_migrate_requires_empty_recall_reset_input_before_ddl(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "legacy-recall.sqlite"
 
@@ -292,7 +292,7 @@ def test_storage_migrate_recall_reset_rejects_populated_state_byte_identically(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "populated-legacy-recall.sqlite"
 
@@ -341,7 +341,7 @@ def test_storage_migrate_incompatible_alias_authority_is_byte_identical(
     capsys,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "incompatible-authority.sqlite"
 
@@ -379,7 +379,7 @@ def test_storage_migrate_existing_database_publishes_only_completed_staging_path
     capsys,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "existing.sqlite"
     backup = tmp_path / "existing.backup.sqlite"
@@ -473,7 +473,7 @@ def test_storage_migrate_invalid_output_fails_before_sqlite_publication(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "invalid-output.sqlite"
 
@@ -511,7 +511,7 @@ def test_storage_migrate_rejects_output_that_aliases_retained_backup(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "backup-output-collision.sqlite"
 
@@ -552,7 +552,7 @@ def test_storage_migrate_reuses_authenticated_backup_after_publication_failure(
     capsys,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "retained-backup-retry.sqlite"
     backup = tmp_path / "retained-backup.sqlite"
@@ -604,7 +604,7 @@ def test_storage_migrate_refuses_to_overwrite_same_revision_writes_on_retry(
     capsys,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "changed-input-retry.sqlite"
     backup = tmp_path / "changed-input-backup.sqlite"
@@ -663,7 +663,7 @@ def test_storage_migrate_rejects_symbolic_link_target(
     tmp_path,
     capsys,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     referent = tmp_path / "referent.sqlite"
     link = tmp_path / "link.sqlite"
@@ -700,7 +700,7 @@ def test_storage_migrate_serializes_receipt_recovery_with_publication(
     tmp_path,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "concurrent-receipt-recovery.sqlite"
 
@@ -793,7 +793,7 @@ def test_storage_migrate_recovers_receipt_after_sqlite_publication(
     capsys,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "receipt-recovery.sqlite"
 
@@ -845,7 +845,7 @@ def test_storage_migrate_recovers_pending_receipt_after_sqlite_publication(
     capsys,
     monkeypatch,
 ):
-    from cayu import SQLiteSessionStore
+    from cayu.storage import SQLiteSessionStore
 
     db = tmp_path / "pending-receipt-recovery.sqlite"
 
@@ -893,10 +893,10 @@ def test_storage_export_emits_jsonl(tmp_path, capsys):
     # Seed one session via a create-mode store, then export it.
     import asyncio
 
-    from cayu import SQLiteSessionStore
     from cayu.messages import Message
     from cayu.sessions.records import SessionIdentity
     from cayu.sessions.requests import RunRequest
+    from cayu.storage import SQLiteSessionStore
 
     async def seed() -> None:
         store = SQLiteSessionStore(db, schema_mode=schema.SchemaMode.CREATE)
@@ -1114,8 +1114,8 @@ def _seed_retention_store(db) -> None:
         create_retention_session,
     )
 
-    from cayu import SQLiteSessionStore
     from cayu.sessions.records import SessionStatus
+    from cayu.storage import SQLiteSessionStore
 
     async def seed() -> None:
         clock = RetentionClock()
@@ -1240,7 +1240,8 @@ def test_storage_prune_all_targets_use_the_project_application(tmp_path, capsys,
             """
             from pathlib import Path
 
-            from cayu import CayuApp, SQLiteSessionStore
+            from cayu import CayuApp
+            from cayu.storage import SQLiteSessionStore
             from cayu.artifacts.local import LocalArtifactStore
             from cayu.environments.base import Environment, EnvironmentSpec
 

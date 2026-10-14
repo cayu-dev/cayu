@@ -8,10 +8,11 @@ import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-from cayu import CayuConfig, ToolExecutionConfig
+from cayu import CayuConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.run_limits import RunLimits
+from cayu.configuration import ToolExecutionConfig
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 from cayu.events import Event, EventType
 from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity

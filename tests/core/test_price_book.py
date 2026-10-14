@@ -8,13 +8,11 @@ import pytest
 from pydantic import ValidationError
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
-from cayu import (
+from cayu import CayuApp, Event, EventType
+from cayu.budgets import (
     BillingIdentity,
     BudgetLimit,
     BudgetReservation,
-    CayuApp,
-    Event,
-    EventType,
     InMemoryBudgetLedger,
     ModelInfo,
     ModelPrice,

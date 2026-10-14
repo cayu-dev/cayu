@@ -9,16 +9,7 @@ from tests.core.test_execution_profiles import RecordingExecutionProfilePolicy
 from tests.core.test_model_failover_recovery import _RecoveryProvider
 from tests.core.test_model_failover_stages import _StageMemoryStore, _StageSQLiteStore
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    Message,
-    ModelFailoverPolicy,
-    ModelTarget,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.execution_profiles import (
@@ -28,6 +19,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

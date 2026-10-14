@@ -15,16 +15,14 @@ from tests.evals.test_workflow_eval_target import (
     _TwoChildWorkflow,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ModelStreamEvent,
-    RunRequest,
+from cayu import AgentSpec, CayuApp, RunRequest
+from cayu.evals import (
     ScriptedModelProvider,
     corpus_execution_result_from_json,
     corpus_execution_result_to_json,
 )
 from cayu.evals.execution import compile_corpus_suite, run_corpus_suite
+from cayu.providers import ModelStreamEvent
 
 
 @pytest.mark.parametrize("structured", [False, True])
@@ -106,7 +104,7 @@ def test_workflow_judges_use_executed_routes(
 def test_workflow_judge_replay_withholds_dispatch_for_incomplete_routes(structured, missing):
     from tests.evals.test_workflow_eval_target import _register_app, _suite
 
-    from cayu import evaluate_assertions, run_workflow_eval_suite
+    from cayu.evals import evaluate_assertions, run_workflow_eval_suite
     from cayu.events import EventType
 
     if structured:

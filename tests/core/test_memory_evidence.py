@@ -9,7 +9,7 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu.memory import (
     ContextExposure,
     ContextExposureTransition,
     KeyedEvidenceFingerprintDomain,
@@ -21,7 +21,6 @@ from cayu import (
     RecallReceipt,
     RecallReceiptPage,
     RecallSourceCoverage,
-    RetrievalCandidateIdentity,
     keyed_evidence_fingerprint,
 )
 from cayu.memory.base import _RecallOfferReason
@@ -34,6 +33,7 @@ from cayu.memory.evidence import (
     decode_recall_evidence_cursor,
     encode_recall_evidence_cursor,
 )
+from cayu.memory.retrieval import RetrievalCandidateIdentity
 from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,

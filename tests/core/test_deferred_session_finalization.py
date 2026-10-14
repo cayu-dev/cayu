@@ -4,19 +4,12 @@ import asyncio
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
-    EventType,
-    Message,
-    ModelStreamEvent,
-    OperationsConfig,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, CayuConfig, EventType, Message, RunRequest
+from cayu.configuration import OperationsConfig
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 from cayu.sessions.cleanup import RecoveryCleanupPolicy
+from cayu.storage import SQLiteSessionStore
 
 
 @pytest.mark.anyio

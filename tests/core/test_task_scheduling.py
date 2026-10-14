@@ -8,8 +8,11 @@ from pydantic import ValidationError
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.core.task_terminalization_conformance import ordinary_cancellation_reconciliation_request
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
+from cayu.tasks import (
     InMemoryTaskStore,
     TaskCreate,
     TaskQuery,
@@ -20,9 +23,6 @@ from cayu import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
 )
-from cayu.storage.migrations import SchemaMode
-from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.scheduling import (
     TaskMisfirePolicy,
     TaskRescheduleRequest,

@@ -14,7 +14,7 @@ import cayu
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 
 
-@pytest.mark.parametrize("module_name", ("cayu", "cayu.storage", "cayu.storage.tasks_sqlite"))
+@pytest.mark.parametrize("module_name", ("cayu.storage", "cayu.storage.tasks_sqlite"))
 def test_sqlite_task_store_operates_without_loading_session_adapter(module_name, tmp_path):
     result = subprocess.run(
         [
@@ -681,7 +681,7 @@ def test_sqlite_task_store_preserves_public_and_legacy_identity():
 
     canonical = tasks_sqlite.SQLiteTaskStore
     assert canonical.__module__ == "cayu.storage.tasks_sqlite"
-    for name in ("cayu", "cayu.storage", "cayu.storage.sqlite"):
+    for name in ("cayu.storage", "cayu.storage.sqlite"):
         assert importlib.import_module(name).SQLiteTaskStore is canonical
     assert pickle.loads(b"ccayu.storage.sqlite\nSQLiteTaskStore\n.") is canonical
     assert pickle.loads(pickle.dumps(canonical)) is canonical

@@ -7,7 +7,8 @@ import json
 import pytest
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
-from cayu import AgentSpec, CayuApp, Environment, EnvironmentSpec, LocalRunner
+from cayu import AgentSpec, CayuApp
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.messages import Message, ToolCallPart
 from cayu.providers.anthropic import build_anthropic_payload
@@ -15,6 +16,7 @@ from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.providers.bedrock import build_bedrock_converse_payload
 from cayu.providers.chat_completions import build_chat_completions_payload
 from cayu.providers.openai import build_openai_payload
+from cayu.runners import LocalRunner
 from cayu.sessions.requests import RunRequest
 from cayu.storage.jsonl_export import export_sessions
 from cayu.storage.sqlite import SQLiteSessionStore

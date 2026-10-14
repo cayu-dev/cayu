@@ -25,7 +25,7 @@ from cayu.environments.base import EnvironmentSpec
 from cayu.messages import ToolResultPart
 from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.server import BasicAuth, DashboardConfig, ServerConfig, create_server
 from cayu.server.browser_recording import BrowserRecordingServer
 from cayu.storage.sqlite import SQLiteSessionStore

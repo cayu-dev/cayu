@@ -7,7 +7,9 @@ from typing import Any, Literal
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
+from cayu._validation import MAX_DURABLE_JSON_NESTING
+from cayu.exceptions import extract_durable_value_error
+from cayu.vaults import (
     ChainVault,
     LocalEnvVault,
     ResolvedSecret,
@@ -17,10 +19,8 @@ from cayu import (
     SecretsManagerVault,
     StaticVault,
     Vault,
-    extract_durable_value_error,
     secret_env_refs,
 )
-from cayu._validation import MAX_DURABLE_JSON_NESTING
 
 _SECRET_CANARY = "vault-private-secret-value-canary"
 _TEXT_CANARY = "vault-private-text-canary"

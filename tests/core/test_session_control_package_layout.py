@@ -50,7 +50,7 @@ def _assert_public_identity(
     owner: str,
     old_module: str,
     names: tuple[str, ...],
-    public_modules: tuple[str, ...] = ("cayu", "cayu.runtime"),
+    public_modules: tuple[str, ...] = (),
 ) -> None:
     module = importlib.import_module(owner)
     historical = importlib.import_module(old_module)
@@ -93,7 +93,7 @@ def test_session_message_public_imports_and_historical_pickle_globals():
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions.messaging", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions.messaging",))
 def test_session_message_values_and_rules_without_stores(public_module):
     _assert_store_independent(
         """
@@ -143,7 +143,7 @@ def test_event_delivery_public_imports_and_historical_pickle_globals():
             "PersistedEventSideEffectStatus",
             "PersistedEventSideEffectClaimLost",
         ),
-        public_modules=("cayu.runtime",),
+        public_modules=(),
     )
     _assert_public_identity(
         "cayu.sessions.event_delivery",
@@ -157,7 +157,7 @@ def test_event_delivery_public_imports_and_historical_pickle_globals():
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions.event_delivery", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions.event_delivery",))
 def test_event_delivery_values_and_projections_without_stores(public_module):
     _assert_store_independent(
         """
@@ -211,11 +211,11 @@ def test_incomplete_recovery_public_imports_and_historical_pickle_globals():
             "IncompleteSessionRecoveryResult",
             "IncompleteSessionsRecoveryPage",
         ),
-        public_modules=("cayu", "cayu.sessions", "cayu.runtime"),
+        public_modules=(),
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_incomplete_recovery_composes_with_plans_without_stores(public_module):
     _assert_store_independent(
         """

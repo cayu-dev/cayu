@@ -8,7 +8,7 @@ from pathlib import Path
 from tests.core.test_collaboration_request_foundation import RequestResolver
 from tests.core.test_participant_identity import CONTEXT, app, registration
 
-from cayu import ProducerOutputRegistration
+from cayu.collaboration import ProducerOutputRegistration
 from cayu.collaboration._contracts import ExactMatch, ExactNotFound
 from cayu.collaboration.request_access import PreparedAdmissionRegistration, RequestRegistration
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore

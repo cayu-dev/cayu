@@ -3,7 +3,7 @@
 import pytest
 from tests.core.test_peer_content import _delivery_request
 
-from cayu import ClarificationReplyRequest
+from cayu.collaboration import ClarificationReplyRequest
 from cayu.collaboration._clarification_commands import ClarificationOpenCommand
 from cayu.collaboration._clarification_deliveries import ClarificationDeliveryIntent
 from cayu.collaboration._clarification_service_api import ClarificationServiceRequest

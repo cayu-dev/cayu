@@ -21,24 +21,20 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from _live_checks import require, require_equal
-from cayu import (
-    AgentSpec,
-    AnthropicProvider,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, RunRequest
+from cayu.evals import (
     CorpusTarget,
     EvalJudgeCalibrationCriterionLabelV1,
     EvalJudgeCalibrationDraftV1,
     EvalJudgeEvidenceSelectionV1,
     ModelJudgeTarget,
-    ModelProvider,
-    OpenAIProvider,
-    RunRequest,
     ScriptedModelProvider,
     StructuredModelJudgeAssertionSpec,
     StructuredRubricCriterionV1,
     StructuredRubricV1,
     model_judge_profile,
 )
+from cayu.providers import AnthropicProvider, ModelProvider, OpenAIProvider
 from cayu.server import BasicAuth, EvalsConfig, ServerConfig, create_server
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 

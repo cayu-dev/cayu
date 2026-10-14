@@ -11,9 +11,10 @@ from pathlib import Path
 import pytest
 
 import cayu
-from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
 from cayu.budgets.base import BudgetReservationResult
 from cayu.budgets.usage import SessionUsageSummary
+from cayu.evals import ScriptedModelProvider
 from cayu.execution_units import new_model_step_identity
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.runtime._model_step_executor import (

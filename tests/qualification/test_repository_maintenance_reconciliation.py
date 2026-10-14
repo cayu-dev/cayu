@@ -6,8 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import Event, EventType, Message, TaskStatus
+from cayu import Event, EventType, Message
 from cayu.sessions.transcript_input import session_input_messages_sha256
+from cayu.tasks import TaskStatus
 from tests.qualification.test_repository_maintenance_http import _A, _BODY, _OP, client
 from tests.qualification.test_repository_maintenance_http import host as host
 from tests.qualification.test_repository_maintenance_request import consumer as consumer
@@ -236,7 +237,7 @@ def test_operator_cancellation_exact_receipt_and_ack_loss(
             # Reopen the durable backend before exact replay. No fresh host or
             # invocation proof is manufactured to replace the committed receipt.
             if hasattr(store, "path"):
-                from cayu import SQLiteTaskStore
+                from cayu.storage import SQLiteTaskStore
 
                 reopened = SQLiteTaskStore(store.path)
                 monkeypatch.setattr(

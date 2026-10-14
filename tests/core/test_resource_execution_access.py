@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
 from cayu.resource_access import ResourceAccessPolicy, current_binding
 from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
 from cayu.sessions.access import SessionAccessDenied
@@ -477,7 +479,7 @@ def test_durable_worker_run_inherits_task_classification_after_restart(tmp_path)
 
 @pytest.mark.parametrize("revoke", [False, True])
 def test_scoped_workspace_effect_dispatch_and_revocation(tmp_path, revoke):
-    from cayu import Environment, EnvironmentSpec
+    from cayu.environments import Environment, EnvironmentSpec
     from cayu.tools.files import ReadFileTool, WriteFileTool
     from cayu.workspaces.local import LocalWorkspace
 

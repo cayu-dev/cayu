@@ -11,7 +11,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from urllib.parse import urlparse
 
-from cayu import ModelCatalog, ModelInfo, ModelPrice, PriceBook
+from cayu.budgets import ModelCatalog, ModelInfo, ModelPrice, PriceBook
 
 CATALOG_MAX_AGE_DAYS = 30
 VERIFY_MAX_AGE_DAYS = 14

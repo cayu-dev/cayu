@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-import cayu
+import cayu.knowledge.maintenance_persistence
+import cayu.storage
 from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRouter,
@@ -697,7 +698,7 @@ async def _assert_publication_conformance(store: Any, prefix: str) -> None:
             suffix=f"{prefix}-stale-reject",
         ),
     )
-    assert stale_rejection.outcome is cayu.KnowledgeMaintenanceOutcome.REJECTED
+    assert stale_rejection.outcome is cayu.storage.KnowledgeMaintenanceOutcome.REJECTED
     assert await store.get_entry(advanced_source.id, access_scope=_PRIVILEGED) == advanced_source
     archived_stale_replacement = await store.transition_entry_status(
         stale_publication.replacement.id,
@@ -743,7 +744,7 @@ async def _assert_publication_conformance(store: Any, prefix: str) -> None:
             suffix=f"{prefix}-expired-reject",
         ),
     )
-    assert expired_rejection.outcome is cayu.KnowledgeMaintenanceOutcome.REJECTED
+    assert expired_rejection.outcome is cayu.storage.KnowledgeMaintenanceOutcome.REJECTED
     archived_expired_replacement = await store.transition_entry_status(
         expired_publication.replacement.id,
         expected_revision=expired_publication.replacement.revision,
@@ -769,7 +770,7 @@ def test_public_maintenance_proposal_persistence_surface_is_exported() -> None:
         "KnowledgeMaintenanceProposalPublisher",
         "KnowledgeMaintenanceProposalPublisherConfig",
     ):
-        assert getattr(cayu, name).__name__ == name
+        assert getattr(cayu.knowledge.maintenance_persistence, name).__name__ == name
 
 
 def test_inmemory_accepted_plan_publication_and_review_handoff() -> None:
@@ -806,7 +807,7 @@ def test_publication_rejects_a_source_that_advanced_after_evaluation() -> None:
         with pytest.raises(KnowledgeMaintenanceStale):
             await _publisher(store).publish(request, routing, planning)
         entries = await store.list_entries(
-            cayu.KnowledgeListQuery(
+            cayu.storage.KnowledgeListQuery(
                 namespace="project:cayu",
                 statuses=[KnowledgeStatus.PENDING],
                 limit=10,

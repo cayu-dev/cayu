@@ -15,7 +15,6 @@ from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_event_watcher_leases import event_app
 from tests.core.test_mcp import FakeMcpSession, _fake_toolset, _list_changed_initialize_result
 
-from cayu import BrowserControlConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.messages import Message
@@ -30,6 +29,7 @@ from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
+from cayu.tools import BrowserControlConfig
 
 
 class _OwnedWatcherStore(InMemoryEventWatcherStore):

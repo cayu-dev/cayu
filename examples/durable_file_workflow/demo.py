@@ -16,26 +16,26 @@ from tempfile import TemporaryDirectory
 
 from examples.durable_file_workflow.file_worker import register_file_worker
 
-from cayu import (
-    CayuApp,
+from cayu import CayuApp, Message, RunRequest
+from cayu.environments import (
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    InMemoryTaskStore,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
     NativeBinding,
-    RunRequest,
+)
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners import LocalRunner
+from cayu.tasks import (
+    InMemoryTaskStore,
     Task,
     TaskCreate,
     TaskQuery,
     complete_managed_task,
     run_task_worker,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.workspaces import LocalWorkspace
 
 GOAL_PROMPT = """\
 Goal: Transform the supplied source text into the required artifact.

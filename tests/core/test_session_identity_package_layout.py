@@ -73,16 +73,14 @@ def test_identity_historical_imports_and_pickle_globals(name):
     assert getattr(importlib.import_module("cayu.sessions.base"), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
     if name == "SessionIdentity":
-        for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+        for module in ("cayu.sessions",):
             assert getattr(importlib.import_module(module), name) is canonical
 
 
 @pytest.mark.parametrize(
     "public_module",
     (
-        "cayu",
         "cayu.sessions",
-        "cayu.runtime",
         "cayu.sessions.records",
     ),
 )
@@ -171,7 +169,7 @@ assert records._queued_dispatch_session_instance_fingerprint(shifted) == records
 @pytest.mark.parametrize("name", ("SessionStateSnapshot", "SessionInvocationSnapshot"))
 def test_snapshot_public_imports_and_historical_pickle_globals(name):
     canonical = getattr(importlib.import_module("cayu.sessions.records"), name)
-    for module in ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.base"):
+    for module in ("cayu.sessions", "cayu.sessions.base"):
         assert getattr(importlib.import_module(module), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
 
@@ -179,9 +177,7 @@ def test_snapshot_public_imports_and_historical_pickle_globals(name):
 @pytest.mark.parametrize(
     "public_module",
     (
-        "cayu",
         "cayu.sessions",
-        "cayu.runtime",
         "cayu.sessions.records",
     ),
 )

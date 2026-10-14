@@ -5,7 +5,6 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import SQLiteSessionStore
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart
 from cayu.sessions._execution_profile_rules import SessionModelTransition
@@ -16,6 +15,7 @@ from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusC
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import session_input_messages_sha256
+from cayu.storage import SQLiteSessionStore
 
 
 async def _close_store(store: SessionStore) -> None:
@@ -216,7 +216,7 @@ def test_model_switch_transition_is_atomic_in_local_stores(store_kind: str, tmp_
 
 def test_model_switch_transition_is_atomic_in_postgres(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import PostgresSessionStore
+        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
         store = PostgresSessionStore(

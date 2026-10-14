@@ -7,16 +7,8 @@ import httpx
 import pytest
 from tests.core.test_openai_subscription_provider import StaticSubscriptionAuth
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    EventType,
-    Message,
-    ModelCompactor,
-    RunRequest,
-    SQLiteSessionStore,
-)
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.context import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.providers import (
     HttpxOpenAITransport,
     ModelRequest,
@@ -26,6 +18,7 @@ from cayu.providers import (
     capture_provider_errors,
 )
 from cayu.providers.diagnostics import _record_stream_error
+from cayu.storage import SQLiteSessionStore
 from cayu.vaults import SecretRedactor
 
 ERROR = {

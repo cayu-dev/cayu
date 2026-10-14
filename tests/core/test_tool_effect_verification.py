@@ -9,17 +9,8 @@ from typing import Any, cast
 import pytest
 
 import cayu.testing.base as testing
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    LocalWorkspace,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.testing.base import (
     ToolEffectVerificationStatus,
     verify_tool_effect,
@@ -29,6 +20,7 @@ from cayu.tools.isolated import (
     ProcessIsolatedToolFactoryRef,
     ProcessIsolatedToolLimits,
 )
+from cayu.workspaces import LocalWorkspace
 
 
 def _spec(name: str, effect: ToolEffect = ToolEffect.NONE) -> ToolSpec:

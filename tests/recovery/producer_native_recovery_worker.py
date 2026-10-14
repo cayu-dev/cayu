@@ -14,17 +14,13 @@ from tests.recovery.producer_recovery_fixture import (
 )
 from tests.recovery.producer_recovery_lineage_checks import require_missing_rebind_refusal
 
-from cayu import (
-    AgentSpec,
-    CollaborationAccessContext,
-    EnqueueSessionMessageRequest,
-    IncompleteSessionRecoveryRequest,
-    ProducerOutputRegistration,
-)
+from cayu import AgentSpec
+from cayu.collaboration import CollaborationAccessContext, ProducerOutputRegistration
 from cayu.collaboration.prepared_admission import prepared_budget
 from cayu.collaboration.request_access import PreparedAdmissionRegistration, RequestRegistration
 from cayu.collaboration.requests import RequestControl
 from cayu.runtime.authority import SessionRunFenced
+from cayu.sessions import EnqueueSessionMessageRequest, IncompleteSessionRecoveryRequest
 from cayu.sessions.messaging import SessionMessageQuery
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.budget_postgres import PostgresBudgetLedger

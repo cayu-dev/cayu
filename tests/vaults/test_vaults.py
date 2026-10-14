@@ -7,17 +7,17 @@ from itertools import product
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from cayu import (
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.proxies import PassthroughProxy
+from cayu.vaults import (
     REDACTED_SECRET,
     ChainVault,
-    Environment,
-    EnvironmentSpec,
     LocalEnvVault,
-    PassthroughProxy,
     ResolvedSecret,
     RoutedVault,
     SecretEnv,
     SecretNotFound,
+    SecretRedactionTail,
     SecretRedactor,
     SecretRef,
     StaticVault,
@@ -29,7 +29,6 @@ from cayu import (
     secret_env_refs,
     validate_secret_resolver,
 )
-from cayu.vaults import SecretRedactionTail
 from cayu.vaults.redaction import (
     SecretRedactionCapacityError,
     _source_redaction_pieces,

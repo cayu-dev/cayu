@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from cayu import (
+from cayu.sessions import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionExecutionSource,
@@ -11,9 +11,9 @@ from cayu import (
     SessionStore,
     TaskExecutionSource,
     TaskInvocation,
-    TaskStore,
     session_invocation_from_task,
 )
+from cayu.tasks import TaskStore
 
 
 def unattributed_task_invocation() -> TaskInvocation:

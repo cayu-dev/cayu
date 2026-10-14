@@ -8,21 +8,19 @@ import pytest
 
 from cayu import (
     AgentSpec,
-    BeforeStopDecision,
     CayuApp,
     EventType,
-    InMemorySessionStore,
-    LoopPolicy,
     Message,
-    ModelStreamEvent,
     RunRequest,
-    ScriptedModelProvider,
     SessionStatus,
-    SQLiteSessionStore,
-    StructuredOutputSpec,
     run_to_completion,
-    scripted_structured_output,
 )
+from cayu.context import StructuredOutputSpec
+from cayu.evals import ScriptedModelProvider, scripted_structured_output
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import BeforeStopDecision, LoopPolicy
+from cayu.sessions import InMemorySessionStore
+from cayu.storage import SQLiteSessionStore
 
 
 class _RejectFirstDraft(LoopPolicy):

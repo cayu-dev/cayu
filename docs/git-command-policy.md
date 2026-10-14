@@ -13,7 +13,7 @@ interpret an untrusted alias during authorization.
 ## Secure configuration
 
 ```python
-from cayu import ExecCommandTool, GitCommandPolicy, ProcessCommandPolicy
+from cayu.tools import ExecCommandTool, GitCommandPolicy, ProcessCommandPolicy
 
 process_policy = ProcessCommandPolicy(
     # Match the exact spelling the runner will execute.

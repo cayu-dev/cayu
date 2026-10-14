@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from cayu import ModelCatalog, ModelInfo, ModelPrice, PriceBook
+from cayu.budgets import ModelCatalog, ModelInfo, ModelPrice, PriceBook
 
 
 def _key(model: ModelInfo | ModelPrice) -> tuple[str, str]:

@@ -1958,7 +1958,6 @@ async def test_producer_human_pause_is_not_failure(
 ):
     from tests.core.test_participant_identity import CONTEXT
 
-    from cayu import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
     from cayu.collaboration._producer_completion import retain_producer_completion
     from cayu.collaboration._producer_outcome import publish_producer_outcome
     from cayu.collaboration._producer_registration import register_producer_output
@@ -1969,6 +1968,7 @@ async def test_producer_human_pause_is_not_failure(
     from cayu.providers.base import ModelStreamEvent
     from cayu.runtime._producer_execution import _ProducerExecution
     from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+    from cayu.tools import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
     from cayu.tools.user_input import UserInputTool
 
     class Approval(ToolPolicy):
@@ -2128,7 +2128,7 @@ async def test_producer_human_pause_is_not_failure(
     assert owned.completion is None and owned.cleanup is None
     assert len(provider.requests) == 1
 
-    from cayu import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
+    from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
 
     provider._batches = (
         *provider._batches,

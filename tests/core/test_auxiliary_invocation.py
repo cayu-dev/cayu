@@ -8,13 +8,14 @@ from decimal import Decimal
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest, ScriptedModelProvider
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
 from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu.budgets._run_limit_accounting import RunLimitAccountingContext
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import SessionUsageSummary, session_usage_summary
+from cayu.evals import ScriptedModelProvider
 from cayu.execution_units import ModelAttemptIdentity
 from cayu.providers import (
     ModelProviderError,
@@ -215,7 +216,7 @@ def test_public_auxiliary_preparation_binds_every_intent_field(
     ],
 )
 def test_public_auxiliary_output_failure_retains_fence_and_usage(sqlite_resources, backend, case):
-    from cayu.runtime import IncompleteSessionRecoveryRequest
+    from cayu.sessions import IncompleteSessionRecoveryRequest
     from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 
     async def scenario():
@@ -609,7 +610,7 @@ def test_public_inference_input_boundary(
     ],
 )
 def test_public_auxiliary_publication_failure_preserves_recovery_owner(monkeypatch, phase):
-    from cayu.runtime import IncompleteSessionRecoveryRequest
+    from cayu.sessions import IncompleteSessionRecoveryRequest
     from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 
     async def run():
@@ -1118,7 +1119,7 @@ def test_public_inference_preserves_deadline_and_cancellation_classification(
                 == 1
             )
 
-        from cayu.runtime import IncompleteSessionRecoveryRequest
+        from cayu.sessions import IncompleteSessionRecoveryRequest
 
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(

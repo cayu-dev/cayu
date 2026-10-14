@@ -10,7 +10,7 @@ from psycopg.errors import DiskFull
 from pydantic import ValidationError
 from tests.core.task_invocation_fixtures import unattributed_task_invocation
 
-from cayu import (
+from cayu.tasks import (
     InMemoryTaskStore,
     Task,
     TaskClaimLost,

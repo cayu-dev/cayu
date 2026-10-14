@@ -6,10 +6,8 @@ from typing import cast
 
 import pytest
 
-from cayu import (
-    ToolContext,
-    ToolEffect,
-    ToolResult,
+from cayu import ToolContext, ToolEffect, ToolResult
+from cayu.tools import (
     WebSearchAdapter,
     WebSearchAdapterRequest,
     WebSearchRestrictions,

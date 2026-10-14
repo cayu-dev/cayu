@@ -9,16 +9,11 @@ from typing import Any
 import pytest
 from tests._session_provenance import session_fixture
 
-from cayu import (
-    AgentSpec,
-    ResolutionActor,
-    ResolutionActorSource,
-    ToolContext,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-)
+from cayu import AgentSpec, ToolContext
+from cayu.approvals import ResolutionActor, ResolutionActorSource
 from cayu.cli import main
 from cayu.cli.guide import _GUIDES
+from cayu.tools import ToolPolicyDecision, ToolPolicyRequest
 
 
 @pytest.mark.parametrize("topic", _GUIDES)
@@ -44,7 +39,7 @@ def test_every_registered_guide_is_listed_and_readable(topic: str, capsys) -> No
 
 
 def test_durable_service_guide_discovery_and_executable_injection(capsys) -> None:
-    from cayu import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+    from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 
     assert main(["guide", "durable-service-tools", "--json"]) == 0
     result = json.loads(capsys.readouterr().out)

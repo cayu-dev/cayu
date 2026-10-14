@@ -129,16 +129,11 @@ def test_native_round_delivers_all_results_with_bounded_parse_work(
     from tests.core._event_projection_support import private_events_for_public_events
     from tests.core.test_tool_round_runtime_publication import _EchoTool
 
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        InMemorySessionStore,
-        Message,
-        ModelStreamEvent,
-        RunRequest,
-        ScriptedModelProvider,
-    )
+    from cayu import AgentSpec, CayuApp, Message, RunRequest
+    from cayu.evals import ScriptedModelProvider
     from cayu.messages import ToolResultPart
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions import InMemorySessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 
     parses = 0

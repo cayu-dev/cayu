@@ -14,21 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    ApprovedEgressDestination,
-    BrowserEgressPolicy,
-    BrowserPopupPolicy,
-    BrowserSessionTool,
-    BrowserVisualPolicy,
-    LocalArtifactStore,
-    ToolContext,
-)
-from cayu.egress import HttpxUpstream
+from cayu import ToolContext
+from cayu.artifacts import LocalArtifactStore
+from cayu.egress import ApprovedEgressDestination, BrowserEgressPolicy, HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.evals.browser_acceptance_fixture import _fixture_address
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.tools import BrowserPopupPolicy, BrowserSessionTool, BrowserVisualPolicy
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import SecretRedactor

@@ -8,8 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 from tests.core.test_human_review import ReviewPolicy, make_app, pause
 
-from cayu import SQLiteSessionStore
 from cayu.server import AuthContext, ServerConfig, create_server
+from cayu.storage import SQLiteSessionStore
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("CAYU_BROWSER_DASHBOARD_URL"),

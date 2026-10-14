@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from cayu import (
+from cayu.browser_profiles import (
     AESGCMBrowserProfileKeyAuthority,
     BrowserProfileBinding,
     BrowserProfileDestinationPolicy,

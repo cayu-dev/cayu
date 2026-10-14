@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 
 from examples.collaboration import explicit_host as example
 
-from cayu import (
+from cayu.collaboration import (
     ContinuationService,
     HostContinuationRule,
     HostProducerDisclosure,
@@ -28,8 +28,8 @@ from cayu import (
     MandateAccessContext,
     MandateResolution,
     SessionExportAccessContext,
+    _host_producer_maintenance,
 )
-from cayu.collaboration import _host_producer_maintenance
 from cayu.collaboration._contracts import ExactMatch, OwnerRef
 from cayu.collaboration._producer_recovery import ProducerOutputRecovery
 from cayu.collaboration._wait_discovery import WaitRecovery

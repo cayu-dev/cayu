@@ -34,15 +34,12 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
-from cayu import (
+from cayu import CayuApp
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
     ExecCommand,
     ExecResult,
-)
-from cayu.runners import (
     Runner,  # the base ABC is exported from cayu.runners, not top-level cayu
     attach_cancellation_artifacts,
 )

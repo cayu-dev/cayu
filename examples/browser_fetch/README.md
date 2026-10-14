@@ -73,13 +73,8 @@ declaring every document and subresource host as an
 the normal model-facing name and input schema:
 
 ```python
-from cayu import (
-    ApprovedEgressDestination,
-    BrowserEgressPolicy,
-    BrowserWebFetchAdapter,
-    ScreenshotPageTool,
-    WebFetchTool,
-)
+from cayu.egress import ApprovedEgressDestination, BrowserEgressPolicy
+from cayu.tools import BrowserWebFetchAdapter, ScreenshotPageTool, WebFetchTool
 
 browser_policy = BrowserEgressPolicy(
     name="product-docs",

@@ -5,10 +5,11 @@ import json
 import os
 from typing import Any
 
-from cayu import AgentSpec, CayuApp, OpenAIProvider, ScriptedModelProvider, WorkflowSpec
+from cayu import AgentSpec, CayuApp
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.providers import ModelStreamEvent
-from cayu.workflows import StepRunOptions, WorkflowBase, step
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent, OpenAIProvider
+from cayu.workflows import StepRunOptions, WorkflowBase, WorkflowSpec, step
 
 SUMMARY_SCHEMA = {
     "type": "object",

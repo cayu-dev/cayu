@@ -14,7 +14,8 @@ from tests.core.test_durable_tool_round import _app
 from tests.core.test_tool_round_continuation_backends import _pause, _resolve, _runtime
 
 import cayu
-from cayu import EventType, InMemorySessionStore, Message, RunRequest
+from cayu import EventType, Message, RunRequest
+from cayu.sessions import InMemorySessionStore
 from cayu.tools.base import ToolEffect
 
 

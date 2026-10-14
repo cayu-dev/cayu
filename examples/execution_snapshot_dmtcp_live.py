@@ -25,18 +25,13 @@ from examples.aws.lambda_microvm_dmtcp_snapshot_probe import upload
 from examples.aws.lambda_microvm_execution_snapshot_probe import cleanup, client, run_options
 from examples.execution_snapshot_probe import load, write_private
 
-from cayu import (
-    CayuApp,
-    DockerRunner,
-    Environment,
-    EnvironmentSpec,
-    ExecCommand,
-    LambdaMicroVMRunner,
-    LocalArtifactStore,
-)
+from cayu import CayuApp
+from cayu.artifacts import LocalArtifactStore
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.environments.dmtcp_snapshots import DmtcpExecutionSnapshotAdapter
 from cayu.environments.snapshot_lifecycle import ensure_execution_snapshot_binding
 from cayu.environments.snapshots import ExecutionSnapshotPolicy
+from cayu.runners import DockerRunner, ExecCommand, LambdaMicroVMRunner
 from cayu.runners.docker_workload import (
     DockerImageIdentity,
     DockerTmpfsMount,

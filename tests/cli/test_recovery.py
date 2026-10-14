@@ -145,7 +145,8 @@ def test_recovery_cli_restores_a_startup_blocked_registration(monkeypatch, tmp_p
 
     from tests.core.test_startup_recovery_isolation import _app, _seed, _state
 
-    from cayu import InMemorySessionStore, SessionStatus
+    from cayu import SessionStatus
+    from cayu.sessions import InMemorySessionStore
 
     store = InMemorySessionStore()
     restored = _app(store, "3")

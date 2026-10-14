@@ -11,21 +11,19 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
-    ExecutionProfileBehaviorIdentity,
     Message,
-    ModelFailoverPolicy,
-    ModelTarget,
     ResumeRequest,
     RunRequest,
     Tool,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
     ToolEffect,
     ToolResult,
     ToolSpec,
 )
+from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
 from cayu.providers.base import ModelStreamEvent
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AllowAllToolPolicy

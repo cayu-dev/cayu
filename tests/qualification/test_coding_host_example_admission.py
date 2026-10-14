@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from cayu import CodingProductRunner
+from cayu.coding_products import CodingProductRunner
 from cayu.guides.coding_host import (
     BusinessStore,
     Reservation,

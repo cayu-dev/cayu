@@ -26,9 +26,10 @@ from examples.aws.lambda_microvm_agent.runtime import (
     build_runtime,
 )
 
-from cayu import ExecResult, ToolContext
+from cayu import ToolContext
 from cayu.artifacts import S3ArtifactStore
 from cayu.environments import EFSAccessPointBinding, S3FilesAccessPointBinding
+from cayu.runners import ExecResult
 from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 from cayu.vaults import SecretsManagerVault
 

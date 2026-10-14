@@ -5,7 +5,7 @@ disambiguates them so a name never sends you down the wrong path.
 
 ## Names that collide with Python
 
-- **`Task` (cayu) vs `asyncio.Task`.** `cayu.Task` is a durable unit of work in a
+- **`Task` (cayu) vs `asyncio.Task`.** `cayu.tasks.Task` is a durable unit of work in a
   `TaskStore` (created with `TaskCreate`, claimed by a worker). `asyncio.Task`
   wraps a coroutine. They co-occur — a worker often runs an `asyncio.Task` that
   heartbeats a cayu `Task` — so name your locals accordingly (`bg_task`,

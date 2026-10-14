@@ -6,13 +6,9 @@ import asyncio
 
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-)
+from cayu import AgentSpec
 from cayu.sessions.records import Session, SessionStatus
+from cayu.tools import AlwaysRequireApprovalToolPolicy, ToolPolicyDecision, ToolPolicyRequest
 
 
 def _request(tool_name: str) -> ToolPolicyRequest:

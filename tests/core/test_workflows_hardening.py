@@ -42,9 +42,9 @@ from typing import Any
 import pytest
 from tests._session_provenance import fixture_session_invocation
 
-import cayu
+import cayu.workflows
 import cayu.workflows as workflows
-from cayu import AgentSpec, CayuApp, EventType, ScriptedModelProvider, WorkflowSpec
+from cayu import AgentSpec, CayuApp, EventType
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.budgets.base import BudgetLimit, BudgetWindow
 from cayu.budgets.pricing import ModelPrice, PriceBook
@@ -53,6 +53,7 @@ from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.context.thinking import ThinkingConfig
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.observability.events import InMemoryEventSink
@@ -88,6 +89,7 @@ from cayu.workflows import (
     WorkflowJournal,
     WorkflowJournalContext,
     WorkflowJournalReplayEvidence,
+    WorkflowSpec,
     WorkflowStepCompletionSnapshot,
     WorkflowSupersededError,
     canonical_workflow_step_completion_ids,
@@ -2455,15 +2457,15 @@ def test_workflow_context_emit_custom_event_rejects_non_custom_names():
 
 
 def test_workflow_exports_keep_root_package_focused():
-    assert cayu.WorkflowContext is WorkflowContext
-    assert cayu.StepRunOptions is StepRunOptions
-    assert cayu.StepResult is StepResult
-    assert cayu.StepFailure is StepFailure
-    assert cayu.WorkflowBase is WorkflowBase
-    assert cayu.gated_loop is gated_loop
-    assert cayu.parallel is parallel
-    assert cayu.pipeline is pipeline
-    assert cayu.step is step
+    assert cayu.workflows.WorkflowContext is WorkflowContext
+    assert cayu.workflows.StepRunOptions is StepRunOptions
+    assert cayu.workflows.StepResult is StepResult
+    assert cayu.workflows.StepFailure is StepFailure
+    assert cayu.workflows.WorkflowBase is WorkflowBase
+    assert cayu.workflows.gated_loop is gated_loop
+    assert cayu.workflows.parallel is parallel
+    assert cayu.workflows.pipeline is pipeline
+    assert cayu.workflows.step is step
 
     assert workflows.WORKFLOW_JOURNAL_MODEL == WORKFLOW_JOURNAL_MODEL
     assert workflows.WORKFLOW_JOURNAL_PROVIDER == WORKFLOW_JOURNAL_PROVIDER

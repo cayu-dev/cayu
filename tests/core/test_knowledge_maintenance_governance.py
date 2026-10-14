@@ -23,7 +23,7 @@ from tests.core.test_knowledge_maintenance_persistence import (
     _publisher,
 )
 
-import cayu
+import cayu.knowledge.maintenance_governance
 from cayu.knowledge.maintenance_governance import (
     KnowledgeMaintenanceGovernanceDecision,
     KnowledgeMaintenanceGovernanceDisposition,
@@ -554,8 +554,8 @@ def test_public_maintenance_governance_exports_are_stable() -> None:
         "load_knowledge_maintenance_governance_receipt",
         "prepare_knowledge_maintenance_governance_request",
     ):
-        assert name in cayu.__all__
-        assert getattr(cayu, name) is not None
+        assert name in dir(cayu.knowledge.maintenance_governance)
+        assert getattr(cayu.knowledge.maintenance_governance, name) is not None
 
 
 def test_deterministic_example_covers_all_governance_modes(capsys) -> None:

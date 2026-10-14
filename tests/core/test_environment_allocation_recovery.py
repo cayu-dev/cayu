@@ -8,9 +8,9 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu import AgentSpec, CayuApp, Event, EventType, Message, ResumeRequest, RunRequest
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.environments import (
     Environment,
     EnvironmentAllocationContext,
     EnvironmentAllocationIntent,
@@ -22,23 +22,8 @@ from cayu import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    Event,
-    EventQuery,
-    EventType,
-    ExecutionProfileAdoptionIntent,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    InMemorySessionStore,
-    Message,
-    PostgresSessionStore,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionStore,
-    SQLiteSessionStore,
 )
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._environment_allocation import (
     EnvironmentAllocationCoordinator,
@@ -59,8 +44,17 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
+from cayu.sessions import (
+    EventQuery,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    InMemorySessionStore,
+    SessionIdentity,
+    SessionStore,
+)
 from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import CheckpointTransform, Session
+from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import SecretRedactor
 

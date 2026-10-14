@@ -9,7 +9,12 @@ from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_participant_identity import registration as participant_registration
 from tests.core.test_prepared_admission_public import native_stores as native_stores
 
-from cayu import CollaborationHost, HostOwnershipLimits, HostRegistration, HostWaitRule
+from cayu.collaboration import (
+    CollaborationHost,
+    HostOwnershipLimits,
+    HostRegistration,
+    HostWaitRule,
+)
 from cayu.collaboration.requests import RequestControl
 
 pytestmark = pytest.mark.anyio

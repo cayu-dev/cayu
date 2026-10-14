@@ -22,17 +22,9 @@ def test_inspect_json_discovers_nested_project_and_builds_factory_once(
     (project / "inspect_project.py").write_text(
         """from pathlib import Path
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    ScriptedModelProvider,
-    Tool,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+from cayu import AgentSpec, CayuApp, Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals import ScriptedModelProvider
 
 
 class ReviewTool(Tool):
@@ -109,7 +101,8 @@ def test_inspect_subject_filter_and_missing_subject_use_structured_contract(
         encoding="utf-8",
     )
     (tmp_path / "filter_project.py").write_text(
-        """from cayu import AgentSpec, CayuApp, ScriptedModelProvider
+        """from cayu import AgentSpec, CayuApp
+from cayu.evals import ScriptedModelProvider
 
 
 def build_app():

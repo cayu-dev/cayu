@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from cayu import ExecCommand, LocalRunner
+from cayu.runners import ExecCommand, LocalRunner
 from cayu.runners import _subprocess as subprocess_module
 from cayu.runners.base import runner_workspace_mutation_settlement
 

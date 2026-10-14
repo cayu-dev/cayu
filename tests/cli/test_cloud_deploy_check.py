@@ -22,7 +22,9 @@ import os
 
 from fastapi import HTTPException, Request
 
-from cayu import AgentSpec, CayuApp, ScriptedModelProvider, SQLiteSessionStore, SQLiteTaskStore
+from cayu import AgentSpec, CayuApp
+from cayu.evals import ScriptedModelProvider
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,

@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-import cayu
 import cayu._version as cayu_version_module
+import cayu.mcp
 from cayu import CayuApp
 from cayu.cli import _version, main
 
@@ -30,7 +30,8 @@ def test_console_discovers_project_and_opens_booted_namespace(
     (project / "console_project_app.py").write_text(
         """from pathlib import Path
 
-from cayu import AgentSpec, CayuApp, Environment, EnvironmentSpec
+from cayu import AgentSpec, CayuApp
+from cayu.environments import Environment, EnvironmentSpec
 
 build_count = 0
 
@@ -327,7 +328,7 @@ def test_other_cli_commands_work_without_ipython(monkeypatch, capsys) -> None:
 
 def test_package_version_attribute_and_root_version_flag(capsys) -> None:
     assert cayu.__version__ == _version()
-    assert cayu.__version__ == cayu.DEFAULT_MCP_CLIENT_VERSION
+    assert cayu.__version__ == cayu.mcp.DEFAULT_MCP_CLIENT_VERSION
 
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])

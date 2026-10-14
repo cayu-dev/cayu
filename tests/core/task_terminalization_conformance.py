@@ -7,9 +7,8 @@ from uuid import uuid4
 import pytest
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
-from cayu import (
-    ResolutionActor,
-    ResolutionActorSource,
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.tasks import (
     Task,
     TaskCancellationReconciliationConflict,
     TaskCancellationReconciliationEventType,

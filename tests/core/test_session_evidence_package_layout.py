@@ -26,7 +26,7 @@ _PUBLIC_RECORDS = (
 def test_session_record_imports_preserve_public_identity_and_pickle_globals():
     from cayu.sessions import base, records
 
-    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    surfaces = [importlib.import_module(name) for name in ("cayu.sessions",)]
     for name in _PUBLIC_RECORDS:
         canonical = getattr(records, name)
         assert getattr(base, name) is canonical
@@ -39,7 +39,7 @@ def test_session_record_imports_preserve_public_identity_and_pickle_globals():
     )
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_public_session_records_work_without_loading_concrete_stores(public_module):
     result = subprocess.run(
         [
@@ -161,7 +161,7 @@ for field, value in (
 def test_terminal_evidence_imports_preserve_public_identity_and_pickle_globals():
     from cayu.sessions import base, terminal_evidence
 
-    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    surfaces = [importlib.import_module(name) for name in ("cayu.sessions",)]
     names = (
         "TerminalPublicationMarker",
         "TerminalSessionEvidence",
@@ -187,7 +187,7 @@ def test_terminal_evidence_imports_preserve_public_identity_and_pickle_globals()
     assert base.copy_terminal_session_evidence is terminal_evidence.copy_terminal_session_evidence
 
 
-@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+@pytest.mark.parametrize("public_module", ("cayu.sessions",))
 def test_terminal_evidence_composes_without_loading_concrete_stores(public_module):
     result = subprocess.run(
         [

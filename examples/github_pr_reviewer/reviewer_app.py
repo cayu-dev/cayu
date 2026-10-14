@@ -7,17 +7,10 @@ from examples.github_pr_reviewer.github_tools import GetPRDiffTool, PostPRCommen
 from examples.github_pr_reviewer.qa_policy import QaCommandPolicy
 from examples.github_pr_reviewer.workspace import PRReviewWorkspaceFactory
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    ExecCommandTool,
-    ListFilesTool,
-    ReadFileTool,
-    SQLiteTaskStore,
-    StaticToolPolicy,
-    Tool,
-)
+from cayu import AgentSpec, CayuApp, Tool
+from cayu.environments import EnvironmentSpec
+from cayu.storage import SQLiteTaskStore
+from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, StaticToolPolicy
 
 REVIEWER_SYSTEM_PROMPT = """\
 You are an autonomous pull-request review agent. For the pull request described in
@@ -70,11 +63,11 @@ def build_app(
 def build_provider() -> tuple[object, str]:
     """Pick a real provider from whichever key is set (used outside the demo)."""
     if os.environ.get("ANTHROPIC_API_KEY"):
-        from cayu import AnthropicProvider
+        from cayu.providers import AnthropicProvider
 
         return AnthropicProvider(), os.environ.get("CAYU_MODEL", "claude-sonnet-4-6")
     if os.environ.get("OPENAI_API_KEY"):
-        from cayu import OpenAIProvider
+        from cayu.providers import OpenAIProvider
 
         return OpenAIProvider(), os.environ.get("CAYU_MODEL", "gpt-5.6-luna")
     raise RuntimeError("Set ANTHROPIC_API_KEY or OPENAI_API_KEY to run a live review.")

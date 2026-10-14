@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-import cayu
+import cayu.tools
 import cayu.tools.exposure as exposure_contracts
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -163,7 +163,7 @@ def test_tool_capability_ceiling_is_versioned_owned_and_fingerprint_bound() -> N
     assert ceiling.schema_version == 1
     assert ceiling.tool_names == ("alpha", "beta")
     assert len(ceiling.fingerprint) == 64
-    assert cayu.ToolCapabilityCeiling is ToolCapabilityCeiling
+    assert cayu.tools.ToolCapabilityCeiling is ToolCapabilityCeiling
     assert ToolCapabilityCeiling.model_validate(ceiling.model_dump(mode="json")) == ceiling
 
     dumped = ceiling.model_dump(mode="json")
@@ -381,8 +381,8 @@ def test_policy_metadata_is_json_safe_and_bounded() -> None:
 
 
 def test_policy_decision_and_exposure_evidence_have_distinct_public_names() -> None:
-    assert cayu.ToolExposureDecision is ToolExposureDecision
-    assert cayu.ToolExposure is ToolExposure
+    assert cayu.tools.ToolExposureDecision is ToolExposureDecision
+    assert cayu.tools.ToolExposure is ToolExposure
     evidence = ToolExposure(
         execution_profile_fingerprint="b" * 64,
         profile_id="review",

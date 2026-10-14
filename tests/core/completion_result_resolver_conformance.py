@@ -13,35 +13,29 @@ from tests.core.test_completion_decision_application import (
     _result,
 )
 
-from cayu import (
-    CayuApp,
-    CompletionResultResolutionRequest,
-    CompletionResultResolver,
-    CompletionResultResolverExecutionError,
-    CompletionResultResolverRequest,
-    CompletionResultResolverUnavailable,
-    CompletionResultUnavailable,
+from cayu import CayuApp, Event, EventType, Message, RunRequest, SessionStatus
+from cayu.sessions import EventQuery, InMemorySessionStore, Session, SessionIdentity
+from cayu.sessions.forks import fork_session_invocation
+from cayu.sessions.requests import run_request_with_task_invocation
+from cayu.sessions.store import SessionStore
+from cayu.tasks import (
     CompletionVerdict,
-    Event,
-    EventQuery,
-    EventType,
-    InMemorySessionStore,
     InMemoryTaskStore,
-    Message,
-    RunRequest,
-    Session,
-    SessionIdentity,
-    SessionStatus,
     Task,
     TaskCreate,
     TaskInvocationSnapshot,
     TaskStatus,
     WorkCompletionConflict,
 )
-from cayu.sessions.forks import fork_session_invocation
-from cayu.sessions.requests import run_request_with_task_invocation
-from cayu.sessions.store import SessionStore
 from cayu.tasks.store import TaskStore
+from cayu.verification import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+    CompletionResultResolverExecutionError,
+    CompletionResultResolverRequest,
+    CompletionResultResolverUnavailable,
+    CompletionResultUnavailable,
+)
 
 
 @dataclass(frozen=True)

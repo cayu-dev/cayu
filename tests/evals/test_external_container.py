@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from cayu import FileAttachment, FileAttachmentKind, Message, ResolvedFileAttachment
+from cayu import Message
+from cayu.artifacts import FileAttachment, FileAttachmentKind, ResolvedFileAttachment
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION
 from cayu.evals.external import (
     EXTERNAL_PROCESS_PROTOCOL_VERSION,

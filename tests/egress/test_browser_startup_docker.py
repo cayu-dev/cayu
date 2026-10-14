@@ -22,22 +22,15 @@ pytestmark = [
 @pytest.mark.parametrize("sandbox_denied", [False, True])
 def test_native_docker_default_setup_navigates(tmp_path, sandbox_denied):
     """Exercise public profile admission and inspect actual native tool output."""
-    from cayu import (
-        AgentSpec,
-        ApprovedEgressDestination,
-        BrowserEgressPolicy,
-        CayuApp,
-        EnvironmentSpec,
-        ExecutionProfileBehaviorIdentity,
-        InMemorySessionStore,
-        LocalArtifactStore,
-        Message,
-        ModelStreamEvent,
-        RunRequest,
-        ScriptedModelProvider,
-        WebBridge,
-        run_to_completion,
-    )
+    from cayu import AgentSpec, CayuApp, Message, RunRequest, run_to_completion
+    from cayu.artifacts import LocalArtifactStore
+    from cayu.egress import ApprovedEgressDestination, BrowserEgressPolicy
+    from cayu.environments import EnvironmentSpec
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+    from cayu.sessions import InMemorySessionStore
+    from cayu.tools import WebBridge
 
     async def scenario():
         artifacts = LocalArtifactStore(tmp_path / "artifacts", store_id="public-web-run")

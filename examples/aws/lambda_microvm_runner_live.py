@@ -9,7 +9,8 @@ import os
 from examples._live_checks import require, require_exec_success
 from examples._runner_conformance import verify_bounded_output_drain
 
-from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
+from cayu.runners import ExecCommand, LambdaMicroVMRunner
+from cayu.workspaces import RunnerWorkspace
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 

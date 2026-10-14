@@ -10,28 +10,28 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
-    ExecutionProfileAdoptionIntent,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
     Message,
-    ResolutionActor,
-    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
-    ScriptedModelProvider,
-    Session,
-    SessionExecutionSource,
-    SessionIdentity,
     SessionStatus,
-    TaintAwareToolPolicy,
     Tool,
     ToolContext,
-    ToolPolicyDecision,
     ToolResult,
     ToolSpec,
 )
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.evals import ScriptedModelProvider
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.providers import ModelStreamEvent
+from cayu.sessions import (
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    Session,
+    SessionExecutionSource,
+    SessionIdentity,
+)
 from cayu.sessions.forks import fork_session_invocation
+from cayu.tools import TaintAwareToolPolicy, ToolPolicyDecision
 
 
 class UntrustedEvidenceTool(Tool):
@@ -140,7 +140,7 @@ def test_generic_session_fork_inherits_durable_taint() -> None:
 
 def test_agent_override_explains_that_the_source_agent_must_be_registered() -> None:
     async def scenario() -> None:
-        from cayu import InMemorySessionStore
+        from cayu.sessions import InMemorySessionStore
 
         store = InMemorySessionStore()
         source = await store.create(
@@ -229,7 +229,7 @@ def test_profiled_fork_replay_does_not_require_source_registration() -> None:
 
 def test_store_rejects_fork_when_source_run_epoch_changed_during_preparation() -> None:
     async def scenario() -> None:
-        from cayu import InMemorySessionStore
+        from cayu.sessions import InMemorySessionStore
 
         store = InMemorySessionStore()
         source = await store.create(

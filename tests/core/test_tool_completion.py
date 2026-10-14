@@ -15,23 +15,21 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
-    ExecutionProfileBehaviorIdentity,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
     Message,
-    ModelStreamEvent,
-    RequireFinalTool,
     ResumeRequest,
     RunRequest,
-    ScriptedModelProvider,
     SessionStatus,
     Tool,
-    ToolCompletionPolicy,
     ToolContext,
     ToolEffect,
     ToolResult,
     ToolSpec,
 )
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import RequireFinalTool, ToolCompletionPolicy
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import IncompleteSessionRecoveryRequest, InMemorySessionStore
 
 
 class FinalTool(Tool):
@@ -373,7 +371,7 @@ def test_a_fresh_resumed_turn_requires_its_own_policy(enabled_on_resume):
         app = app_for(store, provider, tool)
         [e async for e in app.run(request(tool_completion={"tool_names": ["ask_customer"]}))]
         if not enabled_on_resume:
-            from cayu import ExecutionProfileMismatchError
+            from cayu.runtime import ExecutionProfileMismatchError
 
             with pytest.raises(ExecutionProfileMismatchError):
                 [
@@ -490,7 +488,7 @@ def test_require_final_tool_reminds_then_success_completes_immediately():
 def test_approval_continuation_retains_policy_and_denial_cannot_complete(store_factory, approve):
     from tests.core.test_require_final_tool import _ApprovalPolicy
 
-    from cayu import ToolApprovalDecision, ToolApprovalRequest
+    from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
 
     session_id = f"approval-{approve}"
 
@@ -575,7 +573,7 @@ def test_run_outcome_exposes_a_detached_tool_result():
 
 @pytest.mark.parametrize("blocked", [False, True])
 def test_malformed_and_policy_blocked_calls_cannot_complete(blocked):
-    from cayu import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
+    from cayu.tools import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
 
     class Deny(ToolPolicy):
         async def authorize(self, request):
@@ -617,7 +615,7 @@ def test_malformed_and_policy_blocked_calls_cannot_complete(blocked):
 
 
 def test_completion_does_not_grant_exposure_or_capabilities():
-    from cayu import StaticToolExposurePolicy
+    from cayu.tools import StaticToolExposurePolicy
 
     async def scenario():
         store = InMemorySessionStore()
@@ -646,7 +644,7 @@ def test_completion_does_not_grant_exposure_or_capabilities():
 
 
 def test_structured_output_combination_is_rejected_before_provider_dispatch():
-    from cayu import StructuredOutputSpec
+    from cayu.context import StructuredOutputSpec
 
     async def scenario():
         provider = _TwoCallProvider([])
@@ -667,7 +665,7 @@ def test_structured_output_combination_is_rejected_before_provider_dispatch():
 
 
 def test_secret_names_are_rejected_before_provider_dispatch():
-    from cayu import SecretRedactor
+    from cayu.vaults import SecretRedactor
 
     async def scenario():
         provider = _TwoCallProvider([])
@@ -686,7 +684,8 @@ def test_secret_names_are_rejected_before_provider_dispatch():
 
 
 def test_completion_uses_hook_modified_and_secret_projected_result():
-    from cayu import AfterToolCallDecision, RuntimeHook, SecretRedactor
+    from cayu.observability import AfterToolCallDecision, RuntimeHook
+    from cayu.vaults import SecretRedactor
 
     class Modify(RuntimeHook):
         async def after_tool_call(self, context):
@@ -724,8 +723,8 @@ def test_completion_uses_hook_modified_and_secret_projected_result():
 
 
 def test_retry_retains_policy_and_success_has_no_followup_request():
-    from cayu import RetryPolicy
     from cayu.providers.base import ModelProviderError
+    from cayu.providers.retry_policy import RetryPolicy
 
     class RetryProvider(_TwoCallProvider):
         async def stream(self, request):
@@ -806,7 +805,8 @@ def test_terminal_and_transcript_result_mismatch_fails_closed():
 
 
 def test_disabled_policy_keeps_existing_serialization_and_finalization_material():
-    from cayu import RetryPolicy, RunLimits
+    from cayu.budgets.run_limits import RunLimits
+    from cayu.providers.retry_policy import RetryPolicy
     from cayu.runtime._execution_profile_admission import model_finalization_material
 
     assert "tool_completion" not in request().model_dump(mode="json")
@@ -829,7 +829,7 @@ def test_disabled_policy_keeps_existing_serialization_and_finalization_material(
 def test_recorded_policy_lookup_loads_only_required_evidence(configured, checkpoint_state):
     from scripts.benchmark_tool_round import observe_store
 
-    from cayu import RetryPolicy
+    from cayu.providers.retry_policy import RetryPolicy
     from cayu.runtime._tool_completion import load_recorded_tool_completion_policy
     from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 
@@ -917,7 +917,7 @@ def test_portable_work_attempt_source_preserves_completion_controls(kind, policy
 
 @pytest.mark.parametrize("worker", [False, True])
 def test_final_tool_uses_normal_task_completion_owner(worker):
-    from cayu import InMemoryTaskStore, TaskCreate, TaskStatus
+    from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
 
     async def scenario():
         sessions = InMemorySessionStore()
@@ -952,7 +952,7 @@ def test_final_tool_uses_normal_task_completion_owner(worker):
 def test_admitted_work_attempt_retains_policy_and_preserves_task_verification():
     from tests.core.test_verified_work_contracts import _contract
 
-    from cayu import InMemoryTaskStore, TaskCreate, TaskStatus
+    from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
     from cayu.tasks.admission import WorkAttemptExecutionRequest, WorkAttemptRunRequest
 
     async def scenario():
@@ -1004,7 +1004,7 @@ def test_admitted_work_attempt_retains_policy_and_preserves_task_verification():
 
 
 def test_queued_turn_keeps_its_admitted_policy_and_completes_from_its_own_tool():
-    from cayu import EnqueueSessionMessageRequest
+    from cayu.sessions import EnqueueSessionMessageRequest
 
     async def scenario():
         entered = asyncio.Event()

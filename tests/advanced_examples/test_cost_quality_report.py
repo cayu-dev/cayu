@@ -8,12 +8,11 @@ from examples._advanced_support import (
     paired_cost_quality_report,
 )
 
-from cayu import (
+from cayu import Event, EventType
+from cayu.budgets import (
     ComparableGenerationSettings,
     ComparableOutputBudget,
     CostQualityAttemptOperation,
-    Event,
-    EventType,
     ModelPrice,
     PairedQualityEvidence,
     PriceBook,

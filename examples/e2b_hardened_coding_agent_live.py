@@ -13,24 +13,12 @@ import os
 from collections.abc import AsyncIterator
 
 from _live_checks import require_equal, require_exec_success
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    E2BGuestProvisioner,
-    E2BRunner,
-    E2BWorkspace,
-    Environment,
-    EnvironmentSpec,
-    ExecCommand,
-    ExecCommandTool,
-    Message,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    ReadFileTool,
-    RunRequest,
-    WriteFileTool,
-)
+from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu.environments import Environment, EnvironmentSpec
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners import E2BGuestProvisioner, E2BRunner, ExecCommand
+from cayu.tools import ExecCommandTool, ReadFileTool, WriteFileTool
+from cayu.workspaces import E2BWorkspace
 
 _VERIFICATION_ROOT = "/opt/cayu-verification"
 _EXPECTED_PATH = f"{_VERIFICATION_ROOT}/expected.txt"

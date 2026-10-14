@@ -9,7 +9,8 @@ from tests.core.knowledge_governance_conformance import (
     assert_inaccessible_malformed_activation_receipt_is_hidden,
 )
 
-from cayu import (
+from cayu.knowledge.governance import KnowledgeActivationPolicyError, decide_knowledge_activation
+from cayu.storage import (
     MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
     MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES,
     MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
@@ -20,7 +21,6 @@ from cayu import (
     KnowledgeActivationConflict,
     KnowledgeActivationDecision,
     KnowledgeActivationDisposition,
-    KnowledgeActivationPolicyError,
     KnowledgeActivationReceipt,
     KnowledgeActivationRequest,
     KnowledgeActivationSource,
@@ -33,7 +33,6 @@ from cayu import (
     KnowledgeReviewWorkflow,
     KnowledgeStatus,
     SQLiteKnowledgeStore,
-    decide_knowledge_activation,
     prepare_knowledge_activation_request,
 )
 

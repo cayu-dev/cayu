@@ -6,23 +6,15 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
-    Event,
-    EventType,
-    Message,
-    RetryPolicy,
-    RunDefaults,
-    RunRequest,
-)
+from cayu import AgentSpec, CayuApp, CayuConfig, Event, EventType, Message, RunRequest
+from cayu.configuration import RunDefaults
 from cayu.providers import (
     AnthropicProvider,
     ChatCompletionsProvider,
     ModelProvider,
     OpenAIProvider,
 )
+from cayu.providers.retry_policy import RetryPolicy
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:

@@ -16,22 +16,10 @@ import sys
 from contextlib import suppress
 from datetime import UTC, datetime
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeCurator,
-    KnowledgeCuratorConfig,
-    LearningBatch,
-    LearningCandidate,
-    LearningDecision,
-    LearningSignal,
-    LearningSourceReference,
-    LearningVerdict,
-    RememberKnowledgeTool,
-    ToolContext,
-)
+from cayu import AgentSpec, CayuApp, ToolContext
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope
+from cayu.knowledge.curator import KnowledgeCurator, KnowledgeCuratorConfig, LearningBatch, LearningCandidate, LearningDecision, LearningSignal, LearningSourceReference, LearningVerdict
+from cayu.tools import RememberKnowledgeTool
 from cayu.server import DashboardConfig, ServerConfig, ServerLifecycleConfig, create_server
 
 

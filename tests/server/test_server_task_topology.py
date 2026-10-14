@@ -10,19 +10,14 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import (
-    REDACTED_SECRET,
-    CayuApp,
-    InMemoryTaskStore,
-    Message,
-    SecretRedactor,
-    TaskCreate,
-)
+from cayu import CayuApp, Message
 from cayu.server import ServerConfig, create_server
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
+from cayu.tasks import InMemoryTaskStore, TaskCreate
 from cayu.tasks.topology import TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 def _client(

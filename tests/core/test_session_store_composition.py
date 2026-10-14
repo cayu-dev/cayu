@@ -103,9 +103,7 @@ assert _project_interruption_cascade_marker({"attempt_id": "x" * 129})["attempt_
     )
 
 
-@pytest.mark.parametrize(
-    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.store")
-)
+@pytest.mark.parametrize("public_module", ("cayu.sessions", "cayu.sessions.store"))
 def test_store_interface_and_custom_checkpoint_reader_compose_without_memory(public_module):
     _isolated(
         f"""
@@ -183,7 +181,7 @@ asyncio.run(scenario())
 )
 def test_store_public_imports_and_historical_symbol_pickles_keep_identity(name):
     canonical = getattr(importlib.import_module("cayu.sessions"), name)
-    for module in ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.base"):
+    for module in ("cayu.sessions", "cayu.sessions.base"):
         assert getattr(importlib.import_module(module), name) is canonical
     historical = f"ccayu.sessions.base\n{name}\n.".encode()
     assert pickle.loads(historical) is canonical

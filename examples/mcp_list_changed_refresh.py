@@ -9,15 +9,13 @@ from pathlib import Path
 async def main() -> None:
     """Run a credential-free MCP catalogue-change notification end to end."""
 
-    from cayu import (
-        AgentSpec,
-        CayuApp,
+    from cayu import AgentSpec, CayuApp, ToolContext
+    from cayu.mcp import (
         McpServerSpec,
         McpToolAdapter,
         McpToolsetUnavailable,
         StdioMcpClient,
         StdioMcpProcessLifetime,
-        ToolContext,
         connect_mcp_toolset,
     )
 
@@ -65,7 +63,7 @@ async def main() -> None:
 
 
 async def _wait_for_refresh(toolset) -> None:
-    from cayu import McpToolsetRefreshState
+    from cayu.mcp import McpToolsetRefreshState
 
     async with asyncio.timeout(2):
         while toolset.refresh_state is not McpToolsetRefreshState.READY:

@@ -14,7 +14,6 @@ from pydantic import SecretStr
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 
-from cayu import SQLiteSessionStore
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.internal.browser_acceptance import (
     BrowserAcceptanceDeterministicProvider,
@@ -22,6 +21,7 @@ from cayu.evals.internal.browser_acceptance import (
     build,
 )
 from cayu.evals.internal.browser_acceptance_operator import OperatorFixtureBinding
+from cayu.storage import SQLiteSessionStore
 from cayu.tools.browser_control_config import BrowserControlConfig
 
 
