@@ -25,8 +25,10 @@ from cayu.events import EventType
 from cayu.external_wait_host import ExternalWaitHost
 from cayu.external_waits import ExternalEventWaits
 from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._session_continuation_owner import SessionContinuationOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.session_external_waits import SessionExternalWaitAdapter
+from cayu.sessions._session_continuation import ContinuationUnavailable
 from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitUnavailable
 from cayu.tools.user_input import UserInputTool
 
@@ -53,17 +55,78 @@ class ApprovalPolicy(_RequireApprovalPolicy):
         )
 
 
+@pytest.fixture
+def pending_service_ack(backend, request, monkeypatch):
+    if backend == "postgres":
+        # Allow unavailable backends to skip before requiring an observation.
+        request.getfixturevalue("postgres_dsn")
+    observe = SessionContinuationOwner._observe
+    expired = False
+
+    async def hold_service_ack(owner, operation, *, key, **kwargs):
+        nonlocal expired
+        if key[-1] != "service" or expired:
+            return await observe(owner, operation, key=key, **kwargs)
+        ready, release = asyncio.Event(), asyncio.Event()
+        caller = asyncio.current_task()
+        real_wait = asyncio.wait
+        owned = None
+
+        async def held_ack():
+            result = await operation()
+            ready.set()
+            await release.wait()
+            return result
+
+        async def expire_ack(tasks, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+            nonlocal expired, owned
+            if asyncio.current_task() is caller:
+                assert timeout == owner.owners.observation_timeout
+                (owned,) = tasks
+                ready_wait = asyncio.create_task(ready.wait())
+                try:
+                    # Finish native work before expiring the public observer;
+                    # storage speed must not determine whether this case runs.
+                    done, _ = await real_wait(
+                        {owned, ready_wait}, timeout=60, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    assert ready_wait in done and owned not in done
+                finally:
+                    ready_wait.cancel()
+                    await asyncio.gather(ready_wait, return_exceptions=True)
+                expired = True
+                timeout = 0
+            return await real_wait(tasks, timeout=timeout, return_when=return_when)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "wait", expire_ack)
+            try:
+                return await observe(owner, held_ack, key=key, **kwargs)
+            except ContinuationUnavailable:
+                assert owned in owner.owners.pending
+                assert not owned.done() and not owned.cancelling()
+                raise
+            finally:
+                release.set()
+
+    monkeypatch.setattr(SessionContinuationOwner, "_observe", hold_service_ack)
+    yield
+    assert expired
+
+
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 @pytest.mark.parametrize("pause", ["approval", "user_input"])
 def test_external_event_after_native_pause_restart_preserves_budget(
-    backend, pause, tmp_path, request
+    backend, pause, tmp_path, request, pending_service_ack
 ):
     _native_pause_scenario(backend, pause, tmp_path, request)
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 @pytest.mark.parametrize("pause", ["approval", "user_input"])
-def test_host_preserves_native_pause_until_resolution(backend, pause, tmp_path, request):
+def test_host_preserves_native_pause_until_resolution(
+    backend, pause, tmp_path, request, pending_service_ack
+):
     _native_pause_scenario(backend, pause, tmp_path, request, poll=True)
 
 
@@ -266,7 +329,20 @@ def _native_pause_scenario(backend, pause, tmp_path, request, *, poll=False, con
                     registered, context=CONTEXT, inactive_for_seconds=0
                 )
                 assert len(provider.requests) == 2
-                settled = await final_adapter.service_wait(registered, context=CONTEXT)
+                # Public observation may finish before its owned continuation.
+                # Reconcile the same registration; never repeat the original run.
+                async with asyncio.timeout(60):
+                    while True:
+                        try:
+                            settled = await final_adapter.service_wait(registered, context=CONTEXT)
+                            break
+                        except ExternalWaitUnavailable as pending:
+                            assert str(pending) == "External continuation remains pending."
+                            assert isinstance(pending.__cause__, ContinuationUnavailable)
+                            assert str(pending.__cause__) == (
+                                "Continuation acknowledgement remains pending."
+                            )
+                            await asyncio.sleep(0.01)
                 assert settled.wait.handoff == "settled"
                 assert len(provider.requests) == 3 and tool.calls == expected_calls
                 assert await final_adapter.service_wait(registered, context=CONTEXT) == settled
