@@ -6,8 +6,10 @@ import asyncio
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from tests.core.test_completion_verifier_adapters import (
@@ -32,6 +34,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit, BudgetPolicy
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.deadlines import current_execution_deadline
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
@@ -90,20 +93,67 @@ def _limit_app(sessions, tasks, reason):
     return app, provider, verifier
 
 
+def _expire_worker_deadline(monkeypatch):
+    import cayu.deadlines as deadlines
+
+    boundary = current_execution_deadline()
+    assert boundary.source == "verified-task-worker"
+    remaining = boundary.remaining_seconds()
+    assert remaining is not None and remaining > 0
+    timers = [
+        timer
+        for timer, deadline in deadlines._TIMERS.get()
+        if deadline.expires_at == boundary.expires_at and timer.when() is not None
+    ]
+    assert timers
+    advance = remaining + 1
+    real_time = deadlines.time
+
+    class ExpiredClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(seconds=advance)
+
+    # Advance only execution-deadline clocks; storage leases keep real time.
+    monkeypatch.setattr(deadlines, "datetime", ExpiredClock)
+    monkeypatch.setattr(
+        deadlines, "time", SimpleNamespace(monotonic=lambda: real_time.monotonic() + advance)
+    )
+    assert boundary.expired
+    for timer in timers:
+        timer.reschedule(asyncio.get_running_loop().time())
+
+
 def _crash_after_limit_stop(directory, reason, postgres_dsn=None, unknown_dispatch=False):
-    async def scenario():
+    async def scenario(monkeypatch):
         factory = VerifiedWorkerStoreFactory(
             "postgres" if postgres_dsn else "sqlite", Path(directory), postgres_dsn
         )
         sessions, tasks = factory()
         app, provider, _ = _limit_app(sessions, tasks, reason)
         provider_settled = False
+        expiry_triggered = False
+
+        def expire():
+            nonlocal expiry_triggered
+            assert not expiry_triggered
+            _expire_worker_deadline(monkeypatch)
+            expiry_triggered = True
+
+        if reason == "elapsed_limit" and not unknown_dispatch:
+
+            async def expire_after_model(self, context):
+                expire()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(_WaitAfterModel, "before_stop", expire_after_model)
         if unknown_dispatch:
 
             async def stream(self, request):
                 nonlocal provider_settled
                 self.requests.append(request)
                 try:
+                    expire()
                     await asyncio.Event().wait()
                     yield None
                 finally:
@@ -120,6 +170,7 @@ def _crash_after_limit_stop(directory, reason, postgres_dsn=None, unknown_dispat
             if reason == "budget_limit":
                 assert provider.requests == []
             else:
+                assert expiry_triggered
                 assert len(provider.requests) == 1
                 if unknown_dispatch:
                     assert provider_settled
@@ -134,11 +185,13 @@ def _crash_after_limit_stop(directory, reason, postgres_dsn=None, unknown_dispat
             worker_id="limit-crash-worker",
             lease_seconds=5,
             callback_timeout_seconds=1,
-            max_elapsed_seconds=3 if reason == "elapsed_limit" else 3600,
         ) as worker:
             await worker.run(max_tasks=1)
 
-    asyncio.run(scenario())
+    # Setup must reach the intended model boundary before real timer expiry.
+    # The parent still bounds the whole child process independently.
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        asyncio.run(scenario(monkeypatch))
 
 
 @pytest.mark.parametrize("reason", ["budget_limit", "elapsed_limit"])
