@@ -57,6 +57,16 @@ def _abandoned_execution(session: Session, *, replays_tool_calls: bool = False) 
         _ABANDONED_EXECUTION.reset(token)
 
 
+def abandoned_execution_takeover(session: Session) -> bool:
+    """Whether recovering ``session`` is part of a continuation's takeover of it."""
+
+    current = _ABANDONED_EXECUTION.get()
+    return current is not None and (session.id, session.instance_id) == (
+        current.session_id,
+        current.session_instance_id,
+    )
+
+
 def abandoned_running_execution(session: Session) -> bool:
     """Whether recovering ``session`` takes over its dead running execution to replay.
 

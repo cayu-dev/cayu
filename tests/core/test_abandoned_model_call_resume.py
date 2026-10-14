@@ -182,6 +182,13 @@ def test_resume_recovers_process_death_during_model_call(backend, request, tmp_p
                 and event.payload["reason"] == "continuation_recovered_abandoned_execution"
                 for event in events
             )
+            # The interruption names the takeover, as a tool-call takeover's does.
+            [interrupted] = [
+                event
+                for event in await store.load_events(sid)
+                if event.type is EventType.SESSION_INTERRUPTED
+            ]
+            assert interrupted.payload["reason"] == "continuation_recovered_abandoned_execution"
             settlement = await store.load_model_completion_stage_settlement(
                 sid, active.stage.stage_id
             )

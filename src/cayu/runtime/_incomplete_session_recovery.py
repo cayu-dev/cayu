@@ -3346,12 +3346,17 @@ class IncompleteSessionRecovery:
                 checkpoint=checkpoint,
             )
         ):
+            from cayu.runtime._abandoned_session_recovery import abandoned_execution_takeover
+
             repaired = await self.terminal_finalization.repair(
                 session=session,
                 terminal_run_epoch=session_before_fence.run_epoch,
                 terminal_timestamp=session_before_fence.updated_at,
                 previous_status=previous_status,
                 claim_id=claim_id,
+                # A takeover that already settled the lost model call reports
+                # its own reason, as one that interrupts here does.
+                interruption_reason=reason if abandoned_execution_takeover(session) else None,
             )
             actions.extend(repaired.actions)
             events.extend(repaired.events)

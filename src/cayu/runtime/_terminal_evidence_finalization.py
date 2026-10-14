@@ -781,6 +781,7 @@ class TerminalEvidenceFinalization:
         terminal_timestamp: datetime,
         previous_status: SessionStatus,
         claim_id: str,
+        interruption_reason: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
         checkpoint = await self._session_store.load_checkpoint(session.id)
         inspection = await self._terminal_evidence.inspect(
@@ -796,6 +797,7 @@ class TerminalEvidenceFinalization:
                 pending_interrupt_payload=inspection.pending_interrupt_payload,
                 pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
                 run_operation=inspection.run_operation,
+                interruption_reason=interruption_reason,
             )
             if session.status is SessionStatus.COMPLETED:
                 repair_event.payload.update(
@@ -853,6 +855,7 @@ class TerminalEvidenceFinalization:
         pending_interrupt_payload: dict[str, Any] | None,
         pending_action_interrupt_payload: dict[str, Any] | None,
         run_operation: _SessionRunOperation | None,
+        interruption_reason: str | None = None,
     ) -> Event:
         event_type = _TERMINAL_EVENT_TYPE_BY_STATUS[session.status]
         pending_interrupt_request_id = (
@@ -901,7 +904,7 @@ class TerminalEvidenceFinalization:
         else:
             payload = {
                 "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                "reason": "terminal_event_evidence_repaired",
+                "reason": interruption_reason or "terminal_event_evidence_repaired",
                 "recovered": True,
                 "terminal_evidence_repaired": True,
             }
