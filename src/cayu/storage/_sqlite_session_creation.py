@@ -337,10 +337,10 @@ async def create(
                         sqlite_records.session_label_row_values(session),
                     )
                 if admission is not None:
-                    started_event, source_messages = admission
-                    interaction_id = started_event.interaction_id
-                    if interaction_id is None:
-                        raise AssertionError("Interaction admission lost its identity.")
+                    started_event = admission.started_event
+                    source_messages = list(admission.source_messages)
+                    assert started_event is not None
+                    interaction_id = admission.interaction_id
                     deferred_input = deferred_interaction_input_for_run_request(
                         request,
                         session_id=session.id,

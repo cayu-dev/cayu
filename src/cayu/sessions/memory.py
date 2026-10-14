@@ -2921,8 +2921,8 @@ class InMemorySessionStore(
         prepared_model_transition = session_profile_rules._copy_session_model_transition(
             session_id,
             model_transition,
-            interaction_id=(None if admission is None else admission[1]),
-            interaction_is_new=(admission is not None and admission[0] is not None),
+            interaction_id=(None if admission is None else admission.interaction_id),
+            interaction_is_new=(admission is not None and admission.started_event is not None),
         )
         prepared_execution_profile = session_profile_rules._copy_optional_execution_profile(
             execution_profile
@@ -3004,7 +3004,11 @@ class InMemorySessionStore(
                 )
             )
 
-            if session.status == SessionStatus.PENDING and admission is not None and admission[3]:
+            if (
+                session.status == SessionStatus.PENDING
+                and admission is not None
+                and admission.defer_source
+            ):
                 receipt = self._participant_session_receipts.get(session_id)
                 if receipt is not None:
                     from cayu.sessions._participant_execution_identity import (
@@ -3012,7 +3016,10 @@ class InMemorySessionStore(
                     )
 
                     require_initial_execution_input(
-                        session, receipt, self._transcripts.get(session_id, []), admission[2]
+                        session,
+                        receipt,
+                        self._transcripts.get(session_id, []),
+                        list(admission.source_messages),
                     )
 
             if prepared_model_transition is not None:
@@ -3095,7 +3102,8 @@ class InMemorySessionStore(
                 )
 
             if admission is not None:
-                _, interaction_id, _, defer_source = admission
+                interaction_id = admission.interaction_id
+                defer_source = admission.defer_source
                 existing_deferred = self._deferred_interaction_inputs.get(session_id)
                 if existing_deferred is not None and (
                     not defer_source or existing_deferred.interaction_id != interaction_id
@@ -3170,8 +3178,8 @@ class InMemorySessionStore(
                 admission_events.append(prepared_execution_profile_decision.event)
             if prepared_model_transition is not None:
                 admission_events.append(prepared_model_transition.event)
-            if admission is not None and admission[0] is not None:
-                admission_events.append(admission[0])
+            if admission is not None and admission.started_event is not None:
+                admission_events.append(admission.started_event)
             if admission_events:
                 prepared_events = self._prepare_event_append_unlocked(
                     updated,
@@ -3198,7 +3206,9 @@ class InMemorySessionStore(
             if temporary_records:
                 self._session_operation_records.setdefault(session_id, {}).update(temporary_records)
             if admission is not None:
-                _, interaction_id, source_messages, defer_source = admission
+                interaction_id = admission.interaction_id
+                source_messages = list(admission.source_messages)
+                defer_source = admission.defer_source
                 if prepared_events is not None:
                     self._sessions[session_id] = self._apply_event_append_unlocked(
                         updated,

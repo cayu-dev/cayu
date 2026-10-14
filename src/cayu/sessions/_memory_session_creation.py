@@ -361,10 +361,10 @@ async def create(
                     copied_checkpoint,
                 )
         if admission is not None:
-            started_event, source_messages = admission
-            interaction_id = started_event.interaction_id
-            if interaction_id is None:
-                raise AssertionError("Interaction admission lost its identity.")
+            started_event = admission.started_event
+            source_messages = list(admission.source_messages)
+            assert started_event is not None
+            interaction_id = admission.interaction_id
             prepared_admission_events = state.prepare_event_append(
                 session,
                 [started_event],
@@ -512,9 +512,8 @@ async def create(
         state.refresh_child_lifecycle_candidate(session)
         if prepared_admission_events is not None:
             assert admission is not None
-            started_event, source_messages = admission
-            interaction_id = started_event.interaction_id
-            assert interaction_id is not None
+            source_messages = list(admission.source_messages)
+            interaction_id = admission.interaction_id
             state.sessions[session.id] = state.apply_event_append(
                 session,
                 prepared_admission_events,

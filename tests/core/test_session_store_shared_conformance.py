@@ -425,4 +425,8 @@ from tests.core.session_store_conformance.recall import (
     test_session_store_conformance_persists_carried_recall_receipts,
 )
 
+from tests.core.session_store_conformance.lifecycle import (
+    test_session_store_conformance_admission_detaches_started_and_continued_inputs,
+)
+
 pytestmark = pytest.mark.postgres

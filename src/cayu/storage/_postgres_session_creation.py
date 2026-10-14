@@ -324,11 +324,11 @@ async def create(
                             for key, record in initial_operation_records.items()
                         ],
                     )
-                await register_event_authorities(
-                    cur,
-                    session.id,
-                    [] if admission is None else [admission[0]],
-                )
+                admission_events: list[Event] = []
+                if admission is not None:
+                    assert admission.started_event is not None
+                    admission_events.append(admission.started_event)
+                await register_event_authorities(cur, session.id, admission_events)
                 if session.labels:
                     await cur.executemany(
                         """
@@ -338,10 +338,10 @@ async def create(
                         pg_support.session_label_insert_values(session),
                     )
                 if admission is not None:
-                    started_event, source_messages = admission
-                    interaction_id = started_event.interaction_id
-                    if interaction_id is None:
-                        raise AssertionError("Interaction admission lost its identity.")
+                    started_event = admission.started_event
+                    source_messages = list(admission.source_messages)
+                    assert started_event is not None
+                    interaction_id = admission.interaction_id
                     deferred_input = deferred_interaction_input_for_run_request(
                         request,
                         session_id=session.id,

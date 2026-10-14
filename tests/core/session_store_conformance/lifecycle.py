@@ -2474,3 +2474,69 @@ def test_session_store_conformance_interaction_receipts_do_not_bypass_run_fencin
             await _close_store(store)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("new_interaction", [False, True])
+@pytest.mark.parametrize("defer_source", [False, True])
+def test_session_store_conformance_admission_detaches_started_and_continued_inputs(
+    session_store_case,
+    new_interaction,
+    defer_source,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "admission-detachment"
+        interaction_id = "admitted-interaction"
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            source = [Message.text("user", "original")]
+            started = Event(
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                payload={"nested": {"value": 1}},
+            )
+            await store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                interaction_started_event=started if new_interaction else None,
+                continued_interaction_id=None if new_interaction else interaction_id,
+                interaction_source_messages=source,
+                defer_interaction_source=defer_source,
+            )
+            source[0] = Message.text("user", "changed")
+            source.clear()
+            started.payload["nested"]["value"] = 2
+            started.interaction_id = "changed"
+            store = await _reopen_store(session_store_case, store)
+            events = await store.query_events(EventQuery(session_id=session_id))
+            assert len(events) == int(new_interaction)
+            if events:
+                assert events[0].event.interaction_id == interaction_id
+                assert events[0].event.payload == {"nested": {"value": 1}}
+            deferred = await store.load_deferred_interaction_input(session_id)
+            if defer_source:
+                assert deferred is not None
+                assert deferred.interaction_id == interaction_id
+                assert deferred.source_messages == [Message.text("user", "original")]
+                assert (
+                    await store.query_transcript(TranscriptQuery(session_id=session_id))
+                ).records == []
+                assert await store.materialize_deferred_interaction_input(
+                    session_id, interaction_id=interaction_id
+                )
+            else:
+                assert deferred is None
+            transcript = await store.query_transcript(TranscriptQuery(session_id=session_id))
+            assert [r.message for r in transcript.records] == [Message.text("user", "original")]
+            assert [r.interaction_id for r in transcript.records] == [interaction_id]
+        finally:
+            await store.release_run_fence(session_id)
+            await _close_store(store)
+
+    asyncio.run(run())

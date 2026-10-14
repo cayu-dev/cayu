@@ -717,6 +717,10 @@ trusted restoration and batch validation, preserving the export-publication gate
 interaction transitions and their input validation. These values compose the
 checkpoint mutation contracts in `sessions/_checkpoint_mutations.py` and the
 stage-settlement contracts in `sessions/_model_completion_publication.py`.
+Creation and continuation use the same private `_InteractionAdmission` value:
+validated identity, optional start event, detached source messages and the deferred
+source decision. Its fields and message sequence are immutable; the receiving
+store operation owns the copied event and message payloads.
 The stores retain atomic admission, status checks and checkpoint publication.
 `sessions/interactions.py` retains lightweight lifecycle summaries without
 loading invocation admission, execution profiles or checkpoint mutation rules.

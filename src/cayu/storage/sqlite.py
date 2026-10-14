@@ -3101,8 +3101,8 @@ class SQLiteSessionStore(
         prepared_model_transition = _copy_session_model_transition(
             session_id,
             model_transition,
-            interaction_id=(None if admission is None else admission[1]),
-            interaction_is_new=(admission is not None and admission[0] is not None),
+            interaction_id=(None if admission is None else admission.interaction_id),
+            interaction_is_new=(admission is not None and admission.started_event is not None),
         )
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
@@ -3195,7 +3195,7 @@ class SQLiteSessionStore(
                 if (
                     loaded.status == SessionStatus.PENDING
                     and admission is not None
-                    and admission[3]
+                    and admission.defer_source
                 ):
                     binding_row = self._connection.execute(
                         "SELECT * FROM cayu_participant_session_bindings WHERE session_id = ?",
@@ -3215,7 +3215,7 @@ class SQLiteSessionStore(
                             loaded,
                             reconstruct(dict(binding_row), loaded),
                             [Message.model_validate_json(row[0]) for row in transcript_rows],
-                            admission[2],
+                            list(admission.source_messages),
                         )
                 transition_metadata = transition_profile_metadata
                 if prepared_model_transition is not None:
@@ -3510,7 +3510,10 @@ class SQLiteSessionStore(
                         ),
                     )
                 if admission is not None:
-                    started_event, interaction_id, source_messages, defer_source = admission
+                    started_event = admission.started_event
+                    interaction_id = admission.interaction_id
+                    source_messages = list(admission.source_messages)
+                    defer_source = admission.defer_source
                     existing_deferred = self._connection.execute(
                         "SELECT interaction_id FROM cayu_deferred_interaction_inputs "
                         "WHERE session_id = ?",
@@ -3622,7 +3625,11 @@ class SQLiteSessionStore(
                                 if prepared_model_transition is not None
                                 else []
                             ),
-                            *([admission[0].id] if admission[0] is not None else []),
+                            *(
+                                [admission.started_event.id]
+                                if admission.started_event is not None
+                                else []
+                            ),
                         ],
                     )
                 )

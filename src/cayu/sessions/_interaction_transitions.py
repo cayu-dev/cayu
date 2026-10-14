@@ -689,13 +689,27 @@ def _prepare_interaction_transition(
     return session_id, transition
 
 
+@dataclass(frozen=True, slots=True)
+class _InteractionAdmission:
+    """Detached interaction input validated before a store's atomic admission.
+
+    The field bindings and message sequence are immutable. Event and message
+    payloads are private copies owned by the receiving store operation.
+    """
+
+    interaction_id: str
+    started_event: Event | None
+    source_messages: tuple[Message, ...]
+    defer_source: bool
+
+
 def _copy_interaction_admission(
     session_id: str,
     started_event: Event,
     source_messages: list[Message],
     *,
     defer_transcript: bool,
-) -> tuple[Event, list[Message]]:
+) -> _InteractionAdmission:
     session_id = require_durable_clean_nonblank(session_id, "session_id")
     if type(defer_transcript) is not bool:
         raise TypeError("defer_transcript must be a bool.")
@@ -709,7 +723,12 @@ def _copy_interaction_admission(
     if copied_event.interaction_id is None:
         raise ValueError("started_event must have an interaction_id.")
     copied_messages = copy_transcript_messages(source_messages)
-    return copied_event, copied_messages
+    return _InteractionAdmission(
+        interaction_id=copied_event.interaction_id,
+        started_event=copied_event,
+        source_messages=tuple(copied_messages),
+        defer_source=defer_transcript,
+    )
 
 
 def _copy_optional_interaction_admission(
@@ -718,7 +737,7 @@ def _copy_optional_interaction_admission(
     source_messages: list[Message] | None,
     *,
     defer_transcript: bool,
-) -> tuple[Event, list[Message]] | None:
+) -> _InteractionAdmission | None:
     if (started_event is None) != (source_messages is None):
         raise ValueError(
             "interaction_started_event and interaction_source_messages must be supplied together."
@@ -740,7 +759,7 @@ def _copy_transition_interaction_admission(
     *,
     continued_interaction_id: str | None,
     defer_interaction_source: bool,
-) -> tuple[Event | None, str, list[Message], bool] | None:
+) -> _InteractionAdmission | None:
     if type(defer_interaction_source) is not bool:
         raise TypeError("defer_interaction_source must be a bool.")
     if started_event is not None and continued_interaction_id is not None:
@@ -754,24 +773,20 @@ def _copy_transition_interaction_admission(
     if source_messages is None:
         raise ValueError("interaction_source_messages are required for interaction admission.")
     if started_event is not None:
-        event, messages = _copy_interaction_admission(
+        return _copy_interaction_admission(
             session_id,
             started_event,
             source_messages,
             defer_transcript=defer_interaction_source,
         )
-        interaction_id = event.interaction_id
-        if interaction_id is None:
-            raise AssertionError("Interaction admission lost its identity.")
-        return event, interaction_id, messages, defer_interaction_source
     if continued_interaction_id is None:
         raise AssertionError("Continued interaction admission lost its identity.")
     interaction_id = require_durable_clean_nonblank(
         continued_interaction_id, "continued_interaction_id"
     )
-    return (
-        None,
-        interaction_id,
-        copy_transcript_messages(source_messages),
-        defer_interaction_source,
+    return _InteractionAdmission(
+        interaction_id=interaction_id,
+        started_event=None,
+        source_messages=tuple(copy_transcript_messages(source_messages)),
+        defer_source=defer_interaction_source,
     )
