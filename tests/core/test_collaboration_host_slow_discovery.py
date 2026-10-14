@@ -156,7 +156,6 @@ async def test_blocked_maintenance_source_preserves_unrelated_expiry(
 async def test_saturated_discovery_preserves_producer_cleanup(
     native_stores, monkeypatch, saturation
 ):
-    from tests.core.test_collaboration_host_execution_exclusion import close_request
     from tests.core.test_producer_budget_refusal import authorize_execution
     from tests.core.test_producer_output_contracts import output_scenario
 
@@ -165,6 +164,7 @@ async def test_saturated_discovery_preserves_producer_cleanup(
     from cayu.collaboration._host import _ProducerExecutionRule, _ProducerMaintenanceRule
     from cayu.collaboration._host_producer_execution import HostProducerExecution
     from cayu.collaboration._host_producer_maintenance import HostProducerMaintenance
+    from cayu.collaboration.requests import RequestControl
     from cayu.providers.base import ModelStreamEvent
 
     app, resolver, admission, provider, _, initialized, command, execution = await output_scenario(
@@ -181,7 +181,22 @@ async def test_saturated_discovery_preserves_producer_cleanup(
     ):
         pass
     await app.retain_producer_completion(command, context=CONTEXT)
-    await close_request(app, initialized, admission.expected, resolver.sender.context, "close-done")
+    # Establish the closed source before exercising discovery. The native owner
+    # may outlive its public acknowledgement window without losing the control.
+    async with asyncio.timeout(60):
+        current = await app.inspect_collaboration_request(
+            admission.expected, context=resolver.sender.context
+        )
+        control = RequestControl(
+            operation=initialized.operation("close-done"),
+            expected=admission.expected,
+            expected_revision=current.revision,
+            kind="cancel",
+        )
+        closed = await app._request_coordinator.control(
+            control, context=resolver.sender.context, wait_for_settlement=True
+        )
+        assert closed.expected.intent == control and closed.state == "cancelled"
     recipient = admission.prepared.recipient
     page = await app.pending_producer_outputs(recipient, context=CONTEXT)
     token = next(
@@ -379,15 +394,20 @@ async def test_delayed_producer_discovery_does_not_block_expiry(
         assert observer.cancelled()
         async with asyncio.timeout(30):
             while True:
-                await host.service_once()
+                observed = await host.service_once()
+                assert not observed.source_failures
                 for outcome in host._owned.inspect().completed:
                     if outcome.error is not None:
                         raise outcome.error
-                current = await application.inspect_collaboration_request(
-                    accepted.expected, context=resolver.context
-                )
-                if current.state == "expired":
+                if observed.serviced:
                     break
+                await asyncio.sleep(0.01)
+            # Poll the owner that drives expiry; repeated native inspections
+            # would compete with that work and delay the next service pass.
+            current = await application.inspect_collaboration_request(
+                accepted.expected, context=resolver.context
+            )
+            assert current.state == "expired"
         assert not release.is_set()
         assert producer_reads == 1
         assert host._reads.pending == 1
