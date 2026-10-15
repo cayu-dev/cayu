@@ -33,6 +33,8 @@ _COMMON_NAMES = {
     "ToolResult",
     "ToolSpec",
     "run_to_completion",
+    "send_turn",
+    "TurnRequest",
 }
 
 

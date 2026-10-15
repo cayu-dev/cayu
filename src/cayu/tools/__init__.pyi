@@ -190,6 +190,7 @@ from cayu.tools.knowledge import RememberKnowledgeTool as RememberKnowledgeTool
 from cayu.tools.knowledge import SearchKnowledgeTool as SearchKnowledgeTool
 from cayu.tools.named_checks import NamedCheck as NamedCheck
 from cayu.tools.named_checks import RunCheckTool as RunCheckTool
+from cayu.tools.outcomes import ToolCallSummary as ToolCallSummary
 from cayu.tools.parallel import ParallelAIWebAdapter as ParallelAIWebAdapter
 from cayu.tools.patches import ApplyPatchTool as ApplyPatchTool
 from cayu.tools.policy import ANY_TAINT_LABEL as ANY_TAINT_LABEL

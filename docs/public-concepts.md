@@ -175,7 +175,7 @@ application authors can use them without knowing their defining source modules.
 | Compose an application | `Agent`, `AgentSpec`, `CayuApp`, `CayuConfig` |
 | Exchange messages and events | `Message`, `Event`, `EventType` |
 | Define a custom tool | `Tool`, `ToolSpec`, `ToolContext`, `ToolEffect`, `ToolResult` |
-| Run and resume | `RunRequest`, `ResumeRequest`, `RunOutcome`, `StructuredOutputResult`, `SessionStatus`, `run_to_completion` |
+| Run and resume | `RunRequest`, `ResumeRequest`, `RunOutcome`, `StructuredOutputResult`, `SessionStatus`, `run_to_completion`, `TurnRequest`, `send_turn` |
 | Identify the installed release | `__version__` |
 
 Use the owning public package or module for specialized capabilities. For example:

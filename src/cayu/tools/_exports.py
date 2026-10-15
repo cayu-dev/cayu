@@ -444,6 +444,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "tool_catalogue_descriptors_within_ceiling",
     ),
     "validate_application_tool_name": ("cayu.tools.catalogue", "validate_application_tool_name"),
+    "ToolCallSummary": ("cayu.tools.outcomes", "ToolCallSummary"),
 }
 
 PUBLIC_NAMES = [
@@ -719,4 +720,5 @@ PUBLIC_NAMES = [
     "taint_labels_from_metadata",
     "tool_catalogue_descriptors_within_ceiling",
     "validate_application_tool_name",
+    "ToolCallSummary",
 ]

@@ -370,6 +370,7 @@ from cayu.sessions.messaging import SessionMessageDeliveryMode as SessionMessage
 from cayu.sessions.messaging import SessionMessageQueueStatus as SessionMessageQueueStatus
 from cayu.sessions.messaging import SessionQueuedMessage as SessionQueuedMessage
 from cayu.sessions.messaging import SessionQueuedMessagesPending as SessionQueuedMessagesPending
+from cayu.sessions.outcomes import RunInterruption as RunInterruption
 from cayu.sessions.outcomes import RunOutcome as RunOutcome
 from cayu.sessions.outcomes import StructuredOutputResult as StructuredOutputResult
 from cayu.sessions.outcomes import run_to_completion as run_to_completion
@@ -541,6 +542,8 @@ from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSe
 from cayu.sessions.transcript_queries import TranscriptSearchQuery as TranscriptSearchQuery
 from cayu.sessions.transcript_queries import TranscriptSearchResult as TranscriptSearchResult
 from cayu.sessions.transcript_queries import TranscriptSnapshot as TranscriptSnapshot
+from cayu.sessions.turns import TurnRequest as TurnRequest
+from cayu.sessions.turns import send_turn as send_turn
 from cayu.sessions.usage import UsageRollupQuery as UsageRollupQuery
 
 __all__ = [
@@ -735,6 +738,7 @@ __all__ = [
     "RejectInvocationCommand",
     "ReleaseInvocationCommand",
     "ResumeRequest",
+    "RunInterruption",
     "RunOutcome",
     "RunRequest",
     "RunnerObservedEventIdentity",
@@ -827,6 +831,7 @@ __all__ = [
     "TranscriptSearchQuery",
     "TranscriptSearchResult",
     "TranscriptSnapshot",
+    "TurnRequest",
     "UsageRollupQuery",
     "checkpoint_root_field_projection_from_storage",
     "copy_invocation_lifecycle_command",
@@ -841,6 +846,7 @@ __all__ = [
     "runtime_publication_checkpoint_value_digest",
     "runtime_publication_event_reference",
     "runtime_publication_operation_record_value_digest",
+    "send_turn",
     "session_execution_profiles",
     "session_fork_profile_relationship",
     "session_invocation_for_run_request",

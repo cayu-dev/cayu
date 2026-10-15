@@ -246,6 +246,11 @@ def prepare_resume_request(
     store_resolved_session_id: str | None = None,
 ) -> ResumeRequest:
     request = copy_resume_request(request)
+    require_secret_free_session_authority(
+        request.expected_session_instance_id,
+        field_name="expected_session_instance_id",
+        redactor=redactor,
+    )
     require_secret_free_model_failover_policy(request.failover, redactor=redactor)
     require_secret_free_structured_output_spec(
         request.structured_output,
@@ -1143,6 +1148,10 @@ def work_attempt_source_document(request: RunRequest | ResumeRequest) -> dict[st
         document["failover"] = None
     if request.tool_completion is None and "tool_completion" in request.model_fields_set:
         document["tool_completion"] = None
+    if type(request) is ResumeRequest:
+        for name in ("expected_session_instance_id", "expected_run_epoch"):
+            if name in request.model_fields_set and getattr(request, name) is None:
+                document[name] = None
     if type(request) is RunRequest:
         # An unbounded deadline must not become an inherited replacement
         # deadline merely because the ordinary serializer omits it.

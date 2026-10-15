@@ -479,6 +479,13 @@ class ResumeRequest(BaseModel):
     )
 
     session_id: str
+    # Restrictive optimistic guard: never resume a replacement incarnation.
+    expected_session_instance_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    expected_run_epoch: StrictInt | None = Field(
+        default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER, exclude_if=lambda value: value is None
+    )
     # Optional exact task lease owner for a receipt-backed task continuation.
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
@@ -525,6 +532,13 @@ class ResumeRequest(BaseModel):
         if not copied_messages:
             raise ValueError("ResumeRequest messages cannot be empty.")
         return copied_messages
+
+    @field_validator("expected_session_instance_id")
+    @classmethod
+    def validate_expected_session_instance_id(cls, value: str | None) -> str | None:
+        return (
+            None if value is None else require_clean_nonblank(value, "expected_session_instance_id")
+        )
 
     @field_validator("task_worker_id", "task_handoff_id")
     @classmethod
@@ -1052,6 +1066,8 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         raise ValueError("ResumeRequest messages must be a list.")
     copied = ResumeRequest(
         session_id=request.session_id,
+        expected_session_instance_id=request.expected_session_instance_id,
+        expected_run_epoch=request.expected_run_epoch,
         task_worker_id=request.task_worker_id,
         task_handoff_id=request.task_handoff_id,
         failover=copy_optional_model_failover_policy(request.failover),
@@ -1097,7 +1113,15 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         }
     )
     copied_fields_set = set(copied.model_fields_set)
-    for field_name in ("max_steps", "limits", "thinking", "retry_policy", "tool_completion"):
+    for field_name in (
+        "max_steps",
+        "limits",
+        "thinking",
+        "retry_policy",
+        "tool_completion",
+        "expected_session_instance_id",
+        "expected_run_epoch",
+    ):
         if field_name not in request.model_fields_set:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)

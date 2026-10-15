@@ -676,6 +676,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions._execution_profile_checkpoint",
         "session_execution_profiles",
     ),
+    "TurnRequest": ("cayu.sessions.turns", "TurnRequest"),
+    "send_turn": ("cayu.sessions.turns", "send_turn"),
+    "RunInterruption": ("cayu.sessions.outcomes", "RunInterruption"),
 }
 
 PUBLIC_NAMES = [
@@ -982,4 +985,7 @@ PUBLIC_NAMES = [
     "ReleaseInvocationCommand",
     "SettleInvocationCommand",
     "copy_invocation_lifecycle_command",
+    "TurnRequest",
+    "send_turn",
+    "RunInterruption",
 ]

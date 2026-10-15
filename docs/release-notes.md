@@ -1,5 +1,15 @@
 # Release notes
 
+## Unreleased
+
+- Add `send_turn` and `TurnRequest` for applications that create or continue a
+  conversation and await one result. Creation races and session replacement
+  retain native admission checks. `RunOutcome` now reports invocation usage,
+  model identity, public tool-call summaries and interruption information, with
+  bounded presentation exports and a shared collector for recovery streams.
+  Streaming APIs remain available. See the
+  [terminal-turn contract](runtime-contracts.md#terminal-turn-convenience).
+
 ## v0.11.4
 
 Cayu repairs release qualification customization drift and keeps release publication checks deterministic.

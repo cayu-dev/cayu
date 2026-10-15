@@ -20,6 +20,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ToolSpec": ("cayu.tools.base", "ToolSpec"),
     "__version__": ("cayu._version", "__version__"),
     "run_to_completion": ("cayu.sessions.outcomes", "run_to_completion"),
+    "TurnRequest": ("cayu.sessions.turns", "TurnRequest"),
+    "send_turn": ("cayu.sessions.turns", "send_turn"),
 }
 
 PUBLIC_NAMES = [
@@ -42,4 +44,6 @@ PUBLIC_NAMES = [
     "ToolSpec",
     "__version__",
     "run_to_completion",
+    "TurnRequest",
+    "send_turn",
 ]

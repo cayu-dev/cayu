@@ -31,6 +31,13 @@ disambiguates them so a name never sends you down the wrong path.
   `claim_task` / `complete_task` / `fail_task` — a separate lifecycle, not
   "resuming a task."
 
+- **`send_turn` and `run_to_completion`.** Both return the same `RunOutcome`.
+  `send_turn(app, TurnRequest(...))` selects creation or continuation from a
+  conversation ID; `run_to_completion` consumes an explicitly selected run or
+  resume stream. An outcome describes one consumed invocation, including its
+  usage and tool calls. It is not a cumulative session report. See the
+  [terminal-turn contract](runtime-contracts.md#terminal-turn-convenience).
+
 - **`*Spec` is a suffix with a consistent meaning, one exception.** `AgentSpec`,
   `EnvironmentSpec`, `WorkflowSpec` are the portable, serializable *core* of a
   declaration; live objects (tools, workspaces, runners) attach at construction or

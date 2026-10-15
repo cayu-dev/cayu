@@ -50,6 +50,7 @@ task-backed sessions inherit the immutable root origin automatically.
 
 | Your trigger | Use | Notes |
 | --- | --- | --- |
+| A customer message in a new or existing conversation, with one result to await | `send_turn(app, TurnRequest(...))` | Returns `RunOutcome`. An absent ID creates a session; a supplied ID selects creation or resume once. Active sessions conflict; approvals and recovery keep their dedicated APIs. |
 | A synchronous request you can await in-process | `app.run(RunRequest(...))` | The base case. Returns an async event stream. No durability beyond the session stores. |
 | Durable follow-up work on an **existing** session (retry, continue, deferred step) | `app.dispatch(DispatchRequest(...))` + a worker running `TaskStoreDispatcher.run_worker(app, ...)` | The dispatcher **resumes** existing sessions from durable dispatch requests. |
 | Durable **new** work pulled from a queue (e.g. "review this PR") | `run_task_worker(app, task_store, handler, ...)` | Claims arbitrary `Task`s and starts a **fresh** session per task. This is the PR-reviewer shape. |
@@ -57,6 +58,26 @@ task-backed sessions inherit the immutable root origin automatically.
 | React to Cayu's **own** durable events (budget alerts, session completion) | `EventWatcher` | Trusted app code that pulls the durable event log. **Not** an external-webhook receiver. |
 | Continue one specific session by id | `ResumeRequest` / `ForkSessionRequest` / `InterruptSessionRequest` | Resume appends messages; fork branches without mutating the source; interrupt stops a pending/running session. |
 | Start independent durable work from one exact session checkpoint | `snapshot_fork_source(...)` + `fork_session(ForkSessionRequest(...))` + `dispatch(DispatchRequest(...))` | Bind the snapshot, exact first invocation, and one matching `initial_dispatch_id` to each child, then let ordinary workers run them. Application code consumes results independently and owns any join or evaluation policy. |
+
+For a product response, select the fields its customer needs rather than
+serializing every event or tool result:
+
+```python
+outcome = await send_turn(app, TurnRequest(
+    agent_name="support", session_id=conversation_id,
+    messages=[Message.text("user", customer_message)],
+))
+response = {
+    "conversation_id": outcome.session_id,
+    "status": outcome.status.value,
+    "answer": outcome.final_text,
+}
+```
+
+`outcome.summary()` supplies bounded presentation data when a richer view is
+useful. Applications still decide which results and errors a customer may see.
+See [terminal-turn convenience](runtime-contracts.md#terminal-turn-convenience)
+for interruption, concurrency and opt-in payload rules.
 
 For a coordinator model that must notice independently completing children,
 register `ChildSessionContextContributor` on that parent agent and expose

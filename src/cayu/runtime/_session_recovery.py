@@ -125,6 +125,7 @@ from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (
     Session,
     SessionStatus,
+    SessionStatusConflict,
 )
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
@@ -1365,6 +1366,14 @@ class SessionRecovery:
         session = await self.session_store.load(request.session_id)
         if session is not None:
             await self._require_participant_execution(session, participant_context)
+        if request.expected_session_instance_id is not None and (
+            session is None or session.instance_id != request.expected_session_instance_id
+        ):
+            raise SessionStatusConflict("The session was replaced before this turn could resume.")
+        if request.expected_run_epoch is not None and (
+            session is None or session.run_epoch != request.expected_run_epoch
+        ):
+            raise SessionStatusConflict("The session run changed before this turn could resume.")
         from cayu.runtime._resume_configuration import inherit_resume_configuration
 
         # Bind adoption replay to the caller's request before resolving controls

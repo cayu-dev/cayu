@@ -1068,6 +1068,10 @@ def _limit_reached_payload(
         "message": decision.message,
         "usage_summary": session_usage_summary_payload(usage_summary),
     }
+    if decision.limit is StopLimit.MODEL_STEPS:
+        # Invocation step exhaustion can continue through ordinary resume.
+        # This is observational evidence; admission still validates the checkpoint.
+        payload["resumable"] = True
     if cost_summary is not None:
         payload["cost_summary"] = cost_summary.model_dump(mode="json")
     return payload

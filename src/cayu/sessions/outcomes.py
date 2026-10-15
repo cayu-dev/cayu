@@ -9,10 +9,14 @@ correctly, and returns the answer most callers want.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from cayu._validation import copy_json_value
+from cayu.budgets.usage import AggregateUsageMetrics, build_aggregate_usage_metrics
 from cayu.events import Event, EventType, copy_event
 from cayu.runtime._exception_detail import (
     MAX_EXCEPTION_SUMMARY_UTF8_BYTES,
@@ -22,6 +26,7 @@ from cayu.runtime._exception_detail import (
 from cayu.runtime.tool_completion import ToolCompletionResult
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import ResumeRequest
+from cayu.tools.outcomes import ToolCallSummary
 from cayu.vaults import SecretRedactor
 
 if TYPE_CHECKING:
@@ -42,6 +47,34 @@ class StructuredOutputResult:
     name: str | None
     attempt: int
     max_retries: int
+
+
+class RunInterruption(BaseModel):
+    """Observed interruption; resumability is a hint, never admission authority.
+
+    ``None`` means the stream does not establish ordinary resumability. False
+    requires a dedicated approval/input/recovery operation. Even a true hint
+    remains subject to the current store, checkpoint and execution-profile checks.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[
+        "tool_approval",
+        "user_input",
+        "manual_recovery",
+        "operator",
+        "limit",
+        "delegated_action",
+        "unclassified",
+    ]
+    reason: str | None = None
+    resumable: bool | None = None
+    approval_id: str | None = None
+    input_id: str | None = None
+    tool_round_id: str | None = None
+    tool_call_id: str | None = None
+    limit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,9 +109,34 @@ class RunOutcome:
     interaction_id: str | None = None
     tool_completion: ToolCompletionResult | None = None
     error_detail: ExceptionDetail | None = None
+    provider_name: str | None = None
+    requested_model: str | None = None
+    model: str | None = None
+    model_steps: int = 0
+    unmeasured_model_steps: int = 0
+    usage: AggregateUsageMetrics = field(default_factory=build_aggregate_usage_metrics)
+    tool_calls: tuple[ToolCallSummary, ...] = ()
+    interruption: RunInterruption | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "events", tuple(copy_event(event) for event in self.events))
+        object.__setattr__(
+            self,
+            "usage",
+            AggregateUsageMetrics.model_validate(self.usage.model_dump(mode="python")),
+        )
+        object.__setattr__(
+            self,
+            "tool_calls",
+            tuple(
+                ToolCallSummary.model_validate(call.model_dump(mode="python"))
+                for call in self.tool_calls
+            ),
+        )
+        if self.interruption is not None:
+            object.__setattr__(
+                self, "interruption", RunInterruption.model_validate(self.interruption)
+            )
         if self.error_detail is not None and type(self.error_detail) is not ExceptionDetail:
             raise TypeError("error_detail must be an ExceptionDetail.")
         if self.tool_completion is not None:
@@ -109,6 +167,56 @@ class RunOutcome:
             )
 
     @property
+    def tool_call_count(self) -> int:
+        """Distinct calls observed in this invocation, including blocked calls."""
+        return len(self.tool_calls)
+
+    @property
+    def resumable(self) -> bool | None:
+        if self.status is not SessionStatus.INTERRUPTED or self.interruption is None:
+            return None
+        return self.interruption.resumable
+
+    @classmethod
+    def from_events(cls, events: Iterable[Event], *, session_id: str = "") -> RunOutcome:
+        """Summarize a collected run, approval, input-resolution or recovery stream.
+
+        Only supplied events contribute usage and call outcomes. This performs
+        no store reads and makes no claim that an incomplete stream is terminal.
+        """
+        collector = _OutcomeCollector(session_id)
+        for event in events:
+            collector.observe(event)
+        return collector.finish()
+
+    def summary(
+        self,
+        *,
+        max_bytes: int = 16_384,
+        include_events: bool = False,
+        include_arguments: bool = False,
+        include_structured: bool = False,
+        include_artifacts: bool = False,
+    ) -> dict[str, Any]:
+        """Export bounded presentation data; this is not an authorization boundary.
+
+        The byte bound is measured as compact UTF-8 JSON with ensure_ascii=False.
+        Omitted or shortened requested values are listed in ``omitted_fields``.
+        Raw events and full argument/result/artifact payloads require opt-in and
+        still obey the byte bound. Raw events can themselves contain all payloads.
+        """
+        from cayu.sessions._outcome_summary import summarize_outcome
+
+        return summarize_outcome(
+            self,
+            max_bytes=max_bytes,
+            include_events=include_events,
+            include_arguments=include_arguments,
+            include_structured=include_structured,
+            include_artifacts=include_artifacts,
+        )
+
+    @property
     def ok(self) -> bool:
         """True only if the run reached ``session.completed``."""
         return self.status is SessionStatus.COMPLETED
@@ -129,73 +237,90 @@ async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -
     exception group, its leaf errors. Both are redacted with the app's secret
     redactor.
     """
-    events: list[Event] = []
-    current_turn_text: list[str] = []
-    final_text = ""
-    status = SessionStatus.INTERRUPTED
-    error: str | None = None
-    error_detail: ExceptionDetail | None = None
-    tool_completion: ToolCompletionResult | None = None
-    structured_output: StructuredOutputResult | None = None
-    interaction_id: str | None = None
-    session_id = request.session_id or ""
-
+    collector = _OutcomeCollector(request.session_id or "")
     try:
         stream = app.resume(request) if isinstance(request, ResumeRequest) else app.run(request)
         async for event in stream:
-            events.append(event)
-            session_id = event.session_id
-            if event.interaction_id is not None:
-                interaction_id = event.interaction_id
-            payload = event.payload or {}
-            # EventType is a StrEnum — compare with == never `is` (see the note on Event.type).
-            if event.type == EventType.MODEL_STARTED:
-                current_turn_text = []
-                final_text = ""
-            elif event.type == EventType.MODEL_TEXT_DELTA:
-                delta = payload.get("delta")
-                if isinstance(delta, str):
-                    current_turn_text.append(delta)
-            elif event.type == EventType.MODEL_COMPLETED:
-                final_text = "".join(current_turn_text)
-            elif event.type == EventType.STRUCTURED_OUTPUT_VALIDATED:
-                structured_output = StructuredOutputResult(
-                    output=copy_json_value(payload.get("output"), "structured_output"),
-                    name=payload.get("name") if isinstance(payload.get("name"), str) else None,
-                    attempt=payload["attempt"],
-                    max_retries=payload["max_retries"],
-                )
-            elif event.type == EventType.SESSION_COMPLETED:
-                status = SessionStatus.COMPLETED
-                value = payload.get("tool_completion")
-                tool_completion = (
-                    None if value is None else ToolCompletionResult.model_validate(value)
-                )
-            elif event.type == EventType.SESSION_FAILED:
-                status = SessionStatus.FAILED
-                failure = payload.get("error")
-                error = failure if isinstance(failure, str) else None
-            elif event.type == EventType.SESSION_INTERRUPTED:
-                status = SessionStatus.INTERRUPTED
+            collector.observe(event)
     except Exception as exc:
-        status = SessionStatus.FAILED
         redactor = getattr(app, "_secret_redactor", None)
         if not isinstance(redactor, SecretRedactor):
             redactor = SecretRedactor()
-        error_detail = exception_detail(exc, redactor=redactor)
-        error = redactor.redact_text_bounded(
-            error_detail.summary(),
+        collector.error_detail = exception_detail(exc, redactor=redactor)
+        collector.error = redactor.redact_text_bounded(
+            collector.error_detail.summary(),
             max_bytes=MAX_EXCEPTION_SUMMARY_UTF8_BYTES,
         )
+        collector.status = SessionStatus.FAILED
+    return collector.finish()
 
-    return RunOutcome(
-        session_id=session_id,
-        status=status,
-        final_text=final_text,
-        error=error,
-        events=tuple(events),
-        structured_output=structured_output,
-        tool_completion=tool_completion,
-        interaction_id=interaction_id,
-        error_detail=error_detail,
-    )
+
+class _OutcomeCollector:
+    """One incremental projection for live streams and already collected events."""
+
+    def __init__(self, session_id: str) -> None:
+        from cayu.sessions._outcome_projection import InvocationProjection
+
+        self.session_id = session_id
+        self.events: list[Event] = []
+        self.current_turn_text: list[str] = []
+        self.final_text = ""
+        self.status = SessionStatus.INTERRUPTED
+        self.error: str | None = None
+        self.error_detail: ExceptionDetail | None = None
+        self.tool_completion: ToolCompletionResult | None = None
+        self.structured_output: StructuredOutputResult | None = None
+        self.projection = InvocationProjection()
+
+    def observe(self, event: Event) -> None:
+        self.events.append(event)
+        self.session_id = event.session_id
+        if not self.projection.observe(event, len(self.events) - 1):
+            return
+        payload = event.payload
+        if event.type == EventType.MODEL_STARTED:
+            self.current_turn_text = []
+            self.final_text = ""
+        elif event.type == EventType.MODEL_TEXT_DELTA:
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                self.current_turn_text.append(delta)
+        elif event.type == EventType.MODEL_COMPLETED:
+            self.final_text = "".join(self.current_turn_text)
+        elif event.type == EventType.STRUCTURED_OUTPUT_VALIDATED:
+            self.structured_output = StructuredOutputResult(
+                output=copy_json_value(payload.get("output"), "structured_output"),
+                name=payload.get("name") if isinstance(payload.get("name"), str) else None,
+                attempt=payload["attempt"],
+                max_retries=payload["max_retries"],
+            )
+        elif event.type == EventType.SESSION_COMPLETED:
+            self.status = SessionStatus.COMPLETED
+            self.error = None
+            value = payload.get("tool_completion")
+            self.tool_completion = (
+                None if value is None else ToolCompletionResult.model_validate(value)
+            )
+        elif event.type == EventType.SESSION_FAILED:
+            self.status = SessionStatus.FAILED
+            failure = payload.get("error")
+            self.error = failure if isinstance(failure, str) else None
+        elif event.type == EventType.SESSION_INTERRUPTED:
+            self.status = SessionStatus.INTERRUPTED
+            self.error = None
+
+    def finish(self) -> RunOutcome:
+        projection = self.projection.result()
+        interruption = projection.pop("interruption")
+        return RunOutcome(
+            session_id=self.session_id,
+            status=self.status,
+            final_text=self.final_text,
+            error=self.error,
+            events=tuple(self.events),
+            structured_output=self.structured_output,
+            tool_completion=self.tool_completion,
+            error_detail=self.error_detail,
+            interruption=None if interruption is None else RunInterruption(**interruption),
+            **projection,
+        )

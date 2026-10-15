@@ -8278,6 +8278,105 @@ from `run_to_completion(...).final_text`, which reports the last completed model
 turn observed in that live stream and can be empty even when an earlier persisted
 assistant message contains text.
 
+## Terminal-turn convenience
+
+`send_turn(app, TurnRequest(...))` composes `run_to_completion` with the existing
+`app.run` and `app.resume` APIs. It introduces no separate execution loop or
+result type. Import `TurnRequest` and `send_turn` from `cayu` or `cayu.sessions`.
+
+- `agent_name` and `messages` are explicit. With no session ID, it creates a new
+  generated session. A supplied ID creates that exact session when absent and
+  resumes it when present. The existing agent must match.
+- `TurnRequest` reuses `RunRequest` validation and controls, including structured
+  output, final-tool completion, limits, budgets, retry policy, thinking, tool
+  capabilities and loop policies. Omitted resume controls retain native
+  inheritance. Creation-only settings, including environment, labels, parent,
+  task linkage and execution deadline, must be omitted for an existing session,
+  even when their supplied values equal its current settings. Use the explicit
+  `ResumeRequest` API for resume-only controls such as profile adoption.
+- Selection occurs once. Native atomic creation and resume admission decide
+  whether execution proceeds. Losing a creation race never falls back to
+  appending messages to the winner's session. A resume is pinned to the inspected
+  session incarnation and run epoch through `ResumeRequest.expected_session_instance_id`
+  and `expected_run_epoch`. Deletion and recreation cannot redirect the request
+  to a replacement. A competing turn invalidates the observed epoch before
+  recovery or admission can take over its execution.
+- Pending, running and interrupting sessions raise `SessionStatusConflict`.
+  Request validation, lookup and selection errors raise before execution.
+  Failures while consuming the selected runtime stream become failed outcomes,
+  following `run_to_completion`. Cancellation and process-control exceptions
+  retain their normal propagation.
+- Pending approval, user input, ambiguous effects, incompatible checkpoints and
+  execution profiles keep native admission and recovery checks. The helper
+  neither resolves a human decision nor takes over an active execution.
+
+### Invocation outcome fields
+
+The additional `RunOutcome` fields are projections of consumed public events;
+there are no transcript, checkpoint or session-usage lookups during collection.
+`RunOutcome.from_events(events)` uses the same collector for already collected
+run, approval, input-resolution or recovery streams. It propagates malformed
+projection errors and cannot prove that a partial stream reached a terminal
+boundary. Without a terminal event its status remains `INTERRUPTED`.
+
+- `provider_name`, `requested_model` and `model` come from the latest
+  `model.completed` event. Starting another model step clears them and
+  `final_text`, so an empty or failed later step does not expose an old draft.
+  Unrelated extension events do not change response interaction attribution.
+- `model_steps` counts distinct completed model events. `usage` is the existing
+  `AggregateUsageMetrics` type, summed only from those events; it can exceed the
+  single-step safe-integer bound. Its JSON counters are decimal strings.
+  `unmeasured_model_steps` reports missing or invalid usage. Retry events and
+  historical session totals are excluded; this projection is not a billing ledger.
+- `tool_calls` contains detached `cayu.tools.ToolCallSummary` values in first
+  observed order, including started calls with no terminal event. Event type
+  determines `completed`, `failed` or `blocked`; `result.is_error` alone does not
+  distinguish denial from failure. Summaries retain event IDs and indices,
+  public call/round aliases, the final redacted result, and requested/effective
+  arguments when published. `None` arguments mean unavailable, while `{}` is a
+  real argument value. `arguments_exact` preserves published precision evidence;
+  `None` means unknown. Private idempotency markers become `None`, while a
+  published idempotency key is retained. `tool_call_count` counts these distinct
+  observed calls.
+- Public tool lifecycle events include `tool_call_correlation_id`, derived from
+  session, round and call identity through the existing HMAC alias codec. This
+  observation handle groups start and terminal events whose resolution aliases
+  intentionally differ. `ToolCallSummary.correlation_id` preserves it. Existing
+  call/round aliases still select their original records. The observation handle
+  grants no resolution authority. With a configured store keyring it is stable
+  for that active key; without one it uses a process-local key. It is not a
+  durable application identifier. Older events without it can only be grouped
+  when their supplied session/round/call IDs match; missing historical identity
+  is never guessed from tool names or ordering.
+- Replayed event IDs contribute once to derived values, while the full raw event
+  tuple preserves every consumed occurrence. Recovery terminals need not have a
+  start in the same stream. A newly resolved call contributes once to that
+  invocation; combining separately exported streams across alias-key changes
+  requires application-level reconciliation.
+- `interruption` is a `cayu.sessions.RunInterruption`, with kind, reason, relevant
+  public approval/input/call/round IDs, limit and resumability evidence.
+  `resumable=True` is emitted for model-step exhaustion. `False` identifies a
+  dedicated approval/input/recovery/delegation action; `None` means ordinary
+  resumability was not established. These hints confer no authority and do not
+  bypass current access, checkpoint or execution-profile checks.
+
+### Bounded summaries
+
+`outcome.summary(max_bytes=16384)` returns detached JSON-ready presentation data.
+The limit is measured as compact UTF-8 JSON (`ensure_ascii=False`, separators
+`(',', ':')`) and may range from 1 KiB to 4 MiB. Text is shortened, and fields or
+trailing tool/event entries that do not fit are omitted. `truncated` and
+`omitted_fields` describe those changes; omission labels are field categories,
+not caller-supplied paths.
+
+The default excludes raw events, arguments, structured payloads and artifacts.
+Use `include_events`, `include_arguments`, `include_structured` and
+`include_artifacts` to request them within the same bound. Raw events may contain
+all of those payloads regardless of the other flags. The default still includes
+bounded final text, error and tool-result content, so it is not an authorization
+or data-redaction boundary. The original outcome keeps the full consumed events
+and projected results; summarization does not make collection memory-bounded.
+
 ## Model Step Outcomes
 
 Provider `completed` stream events keep their raw provider payload in the

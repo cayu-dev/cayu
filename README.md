@@ -333,6 +333,30 @@ when an application only needs the result. It retains the complete event stream
 in `RunOutcome.events`; use it for bounded runs. Consume `CayuApp.run(...)`
 incrementally for long-lived or high-volume runs.
 
+For a product that creates or continues conversations, use `send_turn`:
+
+```python
+from cayu import Message, TurnRequest, send_turn
+
+outcome = await send_turn(app, TurnRequest(
+    agent_name="assistant",
+    session_id=conversation_id,  # None generates an ID; an existing ID resumes.
+    messages=[Message.text("user", customer_message)],
+))
+conversation_id = outcome.session_id
+if outcome.ok:
+    print(outcome.final_text)
+else:
+    print(outcome.summary())
+```
+
+It returns the same `RunOutcome`, with invocation usage, model identity, ordered
+public tool-call summaries, and interruption information. Active sessions raise
+`SessionStatusConflict`; approvals, user input and manual recovery keep their
+dedicated resolution APIs. See the
+[terminal-turn contract](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md#terminal-turn-convenience)
+and [runnable example](https://github.com/cayu-dev/cayu/blob/main/examples/send_turn.py).
+
 For a credential-free domain-tool tracer bullet, run `cayu guide
 references#domain-tool`, then use `cayu generate tool`. To add workspace tools
 and command execution, see

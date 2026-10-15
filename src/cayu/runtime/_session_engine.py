@@ -3642,6 +3642,17 @@ class SessionEngine:
             raise KeyError(f"Session not found: {request.session_id}")
         await self._require_participant_execution(loaded_session, participant_context)
         if (
+            request.expected_session_instance_id is not None
+            and loaded_session.instance_id != request.expected_session_instance_id
+        ):
+            raise SessionStatusConflict("The session was replaced before this turn could resume.")
+        if (
+            request.expected_run_epoch is not None
+            and loaded_session.run_epoch != request.expected_run_epoch
+        ):
+            raise SessionStatusConflict("The session run changed before this turn could resume.")
+
+        if (
             required_task_session_instance_id is not None
             and loaded_session.instance_id != required_task_session_instance_id
         ):

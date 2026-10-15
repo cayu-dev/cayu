@@ -38,7 +38,7 @@ only when the requested behavior requires it.
 | --- | --- | --- |
 | Create or extend a generated application | complete scaffold convention, normalized plan, explicit registration | `cayu guide applications` |
 | One model-driven agent | `CayuApp`, `AgentSpec`, `ModelProvider`, `RunRequest` | `cayu guide anatomy` |
-| A provider-neutral run result | `run_to_completion`, `RunOutcome`, events | `cayu guide anatomy#verify-the-contract` |
+| A provider-neutral run result | `send_turn`, `TurnRequest`, `run_to_completion`, `RunOutcome`, events | `cayu guide anatomy#verify-the-contract` |
 | Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | `cayu guide providers`, `cayu guide structured-output` |
 | A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | `cayu guide references#domain-tool` |
 | Replay or mutation semantics | `ToolEffect`, idempotency keys | `cayu guide tool-effects` |
@@ -667,6 +667,29 @@ Environment selection is opt-in. Pass `default=True` to
 unnamed `RunRequest`s should use that environment. Otherwise leave it
 non-default and set `RunRequest.environment_name` explicitly. Registering the
 first environment never makes it the default implicitly.
+
+### Send a conversation turn
+
+Use `send_turn(app, TurnRequest(...))` when a product wants one result after a
+turn. Import both from `cayu`. Supply an explicit agent and messages; omit
+`session_id` to create a session, or pass the conversation's saved ID to create
+that exact ID or resume its existing session. Save `outcome.session_id` for the
+next turn. Creation-only settings such as labels and environment selection must
+be omitted when continuing an existing session.
+
+The result is the same `RunOutcome` returned by `run_to_completion`. Its
+`tool_calls`, `usage`, `model_steps`, and `interruption` describe only the events
+consumed for this invocation. `outcome.summary()` provides a bounded JSON-ready
+view. Full events, arguments, structured data, and artifacts require explicit
+summary options. The result itself retains all consumed events, so stream
+`app.run` or `app.resume` directly for long-running work.
+
+An active session raises `cayu.sessions.SessionStatusConflict`. Resolve an
+approval with `app.resolve_tool_approval`, a user question with
+`app.resolve_user_input`, and an ambiguous tool effect with the appropriate
+recovery API. `RunOutcome.from_events(collected_events)` can summarize those
+streams too. `resumable` describes observed evidence; current execution-profile,
+checkpoint and access checks still decide whether a new turn is admitted.
 
 ### Continue after a process crash
 

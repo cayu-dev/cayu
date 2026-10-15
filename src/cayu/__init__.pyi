@@ -14,6 +14,8 @@ from cayu.sessions.outcomes import run_to_completion as run_to_completion
 from cayu.sessions.records import SessionStatus as SessionStatus
 from cayu.sessions.requests import ResumeRequest as ResumeRequest
 from cayu.sessions.requests import RunRequest as RunRequest
+from cayu.sessions.turns import TurnRequest as TurnRequest
+from cayu.sessions.turns import send_turn as send_turn
 from cayu.tools.base import Tool as Tool
 from cayu.tools.base import ToolContext as ToolContext
 from cayu.tools.base import ToolEffect as ToolEffect
@@ -38,6 +40,8 @@ __all__ = [
     "ToolEffect",
     "ToolResult",
     "ToolSpec",
+    "TurnRequest",
     "__version__",
     "run_to_completion",
+    "send_turn",
 ]
