@@ -15,6 +15,8 @@
     "tests/cli/test_scaffold_import_migrations.py::test_retry_policy_package_import_retains_declaration_safety[max_attempts=construct()]": 0.001714332029223442,
     "tests/core/test_release_artifacts.py::test_release_requires_import_migration_inventory[sdist]": 0.2451799170812592,
     "tests/core/test_release_artifacts.py::test_release_requires_import_migration_inventory[wheel]": 0.05261166603304446,
+    "tests/core/test_tool_call_correlation.py::test_public_correlation_is_scoped_opaque_and_cannot_be_supplied_by_a_producer[False]": 0.002,
+    "tests/core/test_tool_call_correlation.py::test_public_correlation_is_scoped_opaque_and_cannot_be_supplied_by_a_producer[True]": 0.002,
     "tests/test_import_migration_diagnostics.py::test_authoring_exports_keep_their_owner_and_wildcard_visibility[cayu.budgets-cayu.budgets.run_limits-names1]": 0.0002268750686198473,
     "tests/test_import_migration_diagnostics.py::test_authoring_exports_keep_their_owner_and_wildcard_visibility[cayu.coding_products-cayu.coding_products-names3]": 2.2053770010825247,
     "tests/test_import_migration_diagnostics.py::test_authoring_exports_keep_their_owner_and_wildcard_visibility[cayu.providers-cayu.providers.retry_policy-names0]": 0.0004180840915068984,

@@ -35,6 +35,11 @@ from cayu.providers._credential_boundary import copy_provider_cancellation_failu
 from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime._tool_call_correlation import (
+    TOOL_CALL_CORRELATION_EVENT_TYPES,
+    TOOL_CALL_CORRELATION_FIELD,
+    public_tool_call_correlation,
+)
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.runtime._tool_result_adapters import (
     finish_tool_result_event,
@@ -1631,6 +1636,13 @@ def _project_runtime_event(
             else PRIVATE_EVENT_AUTHORITY
         )
     redacted_payload.update(_public_authority_aliases(event, event_sequence=sequence))
+    # Correlation is derived from the record, never trusted from producer data.
+    # Existing event-scoped authority aliases keep their resolution semantics.
+    if event.type in TOOL_CALL_CORRELATION_EVENT_TYPES:
+        redacted_payload.pop(TOOL_CALL_CORRELATION_FIELD, None)
+    correlation = public_tool_call_correlation(event, public_authority_alias_codec)
+    if correlation is not None:
+        redacted_payload[TOOL_CALL_CORRELATION_FIELD] = correlation
     # Only fixed validated discriminators are restored during exposure.
     redacted_payload.update(
         {
