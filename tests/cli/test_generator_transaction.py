@@ -898,6 +898,7 @@ def test_transaction_accepts_platform_width_identities_and_replays_receipt(
         descriptor: int | None = None,
         dir_fd: int | None = None,
         name: str | None = None,
+        ensure_fallback_token: bool = False,
     ) -> publication._Identity:
         captured = real_capture(
             value,
@@ -905,6 +906,7 @@ def test_transaction_accepts_platform_width_identities_and_replays_receipt(
             descriptor=descriptor,
             dir_fd=dir_fd,
             name=name,
+            ensure_fallback_token=ensure_fallback_token,
         )
         return owner._Identity(
             device=(1 << 96) | captured.device,

@@ -90,6 +90,262 @@ def test_linux_zero_inode_generation_fails_closed(
     assert exc_info.value.code == "stable_identity_unavailable"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX descriptor")
+@pytest.mark.parametrize("failure", (errno.ENOTTY, errno.EOPNOTSUPP))
+def test_linux_incarnation_falls_back_when_generation_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: int,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("value", encoding="utf-8")
+    descriptor = os.open(target, os.O_RDONLY)
+    monkeypatch.setattr(publication, "_linux_birth_time_ns", lambda *args, **kwargs: 42)
+
+    def unavailable(*args: object, **kwargs: object) -> int:
+        raise GuardedTreePublicationError(
+            "stable_identity_unavailable", "generation unavailable"
+        ) from OSError(failure, os.strerror(failure))
+
+    monkeypatch.setattr(publication, "_linux_inode_generation", unavailable)
+    try:
+        identity = publication._linux_incarnation(
+            os.fstat(descriptor),
+            path=None,
+            descriptor=descriptor,
+            dir_fd=None,
+            name=None,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert identity == publication._LINUX_FALLBACK_BIRTH_MARKER | 42
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX fcntl")
+def test_linux_incarnation_falls_back_when_generation_is_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcntl
+
+    target = tmp_path / "target.txt"
+    target.write_text("value", encoding="utf-8")
+    descriptor = os.open(target, os.O_RDONLY)
+    monkeypatch.setattr(publication, "_linux_birth_time_ns", lambda *args, **kwargs: 42)
+    monkeypatch.setattr(fcntl, "ioctl", lambda *args, **kwargs: 0)
+    try:
+        identity = publication._linux_incarnation(
+            os.fstat(descriptor),
+            path=None,
+            descriptor=descriptor,
+            dir_fd=None,
+            name=None,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert identity == publication._LINUX_FALLBACK_BIRTH_MARKER | 42
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX descriptor")
+def test_linux_incarnation_falls_back_to_ctime_without_birth_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("value", encoding="utf-8")
+    descriptor = os.open(target, os.O_RDONLY)
+    monkeypatch.setattr(
+        publication,
+        "_linux_birth_time_ns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no birth time")
+        ),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_linux_inode_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no generation")
+        ),
+    )
+    try:
+        value = os.fstat(descriptor)
+        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+        current = os.fstat(descriptor)
+        identity = publication._linux_incarnation(
+            value,
+            path=None,
+            descriptor=descriptor,
+            dir_fd=None,
+            name=None,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert identity == publication._LINUX_FALLBACK_CTIME_MARKER | int(current.st_ctime_ns)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX descriptor")
+def test_linux_incarnation_uses_persistent_fallback_token_for_owned_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("value", encoding="utf-8")
+    descriptor = os.open(target, os.O_RDONLY)
+    xattrs: dict[tuple[int, int, int], bytes] = {}
+
+    def object_key(path: object) -> tuple[int, int, int]:
+        assert isinstance(path, str)
+        value = os.fstat(int(path.rsplit("/", 1)[-1]))
+        return (int(value.st_dev), int(value.st_ino), stat.S_IFMT(value.st_mode))
+
+    def getxattr(path: object, _name: object) -> bytes:
+        try:
+            return xattrs[object_key(path)]
+        except KeyError as exc:
+            raise OSError(errno.ENODATA, "missing") from exc
+
+    def setxattr(path: object, _name: object, value: bytes, flags: int = 0) -> None:
+        key = object_key(path)
+        if flags == publication._LINUX_XATTR_CREATE and key in xattrs:
+            raise OSError(errno.EEXIST, "exists")
+        xattrs[key] = bytes(value)
+
+    monkeypatch.setattr(publication.sys, "platform", "linux")
+    monkeypatch.setattr(publication.os, "getxattr", getxattr, raising=False)
+    monkeypatch.setattr(publication.os, "setxattr", setxattr, raising=False)
+    monkeypatch.setattr(
+        publication,
+        "_linux_birth_time_ns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no birth time")
+        ),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_linux_inode_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no generation")
+        ),
+    )
+    try:
+        value = os.fstat(descriptor)
+        first = publication._linux_incarnation(
+            value,
+            path=None,
+            descriptor=descriptor,
+            dir_fd=None,
+            name=None,
+            ensure_fallback_token=True,
+        )
+        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+        second = publication._linux_incarnation(
+            os.fstat(descriptor),
+            path=None,
+            descriptor=descriptor,
+            dir_fd=None,
+            name=None,
+            ensure_fallback_token=True,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert first == second
+    assert first & publication._LINUX_FALLBACK_XATTR_MARKER
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux fallback APIs")
+def test_guarded_tree_publishes_when_linux_generation_and_birth_time_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "xattr-probe"
+    probe.mkdir()
+    try:
+        os.setxattr(
+            probe,
+            publication._LINUX_FALLBACK_XATTR_NAME,
+            b"0" * publication._LINUX_FALLBACK_TOKEN_BYTES,
+        )
+        os.removexattr(probe, publication._LINUX_FALLBACK_XATTR_NAME)
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support private user xattrs: {exc}")
+    monkeypatch.setattr(
+        publication,
+        "_linux_birth_time_ns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no birth time")
+        ),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_linux_inode_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no generation")
+        ),
+    )
+
+    destination = tmp_path / "published"
+    publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        populate=_populate,
+    )
+
+    assert (destination / "nested/value.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux fallback APIs")
+def test_guarded_tree_replaces_nested_original_when_linux_generation_and_birth_time_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "xattr-probe"
+    probe.mkdir()
+    try:
+        os.setxattr(
+            probe,
+            publication._LINUX_FALLBACK_XATTR_NAME,
+            b"0" * publication._LINUX_FALLBACK_TOKEN_BYTES,
+        )
+        os.removexattr(probe, publication._LINUX_FALLBACK_XATTR_NAME)
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support private user xattrs: {exc}")
+    monkeypatch.setattr(
+        publication,
+        "_linux_birth_time_ns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no birth time")
+        ),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_linux_inode_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GuardedTreePublicationError("stable_identity_unavailable", "no generation")
+        ),
+    )
+
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / "nested").mkdir()
+    (destination / "nested/old.txt").write_text("old\n", encoding="utf-8")
+    publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        policy=DestinationPolicy.REPLACE_DIRECTORY,
+        populate=_populate,
+    )
+
+    assert (destination / "nested/value.txt").read_text(encoding="utf-8") == "new\n"
+
+
 def test_identity_pin_translates_namespace_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2582,6 +2838,7 @@ def test_guarded_tree_publication_rejects_same_content_descendant_replacement_af
         *,
         expected: publication._Identity,
         require_cleanup_access: bool = False,
+        ensure_fallback_token: bool = False,
     ) -> tuple[str, tuple[publication._CleanupEntry, ...]]:
         nonlocal replaced
         if path.name.startswith(".cayu-tree-cleanup-") and not replaced:
@@ -2593,6 +2850,7 @@ def test_guarded_tree_publication_rejects_same_content_descendant_replacement_af
             path,
             expected=expected,
             require_cleanup_access=require_cleanup_access,
+            ensure_fallback_token=ensure_fallback_token,
         )
 
     monkeypatch.setattr(
@@ -2712,6 +2970,7 @@ def test_guarded_tree_recovery_rejects_reused_descendant_inode_after_cleanup_sea
         descriptor: int | None = None,
         dir_fd: int | None = None,
         name: str | None = None,
+        ensure_fallback_token: bool = False,
     ) -> publication._Identity:
         identity = capture_stable_identity(
             value,
@@ -2719,6 +2978,7 @@ def test_guarded_tree_recovery_rejects_reused_descendant_inode_after_cleanup_sea
             descriptor=descriptor,
             dir_fd=dir_fd,
             name=name,
+            ensure_fallback_token=ensure_fallback_token,
         )
         if (
             identity.device == retained_stat.st_dev
@@ -3973,6 +4233,7 @@ def test_guarded_tree_recovery_rejects_reused_published_inode(
         descriptor: int | None = None,
         dir_fd: int | None = None,
         name: str | None = None,
+        ensure_fallback_token: bool = False,
     ) -> publication._Identity:
         identity = capture_stable_identity(
             value,
@@ -3980,6 +4241,7 @@ def test_guarded_tree_recovery_rejects_reused_published_inode(
             descriptor=descriptor,
             dir_fd=dir_fd,
             name=name,
+            ensure_fallback_token=ensure_fallback_token,
         )
         if (
             identity.device == destination_stat.st_dev

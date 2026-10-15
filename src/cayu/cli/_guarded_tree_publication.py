@@ -1,4 +1,13 @@
-"""Crash-aware publication of one complete CLI-owned directory tree."""
+"""Crash-aware publication of one complete CLI-owned directory tree.
+
+On Linux filesystems that do not implement ``FS_IOC_GETVERSION`` (including
+overlayfs and tmpfs), publication uses a marked birth-time identity or a
+private persistent token.  The token is stored as a user extended attribute
+on publisher-owned objects so ordinary writes do not change their identity.
+Read-only observations of unmarked objects retain the weaker change-time
+fallback; mutable publisher-owned objects fail closed when the token cannot
+be persisted.
+"""
 
 from __future__ import annotations
 
@@ -73,6 +82,13 @@ _LINUX_AT_SYMLINK_NOFOLLOW = 0x100
 _LINUX_STATX_BTIME = 0x0800
 _LINUX_STATX_INO = 0x0100
 _LINUX_STATX_TYPE = 0x0001
+_LINUX_FALLBACK_BIRTH_MARKER = 1 << 255
+_LINUX_FALLBACK_CTIME_MARKER = 1 << 254
+_LINUX_FALLBACK_XATTR_MARKER = 1 << 253
+_LINUX_FALLBACK_XATTR_NAME = "user.cayu.stable-incarnation-v1"
+_LINUX_FALLBACK_TOKEN_BYTES = 32
+_LINUX_FALLBACK_TOKEN_MASK = (1 << 253) - 1
+_LINUX_XATTR_CREATE = 1
 _DARWIN_ATTR_BIT_MAP_COUNT = 5
 _DARWIN_ATTR_VOL_INFO = 0x80000000
 _DARWIN_ATTR_VOL_CAPABILITIES = 0x00020000
@@ -291,6 +307,7 @@ def _capture_stable_identity(
     descriptor: int | None = None,
     dir_fd: int | None = None,
     name: str | None = None,
+    ensure_fallback_token: bool = False,
 ) -> _Identity:
     if stat.S_ISLNK(value.st_mode) or _is_windows_reparse_point(value):
         raise GuardedTreePublicationError(
@@ -312,6 +329,7 @@ def _capture_stable_identity(
             descriptor=descriptor,
             dir_fd=dir_fd,
             name=name,
+            ensure_fallback_token=ensure_fallback_token,
         )
     elif sys.platform == "darwin":
         incarnation = _darwin_incarnation(
@@ -354,6 +372,7 @@ def _linux_incarnation(
     descriptor: int | None,
     dir_fd: int | None,
     name: str | None,
+    ensure_fallback_token: bool = False,
 ) -> int:
     pinned, owned = _pin_identity_descriptor(
         expected,
@@ -363,14 +382,119 @@ def _linux_incarnation(
         name=name,
     )
     try:
-        birth_time_ns = _linux_birth_time_ns(expected, descriptor=pinned, path=path)
-        generation = _linux_inode_generation(pinned, path=path)
+        fallback_token = _linux_fallback_xattr(pinned, path=path)
+        if fallback_token is not None:
+            return _LINUX_FALLBACK_XATTR_MARKER | int.from_bytes(
+                fallback_token,
+                byteorder="big",
+            )
+        try:
+            birth_time_ns = _linux_birth_time_ns(expected, descriptor=pinned, path=path)
+        except GuardedTreePublicationError as exc:
+            if exc.code != "stable_identity_unavailable":
+                raise
+            birth_time_ns = None
+        try:
+            generation = _linux_inode_generation(pinned, path=path)
+        except GuardedTreePublicationError as exc:
+            if exc.code != "stable_identity_unavailable":
+                raise
+            # Overlayfs, tmpfs, and several container filesystems do not
+            # implement FS_IOC_GETVERSION.  Prefer a persistent token for
+            # publisher-owned objects so normal writes do not change their
+            # identity; retain ctime only for unmarked objects.
+            if birth_time_ns is not None:
+                return _LINUX_FALLBACK_BIRTH_MARKER | birth_time_ns
+            if ensure_fallback_token:
+                fallback_token = _ensure_linux_fallback_xattr(pinned, path=path)
+                if fallback_token is not None:
+                    return _LINUX_FALLBACK_XATTR_MARKER | int.from_bytes(
+                        fallback_token,
+                        byteorder="big",
+                    )
+                raise GuardedTreePublicationError(
+                    "stable_identity_unavailable",
+                    "Linux fallback identity requires a persistent user xattr",
+                    paths=(() if path is None else (path.name,)),
+                ) from exc
+            changed_ns = int(os.fstat(pinned).st_ctime_ns)
+            if changed_ns < 0:
+                raise
+            return _LINUX_FALLBACK_CTIME_MARKER | changed_ns
     finally:
         if owned:
             _close_descriptor(pinned)
+    if birth_time_ns is None:
+        # A filesystem may expose the ioctl but omit statx birth time.  The
+        # generation remains the strongest signal available; retain ctime as
+        # the low-order supporting evidence for journal compatibility.
+        birth_time_ns = int(expected.st_ctime_ns)
     # Keep creation time as independent supporting evidence. The generation,
     # rather than the timestamp, is the positive proof against inode reuse.
     return (generation << 128) | birth_time_ns
+
+
+def _linux_fallback_xattr(descriptor: int, *, path: Path | None) -> bytes | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    target = f"/proc/self/fd/{descriptor}"
+    try:
+        value = os.getxattr(target, _LINUX_FALLBACK_XATTR_NAME)
+    except OSError as exc:
+        if exc.errno in {
+            errno.ENODATA,
+            getattr(errno, "ENOATTR", errno.ENODATA),
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+            errno.ENOSYS,
+            errno.EINVAL,
+            errno.ENOENT,
+        }:
+            return None
+        raise GuardedTreePublicationError(
+            "stable_identity_unavailable",
+            "Linux fallback identity could not be inspected",
+            paths=(() if path is None else (path.name,)),
+        ) from exc
+    if len(value) != _LINUX_FALLBACK_TOKEN_BYTES or (
+        int.from_bytes(value, byteorder="big") & ~_LINUX_FALLBACK_TOKEN_MASK
+    ):
+        raise GuardedTreePublicationError(
+            "stable_identity_unavailable",
+            "Linux fallback identity has an invalid persistent token",
+            paths=(() if path is None else (path.name,)),
+        )
+    return value
+
+
+def _ensure_linux_fallback_xattr(descriptor: int, *, path: Path | None) -> bytes | None:
+    token = secrets.randbits(253).to_bytes(_LINUX_FALLBACK_TOKEN_BYTES, byteorder="big")
+    target = f"/proc/self/fd/{descriptor}"
+    try:
+        os.setxattr(
+            target,
+            _LINUX_FALLBACK_XATTR_NAME,
+            token,
+            _LINUX_XATTR_CREATE,
+        )
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return _linux_fallback_xattr(descriptor, path=path)
+        if exc.errno in {
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+            errno.ENOSYS,
+            errno.EINVAL,
+            errno.EPERM,
+            errno.ENOENT,
+        }:
+            return None
+        raise GuardedTreePublicationError(
+            "stable_identity_unavailable",
+            "Linux fallback identity could not be persisted",
+            paths=(() if path is None else (path.name,)),
+        ) from exc
+    return token
 
 
 def _linux_birth_time_ns(
@@ -1240,13 +1364,24 @@ class _Parent:
                 paths=(name,),
             ) from exc
 
-    def entry_identity(self, name: str, *, value: os.stat_result) -> _Identity:
+    def entry_identity(
+        self,
+        name: str,
+        *,
+        value: os.stat_result,
+        ensure_fallback_token: bool = False,
+    ) -> _Identity:
         if self.descriptor is None:
-            return _capture_stable_identity(value, path=self.path / name)
+            return _capture_stable_identity(
+                value,
+                path=self.path / name,
+                ensure_fallback_token=ensure_fallback_token,
+            )
         return _capture_stable_identity(
             value,
             dir_fd=self.descriptor,
             name=name,
+            ensure_fallback_token=ensure_fallback_token,
         )
 
     def assert_unchanged(self) -> None:
@@ -1538,7 +1673,13 @@ def _publish_guarded_tree_owned(
 
     original = _validate_destination(parent, destination.name, policy=policy)
     original_identity = (
-        None if original is None else parent.entry_identity(destination.name, value=original)
+        None
+        if original is None
+        else parent.entry_identity(
+            destination.name,
+            value=original,
+            ensure_fallback_token=True,
+        )
     )
     original_destination_mode = None if original is None else stat.S_IMODE(original.st_mode)
     if original_identity is None:
@@ -1549,6 +1690,7 @@ def _publish_guarded_tree_owned(
             parent.path / destination.name,
             expected=original_identity,
             require_cleanup_access=True,
+            ensure_fallback_token=True,
         )
     token = secrets.token_hex(16)
     record = _Record(
@@ -3019,7 +3161,11 @@ def _create_stage_directory_from_fd(
             child = os.open(component, directory_flags, dir_fd=descriptor)
             try:
                 current = os.fstat(child)
-                current_identity = _capture_stable_identity(current, descriptor=child)
+                current_identity = _capture_stable_identity(
+                    current,
+                    descriptor=child,
+                    ensure_fallback_token=True,
+                )
                 if not stat.S_ISDIR(current.st_mode) or (
                     expected is not None and current_identity != expected
                 ):
@@ -3102,6 +3248,11 @@ def _write_stage_file_from_fd(
                 paths=(item.path.as_posix(),),
             ) from exc
         try:
+            _capture_stable_identity(
+                os.fstat(output),
+                descriptor=output,
+                ensure_fallback_token=True,
+            )
             _write_all(output, item.content)
             if item.mode is not None:
                 os.fchmod(output, item.mode)
@@ -3284,7 +3435,12 @@ def _create_private_stage(stage: Path, *, token: str, parent: _Parent) -> None:
     if os.name == "nt":
         security_descriptor_error = _create_private_windows_directory(stage)
         _publication_fault("stage_directory_created")
-        identity = _require_directory_identity(parent, stage.name, label="staging")
+        identity = _require_directory_identity(
+            parent,
+            stage.name,
+            label="staging",
+            ensure_fallback_token=True,
+        )
         with _windows_directory_namespace_fence(stage):
             marker = stage / _OWNER_MARKER
             flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
@@ -3303,7 +3459,12 @@ def _create_private_stage(stage: Path, *, token: str, parent: _Parent) -> None:
             raise AssertionError("POSIX publication parent has no descriptor")
         os.mkdir(stage.name, mode=0o700, dir_fd=parent.descriptor)
         _publication_fault("stage_directory_created")
-        identity = _require_directory_identity(parent, stage.name, label="staging")
+        identity = _require_directory_identity(
+            parent,
+            stage.name,
+            label="staging",
+            ensure_fallback_token=True,
+        )
         directory_flags = (
             os.O_RDONLY
             | getattr(os, "O_CLOEXEC", 0)
@@ -3701,6 +3862,7 @@ def _capture_tree_authority(
     expected: _Identity,
     require_cleanup_access: bool = False,
     entry_limit: int | None = None,
+    ensure_fallback_token: bool = False,
 ) -> tuple[str, tuple[_CleanupEntry, ...]]:
     if entry_limit is None:
         entry_limit = _TREE_ENTRY_LIMIT
@@ -3768,6 +3930,7 @@ def _capture_tree_authority(
             entry_budget=entry_budget,
             linux_mount_points=linux_mount_points,
             require_cleanup_access=require_cleanup_access,
+            ensure_fallback_token=ensure_fallback_token,
         )
         os.fsync(descriptor)
         final_root = os.fstat(descriptor)
@@ -3789,6 +3952,7 @@ def _seal_directory_from_fd(
     entry_budget: _TreeEntryBudget,
     linux_mount_points: frozenset[str],
     require_cleanup_access: bool,
+    ensure_fallback_token: bool = False,
 ) -> None:
     try:
         with os.scandir(descriptor) as scanned_entries:
@@ -3842,10 +4006,17 @@ def _seal_directory_from_fd(
                         descriptor=child,
                         relative=relative.as_posix(),
                     )
-                opened_identity = _capture_stable_identity(
-                    opened,
-                    descriptor=child,
-                )
+                if ensure_fallback_token:
+                    opened_identity = _capture_stable_identity(
+                        opened,
+                        descriptor=child,
+                        ensure_fallback_token=True,
+                    )
+                else:
+                    opened_identity = _capture_stable_identity(
+                        opened,
+                        descriptor=child,
+                    )
                 digest.update(
                     f"d\0{relative.as_posix()}\0{opened_identity.device}\0"
                     f"{opened_identity.inode}\0{opened_identity.kind}\0"
@@ -3871,6 +4042,7 @@ def _seal_directory_from_fd(
                     entry_budget=entry_budget,
                     linux_mount_points=linux_mount_points,
                     require_cleanup_access=require_cleanup_access,
+                    ensure_fallback_token=ensure_fallback_token,
                 )
                 os.fsync(child)
                 if not _Identity.capture(opened).matches(os.fstat(child)):
@@ -3903,7 +4075,18 @@ def _seal_directory_from_fd(
                     descriptor=child,
                     relative=relative.as_posix(),
                 )
-            opened_observation = _FileMutationObservation.capture(opened)
+            if ensure_fallback_token:
+                opened_identity = _capture_stable_identity(
+                    opened,
+                    descriptor=child,
+                    ensure_fallback_token=True,
+                )
+            else:
+                opened_identity = _capture_stable_identity(
+                    opened,
+                    descriptor=child,
+                )
+            opened_observation = _FileMutationObservation.capture(os.fstat(child))
             content_digest = hashlib.sha256()
             content_size = 0
             while chunk := os.read(child, 1024 * 1024):
@@ -3921,10 +4104,6 @@ def _seal_directory_from_fd(
                     "staging file changed while it was sealed",
                     paths=(relative.as_posix(),),
                 )
-            opened_identity = _capture_stable_identity(
-                opened,
-                descriptor=child,
-            )
         finally:
             _close_descriptor(child)
         digest.update(
@@ -4428,6 +4607,7 @@ def _publish_new_regular_file(
         temporary_identity = _capture_stable_identity(
             temporary_value,
             descriptor=descriptor,
+            ensure_fallback_token=True,
         )
         if created_fault_phase is not None:
             _publication_fault(created_fault_phase)
@@ -6036,7 +6216,13 @@ def _require_identity(
         )
 
 
-def _require_directory_identity(parent: _Parent, name: str, *, label: str) -> _Identity:
+def _require_directory_identity(
+    parent: _Parent,
+    name: str,
+    *,
+    label: str,
+    ensure_fallback_token: bool = False,
+) -> _Identity:
     current = parent.entry_stat(name)
     if current is None:
         raise GuardedTreePublicationError(
@@ -6045,7 +6231,11 @@ def _require_directory_identity(parent: _Parent, name: str, *, label: str) -> _I
             paths=(name,),
         )
     _require_plain_directory(current, label=label, path=name)
-    return parent.entry_identity(name, value=current)
+    return parent.entry_identity(
+        name,
+        value=current,
+        ensure_fallback_token=ensure_fallback_token,
+    )
 
 
 def _require_plain_directory(value: os.stat_result, *, label: str, path: str) -> None:
@@ -6144,7 +6334,11 @@ def _capture_parent(path: Path) -> _Identity:
             "publication parent must be an existing ordinary directory",
         ) from exc
     _require_plain_directory(current, label="publication parent", path=path.name)
-    return _capture_stable_identity(current, path=path)
+    return _capture_stable_identity(
+        current,
+        path=path,
+        ensure_fallback_token=True,
+    )
 
 
 @contextmanager
