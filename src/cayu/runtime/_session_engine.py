@@ -876,6 +876,7 @@ class _ResumePreparation:
     budget_policy: BudgetPolicy | None
     loaded_session: Session
     recovery_required: bool
+    recovered_run_epoch: int | None = None
 
 
 class SessionEngine:
@@ -3745,8 +3746,21 @@ class SessionEngine:
 
         if preparation.recovery_required:
             loaded_session = await self.session_store.load(request.session_id)
-            if loaded_session is None:
-                raise KeyError(f"Session not found: {request.session_id}")
+            if (
+                loaded_session is None
+                or loaded_session.instance_id != preparation.loaded_session.instance_id
+            ):
+                raise SessionStatusConflict(
+                    "The session was replaced before this turn could resume."
+                )
+            if (
+                preparation.recovered_run_epoch is None
+                or loaded_session.run_epoch != preparation.recovered_run_epoch
+            ):
+                raise SessionStatusConflict(
+                    "The session run changed before this turn could resume."
+                )
+            await self._require_participant_execution(loaded_session, participant_context)
         fork_initial_profile = _require_exact_fork_initial_invocation_profile(
             loaded_session,
             request,

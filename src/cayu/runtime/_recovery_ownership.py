@@ -1567,6 +1567,8 @@ class RecoveryOwnership:
         claim: _IncompleteRecoveryClaim,
         recovery: Callable[[], Awaitable[_RecoveryResultT]],
     ) -> _RecoveryResultT:
+        from cayu.runtime._abandoned_session_recovery import retain_abandoned_execution_recovery
+
         stop_heartbeat = asyncio.Event()
         recovery_outcome_observed = False
         shutdown_recovery_outcome_observed = False
@@ -1576,6 +1578,7 @@ class RecoveryOwnership:
             session_id=claim.session.id,
             local_lease_deadline=claim.local_lease_deadline,
         )
+        retain_abandoned_execution_recovery(claim.session)
 
         async def run_live_recovery() -> _RecoveryResultT:
             # Recheck in the child at the exact dispatch boundary. Creating a

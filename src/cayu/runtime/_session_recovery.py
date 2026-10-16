@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -529,6 +530,7 @@ class SessionRecovery:
         *,
         participant_context: CollaborationAccessContext | None = None,
         replays_tool_calls: bool = False,
+        retain_recovery_run_epoch: Callable[[int], None] | None = None,
     ) -> tuple[Event, ...]:
         from cayu.runtime._abandoned_session_recovery import recover_abandoned_execution
 
@@ -542,6 +544,7 @@ class SessionRecovery:
             ),
             settle_model_dispatch=self._settle_abandoned_model_dispatch,
             replays_tool_calls=replays_tool_calls,
+            retain_recovery_run_epoch=retain_recovery_run_epoch,
         )
 
     async def _settle_abandoned_model_dispatch(
@@ -1337,10 +1340,16 @@ class SessionRecovery:
             participant_context=participant_context,
             execution_to_wait=execution_to_wait,
         )
+
+        def retain_recovery_run_epoch(run_epoch: int) -> None:
+            nonlocal preparation
+            preparation = replace(preparation, recovered_run_epoch=run_epoch)
+
         recovery_events = await self.recover_abandoned_execution(
             preparation.loaded_session,
             participant_context=participant_context,
             replays_tool_calls=True,
+            retain_recovery_run_epoch=retain_recovery_run_epoch,
         )
         for event in recovery_events:
             yield event
