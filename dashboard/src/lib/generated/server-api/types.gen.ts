@@ -1569,6 +1569,114 @@ export type ApiSessionTopologyNode = {
 };
 
 /**
+ * ApiSupervisionActor
+ */
+export type ApiSupervisionActor = {
+    source?: ResolutionActorSource | null;
+    /**
+     * Subject
+     */
+    subject: string;
+    /**
+     * Tenant
+     */
+    tenant?: string | null;
+};
+
+/**
+ * ApiSupervisionEvent
+ *
+ * One settled supervision touch; linkage ids are event-scoped public aliases.
+ */
+export type ApiSupervisionEvent = {
+    actor?: ApiSupervisionActor | null;
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Approval Id
+     */
+    approval_id?: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Event Id
+     */
+    event_id: string;
+    /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint?: string | null;
+    /**
+     * Forked
+     */
+    forked: boolean;
+    /**
+     * Input Id
+     */
+    input_id?: string | null;
+    /**
+     * Interruption Request Id
+     */
+    interruption_request_id?: string | null;
+    kind: SupervisionEventKind;
+    message_origin?: SupervisionMessageOrigin | null;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id?: string | null;
+    /**
+     * Model Step Id
+     */
+    model_step_id?: string | null;
+    outcome: SupervisionEventOutcome;
+    /**
+     * Parent Session Id
+     */
+    parent_session_id?: string | null;
+    /**
+     * Queue Id
+     */
+    queue_id?: string | null;
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    /**
+     * Requested At
+     */
+    requested_at?: string | null;
+    /**
+     * Resolved At
+     */
+    resolved_at: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Supervision Id
+     */
+    supervision_id: string;
+    /**
+     * Tool Call Count
+     */
+    tool_call_count: number;
+    /**
+     * Tool Name
+     */
+    tool_name?: string | null;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id?: string | null;
+    usage?: UsageMetrics | null;
+};
+
+/**
  * ApiTaskDetail
  */
 export type ApiTaskDetail = {
@@ -2758,6 +2866,42 @@ export type BudgetWindow = {
 };
 
 /**
+ * CacheUsageMetrics
+ *
+ * Provider-neutral cache token counters for one model step.
+ */
+export type CacheUsageMetrics = {
+    /**
+     * Cached Input Tokens
+     */
+    cached_input_tokens?: number;
+    /**
+     * Read Tokens
+     */
+    read_tokens?: number;
+    /**
+     * Uncached Input Tokens
+     */
+    uncached_input_tokens?: number;
+    /**
+     * Write 1H Tokens
+     */
+    write_1h_tokens?: number;
+    /**
+     * Write 5M Tokens
+     */
+    write_5m_tokens?: number;
+    /**
+     * Write Tokens
+     */
+    write_tokens?: number;
+    /**
+     * Write Unknown Ttl Tokens
+     */
+    write_unknown_ttl_tokens?: number;
+};
+
+/**
  * CapabilityManifest
  */
 export type CapabilityManifest = {
@@ -3879,6 +4023,7 @@ export type ControlPlaneSurfaceCapabilities = {
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     session_follow?: OptionalSurfaceCapability | null;
+    supervision?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
@@ -9643,6 +9788,22 @@ export type HostedToolManifest = {
      * Type
      */
     type: 'openai_web_search';
+};
+
+/**
+ * HostedToolUsageMetrics
+ *
+ * Provider-neutral hosted-resource counters for one model attempt.
+ */
+export type HostedToolUsageMetrics = {
+    /**
+     * Web Search Calls
+     */
+    web_search_calls?: number;
+    /**
+     * Web Search Outcome Unknown
+     */
+    web_search_outcome_unknown?: number;
 };
 
 /**
@@ -17359,6 +17520,90 @@ export type StructuredRubricV1 = {
 };
 
 /**
+ * SupervisionEventKind
+ *
+ * Closed set of supervision touches the runtime records durably.
+ */
+export type SupervisionEventKind = 'approve' | 'deny' | 'expire' | 'answer' | 'recover' | 'interrupt' | 'steer';
+
+/**
+ * SupervisionEventOutcome
+ *
+ * Settled result of one supervision touch.
+ */
+export type SupervisionEventOutcome = 'approved' | 'denied' | 'expired' | 'answered' | 'completed' | 'failed' | 'interrupted' | 'delivered' | 'withdrawn' | 'quarantined' | 'stale';
+
+/**
+ * SupervisionEventsRequest
+ *
+ * Half-open ``[start_at, end_at)`` window over settled supervision touches.
+ */
+export type SupervisionEventsRequest = {
+    /**
+     * Actor Sources
+     */
+    actor_sources?: Array<ResolutionActorSource>;
+    /**
+     * Cursor
+     */
+    cursor?: string | null;
+    /**
+     * End At
+     */
+    end_at: string;
+    /**
+     * Exclude Forked Sessions
+     */
+    exclude_forked_sessions?: boolean;
+    /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint?: string | null;
+    /**
+     * Kinds
+     */
+    kinds?: Array<SupervisionEventKind>;
+    /**
+     * Limit
+     */
+    limit?: number;
+    /**
+     * Max Bytes
+     */
+    max_bytes?: number;
+    session_filter?: SessionAggregateFilter;
+    /**
+     * Start At
+     */
+    start_at: string;
+};
+
+/**
+ * SupervisionEventsResponse
+ */
+export type SupervisionEventsResponse = {
+    /**
+     * Events
+     */
+    events: Array<ApiSupervisionEvent>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string;
+};
+
+/**
+ * SupervisionMessageOrigin
+ *
+ * Who submitted a steering message, from durable message provenance.
+ */
+export type SupervisionMessageOrigin = 'actor' | 'session' | 'peer' | 'unknown';
+
+/**
  * SystemDeploymentDiagnostics
  *
  * Bounded resolved server identity and effective access posture.
@@ -18933,6 +19178,45 @@ export type UsageCurrencyCost = {
      * Total Cost
      */
     total_cost: string;
+};
+
+/**
+ * UsageMetrics
+ *
+ * Provider-neutral token counters for one model step.
+ */
+export type UsageMetrics = {
+    billing_identity?: BillingIdentity | null;
+    cache?: CacheUsageMetrics;
+    hosted_tools?: HostedToolUsageMetrics;
+    /**
+     * Input Tokens
+     */
+    input_tokens?: number;
+    /**
+     * Model
+     */
+    model?: string | null;
+    /**
+     * Output Tokens
+     */
+    output_tokens?: number;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Reasoning Output Tokens
+     */
+    reasoning_output_tokens?: number;
+    /**
+     * Requested Model
+     */
+    requested_model?: string | null;
+    /**
+     * Total Tokens
+     */
+    total_tokens?: number;
 };
 
 /**
@@ -24232,6 +24516,39 @@ export type GetSessionUsageApiSessionsSessionIdUsageGetResponses = {
 };
 
 export type GetSessionUsageApiSessionsSessionIdUsageGetResponse = GetSessionUsageApiSessionsSessionIdUsageGetResponses[keyof GetSessionUsageApiSessionsSessionIdUsageGetResponses];
+
+export type QuerySupervisionEventsApiSupervisionEventsQueryPostData = {
+    body: SupervisionEventsRequest;
+    path?: never;
+    query?: never;
+    url: '/api/supervision-events/query';
+};
+
+export type QuerySupervisionEventsApiSupervisionEventsQueryPostErrors = {
+    /**
+     * The request, an evidence read, or the response exceeds its byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The configured store does not implement this aggregate read.
+     */
+    501: ApiErrorResponse;
+};
+
+export type QuerySupervisionEventsApiSupervisionEventsQueryPostError = QuerySupervisionEventsApiSupervisionEventsQueryPostErrors[keyof QuerySupervisionEventsApiSupervisionEventsQueryPostErrors];
+
+export type QuerySupervisionEventsApiSupervisionEventsQueryPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SupervisionEventsResponse;
+};
+
+export type QuerySupervisionEventsApiSupervisionEventsQueryPostResponse = QuerySupervisionEventsApiSupervisionEventsQueryPostResponses[keyof QuerySupervisionEventsApiSupervisionEventsQueryPostResponses];
 
 export type GetSystemDiagnosticsApiSystemDiagnosticsGetData = {
     body?: never;

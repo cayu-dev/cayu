@@ -122,6 +122,26 @@ PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
 """
 
 
+def _event_query_source(query: EventQuery) -> str:
+    """Pin cross-session typed window scans to the type/timestamp index.
+
+    With ``ANALYZE`` statistics SQLite can prefer an ordered rowid range for
+    ``ORDER BY sequence LIMIT``, which walks the whole event history to find
+    rare event types; the index keeps the scan proportional to matching rows.
+    """
+
+    if (
+        query.event_types
+        and (query.since is not None or query.until is not None)
+        and query.session_id is None
+        and not query.session_ids
+        and query.event_id is None
+        and query.interaction_id is None
+    ):
+        return "cayu_events INDEXED BY idx_cayu_events_type_timestamp"
+    return "cayu_events"
+
+
 def _event_query_session_id_batches(
     session_ids: tuple[str, ...],
 ) -> list[tuple[str, ...]]:
@@ -407,6 +427,7 @@ async def query_events(
 
     plan = session_store_sql.build_event_query_sql(query, dialect=SQL_DIALECT)
     params = [*plan.params, query.limit]
+    source = _event_query_source(query)
 
     def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
         event_columns = ", ".join(
@@ -415,7 +436,7 @@ async def query_events(
         rows = connection.execute(
             f"""
             SELECT cayu_events.sequence, {event_columns}
-            FROM cayu_events
+            FROM {source}
             JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
             {plan.where_sql}
             ORDER BY cayu_events.sequence {plan.order_direction}
@@ -688,6 +709,7 @@ async def query_events_bounded(
         raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
     plan = session_store_sql.build_event_query_sql(query, dialect=SQL_DIALECT)
     params = [*plan.params, query.limit]
+    source = _event_query_source(query)
 
     def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
         event_columns = ", ".join(
@@ -708,7 +730,7 @@ async def query_events_bounded(
                 f"""
                 WITH bounded_candidates AS (
                     SELECT {serialized_bytes} AS serialized_bytes
-                    FROM cayu_events
+                    FROM {source}
                     JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                     {plan.where_sql}
                     ORDER BY cayu_events.sequence {plan.order_direction}
@@ -724,7 +746,7 @@ async def query_events_bounded(
             rows = connection.execute(
                 f"""
                 SELECT cayu_events.sequence, {event_columns}
-                FROM cayu_events
+                FROM {source}
                 JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                 {plan.where_sql}
                 ORDER BY cayu_events.sequence {plan.order_direction}

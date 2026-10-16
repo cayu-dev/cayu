@@ -24,6 +24,11 @@ from cayu.resource_access import ScopedCayuAccess
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
+from cayu.sessions.supervision_events import (
+    SupervisionEventCursorInvalid,
+    SupervisionEventQuery,
+    SupervisionEventResultTooLarge,
+)
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.queries import TaskQuery
 
@@ -232,6 +237,27 @@ def create_resource_router(
         query: EventQuery, by_session: bool = False, handle: ScopedCayuAccess = access_dependency
     ):
         return await _checked(handle.sessions.usage(query, by_session=by_session))
+
+    @router.post("/supervision-events/query")
+    async def supervision_events(
+        query: SupervisionEventQuery, handle: ScopedCayuAccess = access_dependency
+    ):
+        try:
+            return await _checked(handle.sessions.supervision_events(query))
+        except SupervisionEventCursorInvalid:
+            raise HTTPException(
+                status_code=422, detail="Invalid supervision event cursor."
+            ) from None
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=501,
+                detail="The configured session store does not support supervision events.",
+            ) from None
+        except SupervisionEventResultTooLarge:
+            raise HTTPException(
+                status_code=413,
+                detail="Supervision events exceed the byte limit; request a smaller page.",
+            ) from None
 
     @router.get("/graphs/{graph_id}")
     async def graph(graph_id: str, handle: ScopedCayuAccess = access_dependency):

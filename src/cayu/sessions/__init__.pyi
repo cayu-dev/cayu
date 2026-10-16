@@ -488,6 +488,37 @@ from cayu.sessions.store import SessionStore as SessionStore
 from cayu.sessions.summaries import EventSummary as EventSummary
 from cayu.sessions.summaries import SessionOperationalSnapshot as SessionOperationalSnapshot
 from cayu.sessions.summaries import SessionOutcome as SessionOutcome
+from cayu.sessions.supervision_events import (
+    SUPERVISION_EVENT_MAX_CURSOR_BYTES as SUPERVISION_EVENT_MAX_CURSOR_BYTES,
+)
+from cayu.sessions.supervision_events import (
+    SUPERVISION_EVENT_MAX_LIMIT as SUPERVISION_EVENT_MAX_LIMIT,
+)
+from cayu.sessions.supervision_events import (
+    SUPERVISION_EVENT_MAX_RESULT_BYTES as SUPERVISION_EVENT_MAX_RESULT_BYTES,
+)
+from cayu.sessions.supervision_events import (
+    SUPERVISION_EVENT_MAX_WINDOW as SUPERVISION_EVENT_MAX_WINDOW,
+)
+from cayu.sessions.supervision_events import SupervisionEvent as SupervisionEvent
+from cayu.sessions.supervision_events import SupervisionEventContent as SupervisionEventContent
+from cayu.sessions.supervision_events import (
+    SupervisionEventCursorInvalid as SupervisionEventCursorInvalid,
+)
+from cayu.sessions.supervision_events import SupervisionEventKind as SupervisionEventKind
+from cayu.sessions.supervision_events import SupervisionEventOutcome as SupervisionEventOutcome
+from cayu.sessions.supervision_events import SupervisionEventPage as SupervisionEventPage
+from cayu.sessions.supervision_events import SupervisionEventQuery as SupervisionEventQuery
+from cayu.sessions.supervision_events import (
+    SupervisionEventResultTooLarge as SupervisionEventResultTooLarge,
+)
+from cayu.sessions.supervision_events import SupervisionMessageOrigin as SupervisionMessageOrigin
+from cayu.sessions.supervision_events import (
+    decode_supervision_event_cursor as decode_supervision_event_cursor,
+)
+from cayu.sessions.supervision_events import (
+    encode_supervision_event_cursor as encode_supervision_event_cursor,
+)
 from cayu.sessions.terminal_evidence import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
 )
@@ -578,6 +609,10 @@ __all__ = [
     "RUNTIME_BUILD_PROVENANCE_METADATA_KEY",
     "SESSION_RUNTIME_METADATA_KEYS",
     "SESSION_RUNTIME_METADATA_PREFIX",
+    "SUPERVISION_EVENT_MAX_CURSOR_BYTES",
+    "SUPERVISION_EVENT_MAX_LIMIT",
+    "SUPERVISION_EVENT_MAX_RESULT_BYTES",
+    "SUPERVISION_EVENT_MAX_WINDOW",
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS",
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES",
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES",
@@ -816,6 +851,15 @@ __all__ = [
     "StoreTimeCheckpointTransform",
     "StoreTimeSessionOperationTransform",
     "StructuredOutputResult",
+    "SupervisionEvent",
+    "SupervisionEventContent",
+    "SupervisionEventCursorInvalid",
+    "SupervisionEventKind",
+    "SupervisionEventOutcome",
+    "SupervisionEventPage",
+    "SupervisionEventQuery",
+    "SupervisionEventResultTooLarge",
+    "SupervisionMessageOrigin",
     "TaskExecutionSource",
     "TaskInvocation",
     "TerminalPublicationMarker",
@@ -837,6 +881,8 @@ __all__ = [
     "copy_invocation_lifecycle_command",
     "copy_recovery_cleanup_policy",
     "copy_session_user_metadata",
+    "decode_supervision_event_cursor",
+    "encode_supervision_event_cursor",
     "exception_detail",
     "is_runtime_owned_session_metadata_key",
     "project_terminal_child_session_result",

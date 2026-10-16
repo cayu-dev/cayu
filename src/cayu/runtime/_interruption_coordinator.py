@@ -83,10 +83,19 @@ _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE: ContextVar[bool] = ContextVar(
 _BACKGROUND_INTERRUPTION_COORDINATOR_STOP: ContextVar[asyncio.Event | None] = ContextVar(
     "cayu_background_interruption_coordinator_stop", default=None
 )
+_BACKGROUND_CASCADE_INTERRUPTION: ContextVar[bool] = ContextVar(
+    "cayu_background_cascade_interruption", default=False
+)
 
 
 def interruption_cascade_suppressed() -> bool:
     return _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get()
+
+
+def background_cascade_interruption_active() -> bool:
+    """Whether the current interrupt is a background cascade from a parent."""
+
+    return _BACKGROUND_CASCADE_INTERRUPTION.get()
 
 
 def interruption_cascade_lease_seconds() -> float:
@@ -115,6 +124,16 @@ def suppress_interruption_cascade() -> Iterator[None]:
         # overwritten with the creator's previous value.
         with contextlib.suppress(ValueError):
             _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.reset(token)
+
+
+@contextmanager
+def _background_cascade_interruption() -> Iterator[None]:
+    token = _BACKGROUND_CASCADE_INTERRUPTION.set(True)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            _BACKGROUND_CASCADE_INTERRUPTION.reset(token)
 
 
 def _is_background_subagent_session(session: Session) -> bool:
@@ -1138,7 +1157,7 @@ class BackgroundInterruptionCoordinator:
             )
             return
         try:
-            with suppress_interruption_cascade():
+            with suppress_interruption_cascade(), _background_cascade_interruption():
                 async for _event in self._interrupt_session(
                     InterruptSessionRequest(
                         session_id=session.id,

@@ -2201,6 +2201,79 @@ stores remove untrusted origin linkage before persistence and reconstruct the
 provenance of retained trusted fields when SQL evidence is decoded. Custom
 terminal-evidence readers must preserve or reconstruct equivalent provenance.
 
+Supervision events are a separate optional capability.
+`SessionStore.query_supervision_events(SupervisionEventQuery)` returns one
+bounded `SupervisionEventPage` of settled human or operator touches across
+sessions: tool-approval `approve`, `deny` and `expire`; user-input `answer`;
+manual `recover`; operator `interrupt`; and settled `steer` messages. Built-in
+stores set `supports_supervision_events = True`; the base implementation and
+custom stores without the flag raise `NotImplementedError`, and the server
+returns 501. The projection needs no store-specific SQL: candidates come from
+the store's cross-session event query, and evidence comes from session loads and
+bounded per-session event reads. Each evidence lookup pages through one event
+type near its anchor and stops at the first match or after a fixed number of
+pages, so its cost follows one touch, not the session's history. A session holds
+at most one pending approval or question, so a resolution's request is the
+nearest matching request before it; when a lookup finds nothing within its
+bound, the record omits that evidence, for example `requested_at`.
+
+Each record is decided by one anchor event of a rare event type:
+`tool.call.approved`, `tool.call.approval_denied` with `approval_required`
+true and `expired` false, `tool.call.approval_expired`, `session.resumed`,
+`session.interrupted` with `interruption_type="operator_requested"`, and the
+terminal `session.message.*` events. A touch is counted once, at its first
+anchor: one approval covering several calls is one record listing them,
+repeated resolution events are dropped, and a recovery after a recorded
+approval is a second touch. A `session.resumed` whose next event in the same
+session is a manual-recovery tool terminal is `recover` (both are appended in
+one batch); a resumed user-input pause without one is `answer`. An interrupt
+that closes a pending approval or supersedes a pending question is one
+`interrupt` record with that approval's or question's linkage. Background cascade copies carry the runtime-owned
+`interruption_origin="background_cascade"` and are not counted again; caller
+metadata cannot claim that origin. Steering is reported when the message
+settles; its actor and `requested_at` come from `session.message.queued`, and
+`message_origin` distinguishes actor, session-sourced and peer messages, or is
+`unknown` when the queued event records none of them.
+
+The window is half-open `[start_at, end_at)` on the anchor timestamp and spans
+at most 366 days. Records follow durable sequence order. The opaque cursor binds
+every filter, the content flag, and the reader (its access scope or verified
+tenant), so a cursor from another query or reader is rejected with
+`SupervisionEventCursorInvalid`;
+`next_cursor` always resumes after the last inspected position, including on a
+final page, so a supervisor can continue later. `limit` bounds returned records;
+a page can hold fewer when filters applied after classification drop
+candidates, and `has_more` reports whether more candidates were already
+available. On PostgreSQL the scan uses the cross-session commit cutoff, so a
+page does not pass a lower sequence whose inserting transaction is older than
+every running one. `max_bytes` bounds the page; exceeding it raises
+`SupervisionEventResultTooLarge` rather than truncating. Cost grows with the
+number of anchor-type events in the remaining window; prefer bounded windows
+for large backfills.
+
+Records are content-free by default: no tool arguments, questions, answers or
+message text. `CayuApp.query_supervision_events(..., include_content=True)` adds
+only content the runtime already published durably, such as arguments from a
+call's terminal event; content withheld at publication stays withheld.
+`execution_profile_fingerprint` is the profile bound to the anchor, from the
+anchor itself, else the latest admitted `session.execution_profile.decided`
+before it, else the session's immutable baseline; filtering by it is exact.
+`exclude_forked_sessions` drops sessions whose origin is `session.forked`;
+subagent children remain included and every record carries
+`parent_session_id`. A non-empty `actor_sources` filter drops records without a
+recorded actor. `usage` is the usage of the anchor's model step attempt when
+recorded, otherwise null.
+
+`access(subject).sessions.supervision_events(query)` applies the session access
+scope inside the store query and offers no content option. The server route
+`POST /api/supervision-events/query` never returns content; it exposes session
+identity through public session aliases and linkage only as event-scoped
+aliases that the server's alias resolver maps back to the anchor's value, and
+replaces call ids with `tool_call_count`. An authenticated identity with a verified tenant sees only
+sessions whose invocation origin carries that tenant; an identity without a
+tenant reads the configured session store. The host-authenticated
+`POST /resources/supervision-events/query` returns scoped records.
+
 Task topology is an independent optional `TaskStore` capability.
 `query_task_topology(...)` batch-loads tasks attached to a bounded set of
 session IDs and direct children for a bounded set of task-parent IDs. Each

@@ -8,6 +8,11 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+from tests.core.session_store_conformance.support import (
+    _collect_events,
+    _SimulatedProcessLoss,
+    _UserInputRecoveryProvider,
+)
 from tests.runtime.runtime_provider_support import FakeProvider
 from tests.runtime.runtime_session_support import _private_record_for_public_event, collect_events
 
@@ -19,6 +24,10 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
+from cayu.runtime._interruption_coordinator import (
+    _background_cascade_interruption,
+    suppress_interruption_cascade,
+)
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -34,6 +43,7 @@ from cayu.tools.subagents import (
     SubagentSpec,
     SubagentTool,
 )
+from cayu.tools.user_input import UserInputTool
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
@@ -178,6 +188,8 @@ def test_interrupting_parent_interrupts_running_background_subagents(
     assert child_interrupted[0].payload["metadata"]["source"] == (
         "background_subagent_parent_interrupt"
     )
+    assert child_interrupted[0].payload["interruption_origin"] == "background_cascade"
+    assert "interruption_origin" not in parent_events[-1].payload
     assert child_interrupted[0].payload["requested_by"] == {
         "subject": "operator-42",
         "tenant": None,
@@ -292,6 +304,7 @@ def test_retried_parent_interruption_cascades_original_durable_provenance():
         event for event in child_events if event.type == EventType.SESSION_INTERRUPTED
     ]
     assert len(child_interrupted) == 1
+    assert child_interrupted[0].payload["interruption_origin"] == "background_cascade"
     assert child_interrupted[0].payload["reason"] == "original operator stop"
     assert child_interrupted[0].payload["metadata"]["parent_metadata"] == {
         "ticket": f"incident{REDACTED_SECRET}a"
@@ -1709,3 +1722,91 @@ def test_interruption_cascade_completion_clear_failure_is_durably_reported(monke
         "reason": "completion_checkpoint_clear_failed",
         "error_type": "RuntimeError",
     }
+
+
+def test_operator_metadata_cannot_claim_a_background_cascade_origin():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="reviewer", model="fakemodel"))
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_forged_cascade_origin",
+                messages=[Message.text("user", "task")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+        )
+        _ = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_forged_cascade_origin",
+                    reason="operator stop",
+                    metadata={
+                        "source": "background_subagent_parent_interrupt",
+                        "interruption_origin": "background_cascade",
+                    },
+                )
+            )
+        ]
+        return await store.load_events("sess_forged_cascade_origin")
+
+    events = asyncio.run(run())
+
+    interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
+    assert len(interrupted) == 1
+    assert "interruption_origin" not in interrupted[0].payload
+    assert interrupted[0].payload["interruption_type"] == "operator_requested"
+
+
+@pytest.mark.parametrize("cascade_retry", [False, True], ids=["operator", "cascade"])
+def test_adopting_a_retained_input_interrupt_keeps_its_operator_identity(cascade_retry):
+    async def run():
+        store = InMemorySessionStore()
+        session_id = "sess_adopted_input_interrupt"
+
+        def make_app() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()]
+            )
+            return app
+
+        await _collect_events(
+            make_app().run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "ask a question")],
+                )
+            )
+        )
+        original = store.transition_status_and_checkpoint
+        injected = False
+
+        async def lose_acknowledgement(*args, **kwargs):
+            nonlocal injected
+            result = await original(*args, **kwargs)
+            if kwargs.get("to_status") is SessionStatus.INTERRUPTING and not injected:
+                injected = True
+                raise _SimulatedProcessLoss("acknowledgement lost")
+            return result
+
+        store.transition_status_and_checkpoint = lose_acknowledgement
+        request = InterruptSessionRequest(session_id=session_id, reason="operator stop")
+        with suppress_interruption_cascade(), pytest.raises(_SimulatedProcessLoss):
+            await _collect_events(make_app().interrupt_session(request))
+        store.transition_status_and_checkpoint = original
+        if cascade_retry:
+            with suppress_interruption_cascade(), _background_cascade_interruption():
+                return await _collect_events(make_app().interrupt_session(request))
+        with suppress_interruption_cascade():
+            return await _collect_events(make_app().interrupt_session(request))
+
+    events = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert "interruption_origin" not in events[-1].payload

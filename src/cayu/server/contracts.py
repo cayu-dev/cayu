@@ -28,6 +28,7 @@ from cayu._validation import (
     json_utf8_size_within_limit,
     require_unicode_scalar_text,
 )
+from cayu.approvals.actors import ResolutionActorSource
 from cayu.budgets.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -49,6 +50,7 @@ from cayu.budgets.usage import (
     AggregateUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
+    UsageMetrics,
 )
 from cayu.configuration import MAX_STEPS
 from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
@@ -201,6 +203,16 @@ from cayu.sessions.invocation import (
 from cayu.sessions.pending_action_contracts import DelegatedActionReference
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.summaries import SessionOperationalSnapshot
+from cayu.sessions.supervision_events import (
+    SUPERVISION_EVENT_DEFAULT_LIMIT,
+    SUPERVISION_EVENT_DEFAULT_RESULT_BYTES,
+    SUPERVISION_EVENT_MAX_CURSOR_BYTES,
+    SUPERVISION_EVENT_MAX_LIMIT,
+    SUPERVISION_EVENT_MAX_RESULT_BYTES,
+    SupervisionEventKind,
+    SupervisionEventOutcome,
+    SupervisionMessageOrigin,
+)
 from cayu.sessions.topology import (
     SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
     SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH,
@@ -699,6 +711,85 @@ USAGE_ROLLUP_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     500: {
         "description": "The configured store returned an inconsistent usage projection.",
+        "model": ApiErrorResponse,
+    },
+}
+
+
+MAX_SUPERVISION_EVENTS_REQUEST_BYTES = 64 * 1024
+
+
+class SupervisionEventsRequest(ApiBaseModel):
+    """Half-open ``[start_at, end_at)`` window over settled supervision touches."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    start_at: datetime
+    end_at: datetime
+    session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
+    exclude_forked_sessions: StrictBool = False
+    execution_profile_fingerprint: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    kinds: tuple[SupervisionEventKind, ...] = ()
+    actor_sources: tuple[ResolutionActorSource, ...] = ()
+    limit: StrictInt = Field(
+        default=SUPERVISION_EVENT_DEFAULT_LIMIT, ge=1, le=SUPERVISION_EVENT_MAX_LIMIT
+    )
+    max_bytes: StrictInt = Field(
+        default=SUPERVISION_EVENT_DEFAULT_RESULT_BYTES,
+        ge=1,
+        le=SUPERVISION_EVENT_MAX_RESULT_BYTES,
+    )
+    cursor: StrictStr | None = Field(
+        default=None, min_length=1, max_length=SUPERVISION_EVENT_MAX_CURSOR_BYTES
+    )
+
+
+class ApiSupervisionActor(ApiBaseModel):
+    subject: str
+    tenant: str | None = None
+    source: ResolutionActorSource | None = None
+
+
+class ApiSupervisionEvent(ApiBaseModel):
+    """One settled supervision touch; linkage ids are event-scoped public aliases."""
+
+    supervision_id: str
+    kind: SupervisionEventKind
+    outcome: SupervisionEventOutcome
+    event_id: str
+    session_id: str
+    parent_session_id: str | None = None
+    forked: bool
+    agent_name: str | None = None
+    environment_name: str | None = None
+    tool_name: str | None = None
+    execution_profile_fingerprint: str | None = None
+    model_step_id: str | None = None
+    model_attempt_id: str | None = None
+    tool_round_id: str | None = None
+    tool_call_count: StrictInt = Field(ge=0)
+    approval_id: str | None = None
+    input_id: str | None = None
+    queue_id: str | None = None
+    interruption_request_id: str | None = None
+    message_origin: SupervisionMessageOrigin | None = None
+    actor: ApiSupervisionActor | None = None
+    reason: str | None = None
+    requested_at: datetime | None = None
+    resolved_at: datetime
+    usage: UsageMetrics | None = None
+
+
+class SupervisionEventsResponse(ApiBaseModel):
+    events: list[ApiSupervisionEvent]
+    next_cursor: str
+    has_more: bool
+
+
+SUPERVISION_EVENTS_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **AGGREGATE_ENDPOINT_RESPONSES,
+    413: {
+        "description": "The request, an evidence read, or the response exceeds its byte limit.",
         "model": ApiErrorResponse,
     },
 }

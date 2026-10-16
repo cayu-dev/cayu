@@ -29,6 +29,7 @@ from cayu.sessions.queries import (
 from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
+from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
 
 
 class ScopedSessionAccess:
@@ -110,6 +111,14 @@ class ScopedSessionAccess:
         return await self._query(
             lambda: self.__store.read_cost_accounting(query, pricing, by_session=by_session)
         )
+
+    async def supervision_events(self, query: SupervisionEventQuery) -> SupervisionEventPage:
+        """Page settled supervision touches on admitted sessions; never includes content."""
+
+        if type(query) is not SupervisionEventQuery:
+            raise TypeError("Supervision event reads require a SupervisionEventQuery.")
+        query = SupervisionEventQuery.model_validate(query.model_dump(mode="python"))
+        return await self._query(lambda: self.__store.query_supervision_events(query))
 
     async def create(self, request: RunRequest, *, identity: SessionIdentity) -> Session:
         if type(request) is not RunRequest or type(identity) is not SessionIdentity:

@@ -34,6 +34,7 @@ class ControlPlaneCapabilitySnapshot:
     evaluation_promotion_configured: bool
     terminal_session_evidence_supported: bool
     session_lineage_supported: bool
+    session_supervision_events_supported: bool
     evals_configured: bool
     eval_store_configured: bool
     eval_target_configured: bool
@@ -96,6 +97,11 @@ class ControlPlaneCapabilitySnapshot:
                     True,
                     mutation_supported=False,
                 ),
+                supervision=_optional_surface(
+                    True,
+                    read_supported=self.session_supervision_events_supported,
+                    mutation_supported=False,
+                ),
                 tasks=_optional_surface(
                     self.tasks_configured,
                     mutation_supported=True,
@@ -151,6 +157,7 @@ def inspect_control_plane_capabilities(
     evaluation_promotion_configured: bool = False,
     terminal_session_evidence_supported: bool = False,
     session_lineage_supported: bool = False,
+    session_supervision_events_supported: bool = False,
     evals_configured: bool = False,
     eval_store_configured: bool | None = None,
     eval_target_configured: bool | None = None,
@@ -182,6 +189,7 @@ def inspect_control_plane_capabilities(
         ("evaluation_promotion_configured", evaluation_promotion_configured),
         ("terminal_session_evidence_supported", terminal_session_evidence_supported),
         ("session_lineage_supported", session_lineage_supported),
+        ("session_supervision_events_supported", session_supervision_events_supported),
         ("evals_configured", evals_configured),
         ("eval_store_configured", eval_store_configured),
         ("eval_target_configured", eval_target_configured),
@@ -208,6 +216,7 @@ def inspect_control_plane_capabilities(
         evaluation_promotion_configured=evaluation_promotion_configured,
         terminal_session_evidence_supported=terminal_session_evidence_supported,
         session_lineage_supported=session_lineage_supported,
+        session_supervision_events_supported=session_supervision_events_supported,
         evals_configured=evals_configured,
         eval_store_configured=eval_store_configured,
         eval_target_configured=eval_target_configured,

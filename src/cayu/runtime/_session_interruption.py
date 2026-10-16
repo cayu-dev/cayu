@@ -32,6 +32,7 @@ from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
     _copy_interruption_cascade_retry_request,
     _interruption_cascade_retry_event_payload,
+    background_cascade_interruption_active,
     interruption_cascade_suppressed,
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
@@ -72,6 +73,8 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_stage import SessionModelCompletionDispatchAlreadyAuthorized
 from cayu.sessions._terminal_evidence import (
+    INTERRUPTION_ORIGIN_BACKGROUND_CASCADE,
+    INTERRUPTION_ORIGIN_PAYLOAD_KEY,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
@@ -485,6 +488,13 @@ class SessionInterruption:
                 "interruption_request_id": str(uuid4()),
             }
         )
+        if (
+            background_cascade_interruption_active()
+            and adopted_user_input_interrupt_payload is None
+        ):
+            interrupt_payload[INTERRUPTION_ORIGIN_PAYLOAD_KEY] = (
+                INTERRUPTION_ORIGIN_BACKGROUND_CASCADE
+            )
         finalization = self._terminal_finalization.interruption(
             session_id=loaded_session.id,
             adopting_pending=adopted_user_input_interrupt_payload is not None,

@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
 from cayu import _application_accounting as accounting
+from cayu._event_schema import private_event_linkage_value
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -202,6 +203,7 @@ from cayu.server.contracts import (
     MAX_EVALS_REQUEST_BYTES,
     MAX_EVALUATION_PROMOTION_REQUEST_BYTES,
     MAX_SESSION_TOPOLOGY_REQUEST_BYTES,
+    MAX_SUPERVISION_EVENTS_REQUEST_BYTES,
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
     MAX_USAGE_ROLLUP_REQUEST_BYTES,
     MAX_USAGE_ROLLUP_RESULT_BYTES,
@@ -215,6 +217,7 @@ from cayu.server.contracts import (
     SESSION_STATE_ENDPOINT_RESPONSES,
     SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
+    SUPERVISION_EVENTS_ENDPOINT_RESPONSES,
     TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
     USAGE_ROLLUP_ENDPOINT_RESPONSES,
     AccountingContract,
@@ -254,6 +257,8 @@ from cayu.server.contracts import (
     SessionTranscriptResponse,
     SessionUsageEndpointContract,
     SseContract,
+    SupervisionEventsRequest,
+    SupervisionEventsResponse,
     SystemDiagnosticsResponse,
     UsageBreakdownItem,
     UsageRollupRequest,
@@ -287,6 +292,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles,
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
+from cayu.sessions._supervision_projection import supervision_page_with_anchors
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
 from cayu.sessions.event_delivery import PersistedEventSideEffectPage, PersistedEventSideEffectQuery
 from cayu.sessions.event_delivery import Status as EventSideEffectStatus
@@ -352,6 +358,12 @@ from cayu.sessions.requests import (
 )
 from cayu.sessions.store import SessionStore
 from cayu.sessions.summaries import SessionOutcome
+from cayu.sessions.supervision_events import (
+    SupervisionEvent,
+    SupervisionEventCursorInvalid,
+    SupervisionEventQuery,
+    SupervisionEventResultTooLarge,
+)
 from cayu.sessions.topology import (
     SessionTopologyCycle,
     SessionTopologyDepthExceeded,
@@ -835,6 +847,17 @@ def _bounded_memory_report_route_class(
         preparse_auth = staticmethod(auth)
 
     return _AuthenticatedBoundedMemoryReportRoute
+
+
+class _BoundedSupervisionEventsRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound supervision queries before FastAPI parses caller filters."""
+
+    max_request_bytes = MAX_SUPERVISION_EVENTS_REQUEST_BYTES
+    invalid_request_detail = "Invalid supervision events request."
+    oversized_request_detail = "Supervision events request exceeds the server byte limit."
+
+    def _invalid_request_response(self) -> JSONResponse:
+        return _private_no_store_validation_error_response(self.invalid_request_detail)
 
 
 class _BoundedUsageRollupRoute(_BoundedPrivateJsonBodyRoute):
@@ -2389,6 +2412,77 @@ def _serialize_pending_action(
     payload["session"] = _serialize_session_base(cayu_app, action.session)
     payload["event"] = _serialize_event_record(cayu_app, action.event)
     return payload
+
+
+_SUPERVISION_LINKAGE_FIELDS = (
+    "model_step_id",
+    "model_attempt_id",
+    "tool_round_id",
+    "approval_id",
+    "input_id",
+    "queue_id",
+    "interruption_request_id",
+)
+
+
+def _serialize_supervision_event(
+    cayu_app: Any,
+    event: SupervisionEvent,
+    anchor: EventRecord,
+) -> dict[str, Any]:
+    """Expose one touch without publishing private linkage or session identity.
+
+    Linkage becomes an event-scoped alias only when the server's alias resolver
+    returns that exact value from the anchor event, so every alias resolves;
+    other linkage is withheld.
+    """
+
+    text = _redact_control_plane_values(
+        cayu_app,
+        {
+            "agent_name": event.agent_name,
+            "environment_name": event.environment_name,
+            "tool_name": event.tool_name,
+            "reason": event.reason,
+            "actor": (
+                None
+                if event.actor is None
+                else event.actor.model_dump(mode="json", exclude={"claims"})
+            ),
+        },
+        "supervision_event",
+        preserve_string_fields={"source"},
+    )
+    linkage = {
+        field: (
+            public_event_linkage_id(anchor.sequence, field)
+            if (value := getattr(event, field)) is not None
+            and private_event_linkage_value(anchor.event, field_name=field) == value
+            else None
+        )
+        for field in _SUPERVISION_LINKAGE_FIELDS
+    }
+    return {
+        "supervision_id": event.supervision_id,
+        "kind": event.kind.value,
+        "outcome": event.outcome.value,
+        "event_id": public_event_id(event.sequence),
+        "session_id": cayu_app.project_session_id_for_exposure(event.session_id),
+        "parent_session_id": (
+            None
+            if event.parent_session_id is None
+            else cayu_app.project_session_id_for_exposure(event.parent_session_id)
+        ),
+        "forked": event.forked,
+        "execution_profile_fingerprint": event.execution_profile_fingerprint,
+        "tool_call_count": len(event.tool_call_ids),
+        "message_origin": None if event.message_origin is None else event.message_origin.value,
+        "requested_at": event.requested_at,
+        "resolved_at": event.resolved_at,
+        "usage": None if event.usage is None else event.usage.model_dump(mode="json"),
+        **text,
+        **linkage,
+    }
 
 
 def _serialize_interaction_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
@@ -4264,6 +4358,7 @@ def create_router(
         evaluation_promotion_configured=evaluation_promotion is not None,
         terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
         session_lineage_supported=session_store.supports_session_lineage,
+        session_supervision_events_supported=session_store.supports_supervision_events,
         evals_configured=eval_runtime is not None,
         eval_store_configured=(
             eval_runtime is not None
@@ -4917,6 +5012,85 @@ def create_router(
             "authentication does not add tenant filtering."
         ),
         route_class_override=_BoundedUsageRollupRoute,
+    )
+
+    async def query_supervision_events(
+        body: SupervisionEventsRequest,
+        response: Response,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        response.headers["Cache-Control"] = "private, no-store"
+        no_store = {"Cache-Control": "private, no-store"}
+        if not session_store.supports_supervision_events:
+            raise HTTPException(
+                status_code=501,
+                detail="The configured session store does not support supervision events.",
+            )
+        try:
+            query = SupervisionEventQuery(
+                start_at=body.start_at,
+                end_at=body.end_at,
+                sessions=body.session_filter,
+                exclude_forked_sessions=body.exclude_forked_sessions,
+                execution_profile_fingerprint=body.execution_profile_fingerprint,
+                kinds=body.kinds,
+                actor_sources=body.actor_sources,
+                limit=body.limit,
+                max_bytes=body.max_bytes,
+                cursor=body.cursor,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid supervision events request.",
+                headers=no_store,
+            ) from exc
+        try:
+            page, anchors = await supervision_page_with_anchors(
+                session_store,
+                query,
+                include_content=False,
+                origin_tenant=None if auth_context is None else auth_context.tenant,
+            )
+        except SupervisionEventCursorInvalid as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid supervision event cursor.",
+                headers=no_store,
+            ) from exc
+        except SupervisionEventResultTooLarge as exc:
+            raise HTTPException(
+                status_code=413,
+                detail="Supervision events exceed the byte limit; request a smaller page.",
+                headers=no_store,
+            ) from exc
+        return SupervisionEventsResponse.model_validate(
+            {
+                "events": [
+                    _serialize_supervision_event(cayu_app, event, anchors[event.sequence])
+                    for event in page.events
+                ],
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            }
+        )
+
+    router.add_api_route(
+        "/supervision-events/query",
+        query_supervision_events,
+        methods=["POST"],
+        response_model=SupervisionEventsResponse,
+        responses=SUPERVISION_EVENTS_ENDPOINT_RESPONSES,
+        dependencies=protected,
+        description=(
+            "Page settled approvals, denials, expiries, answers, manual recoveries, operator "
+            "interrupts and steering messages across sessions, in durable sequence order, for "
+            "a UTC-normalized half-open resolution-time window. Content is never included. "
+            "Session identity and step linkage are public aliases. An identity with a verified "
+            "tenant sees only sessions whose invocation origin carries that tenant; an identity "
+            "without a tenant reads the configured session store."
+        ),
+        route_class_override=_BoundedSupervisionEventsRoute,
     )
 
     async def _public_or_legacy_event_record(

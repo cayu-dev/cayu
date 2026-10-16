@@ -57,6 +57,10 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
 )
 from cayu.runtime.retry_policy import RetryDisposition, RetryReason, RetrySuppression
+from cayu.sessions._terminal_evidence import (
+    INTERRUPTION_ORIGIN_BACKGROUND_CASCADE,
+    INTERRUPTION_ORIGIN_PAYLOAD_KEY,
+)
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools._shared_artifact_results import (
@@ -492,6 +496,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
     },
     EventType.SESSION_INTERRUPTED: {
+        (INTERRUPTION_ORIGIN_PAYLOAD_KEY,): frozenset({INTERRUPTION_ORIGIN_BACKGROUND_CASCADE}),
         ("approval", "arguments_state"): frozenset({"quarantined"}),
         ("approval", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
         ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,

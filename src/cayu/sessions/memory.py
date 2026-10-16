@@ -732,6 +732,7 @@ class InMemorySessionStore(
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
+    supports_supervision_events: ClassVar[bool] = True
     child_session_notification_version: ClassVar[int | None] = 1
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_targeted_tool_grants: ClassVar[bool] = True

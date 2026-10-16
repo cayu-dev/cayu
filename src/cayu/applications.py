@@ -808,6 +808,7 @@ if TYPE_CHECKING:
         ParticipantSessionReference,
     )
     from cayu.sessions._session_continuation import ContinuationRecord
+    from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
     from cayu.storage.retention import (
         RetentionProgressCallback,
         StorageRetentionPolicy,
@@ -5930,6 +5931,22 @@ class CayuApp:
         Unavailable reads or missing terminal evidence never imply resolution.
         """
         return await observe_human_attention(self._runtime_session_store, reference)
+
+    @_tracked_entrance
+    async def query_supervision_events(
+        self,
+        query: SupervisionEventQuery,
+        *,
+        include_content: bool = False,
+    ) -> SupervisionEventPage:
+        """Page settled approvals, answers, recoveries, interrupts and steering across sessions.
+
+        This trusted SDK read is store-wide; use ``access(...).sessions`` for scoped reads.
+        ``include_content`` adds runtime-published content and is available only here.
+        """
+        return await self._runtime_session_store.query_supervision_events(
+            query, include_content=include_content
+        )
 
     @_tracked_entrance
     async def inspect_human_review(

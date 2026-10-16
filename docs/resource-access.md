@@ -89,6 +89,7 @@ Handles have explicit methods and no fallback forwarding to raw stores.
 | `sessions.update_metadata`, `update_labels`, `delete_session` | Current session; modify, update_labels, delete | Checks and mutation share the write lock/transaction; normal lifecycle/closure fences remain |
 | `sessions.read_records` | Session owns events/transcript/checkpoint/relabel audit | Bounded page and bytes under one read snapshot; checkpoint also requires inspect_state |
 | `sessions.events`, `usage`, `costs` | Current session owns historical events | Policy predicate precedes export, aggregation and grouping; historical event label snapshots do not grant access |
+| `sessions.supervision_events` | Current session owns its supervision events | Policy predicate precedes every candidate and evidence read; no content option |
 | `tasks.load`, `list`, `create`, `cancel`, `pause`, `resume` | Immutable `TaskInvocation.access_labels`; corresponding read/create/modify | Native filtering and mutation checks; standalone tasks have their own durable classification |
 | `tasks.create_graph`, `create_group`, `graph`, `group`, graph/group events | Collection receipt retains the uniform member classification and binding | Admission checks all members; replay must match classification; receipts retain ownership after member deletion |
 | `artifacts(store, environment_name=...)` put/read/range/list/delete | Immutable artifact labels, plus existing artifact/environment/session ownership | Local and S3 metadata checked before bytes; inventory filters before counts; immutable publication identity prevents relabel-by-ID-reuse |
@@ -180,7 +181,8 @@ server.include_router(create_resource_router(app, authenticate=authenticate))
 ```
 
 The router exposes session queries/records/mutations, tasks, graph/group reads,
-event export, usage, run/resume/fork streams, and configured artifact operations.
+event export, usage, supervision events, run/resume/fork streams, and configured
+artifact operations.
 Supply `knowledge_scope` to enable knowledge read/search routes. Artifact store
 aliases and environments are host configuration, never client-selected backend
 credentials. Keep the packaged operator server behind separate operator access.

@@ -172,6 +172,7 @@ from cayu.sessions.records import (
 )
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.summaries import EventSummary, SessionOperationalSnapshot, SessionOutcome
+from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
 from cayu.sessions.terminal_evidence import TerminalSessionEvidence, TerminalSessionEvidenceLimits
 from cayu.sessions.topology import SessionTopologyQuery, SessionTopologyStoreResult
 from cayu.sessions.transcript_input import DeferredInteractionInput
@@ -459,6 +460,7 @@ class SessionStore(ABC):
     supports_mcp_manifest_history: ClassVar[bool] = False
     supports_session_topology: ClassVar[bool] = False
     supports_session_lineage: ClassVar[bool] = False
+    supports_supervision_events: ClassVar[bool] = False
     child_session_notification_version: ClassVar[int | None] = None
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_targeted_tool_grants: ClassVar[bool] = False
@@ -5080,6 +5082,29 @@ class SessionStore(ABC):
         model does not make existing out-of-tree stores uninstantiable.
         """
         raise NotImplementedError("This SessionStore does not support usage aggregates.")
+
+    async def query_supervision_events(
+        self,
+        query: SupervisionEventQuery,
+        *,
+        include_content: bool = False,
+    ) -> SupervisionEventPage:
+        """Return one page of settled human-supervision touches across sessions.
+
+        Stores opt in with ``supports_supervision_events``; the projection then
+        reads only this store's cross-session and byte-bounded event queries,
+        under any active session access bounds. ``include_content`` returns
+        runtime-published content and is reserved for trusted in-process callers.
+        """
+        if not self.supports_supervision_events:
+            raise NotImplementedError("This SessionStore does not support supervision events.")
+        if type(include_content) is not bool:
+            raise TypeError("include_content must be a bool.")
+        from cayu.sessions._supervision_projection import (
+            query_supervision_events as project_supervision_events,
+        )
+
+        return await project_supervision_events(self, query, include_content=include_content)
 
     @abstractmethod
     async def list_sessions_with_pending_interruption_cascade(

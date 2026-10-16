@@ -2575,7 +2575,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.SESSION_INTERRUPTED] = _observed_policy(
         "abandoned actual action_id action_kind child_session_id status approval approval_close_intent approval_id "
         "approval_metadata_truncated cost_summary durable_value_error_code "
-        "durable_value_error_path error error_type execution_profile_fingerprint input_id interruption_request_id "
+        "durable_value_error_path error error_type execution_profile_fingerprint input_id interruption_origin "
+        "interruption_request_id "
         "interaction_transition_failures interruption_type limit manual_recovery_persisted "
         "manual_recovery_persistence_unknown manual_recovery_required "
         "manual_recovery_stale_live_failure maximum message metadata model_attempt_id "
