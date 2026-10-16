@@ -8,13 +8,20 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cayu.events import Event, EventType, event_with_runtime_nested_payload_authority
+from cayu.messages import Message, ToolResultPart
 from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
     project_persisted_runtime_event,
     project_runtime_event,
 )
+from cayu.runtime._message_redaction import (
+    redact_runtime_message_for_boundary,
+    redact_untrusted_message_for_boundary,
+)
 from cayu.runtime._tool_result_projection import (
     PreparedToolResultProjection,
+    ValidatedToolResultMessage,
+    read_runtime_tool_result_message,
     read_runtime_tool_result_projection,
 )
 from cayu.tools.base import ToolResult
@@ -80,7 +87,7 @@ def test_preparation_preserves_identity_and_accounts_after_redaction(status, met
     redactor = SecretRedactor(["private-preview", "art_"])
     redacted = redactor.redact_json(payload["result"])
     prepared = PreparedToolResultProjection(source, redacted_result=redacted, redactor=redactor)
-    record = prepared.record_for_content(prepared.content)
+    record = prepared.finish(prepared.content).record_payload()
     assert "private-preview" not in prepared.content
     assert prepared.artifacts[0]["application"]["value"] == REDACTED_SECRET
     assert record["projected_bytes"] == len(prepared.content.encode("utf-8"))
@@ -103,7 +110,7 @@ def test_preparation_preserves_identity_and_accounts_after_redaction(status, met
     # A fresh process only retains serialized result/evidence, not this value.
     replay_payload = deepcopy(before)
     replay_payload["result"].update(content=prepared.content, artifacts=prepared.artifact_payload())
-    replay_payload["tool_result_projection"] = prepared.record_for_content(prepared.content)
+    replay_payload["tool_result_projection"] = prepared.finish(prepared.content).record_payload()
     replay = read_runtime_tool_result_projection(replay_payload)
     assert replay is not None
     repeated = PreparedToolResultProjection(
@@ -111,7 +118,7 @@ def test_preparation_preserves_identity_and_accounts_after_redaction(status, met
     )
     assert repeated.content == prepared.content
     assert repeated.artifacts == prepared.artifacts
-    assert repeated.record_for_content(repeated.content) == record
+    assert repeated.finish(repeated.content).record_payload() == record
 
 
 @pytest.mark.parametrize("damage", ["extra", "missing", "authority", "hash", "count", "duplicate"])
@@ -154,11 +161,11 @@ def test_preparation_values_and_payload_copies_do_not_share_mutable_state():
     reference["artifact_id"] = "changed"
     emitted = prepared.artifact_payload()
     emitted[0]["application"]["value"] = "changed"
-    emitted_record = prepared.record_for_content("final content")
+    emitted_record = prepared.finish("final content").record_payload()
     emitted_record["policy_id"] = "changed"
     assert source.references()[1]["artifact_id"] == "art_" + "a" * 32
     assert prepared.artifacts[0]["application"]["value"] == "private-preview"
-    assert prepared.record_for_content(prepared.content)["policy_id"] == "test.projection.v1"
+    assert prepared.finish(prepared.content).record_payload()["policy_id"] == "test.projection.v1"
     with pytest.raises(FrozenInstanceError):
         prepared.content = "changed"
     with pytest.raises(TypeError):
@@ -175,7 +182,7 @@ def test_externalized_preparation_bounds_expanding_redaction_before_accounting(c
     prepared = PreparedToolResultProjection(
         source, redacted_result=redactor.redact_json(payload["result"]), redactor=redactor
     )
-    record = prepared.record_for_content(prepared.content)
+    record = prepared.finish(prepared.content).record_payload()
     assert record["projected_bytes"] == len(prepared.content.encode("utf-8"))
     assert record["projected_bytes"] <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
     assert prepared.content.endswith("use only advertised offsets.")
@@ -190,7 +197,7 @@ def test_final_accounting_uses_content_after_other_terminal_policies():
         source, redacted_result=payload["result"], redactor=SecretRedactor()
     )
     final = "replacement 🙂"
-    record = prepared.record_for_content(final)
+    record = prepared.finish(final).record_payload()
     assert record["projected_bytes"] == len(final.encode("utf-8"))
     assert record["projected_token_estimate"] == (len(final) + 3) // 4
     assert record["status"] == "failed"
@@ -354,3 +361,88 @@ def test_event_accounting_describes_content_after_later_result_policy(monkeypatc
     assert record["projected_bytes"] == len(final_content.encode("utf-8"))
     assert record["projected_token_estimate"] == (len(final_content) + 3) // 4
     assert event.payload == payload
+
+
+@pytest.mark.parametrize(
+    "project", [prepare_new_runtime_event, project_runtime_event, project_persisted_runtime_event]
+)
+@pytest.mark.parametrize("secrets", [["private-preview"], ["art_"], ["private-preview", "art_"]])
+def test_event_and_transcript_adapters_prepare_equivalent_results(project, secrets):
+    payload = projection_payload(content="private-preview 界🙂")
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    message = Message.tool_result(
+        results=[ToolResultPart(tool_call_id="call", tool_name="tool", **payload["result"])]
+    )
+    kwargs = {} if project is prepare_new_runtime_event else {"sequence": 1}
+    event_result = project(event, redactor=SecretRedactor(secrets), **kwargs).payload["result"]
+    transcript = redact_runtime_message_for_boundary(
+        message, redactor=SecretRedactor(secrets), field_name="transcript"
+    )
+    part = transcript.content[0].model_dump(mode="json")
+    assert {name: part[name] for name in payload["result"]} == event_result
+    repeated = redact_runtime_message_for_boundary(
+        transcript, redactor=SecretRedactor(secrets), field_name="transcript"
+    )
+    assert repeated == transcript
+    assert message.content[0].content == "private-preview 界🙂"
+
+
+def test_projection_preparation_does_not_authorize_untrusted_message_ingress():
+    payload = projection_payload()
+    message = Message.tool_result(
+        results=[ToolResultPart(tool_call_id="call", tool_name="tool", **payload["result"])]
+    )
+    redactor = SecretRedactor(["private-preview", "art_"])
+    projected = redact_untrusted_message_for_boundary(
+        message, redactor=redactor, field_name="ingress"
+    )
+    part = projected.content[0]
+    assert part.content == REDACTED_SECRET
+    assert "projection_authority" not in part.artifacts[1]
+    assert part.artifacts[1]["artifact_id"] != payload["result"]["artifacts"][1]["artifact_id"]
+    assert "[cayu tool-result projection reference]" not in part.content
+
+
+def test_validated_message_references_are_detached_even_when_constructed_directly():
+    payload = projection_payload()
+    artifacts = payload["result"]["artifacts"]
+    source = ValidatedToolResultMessage("preview", artifacts)
+    artifacts[1]["artifact_id"] = "changed"
+    copied = source.references()
+    with pytest.raises(TypeError):
+        copied[1]["artifact_id"] = "changed-again"
+    with pytest.raises(TypeError):
+        copied[1] = {}
+    assert source.references()[1]["artifact_id"] == "art_" + "a" * 32
+    with pytest.raises(FrozenInstanceError):
+        source.original_content = "changed"
+
+
+@pytest.mark.parametrize("damage", ["extra", "hash", "authority", "duplicate"])
+def test_transcript_adapter_does_not_reconstruct_invalid_or_ambiguous_references(damage):
+    payload = projection_payload()
+    artifacts = payload["result"]["artifacts"]
+    if damage == "extra":
+        artifacts[1]["extra"] = True
+    elif damage == "hash":
+        artifacts[1]["sha256"] = "invalid"
+    elif damage == "authority":
+        artifacts[1]["projection_authority"] = "application-owned"
+    else:
+        artifacts.append(deepcopy(artifacts[1]))
+    part = ToolResultPart(tool_call_id="call", tool_name="tool", **payload["result"])
+    message = Message.tool_result(results=[part])
+    if damage == "duplicate":
+        with pytest.raises(AssertionError, match="exactly one artifact reference"):
+            redact_runtime_message_for_boundary(
+                message, redactor=SecretRedactor(), field_name="transcript"
+            )
+        return
+    assert read_runtime_tool_result_message(part.model_dump(mode="json")) is None
+    projected = redact_runtime_message_for_boundary(
+        message, redactor=SecretRedactor("private-preview"), field_name="transcript"
+    )
+    assert projected.content[0].content == REDACTED_SECRET

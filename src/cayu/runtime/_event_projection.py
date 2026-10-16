@@ -36,10 +36,11 @@ from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._tool_identity import tool_idempotency_key
-from cayu.runtime._tool_result_projection import (
-    PreparedToolResultProjection,
-    ValidatedToolResultProjection,
+from cayu.runtime._tool_result_adapters import (
+    finish_tool_result_event,
+    prepare_tool_result_event,
 )
+from cayu.runtime._tool_result_projection import ValidatedToolResultProjection
 from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -1220,7 +1221,7 @@ def _prepare_runtime_event(
         redacted_payload=redacted_payload,
         redactor=redactor,
     )
-    prepared_projection = _restore_runtime_tool_result_projection(
+    prepared_projection = prepare_tool_result_event(
         redacted_payload=redacted_payload,
         projection=projection,
         controls=controls,
@@ -1249,7 +1250,7 @@ def _prepare_runtime_event(
         redacted_payload=redacted_payload,
         reject_malformed=True,
     )
-    _synchronize_runtime_tool_result_projection_record(
+    finish_tool_result_event(
         redacted_payload,
         controls=controls,
         prepared=prepared_projection,
@@ -1589,7 +1590,7 @@ def _project_runtime_event(
         redacted_payload=redacted_payload,
         controls=controls,
     )
-    prepared_projection = _restore_runtime_tool_result_projection(
+    prepared_projection = prepare_tool_result_event(
         redacted_payload=redacted_payload,
         projection=projection,
         controls=controls,
@@ -1649,7 +1650,7 @@ def _project_runtime_event(
         redacted_payload=redacted_payload,
         reject_malformed=False,
     )
-    _synchronize_runtime_tool_result_projection_record(
+    finish_tool_result_event(
         redacted_payload,
         controls=controls,
         prepared=prepared_projection,
@@ -3188,52 +3189,6 @@ def _public_authority_aliases(
         if type(sequence) is int and sequence >= 1:
             return {"start_event_id": public_event_id(sequence)}
     return {}
-
-
-def _restore_runtime_tool_result_projection(
-    *,
-    redacted_payload: dict[str, Any],
-    projection: ValidatedToolResultProjection | None,
-    controls: Mapping[str, Any],
-    redactor: SecretRedactor,
-) -> PreparedToolResultProjection | None:
-    """Reinsert prepared projection fields at their existing publication stage."""
-
-    if projection is None:
-        return None
-    if "tool_result_projection" not in controls and not projection.references():
-        # Exposure can discard controls after parsing a valid projection when
-        # another legacy control is malformed. Preserve its inline fallback;
-        # strict externalized references still need content reconstruction.
-        return None
-    redacted_result = redacted_payload.get("result")
-    if type(redacted_result) is not dict:
-        raise AssertionError("Validated projection lost its result object.")
-    prepared = PreparedToolResultProjection(
-        projection, redacted_result=redacted_result, redactor=redactor
-    )
-    redacted_result["content"] = prepared.content
-    if "artifacts" in redacted_result:
-        redacted_result["artifacts"] = prepared.artifact_payload()
-    return prepared
-
-
-def _synchronize_runtime_tool_result_projection_record(
-    payload: dict[str, Any],
-    *,
-    controls: Mapping[str, Any],
-    prepared: PreparedToolResultProjection | None,
-) -> None:
-    """Finish accounting after all other terminal-result policies have run."""
-
-    if type(controls.get("tool_result_projection")) is not dict:
-        return
-    result = payload.get("result")
-    record = payload.get("tool_result_projection")
-    if type(result) is not dict or type(record) is not dict or prepared is None:
-        raise AssertionError("Validated projection lost its result or evidence record.")
-    record.clear()
-    record.update(prepared.record_for_content(result.get("content")))
 
 
 def _restore_policy_denial_truncation_markers(

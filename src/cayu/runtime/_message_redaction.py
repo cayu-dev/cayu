@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
 from cayu.messages import Message
 from cayu.runtime import _tool_results as tool_results
-from cayu.runtime._tool_result_projection import prepare_runtime_reference_content
+from cayu.runtime._tool_result_adapters import prepare_tool_result_message
+from cayu.runtime._tool_result_projection import (
+    ValidatedToolResultMessage,
+    read_runtime_tool_result_message,
+    require_secret_free_tool_result_artifact_keys,
+)
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools import _web_access_results as web_access_results
-from cayu.tools.result_projection import (
-    _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
-    TOOL_RESULT_ARTIFACT_TYPE,
-    _validate_builtin_tool_result_artifact_reference,
-)
 from cayu.vaults import SecretRedactor
 
 _MESSAGE_ROOT_STRUCTURE_KEYS = frozenset({"content", "role"})
@@ -178,20 +179,46 @@ _MESSAGE_PRESERVED_STRING_FIELDS = _MESSAGE_AUTHORITY_STRING_FIELDS | {
 }
 
 
+@dataclass(slots=True)
+class _MessageAdmission:
+    """Positive per-part facts established by one ingress or runtime entry point."""
+
+    projections: dict[int, ValidatedToolResultMessage] = field(default_factory=dict)
+    controls: dict[int, dict[str, object]] = field(default_factory=dict)
+    execution_authority_fields: frozenset[str] = frozenset()
+
+
+def _message_payload(message: Message, redactor: SecretRedactor) -> dict[str, Any]:
+    if type(message) is not Message:
+        raise TypeError("Messages must be Message instances.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    payload = message.model_dump(mode="json")
+    content = payload.get("content")
+    if type(content) is not list:
+        raise AssertionError("Message serialization returned non-list content.")
+    if any(type(part) is not dict for part in content):
+        raise AssertionError("Message content serialized as a non-object.")
+    return payload
+
+
 def redact_untrusted_message_for_boundary(
     message: Message,
     *,
     redactor: SecretRedactor,
     field_name: str,
 ) -> Message:
-    """Redact untrusted ingress without accepting runtime projection authority."""
+    """Redact ingress after stripping runtime projection and control lookalikes."""
 
+    payload = _message_payload(message, redactor)
+    _strip_untrusted_runtime_tool_result_projection_authority(payload)
+    admission = _MessageAdmission()
+    for index, part in enumerate(payload["content"]):
+        structured = part.get("structured")
+        if type(structured) is dict:
+            admission.controls[index] = _recognized_untrusted_terminal_controls(structured)
     return _redact_message_for_boundary(
-        message,
-        redactor=redactor,
-        field_name=field_name,
-        trust_runtime_tool_result_projection=False,
-        reject_secret_bearing_runtime_projection_authority=False,
+        payload, admission=admission, redactor=redactor, field_name=field_name
     )
 
 
@@ -202,13 +229,24 @@ def redact_runtime_message_for_boundary(
     field_name: str,
     reject_secret_bearing_runtime_projection_authority: bool = False,
 ) -> Message:
-    """Redact runtime-owned transcript state after validating projection authority."""
+    """Redact runtime transcript state using positively admitted per-part facts."""
 
+    payload = _message_payload(message, redactor)
+    admission = _MessageAdmission(
+        execution_authority_fields=_MESSAGE_RUNTIME_EXECUTION_AUTHORITY_FIELDS
+    )
+    for index, part in enumerate(payload["content"]):
+        projection = read_runtime_tool_result_message(part)
+        if projection is not None:
+            admission.projections[index] = projection
+        structured = part.get("structured")
+        if type(structured) is dict:
+            admission.controls[index] = _recognized_runtime_terminal_controls(structured)
     return _redact_message_for_boundary(
-        message,
+        payload,
+        admission=admission,
         redactor=redactor,
         field_name=field_name,
-        trust_runtime_tool_result_projection=True,
         reject_secret_bearing_runtime_projection_authority=(
             reject_secret_bearing_runtime_projection_authority
         ),
@@ -216,58 +254,38 @@ def redact_runtime_message_for_boundary(
 
 
 def _redact_message_for_boundary(
-    message: Message,
+    payload: dict[str, Any],
     *,
+    admission: _MessageAdmission,
     redactor: SecretRedactor,
     field_name: str,
-    trust_runtime_tool_result_projection: bool,
-    reject_secret_bearing_runtime_projection_authority: bool,
+    reject_secret_bearing_runtime_projection_authority: bool = False,
 ) -> Message:
-    """Redact one message without rewriting executable protocol authorities."""
+    """Redact one admitted message without rewriting executable authorities."""
 
-    if type(message) is not Message:
-        raise TypeError("Messages must be Message instances.")
-    if not isinstance(redactor, SecretRedactor):
-        raise TypeError("redactor must be a SecretRedactor.")
-    payload = message.model_dump(mode="json")
-    if not trust_runtime_tool_result_projection:
-        _strip_untrusted_runtime_tool_result_projection_authority(payload)
-    content = payload.get("content")
-    if type(content) is not list:
-        raise AssertionError("Message serialization returned non-list content.")
+    content = payload["content"]
     _require_secret_free_message_keys(
         payload,
         content=content,
         redactor=redactor,
         field_name=field_name,
-        trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
+        admission=admission,
     )
     redacted_content: list[object] = []
     for index, part in enumerate(content):
         if type(part) is not dict:
             raise AssertionError("Message content serialized as a non-object.")
         part = cast("dict[str, object]", part)
-        projection_references = _runtime_tool_result_artifact_references(
-            part,
-            trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
-        )
-        if reject_secret_bearing_runtime_projection_authority:
-            _require_secret_free_runtime_projection_authority(
-                projection_references,
-                redactor=redactor,
-                field_name=f"{field_name}.content[{index}].artifacts",
+        projection = admission.projections.get(index)
+        if reject_secret_bearing_runtime_projection_authority and projection is not None:
+            projection.require_secret_free_authority(
+                redactor, f"{field_name}.content[{index}].artifacts"
             )
         # Protocol linkage and routing fields are executable authority. They
         # must fail closed instead of being rewritten into a different value.
         for authority_field in _MESSAGE_AUTHORITY_STRING_FIELDS:
             value = part.get(authority_field)
-            if (
-                trust_runtime_tool_result_projection
-                and authority_field in _MESSAGE_RUNTIME_EXECUTION_AUTHORITY_FIELDS
-            ):
-                # Runtime transcript admission already authenticated this
-                # complete tool-round lineage. A coincidental workload-secret
-                # substring must not rewrite or reject runtime-generated IDs.
+            if authority_field in admission.execution_authority_fields:
                 continue
             if type(value) is str and redactor.redact_text(value) != value:
                 raise ValueError(
@@ -285,21 +303,10 @@ def _redact_message_for_boundary(
         )
         if type(redacted_part) is not dict:
             raise AssertionError("Message part redaction returned a non-object.")
-        if projection_references:
-            projected_content, projected_artifacts = prepare_runtime_reference_content(
-                original_content=part.get("content"),
-                redacted_artifacts=redacted_part.get("artifacts"),
-                references=projection_references,
-                redactor=redactor,
-            )
-            redacted_part["content"] = projected_content
-            redacted_part["artifacts"] = projected_artifacts
+        prepare_tool_result_message(redacted_part, projection=projection, redactor=redactor)
         structured = part.get("structured")
         if type(structured) is dict:
-            terminal_controls = _recognized_runtime_terminal_controls(
-                cast("dict[str, object]", structured),
-                trust_boundary_only=trust_runtime_tool_result_projection,
-            )
+            terminal_controls = admission.controls.get(index, {})
             redacted_structured = redacted_part.get("structured")
             if terminal_controls and type(redacted_structured) is dict:
                 redacted_structured.update(terminal_controls)
@@ -357,7 +364,7 @@ def _require_secret_free_message_keys(
     content: list[object],
     redactor: SecretRedactor,
     field_name: str,
-    trust_runtime_tool_result_projection: bool,
+    admission: _MessageAdmission,
 ) -> None:
     """Validate message keys against the schema that owns each typed container."""
 
@@ -412,11 +419,11 @@ def _require_secret_free_message_keys(
                 match_short_substrings=True,
             )
         elif part_type == "tool_result":
-            _require_secret_free_tool_result_artifacts(
+            require_secret_free_tool_result_artifact_keys(
                 artifacts,
+                source=admission.projections.get(index),
                 redactor=redactor,
                 field_name=f"{field_name}.content[{index}].artifacts",
-                trust_runtime_tool_result_projection=(trust_runtime_tool_result_projection),
             )
             if type(structured) is dict:
                 _require_secret_free_tool_result_structure(
@@ -424,79 +431,8 @@ def _require_secret_free_message_keys(
                     structured=cast("dict[str, object]", structured),
                     redactor=redactor,
                     field_name=f"{field_name}.content[{index}].structured",
-                    trust_runtime_tool_result_projection=(trust_runtime_tool_result_projection),
+                    terminal_controls=admission.controls.get(index, {}),
                 )
-
-
-def _runtime_tool_result_artifact_references(
-    part: dict[str, object],
-    *,
-    trust_runtime_tool_result_projection: bool,
-) -> dict[int, dict[str, object]]:
-    if not trust_runtime_tool_result_projection or part.get("type") != "tool_result":
-        return {}
-    artifacts = part.get("artifacts")
-    if type(artifacts) is not list:
-        return {}
-    references: dict[int, dict[str, object]] = {}
-    for index, artifact in enumerate(artifacts):
-        if type(artifact) is not dict:
-            continue
-        artifact = cast("dict[str, Any]", artifact)
-        if artifact.get("type") != TOOL_RESULT_ARTIFACT_TYPE:
-            continue
-        try:
-            reference = _validate_builtin_tool_result_artifact_reference(artifact)
-        except (TypeError, ValueError):
-            continue
-        references[index] = cast("dict[str, object]", reference)
-    return references
-
-
-def _require_secret_free_runtime_projection_authority(
-    references: dict[int, dict[str, object]],
-    *,
-    redactor: SecretRedactor,
-    field_name: str,
-) -> None:
-    """Reject unverified stored references that secret redaction would rewrite."""
-
-    for index, reference in references.items():
-        if redactor.redact_json_values(reference) != reference:
-            raise ValueError(
-                f"{field_name}[{index}] contains a workload secret and cannot be "
-                "used as runtime projection authority."
-            )
-
-
-def _require_secret_free_tool_result_artifacts(
-    artifacts: object,
-    *,
-    redactor: SecretRedactor,
-    field_name: str,
-    trust_runtime_tool_result_projection: bool,
-) -> None:
-    if type(artifacts) is not list:
-        raise AssertionError("Tool result artifacts serialized as a non-list.")
-    references = _runtime_tool_result_artifact_references(
-        {
-            "type": "tool_result",
-            "artifacts": artifacts,
-        },
-        trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
-    )
-    for index, artifact in enumerate(artifacts):
-        if type(artifact) is not dict:
-            raise AssertionError("Tool result artifact serialized as a non-object.")
-        reference = references.get(index)
-        redactor.require_no_secret_keys(
-            artifact if reference is None else reference,
-            field_name=f"{field_name}[{index}]",
-            preserve_keys=(
-                () if reference is None else _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS
-            ),
-            match_short_substrings=True,
-        )
 
 
 def _strip_untrusted_runtime_tool_result_projection_authority(
@@ -534,7 +470,7 @@ def _require_secret_free_tool_result_structure(
     structured: dict[str, object],
     redactor: SecretRedactor,
     field_name: str,
-    trust_runtime_tool_result_projection: bool,
+    terminal_controls: dict[str, object],
 ) -> None:
     """Exempt only positively identified runtime-owned tool-result schemas."""
 
@@ -547,10 +483,6 @@ def _require_secret_free_tool_result_structure(
         )
         return
 
-    terminal_controls = _recognized_runtime_terminal_controls(
-        structured,
-        trust_boundary_only=trust_runtime_tool_result_projection,
-    )
     if terminal_controls:
         runtime_fields = {
             key: value
@@ -650,16 +582,23 @@ def _require_secret_free_tool_result_structure(
     )
 
 
-def _recognized_runtime_terminal_controls(
-    structured: dict[str, object],
-    *,
-    trust_boundary_only: bool,
-) -> dict[str, object]:
-    """Return only positively validated runtime-owned terminal controls."""
+def _recognized_runtime_terminal_controls(structured: dict[str, object]) -> dict[str, object]:
+    """Return validated terminal and execution controls from admitted runtime state."""
 
     try:
         controls: dict[str, object] = tool_terminal_controls.runtime_terminal_controls(structured)
-        if controls or trust_boundary_only:
+        controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
+        return controls
+    except (TypeError, ValueError):
+        return {}
+
+
+def _recognized_untrusted_terminal_controls(structured: dict[str, object]) -> dict[str, object]:
+    """Retain the ingress rule: boundary-only shapes cannot claim runtime authority."""
+
+    try:
+        controls: dict[str, object] = tool_terminal_controls.runtime_terminal_controls(structured)
+        if controls:
             controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
         return controls
     except (TypeError, ValueError):

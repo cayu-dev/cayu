@@ -46907,5 +46907,20 @@
   "tests/core/test_tool_result_preparation.py::test_externalized_event_preserves_missing_and_empty_content[True-project_persisted_runtime_event-False]": 0.0020459170918911695,
   "tests/core/test_tool_result_preparation.py::test_externalized_event_preserves_missing_and_empty_content[True-project_persisted_runtime_event-True]": 0.0021280839573591948,
   "tests/core/test_tool_result_preparation.py::test_externalized_event_preserves_missing_and_empty_content[True-project_runtime_event-False]": 0.0021499580470845103,
-  "tests/core/test_tool_result_preparation.py::test_externalized_event_preserves_missing_and_empty_content[True-project_runtime_event-True]": 0.002042792155407369
+  "tests/core/test_tool_result_preparation.py::test_externalized_event_preserves_missing_and_empty_content[True-project_runtime_event-True]": 0.002042792155407369,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets0-prepare_new_runtime_event]": 0.0033160840393975377,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets0-project_persisted_runtime_event]": 0.0029038330540060997,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets0-project_runtime_event]": 0.0028593329479917884,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets1-prepare_new_runtime_event]": 0.00313520897179842,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets1-project_persisted_runtime_event]": 0.0028446660144254565,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets1-project_runtime_event]": 0.0032577919773757458,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets2-prepare_new_runtime_event]": 0.003072001039981842,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets2-project_persisted_runtime_event]": 0.002862791996449232,
+  "tests/core/test_tool_result_preparation.py::test_event_and_transcript_adapters_prepare_equivalent_results[secrets2-project_runtime_event]": 0.0028095009038224816,
+  "tests/core/test_tool_result_preparation.py::test_projection_preparation_does_not_authorize_untrusted_message_ingress": 0.0006137079326435924,
+  "tests/core/test_tool_result_preparation.py::test_transcript_adapter_does_not_reconstruct_invalid_or_ambiguous_references[authority]": 0.0006706260610371828,
+  "tests/core/test_tool_result_preparation.py::test_transcript_adapter_does_not_reconstruct_invalid_or_ambiguous_references[duplicate]": 0.0006046260241419077,
+  "tests/core/test_tool_result_preparation.py::test_transcript_adapter_does_not_reconstruct_invalid_or_ambiguous_references[extra]": 0.0006747088627889752,
+  "tests/core/test_tool_result_preparation.py::test_transcript_adapter_does_not_reconstruct_invalid_or_ambiguous_references[hash]": 0.0006724590202793479,
+  "tests/core/test_tool_result_preparation.py::test_validated_message_references_are_detached_even_when_constructed_directly": 0.00022945902310311794
 }

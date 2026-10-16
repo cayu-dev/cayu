@@ -1,7 +1,6 @@
 """Validated tool-result projection and preparation for runtime publication.
 
-Event adapters establish provenance before retaining these values. Transcript
-adapters independently validate references and share the content helper below.
+Event and transcript adapters establish provenance before retaining these values.
 Parsing a matching application-authored shape never grants runtime authority.
 This owner has no artifact-store or tool-execution collaborator: preparing an
 existing projection cannot persist another artifact or repeat a tool call.
@@ -11,14 +10,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from types import MappingProxyType
+from typing import Any, cast
 
-from cayu._validation import copy_durable_json_value, freeze_json_value, thaw_json_value
+from cayu._validation import (
+    copy_durable_json_value,
+    freeze_json_value,
+    require_durable_text,
+    thaw_json_value,
+)
 from cayu.tools.base import ToolResult
 from cayu.tools.result_projection import (
+    _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
+    TOOL_RESULT_ARTIFACT_TYPE,
     ToolResultProjection,
     ToolResultProjectionRecord,
     ToolResultProjectionStatus,
+    _validate_builtin_tool_result_artifact_reference,
     _validate_externalized_projection_reference,
     redact_tool_result_projection_content,
     reestimate_tool_result_projection_tokens,
@@ -53,6 +61,10 @@ class ValidatedToolResultProjection:
 
         return {index: thaw_json_value(reference) for index, reference in self._references}
 
+    @property
+    def original_content(self) -> str:
+        return self.result.content
+
     def record_for_boundary(self, redactor: SecretRedactor | None) -> dict[str, Any]:
         """Omit secret-bearing optional metadata before restoring the record."""
 
@@ -72,16 +84,76 @@ class ValidatedToolResultProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidatedToolResultMessage:
+    """Validated references from an admitted runtime transcript result.
+
+    The durable message shape has no projection record. Its runtime adapter
+    establishes provenance; matching references in untrusted ingress do not
+    enter this path. Reference validation belongs to this owner in both shapes.
+    """
+
+    original_content: str = field(repr=False)
+    _references: Mapping[int, Mapping[str, Any]] = field(repr=False)
+
+    def __init__(self, content: str, artifacts: list[dict[str, Any]]) -> None:
+        references: dict[int, Mapping[str, Any]] = {}
+        for index, artifact in enumerate(artifacts):
+            if type(artifact) is not dict or artifact.get("type") != TOOL_RESULT_ARTIFACT_TYPE:
+                continue
+            try:
+                reference = _validate_builtin_tool_result_artifact_reference(artifact)
+            except (TypeError, ValueError):
+                continue
+            references[index] = freeze_json_value(reference)
+        object.__setattr__(self, "original_content", require_durable_text(content, "content"))
+        object.__setattr__(self, "_references", MappingProxyType(references))
+
+    def references(self) -> Mapping[int, Mapping[str, Any]]:
+        """Share immutable, already-validated references across boundary checks."""
+
+        return self._references
+
+    def record_for_boundary(self, redactor: SecretRedactor | None) -> None:
+        """The durable transcript shape does not carry projection evidence."""
+
+        return None
+
+    def require_secret_free_authority(self, redactor: SecretRedactor, field_name: str) -> None:
+        """Apply the stricter admission rule for unverified stored transcripts."""
+
+        for index, reference in self.references().items():
+            if redactor.redact_json_values(reference) != reference:
+                raise ValueError(
+                    f"{field_name}[{index}] contains a workload secret and cannot be "
+                    "used as runtime projection authority."
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultPublication:
+    """Final content and durable evidence for the event adapter."""
+
+    content: str = field(repr=False)
+    _record: Mapping[str, Any] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_record", freeze_json_value(self._record))
+
+    def record_payload(self) -> dict[str, Any]:
+        return thaw_json_value(self._record)
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedToolResultProjection:
     """Immutable projection fields; other result fields belong to the adapter."""
 
     content: str = field(repr=False)
     artifacts: tuple[Mapping[str, Any], ...] = field(repr=False)
-    _record: Mapping[str, Any] = field(repr=False)
+    _record: Mapping[str, Any] | None = field(repr=False)
 
     def __init__(
         self,
-        source: ValidatedToolResultProjection,
+        source: ValidatedToolResultProjection | ValidatedToolResultMessage,
         *,
         redacted_result: dict[str, Any],
         redactor: SecretRedactor,
@@ -95,7 +167,7 @@ class PreparedToolResultProjection:
         and token accounting waits until the adapter finishes its other policies.
         """
 
-        if type(source) is not ValidatedToolResultProjection:
+        if type(source) not in (ValidatedToolResultProjection, ValidatedToolResultMessage):
             raise TypeError("Projection preparation requires a validated projection value.")
         if type(redacted_result) is not dict:
             raise TypeError("Projection preparation requires an object result.")
@@ -109,8 +181,8 @@ class PreparedToolResultProjection:
             # missing-field rejection before reconstructing from that value.
             if type(content) is not str:
                 raise AssertionError("Validated projection lost its content or artifacts.")
-            content, artifacts = prepare_runtime_reference_content(
-                original_content=source.result.content,
+            content, artifacts = _prepare_reference_content(
+                original_content=source.original_content,
                 redacted_artifacts=artifacts,
                 references=references,
                 redactor=redactor,
@@ -131,8 +203,8 @@ class PreparedToolResultProjection:
     def artifact_payload(self) -> list[dict[str, Any]]:
         return [thaw_json_value(artifact) for artifact in self.artifacts]
 
-    def record_for_content(self, content: object) -> dict[str, Any]:
-        """Account after an adapter finishes its other terminal-result policies.
+    def finish(self, content: object) -> ToolResultPublication:
+        """Finish content and accounting after other terminal-result policies.
 
         Those policies retain their existing order. Accounting must describe the
         final content, including when another attested result owner restores it.
@@ -140,9 +212,13 @@ class PreparedToolResultProjection:
 
         if type(content) is not str:
             raise AssertionError("Validated projection lost its content.")
-        copied = thaw_json_value(self._record)
-        _account_content(copied, content)
-        return copied
+        if self._record is None:
+            raise AssertionError("Only event projections carry publication evidence.")
+        # Accounting replaces only top-level scalars. Retain immutable
+        # nested evidence until the adapter requests its mutable payload.
+        record = dict(self._record)
+        _account_content(record, content)
+        return ToolResultPublication(content, record)
 
 
 def read_runtime_tool_result_projection(
@@ -171,11 +247,54 @@ def read_runtime_tool_result_projection(
         return None
 
 
-def prepare_runtime_reference_content(
+def read_runtime_tool_result_message(part: dict[str, Any]) -> ValidatedToolResultMessage | None:
+    """Read an already-admitted runtime message, without accepting ingress authority."""
+
+    if part.get("type") != "tool_result":
+        return None
+    artifacts = part.get("artifacts")
+    if type(artifacts) is not list:
+        return None
+    content = part.get("content")
+    if type(content) is not str:
+        raise AssertionError("Validated projection lost its content or artifacts.")
+    if not artifacts:
+        return None
+    source = ValidatedToolResultMessage(content, cast("list[dict[str, Any]]", artifacts))
+    return source if source._references else None
+
+
+def require_secret_free_tool_result_artifact_keys(
+    artifacts: object,
+    *,
+    source: ValidatedToolResultMessage | None,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> None:
+    """Exempt only a positively validated runtime reference's fixed schema."""
+
+    if type(artifacts) is not list:
+        raise AssertionError("Tool result artifacts serialized as a non-list.")
+    references = {} if source is None else source.references()
+    for index, artifact in enumerate(artifacts):
+        if type(artifact) is not dict:
+            raise AssertionError("Tool result artifact serialized as a non-object.")
+        reference = references.get(index)
+        redactor.require_no_secret_keys(
+            artifact if reference is None else reference,
+            field_name=f"{field_name}[{index}]",
+            preserve_keys=()
+            if reference is None
+            else _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
+            match_short_substrings=True,
+        )
+
+
+def _prepare_reference_content(
     *,
     original_content: object,
     redacted_artifacts: object,
-    references: dict[int, dict[str, Any]],
+    references: Mapping[int, Mapping[str, Any]],
     redactor: SecretRedactor,
 ) -> tuple[str, list[object]]:
     """Prepare an adapter's already-validated runtime artifact reference.
@@ -204,7 +323,7 @@ def prepare_runtime_reference_content(
         redact_text=redactor.redact_text,
     )
     artifacts = list(redacted_artifacts)
-    artifacts[artifact_index] = reference
+    artifacts[artifact_index] = thaw_json_value(reference)
     return content, artifacts
 
 

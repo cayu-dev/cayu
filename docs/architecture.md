@@ -487,18 +487,19 @@ and safe hook evidence. `ToolTerminalPublisher` owns result limits, projection,
 deferred staging and terminal delivery, sharing one publication governor with
 the durable round. Live execution and recovered continuations use the same
 components; detached projection work remains visible to environment cleanup.
-`runtime/_tool_result_projection.py` owns parsing and preparing retained tool-result
-projection evidence. Its validated value holds a detached result, record and strict
-artifact references; preparation retains immutable content, artifacts and evidence.
-Events request final byte/token accounting after their other terminal policies,
-preserving publication order. Transcript messages still select built-in references
-independently without matching a projection record or using the typed preparation
-value. They share only the reference-content helper for canonical instruction
-reconstruction and current-registry redaction. The adapters establish provenance:
-matching application-authored JSON does not authorize runtime reference restoration.
-Policy invocation, artifact writes and their cancellation lifetime remain with the
-existing policy and terminal publisher. Preparation does not execute tools or write
-artifacts, and the durable formats and public policy interface remain unchanged.
+`runtime/_tool_result_projection.py` owns strict projection/reference parsing,
+current-registry content preparation and final byte/token accounting. Event and
+transcript containers use the same typed preparation through the thin adapters
+in `runtime/_tool_result_adapters.py`. Events retain a validated projection record;
+transcript messages retain validated artifact references without a projection
+record. Event accounting waits until the other terminal policies finish.
+Runtime message admission supplies positively validated references, controls and
+execution lineage to generic redaction. Untrusted ingress strips runtime authority
+before redaction; matching application-authored JSON cannot opt into the runtime
+path. Provider requests, retries, deferred input and recovery already converge on
+these publication boundaries. Preparation does not execute tools or write artifacts.
+Policy invocation, artifact persistence and authority issuance remain with the
+existing policy and terminal publisher; durable formats are unchanged.
 `ToolInvocationAdmission` owns targeted-tool resolution, policy/taint evaluation
 and durable approval pauses. Round planning and individual invocation admission
 use the same component without depending on dispatch or terminal persistence.
