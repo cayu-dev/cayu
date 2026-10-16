@@ -35,6 +35,23 @@ _RUNTIME_UPGRADE_PROFILE_POLICY_ID = "cayu:runtime-upgrade-adoption:v1"
 _MODEL_TARGET_AND_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = (
     "cayu:model-target-and-tool-capability-ceiling-adoption:v1"
 )
+_FORK_CONTROLLER_OVERLAY_PROFILE_POLICY_ID = "cayu:fork-controller-overlay-adoption:v1"
+# An enrolled controller's overlay may change the child's tool set and, through
+# its first invocation, the same budget, result-shape and stop semantics an
+# inherited fork may declare. Any other difference still needs the
+# application's execution-profile policy.
+_FORK_CONTROLLER_OVERLAY_COMPONENTS = frozenset(
+    {
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
+    }
+)
 _MODEL_TARGET_BUILT_IN_COMPONENTS = frozenset(
     {
         ExecutionProfileComponentClass.PROVIDER_ADAPTER,
@@ -116,6 +133,7 @@ class ExecutionProfileClassifier:
         source_model: str | None = None,
         force_authority_review: bool = False,
         tool_capability_ceiling_narrowed: bool = False,
+        fork_controller_overlay: bool = False,
         decision_clock: Callable[[], datetime] | None = None,
     ) -> ExecutionProfileDecision:
         event_session = session if decision_session is None else decision_session
@@ -178,7 +196,19 @@ class ExecutionProfileClassifier:
             and not target_changed
             and changed_component_set == frozenset({ExecutionProfileComponentClass.RUNTIME})
         )
-        if built_in_model_target_and_ceiling_adoption:
+        # The host authorized these tools by enrolling the controller, and the
+        # authenticated controller requested them by name on this fork.
+        built_in_fork_controller_overlay = (
+            fork_controller_overlay
+            and self._execution_profile_policy is None
+            and intent is not None
+            and changed_component_set <= _FORK_CONTROLLER_OVERLAY_COMPONENTS
+        )
+        if built_in_fork_controller_overlay:
+            fallback_actor = None
+            fallback_reason = "An enrolled fork controller requested its served tools."
+            policy_identity = _FORK_CONTROLLER_OVERLAY_PROFILE_POLICY_ID
+        elif built_in_model_target_and_ceiling_adoption:
             fallback_actor = _model_target_and_tool_capability_ceiling_profile_actor()
             fallback_reason = (
                 "The caller explicitly requested a model-target transition and narrowed the "
@@ -206,7 +236,8 @@ class ExecutionProfileClassifier:
             policy_identity = _DEFAULT_PROFILE_POLICY_ID
         policy_reason = fallback_reason
         built_in_profile_adoption = (
-            built_in_model_target_adoption
+            built_in_fork_controller_overlay
+            or built_in_model_target_adoption
             or built_in_ceiling_narrowing
             or built_in_model_target_and_ceiling_adoption
             or built_in_runtime_upgrade

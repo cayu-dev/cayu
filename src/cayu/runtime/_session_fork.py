@@ -54,6 +54,13 @@ from cayu.execution_profiles import (
     inherited_execution_profile_component_changes,
     unavailable_execution_profile_components,
 )
+from cayu.fork_controllers import (
+    ForkControllerDenied,
+    VerifiedForkController,
+    fork_overlay_agent_name,
+    fork_overlay_tool_capability_ceiling,
+    require_verified_fork_controller,
+)
 from cayu.messages import Message, MessageRole, detach_message
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _approval_support as approval_support
@@ -123,6 +130,7 @@ from cayu.sessions._execution_profile_rules import (
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.fork_overlays import FORK_OVERLAY_METADATA_KEY, ForkOverlayRecord
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
     FORK_EXECUTION_PROFILE_METADATA_KEY,
@@ -132,6 +140,7 @@ from cayu.sessions.forks import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileDecisionRecord,
     ForkExecutionProfileSelection,
+    ForkRequestConflict,
     ForkSystemPromptPolicy,
     ForkSystemPromptReplacement,
     ProfiledSessionForkResult,
@@ -166,6 +175,7 @@ from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptSnapshot, fork_source_transcript_sha256
 from cayu.tasks.store import TaskStore
 from cayu.tools.exposure import (
+    ToolCapabilityCeiling,
     resolve_tool_capability_ceiling,
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
@@ -328,7 +338,7 @@ class _PromptSuccessionWorkflow:
     ) -> _PromptSuccessionWorkflow:
         receipt = session_prompt_anatomy_transition(descendant)
         if receipt is None or receipt.request_sha256 not in accepted_request_sha256s:
-            raise RuntimeError(
+            raise ForkRequestConflict(
                 "Existing prompt-anatomy descendant conflicts with the exact request."
             )
         return cls(
@@ -675,6 +685,8 @@ def _fork_event_with_runtime_authority(event: Event) -> Event:
         "fork_request_sha256",
         "system_prompt_policy",
     ]
+    if "fork_overlay_fingerprint" in event.payload:
+        payload_fields.extend(("fork_overlay_controller", "fork_overlay_fingerprint"))
     if "initial_invocation_request_sha256" in event.payload:
         payload_fields.extend(
             (
@@ -701,6 +713,17 @@ def _fork_event_with_runtime_authority(event: Event) -> Event:
         ("source_environment_allocation_owners", "*", "environment_name"),
         ("source_environment_allocation_owners", "*", "owner_session_id"),
     )
+
+
+# Per-invocation profile parts a fork's first invocation may set freely.
+_FORK_OVERLAY_INVOCATION_COMPONENTS = frozenset(
+    {
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
+    }
+)
 
 
 class SessionFork:
@@ -877,8 +900,17 @@ class SessionFork:
         request_sha256: str,
         accepted_request_sha256s: tuple[str, ...],
         store_resolved_source_session_id: str | None = None,
+        fork_controller: VerifiedForkController | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = copy_fork_session_request(request)
+        overlay = request.overlay
+        verified_controller: VerifiedForkController | None = None
+        if overlay is not None:
+            verified_controller = require_verified_fork_controller(fork_controller)
+            if overlay.controller != verified_controller.controller.name:
+                raise ForkControllerDenied("The overlay names a different controller.")
+        elif fork_controller is not None:
+            raise ValueError("Controller forks require an overlay.")
         if (
             request.initial_invocation is not None
             and request.initial_invocation.failover is not None
@@ -914,6 +946,17 @@ class SessionFork:
             destination_session_id = runtime_generated_session_id
         if destination_session_id is not None:
             existing_descendant = await self.session_store.load(destination_session_id)
+            if existing_descendant is not None and verified_controller is not None:
+                # Replay returns durable evidence, so it needs current enrollment
+                # for the child's own agent; the source may be gone by now.
+                try:
+                    child_host_agent = self._get_registered_agent(
+                        existing_descendant.agent_name
+                    ).policy_agent_name
+                except KeyError:
+                    child_host_agent = None
+                if child_host_agent not in verified_controller.controller.agents:
+                    raise ForkControllerDenied("The fork is not an agent this controller may fork.")
             if existing_descendant is not None:
                 relationship: SessionForkProfileRelationship | None = None
                 malformed_relationship = False
@@ -937,7 +980,7 @@ class SessionFork:
                 ):
                     existing_descendant = None
                     relationship = None
-                    raise RuntimeError(
+                    raise ForkRequestConflict(
                         "Existing fork destination conflicts with the exact profiled request."
                     ) from None
                 evidence_ids = (
@@ -1170,6 +1213,12 @@ class SessionFork:
                 "Source agent must be registered to derive inherited taint before forking: "
                 f"{source_session.agent_name}"
             ) from exc
+        if source_registered_agent.fork_controller_name is not None and (
+            overlay is None or overlay.controller != source_registered_agent.fork_controller_name
+        ):
+            raise ForkControllerDenied(
+                "Only the enrolling controller can fork one of its overlay forks."
+            )
         source_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
             source_session.metadata,
         )
@@ -1186,6 +1235,32 @@ class SessionFork:
                 require_empty=False,
             )
         agent_name = request.agent_name or source_session.agent_name
+        if request.agent_name is not None and (
+            self._get_registered_agent(request.agent_name).fork_controller_name is not None
+        ):
+            raise ValueError("A fork-controller body is selected only by an overlay.")
+        if verified_controller is not None and overlay is not None:
+            # Authorize the source itself: a controller may read only sessions of
+            # agents it is enrolled for, and its forks keep the source's agent.
+            source_host_agent = source_registered_agent.policy_agent_name
+            if source_host_agent not in verified_controller.controller.agents:
+                raise ForkControllerDenied("The source is not an agent this controller may fork.")
+            if request.agent_name is not None and request.agent_name != source_host_agent:
+                raise ForkControllerDenied("A controller fork keeps the source session's agent.")
+            agent_name = fork_overlay_agent_name(
+                verified_controller.controller,
+                overlay,
+                host_agent_name=source_host_agent,
+            )
+            if (
+                agent_name != source_session.agent_name
+                and request.execution_profile_selection
+                is ForkExecutionProfileSelection.INHERIT_PARENT
+            ):
+                raise ValueError(
+                    "This overlay changes the child's body and requires "
+                    "execution_profile_selection='current_child' with profile_adoption."
+                )
         registered_agent = self._get_registered_agent(agent_name)
         if (
             registered_agent.tool_discovery_mode is not None
@@ -1196,6 +1271,13 @@ class SessionFork:
             request.tool_capability_ceiling,
             registered_agent.tool_capabilities,
             maximum=source_tool_capability_ceiling,
+        )
+        # Controller tools are never inherited or requested through the host
+        # ceiling; only this fork's overlay grants admit them.
+        effective_tool_capability_ceiling = fork_overlay_tool_capability_ceiling(
+            effective_tool_capability_ceiling,
+            registered_agent,
+            overlay,
         )
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
@@ -1250,10 +1332,14 @@ class SessionFork:
         )
 
         def ordinary_child_execution_profile(
-            child_provider: runtime_records.RegisteredProvider, child_model: str
+            child_provider: runtime_records.RegisteredProvider,
+            child_model: str,
+            *,
+            profile_agent: runtime_records.RegisteredAgentState | None = None,
+            profile_ceiling: ToolCapabilityCeiling | None = None,
         ) -> ExecutionProfileIdentity:
             candidate = _session_execution_profile._execution_profile_identity(
-                registered_agent=registered_agent,
+                registered_agent=registered_agent if profile_agent is None else profile_agent,
                 provider_name=child_provider.name,
                 registered_provider=child_provider,
                 model=child_model,
@@ -1300,7 +1386,9 @@ class SessionFork:
                     if initial_invocation is None
                     else self._effective_retry_policy(initial_invocation.retry_policy)
                 ),
-                tool_capability_ceiling=initial_tool_capability_ceiling,
+                tool_capability_ceiling=(
+                    initial_tool_capability_ceiling if profile_ceiling is None else profile_ceiling
+                ),
                 runtime_identity=current_child_runtime_identity,
                 tool_completion=None
                 if initial_invocation is None
@@ -1344,6 +1432,30 @@ class SessionFork:
                 resolve_candidate_profile=ordinary_child_execution_profile,
                 redactor=self._secret_redactor,
             ).profile
+
+        def overlay_changes_are_attributable() -> bool:
+            """Whether only the overlay's grants explain the profile change.
+
+            Rebuild the source's profile from today's registrations of its own
+            agent and ceiling. Any difference outside per-invocation settings
+            means a host or controller registration drifted since the source
+            was created, which the built-in overlay adoption must not admit.
+            """
+
+            try:
+                source_provider = self._get_registered_provider(source_session.provider_name)
+            except KeyError:
+                return False
+            rebuilt_source = ordinary_child_execution_profile(
+                source_provider,
+                source_session.model,
+                profile_agent=source_registered_agent,
+                profile_ceiling=source_tool_capability_ceiling,
+            )
+            drift = set(
+                changed_execution_profile_components(source_execution_profile, rebuilt_source)
+            )
+            return not (drift - _FORK_OVERLAY_INVOCATION_COMPONENTS)
 
         initial_invocation_profile: ExecutionProfileIdentity | None = None
         selected_execution_profile = source_execution_profile
@@ -1396,6 +1508,10 @@ class SessionFork:
                 source_provider_name=source_session.provider_name,
                 source_model=source_session.model,
                 force_authority_review=True,
+                fork_controller_overlay=(
+                    registered_agent.fork_controller_name is not None
+                    and overlay_changes_are_attributable()
+                ),
             )
             if execution_profile_decision.kind in {
                 ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
@@ -1755,6 +1871,12 @@ class SessionFork:
             fork_metadata,
             effective_tool_capability_ceiling,
         )
+        if overlay is not None and verified_controller is not None:
+            fork_metadata[FORK_OVERLAY_METADATA_KEY] = ForkOverlayRecord(
+                overlay=overlay,
+                fingerprint=overlay.fingerprint,
+                controller_subject=verified_controller.subject,
+            ).model_dump(mode="json")
         prompt_workflow.attach_receipt(
             fork_metadata,
             source_session=source_session,
@@ -1914,6 +2036,15 @@ class SessionFork:
             "source_profile_fingerprint": source_execution_profile.fingerprint,
             "source_environment_allocation_owners": (source_environment_allocation_owner_payload),
             "fork_request_sha256": fork_request_sha256,
+            **(
+                {}
+                if overlay is None
+                else {
+                    "fork_overlay_controller": overlay.controller,
+                    "fork_overlay_fingerprint": overlay.fingerprint,
+                    "fork_overlay_tool_names": list(overlay.tool_names),
+                }
+            ),
             "workspace_lineage": WorkspaceForkLineage(
                 status=(
                     WorkspaceForkLineageStatus.SHARED_OR_AMBIGUOUS
@@ -2132,7 +2263,9 @@ class SessionFork:
                     )
                 existing_relationship = session_fork_profile_relationship(existing)
                 if existing_relationship != relationship:
-                    raise RuntimeError("Existing profiled fork conflicts with the exact request.")
+                    raise ForkRequestConflict(
+                        "Existing profiled fork conflicts with the exact request."
+                    )
                 await validate_tool_discovery_view(existing)
                 recovered_events: list[Event] = []
                 for prepared_event in prepared_events:

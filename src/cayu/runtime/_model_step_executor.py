@@ -338,6 +338,10 @@ from cayu.sessions._terminal_evidence import interruption_request_id_from_payloa
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.fork_overlays import (
+    fork_overlay_context_message,
+    fork_overlay_record_from_metadata,
+)
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
 from cayu.sessions.store import SessionStore
 from cayu.tools.catalogue import (
@@ -388,6 +392,15 @@ from cayu.tools.targeted_projection import (
 from cayu.vaults.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
+
+
+def _fork_overlay_layer(session, registered_agent) -> Message | None:
+    """Render the durable overlay; a controller body without its record fails closed."""
+
+    record = fork_overlay_record_from_metadata(session.metadata)
+    if record is None and registered_agent.fork_controller_name is not None:
+        raise RuntimeError("A fork-controller body session has no overlay record.")
+    return fork_overlay_context_message(record)
 
 
 class _ModelFailoverCandidateExhausted(Exception):
@@ -3305,6 +3318,11 @@ class ModelStepRun:
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
 
+        # A controller overlay is a separate layer after the selected history,
+        # rebuilt from the child's durable record and never transcribed.
+        overlay_message = _fork_overlay_layer(self._session, self._registered_agent)
+        if overlay_message is not None:
+            context_messages.append(overlay_message)
         child_session_notification_binding = None
         child_session_contributor = self._registered_agent.child_session_context_contributor
         if child_session_contributor is not None:
@@ -4676,6 +4694,9 @@ class ModelStepRun:
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
 
+        overlay_message = _fork_overlay_layer(self._session, self._registered_agent)
+        if overlay_message is not None:
+            recovery_context_messages.append(overlay_message)
         recovery_child_notification_binding = None
         child_session_contributor = self._registered_agent.child_session_context_contributor
         if child_session_contributor is not None:

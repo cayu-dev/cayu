@@ -491,6 +491,8 @@ class SessionPreparation:
         )
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
+        if registered_agent.fork_controller_name is not None:
+            raise ValueError("A fork-controller body runs only as an overlay fork.")
         if (
             registered_agent.tool_discovery_mode is not None
             and not self.session_store.supports_atomic_session_operation_initialization

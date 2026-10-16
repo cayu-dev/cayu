@@ -50,6 +50,7 @@ from cayu.sessions._browser_control_checkpoint import (
 )
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.fork_overlays import fork_overlay_record_from_metadata
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.store import SessionStore
 from cayu.tools._redaction import InvocationRedactorSnapshot
@@ -113,6 +114,15 @@ class BoundInvocationResources:
     workspace_mutation_owner: InvocationWorkspaceMutationOwner | None
     workspace_receipt_artifact_store: Any
     workspace_receipt_artifact_unavailable_detail: str
+
+
+def _sealed_publication_scope() -> KnowledgePublicationScope:
+    scope = KnowledgePublicationScope()
+    scope.seal()
+    return scope
+
+
+_SEALED_OVERLAY_PUBLICATION_SCOPE = _sealed_publication_scope()
 
 
 class ToolInvocationResources:
@@ -280,7 +290,12 @@ class ToolInvocationResources:
             workspace=raw_workspace,
             artifact_store=raw_artifact_store,
         )
-        tool_context._bind_runtime_knowledge_publication_scope(self._knowledge_publication_scope)
+        tool_context._bind_runtime_knowledge_publication_scope(
+            # Overlay forks never write host knowledge: their tools see a sealed scope.
+            _SEALED_OVERLAY_PUBLICATION_SCOPE
+            if fork_overlay_record_from_metadata(session.metadata) is not None
+            else self._knowledge_publication_scope
+        )
         if effective_tool_call.name == SEARCH_TOOLS_NAME:
             if registered_agent.tool_discovery_mode is None:
                 raise RuntimeError("search_tools execution requires enabled tool discovery.")

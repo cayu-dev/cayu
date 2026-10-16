@@ -2689,6 +2689,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "copy_checkpoint",
         "environment_name",
         "execution_profile_selection",
+        "fork_overlay_controller",
+        "fork_overlay_fingerprint",
+        "fork_overlay_tool_names",
         "fork_request_sha256",
         "inherited_taint_labels",
         "initial_dispatch_id",
@@ -2715,6 +2718,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         },
         authority_keys={
             "causal_budget_id",
+            "fork_overlay_controller",
+            "fork_overlay_fingerprint",
             "fork_request_sha256",
             "initial_invocation_profile_fingerprint",
             "initial_invocation_request_sha256",
@@ -2737,6 +2742,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         },
         internal_keys={"source_environment_allocation_owners"},
         public_authority_keys={
+            "fork_overlay_controller",
+            "fork_overlay_fingerprint",
             "initial_dispatch_id",
             "source_instance_fingerprint",
             "source_transcript_sha256",

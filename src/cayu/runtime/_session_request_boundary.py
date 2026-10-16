@@ -511,6 +511,24 @@ def prepare_fork_session_request(
                 requested_by=requested_by,
             )
         _require_secret_free_fork_policy_metadata(request.metadata, redactor=redactor)
+        if request.overlay is not None and redactor.has_values:
+            overlay = request.overlay
+            overlay_text = (
+                overlay.controller,
+                *(() if overlay.instructions is None else (overlay.instructions,)),
+                *overlay.tool_names,
+                *(
+                    text
+                    for item in overlay.memory
+                    for text in (item.id, item.content, item.source)
+                    if text is not None
+                ),
+            )
+            if any(redactor.redact_text(text) != text for text in overlay_text):
+                raise ForkAuthorityError(
+                    "overlay contains a workload secret and cannot become model-visible "
+                    "fork context."
+                )
         return request.model_copy(
             update={
                 "metadata": redact_json_object(

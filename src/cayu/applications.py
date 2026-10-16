@@ -298,6 +298,14 @@ from cayu.events import (
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.fork_controllers import (
+    ForkController,
+    ForkControllerAccess,
+    ForkControllerDenied,
+    VerifiedForkController,
+    fork_controller_access,
+    require_verified_fork_controller,
+)
 from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.scopes import (
@@ -6086,6 +6094,14 @@ class CayuApp:
             execution_requirements=execution_requirements,
         )
 
+    def enroll_fork_controller(self, controller: ForkController) -> None:
+        """Let one outside controller fork the named agents with its own overlay."""
+        self._agent_registry.enroll_fork_controller(controller)
+
+    def fork_controller_access(self, subject: str) -> ForkControllerAccess:
+        """Return the overlay entrance for a subject the host already authenticated."""
+        return fork_controller_access(self, subject, self._agent_registry.fork_controllers)
+
     async def _release_mcp_toolsets(self, timeout_s: float) -> bool:
         return await self._agent_registry.release_mcp_toolsets(timeout_s)
 
@@ -8657,9 +8673,18 @@ class CayuApp:
 
     @_admitted_entrance
     @runtime_stream_entrance
-    async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
+    async def fork_session(
+        self,
+        request: ForkSessionRequest,
+        *,
+        _fork_controller: VerifiedForkController | None = None,
+    ) -> AsyncIterator[Event]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        if request.overlay is not None:
+            verified = require_verified_fork_controller(_fork_controller)
+            if not any(c is verified.controller for c in self._agent_registry.fork_controllers):
+                raise ForkControllerDenied("The fork controller is not the enrolled controller.")
         source_session_id: str | None = None
         store_resolved_source_session_id: str | None = None
         store_resolved_expected_source_causal_budget_id: str | None = None
@@ -8701,6 +8726,7 @@ class CayuApp:
                 store_resolved_expected_source_causal_budget_id=(
                     store_resolved_expected_source_causal_budget_id
                 ),
+                fork_controller=_fork_controller,
             )
         finally:
             del request
@@ -8845,6 +8871,7 @@ class CayuApp:
         *,
         store_resolved_source_session_id: str | None,
         store_resolved_expected_source_causal_budget_id: str | None = None,
+        fork_controller: VerifiedForkController | None = None,
     ) -> tuple[Event, ...]:
         """Detach fork-authority failures before they cross the public boundary."""
 
@@ -8869,6 +8896,7 @@ class CayuApp:
                     store_resolved_expected_source_causal_budget_id=(
                         store_resolved_expected_source_causal_budget_id
                     ),
+                    fork_controller=fork_controller,
                 )
                 async with _close_delegated_event_stream(stream) as owned_stream:
                     async for event in owned_stream:
@@ -8897,6 +8925,7 @@ class CayuApp:
         *,
         store_resolved_source_session_id: str | None = None,
         store_resolved_expected_source_causal_budget_id: str | None = None,
+        fork_controller: VerifiedForkController | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
@@ -8915,6 +8944,7 @@ class CayuApp:
             request_sha256=prepared.request_sha256,
             accepted_request_sha256s=prepared.accepted_request_sha256s,
             store_resolved_source_session_id=store_resolved_source_session_id,
+            fork_controller=fork_controller,
         )
         stream = await self._resource_session_stream.restore(
             stream, prepared.request.source_session_id

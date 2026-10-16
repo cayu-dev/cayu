@@ -1165,7 +1165,10 @@ class ToolInvocationAdmission:
         policy_result = await registered_agent.tool_policy.authorize(
             ToolPolicyRequest(
                 session=session.model_copy(deep=True),
-                agent=_copy_agent_spec(registered_agent.spec),
+                # A fork-controller body is governed as its host agent.
+                agent=_copy_agent_spec(registered_agent.spec).model_copy(
+                    update={"name": registered_agent.policy_agent_name}
+                ),
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
                 tool_round_id=tool_round_id,

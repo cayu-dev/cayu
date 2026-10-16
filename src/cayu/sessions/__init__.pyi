@@ -316,6 +316,9 @@ from cayu.sessions.exports import SessionExportBoundary as SessionExportBoundary
 from cayu.sessions.exports import SessionExportLimits as SessionExportLimits
 from cayu.sessions.exports import SessionExportSnapshot as SessionExportSnapshot
 from cayu.sessions.exports import SessionExportTooLarge as SessionExportTooLarge
+from cayu.sessions.fork_overlays import ForkOverlay as ForkOverlay
+from cayu.sessions.fork_overlays import ForkOverlayMemoryItem as ForkOverlayMemoryItem
+from cayu.sessions.fork_overlays import ForkOverlayToolGrant as ForkOverlayToolGrant
 from cayu.sessions.forks import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
@@ -670,6 +673,9 @@ __all__ = [
     "ForkExecutionProfileDecisionRecord",
     "ForkExecutionProfileSelection",
     "ForkExecutionProfileSource",
+    "ForkOverlay",
+    "ForkOverlayMemoryItem",
+    "ForkOverlayToolGrant",
     "ForkSessionRequest",
     "ForkSourceSnapshot",
     "ForkSystemPromptPolicy",

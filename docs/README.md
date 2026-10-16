@@ -29,6 +29,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Environment factories](environment-factories.md)
 - [Execution capabilities: Docker and Lambda MicroVM](execution-capabilities.md)
 - [Execution snapshots: managed process and workspace restoration](execution-snapshots.md)
+- [Session fork overlays: outside controllers with their own instructions, tools and memory](fork-overlays.md)
 - Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)
 - [GitHub delivery](github-delivery.md)
 - [Human review](human-review.md)

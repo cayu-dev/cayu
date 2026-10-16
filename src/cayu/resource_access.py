@@ -362,6 +362,11 @@ class ScopedCayuAccess:
         private_id = await self.__app._resolve_public_session_id(request.session_id)
         request = request.model_copy(update={"session_id": private_id})
         session = await self.sessions.load(private_id)
+        from cayu.sessions.fork_overlays import fork_overlay_record_from_metadata
+
+        if fork_overlay_record_from_metadata(session.metadata) is not None:
+            # A controller's overlay fork continues only through that controller.
+            raise ResourceAccessDenied()
         stored_binding = session.invocation.resource_access
         if stored_binding is None or (stored_binding.authority, stored_binding.subject) != (
             self.__binding.authority,
@@ -389,6 +394,11 @@ class ScopedCayuAccess:
             raise TypeError("Scoped recovery requires IncompleteSessionRecoveryRequest.")
         private_id = await self.__app._resolve_public_session_id(request.session_id)
         session = await self.sessions.load(private_id)
+        from cayu.sessions.fork_overlays import fork_overlay_record_from_metadata
+
+        if fork_overlay_record_from_metadata(session.metadata) is not None:
+            # Recovery can continue a run, so it follows the same rule as resume.
+            raise ResourceAccessDenied()
         binding = session.invocation.resource_access
         if binding is None or (binding.authority, binding.subject) != (
             self.__binding.authority,

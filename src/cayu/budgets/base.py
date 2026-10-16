@@ -3219,6 +3219,18 @@ def budget_limits_for_session(
         policy.limits,
         identity_namespace="app_policy",
     )
+    from cayu.sessions.fork_overlays import FORK_CONTROLLER_AGENT_SEPARATOR
+
+    host_agent_name = agent_name.split(FORK_CONTROLLER_AGENT_SEPARATOR, 1)[0]
+    if host_agent_name != agent_name and any(
+        limit.scope == "agent" and limit.key == host_agent_name for limit in effective_limits
+    ):
+        # Agent-scoped usage is accounted by exact agent name. Refuse rather
+        # than let a fork-controller body run outside its host agent's budget.
+        raise ValueError(
+            f"Agent-scoped budgets for {host_agent_name!r} do not yet cover its "
+            "fork-controller bodies; use app or causal budgets for overlay forks."
+        )
     for limit in effective_limits:
         if (
             limit.scope == "app"

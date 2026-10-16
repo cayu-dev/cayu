@@ -1087,6 +1087,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
     # public tool modules' import graph. Each unbound extractor is owned by the
     # component it describes; exact-type lookup prevents subclasses from
     # inheriting Cayu-versioned trust.
+    from cayu.mcp.tools import McpToolAdapter
     from cayu.tools.browser import ScreenshotPageTool
     from cayu.tools.browser_session import BrowserSessionTool
     from cayu.tools.commands import ExecCommandTool
@@ -1135,6 +1136,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
         UserInputTool,
         WebFetchTool,
         WebAccessRoutingTool,
+        McpToolAdapter,
     )
     return {tool_type: tool_type._execution_profile_material for tool_type in tool_types}
 

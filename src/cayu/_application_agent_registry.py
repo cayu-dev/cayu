@@ -22,6 +22,7 @@ from cayu.configuration import CayuConfigSource
 from cayu.context.base import ContextPolicy, DefaultContextPolicy
 from cayu.context.thinking import ThinkingConfig
 from cayu.environments.admission import ExecutionRequirements
+from cayu.fork_controllers import ForkController
 from cayu.mcp.tools import (
     McpToolAdapter,
     McpToolset,
@@ -46,6 +47,7 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.mcp_manifest_policy import McpManifestPolicy, McpManifestPolicyAction
 from cayu.runtime.tool_effects import ToolEffectReconciliationRegistration
 from cayu.sessions.child_context import ChildSessionContextContributor
+from cayu.sessions.fork_overlays import FORK_CONTROLLER_AGENT_SEPARATOR, fork_controller_agent_name
 from cayu.sessions.store import SessionStore
 from cayu.tools.base import Tool, ToolEffect
 from cayu.tools.catalogue import build_tool_catalog_snapshot
@@ -101,6 +103,7 @@ class ApplicationAgentRegistry:
         self._mcp_refresh_owner = object()
         self._mcp_publication_lock = asyncio.Lock()
         self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
+        self._fork_controllers: dict[str, ForkController] = {}
         self._notification_refresh = (
             self._refresh_after_notification
             if notification_refresh is None
@@ -193,6 +196,12 @@ class ApplicationAgentRegistry:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
         stored_spec = _validate_agent_spec(spec)
+        if FORK_CONTROLLER_AGENT_SEPARATOR in stored_spec.name:
+            # Reserved for fork-controller bodies, which enrollment registers itself.
+            raise ValueError(
+                f"Agent names cannot contain {FORK_CONTROLLER_AGENT_SEPARATOR!r}; "
+                "it is reserved for fork-controller bodies."
+            )
         thinking_source: CayuConfigSource = (
             "explicit" if stored_spec.thinking is not None else default_thinking_source
         )
@@ -684,6 +693,80 @@ class ApplicationAgentRegistry:
                 )
             raise
 
+    @property
+    def fork_controllers(self) -> tuple[ForkController, ...]:
+        return tuple(self._fork_controllers.values())
+
+    def fork_controller(self, name: str) -> ForkController:
+        try:
+            return self._fork_controllers[name]
+        except KeyError:
+            raise KeyError(f"Fork controller not enrolled: {name}") from None
+
+    def enroll_fork_controller(self, controller: ForkController) -> None:
+        """Enroll one outside controller and register its tool-carrying bodies.
+
+        Each named host agent must already be registered. When the controller
+        serves tools, one additional body per agent combines the host agent's
+        exact registration with those tools. Host sessions never see that body;
+        only an overlay fork from this controller selects it.
+        """
+
+        if type(controller) is not ForkController:
+            raise TypeError("controller must be a ForkController.")
+        if controller.name in self._fork_controllers:
+            raise ValueError(f"Fork controller already enrolled: {controller.name}")
+        enrolled_subjects = {
+            subject for enrolled in self._fork_controllers.values() for subject in enrolled.subjects
+        }
+        if enrolled_subjects.intersection(controller.subjects):
+            raise ValueError("A subject can act for only one enrolled fork controller.")
+        adapters: list[McpToolAdapter] = []
+        for toolset in controller.mcp_toolsets:
+            if _mcp_refresh_source_key(toolset) in self._refreshable_mcp_toolsets:
+                raise ValueError(
+                    "A refreshable host MCP source cannot also serve a fork controller."
+                )
+            adapters.extend(sorted(toolset.tools, key=lambda tool: tool.name))
+        bodies: dict[str, runtime_records.RegisteredAgentState] = {}
+        for agent_name in controller.agents:
+            base = self._get_registered_agent(agent_name)
+            if base.fork_controller_name is not None:
+                raise ValueError("A fork-controller body cannot be enrolled again.")
+            if not adapters:
+                continue
+            body_name = fork_controller_agent_name(agent_name, controller.name)
+            if body_name in self._agents:
+                raise ValueError(f"Agent already registered: {body_name}")
+            bodies[body_name] = _registered_agent_with_fork_controller_tools(
+                base,
+                body_name=body_name,
+                controller_name=controller.name,
+                adapters=adapters,
+                redactor=self._secret_redactor,
+                timeout_seconds=self._tool_timeout_seconds,
+            )
+        if adapters and self._admission.sealed:
+            raise ApplicationAdmissionsSealed(
+                "A closing application cannot take ownership of MCP toolsets."
+            )
+        claimed: list[McpToolset] = []
+        try:
+            for toolset in controller.mcp_toolsets:
+                if toolset._refresh_source.claim_static_owner(self._mcp_refresh_owner):
+                    claimed.append(toolset)
+        except BaseException:
+            for toolset in claimed:
+                toolset._refresh_source.release_static_owner(self._mcp_refresh_owner)
+            raise
+        for body_name, body in bodies.items():
+            self._agents[body_name] = body
+            base_name = body.policy_agent_name
+            self._agent_thinking_sources[body_name] = self._agent_thinking_sources[base_name]
+        for toolset in claimed:
+            self._static_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
+        self._fork_controllers[controller.name] = controller
+
     def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
         agent_name = require_clean_nonblank(name, "agent.name")
         registered_agent = self._get_registered_agent(agent_name)
@@ -752,6 +835,66 @@ def _agents_contain_mcp_source(
         and registered.tool.toolset._refresh_source is source
         for agent in agents.values()
         for registered in agent.tools.values()
+    )
+
+
+def _registered_agent_with_fork_controller_tools(
+    base: runtime_records.RegisteredAgentState,
+    *,
+    body_name: str,
+    controller_name: str,
+    adapters: list[McpToolAdapter],
+    redactor: SecretRedactor,
+    timeout_seconds: float | None,
+) -> runtime_records.RegisteredAgentState:
+    """Compose a host agent's exact registration with controller-served tools."""
+
+    tools_by_name = dict(base.tools)
+    controller_tool_names: list[str] = []
+    for adapter in adapters:
+        registered = _validate_registered_tool(
+            adapter,
+            redactor=redactor,
+            timeout_seconds=timeout_seconds,
+        )
+        if registered.name in tools_by_name or registered.name in base.runtime_tools:
+            raise ValueError(f"Fork-controller tool collides with a host tool: {registered.name}")
+        tools_by_name[registered.name] = registered
+        controller_tool_names.append(registered.name)
+    descriptors_by_name = {
+        tool.name: _registered_tool_descriptor(tool) for tool in tools_by_name.values()
+    }
+    tool_catalogue = build_tool_catalog_snapshot(descriptors_by_name.values())
+    tool_capabilities = tuple(
+        RegisteredToolCapability(**descriptors_by_name[name].exposure_capability_material())
+        for name in tools_by_name
+    )
+    all_registered_tool_exposure = ResolvedToolExposure(
+        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+        catalogue_revision=tool_catalogue.revision,
+        tools=tool_capabilities,
+        registered_count=len(tool_capabilities),
+        ceiling_count=len(tool_capabilities),
+    )
+    exposure_policy = base.tool_exposure_policy
+    if type(exposure_policy) is StaticToolExposurePolicy:
+        # Granted controller tools are directly callable. A custom exposure
+        # policy keeps deciding for itself.
+        exposure_policy = StaticToolExposurePolicy(
+            profile_id=exposure_policy.profile_id,
+            tools=(*exposure_policy.tools, *controller_tool_names),
+        )
+    return replace(
+        base,
+        spec=base.spec.model_copy(update={"name": body_name}, deep=True),
+        tools=MappingProxyType(tools_by_name),
+        tool_catalogue=tool_catalogue,
+        tool_capabilities=all_registered_tool_exposure.tools,
+        all_registered_tool_exposure=all_registered_tool_exposure,
+        tool_exposure_policy=exposure_policy,
+        fork_controller_name=controller_name,
+        fork_controller_base_agent=base.spec.name,
+        fork_controller_tool_names=frozenset(controller_tool_names),
     )
 
 

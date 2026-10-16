@@ -92,12 +92,24 @@ class RegisteredAgentState:
     registration_symbol: str | None = None
     child_session_context_contributor: ChildSessionContextContributor | None = None
     tool_exposure_mode: ToolExposureMode = ToolExposureMode.FILTERED_TOOLS
+    # A fork-controller body is a host agent plus one enrolled controller's
+    # served tools. It runs only as an overlay fork; host policies and budgets
+    # keyed by agent name keep applying through ``policy_agent_name``.
+    fork_controller_name: str | None = None
+    fork_controller_base_agent: str | None = None
+    fork_controller_tool_names: frozenset[str] = frozenset()
 
     def executable_tool(self, name: str) -> RegisteredTool | None:
         """Resolve an application or runtime-owned executable without merging catalogues."""
 
         registered = self.tools.get(name)
         return registered if registered is not None else self.runtime_tools.get(name)
+
+    @property
+    def policy_agent_name(self) -> str:
+        """Return the host agent whose policies and budgets govern this body."""
+
+        return self.fork_controller_base_agent or self.spec.name
 
     @property
     def executable_tool_names(self) -> frozenset[str]:

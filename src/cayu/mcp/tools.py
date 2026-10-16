@@ -828,6 +828,19 @@ class McpToolAdapter(Tool):
         toolset = self.__binding.toolset
         return toolset._refresh_source.dispatch_authority_is_current(toolset.generation)
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        # The adapter only forwards arguments to one server tool. With an
+        # explicit connection identity that target is comparable across
+        # processes; the tool's contract stays in its direct-tool descriptor.
+        binding = self.__binding
+        if not binding.toolset.manifest_identity_is_explicit:
+            return None
+        return {
+            "kind": "mcp",
+            "connection": binding.toolset.manifest_identity,
+            "tool": binding.manifest_mcp_name,
+        }
+
     @property
     def toolset(self) -> McpToolset:
         return self.__binding.toolset

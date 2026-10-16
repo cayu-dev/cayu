@@ -54,6 +54,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.fork_overlays import fork_overlay_granted_tool_names
 from cayu.sessions.invocation import (
     SessionExecutionSource,
     SessionInvocation,
@@ -819,6 +820,10 @@ class SessionForkSourceNotFound(KeyError):
     """A fork's source disappeared before the atomic child-creation boundary."""
 
 
+class ForkRequestConflict(RuntimeError):
+    """A fork destination already exists for a different exact request."""
+
+
 class SessionForkActiveModelStageConflict(ValueError):
     """A fork was rejected because its source still owns an active model stage."""
 
@@ -961,7 +966,10 @@ def _validate_profiled_fork_authority(
 ) -> None:
     source_ceiling = tool_capability_ceiling_from_session_metadata(source_session.metadata)
     fork_ceiling = tool_capability_ceiling_from_session_metadata(fork.metadata)
-    if not frozenset(fork_ceiling.tool_names) <= frozenset(source_ceiling.tool_names):
+    widened = frozenset(fork_ceiling.tool_names) - frozenset(source_ceiling.tool_names)
+    # Only the overlay's explicit grants may add tools; re-granting a tool the
+    # source already had is not a widening, and nothing else may be added.
+    if not widened <= fork_overlay_granted_tool_names(fork):
         raise ValueError("A fork cannot widen its source tool capability ceiling.")
     source_kind, source_profile, active = effective_fork_source_execution_profile(
         source_session,

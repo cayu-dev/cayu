@@ -3376,7 +3376,9 @@ explicit registered subset. Resume and fork may narrow that ceiling but never
 widen it, and the store commits a narrowing with the matching execution-profile
 component. A ceiling-filtered catalogue view retains canonical descriptor
 identities and cannot manufacture members absent from the full snapshot. Later
-registration changes cannot silently grant more tools.
+registration changes cannot silently grant more tools. The only additions a
+fork can carry are the tools an enrolled controller's overlay grants, on that
+controller's body; see [session fork overlays](fork-overlays.md).
 
 The snapshot is frozen for the logical model step: generic retries and the one
 context-overflow recovery reuse its exact definitions and order. A later model

@@ -60,6 +60,7 @@ from cayu.sessions._model_failover import (
     ModelTarget,
     copy_optional_model_failover_policy,
 )
+from cayu.sessions.fork_overlays import FORK_OVERLAY_METADATA_KEY, ForkOverlay, copy_fork_overlay
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
@@ -327,6 +328,7 @@ class RunRequest(BaseModel):
                     TOOL_CAPABILITY_CEILING_METADATA_KEY,
                     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
                     FORK_EXECUTION_PROFILE_METADATA_KEY,
+                    FORK_OVERLAY_METADATA_KEY,
                 )
                 if key in copied
             ),
@@ -344,6 +346,8 @@ class RunRequest(BaseModel):
                 authority_name = "fork-profile authority"
             elif reserved_key == TOOL_CAPABILITY_CEILING_METADATA_KEY:
                 authority_name = "tool-capability-ceiling authority"
+            elif reserved_key == FORK_OVERLAY_METADATA_KEY:
+                authority_name = "fork-overlay authority"
             else:
                 authority_name = "prompt-transition authority"
             raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
@@ -733,6 +737,10 @@ class ForkSessionRequest(BaseModel):
     expected_source: ForkSourceSnapshot | None = None
     initial_invocation: ResumeRequest | None = None
     initial_dispatch_id: str | None = None
+    # Only an enrolled controller entrance may admit an overlay. An absent
+    # overlay is omitted from the request identity so existing fork digests and
+    # generated child ids are unchanged.
+    overlay: ForkOverlay | None = Field(default=None, exclude_if=lambda value: value is None)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("session_id")
@@ -775,6 +783,7 @@ class ForkSessionRequest(BaseModel):
             PROMPT_ANATOMY_TRANSITION_METADATA_KEY: "prompt-transition authority",
             FORK_EXECUTION_PROFILE_METADATA_KEY: "fork-profile authority",
             FORK_SOURCE_SNAPSHOT_METADATA_KEY: "fork-source authority",
+            FORK_OVERLAY_METADATA_KEY: "fork-overlay authority",
         }
         reserved_key = next(
             (key for key in reserved_authority_kinds if key in copied),
@@ -807,6 +816,11 @@ class ForkSessionRequest(BaseModel):
         if isinstance(value, ExecutionProfileAdoptionIntent):
             return copy_execution_profile_adoption_intent(value)
         return ExecutionProfileAdoptionIntent.model_validate(value)
+
+    @field_validator("overlay", mode="before")
+    @classmethod
+    def copy_overlay(cls, value: object) -> ForkOverlay | None:
+        return copy_fork_overlay(value)
 
     @field_validator("expected_source", mode="before")
     @classmethod
@@ -869,6 +883,15 @@ class ForkSessionRequest(BaseModel):
             raise ValueError(
                 "initial_invocation cannot contain process-local loop_policies because "
                 "durable dispatch cannot reconstruct them."
+            )
+        if (
+            self.overlay is not None
+            and self.overlay.tools
+            and self.execution_profile_selection is ForkExecutionProfileSelection.INHERIT_PARENT
+        ):
+            raise ValueError(
+                "Fork overlay tools change the child's tools and require "
+                "execution_profile_selection='current_child' with profile_adoption."
             )
         if self.execution_profile_selection is ForkExecutionProfileSelection.INHERIT_PARENT:
             if self.profile_adoption is not None:
@@ -1194,6 +1217,7 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
             else copy_resume_request(request.initial_invocation)
         ),
         initial_dispatch_id=request.initial_dispatch_id,
+        overlay=copy_fork_overlay(request.overlay),
         metadata=copy_durable_metadata(request.metadata),
     )
     return copied
