@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.cli._cloud_candidate import staged_candidate
 
 from cayu.cli import _cloud_project as cloud_project
 from cayu.cli import cloud as cloud_cli
@@ -925,7 +926,9 @@ def test_cloud_deploy_is_implemented_by_the_core_package(
             body = json.loads(self.rfile.read(length)) if length else None
             requests.append(("POST", self.path, body))
             idempotency_keys.append(self.headers["Idempotency-Key"])
-            payload = json.dumps({"id": "dep_one", "status": "accepted"}).encode()
+            payload = json.dumps(
+                {"id": "dep_one", "status": "accepted", **staged_candidate(body)}
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -988,6 +991,8 @@ EOF
                     revision,
                     "--no-wait",
                     "--no-promote",
+                    "--evaluated-against",
+                    "none",
                 ]
             )
             == 2
@@ -1010,6 +1015,8 @@ EOF
                     revision,
                     "--no-wait",
                     "--no-promote",
+                    "--evaluated-against",
+                    "none",
                 ]
             )
             == 0
@@ -1031,6 +1038,8 @@ EOF
                     "b" * 40,
                     "--no-wait",
                     "--no-promote",
+                    "--evaluated-against",
+                    "none",
                 ]
             )
             == 0
@@ -1056,6 +1065,9 @@ EOF
         "repository": "https://github.com/example/research-agent",
         "revision": revision,
     }
+    # `--no-promote` stages a candidate against the new Agent's empty selection.
+    assert requests[2][2]["candidate"] == {"evaluated_against_deployment_id": None}
+    assert output["result"]["deployment"]["candidate"]["evaluated_against_deployment_id"] is None
     evidence_files = list((tmp_path / "evidence").glob("*.json"))
     assert len(evidence_files) == 1
     assert "customer-secret-material" not in evidence_files[0].read_text()
@@ -1238,7 +1250,7 @@ def test_cloud_deploy_uploads_a_local_bundle_before_creating_the_release(
                     }
                 )
             else:
-                self._reply({"id": "dep_local", "status": "accepted"})
+                self._reply({"id": "dep_local", "status": "accepted", **staged_candidate(body)})
 
         def do_PUT(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1295,6 +1307,8 @@ policy_version = "v1"
                     str(tmp_path),
                     "--no-wait",
                     "--no-promote",
+                    "--evaluated-against",
+                    "none",
                 ]
             )
             == 0
@@ -1320,6 +1334,8 @@ policy_version = "v1"
     assert deployment_request[2]["manifest"]["source"]["repository"].startswith(
         "cayu-cloud://source-bundles/sha256/"
     )
+    assert deployment_request[2]["candidate"] == {"evaluated_against_deployment_id": None}
+    assert not any(path.endswith("/promote") for _, path, _ in requests)
     assert output["result"]["source"]["kind"] == "local_bundle"
 
 
@@ -4317,6 +4333,47 @@ def test_cloud_acknowledgement_refusal_without_parseable_revisions_keeps_cloud_h
     assert error["code"] == "storage_breaking_acknowledgement_required"
     assert str(error["message"]).endswith(publication_error["hint"])
     assert "retry" not in error["commands"]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        _STORAGE_PUBLICATION_ERRORS["storage_breaking_acknowledgement_required"],
+        _STORAGE_PUBLICATION_ERRORS["storage_writers_not_stopped"],
+        {
+            "acknowledge_sessions": ["s-input"],
+            "code": "unfinished_sessions",
+            "detail": "1 session is waiting for input.",
+            "hint": "Answer the session, then retry.",
+            "message": "The Agent has unfinished sessions.",
+        },
+    ],
+    ids=lambda refusal: refusal["code"],
+)
+def test_a_refusal_cloud_says_no_retry_can_pass_suggests_none(
+    refusal: dict[str, object], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # As Cloud reports any refusal of a candidate that has since expired.
+    hint = "The candidate expired, so it can't be published. Stage a new candidate."
+    publication_error = {**refusal, "hint": hint, "retryable": False}
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            _PublicationClient(publication_error),
+            application_id="ready-agent",
+            initial=None,
+            expected_deployment_id=_DEPLOYMENT,
+            poll_seconds=0.01,
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+
+    error = _publication_failure_envelope(raised, capsys)
+    assert error["code"] == refusal["code"]
+    assert error["message"] == f"{refusal['message']} {refusal['detail']} {hint}"
+    assert set(error["commands"]) == {"status", "timeline"}
+    assert "acknowledge_breaking" not in error and "acknowledge_sessions" not in error
+    assert error["publication_error"]["retryable"] is False
 
 
 def test_cloud_deployment_wait_reports_a_refused_publication(

@@ -129,7 +129,8 @@ def _deploy(client, project, tmp_path, *flags, wait=False):
             acknowledge_session=parsed.acknowledge_session,
             application=None,
             no_wait=not wait,
-            no_promote=not wait,
+            no_promote=parsed.no_promote,
+            evaluated_against=parsed.evaluated_against,
             poll_seconds=5.0,
             retry_failed=True,
             session_policy=parsed.session_policy,
@@ -487,6 +488,7 @@ class RefusedReleaseClient(Client):
         on_promote=None,
         after_retry=None,
         serving="dep_old",
+        candidate=False,
     ):
         super().__init__(project, status="smoke_tested")
         payload = project.manifest.deployment_payload(
@@ -513,6 +515,18 @@ class RefusedReleaseClient(Client):
             "session_policy": stored_choice
             or {"acknowledge_sessions": [], "mode": "wait", "wait_seconds": 900},
         }
+        if candidate:
+            # A candidate staged by `--no-promote` against the Agent's (empty) selection.
+            self.release["candidate"] = {
+                "brief_id": None,
+                "evaluated_against_deployment_id": None,
+                "expires_at": "2026-10-16T00:00:00Z",
+                "expires_in_seconds": 604800,
+                "receipts": [],
+                "requirement_ids": [],
+                "snapshot_root": None,
+            }
+        self.candidate = candidate
         self.current = {**self.release, "publication_error": _SESSION_REFUSAL}
         if current is not None:
             self.current = {**self.release, **current}
@@ -538,7 +552,9 @@ class RefusedReleaseClient(Client):
             return self.release.copy()
         if method == "GET" and path.endswith("/deployments"):
             self.requests.append((method, path, kwargs))
-            return {"items": [self.release.copy()], "next_cursor": None}
+            # Cloud lists a Release as a read shows it; the candidate cases read it only so.
+            listed = self.current if self.candidate else self.release
+            return {"items": [listed.copy()], "next_cursor": None}
         if method == "GET" and path.endswith("/deployments/dep_old"):
             self.requests.append((method, path, kwargs))
             if self.reads:
@@ -620,12 +636,24 @@ _PROCEED_ALL = {"acknowledge_sessions": ["*"], "mode": "proceed", "wait_seconds"
         {"session_preflight": {"state": "reconsidering"}},
     ],
 )
-def test_rerun_without_waiting_fails_when_a_more_permissive_choice_stays(tmp_path, current, capsys):
-    # Asked for `block`; the Release keeps `proceed *`, and this deploy left it to publish.
+def test_rerun_of_a_candidate_fails_when_a_more_permissive_choice_stays(tmp_path, current, capsys):
+    # Asked for `block`; the candidate keeps `proceed *`, and `--no-promote` never retries or
+    # promotes it, so its promotion publishes under `proceed *`.
     project = _project(tmp_path)
-    client = RefusedReleaseClient(project, stored_choice=_PROCEED_ALL, current=current)
+    client = RefusedReleaseClient(
+        project, stored_choice=_PROCEED_ALL, current=current, candidate=True
+    )
     with pytest.raises(CloudApiError) as raised:
-        _deploy(client, project, tmp_path, "--session-policy", "block")
+        _deploy(
+            client,
+            project,
+            tmp_path,
+            "--no-promote",
+            "--evaluated-against",
+            "none",
+            "--session-policy",
+            "block",
+        )
     assert not _posts(client, "/retry")
     error = _failure_envelope(raised, capsys)
     assert error["category"] == "session_choice_not_applied"
@@ -643,6 +671,23 @@ def test_rerun_without_waiting_fails_when_a_more_permissive_choice_stays(tmp_pat
     assert not_applied["confirmed"] is True
     assert not_applied["more_permissive"] is True
     assert "did not apply this command's session choice" in error["message"]
+    assert not _posts(client, "/promote")
+
+
+def test_rerun_without_waiting_fails_when_a_more_permissive_choice_stays(tmp_path, capsys):
+    # Asked for `block`; the Release keeps `proceed *`, and this deploy left it to publish:
+    # it is still building, so Cloud checks it later under `proceed *`. (A built one is
+    # promoted with the choice.)
+    project = _project(tmp_path)
+    client = RefusedReleaseClient(
+        project, stored_choice=_PROCEED_ALL, current={"status": "image_built"}
+    )
+    with pytest.raises(CloudApiError) as raised:
+        _deploy(client, project, tmp_path, "--session-policy", "block")
+    assert not _posts(client, "/retry")
+    error = _failure_envelope(raised, capsys)
+    assert error["category"] == "session_choice_not_applied"
+    assert error["not_applied"]["more_permissive"] is True
 
 
 @pytest.mark.parametrize(
@@ -656,11 +701,33 @@ def test_rerun_without_waiting_fails_when_a_more_permissive_choice_stays(tmp_pat
         (None, {"status": "image_built"}),
     ],
 )
-def test_rerun_without_waiting_reports_a_kept_choice_that_strands_nothing(
+def test_rerun_of_a_candidate_reports_a_kept_choice_that_strands_nothing(
     tmp_path, stored, current, capsys
 ):
     project = _project(tmp_path)
-    client = RefusedReleaseClient(project, stored_choice=stored, current=current)
+    client = RefusedReleaseClient(project, stored_choice=stored, current=current, candidate=True)
+    result = _deploy(
+        client,
+        project,
+        tmp_path,
+        "--no-promote",
+        "--evaluated-against",
+        "none",
+        "--session-policy",
+        "block",
+    )
+    not_applied = result["result"]["not_applied"]
+    assert not_applied["more_permissive"] is False
+    assert not_applied["release_session_policy"] != not_applied["session_policy"]
+    assert not_applied["message"] in capsys.readouterr().err
+    assert not _posts(client, "/retry")
+    assert not _posts(client, "/promote")
+
+
+def test_rerun_without_waiting_reports_a_kept_choice_that_strands_nothing(tmp_path, capsys):
+    # `wait` keeps every session `block` protects; the difference is only reported.
+    project = _project(tmp_path)
+    client = RefusedReleaseClient(project, current={"status": "image_built"})
     result = _deploy(client, project, tmp_path, "--session-policy", "block")
     not_applied = result["result"]["not_applied"]
     assert not_applied["more_permissive"] is False

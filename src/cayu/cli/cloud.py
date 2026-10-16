@@ -18,7 +18,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Never
 
-from cayu.cli._cloud_api import CloudApiClient, CloudApiError, archived_agent_error
+from cayu.cli._cloud_api import (
+    CANDIDATE_REFUSAL_CODES,
+    CloudApiClient,
+    CloudApiError,
+    archived_agent_error,
+)
 from cayu.cli._cloud_auth import (
     CloudAuthCredentials,
     CloudAuthError,
@@ -89,6 +94,21 @@ _SESSION_PUBLICATION_FAILURES = frozenset({"unfinished_sessions", "sessions_unre
 _PASSED_SESSION_CHECKS = frozenset({"clear", "acknowledged", "unsupported", "not_running"})
 # A waiting preflight's `waiting_for` (Cloud names sessions, session_read or agent_wake).
 _SESSION_WAITING_FOR = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# Cloud's bounds on a candidate release's statement (`deploy --no-promote`).
+_MIN_CANDIDATE_LIFETIME_SECONDS = 60 * 60
+_DEFAULT_CANDIDATE_LIFETIME_SECONDS = 7 * 24 * 60 * 60
+_MAX_CANDIDATE_LIFETIME_SECONDS = 30 * 24 * 60 * 60
+_MAX_CANDIDATE_REQUIREMENTS = 100
+_MAX_CANDIDATE_RECEIPTS = 100
+# `--evaluated-against none`: the change was evaluated while the Agent had no selected release.
+_NO_BASELINE = "none"
+# Conflicts that no release of the submitted source can explain, so none is looked up. A
+# candidate's refusals are reported before this applies.
+_CONFLICTS_WITHOUT_RELEASE = frozenset({"application_archived"})
+# Compound brief and requirement IDs and Arena receipt IDs; snapshot roots and receipt
+# fingerprints are lowercase SHA-256 digests.
+_EVALUATION_ID = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 class CloudCommandError(RuntimeError):
@@ -144,9 +164,12 @@ class _CloudServicePublicationError(CloudApiError):
             publication_error[key] for key in ("message", "detail") if key in publication_error
         ]
         code = publication_error.get("code")
+        # A refusal Cloud says no retry of this Release can pass (for example once it is an
+        # expired candidate) gets no retry steps; Cloud's hint says what to do instead.
+        recovery = None if publication_error.get("retryable") is False else code
         revisions = (
             _requested_storage_acknowledgement(publication_error)
-            if code == _STORAGE_ACKNOWLEDGEMENT_REQUIRED
+            if recovery == _STORAGE_ACKNOWLEDGEMENT_REQUIRED
             else ()
         )
         flags = [
@@ -154,7 +177,7 @@ class _CloudServicePublicationError(CloudApiError):
         ]
         sessions: list[str] = (
             _session_retry_acknowledgements(publication_error, release) or []
-            if code in _SESSION_PUBLICATION_FAILURES
+            if recovery in _SESSION_PUBLICATION_FAILURES
             else []
         )
         retry_command = None
@@ -167,7 +190,7 @@ class _CloudServicePublicationError(CloudApiError):
             }
             if revisions:
                 retry_command = shlex.join([*command, "retry", *suffix, *flags])
-            elif code in _RETRYABLE_STORAGE_PUBLICATION_FAILURES:
+            elif recovery in _RETRYABLE_STORAGE_PUBLICATION_FAILURES:
                 retry_command = shlex.join([*command, "retry", *suffix])
             elif sessions:
                 retry_command = shlex.join(
@@ -182,7 +205,7 @@ class _CloudServicePublicationError(CloudApiError):
                         ),
                     ]
                 )
-            if code in _SESSION_PUBLICATION_FAILURES:
+            if recovery in _SESSION_PUBLICATION_FAILURES:
                 # A retry replaces the Release's choice, so keep a longer wait it had.
                 waited = _stored_session_wait_seconds(release)
                 wait_command = shlex.join(
@@ -203,7 +226,7 @@ class _CloudServicePublicationError(CloudApiError):
             if retry_command is not None:
                 commands["retry"] = retry_command
             self.details["commands"] = commands
-        if code in _SESSION_PUBLICATION_FAILURES and wait_command is not None:
+        if wait_command is not None:
             unfinished = code == "unfinished_sessions"
             wait_step = (
                 "wait for them again" if unfinished else "wait for Cloud to read them"
@@ -842,7 +865,10 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     deploy = commands.add_parser(
         "deploy",
         help="Publish an immutable Agent release.",
-        description="Publish and activate an immutable Agent release from a local directory or repository.",
+        description=(
+            "Publish and activate an immutable Agent release from a local directory or "
+            "repository, or stage it as a candidate release with --no-promote."
+        ),
     )
     deploy.add_argument("source", nargs="?", default=".")
     deploy.add_argument("--manifest", type=Path)
@@ -856,7 +882,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     deploy.add_argument("--no-wait", action="store_true")
-    deploy.add_argument("--no-promote", action="store_true")
+    _add_candidate_arguments(deploy)
     deploy.add_argument(
         "--retry-failed",
         action=argparse.BooleanOptionalAction,
@@ -880,7 +906,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     deployment = commands.add_parser(
         "deployment",
         help="Inspect or operate an immutable release.",
-        description="Inspect, wait for, or promote one immutable Agent release.",
+        description="Inspect, wait for, promote or discard one immutable Agent release.",
     )
     deployment_commands = deployment.add_subparsers(
         dest="deployment_command",
@@ -891,7 +917,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "status": "Show the current publication status of one release.",
         "timeline": "Show the publication milestones for one release.",
         "wait": "Wait until one release is promotable or terminal.",
-        "promote": "Select a smoke-tested release for its Agent application.",
+        "promote": (
+            "Select a smoke-tested release for its Agent application. A candidate release "
+            "is published instead: Cloud prepares, selects and publishes it while the Agent "
+            "still selects the release it was evaluated against."
+        ),
+        "discard": "Discard a candidate release so it is never published.",
         "retry": "Create a new immutable release attempt from retained source.",
     }
     for action, description in deployment_descriptions.items():
@@ -1074,6 +1105,363 @@ def _add_session_choice_arguments(parser: argparse.ArgumentParser) -> None:
             "(repeatable; '*' for every unfinished session). Implies --session-policy proceed."
         ),
     )
+
+
+def _add_candidate_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-promote",
+        action="store_true",
+        help=(
+            "Stage a candidate release: Cloud builds and smoke-tests it but publishes it only "
+            "when someone runs `deployment promote` while the Agent still selects the release "
+            "it was evaluated against, before it expires. `deployment discard` drops it. "
+            "Needs --evaluated-against and a Cayu Cloud with candidate releases. Changed: "
+            "earlier CLIs only skipped their own promote request, and Cloud still published "
+            "the release."
+        ),
+    )
+    parser.add_argument(
+        "--evaluated-against",
+        type=_evaluated_against,
+        metavar="DEPLOYMENT_ID",
+        help=(
+            "Required with --no-promote: the release the change was evaluated against, or "
+            f"'{_NO_BASELINE}' when the Agent had no selected release. Cloud stages and later "
+            "publishes the candidate only while the Agent selects it."
+        ),
+    )
+    parser.add_argument(
+        "--expires-in-seconds",
+        type=_candidate_lifetime_seconds,
+        metavar="SECONDS",
+        help=(
+            "With --no-promote: how long the candidate can be promoted "
+            f"({_MIN_CANDIDATE_LIFETIME_SECONDS} to {_MAX_CANDIDATE_LIFETIME_SECONDS}; "
+            f"Cloud's default is {_DEFAULT_CANDIDATE_LIFETIME_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-root",
+        type=_sha256_digest,
+        metavar="SHA256",
+        help="With --no-promote: the evaluated Cayu AgentSnapshot root, in lowercase hex.",
+    )
+    parser.add_argument(
+        "--brief",
+        type=_evaluation_id,
+        metavar="BRIEF_ID",
+        help="With --no-promote: the brief the change was made for.",
+    )
+    parser.add_argument(
+        "--requirement",
+        action="append",
+        type=_evaluation_id,
+        metavar="REQUIREMENT_ID",
+        help="With --no-promote: a requirement of the brief the change meets (repeatable).",
+    )
+    parser.add_argument(
+        "--receipt",
+        action="append",
+        type=_evaluation_receipt,
+        metavar="RECEIPT_ID=FINGERPRINT",
+        help=(
+            "With --no-promote: an evaluation receipt the change was accepted on, with its "
+            "lowercase hex SHA-256 fingerprint (repeatable)."
+        ),
+    )
+
+
+def _evaluated_against(value: str) -> str:
+    if value != _NO_BASELINE and _cloud_deployment_id(value) is None:
+        raise argparse.ArgumentTypeError(
+            f"must be a Cayu Cloud release ID such as dep_..., or '{_NO_BASELINE}'"
+        )
+    return value
+
+
+def _candidate_lifetime_seconds(value: str) -> int:
+    if (
+        re.fullmatch(r"[1-9][0-9]{0,7}", value) is None
+        or not _MIN_CANDIDATE_LIFETIME_SECONDS <= int(value) <= _MAX_CANDIDATE_LIFETIME_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"must be a whole number of seconds between {_MIN_CANDIDATE_LIFETIME_SECONDS} and "
+            f"{_MAX_CANDIDATE_LIFETIME_SECONDS}"
+        )
+    return int(value)
+
+
+def _sha256_digest(value: str) -> str:
+    if _SHA256_HEX.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("must be a lowercase hex SHA-256 digest")
+    return value
+
+
+def _evaluation_id(value: str) -> str:
+    if _EVALUATION_ID.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "must be 1 to 256 letters, digits, '.', '_', ':' or '-', starting and ending "
+            "with a letter or digit"
+        )
+    return value
+
+
+def _evaluation_receipt(value: str) -> tuple[str, str]:
+    receipt_id, separator, fingerprint = value.rpartition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError("must be RECEIPT_ID=FINGERPRINT")
+    return _evaluation_id(receipt_id), _sha256_digest(fingerprint)
+
+
+def _requested_candidate(arguments: argparse.Namespace) -> dict[str, Any] | None:
+    """The candidate statement `deploy --no-promote` stages its release with.
+
+    None for a deploy that is published once smoke-tested; the candidate flags are refused
+    there. The baseline is never guessed: the command names the release the change was
+    evaluated against, so Cloud records only an evaluation that happened.
+    """
+
+    baseline = getattr(arguments, "evaluated_against", None)
+    receipts = getattr(arguments, "receipt", None) or ()
+    requirements = sorted(set(getattr(arguments, "requirement", None) or ()))
+    fields = {
+        "brief_id": getattr(arguments, "brief", None),
+        "expires_in_seconds": getattr(arguments, "expires_in_seconds", None),
+        "snapshot_root": getattr(arguments, "snapshot_root", None),
+    }
+    if not getattr(arguments, "no_promote", False):
+        if (
+            receipts
+            or requirements
+            or baseline is not None
+            or any(value is not None for value in fields.values())
+        ):
+            raise CloudCommandError(
+                "invalid_input",
+                "--evaluated-against, --expires-in-seconds, --snapshot-root, --brief, "
+                "--requirement and --receipt describe a candidate release; use them with "
+                "--no-promote.",
+            )
+        return None
+    if baseline is None:
+        raise CloudCommandError(
+            "invalid_input",
+            "--no-promote needs --evaluated-against: the release the change was evaluated "
+            f"against, or '{_NO_BASELINE}' when the Agent had no selected release.",
+        )
+    fingerprints: dict[str, str] = {}
+    for receipt_id, fingerprint in receipts:
+        if fingerprints.setdefault(receipt_id, fingerprint) != fingerprint:
+            raise CloudCommandError(
+                "invalid_input", f"--receipt {receipt_id} is given with two fingerprints."
+            )
+    if len(requirements) > _MAX_CANDIDATE_REQUIREMENTS:
+        raise CloudCommandError(
+            "invalid_input",
+            f"At most {_MAX_CANDIDATE_REQUIREMENTS} distinct --requirement values can be given.",
+        )
+    if len(fingerprints) > _MAX_CANDIDATE_RECEIPTS:
+        raise CloudCommandError(
+            "invalid_input",
+            f"At most {_MAX_CANDIDATE_RECEIPTS} distinct --receipt values can be given.",
+        )
+    return {
+        "evaluated_against_deployment_id": None if baseline == _NO_BASELINE else baseline,
+        **{name: value for name, value in fields.items() if value is not None},
+        **({"requirement_ids": requirements} if requirements else {}),
+        **(
+            {
+                "receipts": [
+                    {"fingerprint": fingerprint, "receipt_id": receipt_id}
+                    for receipt_id, fingerprint in sorted(fingerprints.items())
+                ]
+            }
+            if fingerprints
+            else {}
+        ),
+    }
+
+
+def _candidate_statement(candidate: dict[str, Any]) -> dict[str, Any]:
+    """A candidate statement with Cloud's defaults filled in, as two are compared."""
+
+    return {
+        "brief_id": candidate.get("brief_id"),
+        "evaluated_against_deployment_id": candidate.get("evaluated_against_deployment_id"),
+        "expires_in_seconds": candidate.get(
+            "expires_in_seconds", _DEFAULT_CANDIDATE_LIFETIME_SECONDS
+        ),
+        "receipts": candidate.get("receipts", []),
+        "requirement_ids": candidate.get("requirement_ids", []),
+        "snapshot_root": candidate.get("snapshot_root"),
+    }
+
+
+def _require_candidate_statement(
+    release: dict[str, Any],
+    *,
+    requested: dict[str, Any] | None,
+    application_id: str,
+) -> None:
+    """Refuse a release of this source that isn't what the command asked for.
+
+    `deploy --no-promote` reports only the candidate it requested, with the same baseline,
+    evaluation and expiry. A plain `deploy` never takes up a candidate, which only a
+    person's promotion publishes.
+    """
+
+    stored = release.get("candidate")
+    release_id = _cloud_deployment_id(str(release.get("id")))
+    named = "" if release_id is None else f", {release_id},"
+    if requested is None:
+        if not isinstance(stored, dict):
+            return
+        commands = (
+            ""
+            if release_id is None
+            else f" Publish it with `cayu cloud deployment promote {release_id} --application "
+            f"{application_id}`, or drop it with `cayu cloud deployment discard {release_id} "
+            f"--application {application_id}`."
+        )
+        raise CloudCommandError(
+            "candidate_conflict",
+            f"Cayu Cloud already has a candidate release of this source{named} and `deploy` "
+            f"never promotes a candidate.{commands}",
+        )
+    if not isinstance(stored, dict):
+        raise CloudCommandError(
+            "candidate_conflict",
+            f"Cayu Cloud already has a release of this source{named} and it is not a "
+            "candidate. Change the source to stage it as a candidate.",
+        )
+    if _candidate_statement(stored) != _candidate_statement(requested):
+        raise CloudCommandError(
+            "candidate_conflict",
+            f"Cayu Cloud already has a candidate release of this source{named} staged with "
+            "another baseline, evaluation or expiry. Change the source to stage a new "
+            "candidate, or promote or discard that one.",
+        )
+
+
+def _require_selected_baseline(
+    client: CloudApiClient,
+    *,
+    release_id: str,
+    baseline: str | None,
+    application: dict[str, Any],
+) -> None:
+    """Refuse a candidate whose baseline the Agent no longer selects.
+
+    Cloud checks this when it stages a new candidate; one replayed or found again was
+    checked when it was first staged, so the deploy checks it again. The Agent is read again
+    before refusing, in case its selection changed while the deploy ran.
+    """
+
+    if baseline == application.get("current_deployment_id"):
+        return
+    selected = client.request("GET", f"/v1/applications/{application['id']}").get(
+        "current_deployment_id"
+    )
+    if baseline == selected:
+        return
+    named = _cloud_deployment_id(release_id)
+    raise CloudCommandError(
+        "candidate_baseline_changed",
+        "Candidate release"
+        + ("" if named is None else f" {named}")
+        + " was evaluated against "
+        + ("no selected release" if baseline is None else f"release {baseline}")
+        + ", but the Agent "
+        + ("has no selected release" if selected is None else f"now selects {selected}")
+        + ", so it can't be promoted. Evaluate the change against the selected release, "
+        "then stage it again from changed source or a new `version` in cayu-cloud.toml.",
+    )
+
+
+def _raise_rejected_candidate(exc: CloudApiError) -> None:
+    """Explain an HTTP 422 that names the candidate statement; any other passes through."""
+
+    if ("body.candidate", "extra_forbidden") in exc.rejected_fields:
+        raise CloudCommandError(
+            "candidate_unsupported",
+            "This Cayu Cloud doesn't support candidate releases, so it can't stage the "
+            "release without publishing it; nothing was deployed. `--no-promote` needs a "
+            "Cayu Cloud with candidate releases. Deploy without it to publish the release.",
+        ) from exc
+    if any(
+        location == "body.candidate" or location.startswith("body.candidate.")
+        for location, _ in exc.rejected_fields
+    ):
+        raise CloudCommandError(
+            "candidate_invalid",
+            "Cayu Cloud rejected the candidate statement, whose rules may be newer than this "
+            "CLI's; nothing was deployed. Check --evaluated-against, --expires-in-seconds, "
+            "--snapshot-root, --brief, --requirement and --receipt.",
+        ) from exc
+
+
+def _candidate_discarded(client: CloudApiClient, *, path: str, status: str) -> bool:
+    """Whether a candidate in a terminal status was discarded or expired, not failed.
+
+    A cancelled one was. A destroyed one was when its timeline ends cancelled, as Cloud
+    shows a cancelled Release it later destroyed; one destroyed after a failed build ends
+    failed. An unreadable timeline is not taken as a discard.
+    """
+
+    if status == "cancelled":
+        return True
+    if status != "destroyed":
+        return False
+    try:
+        timeline = client.request("GET", f"{path}/timeline")
+    except CloudApiError:
+        return False
+    items = timeline.get("items")
+    return isinstance(items, list) and any(
+        isinstance(item, dict)
+        and item.get("key") == "agent_ready"
+        and item.get("state") == "cancelled"
+        for item in items
+    )
+
+
+def _discarded_candidate_error(release_id: str) -> CloudCommandError:
+    named = _cloud_deployment_id(release_id)
+    return CloudCommandError(
+        "candidate_discarded",
+        f"Candidate release {named or 'of this source'} was discarded or expired, so it can't "
+        "be published or retried. To stage this change again, change the source or its "
+        "`version` in cayu-cloud.toml.",
+    )
+
+
+def _raise_candidate_refusal(exc: CloudApiError) -> None:
+    """Report Cloud's refusal of a candidate under the category the CLI's own check uses."""
+
+    if exc.status_code == 409 and exc.code in CANDIDATE_REFUSAL_CODES:
+        raise CloudCommandError(exc.code, exc.detail or str(exc)) from exc
+
+
+def _require_stageable_candidate(
+    client: CloudApiClient,
+    *,
+    release: dict[str, Any],
+    baseline: str | None,
+    application: dict[str, Any],
+) -> None:
+    """Refuse a candidate found again that can never be promoted, before anything retries it:
+    one discarded or expired, or one whose baseline the Agent no longer selects. A promoted
+    one passed the baseline check when it was promoted."""
+
+    release_id = str(release["id"])
+    status = _deployment_status(release)
+    path = f"/v1/applications/{application['id']}/deployments/{release_id}"
+    if _candidate_discarded(client, path=path, status=status):
+        raise _discarded_candidate_error(release_id)
+    if status != "promoted":
+        _require_selected_baseline(
+            client, release_id=release_id, baseline=baseline, application=application
+        )
 
 
 def _session_wait_seconds(value: str) -> int:
@@ -1595,9 +1983,13 @@ def _deploy(
     # so that request and its key stay as before.
     session_choice = _session_choice(arguments)
     session_payload = _session_choice_payload(arguments)
+    candidate = _requested_candidate(arguments)
+    # `--no-promote` stages a candidate, which nothing this command does publishes.
+    staging = candidate is not None
     create_payload = {
         **(acknowledgement or {}),
         **(_session_choice_payload(arguments, omit_default=True) or {}),
+        **({} if candidate is None else {"candidate": candidate}),
     }
     retry_payload = {**(acknowledgement or {}), **(session_payload or {})} or None
     unacknowledged_payload = project.manifest.deployment_payload(
@@ -1610,6 +2002,7 @@ def _deploy(
         revision=revision,
         acknowledge_breaking=acknowledged,
         session_choice=session_choice,
+        candidate=candidate,
     )
     retry: dict[str, Any] | None = None
     acknowledge_existing = False
@@ -1621,7 +2014,15 @@ def _deploy(
             idempotency_key=source_key,
         )
     except CloudApiError as exc:
-        if retry_payload is None or exc.status_code != 409:
+        if staging:
+            _raise_candidate_refusal(exc)
+            if exc.status_code == 422:
+                _raise_rejected_candidate(exc)
+        if (
+            exc.status_code != 409
+            or (retry_payload is None and not staging)
+            or exc.code in _CONFLICTS_WITHOUT_RELEASE
+        ):
             raise
         # The earlier submission may have acknowledged a different set of revisions or
         # made another session choice. Its current acknowledgement and choice can also
@@ -1636,19 +2037,32 @@ def _deploy(
             raise
         deployment = existing
         acknowledge_existing = True
+    # Only a release of this submission is taken up; any other is reported as the conflict.
+    _require_candidate_statement(
+        deployment, requested=candidate, application_id=str(application["id"])
+    )
     original = deployment
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         deployment = _latest_source_retry(client, str(application["id"]), original)
+    if candidate is not None:
+        # The release found carries this statement, so this baseline.
+        _require_stageable_candidate(
+            client,
+            release=deployment,
+            baseline=candidate["evaluated_against_deployment_id"],
+            application=application,
+        )
     already_selected = _published_before(
         client,
         application_id=str(application["id"]),
         deployment=deployment,
         session_choice=session_choice,
     )
-    if acknowledge_existing or session_choice is not None:
+    if (acknowledge_existing or session_choice is not None) and not staging:
         # Publication may have failed on a retry of the original build. Acknowledge
         # that selected Release, while retaining the root for failed-build retries. A
         # replayed create can also return a Release whose choice a retry changed since.
+        # A candidate is never retried this way: that would publish it.
         deployment, retry = _acknowledge_existing_release(
             client,
             application_id=str(application["id"]),
@@ -1687,6 +2101,9 @@ def _deploy(
                     **({} if retry_payload is None else {"payload": retry_payload}),
                 )
             except CloudApiError as exc:
+                if staging:
+                    # The baseline may have changed since it was checked above.
+                    _raise_candidate_refusal(exc)
                 if exc.status_code == 409:
                     _raise_terminal_deployment(
                         application_id=str(application["id"]),
@@ -1738,6 +2155,7 @@ def _deploy(
                 sleep=sleep,
                 monotonic=monotonic,
                 until_built=until_built,
+                candidate=staging,
             )
 
         def apply_choice(release: dict[str, Any]) -> dict[str, Any]:
@@ -1759,38 +2177,42 @@ def _deploy(
                 previously_promoted = False
             return release
 
-        if _session_choice_pending(deployment, session_choice):
-            # The Release was still building, or a retry returned an attempt already
-            # running, so Cloud checks its publication under its earlier choice. Once it
-            # is built, a retry changes a held or refused publication; otherwise the
-            # promote below carries the choice.
-            deployment = apply_choice(follow(until_built=True))
-        deployment = follow()
-        if (
-            deployment.get("status") == "smoke_tested"
-            and _deployment_publication_error(deployment) is not None
-            and _session_choice_pending(deployment, session_choice)
-        ):
-            # Cloud refused it under its earlier choice after the check above.
-            apply_choice(deployment)
+        if staging:
+            # A candidate is followed until it is staged; a person publishes it.
+            deployment = follow(until_built=True)
+        else:
+            if _session_choice_pending(deployment, session_choice):
+                # The Release was still building, or a retry returned an attempt already
+                # running, so Cloud checks its publication under its earlier choice. Once it
+                # is built, a retry changes a held or refused publication; otherwise the
+                # promote below carries the choice.
+                deployment = apply_choice(follow(until_built=True))
             deployment = follow()
-        if deployment.get("status") == "smoke_tested":
-            # Cloud refused to publish the built Release (for example for unfinished
-            # sessions) before selecting it. Promoting it would only publish it again under
-            # the same choice; it waits for a retry.
-            publication_error = _deployment_publication_error(deployment)
-            if publication_error is not None:
-                raise _CloudServicePublicationError(
-                    publication_error,
-                    application_id=str(application["id"]),
-                    deployment_id=str(deployment["id"]),
-                    recovery_arguments=_cloud_recovery_arguments(arguments),
-                    release=deployment,
-                )
+            if (
+                deployment.get("status") == "smoke_tested"
+                and _deployment_publication_error(deployment) is not None
+                and _session_choice_pending(deployment, session_choice)
+            ):
+                # Cloud refused it under its earlier choice after the check above.
+                apply_choice(deployment)
+                deployment = follow()
+            if deployment.get("status") == "smoke_tested":
+                # Cloud refused to publish the built Release (for example for unfinished
+                # sessions) before selecting it. Promoting it would only publish it again
+                # under the same choice; it waits for a retry.
+                publication_error = _deployment_publication_error(deployment)
+                if publication_error is not None:
+                    raise _CloudServicePublicationError(
+                        publication_error,
+                        application_id=str(application["id"]),
+                        deployment_id=str(deployment["id"]),
+                        recovery_arguments=_cloud_recovery_arguments(arguments),
+                        release=deployment,
+                    )
     # A choice that goes with the promote may come after Cloud's finalize checked the
     # sessions under the earlier one, so the check it records is compared below.
     promoted_with_choice = False
-    if not arguments.no_promote and deployment.get("status") == "smoke_tested":
+    if not staging and deployment.get("status") == "smoke_tested":
         promoted_with_choice = _session_choice_pending(deployment, session_choice)
         application, deployment = _promote_release(
             client,
@@ -1813,7 +2235,13 @@ def _deploy(
         )
     service = None
     service_publication_requested = False
-    if project.manifest.runtime_payload() is not None and deployment.get("status") == "promoted":
+    # A candidate's service is published by its promotion, never by this command; its
+    # release is reported as it stands.
+    if (
+        not staging
+        and project.manifest.runtime_payload() is not None
+        and deployment.get("status") == "promoted"
+    ):
         # Unchanged source replays a Release Cloud promoted earlier. The Agent may have
         # selected another Release since, and its service may have been destroyed;
         # either way no finalizer is going to publish this Release now.
@@ -1869,7 +2297,8 @@ def _deploy(
         "service": service,
         "service_publication_requested": service_publication_requested,
         "service_publication_pending": (
-            project.manifest.runtime_payload() is not None
+            not staging
+            and project.manifest.runtime_payload() is not None
             and deployment.get("status") == "promoted"
             and (service is None or service.get("deployment_id") != deployment.get("id"))
         ),
@@ -1895,7 +2324,10 @@ def _deploy(
         _not_applied(
             deployment,
             session_choice=session_choice,
-            acknowledge_breaking=(retry or {}).get("acknowledge_breaking_not_applied", ()),
+            # A candidate found again keeps what it was staged with.
+            acknowledge_breaking=acknowledged
+            if staging
+            else (retry or {}).get("acknowledge_breaking_not_applied", ()),
             check_preflight=check_preflight,
         ),
         application_id=str(application["id"]),
@@ -2265,10 +2697,11 @@ def _deployment_idempotency_key(
     revision: str,
     acknowledge_breaking: Sequence[int] = (),
     session_choice: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
 ) -> str:
-    # Cloud refuses a key reused with another acknowledgement or session choice, so a
-    # nonempty acknowledgement and a non-default choice are part of the key. Without
-    # them the key is unchanged from earlier CLI releases.
+    # Cloud refuses a key reused with another acknowledgement, session choice or candidate
+    # statement, so a nonempty acknowledgement, a non-default choice and a candidate are
+    # part of the key. Without them the key is unchanged from earlier CLI releases.
     identity = json.dumps(
         [application_id, version, revision]
         + ([sorted(set(acknowledge_breaking))] if acknowledge_breaking else [])
@@ -2276,7 +2709,8 @@ def _deployment_idempotency_key(
             [{"session_policy": session_choice}]
             if session_choice is not None and not _default_session_choice(session_choice)
             else []
-        ),
+        )
+        + ([{"candidate": candidate}] if candidate is not None else []),
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
@@ -2466,6 +2900,16 @@ def _deployment(
     if arguments.deployment_command == "status":
         result = client.request("GET", base)
         _deployment_status(result)
+    elif arguments.deployment_command == "discard":
+        release = client.request("GET", base)
+        if not isinstance(release.get("candidate"), dict):
+            raise CloudCommandError(
+                "not_a_candidate",
+                f"Release {arguments.deployment_id} is not a candidate release; only a "
+                "candidate (`deploy --no-promote`) can be discarded.",
+            )
+        # Cancelling a candidate retires its runtime, so it can never be published.
+        result = client.request("POST", base + "/cancel")
     elif arguments.deployment_command in {"logs", "timeline"}:
         query: dict[str, str] = {}
         if arguments.deployment_command == "logs":
@@ -2804,8 +3248,12 @@ def _wait_for_deployment(
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
     until_built: bool = False,
+    candidate: bool = False,
 ) -> dict[str, Any]:
-    """Wait until the Release is ready, or only until it is built with `until_built`."""
+    """Wait until the Release is ready, or only until it is built with `until_built`.
+
+    A `candidate` discarded or expired meanwhile is reported as such, not as a failure.
+    """
 
     _validate_wait(poll_seconds, wait_seconds)
     deadline = monotonic() + wait_seconds
@@ -2827,6 +3275,8 @@ def _wait_for_deployment(
         if status in _DEPLOYMENT_READY and (hold.waiting is None or until_built):
             return deployment
         if status in _DEPLOYMENT_FAILURES:
+            if candidate and _candidate_discarded(client, path=path, status=status):
+                raise _discarded_candidate_error(deployment_id)
             _raise_terminal_deployment(
                 application_id=application_id,
                 deployment_id=deployment_id,
@@ -3312,6 +3762,8 @@ def _deployment_publication_error(deployment: dict[str, Any]) -> dict[str, Any] 
     sessions = _publication_session_acknowledgements(candidate.get("acknowledge_sessions"))
     if sessions:
         error["acknowledge_sessions"] = sessions
+    if candidate.get("retryable") is False:
+        error["retryable"] = False
     return error
 
 
@@ -3763,6 +4215,7 @@ def _preflight_wait(arguments: argparse.Namespace) -> None:
 def _preflight_deploy_wait(arguments: argparse.Namespace) -> None:
     _acknowledged_revisions(arguments)
     _session_choice(arguments)
+    _requested_candidate(arguments)
     if not arguments.no_wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 

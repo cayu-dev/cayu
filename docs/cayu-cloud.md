@@ -23,7 +23,8 @@ cayu cloud service status --application my-agent
 - `applications list|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `init` and `deploy` for local project setup and publication;
-- `deployment logs|status|timeline|wait|promote|retry` and `rollback` for immutable releases;
+- `deployment logs|status|timeline|wait|promote|discard|retry` and `rollback` for immutable
+  releases, including [candidate releases](#candidate-releases);
 - `runtimes list|status` for retained runtime artifacts;
 - `service credentials|destroy|logs|restart|sleep|status|wake` for Agent infrastructure;
 - `env list|set|unset` for Agent-owned configuration; and
@@ -353,6 +354,85 @@ cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
 
+## Candidate releases
+
+`cayu cloud deploy --no-promote` stages a candidate release: Cayu Cloud builds and smoke-tests
+it and stops there, so nothing about the Agent changes. Use it for a change someone evaluated,
+for example a Compound candidate a person approved, that a person should publish later.
+
+> **Changed:** `--no-promote` used to skip only the CLI's own promote request. Cayu Cloud
+> selects and publishes every smoke-tested release itself, so the release was published
+> anyway. It now stages a candidate release, which needs a Cayu Cloud with candidate
+> releases and names the release the change was evaluated against (`--evaluated-against`).
+> An older Cayu Cloud refuses the request: the command exits `2` with category
+> `candidate_unsupported`, and nothing is deployed. Deploy without `--no-promote` to publish
+> a release.
+
+```console
+cayu cloud deploy . --no-promote --evaluated-against dep_live \
+  --snapshot-root 5f0c...e1 --brief brief-monthend-cost --requirement req-1 \
+  --receipt evaluation-7c1d=a3b9...04
+cayu cloud deployment status DEPLOYMENT_ID --application my-agent
+cayu cloud deployment promote DEPLOYMENT_ID --application my-agent
+cayu cloud deployment discard DEPLOYMENT_ID --application my-agent
+```
+
+- `--evaluated-against` (required) names the release the change was evaluated against, or
+  `none` when the Agent had no selected release. The CLI never fills it in, so Cloud records
+  only an evaluation that happened. Cloud refuses the candidate, and later its promotion,
+  while another release is selected, so a change is never published over a release it
+  wasn't compared with.
+- `--expires-in-seconds` (3600 to 2592000) bounds how long it can be promoted; Cloud's default
+  is 604800 (seven days). Cloud then discards it.
+- `--snapshot-root` (the evaluated Cayu `AgentSnapshot` root, lowercase hex SHA-256),
+  `--brief`, `--requirement` and `--receipt RECEIPT_ID=FINGERPRINT` (both repeatable) record
+  the evaluation. Cloud returns them with the release, also after promotion, and never deploys
+  what they name: the release is built only from this source, so the evaluation's trial
+  history and knowledge stay out of the Agent.
+
+These flags are refused without `--no-promote`. The deploy waits until the candidate is
+smoke-tested (or returns at once with `--no-wait`) and reports `result.deployment`, whose
+`candidate` holds the statement and `expires_at`. Nothing it does publishes the candidate: it
+never promotes it, never retries its publication and never starts its service, whatever
+state Cloud reports.
+
+Running it again with the same source and flags replays the same candidate, also after a
+client timeout. When Cloud answers that the source already has a release, for example
+because the acknowledgement or session flags differ, the deploy takes that release up only
+if it is a candidate with the same baseline, evaluation and expiry; otherwise it exits `2`
+with category `candidate_conflict` naming the release, and nothing is promoted. An
+acknowledgement or session choice the candidate found again doesn't carry is reported in
+`result.not_applied`; as for any deploy, a kept session choice more permissive than the one
+given makes it exit `2` with category `session_choice_not_applied`. A plain `deploy` given
+`--acknowledge-breaking` or a session flag, which looks for an earlier release of its source,
+stops with `candidate_conflict` when that release is a candidate, with the `deployment
+promote` and `deployment discard` commands for it, because only a person's promotion
+publishes a candidate. Without those flags it reports Cloud's version conflict (HTTP 409),
+as before.
+
+The deploy exits `2` without promoting anything when the candidate can't be promoted:
+
+- `candidate_baseline_changed`: the Agent no longer selects the release the candidate was
+  evaluated against, whether Cloud refuses to stage it or the deploy finds it again.
+- `candidate_discarded`: the candidate was discarded or expired, before this deploy or while
+  it waited, so it can't be published or retried.
+- `candidate_invalid`: Cloud rejected the statement under rules newer than this CLI's.
+- `candidate_unsupported`: the Cayu Cloud predates candidate releases.
+
+In each case, stage the change again from changed source or a new `version` in
+`cayu-cloud.toml` once it can be promoted.
+
+`deployment promote` publishes a candidate: Cloud's deployment worker checks the serving
+release's [unfinished sessions](#unfinished-sessions), prepares the database, selects the
+candidate and publishes it, so the command returns the Agent before its selection changes.
+Follow it with `deployment timeline` or `service status`. A repeated promote does not publish
+it twice. Promoting an expired candidate, or one whose evaluated-against release is no longer
+selected, fails with HTTP 409, Cloud's reason and `error.code` `candidate_expired` or
+`candidate_baseline_changed`. `deployment discard` cancels a candidate so
+it is never published, and refuses any other release with category `not_a_candidate`. While
+Cloud publishes a promoted candidate, discard fails with HTTP 409 and Cloud's reason; once
+that publication fails or is refused, the candidate can be discarded.
+
 ## Breaking storage revisions
 
 Some Cayu releases move the Agent database across a breaking storage revision. Cayu
@@ -525,7 +605,7 @@ that check), the CLI retries it with the choice, and otherwise the choice goes w
 `deploy`'s promote request.
 
 Cloud can't always take the choice: the release may already be selected or published, a
-promote may race Cloud's own, `--no-wait` or `--no-promote` may stop the deploy first, or
+promote may race Cloud's own, `--no-wait` may stop the deploy first, or
 Cloud's finalize may already have checked the sessions under the earlier choice when the
 promote stores the new one. After a promote that carried the choice, the CLI therefore
 reads the release's recorded check and compares it with the choice: a check that found

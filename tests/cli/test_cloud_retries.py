@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from tests.cli._cloud_candidate import staged_candidate
 
 from cayu.cli import cloud
 from cayu.cli._cloud_api import CloudApiError, _plain_api_error_detail
@@ -101,7 +102,7 @@ class Client:
                 "upload_url": "https://uploads.example.test/signed",
             }
         if method == "POST" and path.endswith("/deployments"):
-            return {"id": "dep_old", "status": self.status}
+            return {"id": "dep_old", "status": self.status, **staged_candidate(kwargs["payload"])}
         if path.endswith("/timeline"):
             return {"failure": self.failure}
         if method == "POST" and path.endswith("/retry"):
@@ -111,7 +112,13 @@ class Client:
 
 def _deploy(client, project, tmp_path, *, retry_failed=True):
     return cloud._deploy(
-        SimpleNamespace(application=None, no_wait=True, no_promote=True, retry_failed=retry_failed),
+        SimpleNamespace(
+            application=None,
+            evaluated_against="none",
+            no_wait=True,
+            no_promote=True,
+            retry_failed=retry_failed,
+        ),
         client=client,
         project=project,
         recorder=EvidenceRecorder(tmp_path / "evidence"),
@@ -220,6 +227,7 @@ def test_deploy_follows_latest_retry_of_unchanged_source(tmp_path, status):
                     "version": "1.0.0",
                     "manifest_digest": "sha256:same",
                     "policy_version": "v1",
+                    **staged_candidate(kwargs["payload"]),
                 }
             if method == "GET" and path.endswith("/deployments"):
                 return {
@@ -277,6 +285,7 @@ class FamilyClient(Client):
                 "manifest_digest": "sha256:same",
                 "policy_version": "v1",
                 "created_at": "2026-09-30T00:00:00Z",
+                **staged_candidate(kwargs["payload"]),
             }
         if method == "GET" and path.endswith("/deployments"):
             self.requests.append((method, path, kwargs))
@@ -491,7 +500,7 @@ def _acknowledged_deploy(client, project, tmp_path, revisions):
             acknowledge_breaking=revisions,
             application=None,
             no_wait=True,
-            no_promote=True,
+            no_promote=False,
             retry_failed=True,
         ),
         client=client,

@@ -54,6 +54,9 @@ _SAFE_API_ERROR_DETAILS = {
 }
 
 
+# Cloud's documented refusals of a candidate release, whose own message names the releases.
+CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_expired"})
+
 # Cloud's stable rejection codes are short lowercase identifiers.
 _CLOUD_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _CONFLICT_DETAIL_LIMIT = 512
@@ -80,6 +83,7 @@ class CloudApiError(RuntimeError):
         status_code: int | None = None,
         detail: str | None = None,
         code: str | None = None,
+        rejected_fields: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -89,6 +93,9 @@ class CloudApiError(RuntimeError):
         # The server's plain-text rejection reason, when it passes the safe-text filter.
         # Callers opt in to showing it; the default message never includes it.
         self.detail = detail
+        # The request fields an HTTP 422 names, as (dotted path, error type) pairs such as
+        # ("body.candidate", "extra_forbidden").
+        self.rejected_fields = rejected_fields
 
 
 @dataclass(frozen=True)
@@ -189,12 +196,17 @@ class CloudApiClient:
             if detail is None and structured is None:
                 detail = _safe_conflict_detail(response)
             suffix = f": {detail}" if detail is not None else "."
+            code = _safe_api_error_code(response.status_code, structured)
             raise CloudApiError(
                 "api_request_rejected",
                 f"Cayu Cloud API returned HTTP {response.status_code}{suffix}",
                 status_code=response.status_code,
-                detail=_plain_api_error_detail(response),
-                code=_safe_api_error_code(response.status_code, structured),
+                # A documented candidate refusal's own message is its plain-text reason.
+                detail=detail
+                if code in CANDIDATE_REFUSAL_CODES
+                else _plain_api_error_detail(response),
+                code=code,
+                rejected_fields=_rejected_fields(response),
             ) from None
         if response.status_code == 204:
             return {}
@@ -349,7 +361,10 @@ def _safe_api_error_code(
     if structured is None:
         return None
     code = structured[0]
-    return code if (status_code, code) in _SAFE_API_ERROR_DETAILS else None
+    documented = (status_code, code) in _SAFE_API_ERROR_DETAILS or (
+        status_code == 409 and code in CANDIDATE_REFUSAL_CODES
+    )
+    return code if documented else None
 
 
 def _safe_api_error_detail(
@@ -398,6 +413,48 @@ def _safe_conflict_detail(response: httpx.Response) -> str | None:
     if response.status_code != 409:
         return None
     return _plain_api_error_detail(response)
+
+
+# A validation rejection names at most this many fields worth reporting.
+_REJECTED_FIELD_LIMIT = 32
+_REJECTED_FIELD_PART = re.compile(r"[A-Za-z0-9_]{1,64}")
+_REJECTED_FIELD_TYPE = re.compile(r"[a-z][a-z_]{0,63}")
+
+
+def _rejected_fields(response: httpx.Response) -> tuple[tuple[str, str], ...]:
+    """The request fields an HTTP 422 validation rejection names, with each error's type.
+
+    Only the location and type of each error are kept, never its message or input, and only
+    when every part of the location is a plain field name or index.
+    """
+
+    if response.status_code != 422:
+        return ()
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    errors = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(errors, list):
+        return ()
+    fields: list[tuple[str, str]] = []
+    for error in errors[:_REJECTED_FIELD_LIMIT]:
+        if not isinstance(error, dict):
+            continue
+        location, kind = error.get("loc"), error.get("type")
+        if (
+            not isinstance(location, list)
+            or not location
+            or not isinstance(kind, str)
+            or _REJECTED_FIELD_TYPE.fullmatch(kind) is None
+        ):
+            continue
+        parts = [str(part) for part in location if isinstance(part, (str, int))]
+        if len(parts) == len(location) and all(
+            _REJECTED_FIELD_PART.fullmatch(part) for part in parts
+        ):
+            fields.append((".".join(parts), kind))
+    return tuple(fields)
 
 
 def _plain_api_error_detail(response: httpx.Response) -> str | None:
