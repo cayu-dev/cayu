@@ -267,6 +267,7 @@ RECOVERY_PLAN_MAX_INSPECTIONS = 10_000
 RECOVERY_PLAN_MAX_CONCURRENCY = 32
 RECOVERY_PLAN_MAX_ID_CHARS = 512
 RECOVERY_PLAN_MAX_CURSOR_BYTES = 8192
+RECOVERY_PLAN_MAX_TASK_CLAIMS = 1000
 
 _MODEL_CONFIG = ConfigDict(
     extra="forbid",
@@ -693,7 +694,9 @@ class RecoveryPlanItem(BaseModel):
     plan_execution: RecoveryPlanExecutionEvidence | None = None
     run_fence_ref: str
     run_operation_ref: str | None = None
-    task_claims: tuple[RecoveryTaskClaimEvidence, ...] = Field(default=(), max_length=1000)
+    task_claims: tuple[RecoveryTaskClaimEvidence, ...] = Field(
+        default=(), max_length=RECOVERY_PLAN_MAX_TASK_CLAIMS
+    )
     pending_actions: tuple[RecoveryPendingActionEvidence, ...] = Field(default=(), max_length=200)
     active_model_stage: RecoveryModelStageEvidence | None = None
     environment_recovery: RecoveryEnvironmentEvidence

@@ -696,6 +696,35 @@ def test_artifact_externalizing_policy_uses_declared_token_estimate_threshold(tm
         )
 
 
+def test_artifact_externalizing_policy_rejects_byte_threshold_above_projection_ceiling() -> None:
+    ArtifactExternalizingToolResultPolicy(
+        max_inline_bytes=MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES,
+    )
+    with pytest.raises(ValueError, match="max_inline_bytes must be less than or equal to"):
+        ArtifactExternalizingToolResultPolicy(
+            max_inline_bytes=MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES + 1,
+        )
+
+
+def test_artifact_externalizing_policy_externalizes_multibyte_text_above_projection_ceiling(
+    tmp_path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    policy = ArtifactExternalizingToolResultPolicy(max_inline_bytes=None)
+    content = "漢" * (MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES // 3 + 1)
+    assert policy.estimate_tokens(content) <= policy.max_inline_token_estimate
+
+    projection = asyncio.run(
+        policy.project(_request(result=ToolResult(content=content), artifact_store=store))
+    )
+
+    assert projection.record.status == "externalized"
+    assert projection.record.original_bytes > MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert projection.record.projected_bytes <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    stored = asyncio.run(store.read_bytes(projection.record.artifact_id))
+    assert stored.content == content.encode()
+
+
 def test_artifact_externalizing_policy_fails_bounded_without_artifact_store() -> None:
     policy = ArtifactExternalizingToolResultPolicy(
         max_inline_bytes=256,

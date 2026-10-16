@@ -20,6 +20,7 @@ from cayu.runners.base import (
     Runner,
 )
 from cayu.runners.local import LocalRunner
+from cayu.tools.files import MAX_READ_LIMIT_BYTES
 from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
     guard_create,
@@ -72,7 +73,7 @@ from cayu.workspaces.branches import (
     _WorkspaceBranchLifecycleRegistry,
 )
 
-DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
+DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES = MAX_READ_LIMIT_BYTES
 DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT = 500
 RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES = 4096
 RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES

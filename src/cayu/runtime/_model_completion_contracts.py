@@ -74,9 +74,9 @@ from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_too
 MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES = MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
 # RunRequest metadata is bounded only by DURABLE_METADATA_LIMITS and its budget
 # limits by MAX_REQUEST_BUDGET_LIMITS; recovery copies both the same way, so an
-# admitted run cannot fail at its first model step.
+# admitted run cannot fail at its first model step. The limits' total size is
+# checked against MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES at admission.
 MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS = MAX_REQUEST_BUDGET_LIMITS
-_MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES = 512
 _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS = 128
 _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES = 256
 
@@ -226,22 +226,6 @@ class ModelCompletionRecoveryContext(BaseModel):
             self.budget_limits,
         ):
             raise ValueError("run_limit_accounting requires active run-scoped authority.")
-        for limit in (
-            *self.budget_limits,
-            *(
-                reservation.limit
-                for reservation in self.budget_reservations
-                if reservation.limit is not None
-            ),
-        ):
-            price_book = limit.pricing
-            if (
-                len(price_book.prices) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
-                or len(price_book.resource_mappings) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
-                or len(price_book.contextual_pricing_requirements)
-                > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
-            ):
-                raise ValueError("budget limit pricing collections exceed recovery bounds.")
         if self.billing_identity is not None:
             identity = self.billing_identity
             if (

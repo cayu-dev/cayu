@@ -38,6 +38,8 @@ from cayu.events import Event, EventType, copy_event
 from cayu.failure_evidence import FailureEvidence
 from cayu.runtime._phase_timing import timed_phase
 from cayu.runtime.tool_effects import (
+    TOOL_EFFECT_RECEIPT_MAX_BYTES,
+    TOOL_EFFECT_RECEIPT_MAX_NODES,
     ToolEffectConflict,
     ToolEffectReceipt,
     ToolEffectReconciliationResult,
@@ -269,8 +271,9 @@ def _digest(value: object) -> str:
         canonical_bounded_durable_json_bytes(
             value,
             "tool_effect_state",
-            max_bytes=256 * 1024,
-            max_nodes=16384,
+            # Terminal publication material embeds one complete receipt.
+            max_bytes=TOOL_EFFECT_RECEIPT_MAX_BYTES + (256 * 1024),
+            max_nodes=TOOL_EFFECT_RECEIPT_MAX_NODES + 16384,
             max_nesting=40,
         )
     ).hexdigest()

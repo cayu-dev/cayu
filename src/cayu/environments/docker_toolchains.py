@@ -28,6 +28,7 @@ from cayu.environments.admission import (
     evaluate_execution_admission,
 )
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
+from cayu.tools.process_diagnostics import MAX_COMMAND_TIMEOUT_SECONDS
 from cayu.workspaces.base import WorkspaceReadResult
 
 DOCKER_CODING_TOOLCHAIN_PROFILE_SCHEMA = "cayu.docker_coding_toolchain_profile.v1"
@@ -206,7 +207,7 @@ class DockerCodingCommandAuthority(BaseModel):
     default_working_directory: str = "."
     allowed_working_directories: tuple[str, ...] = (".",)
     fixed_environment: tuple[DockerCodingFixedEnvironmentVariable, ...] = ()
-    timeout_seconds: StrictInt = Field(default=60, ge=1, le=600)
+    timeout_seconds: StrictInt = Field(default=60, ge=1, le=MAX_COMMAND_TIMEOUT_SECONDS)
     max_output_bytes: StrictInt = Field(default=50_000, ge=1, le=200_000)
     max_model_output_bytes: StrictInt = Field(default=16_000, ge=256, le=50_000)
     allowed_exit_codes: tuple[StrictInt, ...] = (0,)

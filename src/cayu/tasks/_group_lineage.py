@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from cayu.tasks.groups import TaskGroupSnapshot, TaskGroupUnavailable
-from cayu.tasks.records import Task, copy_task
+from cayu.tasks.groups import TASK_GROUP_MAX_MEMBERS, TaskGroupSnapshot, TaskGroupUnavailable
+from cayu.tasks.records import TASK_RETRY_MAX_ATTEMPTS, Task, copy_task
 from cayu.tasks.retry import _task_retry_successor_id
 
 
@@ -19,7 +19,8 @@ def validate_lineage(
     A caller-authored series ID is not membership. Only automatic settlement
     publishes this index, in the same transaction as source and successor.
     """
-    if len(roots) > 128 * 99:
+    # Each member root has at most one retry successor per later automatic attempt.
+    if len(roots) > TASK_GROUP_MAX_MEMBERS * (TASK_RETRY_MAX_ATTEMPTS - 1):
         raise TaskGroupUnavailable("Group retry lineage exceeds its admission bound.")
     for identity, root_id in roots.items():
         if (

@@ -59,7 +59,7 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.execution_profiles import (
     _has_runtime_execution_profile_decision_authority,
 )
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, Session, SessionStatus
 from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
@@ -593,7 +593,7 @@ class EgressAuthorityTransitionRecord(BaseModel):
     record_type: Literal["cayu.egress-authority-transition"] = "cayu.egress-authority-transition"
     schema_version: Literal[3] = EGRESS_AUTHORITY_TRANSITION_SCHEMA_VERSION
     transition_id: str = Field(max_length=256)
-    session_id: str = Field(max_length=256)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     environment_name: str = Field(max_length=256)
     revision: StrictInt = Field(ge=1)
     state: EgressAuthorityTransitionState

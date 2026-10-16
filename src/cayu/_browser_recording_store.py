@@ -24,6 +24,7 @@ from cayu.browser_recording import (
     BrowserRecordingPolicy,
     BrowserRecordingSegment,
 )
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 
 _T = TypeVar("_T")
 
@@ -288,7 +289,7 @@ class BrowserRecordingStore:
     ) -> BrowserRecordingConfig:
         """Application call before the run; never exposed as an HTTP/model mutation."""
         policy = BrowserRecordingPolicy.model_validate(policy)
-        if not session_id or len(session_id) > 128:
+        if not session_id or len(session_id) > MAX_SESSION_ID_BYTES:
             raise ValueError("Recording requires an exact application session.")
         token = secrets.token_hex(32)
         config = BrowserRecordingConfig(

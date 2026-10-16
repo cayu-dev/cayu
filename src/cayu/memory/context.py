@@ -160,6 +160,9 @@ _AUTOMATIC_RECALL_NOTICE = (
 )
 _MAX_RUNTIME_AUTHORED_ANCHORS = 32
 _MAX_PROJECTION_BYTES = 1_000_000
+_DEFAULT_PROJECTION_BYTES = 128_000
+# Room for the manifest notice, digests and tags around the admitted contribution.
+_PROJECTION_ENVELOPE_BYTES = 32_000
 _AUTOMATIC_RECALL_POLICY_ACTIVE: ContextVar[bool] = ContextVar(
     "cayu_automatic_recall_policy_active",
     default=False,
@@ -313,7 +316,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         custom_sources: Sequence[AutomaticRecallSourceRegistration] = (),
         engine_config: RecallEngineConfig | None = None,
         delta_policy: MemoryDeltaPolicy | None = None,
-        max_projection_bytes: int = 128_000,
+        max_projection_bytes: int | None = None,
         retain_earlier_recall: bool = True,
     ) -> None:
         if base_policy is None:
@@ -332,8 +335,9 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             raise TypeError("engine_config must be a RecallEngineConfig or None.")
         if delta_policy is not None and type(delta_policy) is not MemoryDeltaPolicy:
             raise TypeError("delta_policy must be a MemoryDeltaPolicy or None.")
-        if type(max_projection_bytes) is not int or not 1 <= max_projection_bytes <= (
-            _MAX_PROJECTION_BYTES
+        if max_projection_bytes is not None and (
+            type(max_projection_bytes) is not int
+            or not 1 <= max_projection_bytes <= _MAX_PROJECTION_BYTES
         ):
             raise ValueError(f"max_projection_bytes must be between 1 and {_MAX_PROJECTION_BYTES}.")
         if type(retain_earlier_recall) is not bool:
@@ -348,6 +352,20 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         copied_sources = AutomaticRecallSourceConfig.model_validate(
             (sources or AutomaticRecallSourceConfig()).model_dump(mode="python")
         )
+        if max_projection_bytes is None:
+            # The default follows the admission budget so a raised budget still renders.
+            max_projection_bytes = min(
+                _MAX_PROJECTION_BYTES,
+                max(
+                    _DEFAULT_PROJECTION_BYTES,
+                    copied_policy.max_total_bytes + _PROJECTION_ENVELOPE_BYTES,
+                ),
+            )
+        elif max_projection_bytes < copied_policy.max_total_bytes:
+            raise ValueError(
+                "max_projection_bytes cannot be smaller than the admission policy's "
+                "max_total_bytes."
+            )
         if copied_policy.fusion_strategy_version != copied_fusion.strategy_version:
             raise ValueError("Admission calibration does not match the fusion strategy.")
         if copied_policy.fusion_configuration_version != copied_fusion.configuration_version:
@@ -436,6 +454,21 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                 )
             declarations.extend(_FactoryRecallSource(item, None) for item in copied_custom)
             RecallEngine(declarations, fusion_config=copied_fusion, config=self.engine_config)
+        if self.delta_policy is not None:
+            # Deltas raise the injected-item count, so check the derived policy
+            # here rather than when the first delta or reanchor runs.
+            try:
+                AutomaticRecallPolicy.model_validate(
+                    self._delta_admission_policy().model_dump(mode="python")
+                )
+                if self.delta_policy.reanchor_on_projection_loss:
+                    self._reanchor_admission_policy()
+            except ValueError as error:
+                raise ValueError(
+                    "Memory deltas inject up to min(50, max_evaluated_candidates) items "
+                    "alongside max_offered_items, and that derived policy is invalid; "
+                    "lower max_offered_items or max_evaluated_candidates."
+                ) from error
 
     def _custom_source_configuration(self) -> dict[str, Any]:
         # Preserve built-in-only policy fingerprints and stored receipts exactly.

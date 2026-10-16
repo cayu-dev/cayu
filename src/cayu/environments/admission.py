@@ -25,15 +25,20 @@ from cayu.capabilities import (
     CapabilityState,
 )
 from cayu.tools.base import (
+    MAX_TOOL_EXECUTION_REQUIREMENTS,
     ToolExecutableRequirement,
     ToolExecutionRequirement,
     _copy_bounded_iterable,
     copy_tool_executable_probes,
 )
+from cayu.tools.catalogue import TOOL_CATALOGUE_MAX_TOOLS
 
 EXECUTION_CAPABILITY_EVIDENCE_SCHEMA = "cayu.execution_capabilities.v1"
 EXECUTION_TOOL_REQUIREMENT_EVIDENCE_SCHEMA = "cayu.execution_tool_requirements.v1"
 EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS = 300
+# Every requirement of every catalogued tool, so a combined policy never refuses
+# a tool set the catalogue already admitted.
+EXECUTION_TOOL_REQUIREMENTS_MAX_CLAUSES = TOOL_CATALOGUE_MAX_TOOLS * MAX_TOOL_EXECUTION_REQUIREMENTS
 
 ExecutionCodeTrust = Literal["trusted", "untrusted"]
 ExecutionSecretVisibility = Literal["allowed", "non_possession"]
@@ -415,13 +420,17 @@ class ExecutionRequirements(BaseModel):
     )
     required_executables: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
     tool_requirements: tuple[ExecutionToolRequirement, ...] = Field(
-        default_factory=tuple, max_length=64
+        default_factory=tuple, max_length=EXECUTION_TOOL_REQUIREMENTS_MAX_CLAUSES
     )
 
     @field_validator("tool_requirements", mode="before")
     @classmethod
     def copy_tool_requirements(cls, value: object) -> tuple[ExecutionToolRequirement, ...]:
-        items = _copy_bounded_iterable(value, field_name="tool_requirements", maximum=64)
+        items = _copy_bounded_iterable(
+            value,
+            field_name="tool_requirements",
+            maximum=EXECUTION_TOOL_REQUIREMENTS_MAX_CLAUSES,
+        )
         return tuple(
             ExecutionToolRequirement.model_validate(
                 item.model_dump(mode="python", warnings=False)

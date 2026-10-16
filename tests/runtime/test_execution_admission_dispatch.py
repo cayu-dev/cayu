@@ -762,7 +762,9 @@ def test_tool_ceiling_excludes_requirements_of_unavailable_tools(exclude_tool: b
         ("executables_overlap", True),
         ("clauses_below", True),
         ("clauses_at", True),
-        ("clauses_above", False),
+        # 65 clauses: past the old 64-clause cap. The clause bound now follows the
+        # tool catalogue, so this is admitted.
+        ("clauses_above", True),
         ("clauses_overlap", True),
         ("clauses_conflict", False),
     ],

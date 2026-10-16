@@ -13,6 +13,8 @@ from cayu._task_wait import unexpected_child_cancellation_error
 from cayu._validation import canonical_bounded_durable_json_bytes
 from cayu.runtime._tool_effect_state import ToolEffectConflict, ToolEffectRecord, _copy_model
 from cayu.runtime.tool_effects import (
+    TOOL_EFFECT_RECEIPT_MAX_BYTES,
+    TOOL_EFFECT_RECEIPT_MAX_NODES,
     ToolEffectReceipt,
     ToolEffectReconcilerSpec,
     ToolEffectReconciliationContext,
@@ -393,8 +395,9 @@ def _reconciliation_digest(value: object) -> str:
         canonical_bounded_durable_json_bytes(
             value,
             "effect_reconciliation",
-            max_bytes=128 * 1024,
-            max_nodes=16384,
+            # The request embeds one complete receipt.
+            max_bytes=TOOL_EFFECT_RECEIPT_MAX_BYTES + (128 * 1024),
+            max_nodes=TOOL_EFFECT_RECEIPT_MAX_NODES + 16384,
             max_nesting=40,
         )
     ).hexdigest()

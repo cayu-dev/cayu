@@ -31,7 +31,7 @@ from cayu.sessions.invocation import (
     inherited_session_invocation,
     session_invocation_from_task,
 )
-from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import (
     RunRequest,
     _run_request_invocation_lifecycle_authority_sha256,
@@ -83,7 +83,7 @@ class RuntimeSessionCreateClaimReference(BaseModel):
         RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_RECORD_TYPE
     )
     schema_version: Literal[1] = RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_SCHEMA_VERSION
-    session_id: StrictStr = Field(max_length=512)
+    session_id: StrictStr = Field(max_length=MAX_SESSION_ID_BYTES)
     operation_id: StrictStr = Field(
         max_length=RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_OPERATION_ID_CHARS
     )

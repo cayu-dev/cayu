@@ -24,7 +24,7 @@ from cayu.tasks import (
     TaskGroupPolicy,
     TaskGroupStatus,
 )
-from cayu.tasks.graphs import TASK_GRAPH_MAX_BYTES
+from cayu.tasks.graphs import TASK_GRAPH_MAX_BYTES, TASK_GRAPH_MAX_NODES
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType, task_group_request_sha256
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
@@ -188,6 +188,49 @@ async def test_maximum_selected_members_skip_atomically(store):
     events = await app.list_task_group_events(identity, limit=1000)
     assert len(events) == 130
     assert sum(e.type is TaskGroupEventType.MEMBER_TERMINAL for e in events) == 127
+
+
+async def test_group_membership_follows_graph_node_bound():
+    members = tuple(f"m-{i:04}" for i in range(TASK_GRAPH_MAX_NODES))
+    request = TaskGroupCreate(
+        group_id="group",
+        graph=TaskGraphCreate(
+            graph_id="g",
+            nodes=tuple(TaskGraphNode(task=TaskCreate(task_id=m, type="test")) for m in members),
+        ),
+        member_task_ids=members,
+        policy=TaskGroupPolicy(kind="quorum", k=TASK_GRAPH_MAX_NODES),
+    )
+    assert len(request.member_task_ids) == TASK_GRAPH_MAX_NODES
+
+
+async def test_group_beyond_former_member_cap_settles_atomically(store):
+    identity = uuid4().hex
+    members = tuple(identity + f"-{i:03}" for i in range(200))
+    root = identity + "-root"
+    request = TaskGroupCreate(
+        group_id=identity,
+        graph=TaskGraphCreate(
+            graph_id=identity,
+            nodes=(
+                TaskGraphNode(task=TaskCreate(task_id=root, type=identity)),
+                *(
+                    TaskGraphNode(
+                        task=TaskCreate(task_id=m, type=identity), prerequisite_task_ids=(root,)
+                    )
+                    for m in members
+                ),
+            ),
+        ),
+        member_task_ids=members,
+        policy=TaskGroupPolicy(kind="quorum", k=200),
+    )
+    app = CayuApp(task_store=store, enable_logging=False)
+    await app.create_task_group(request)
+    await store.fail_task(root, {})
+    snapshot = await require_group(app, identity)
+    assert snapshot.status is TaskGroupStatus.FAILED
+    assert len(snapshot.members) == 200
 
 
 async def test_group_request_checks_combined_bytes_not_individual_graph_only():

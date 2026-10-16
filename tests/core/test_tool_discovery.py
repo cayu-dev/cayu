@@ -2767,12 +2767,14 @@ def test_registration_rejects_invalid_discovery_modes() -> None:
 def test_discovery_projection_resolution_is_explicit_and_fallback_is_portable() -> None:
     portable_provider = _DiscoveryProvider()
     native_provider = _NativeDiscoveryProvider()
+    catalogue = build_tool_catalog_snapshot(())
 
     assert (
         resolve_tool_discovery_projection(
             ToolDiscoveryMode.SEARCH_TOOLS,
             provider=portable_provider,
             model="fake-model",
+            catalogue=catalogue,
         )
         is ToolDiscoveryProjectionKind.SEARCH_TOOLS
     )
@@ -2781,6 +2783,7 @@ def test_discovery_projection_resolution_is_explicit_and_fallback_is_portable() 
             ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS,
             provider=portable_provider,
             model="fake-model",
+            catalogue=catalogue,
         )
         is ToolDiscoveryProjectionKind.SEARCH_TOOLS
     )
@@ -2789,6 +2792,7 @@ def test_discovery_projection_resolution_is_explicit_and_fallback_is_portable() 
             ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT,
             provider=native_provider,
             model="fake-model",
+            catalogue=catalogue,
         )
         is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
     )
@@ -2797,6 +2801,7 @@ def test_discovery_projection_resolution_is_explicit_and_fallback_is_portable() 
             ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT,
             provider=portable_provider,
             model="fake-model",
+            catalogue=catalogue,
         )
 
 
@@ -2825,6 +2830,112 @@ def test_required_native_discovery_rejects_before_session_creation() -> None:
             ]
 
         assert await store.load("unsupported-native-discovery") is None
+        assert provider.requests == []
+
+    asyncio.run(run())
+
+
+class _OversizedSchemaTool(Tool):
+    def __init__(self, index: int) -> None:
+        super().__init__(
+            ToolSpec(
+                name=f"oversized_{index:03d}",
+                description=f"Large schema capability number {index}.",
+                input_schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"value": {"type": "string", "description": "x" * 60_000}},
+                },
+            )
+        )
+
+    async def run(self, ctx: ToolContext, args: dict[str, object]) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="oversized")
+
+
+class _HostedCapableTextProvider(ModelProvider):
+    name = "hosted-capable-text-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-capable-text-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+def test_hosted_discovery_falls_back_to_search_tools_when_catalogue_exceeds_projection() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedCapableTextProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=tuple(_OversizedSchemaTool(index) for index in range(20)),
+            tool_discovery_mode="openai_tool_search_hosted_or_search_tools",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-oversized-catalogue",
+                    messages=[Message.text("user", "Find a tool.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
+        assert provider.requests[0].tool_discovery_projection is None
+        assert [tool["name"] for tool in provider.requests[0].tools] == [
+            "search_tools",
+            "call_tool",
+        ]
+
+    asyncio.run(run())
+
+
+def test_required_hosted_discovery_rejects_oversized_catalogue_before_session_creation() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedCapableTextProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=tuple(_OversizedSchemaTool(index) for index in range(20)),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        with pytest.raises(ValueError, match="projection would be .* bytes"):
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="hosted-discovery-oversized-required",
+                        messages=[Message.text("user", "Find a tool.")],
+                    )
+                )
+            ]
+
+        assert await store.load("hosted-discovery-oversized-required") is None
         assert provider.requests == []
 
     asyncio.run(run())

@@ -35,6 +35,16 @@ _Digest = Annotated[str, Field(strict=True, pattern=r"^[0-9a-f]{64}$")]
 _Counter = Annotated[StrictInt, Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)]
 
 
+def _require_failover_session_id(value: str) -> str:
+    # sessions.records imports this module through the execution-profile checkpoint.
+    from cayu.sessions.records import MAX_SESSION_ID_BYTES
+
+    value = require_durable_clean_nonblank(value, "model failover session_id")
+    if len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+        raise ValueError(f"Model failover session_id exceeds {MAX_SESSION_ID_BYTES} UTF-8 bytes.")
+    return value
+
+
 class ModelTarget(BaseModel):
     """An application-selected provider and model pair for one session epoch."""
 
@@ -229,7 +239,7 @@ class ModelFailoverSelection(_FailoverValue):
 
     state: Literal["selected"] = "selected"
     schema_version: Literal[1] = 1
-    session_id: str = Field(strict=True, max_length=256)
+    session_id: str = Field(strict=True)
     session_instance_id: str = Field(strict=True, max_length=256)
     execution_profile_fingerprint: _Digest
     plan: ModelFailoverPlan
@@ -249,7 +259,12 @@ class ModelFailoverSelection(_FailoverValue):
     def copy_plan(cls, value: object) -> ModelFailoverPlan:
         return ModelFailoverPlan.model_validate(value)
 
-    @field_validator("session_id", "session_instance_id")
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return _require_failover_session_id(value)
+
+    @field_validator("session_instance_id")
     @classmethod
     def validate_identity(cls, value: str) -> str:
         value = require_durable_clean_nonblank(value, "model failover identity")
@@ -275,7 +290,7 @@ class ModelFailoverProgress(_FailoverValue):
     """
 
     schema_version: Literal[1] = 1
-    session_id: str = Field(strict=True, max_length=256)
+    session_id: str = Field(strict=True)
     session_instance_id: str = Field(strict=True, max_length=256)
     interaction_id: str = Field(strict=True, max_length=256)
     execution_profile_fingerprint: _Digest
@@ -303,9 +318,12 @@ class ModelFailoverProgress(_FailoverValue):
     def copy_plan(cls, value: object) -> ModelFailoverPlan:
         return ModelFailoverPlan.model_validate(value)
 
-    @field_validator(
-        "session_id", "session_instance_id", "interaction_id", "logical_step_id", "stage_id"
-    )
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return _require_failover_session_id(value)
+
+    @field_validator("session_instance_id", "interaction_id", "logical_step_id", "stage_id")
     @classmethod
     def validate_identity(cls, value: str) -> str:
         value = require_durable_clean_nonblank(value, "model failover identity")

@@ -42,8 +42,8 @@ Membership must be nonempty, unique, and restricted to submitted tasks. One grou
 owns one newly submitted graph; existing graphs cannot acquire groups. Neither
 dependencies nor group membership/policy can be edited after admission.
 Task and graph limits still apply: at most 1,024 tasks and 4,096 edges per
-graph, at most 128 group members (each member's execution evidence is kept in
-one durable group record), 256-byte identities, and 4 MiB for the complete
+graph, so at most 1,024 group members (each member's execution evidence is kept
+in one durable group record), 256-byte identities, and 4 MiB for the complete
 canonical group admission authority.
 
 ## Completion policies

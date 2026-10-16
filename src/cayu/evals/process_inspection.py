@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._eval_limits import EVAL_SUITE_MAX_CONCURRENCY
+from cayu._validation import MAX_SESSION_ID_BYTES
 from cayu.build_provenance import RuntimeBuildProvenance
 from cayu.evals._admission import LaunchScheduling, TrialAdmission
 from cayu.evals._inspection_documents import ProcessDocuments, decode_document, read_regular_file
@@ -29,7 +30,7 @@ class _Model(BaseModel):
 class EvalSessionReferenceV1(_Model):
     """An explicit local inspection locator, never execution or recovery authority."""
 
-    session_id: str = Field(min_length=1, max_length=512)
+    session_id: str = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     sqlite_path: str | None = Field(default=None, min_length=1, max_length=4096)
 
     @field_validator("sqlite_path")

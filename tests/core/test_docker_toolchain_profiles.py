@@ -16,6 +16,7 @@ from cayu.environments import (
     verify_local_docker_coding_toolchain_dependencies,
 )
 from cayu.runners import DockerImageIdentity
+from cayu.tools.process_diagnostics import MAX_COMMAND_TIMEOUT_SECONDS
 from cayu.workspaces import LocalWorkspace
 
 
@@ -207,6 +208,21 @@ def test_command_authority_cannot_replace_runtime_home(name: str) -> None:
             executable="/usr/bin/python3",
             fixed_environment=({"name": name, "value": "/workspace"},),
         )
+
+
+def test_command_authority_timeout_shares_the_general_command_ceiling() -> None:
+    options = {
+        "max_arguments": 0,
+        "selector": "full-suite",
+        "revision": "1",
+        "description": "Run the full suite",
+        "exposure": "structured_command",
+        "executable": "/usr/bin/python3",
+    }
+    authority = DockerCodingCommandAuthority(**options, timeout_seconds=MAX_COMMAND_TIMEOUT_SECONDS)
+    assert authority.timeout_seconds == MAX_COMMAND_TIMEOUT_SECONDS
+    with pytest.raises(ValidationError, match="timeout_seconds"):
+        DockerCodingCommandAuthority(**options, timeout_seconds=MAX_COMMAND_TIMEOUT_SECONDS + 1)
 
 
 def test_command_authority_can_add_tool_specific_cache_override() -> None:

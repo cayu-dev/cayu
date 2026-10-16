@@ -49,7 +49,13 @@ def recording_configuration(raw: Any) -> dict[str, Any] | None:
             "allocation_fingerprint",
         }:
             raise ValueError
-        if any(type(v) is not str or not 1 <= len(v) <= 128 for v in identity.values()):
+        # The host bounds session_id at admission; this standalone guest cannot import it.
+        if type(identity["session_id"]) is not str or not identity["session_id"]:
+            raise ValueError
+        if any(
+            type(identity[k]) is not str or not 1 <= len(identity[k]) <= 128
+            for k in ("session_instance_id", "allocation_fingerprint")
+        ):
             raise ValueError
         if re.fullmatch(r"[0-9a-f]{64}", identity["allocation_fingerprint"]) is None:
             raise ValueError

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from cayu.runtime.tool_effects import (
+    TOOL_EFFECT_RECEIPT_MAX_BYTES,
     ToolEffectReceipt,
     copy_tool_effect_receipt,
     tool_effect_receipt_digest,
@@ -51,17 +52,17 @@ def test_receipt_detaches_nested_values_and_canonicalizes_identity() -> None:
         {"receipt_schema_version": True},
         {"tool_call_id": " "},
         {"tool_name": "é" * 129},
-        {"message": "é" * 2049},
+        {"message": "é" * (TOOL_EFFECT_RECEIPT_MAX_BYTES // 2 + 1)},
         {"outcome": "not_found"},
         {"source": "model"},
         {"observed_at": datetime(2026, 9, 8)},
-        {"structured": {"raw": "x" * (64 * 1024)}},
+        {"structured": {"raw": "x" * TOOL_EFFECT_RECEIPT_MAX_BYTES}},
         {"resource_versions": {str(n): "v" for n in range(33)}},
         {"integrity": {str(n): "v" for n in range(17)}},
         {"headers": {"authorization": "not allowed"}},
         {"artifacts": ["not an object"]},
         {"artifacts": {"id": "not a list"}},
-        {"artifacts": [{"raw": "x" * (64 * 1024)}]},
+        {"artifacts": [{"raw": "x" * TOOL_EFFECT_RECEIPT_MAX_BYTES}]},
         {"artifacts": [{"invalid": "\ud800"}]},
     ],
 )
@@ -171,7 +172,7 @@ def test_every_receipt_field_participates_in_content_identity(changes) -> None:
 def test_individually_bounded_fields_cannot_exceed_total_envelope_bound() -> None:
     with pytest.raises(ValueError):
         _receipt(
-            structured={"value": "x" * 60_000},
+            structured={"value": "x" * (TOOL_EFFECT_RECEIPT_MAX_BYTES - 32 * 1024)},
             resource_versions={str(n): "v" * 1024 for n in range(32)},
             integrity={str(n): "v" * 1024 for n in range(16)},
         )
@@ -227,3 +228,42 @@ def test_existing_request_digest_compatibility_and_attachment_binding() -> None:
     assert reconciliation_request_digest(request) == _reconciliation_digest(legacy)
     changed = request.model_copy(update={"receipt": _receipt(artifacts=[{"id": "image"}])})
     assert reconciliation_request_digest(changed) != reconciliation_request_digest(request)
+
+
+def test_receipt_holds_ordinary_output_a_live_tool_result_publishes() -> None:
+    from cayu.runtime._tool_effect_reconciliation import reconciliation_request_digest
+    from cayu.runtime._tool_effect_state import _digest
+    from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
+    from cayu.tools.base import ToolResult
+
+    message = "deployment log line\n" * 1024
+    structured = {"rows": [{"id": index, "value": "x" * 64} for index in range(1024)]}
+    artifacts = [{"artifact_id": f"artifact-{index}", "label": "y" * 64} for index in range(1024)]
+    live = ToolResult(content=message, structured=structured, artifacts=artifacts)
+
+    receipt = _receipt(message=message, structured=structured, artifacts=artifacts)
+    reconciled = ToolResult(
+        content=receipt.message, structured=receipt.structured, artifacts=receipt.artifacts
+    )
+    assert reconciled.model_dump(mode="json") == live.model_dump(mode="json")
+    request = ToolEffectReconciliationRequest(
+        session_id="session",
+        session_instance_id="instance",
+        tool_round_id="round",
+        tool_call_id="call-1",
+        tool_name="deploy",
+        idempotency_key="key-1",
+        expected_run_epoch=1,
+        expected_revision=2,
+        receipt=receipt,
+    )
+    assert len(reconciliation_request_digest(request)) == 64
+    assert len(_digest({"terminal": {"receipt": receipt.model_dump(mode="json")}})) == 64
+
+
+def test_receipt_envelope_fits_its_reconciled_terminal_event() -> None:
+    from cayu._validation import DURABLE_EVENT_LIMITS
+
+    assert DURABLE_EVENT_LIMITS.max_bytes > TOOL_EFFECT_RECEIPT_MAX_BYTES
+    with pytest.raises(ValueError, match="byte limit"):
+        _receipt(message="x" * (TOOL_EFFECT_RECEIPT_MAX_BYTES + 1))

@@ -24,6 +24,7 @@ from cayu.memory.base import (
     RecallOffer,
     admit_recall,
 )
+from cayu.memory.evidence import MAX_RECALL_RECEIPT_ITEMS
 from cayu.memory.recall import (
     RECALL_ENGINE_VERSION,
     RecallCandidate,
@@ -41,6 +42,7 @@ from cayu.memory.retrieval import (
     RetrievalChannelDiagnostics,
     RetrievalFusionDiagnostics,
 )
+from cayu.runtime._memory_evidence import MemoryEvidenceKey, build_recall_receipt
 
 _FUSION_STRATEGY = "cayu.wrrf.v1"
 _FUSION_CONFIGURATION = "memory-admission-tests-v1"
@@ -601,3 +603,40 @@ def test_policy_rejects_unversioned_or_incoherent_calibration() -> None:
         _policy(max_evaluated_candidates=1, max_injected_items=2)
     with pytest.raises(ValueError, match="calibration_version"):
         _policy(calibration_version=" ")
+
+
+def test_policy_item_bounds_fit_one_recall_receipt() -> None:
+    wide = {
+        "max_injected_items": 50,
+        "max_offered_items": 50,
+        "max_focus_bytes": 1_000_000,
+        "max_offer_bytes": 1_000_000,
+        "max_total_bytes": 1_000_000,
+    }
+    with pytest.raises(ValueError, match="recall receipt"):
+        _policy(max_evaluated_candidates=MAX_RECALL_RECEIPT_ITEMS + 1, **wide)
+
+    policy = _policy(max_evaluated_candidates=MAX_RECALL_RECEIPT_ITEMS, **wide)
+    situation = RecallSituation(query="record evidence")
+    result = _result(
+        *(
+            _candidate(f"record-{index:03d}", score=0.05 if index < 50 else 0.02)
+            for index in range(100)
+        )
+    ).model_copy(update={"situation_sha256": situation.fingerprint()})
+    contribution = admit_recall(result, policy)
+    assert len(contribution.focus.items) + len(contribution.offer.items) == (
+        MAX_RECALL_RECEIPT_ITEMS
+    )
+    receipt = build_recall_receipt(
+        session_id="admission",
+        interaction_id="interaction",
+        model_step_id="mstep_00000000000000000000000000000000",
+        situation=situation,
+        result=result,
+        contribution=contribution,
+        admission_policy=policy,
+        source_configuration={},
+        key=MemoryEvidenceKey(key_id="test", key=b"k" * 32),
+    )
+    assert len(receipt.items) == MAX_RECALL_RECEIPT_ITEMS

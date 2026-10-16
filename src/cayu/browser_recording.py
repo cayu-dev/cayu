@@ -10,6 +10,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
+
 
 class _RecordingModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -63,7 +65,7 @@ class BrowserRecordingConfig(_RecordingModel):
     """Application-only capture credential; excluded from ordinary serialization."""
 
     policy: BrowserRecordingPolicy
-    session_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     guest_endpoint: str = Field(repr=False)
     credential: SecretStr = Field(repr=False, exclude=True)
 
@@ -121,7 +123,7 @@ def browser_recording_capability(backend: str) -> BrowserRecordingCapability:
 
 
 class BrowserRecordingIdentity(_RecordingModel):
-    session_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     session_instance_id: str = Field(min_length=1, max_length=128)
     allocation_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     browser_id: str = Field(min_length=1, max_length=96, pattern=r"^[A-Za-z0-9_-]+$")

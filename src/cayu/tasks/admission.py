@@ -22,7 +22,11 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     revalidate_model_input,
 )
-from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+from cayu.runtime.work_attempt_semantics import (
+    WORK_ATTEMPT_RUN_SEMANTICS_MAX_BYTES,
+    WORK_ATTEMPT_RUN_SEMANTICS_MAX_ITEMS,
+    WorkAttemptRunSemantics,
+)
 from cayu.runtime.work_attempt_source import (
     WORK_ATTEMPT_SOURCE_MAX_BYTES,
     WORK_ATTEMPT_SOURCE_MAX_ITEMS,
@@ -48,11 +52,19 @@ from cayu.tasks.contracts import (
 
 # A continuation embeds one complete valid completion decision.  Reserve fixed
 # headroom for the admission, invocation, claim, and attempt authority around
-# that decision while retaining a single bounded durable receipt.
+# that decision, its source snapshot and its run settings while retaining a
+# single bounded durable receipt.
 WORK_ATTEMPT_ADMISSION_MAX_BYTES = (
-    WORK_COMPLETION_DECISION_MAX_BYTES + (128 * 1024) + WORK_ATTEMPT_SOURCE_MAX_BYTES
+    WORK_COMPLETION_DECISION_MAX_BYTES
+    + (128 * 1024)
+    + WORK_ATTEMPT_SOURCE_MAX_BYTES
+    + WORK_ATTEMPT_RUN_SEMANTICS_MAX_BYTES
 )
-WORK_ATTEMPT_ADMISSION_MAX_ITEMS = WORK_CONTRACT_TASK_MAX_ITEMS + WORK_ATTEMPT_SOURCE_MAX_ITEMS
+WORK_ATTEMPT_ADMISSION_MAX_ITEMS = (
+    WORK_CONTRACT_TASK_MAX_ITEMS
+    + WORK_ATTEMPT_SOURCE_MAX_ITEMS
+    + WORK_ATTEMPT_RUN_SEMANTICS_MAX_ITEMS
+)
 WORK_ATTEMPT_ADMISSION_ID_MAX_BYTES = 256
 WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS = 3_600
 WORK_ATTEMPT_ADMISSION_MAX_GENERATIONS = 64

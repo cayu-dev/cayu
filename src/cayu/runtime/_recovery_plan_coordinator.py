@@ -88,6 +88,7 @@ from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, PendingActionSession, Session, SessionStatus
 from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CURSOR_BYTES,
+    RECOVERY_PLAN_MAX_TASK_CLAIMS,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -119,7 +120,7 @@ from cayu.sessions.recovery import (
 )
 from cayu.sessions.store import SessionStore
 from cayu.tasks.handoff import TaskInterruptedHandoffReceipt, interrupted_task_handoff_request
-from cayu.tasks.queries import TaskQuery
+from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
 from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
@@ -148,6 +149,8 @@ _ACTIVE_TASK_STATUSES = frozenset(
         TaskStatus.NEEDS_ATTENTION,
     }
 )
+# TaskQuery's largest page.
+_TASK_QUERY_PAGE_SIZE = 1000
 
 
 class _RecoveryPlanSnapshotChanged(RuntimeError):
@@ -1032,6 +1035,11 @@ class RecoveryPlanCoordinator:
             blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE))
 
         task_claims = await self._task_claims(session, checkpoint)
+        if len(task_claims) > RECOVERY_PLAN_MAX_TASK_CLAIMS:
+            # More active tasks than one item carries can never hand off to a
+            # single owner; keep bounded evidence and leave the session intact.
+            task_claims = task_claims[:RECOVERY_PLAN_MAX_TASK_CLAIMS]
+            blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE))
         if any(claim.ownership_status == "active" for claim in task_claims):
             blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.ACTIVE_TASK_CLAIM))
         recoverable_task_claims = tuple(
@@ -1189,14 +1197,12 @@ class RecoveryPlanCoordinator:
     ) -> tuple[RecoveryTaskClaimEvidence, ...]:
         if self._task_store is None:
             return ()
-        tasks = await self._task_store.list_tasks(TaskQuery(session_id=session.id, limit=1000))
+        tasks = await self._active_session_tasks(session.id)
         exact_handoffs = task_store_exact_interrupted_handoff_capability_is_complete(
             self._task_store
         )
         evidence: list[RecoveryTaskClaimEvidence] = []
         for task in tasks:
-            if task.status not in _ACTIVE_TASK_STATUSES:
-                continue
             ownership_status = "invalid"
             worker_and_lease_present = (
                 task.worker_id is not None and task.lease_expires_at is not None
@@ -1253,6 +1259,29 @@ class RecoveryPlanCoordinator:
                 )
             )
         return tuple(sorted(evidence, key=lambda item: item.task_ref))
+
+    async def _active_session_tasks(self, session_id: str) -> tuple[Task, ...]:
+        """Page every active task of one session, stopping just past the item bound."""
+
+        assert self._task_store is not None
+        tasks: list[Task] = []
+        for status in sorted(_ACTIVE_TASK_STATUSES):
+            offset = 0
+            while len(tasks) <= RECOVERY_PLAN_MAX_TASK_CLAIMS:
+                page = await self._task_store.list_tasks(
+                    TaskQuery(
+                        session_id=session_id,
+                        status=status,
+                        order_by=TaskOrder.CREATED_AT_ASC,
+                        limit=_TASK_QUERY_PAGE_SIZE,
+                        offset=offset,
+                    )
+                )
+                tasks.extend(page)
+                if len(page) < _TASK_QUERY_PAGE_SIZE:
+                    break
+                offset += len(page)
+        return tuple(tasks[: RECOVERY_PLAN_MAX_TASK_CLAIMS + 1])
 
     async def _settled_direct_task_attachment(
         self, session: Session, checkpoint: dict[str, object] | None, task: Task
@@ -1317,9 +1346,7 @@ class RecoveryPlanCoordinator:
             raise StaleRecoveryPlanError("Task store no longer supports exact owner recovery.")
         matches = [
             task
-            for task in await self._task_store.list_tasks(
-                TaskQuery(session_id=private_session_id, limit=1000)
-            )
+            for task in await self._active_session_tasks(private_session_id)
             if _safe_ref("task", task.id) == expected[0].task_ref
         ]
         if len(matches) != 1:

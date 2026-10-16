@@ -63,6 +63,7 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
 )
 from cayu.tasks.contracts import (
+    WORK_VERIFICATION_LEASE_MAX_SECONDS,
     CompletionDecision,
     CompletionProposal,
     CompletionProposalCreate,
@@ -77,7 +78,6 @@ from cayu.tasks.contracts import (
     copy_completion_decision,
     copy_completion_proposal,
     copy_work_contract,
-    require_bounded_work_completion_document,
 )
 from cayu.tasks.groups import TaskGroupResultResolutionPending
 from cayu.tasks.queries import TaskAggregateFilter, TaskQuery, copy_task_query
@@ -96,8 +96,6 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
 
 _T = TypeVar("_T")
-_VERIFIER_LEASE_SECONDS = 300
-_VERIFIER_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -281,6 +279,8 @@ class VerifiedTaskWorker:
         poll_interval_s: float = 1.0,
         max_elapsed_seconds: int = 3600,
         callback_timeout_seconds: float = 30.0,
+        verifier_lease_seconds: int = 300,
+        verifier_timeout_seconds: float = 30.0,
     ) -> None:
         if app.task_store is None:
             raise ValueError("VerifiedTaskWorker requires a task store.")
@@ -297,6 +297,16 @@ class VerifiedTaskWorker:
         validate_worker_interval(callback_timeout_seconds, "callback_timeout_seconds")
         if callback_timeout_seconds >= lease_seconds:
             raise ValueError("callback_timeout_seconds must be shorter than lease_seconds.")
+        if (
+            type(verifier_lease_seconds) is not int
+            or not 1 <= verifier_lease_seconds <= WORK_VERIFICATION_LEASE_MAX_SECONDS
+        ):
+            raise ValueError("verifier_lease_seconds is outside its supported bounds.")
+        validate_worker_interval(verifier_timeout_seconds, "verifier_timeout_seconds")
+        if verifier_timeout_seconds >= verifier_lease_seconds:
+            raise ValueError(
+                "verifier_timeout_seconds must be shorter than verifier_lease_seconds."
+            )
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         if app.redact_json(worker_id) != worker_id:
             raise ValueError("worker_id contains a workload secret.")
@@ -319,6 +329,8 @@ class VerifiedTaskWorker:
         self.poll_interval_s = poll_interval_s
         self.max_elapsed_seconds = max_elapsed_seconds
         self.callback_timeout_seconds = callback_timeout_seconds
+        self.verifier_lease_seconds = verifier_lease_seconds
+        self.verifier_timeout_seconds = float(verifier_timeout_seconds)
         self._running: asyncio.Task[CapturedAwaitableOutcome[int]] | None = None
         self._verification: _RetainedVerifier | None = None
         self._preparation_settlement: _RetainedPreparationSettlement | None = None
@@ -2093,12 +2105,8 @@ class VerifiedTaskWorker:
                 raise WorkCompletionConflict(
                     "Verified task report conflicts with its expected proposal."
                 )
-            require_bounded_work_completion_document(
-                copied.model_dump(mode="json"),
-                "verified_task_report",
-                max_bytes=65536,
-                max_items=4096,
-            )
+            # CompletionProposalCreate already enforces the admitted proposal
+            # ceiling; the report adds no payload of its own.
             return copied.proposal
 
         try:
@@ -2199,7 +2207,7 @@ class VerifiedTaskWorker:
                     execution_timeout_seconds=(
                         claim.execution_timeout_seconds
                         if claim.execution_timeout_seconds is not None
-                        else min(_VERIFIER_TIMEOUT_SECONDS, claim.lease_seconds / 2)
+                        else min(self.verifier_timeout_seconds, claim.lease_seconds / 2)
                     ),
                 ), decision
             if claim.lease_expires_at > datetime.now(UTC):
@@ -2210,6 +2218,6 @@ class VerifiedTaskWorker:
             claim_id=self._verifier_claim_id(proposal_id, contract, attempt_number),
             decision_id=verified_task_operation_id("decision", proposal_id),
             worker_id=self.worker_id,
-            lease_seconds=_VERIFIER_LEASE_SECONDS,
-            execution_timeout_seconds=_VERIFIER_TIMEOUT_SECONDS,
+            lease_seconds=self.verifier_lease_seconds,
+            execution_timeout_seconds=self.verifier_timeout_seconds,
         ), None

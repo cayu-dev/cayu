@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    MAX_SESSION_ID_BYTES,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
@@ -274,9 +275,6 @@ def runtime_build_provenance_from_session_metadata(
         )
     except Exception as exc:
         raise ValueError("Session runtime build-provenance metadata is malformed.") from exc
-
-
-MAX_SESSION_ID_BYTES = 2048
 
 
 def _require_bounded_session_id(value: str, field_name: str) -> str:

@@ -94,14 +94,8 @@ def test_shutdown_mid_attempt_records_no_terminal_outcome(phase: str) -> None:
     asyncio.run(scenario())
 
 
-def test_a_worker_owned_verifier_failure_is_reported_only_by_the_worker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_worker_owned_verifier_failure_is_reported_only_by_the_worker() -> None:
     from tests.core.test_verified_task_worker import _StaticHandler
-
-    from cayu.verification import verified_task_worker as worker_module
-
-    monkeypatch.setattr(worker_module, "_VERIFIER_TIMEOUT_SECONDS", 0.05)
 
     class LateFailingVerifier(RecordingVerifier):
         def __init__(self) -> None:
@@ -131,7 +125,11 @@ def test_a_worker_owned_verifier_failure_is_reported_only_by_the_worker(
         await tasks.publish_work_contract(contract)
         await tasks.create_task(TaskCreate(type="verified", work_contract=contract.reference()))
         worker = VerifiedTaskWorker(
-            app, _StaticHandler(), worker_id="w", callback_timeout_seconds=0.2
+            app,
+            _StaticHandler(),
+            worker_id="w",
+            callback_timeout_seconds=0.2,
+            verifier_timeout_seconds=0.05,
         )
         with pytest.raises(Exception):
             await worker.run(max_tasks=1)

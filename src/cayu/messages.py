@@ -20,6 +20,7 @@ from pydantic import (
 
 from cayu._validation import (
     DURABLE_DOCUMENT_LIMITS,
+    MAX_SESSION_ID_BYTES,
     copy_durable_json_value,
     inspect_bounded_durable_json,
     require_durable_clean_nonblank,
@@ -464,7 +465,7 @@ class PeerContentPart(BaseModel):
     text: str = Field(max_length=131072)
     sender_participant_id: str = Field(max_length=512)
     sender_participant_incarnation: str = Field(max_length=512)
-    sender_session_id: str = Field(max_length=512)
+    sender_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     sender_session_instance_id: str = Field(max_length=512)
     occurrence_id: str = Field(max_length=512)
     append_key_json: str = Field(max_length=16384)

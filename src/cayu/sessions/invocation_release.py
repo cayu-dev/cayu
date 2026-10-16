@@ -6,7 +6,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    MAX_SESSION_ID_BYTES,
+    require_durable_clean_nonblank,
+)
 
 
 class InvocationReleaseEvidence(BaseModel):
@@ -21,7 +25,7 @@ class InvocationReleaseEvidence(BaseModel):
 
     record_type: Literal["cayu.invocation-release-evidence"] = "cayu.invocation-release-evidence"
     schema_version: Literal[1] = 1
-    session_id: str = Field(max_length=1024)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     session_instance_id: str = Field(max_length=1024)
     interaction_id: str = Field(max_length=1024)
     command_identity: str = Field(max_length=4096)

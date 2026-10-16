@@ -11,7 +11,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    MAX_SESSION_ID_BYTES,
+    require_durable_clean_nonblank,
+)
 
 
 class SessionSteeringConflict(ValueError):
@@ -31,7 +35,7 @@ class StopAfterCurrentToolRoundRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    session_id: StrictStr = Field(min_length=1, max_length=512)
+    session_id: StrictStr = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     session_instance_id: StrictStr = Field(min_length=1, max_length=512)
     interaction_id: StrictStr = Field(min_length=1, max_length=512)
     expected_run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)

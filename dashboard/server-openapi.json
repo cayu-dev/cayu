@@ -285,7 +285,7 @@
             "type": "integer"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "title": "Session Id",
             "type": "string"
           },
@@ -18627,7 +18627,7 @@
             "items": {
               "$ref": "#/components/schemas/ExecutionToolRequirement"
             },
-            "maxItems": 64,
+            "maxItems": 320000,
             "title": "Tool Requirements",
             "type": "array"
           }
@@ -21703,7 +21703,7 @@
             "type": "integer"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "title": "Session Id",
             "type": "string"
           },
@@ -24316,7 +24316,7 @@
           "session_id": {
             "anyOf": [
               {
-                "maxLength": 1024,
+                "maxLength": 2048,
                 "type": "string"
               },
               {
@@ -24578,7 +24578,7 @@
             "type": "string"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "title": "Session Id",
             "type": "string"
           },
@@ -24693,7 +24693,7 @@
             "type": "string"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "title": "Session Id",
             "type": "string"
           },
@@ -25320,7 +25320,7 @@
             "type": "string"
           },
           "sender_session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "title": "Sender Session Id",
             "type": "string"
           },
@@ -30678,7 +30678,7 @@
             "type": "integer"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "title": "Session Id",
             "type": "string"
           }
@@ -32446,7 +32446,7 @@
             "type": "array"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "minLength": 1,
             "title": "Session Id",
             "type": "string"
@@ -32573,7 +32573,7 @@
             "type": "integer"
           },
           "session_id": {
-            "maxLength": 512,
+            "maxLength": 2048,
             "minLength": 1,
             "title": "Session Id",
             "type": "string"

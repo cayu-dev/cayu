@@ -14,6 +14,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage.retention import (
     MAX_RETENTION_AUDIT_LIST_LIMIT,
@@ -172,7 +173,8 @@ async def snapshot_pin_text(sql: RetentionSql) -> str:
     return "\0".join(documents)
 
 
-MAX_REFERENCE_ATOM_CHARS = 512
+# Long enough for any admitted session id; SQL length() counts characters.
+MAX_REFERENCE_ATOM_CHARS = MAX_SESSION_ID_BYTES
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 

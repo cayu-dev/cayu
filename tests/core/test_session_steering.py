@@ -32,7 +32,7 @@ from cayu.runtime.session_steering import (
 )
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import EnqueueSessionMessageRequest
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, SessionIdentity, SessionStatus
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -65,8 +65,15 @@ def test_stop_request_requires_exact_durable_epoch(epoch) -> None:
 )
 @pytest.mark.parametrize("value", ["", " padded ", "bad\0name", "bad\ud800name", "x" * 513, 1])
 def test_stop_request_rejects_invalid_identity(field, value) -> None:
+    if field == "session_id" and value == "x" * 513:
+        # Session ids are admitted up to MAX_SESSION_ID_BYTES.
+        value = "x" * (MAX_SESSION_ID_BYTES + 1)
     with pytest.raises(ValidationError):
         _request(**{field: value})
+
+
+def test_stop_request_accepts_every_admitted_session_id() -> None:
+    assert _request(session_id="x" * MAX_SESSION_ID_BYTES).session_id == "x" * MAX_SESSION_ID_BYTES
 
 
 def test_stop_request_copy_revalidates_mutated_fields_without_serialization(recwarn) -> None:

@@ -3114,6 +3114,54 @@ def copy_budget_limits(
 # stores a run's limits with the same bound, so an admitted run cannot fail at
 # its first model step.
 MAX_REQUEST_BUDGET_LIMITS = 1024
+# Model steps that may finish offline (background provider operations, tool
+# completion, external waits) persist a 2 MiB recovery record. It copies the
+# run's request limits, price books included, plus each reserving limit's own
+# copy. This is the share of that record they may use, checked when a session's
+# execution profile is resolved so the run fails there rather than at a step.
+MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES = 1536 * 1024
+
+
+def require_budget_limits_fit_model_completion_recovery(
+    *,
+    request_limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
+    policy: BudgetPolicy | None,
+    agent_name: str,
+    causal_budget_id: str | None,
+) -> None:
+    """Reject run limits whose copies can't fit a model step's recovery record."""
+    request = _effective_budget_limits(
+        copy_request_budget_limits(request_limits),
+        identity_namespace="request",
+    )
+    policy = copy_budget_policy(policy)
+    reserving_policy = (
+        ()
+        if policy is None
+        else tuple(
+            limit
+            for limit in _effective_budget_limits(policy.limits, identity_namespace="app_policy")
+            if limit.reservation is not None
+            and (
+                limit.scope == "app"
+                or (limit.scope == "agent" and limit.key == agent_name)
+                or (limit.scope == "causal" and limit.key == causal_budget_id)
+            )
+        )
+    )
+    size = 0
+    for limit, copies in chain(
+        ((limit, 1 + (limit.reservation is not None)) for limit in request),
+        ((limit, 1) for limit in reserving_policy),
+    ):
+        dumped = limit.model_dump(mode="json")
+        size += copies * len(canonical_durable_json_bytes(dumped, "budget_limit"))
+    if size > MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES:
+        raise ValueError(
+            f"Budget limits take {size} bytes in a model step's recovery record, over "
+            f"the {MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES}-byte limit; "
+            "use smaller price books."
+        )
 
 
 def copy_request_budget_limits(

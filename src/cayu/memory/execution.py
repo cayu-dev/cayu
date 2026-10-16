@@ -50,6 +50,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import (
+    MAX_SESSION_ID_BYTES,
     canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
@@ -508,7 +509,7 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
     overlay_provider_fingerprint: StrictStr
     runtime_runner_fingerprint: StrictStr
     evaluator_fingerprint: StrictStr
-    session_id: StrictStr = Field(max_length=512)
+    session_id: StrictStr = Field(max_length=MAX_SESSION_ID_BYTES)
     causal_budget_id: StrictStr = Field(max_length=512)
     phase: MemoryInterventionExecutionPhase
     status: MemoryInterventionExecutionStatus = MemoryInterventionExecutionStatus.ACTIVE
@@ -613,7 +614,11 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
         return _clean(
             value,
             info.field_name,
-            max_chars=(512 if info.field_name in {"session_id", "causal_budget_id"} else 256),
+            max_chars=(
+                MAX_SESSION_ID_BYTES
+                if info.field_name in {"session_id", "causal_budget_id"}
+                else 256
+            ),
         )
 
     @field_validator("runtime_dispatch_ownership", mode="before")
@@ -1667,7 +1672,8 @@ class MemoryInterventionRuntimeRunner(ABC):
         if not isinstance(session_ids, Sequence) or isinstance(session_ids, str | bytes):
             raise TypeError("session_ids must be an ordered string sequence.")
         copied = tuple(
-            _clean(value, "accounting session_id", max_chars=512) for value in session_ids
+            _clean(value, "accounting session_id", max_chars=MAX_SESSION_ID_BYTES)
+            for value in session_ids
         )
         return all(session_id == execution.session_id for session_id in copied)
 
@@ -1967,7 +1973,8 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         if not isinstance(session_ids, Sequence) or isinstance(session_ids, str | bytes):
             raise TypeError("session_ids must be an ordered string sequence.")
         copied = tuple(
-            _clean(value, "accounting session_id", max_chars=512) for value in session_ids
+            _clean(value, "accounting session_id", max_chars=MAX_SESSION_ID_BYTES)
+            for value in session_ids
         )
         for session_id in dict.fromkeys(copied):
             session = await self._runtime_session_store.load(session_id)
@@ -2768,7 +2775,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
 
 
 class MemoryInterventionRuntimeResult(_ExecutionModel):
-    session_id: StrictStr = Field(max_length=512)
+    session_id: StrictStr = Field(max_length=MAX_SESSION_ID_BYTES)
     terminal_disposition: AgentSnapshotTerminalDisposition
     runtime_evidence_fingerprint: StrictStr
     terminal_evidence_available: StrictBool
@@ -2784,7 +2791,7 @@ class MemoryInterventionRuntimeResult(_ExecutionModel):
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, value: str, info) -> str:
-        return _clean(value, info.field_name, max_chars=512)
+        return _clean(value, info.field_name, max_chars=MAX_SESSION_ID_BYTES)
 
     @field_validator("runtime_evidence_fingerprint", "usage_fingerprint", "cost_fingerprint")
     @classmethod

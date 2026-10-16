@@ -13,7 +13,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     revalidate_model_input,
 )
-from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.budgets.base import MAX_REQUEST_BUDGET_LIMITS, BudgetLimit, copy_request_budget_limits
 from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec
@@ -21,13 +21,20 @@ from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import ExecutionDeadline
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
+from cayu.runtime.work_attempt_source import (
+    WORK_ATTEMPT_SOURCE_MAX_BYTES,
+    WORK_ATTEMPT_SOURCE_MAX_ITEMS,
+)
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.tasks.contracts import require_bounded_work_completion_document
 from cayu.tools.exposure import ToolCapabilityCeiling
 
-WORK_ATTEMPT_RUN_SEMANTICS_MAX_BYTES = 64 * 1024
-WORK_ATTEMPT_RUN_SEMANTICS_MAX_ITEMS = 8_192
-WORK_ATTEMPT_RUN_SEMANTICS_MAX_BUDGETS = 64
+# These settings copy an admitted request whose portable source snapshot is
+# bounded by WORK_ATTEMPT_SOURCE_MAX_*, plus runtime-resolved settings (tool
+# ceiling, effective retry policy, agent thinking) that the headroom covers.
+WORK_ATTEMPT_RUN_SEMANTICS_MAX_BYTES = WORK_ATTEMPT_SOURCE_MAX_BYTES + (64 * 1024)
+WORK_ATTEMPT_RUN_SEMANTICS_MAX_ITEMS = WORK_ATTEMPT_SOURCE_MAX_ITEMS + 8_192
+WORK_ATTEMPT_RUN_SEMANTICS_MAX_BUDGETS = MAX_REQUEST_BUDGET_LIMITS
 
 
 class WorkAttemptRunSemantics(BaseModel):

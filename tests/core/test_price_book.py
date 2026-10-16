@@ -860,3 +860,77 @@ def test_default_app_budget_ledger_does_not_inherit_the_runtime_clock() -> None:
         )
     )
     assert marked[0].dispatch_id == "dispatch-1"
+
+
+def _numbered_prices(count: int) -> tuple[ModelPrice, ...]:
+    return tuple(
+        ModelPrice.fixed(
+            provider_name="fake",
+            model=f"fake-model-{index}",
+            input_per_million=Decimal("1"),
+            output_per_million=Decimal("1"),
+        )
+        for index in range(count)
+    )
+
+
+def test_model_completion_recovery_holds_a_price_book_of_any_entry_count() -> None:
+    from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
+
+    # Recovery used to cap each book at 512 entries; only the record's size matters.
+    limit = BudgetLimit(
+        max_estimated_cost=Decimal("5"), pricing=PriceBook(prices=_numbered_prices(2_000))
+    )
+    context = ModelCompletionRecoveryContext(budget_limits=(limit,))
+
+    assert len(context.budget_limits[0].pricing.prices) == 2_000
+
+
+def test_model_completion_recovery_leaves_room_for_request_metadata() -> None:
+    from cayu._validation import DURABLE_METADATA_LIMITS
+    from cayu.budgets.base import MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES
+    from cayu.runtime._model_completion_contracts import (
+        MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
+    )
+
+    assert (
+        MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES + DURABLE_METADATA_LIMITS.max_bytes
+        < MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES
+    )
+
+
+def test_run_rejects_price_books_too_large_for_model_completion_recovery() -> None:
+    from cayu import AgentSpec, Message, RunRequest
+    from cayu.budgets import BudgetPolicy
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+
+    book = PriceBook(prices=_numbered_prices(1_000))
+    reserving = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("5"),
+        pricing=book,
+        reservation=BudgetReservation(max_input_tokens=1_000, max_output_tokens=1_000),
+    )
+
+    async def run(*, policy: BudgetPolicy | None, limits: tuple[BudgetLimit, ...]) -> int:
+        provider = ScriptedModelProvider([[ModelStreamEvent.completed()]])
+        app = CayuApp(enable_logging=False, budget_policy=policy)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="scripted"))
+        request = RunRequest(
+            agent_name="assistant",
+            messages=[Message.text("user", "hello")],
+            budget_limits=limits,
+        )
+        with pytest.raises(ValueError, match="recovery record"):
+            _ = [event async for event in app.run(request)]
+        return len(provider.requests)
+
+    # Three request copies of a ~540 KB book overflow the share on their own,
+    # and a reserving app-policy limit counts with the request's limits.
+    request_limit = BudgetLimit(max_estimated_cost=Decimal("5"), pricing=book)
+    assert asyncio.run(run(policy=None, limits=(request_limit,) * 3)) == 0
+    assert (
+        asyncio.run(run(policy=BudgetPolicy(limits=(reserving,)), limits=(request_limit,) * 2)) == 0
+    )

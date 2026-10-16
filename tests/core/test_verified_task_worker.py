@@ -98,6 +98,7 @@ from cayu.tasks.contracts import (
     CompletionVerdict,
     CompletionVerificationClaimRequest,
     WorkCompletionConflict,
+    WorkEvidenceReference,
 )
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
@@ -3436,13 +3437,8 @@ def test_worker_recovers_expired_completed_execution_without_redispatch(
 @pytest.mark.parametrize("late_failure", [False, True])
 @pytest.mark.parametrize("context_exit", [False, True])
 def test_worker_close_retains_exact_verifier_until_settlement(
-    backend, signal, late_failure, context_exit, verified_worker_store_factory, monkeypatch
+    backend, signal, late_failure, context_exit, verified_worker_store_factory
 ):
-    from cayu.verification import verified_task_worker as worker_module
-
-    if signal == "timeout":
-        monkeypatch.setattr(worker_module, "_VERIFIER_TIMEOUT_SECONDS", 0.05)
-
     async def scenario():
         sessions, tasks = verified_worker_store_factory()
         entered = asyncio.Event()
@@ -3481,6 +3477,7 @@ def test_worker_close_retains_exact_verifier_until_settlement(
             worker_id="retained-verifier",
             callback_timeout_seconds=0.2,
             max_elapsed_seconds=5 if signal == "deadline" else 3600,
+            verifier_timeout_seconds=0.05 if signal == "timeout" else 30.0,
         )
 
         async def invoke():
@@ -3927,6 +3924,105 @@ def test_worker_discovery_skips_live_verifier_and_handles_unrelated_work(backend
                 await sessions.close()
 
     asyncio.run(scenario())
+
+
+class _LargeProposalHandler(_StaticHandler):
+    async def propose(self, context):
+        self.proposals.append(context)
+        # About 130 KiB: above the old 64 KiB worker report cap, below the
+        # admitted completion-proposal ceiling.
+        references = tuple(
+            WorkEvidenceReference(
+                kind="artifact", reference_id=f"artifact:{index:03d}:" + "x" * 1000
+            )
+            for index in range(128)
+        )
+        return VerifiedTaskHandlerReport(
+            proposal=CompletionProposalCreate(
+                proposal_id=context.proposal_id,
+                attempt_id=context.attempt.attempt_id,
+                result=_result_reference(),
+                evidence_references=references,
+            )
+        )
+
+
+@pytest.mark.parametrize("backend", ["memory"])
+def test_worker_admits_report_up_to_the_completion_proposal_ceiling(
+    backend, verified_worker_store_factory
+):
+    async def scenario():
+        sessions, tasks = verified_worker_store_factory()
+        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        app.register_provider(_RecordingProvider(), default=True)
+        app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract()
+        await tasks.publish_work_contract(contract)
+        task = await tasks.create_task(
+            TaskCreate(type="verified", work_contract=contract.reference())
+        )
+        verifier = RecordingVerifier(_accepted_decision())
+        app.register_completion_verifier(contract.verifier, verifier)
+        app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
+        handler = _LargeProposalHandler()
+        async with VerifiedTaskWorker(app, handler, worker_id="large-proposal") as worker:
+            assert await worker.run(max_tasks=1) == 1
+        assert (await tasks.load_task(task.id)).status is TaskStatus.COMPLETED
+        assert len(verifier.requests) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory"])
+def test_worker_dispatches_its_configured_verifier_lease_and_timeout(
+    backend, verified_worker_store_factory
+):
+    async def scenario():
+        sessions, tasks = verified_worker_store_factory()
+        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        app.register_provider(_RecordingProvider(), default=True)
+        app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract()
+        await tasks.publish_work_contract(contract)
+        task = await tasks.create_task(
+            TaskCreate(type="verified", work_contract=contract.reference())
+        )
+        app.register_completion_verifier(contract.verifier, RecordingVerifier(_accepted_decision()))
+        app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
+        handler = _StaticHandler()
+        async with VerifiedTaskWorker(
+            app,
+            handler,
+            worker_id="slow-verifier",
+            verifier_lease_seconds=1800,
+            verifier_timeout_seconds=900,
+        ) as worker:
+            assert await worker.run(max_tasks=1) == 1
+        assert (await tasks.load_task(task.id)).status is TaskStatus.COMPLETED
+        claim = await tasks.load_completion_verification_claim(handler.proposals[0].proposal_id)
+        assert claim.lease_seconds == 1800
+        assert claim.execution_timeout_seconds == 900.0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"verifier_lease_seconds": 0}, "verifier_lease_seconds"),
+        ({"verifier_lease_seconds": 3601}, "verifier_lease_seconds"),
+        ({"verifier_lease_seconds": 300.0}, "verifier_lease_seconds"),
+        ({"verifier_timeout_seconds": 0}, "verifier_timeout_seconds"),
+        ({"verifier_timeout_seconds": float("inf")}, "verifier_timeout_seconds"),
+        ({"verifier_timeout_seconds": 300.0}, "shorter than verifier_lease_seconds"),
+    ],
+)
+def test_worker_validates_verifier_lease_and_timeout_at_construction(options, message):
+    app = CayuApp(
+        task_store=InMemoryTaskStore(), session_store=InMemorySessionStore(), enable_logging=False
+    )
+    with pytest.raises(ValueError, match=message):
+        VerifiedTaskWorker(app, _StaticHandler(), worker_id="configured", **options)
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
@@ -5382,12 +5478,8 @@ def test_cancelled_close_reports_running_callback_as_draining(
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 def test_cancelled_context_exit_keeps_run_failure_and_draining_once(
-    backend, verified_worker_store_factory, monkeypatch
+    backend, verified_worker_store_factory
 ):
-    from cayu.verification import verified_task_worker as worker_module
-
-    monkeypatch.setattr(worker_module, "_VERIFIER_TIMEOUT_SECONDS", 0.05)
-
     async def scenario():
         sessions, tasks = verified_worker_store_factory()
         entered, release = asyncio.Event(), asyncio.Event()
@@ -5411,7 +5503,11 @@ def test_cancelled_context_exit_keeps_run_failure_and_draining_once(
         await tasks.publish_work_contract(contract)
         await tasks.create_task(TaskCreate(type="verified", work_contract=contract.reference()))
         worker = VerifiedTaskWorker(
-            app, _StaticHandler(), worker_id="failed-run-close", callback_timeout_seconds=5
+            app,
+            _StaticHandler(),
+            worker_id="failed-run-close",
+            callback_timeout_seconds=5,
+            verifier_timeout_seconds=0.05,
         )
 
         async def invoke():

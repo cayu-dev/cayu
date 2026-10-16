@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    DURABLE_EVENT_LIMITS,
     canonical_bounded_durable_json_bytes,
     copy_bounded_durable_json_value,
     require_durable_clean_nonblank,
@@ -33,10 +34,12 @@ from cayu.runtime.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 
-TOOL_EFFECT_RECEIPT_MAX_BYTES = 96 * 1024
-TOOL_EFFECT_RESULT_MAX_BYTES = 64 * 1024
-_RECEIPT_MESSAGE_MAX_BYTES = 4096
-_RECEIPT_MAX_NODES = 8192
+# A validated receipt becomes the reconciled call's terminal ToolResult, which
+# is published like a live result in one durable event. Its message, structured
+# data and artifacts share this envelope; the rest of the event limit is kept
+# for the call identity and receipt evidence published beside them.
+TOOL_EFFECT_RECEIPT_MAX_BYTES = DURABLE_EVENT_LIMITS.max_bytes - (256 * 1024)
+TOOL_EFFECT_RECEIPT_MAX_NODES = DURABLE_EVENT_LIMITS.max_nodes - 4096
 
 
 class ToolEffectConflict(RuntimeError):
@@ -122,7 +125,7 @@ class ToolEffectReceipt(BaseModel):
         # Receipts are validated before workload redaction runs, so shortening
         # here could cut a registered secret and leave a prefix that redaction
         # no longer recognizes. An oversized message is rejected instead.
-        return _bounded_text(value, "message", maximum=_RECEIPT_MESSAGE_MAX_BYTES)
+        return _bounded_text(value, "message", maximum=TOOL_EFFECT_RECEIPT_MAX_BYTES)
 
     @field_validator("structured", mode="before")
     @classmethod
@@ -134,8 +137,8 @@ class ToolEffectReceipt(BaseModel):
         return copy_bounded_durable_json_value(
             value,
             "tool_effect_receipt.structured",
-            max_bytes=TOOL_EFFECT_RESULT_MAX_BYTES,
-            max_nodes=4096,
+            max_bytes=TOOL_EFFECT_RECEIPT_MAX_BYTES,
+            max_nodes=TOOL_EFFECT_RECEIPT_MAX_NODES,
             max_nesting=32,
         )
 
@@ -156,8 +159,8 @@ class ToolEffectReceipt(BaseModel):
         return copy_bounded_durable_json_value(
             value,
             "tool_effect_receipt.artifacts",
-            max_bytes=TOOL_EFFECT_RESULT_MAX_BYTES,
-            max_nodes=4096,
+            max_bytes=TOOL_EFFECT_RECEIPT_MAX_BYTES,
+            max_nodes=TOOL_EFFECT_RECEIPT_MAX_NODES,
             max_nesting=32,
         )
 
@@ -200,7 +203,7 @@ def _receipt_bytes(receipt: ToolEffectReceipt) -> bytes:
         fields,
         "tool_effect_receipt",
         max_bytes=TOOL_EFFECT_RECEIPT_MAX_BYTES,
-        max_nodes=_RECEIPT_MAX_NODES,
+        max_nodes=TOOL_EFFECT_RECEIPT_MAX_NODES,
         max_nesting=34,
     )
 

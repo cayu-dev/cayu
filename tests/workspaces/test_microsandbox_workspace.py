@@ -11,6 +11,7 @@ import pytest
 from guard_harness import make_local_guard_exec
 
 from cayu.runners import ExecResult, MicrosandboxRunner
+from cayu.tools.files import MAX_READ_LIMIT_BYTES
 from cayu.workspaces import MicrosandboxWorkspace
 from cayu.workspaces.microsandbox import _is_path_not_found_error
 
@@ -204,6 +205,14 @@ def test_microsandbox_workspace_deletes_files_through_guest_guard(tmp_path: Path
     asyncio.run(workspace.delete("notes/a.txt"))  # missing file is a no-op
 
     assert not target.exists()
+
+
+def test_microsandbox_workspace_default_read_limit_admits_tool_read_ceiling(
+    tmp_path: Path,
+) -> None:
+    workspace, _ = _guard_workspace(tmp_path)
+
+    assert workspace.bounded_read_limit(MAX_READ_LIMIT_BYTES) == MAX_READ_LIMIT_BYTES
 
 
 def test_microsandbox_workspace_uses_default_read_limit(tmp_path: Path) -> None:

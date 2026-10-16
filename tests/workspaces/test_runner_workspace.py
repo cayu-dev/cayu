@@ -26,6 +26,7 @@ from cayu.environments import SyncBinding
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
 from cayu.tools.base import ToolContext
+from cayu.tools.patches import ApplyPatchTool
 from cayu.workspaces import (
     BoundedTarReader,
     BoundedTarStreamReader,
@@ -1106,6 +1107,38 @@ def test_runner_workspace_rejects_special_file_targets_without_blocking(tmp_path
         asyncio.run(workspace.write_tar_bytes(_tar_bytes((("pipe", b"content"),))))
 
     assert asyncio.run(workspace.list("**/*")).paths == ()
+
+
+def test_runner_workspace_default_bound_admits_apply_patch_beyond_read_page(tmp_path) -> None:
+    workspace = RunnerWorkspace(
+        LocalRunner(tmp_path, inherit_env=False),
+        workspace_id="runner",
+        python_executable=sys.executable,
+    )
+    # Larger than one default read page, within the patch tool's file ceiling.
+    original = b"marker = 1\n" + b"x" * (300 * 1024) + b"\n"
+    (tmp_path / "large.txt").write_bytes(original)
+    revision = asyncio.run(workspace.read_bytes("large.txt", max_bytes=len(original))).revision
+    context = ToolContext(session_id="session", workspace_id=workspace.id, workspace=workspace)
+
+    result = asyncio.run(
+        ApplyPatchTool().run(
+            context,
+            {
+                "operations": [
+                    {
+                        "type": "update",
+                        "path": "large.txt",
+                        "expected_revision": revision,
+                        "edits": [{"old_text": "marker = 1", "new_text": "marker = 2"}],
+                    }
+                ]
+            },
+        )
+    )
+
+    assert not result.is_error, result.structured
+    assert (tmp_path / "large.txt").read_bytes() == original.replace(b"marker = 1", b"marker = 2")
 
 
 def test_runner_workspace_uses_default_remote_bounds(tmp_path) -> None:

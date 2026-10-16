@@ -28,6 +28,7 @@ from pydantic import (
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    MAX_SESSION_ID_BYTES,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     require_clean_nonblank,
@@ -197,7 +198,7 @@ class SharedArtifactRef(BaseModel):
     artifact_id: str = Field(pattern=_ARTIFACT_ID_PATTERN)
     content_digest: str = Field(pattern=_SHA256_IDENTIFIER_PATTERN)
     size_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    source_session_id: str = Field(max_length=1024)
+    source_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     access_grant_id: str = Field(pattern=_GRANT_ID_PATTERN)
 
     @field_validator("artifact_store_id", "source_session_id")
@@ -253,7 +254,7 @@ class SharedArtifactGrant(BaseModel):
     source_workspace_id: str = Field(max_length=1024)
     source_path_sha256: str = Field(pattern=_RAW_SHA256_PATTERN)
     root_invocation_id: str = Field(max_length=64)
-    root_session_id: str = Field(max_length=1024)
+    root_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     invocation_origin_sha256: str = Field(pattern=_RAW_SHA256_PATTERN)
     causal_budget_id: str = Field(max_length=1024)
     content_type: str = Field(max_length=1024)
@@ -343,7 +344,7 @@ class SharedArtifactMaterializationReceipt(BaseModel):
     operation_id: str = Field(pattern=_OPERATION_ID_PATTERN)
     reference: SharedArtifactRef
     source_workspace_id: str = Field(max_length=1024)
-    destination_session_id: str = Field(max_length=1024)
+    destination_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     destination_workspace_id: str = Field(max_length=1024)
     destination_path_sha256: str = Field(pattern=_RAW_SHA256_PATTERN)
     policy_fingerprint: str = Field(pattern=_RAW_SHA256_PATTERN)

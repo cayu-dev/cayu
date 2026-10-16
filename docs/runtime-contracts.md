@@ -3481,9 +3481,12 @@ definition outside the candidate set, an altered definition, or a call outside
 the loaded subset fails terminal validation before policy, hooks, or target
 execution.
 
-The candidate projection is capped at 256 functions, 64 KiB per schema, and
+The candidate projection is capped at 10,000 functions, 64 KiB per schema, and
 1 MiB of aggregate canonical definitions; Cayu never truncates it because
-silent truncation would change model authority. When direct or targeted exposure
+silent truncation would change model authority. Projection resolution measures
+the agent's whole catalogue against these bounds: when it does not fit,
+`"openai_tool_search_hosted_or_search_tools"` freezes the portable gateway and
+`"openai_tool_search_hosted"` fails with a size error before dispatch. When direct or targeted exposure
 covers the complete ceiling, Cayu retains the hosted branch identity but omits
 the inert server search tool from the OpenAI request. Loaded grants and the assistant
 completion publish atomically with the branch discovery view. Background
@@ -7699,7 +7702,9 @@ adapter, so claim fencing, heartbeat renewal, the execution timeout, caller
 cancellation, cancellation-resistant draining, single-flight per proposal and
 claim-fenced decision publication are unchanged. Set
 `CompletionVerifierExecutionRequest.execution_timeout_seconds` (and the lease)
-long enough to cover the provider attempts and retries. The immutable verifier
+long enough to cover the provider attempts and retries; `VerifiedTaskWorker`
+sends its `verifier_timeout_seconds` and `verifier_lease_seconds` options
+(30 s and 300 s by default). The immutable verifier
 profile binds two runtime-derived components in addition to the application's
 own: `runtime.provider-adapter` (the provider adapter identity) and
 `runtime.provider-target` (the complete target, including retry policy, budget
@@ -8889,8 +8894,8 @@ across the request, 64 quality references per side, and 8 MiB of canonical JSON
 input. Pair ids must be unique and the request cannot be empty; those are
 validation errors. Missing baseline/candidate sides and empty attempt sets
 remain representable so the report can return typed `unavailable` findings.
-Identity values are bounded to 512 characters and evidence references to 2,048
-characters. Attempt ordinals, token counters, and other integers cannot exceed
+Identity values are bounded to 512 characters, session ids to
+`MAX_SESSION_ID_BYTES` (2,048), and evidence references to 2,048 characters. Attempt ordinals, token counters, and other integers cannot exceed
 the durable signed-64-bit JSON bound; cost decimals are finite, non-negative,
 bounded to that maximum value, and limited to 64 coefficient digits and 64
 decimal places. Models are frozen and transitively revalidated so caller
@@ -9744,7 +9749,7 @@ deployment.
 `PriceBook`. Pass `default_price_book()` for Cayu's reviewed default rates. Request-scoped
 `BudgetLimit` entries can be attached through
 `budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
-`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`, at most 1,024 per request (`MAX_REQUEST_BUDGET_LIMITS`, the same bound model completion recovery stores). `BudgetLimit` defaults to `scope="session"`; `RunLimits` defaults to `scope="run"`.
+`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`, at most 1,024 per request (`MAX_REQUEST_BUDGET_LIMITS`, the same bound model completion recovery stores). Recovery records copy each limit's whole price book, so a session's request limits plus a second copy of every reserving request or app-policy limit must fit in 1.5 MiB (`MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS_MAX_BYTES`); there is no limit on price-book entry counts. The size is checked when the session's execution profile is resolved, before any model step. `BudgetLimit` defaults to `scope="session"`; `RunLimits` defaults to `scope="run"`.
 Session-scoped token, tool-call, and cost limits are cumulative because they are
 evaluated from durable `model.completed` and `tool.call.started` events.
 Run-scoped limits retain their original aggregate baseline across approval and
@@ -14305,7 +14310,9 @@ estimate, not provider tokenization: version 1 reports
 original and projected estimate. The preview limit is a UTF-8 byte limit and
 never splits a Unicode scalar. The complete projected text is also subject to
 a 64 KiB runtime safety ceiling; configuration therefore caps the preview at
-60 KiB to leave room for the typed readback instruction. The built-in policy
+60 KiB to leave room for the typed readback instruction, and rejects a
+`max_inline_bytes` above 64 KiB. A result larger than 64 KiB is externalized
+even when it is under the token-estimate threshold, as multibyte text can be. The built-in policy
 configuration is immutable after construction. A non-default
 `chars_per_token` value is encoded into the reported estimation-method
 identity. Application manifests and fingerprints include the built-in policy's
@@ -16439,7 +16446,11 @@ frame and re-admits the current interaction under the complete new identity; a
 malformed or internally inconsistent frame still fails closed without recalling.
 The next real user message creates a new frame and can observe new knowledge. The
 complete redacted projection must fit `max_projection_bytes`; otherwise context
-construction fails before dispatch.
+construction fails before dispatch. By default `max_projection_bytes` is the admission
+policy's `max_total_bytes` plus 32,000 bytes of manifest envelope (at least 128,000 and
+at most 1,000,000 bytes); an explicit value smaller than `max_total_bytes` is rejected
+when the policy is constructed. Admission counts each `&`, `<` and `>` as the six bytes
+it takes once escaped for the provider, so admitted recall fits that bound when rendered.
 
 A new frame doesn't edit a message that was already sent, as long as the memory on
 it may still be shown. When the interaction changes, the manifests the previous

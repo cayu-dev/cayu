@@ -26,6 +26,7 @@ from cayu._validation import (
 )
 from cayu.budgets.pricing import CostLineItem, Provenance
 from cayu.runtime._cost_diagnostics import UnpricedReason
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 
 COST_QUALITY_COMPARISON_SCHEMA_VERSION = 3
 
@@ -420,7 +421,7 @@ class PairedCostAttempt(BaseModel):
 
     attempt_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     operation_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
-    session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     branch_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     role: str = Field(max_length=_MAX_IDENTITY_CHARS)
     operation: CostQualityAttemptOperation

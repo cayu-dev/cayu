@@ -31,6 +31,7 @@ from cayu._validation import (
 )
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu._validation import require_durable_nonblank as require_nonblank
+from cayu.sessions import records as session_record_rules
 from cayu.sessions.invocation import SessionInvocationBinding, TaskInvocation, copy_task_invocation
 from cayu.tasks.contracts import (
     WORK_CONTRACT_TASK_MAX_BYTES,
@@ -43,6 +44,7 @@ from cayu.tasks.contracts import (
 )
 from cayu.tasks.scheduling import TaskScheduleState, validate_task_schedule_window
 
+TASK_RETRY_MAX_ATTEMPTS = 100
 _TASK_RETRY_COST_MAX_DIGITS = 64
 _TASK_RETRY_TOTAL_COST_MAX_DIGITS = 128
 _TASK_RETRY_COST_MAX_DECIMAL_PLACES = 64
@@ -116,7 +118,7 @@ class TaskRetryPolicy(BaseModel):
         allow_inf_nan=False,
     )
 
-    max_attempts: StrictInt = Field(ge=1, le=100)
+    max_attempts: StrictInt = Field(ge=1, le=TASK_RETRY_MAX_ATTEMPTS)
     max_elapsed_seconds: StrictFloat | None = Field(default=None, gt=0, le=31_536_000)
     max_total_tokens: StrictInt | None = Field(
         default=None,
@@ -710,14 +712,16 @@ class TaskSessionClosureClaim(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    session_id: str = Field(strict=True, min_length=1, max_length=256)
+    session_id: str = Field(
+        strict=True, min_length=1, max_length=session_record_rules.MAX_SESSION_ID_BYTES
+    )
     plan_id: str = Field(strict=True, pattern=r"^[0-9a-f]{64}$")
     task_ids: tuple[str, ...]
 
     @field_validator("session_id")
     @classmethod
     def validate_session(cls, value):
-        return require_clean_nonblank(value, "session_id")
+        return session_record_rules._require_bounded_session_id(value, "session_id")
 
     @field_validator("task_ids", mode="before")
     @classmethod

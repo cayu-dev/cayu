@@ -24,6 +24,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.memory.evidence import MAX_RECALL_RECEIPT_ITEMS
 from cayu.memory.recall import (
     RecallCandidate,
     RecallEngine,
@@ -219,6 +220,16 @@ class AutomaticRecallPolicy(BaseModel):
             raise ValueError("`max_injected_items` cannot exceed `max_evaluated_candidates`.")
         if self.max_offered_items > self.max_evaluated_candidates:
             raise ValueError("`max_offered_items` cannot exceed `max_evaluated_candidates`.")
+        # Every focused or offered item becomes one item of the durable recall receipt.
+        if (
+            min(self.max_injected_items + self.max_offered_items, self.max_evaluated_candidates)
+            > MAX_RECALL_RECEIPT_ITEMS
+        ):
+            raise ValueError(
+                "`max_injected_items` plus `max_offered_items` can exceed the "
+                f"{MAX_RECALL_RECEIPT_ITEMS} items of one recall receipt; lower them or "
+                f"`max_evaluated_candidates` to at most {MAX_RECALL_RECEIPT_ITEMS}."
+            )
         if self.max_focus_bytes > self.max_total_bytes:
             raise ValueError("`max_focus_bytes` cannot exceed `max_total_bytes`.")
         if self.max_offer_bytes > self.max_total_bytes:
@@ -1979,7 +1990,10 @@ def _recall_offer_ticket(
 
 
 def _serialized_bytes(value: BaseModel, field_name: str) -> int:
-    return len(canonical_durable_json_bytes(value.model_dump(mode="json"), field_name))
+    encoded = canonical_durable_json_bytes(value.model_dump(mode="json"), field_name)
+    # Provider rendering escapes &, < and > as six-byte \u00XX sequences, so
+    # count them at that size and admitted recall still fits once rendered.
+    return len(encoded) + 5 * sum(encoded.count(char) for char in (b"&", b"<", b">"))
 
 
 __all__ = [

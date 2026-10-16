@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -69,7 +70,11 @@ from cayu.runtime._binding_cleanup import (
     record_binding_cleanup_failure,
 )
 from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
-from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
+from cayu.runtime._diagnostics import (
+    MAX_DIAGNOSTIC_UTF8_BYTES,
+    credential_safe_runtime_exception,
+    credential_safe_runtime_exception_group,
+)
 from cayu.runtime._environment_lifecycle import (
     FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES,
     _release_unclaimed_factory_result,
@@ -1528,3 +1533,45 @@ def test_optional_automatic_recall_source_failure_is_portable_and_calls_provider
     assert error_code not in str(completed.payload)
     assert EventType.MODEL_STARTED in [event.type for event in events]
     assert EventType.SESSION_FAILED not in [event.type for event in events]
+
+
+def test_bounded_runtime_diagnostic_keeps_its_truncated_text() -> None:
+    error = credential_safe_runtime_exception(
+        RuntimeError,
+        "provider failure " + "x" * (2 * MAX_DIAGNOSTIC_UTF8_BYTES),
+        redactor=SecretRedactor("unrelated-diagnostic-secret"),
+        fallback_message="Provider failure diagnostic was redacted.",
+    )
+
+    assert str(error).startswith("provider failure xxx")
+    assert str(error).endswith("[truncated]")
+    assert len(str(error).encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+
+
+def test_bounded_runtime_diagnostic_still_withholds_a_composed_secret() -> None:
+    secret = "RuntimeError: composed-secret"
+    error = credential_safe_runtime_exception(
+        RuntimeError,
+        "composed-secret " + "x" * (2 * MAX_DIAGNOSTIC_UTF8_BYTES),
+        redactor=SecretRedactor(secret),
+        fallback_message="Provider failure diagnostic was redacted.",
+    )
+
+    assert str(error) == "Provider failure diagnostic was redacted."
+    assert secret not in "".join(traceback.format_exception(error))
+
+
+def test_bounded_runtime_diagnostic_group_keeps_its_leaves() -> None:
+    leaves = [RuntimeError(f"leaf {index} " + "y" * 1024) for index in range(4)]
+    group = credential_safe_runtime_exception_group(
+        ExceptionGroup("several failures", leaves),
+        group_message="Runtime reported several failures.",
+        leaf_mapper=lambda leaf: leaf,
+        invalid_leaf_factory=lambda: RuntimeError("invalid"),
+        truncated_leaf_factory=lambda: RuntimeError("truncated"),
+        fallback_leaf_mapper=lambda leaf: RuntimeError(),
+        redactor=SecretRedactor("unrelated-diagnostic-secret"),
+    )
+
+    assert group.message == "Runtime reported several failures."
+    assert [str(leaf) for leaf in group.exceptions] == [str(leaf) for leaf in leaves]

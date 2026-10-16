@@ -42,6 +42,7 @@ from cayu.build_provenance import (
     RuntimeBuildProvenance,
     legacy_runtime_build_provenance,
 )
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
@@ -1785,7 +1786,7 @@ class AgentSnapshotCaptureRequest(_SnapshotModel):
     authority_scope_fingerprint: StrictStr
     components: tuple[AgentSnapshotComponentSelector, ...]
     required_consistency: AgentSnapshotConsistency = AgentSnapshotConsistency.FRONTIER_CONSISTENT
-    session_id: StrictStr | None = Field(default=None, max_length=512)
+    session_id: StrictStr | None = Field(default=None, max_length=MAX_SESSION_ID_BYTES)
     environment_name: StrictStr | None = Field(default=None, max_length=256)
     evaluator: AgentSnapshotAuthorityRef | None = None
     promotion_authority: AgentSnapshotAuthorityRef | None = None
@@ -1797,7 +1798,7 @@ class AgentSnapshotCaptureRequest(_SnapshotModel):
     def validate_text(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        max_chars = 256 if info.field_name != "session_id" else 512
+        max_chars = 256 if info.field_name != "session_id" else MAX_SESSION_ID_BYTES
         return _clean(value, info.field_name, max_chars=max_chars)
 
     @field_validator("authority_scope_fingerprint", "parent_snapshot_fingerprint")
@@ -2545,7 +2546,7 @@ class AgentSnapshotResultBinding(_SnapshotModel):
     schema_version: Literal[2] = 2
     fingerprint: StrictStr
     trial_fingerprint: StrictStr
-    session_id: StrictStr = Field(max_length=512)
+    session_id: StrictStr = Field(max_length=MAX_SESSION_ID_BYTES)
     terminal_disposition: AgentSnapshotTerminalDisposition
     runtime_evidence_fingerprint: StrictStr
     eval_result_revision: StrictStr
@@ -2587,7 +2588,7 @@ class AgentSnapshotResultBinding(_SnapshotModel):
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, value: str, info) -> str:
-        return _clean(value, info.field_name)
+        return _clean(value, info.field_name, max_chars=MAX_SESSION_ID_BYTES)
 
     @field_validator("recorded_at")
     @classmethod

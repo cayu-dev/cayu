@@ -22,7 +22,7 @@ from cayu.messages import Message
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.execution import _ExecutionOwner
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.storage.retention import (
     RetentionAuditState,
@@ -88,8 +88,10 @@ async def create_retention_session(
     parent: str | None = None,
     status: SessionStatus = SessionStatus.COMPLETED,
     deliver: bool = True,
+    event_prefix: str | None = None,
 ) -> None:
     store = harness.store
+    event_prefix = session_id if event_prefix is None else event_prefix
     await store.create(
         RunRequest(
             agent_name="retention", messages=[], session_id=session_id, parent_session_id=parent
@@ -109,7 +111,7 @@ async def create_retention_session(
         await store.append_event(
             session_id,
             Event(
-                id=f"{session_id}-delta-{index}",
+                id=f"{event_prefix}-delta-{index}",
                 session_id=session_id,
                 type=event_type,
                 payload={"delta": "partial text"},
@@ -118,7 +120,7 @@ async def create_retention_session(
     await store.append_event(
         session_id,
         Event(
-            id=f"{session_id}-tool",
+            id=f"{event_prefix}-tool",
             session_id=session_id,
             type=EventType.TOOL_CALL_COMPLETED,
             tool_name="read_file",
@@ -136,14 +138,16 @@ async def create_retention_session(
     await store.append_event(
         session_id,
         Event(
-            id=f"{session_id}-model",
+            id=f"{event_prefix}-model",
             session_id=session_id,
             type=EventType.MODEL_COMPLETED,
             payload={"usage": {"input_tokens": 11, "output_tokens": 7}},
         ),
     )
     if status is SessionStatus.COMPLETED:
-        await complete_retention_session(harness, session_id, deliver=deliver)
+        await complete_retention_session(
+            harness, session_id, deliver=deliver, event_prefix=event_prefix
+        )
         return
     if status is not SessionStatus.PENDING:
         await store.update_status(session_id, status)
@@ -152,13 +156,18 @@ async def create_retention_session(
 
 
 async def complete_retention_session(
-    harness: RetentionHarness, session_id: str, *, deliver: bool = True
+    harness: RetentionHarness,
+    session_id: str,
+    *,
+    deliver: bool = True,
+    event_prefix: str | None = None,
 ) -> None:
+    event_prefix = session_id if event_prefix is None else event_prefix
     await harness.store.update_status(session_id, SessionStatus.COMPLETED)
     await harness.store.append_event(
         session_id,
         Event(
-            id=f"{session_id}-completed",
+            id=f"{event_prefix}-completed",
             session_id=session_id,
             type=EventType.SESSION_COMPLETED,
             payload={},
@@ -482,17 +491,23 @@ async def assert_snapshot_pin_protects(harness: RetentionHarness) -> None:
     assert item_ids(report) == ["captured"]
 
 
-async def assert_eval_reference_protects(harness: RetentionHarness) -> None:
-    await create_retention_session(harness, "evaluated")
+async def assert_eval_reference_protects(
+    harness: RetentionHarness, session_id: str = "evaluated"
+) -> None:
+    await create_retention_session(harness, session_id, event_prefix="evaluated")
     await harness.age()
-    document = json.dumps({"cases": [{"trials": [{"session_id": "evaluated"}]}]})
+    document = json.dumps({"cases": [{"trials": [{"session_id": session_id}]}]})
     await harness.sql(
         "INSERT INTO cayu_eval_run_trial_checkpoints (run_id, case_id, trial_number, "
         "checkpoint_json, document_bytes) VALUES ('run-1', 'case-1', 1, ?, ?)",
         (document, len(document.encode())),
         foreign_keys=False,
     )
-    await assert_protected(harness, "evaluated", RetentionProtection.EVAL_REFERENCE)
+    await assert_protected(harness, session_id, RetentionProtection.EVAL_REFERENCE)
+
+
+async def assert_eval_reference_protects_longest_session_id(harness: RetentionHarness) -> None:
+    await assert_eval_reference_protects(harness, "e" * MAX_SESSION_ID_BYTES)
 
 
 async def assert_knowledge_evidence_protects(harness: RetentionHarness) -> None:
@@ -731,6 +746,7 @@ SCENARIOS: tuple[Callable[[RetentionHarness], Awaitable[None]], ...] = (
     assert_checkpoint_dependency_protects,
     assert_snapshot_pin_protects,
     assert_eval_reference_protects,
+    assert_eval_reference_protects_longest_session_id,
     assert_same_size_eval_reference_update_protects,
     assert_knowledge_evidence_protects,
     assert_product_operation_protects,

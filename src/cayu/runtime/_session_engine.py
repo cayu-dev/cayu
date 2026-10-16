@@ -4419,6 +4419,13 @@ class SessionEngine:
                 candidate_execution_profile = ordinary_resume_profile(
                     request.max_steps, registered_provider
                 )
+            self._session_preparation._require_targeted_tool_delivery_capacity(
+                prepared_targeted_tool_grants,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                model=candidate_model,
+                model_failover=model_failover,
+            )
             built_in_model_target_transition = False
             if target_changed:
                 try:

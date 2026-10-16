@@ -34,6 +34,8 @@ MAX_DURABLE_JSON_INTEGER = 2**63 - 1
 # though Cayu's durable stores can retain the wider signed-64-bit domain.
 MAX_PORTABLE_JSON_INTEGER = 2**53 - 1
 MAX_DURABLE_JSON_NESTING = 64
+# Session ids are admitted up to this many UTF-8 bytes; records that copy one use it.
+MAX_SESSION_ID_BYTES = 2048
 
 
 @dataclass(frozen=True, slots=True)

@@ -546,6 +546,7 @@ def resolve_execution_profile_identity(
             registered_agent.tool_discovery_mode,
             provider=registered_provider.provider,
             model=model,
+            catalogue=registered_agent.tool_catalogue,
         )
     )
     targeted_tool_delivery_material = (

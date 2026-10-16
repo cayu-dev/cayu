@@ -11,6 +11,13 @@ from cayu._validation import require_clean_nonblank
 from cayu.egress.destinations import normalize_egress_hostname
 from cayu.proxies import ProxyAuthorizationResult
 
+# Per-policy bounds of the durable egress authority (cayu.egress.authority).
+# Built-in policies check them at construction so an oversized allowlist fails
+# when it is configured, not later when the authority is built from it.
+EGRESS_AUTHORITY_MAX_OPERATIONS = 512
+EGRESS_AUTHORITY_MAX_DESTINATIONS = 1024
+EGRESS_AUTHORITY_MAX_DENIED_PREFIXES = 1024
+
 
 class EgressRequest(BaseModel):
     """The policy's view of one captured outbound request.
@@ -95,6 +102,13 @@ class HttpEgressPolicy(EgressPolicy):
         self.allowed_hosts = _normalize_hosts(allowed_hosts)
         self.allowed_endpoints = _normalize_endpoints(allowed_endpoints)
         self.denied_prefixes = _normalize_prefixes(denied_prefixes)
+        _require_authority_policy_size(
+            self,
+            operations=sum(
+                not any(_path_matches_prefix(path, prefix) for prefix in self.denied_prefixes)
+                for _, path in self.allowed_endpoints
+            ),
+        )
 
     def authorize(self, request: EgressRequest) -> ProxyAuthorizationResult:
         if request.host not in self.allowed_hosts:
@@ -156,6 +170,14 @@ class BrowserEgressPolicy(EgressPolicy):
             policy_name="BrowserEgressPolicy",
             allow_empty=True,
         )
+        _require_authority_policy_size(
+            self,
+            operations=2
+            * sum(
+                not any(_path_matches_prefix(path, denied) for denied in self.denied_prefixes)
+                for path in self.allowed_path_prefixes
+            ),
+        )
 
     def authorize(self, request: EgressRequest) -> ProxyAuthorizationResult:
         if request.host not in self.allowed_hosts:
@@ -197,6 +219,31 @@ class BrowserEgressPolicy(EgressPolicy):
                 policy=self.name,
             )
         return ProxyAuthorizationResult(allowed=True, metadata={"policy": self.name})
+
+
+def _require_authority_policy_size(
+    policy: HttpEgressPolicy | BrowserEgressPolicy,
+    *,
+    operations: int,
+) -> None:
+    """Reject a policy whose egress authority projection would exceed its bounds."""
+
+    kind = type(policy).__name__
+    if operations > EGRESS_AUTHORITY_MAX_OPERATIONS:
+        raise ValueError(
+            f"{kind} {policy.name!r} allows {operations} operations; a policy may "
+            f"allow at most {EGRESS_AUTHORITY_MAX_OPERATIONS} operations."
+        )
+    if len(policy.allowed_hosts) > EGRESS_AUTHORITY_MAX_DESTINATIONS:
+        raise ValueError(
+            f"{kind} {policy.name!r} has {len(policy.allowed_hosts)} allowed hosts; a "
+            f"policy may have at most {EGRESS_AUTHORITY_MAX_DESTINATIONS} allowed hosts."
+        )
+    if len(policy.denied_prefixes) > EGRESS_AUTHORITY_MAX_DENIED_PREFIXES:
+        raise ValueError(
+            f"{kind} {policy.name!r} has {len(policy.denied_prefixes)} denied prefixes; a "
+            f"policy may have at most {EGRESS_AUTHORITY_MAX_DENIED_PREFIXES} denied prefixes."
+        )
 
 
 def _normalize_hosts(

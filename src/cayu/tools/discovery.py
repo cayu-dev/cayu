@@ -35,7 +35,10 @@ from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.providers.base import (
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES,
+    TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES,
     ModelProvider,
+    _tool_discovery_projection_bytes,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.base import (
@@ -134,13 +137,22 @@ def resolve_tool_discovery_projection(
     *,
     provider: ModelProvider,
     model: str,
+    catalogue: ToolCatalogSnapshot,
 ) -> ToolDiscoveryProjectionKind | None:
-    """Resolve one explicit discovery policy without model-name inference."""
+    """Resolve one explicit discovery policy without model-name inference.
+
+    Hosted Tool Search sends every candidate on each request, so it is selected
+    only when the agent's whole catalogue fits the projection bounds. Otherwise
+    the hosted-or-portable mode resolves to ``search_tools`` and the required
+    hosted mode fails before dispatch.
+    """
 
     if mode is None:
         return None
     mode = copy_tool_discovery_mode(mode)
     model = require_durable_clean_nonblank(model, "model")
+    if type(catalogue) is not ToolCatalogSnapshot:
+        raise TypeError("catalogue must be a ToolCatalogSnapshot.")
     if mode is ToolDiscoveryMode.SEARCH_TOOLS:
         return ToolDiscoveryProjectionKind.SEARCH_TOOLS
     hosted = mode in {
@@ -151,12 +163,18 @@ def resolve_tool_discovery_projection(
     supported = provider.supports_tool_discovery_projection(model=model, protocol=protocol)
     if type(supported) is not bool:
         raise TypeError("Provider tool-discovery capability checks must return a bool.")
-    if supported:
-        return (
-            ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED
-            if hosted
-            else ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+    if supported and hosted:
+        oversize = _hosted_tool_discovery_projection_oversize(catalogue)
+        if oversize is None:
+            return ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED
+        if mode is ToolDiscoveryMode.OPENAI_TOOL_SEARCH_HOSTED_OR_SEARCH_TOOLS:
+            return ToolDiscoveryProjectionKind.SEARCH_TOOLS
+        raise ValueError(
+            f"{oversize}; use openai_tool_search_hosted_or_search_tools or search_tools "
+            "for this catalogue."
         )
+    if supported:
+        return ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
     if mode in {
         ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS,
         ToolDiscoveryMode.OPENAI_TOOL_SEARCH_HOSTED_OR_SEARCH_TOOLS,
@@ -164,6 +182,28 @@ def resolve_tool_discovery_projection(
         return ToolDiscoveryProjectionKind.SEARCH_TOOLS
     provider.preflight_tool_discovery_projection(model=model, protocol=protocol)
     raise RuntimeError("Provider tool-discovery preflight returned without establishing support.")
+
+
+def _hosted_tool_discovery_projection_oversize(catalogue: ToolCatalogSnapshot) -> str | None:
+    """Return why the whole catalogue cannot be a hosted projection, if it cannot."""
+
+    total_bytes = 0
+    for descriptor in catalogue.descriptors:
+        definition = _tool_discovery_definition_for_descriptor(descriptor)
+        schema_bytes = _tool_discovery_projection_bytes(definition["input_schema"])
+        if schema_bytes > TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES:
+            return (
+                f"OpenAI hosted Tool Search candidate projection would include a "
+                f"{schema_bytes}-byte input schema, over the per-schema size limit of "
+                f"{TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES} bytes"
+            )
+        total_bytes += _tool_discovery_projection_bytes(definition)
+    if total_bytes > TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES:
+        return (
+            f"OpenAI hosted Tool Search candidate projection would be {total_bytes} bytes, "
+            f"over the aggregate size limit of {TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES} bytes"
+        )
+    return None
 
 
 def search_tools_spec() -> dict[str, Any]:

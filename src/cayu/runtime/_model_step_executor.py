@@ -2618,6 +2618,7 @@ class ModelStepRun:
             self._registered_agent.tool_discovery_mode,
             provider=self._request_provider,
             model=self._request_model,
+            catalogue=self._registered_agent.tool_catalogue,
         )
         if (
             self._targeted_tool_grants is not None

@@ -21,7 +21,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, MAX_SESSION_ID_BYTES
 from cayu.events import Event, EventType
 from cayu.tools.web_access import WebAccessEvidence
 
@@ -58,7 +58,7 @@ class OperationOutcomeEvidence(BaseModel):
     """Content-free reference to one observation in the original event stream."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-    session_id: str | None = Field(default=None, max_length=1024)
+    session_id: str | None = Field(default=None, max_length=MAX_SESSION_ID_BYTES)
     event_id: str = Field(max_length=1024)
     tool_call_id: str | None = Field(default=None, max_length=1024)
     execution_id: str | None = Field(default=None, max_length=1024)

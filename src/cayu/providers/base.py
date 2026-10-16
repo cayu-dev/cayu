@@ -108,8 +108,9 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
 OPENAI_ADDITIONAL_TOOLS_PROTOCOL = "openai.additional_tools.v1"
 OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL = "openai.tool_search.client.v1"
 OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL = "openai.tool_search.hosted.v1"
-# Matches TOOL_CATALOGUE_MAX_TOOLS: every catalogue entry can be projected. The
-# per-schema and total byte bounds below are what limit a request's size.
+# Matches TOOL_CATALOGUE_MAX_TOOLS. The per-schema and total byte bounds below
+# limit a request's size; a catalogue that exceeds them resolves to portable
+# search_tools (or is rejected before dispatch when hosted search is required).
 TOOL_DISCOVERY_PROJECTION_MAX_TOOLS = 10_000
 TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES = 64 * 1024
 TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES = 1024 * 1024
@@ -721,6 +722,19 @@ class TargetedToolProjectionRequest(BaseModel):
         return self
 
 
+def _tool_discovery_projection_bytes(value: Mapping[str, Any]) -> int:
+    """Return the size a discovery projection bound measures for one JSON object."""
+
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
 class ToolDiscoveryProjectionRequest(BaseModel):
     """Provider-native projection of Cayu's durable discovery protocol."""
 
@@ -791,27 +805,15 @@ class ToolDiscoveryProjectionRequest(BaseModel):
                 names.append(require_clean_nonblank(name, f"{field_name} tool name"))
                 if type(input_schema) is not dict:
                     raise ValueError(f"{field_name} input_schema must be an object.")
-                schema_bytes = len(
-                    json.dumps(
-                        input_schema,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-                if schema_bytes > TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES:
+                if (
+                    _tool_discovery_projection_bytes(input_schema)
+                    > TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES
+                ):
                     raise ValueError(
                         f"{field_name} contains a schema larger than "
                         f"{TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES} bytes."
                     )
-                total_bytes += len(
-                    json.dumps(
-                        tool,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
+                total_bytes += _tool_discovery_projection_bytes(tool)
             if names != sorted(names) or len(names) != len(set(names)):
                 raise ValueError(f"{field_name} must have unique canonical names.")
             if total_bytes > TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES:

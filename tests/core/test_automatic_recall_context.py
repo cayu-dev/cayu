@@ -89,6 +89,7 @@ from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     TRANSCRIPT_LEXICAL_CHANNEL,
+    RecallEngineConfig,
 )
 from cayu.memory.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
@@ -1106,6 +1107,30 @@ def test_memory_delta_rejects_a_non_injecting_admission_mode() -> None:
                 TRANSCRIPT_LEXICAL_CHANNEL,
             ),
             delta_policy=MemoryDeltaPolicy(),
+        )
+
+
+@pytest.mark.parametrize("reanchor", [False, True])
+def test_memory_delta_rejects_item_counts_its_receipt_cannot_hold(reanchor: bool) -> None:
+    # 40 + 20 fits one receipt, but deltas inject up to 50 alongside the 20 offered.
+    admission = _admission().model_copy(
+        update={
+            "max_evaluated_candidates": 100,
+            "max_injected_items": 40,
+            "max_offered_items": 20,
+        }
+    )
+    fusion = _fusion(
+        KNOWLEDGE_LEXICAL_CHANNEL,
+        KNOWLEDGE_SEMANTIC_CHANNEL,
+        TRANSCRIPT_LEXICAL_CHANNEL,
+    )
+    AutomaticRecallContextPolicy(admission_policy=admission, fusion_config=fusion)
+    with pytest.raises(ValueError, match="Memory deltas inject up to"):
+        AutomaticRecallContextPolicy(
+            admission_policy=admission,
+            fusion_config=fusion,
+            delta_policy=MemoryDeltaPolicy(reanchor_on_projection_loss=reanchor),
         )
 
 
@@ -3319,6 +3344,118 @@ def test_excluded_source_limits_do_not_constrain_enabled_channels() -> None:
             transcript_candidate_limit=5,
         ),
     )
+
+
+def test_projection_bound_follows_a_raised_admission_budget() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        for index in range(5):
+            await knowledge.create_entry(
+                KnowledgeEntry(
+                    id=f"atlas-volume-{index}",
+                    namespace="project:cayu",
+                    text=f"Atlas release volume {index}. " + "Atlas release notes. " * 5_000,
+                )
+            )
+        admission = _admission().model_copy(
+            update={
+                "max_injected_items": 8,
+                "max_candidate_text_bytes": 128_000,
+                "max_focus_bytes": 400_000,
+                "max_total_bytes": 400_000,
+            }
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=admission,
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(
+                knowledge_namespace="project:cayu",
+                knowledge_max_bytes=600_000,
+                knowledge_max_record_bytes=128_000,
+            ),
+            engine_config=RecallEngineConfig(
+                max_source_result_bytes=600_000,
+                max_result_bytes=600_000,
+            ),
+        )
+        assert policy.max_projection_bytes >= admission.max_total_bytes
+
+        result = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+
+        assert len(_manifest(result).encode("utf-8")) > 128_000
+
+    asyncio.run(run())
+
+
+def test_admission_budget_counts_escaped_markup_as_rendered() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        for index in range(5):
+            await knowledge.create_entry(
+                KnowledgeEntry(
+                    id=f"atlas-markup-{index}",
+                    namespace="project:cayu",
+                    text=f"Atlas release volume {index}. " + "Atlas <release> & notes. " * 4_000,
+                )
+            )
+        admission = _admission().model_copy(
+            update={
+                "max_injected_items": 8,
+                "max_candidate_text_bytes": 128_000,
+                "max_focus_bytes": 400_000,
+                "max_total_bytes": 400_000,
+            }
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=admission,
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(
+                knowledge_namespace="project:cayu",
+                knowledge_max_bytes=600_000,
+                knowledge_max_record_bytes=128_000,
+            ),
+            engine_config=RecallEngineConfig(
+                max_source_result_bytes=600_000,
+                max_result_bytes=600_000,
+            ),
+        )
+
+        # Rendering escapes each &, < and > as six bytes; admission counts them
+        # that way, so the recall renders within the derived projection bound.
+        result = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+
+        rendered = len(_manifest(result).encode("utf-8"))
+        assert 128_000 < rendered <= policy.max_projection_bytes
+
+    asyncio.run(run())
+
+
+def test_explicit_projection_bound_must_fit_the_admission_budget() -> None:
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            max_projection_bytes=_admission().max_total_bytes - 1,
+        )
 
 
 def test_frozen_automatic_recall_projection_is_secret_redacted_before_checkpoint() -> None:

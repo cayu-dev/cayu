@@ -82,12 +82,16 @@ from cayu.tools.exposure import (
     ToolCapabilityCeiling,
     resolve_tool_capability_ceiling,
 )
+from cayu.tools.gateway import require_targeted_tool_gateway_capacity
 from cayu.tools.grants import (
     PreparedTargetedToolGrant,
     TargetedToolGrant,
     prepare_targeted_tool_grants,
 )
-from cayu.tools.targeted_projection import resolve_targeted_tool_projection
+from cayu.tools.targeted_projection import (
+    TargetedToolProjectionKind,
+    resolve_targeted_tool_projection,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -312,6 +316,45 @@ class SessionPreparation:
             catalogue=registered_agent.tool_catalogue,
             capability_ceiling=capability_ceiling,
         )
+
+    def _require_targeted_tool_delivery_capacity(
+        self,
+        prepared: tuple[PreparedTargetedToolGrant, ...],
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        model: str,
+        model_failover: execution_profile_admission.ModelFailoverProfileResolution | None,
+    ) -> None:
+        """Size grants for call_tool when any target this run can use delivers through it."""
+
+        if not prepared:
+            return
+        targets = (
+            ((registered_provider, model),)
+            if model_failover is None
+            else tuple(
+                zip(
+                    model_failover.registered_providers,
+                    (candidate.model for candidate in model_failover.plan.candidates),
+                    strict=True,
+                )
+            )
+        )
+        if any(
+            resolve_targeted_tool_projection(
+                registered_agent.targeted_tool_mode,
+                provider=candidate_provider.provider,
+                model=candidate_model,
+            )
+            is TargetedToolProjectionKind.CALL_TOOL
+            for candidate_provider, candidate_model in targets
+        ):
+            require_targeted_tool_gateway_capacity(
+                prepared,
+                catalogue=registered_agent.tool_catalogue,
+                redactor=self._secret_redactor,
+            )
 
     async def prepare_initial_run(
         self,
@@ -586,6 +629,13 @@ class SessionPreparation:
                 redactor=self._secret_redactor,
             )
             execution_profile = model_failover.profile
+        self._require_targeted_tool_delivery_capacity(
+            targeted_tool_grants,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            model=model,
+            model_failover=model_failover,
+        )
         unavailable_profile_components = unavailable_execution_profile_components(execution_profile)
         if unavailable_profile_components:
             names = ", ".join(component.value for component in unavailable_profile_components)

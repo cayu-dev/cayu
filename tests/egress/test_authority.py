@@ -334,3 +334,62 @@ def test_factory_commits_secret_ref_identity_without_publishing_it() -> None:
     assert first_authority.fingerprint != second_authority.fingerprint
     assert "provider-test-secret" not in first_authority.model_dump_json()
     assert "sk_test_material" not in first_authority.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("build_policy", "message"),
+    (
+        (
+            lambda: HttpEgressPolicy(
+                name="too-many-operations",
+                allowed_hosts=("api.example.com",),
+                allowed_endpoints=tuple(("GET", f"/operation-{index}") for index in range(513)),
+            ),
+            "at most 512 operations",
+        ),
+        (
+            lambda: HttpEgressPolicy(
+                name="too-many-hosts",
+                allowed_hosts=tuple(f"host-{index}.example.com" for index in range(1025)),
+                allowed_endpoints=(("GET", "/"),),
+            ),
+            "at most 1024 allowed hosts",
+        ),
+        (
+            lambda: HttpEgressPolicy(
+                name="too-many-denied-prefixes",
+                allowed_hosts=("api.example.com",),
+                allowed_endpoints=(("GET", "/"),),
+                denied_prefixes=tuple(f"/denied-{index}" for index in range(1025)),
+            ),
+            "at most 1024 denied prefixes",
+        ),
+        (
+            lambda: BrowserEgressPolicy(
+                name="too-many-browser-operations",
+                allowed_hosts=("browser.example.com",),
+                allowed_path_prefixes=tuple(f"/prefix-{index}" for index in range(257)),
+            ),
+            "at most 512 operations",
+        ),
+    ),
+)
+def test_policy_rejects_authority_size_limits_at_construction(build_policy, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_policy()
+
+
+def test_policy_operation_limit_does_not_count_denied_endpoints() -> None:
+    policy = HttpEgressPolicy(
+        name="denied-endpoints",
+        allowed_hosts=("api.example.com",),
+        allowed_endpoints=(
+            *(("GET", f"/operation-{index}") for index in range(512)),
+            ("GET", "/denied/item"),
+        ),
+        denied_prefixes=("/denied",),
+    )
+
+    authority = _bounded_authority_from_policies({policy.name: policy})
+
+    assert len(authority.policies[0].operations) == 512

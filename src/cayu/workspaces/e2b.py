@@ -6,6 +6,7 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_positive_finite_seconds
 from cayu.runners import DEFAULT_E2B_CWD, E2BWorkspaceCapability, Runner
+from cayu.tools.files import MAX_READ_LIMIT_BYTES
 from cayu.workspaces._guest_guard import (
     guard_create,
     guard_delete,
@@ -32,7 +33,7 @@ from cayu.workspaces.base import (
     validate_list_pattern,
 )
 
-DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
+DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES = MAX_READ_LIMIT_BYTES
 DEFAULT_E2B_WORKSPACE_LIST_LIMIT = 500
 DEFAULT_E2B_WORKSPACE_LIST_DEPTH = 64
 

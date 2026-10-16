@@ -31,8 +31,10 @@ is conditional on the existing execution admission checks. Ambiguous recovery
 gates are unavailable for execution and explicitly identify blocked recovery.
 No view promises that a gating call is the only call that can proceed.
 
-Display fields are untrusted text, limited to 32 fields, 4,096 characters per
-field, and 16 KiB before escaping. The response declares `html_escaped_text`:
+Display fields are untrusted text, limited to 32 fields, 128 characters per
+label and 4,096 characters per field after HTML escaping, and 16 KiB of UTF-8
+before escaping. A disclosure whose field outgrows its limit when escaped is
+rejected when constructed. The response declares `html_escaped_text`:
 render these fields as escaped text, never as Markdown, a template, a command,
 or trusted operator instructions. Escape application-added labels and other UI
 content too. Oversized or invalid projections yield typed unavailable outcomes;

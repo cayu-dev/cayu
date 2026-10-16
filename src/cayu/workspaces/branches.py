@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import require_durable_clean_nonblank
+from cayu._validation import MAX_SESSION_ID_BYTES, require_durable_clean_nonblank
 from cayu.workspaces.base import Workspace
 from cayu.workspaces.revisions import (
     WorkspaceIdentity,
@@ -319,7 +319,7 @@ class WorkspaceBranchAuthority(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    session_id: str = Field(max_length=512)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     expected_run_epoch: StrictInt = Field(ge=0)
     environment_name: str = Field(max_length=256)
     binding_generation: str = Field(max_length=512)
@@ -685,7 +685,7 @@ class WorkspaceBranchRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     branch_id: str = Field(max_length=256)
-    session_id: str = Field(max_length=512)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     expected_run_epoch: StrictInt = Field(ge=0)
     binding_generation: str = Field(max_length=512)
     binding_identity: str = Field(max_length=512)

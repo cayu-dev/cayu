@@ -342,15 +342,18 @@ def test_receipt_message_across_the_limit_never_leaks_a_secret_prefix():
     # A message cut before redaction would keep a prefix of a registered secret
     # that redaction can no longer recognize. Oversized messages are rejected;
     # at the limit the whole secret is still present and redacted.
+    from cayu.runtime.tool_effects import TOOL_EFFECT_RECEIPT_MAX_BYTES
+
     secret = "credential-CANARY-0123456789abcdef"
-    oversized = "x" * 4060 + secret + " trailing detail"
+    oversized = "x" * (TOOL_EFFECT_RECEIPT_MAX_BYTES - 36) + secret + " trailing detail"
     with pytest.raises(ValueError, match="message"):
         _receipt_with_message(oversized)
 
     async def scenario():
         callback = _Echo()
         registered, record, request, _ = await _setup(callback)
-        at_limit = "x" * (4096 - len(secret)) + secret
+        # The rest of the receipt shares the envelope, so leave it a little room.
+        at_limit = "x" * (TOOL_EFFECT_RECEIPT_MAX_BYTES - 4096 - len(secret)) + secret
         request = request.model_copy(
             update={"receipt": request.receipt.model_copy(update={"message": at_limit})}
         )

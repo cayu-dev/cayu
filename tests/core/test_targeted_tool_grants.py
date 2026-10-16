@@ -3690,6 +3690,222 @@ def test_enabled_gateway_is_stable_without_an_active_grant(targeted_store) -> No
     asyncio.run(run())
 
 
+def _large_description_tool(name: str, description_bytes: int) -> Tool:
+    class _LargeDescriptionTool(_GatewayOtherTool):
+        spec = _GatewayOtherTool.spec.model_copy(
+            update={"name": name, "description": "d" * description_bytes}
+        )
+
+    return _LargeDescriptionTool()
+
+
+def test_call_tool_context_size_is_enforced_when_grants_are_admitted() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore(public_authority_alias_codec=_codec())
+        provider = _Provider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="call_tool",
+            tools=(
+                _large_description_tool("first_large", 300 * 1024),
+                _large_description_tool("second_large", 300 * 1024),
+            ),
+        )
+
+        def request(session_id: str, *tool_ids: str) -> RunRequest:
+            return RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "Use the granted tools.")],
+                tool_grants=tuple(
+                    TargetedToolGrant(request_id=tool_id, tool_id=tool_id) for tool_id in tool_ids
+                ),
+            )
+
+        with pytest.raises(ValueError, match=r"too large .* request_id 'cayu:second_large'"):
+            async for _event in app.run(
+                request("oversized-gateway", "cayu:first_large", "cayu:second_large")
+            ):
+                pass
+        assert provider.requests == []
+        assert await store.load("oversized-gateway") is None
+
+        events = [event async for event in app.run(request("fitting-gateway", "cayu:first_large"))]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
+
+        # A resumed interaction's grant batch is checked the same way.
+        with pytest.raises(ValueError, match=r"too large .* request_id 'cayu:second_large'"):
+            async for _event in app.resume(
+                ResumeRequest(
+                    session_id="fitting-gateway",
+                    messages=[Message.text("user", "Use both granted tools.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="cayu:first_large", tool_id="cayu:first_large"
+                        ),
+                        TargetedToolGrant(
+                            request_id="cayu:second_large", tool_id="cayu:second_large"
+                        ),
+                    ),
+                )
+            ):
+                pass
+        assert len(provider.requests) == 1
+
+    asyncio.run(run())
+
+
+def test_call_tool_context_size_is_measured_after_redaction_at_admission() -> None:
+    from cayu.vaults import SecretRedactor
+
+    async def run() -> None:
+        store = InMemorySessionStore(public_authority_alias_codec=_codec())
+        provider = _Provider()
+        # A 2-byte secret becomes a 17-byte marker, so a 100 KiB description
+        # renders at about 850 KiB, over the 512 KiB call_tool context.
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            secret_redactor=SecretRedactor("zq"),
+        )
+        app.register_provider(provider, default=True)
+
+        class _SecretHeavyTool(_GatewayOtherTool):
+            spec = _GatewayOtherTool.spec.model_copy(
+                update={"name": "secret_heavy", "description": "zq" * (50 * 1024)}
+            )
+
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="call_tool",
+            tools=(_SecretHeavyTool(),),
+        )
+        with pytest.raises(ValueError, match=r"too large .* request_id 'cayu:secret_heavy'"):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="redacted-gateway",
+                    messages=[Message.text("user", "Use the granted tool.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="cayu:secret_heavy", tool_id="cayu:secret_heavy"
+                        ),
+                    ),
+                )
+            ):
+                pass
+        assert provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_call_tool_context_size_is_measured_before_redaction_at_admission() -> None:
+    from cayu.vaults import SecretRedactor
+
+    async def run() -> None:
+        store = InMemorySessionStore(public_authority_alias_codec=_codec())
+        provider = _Provider()
+        # A 64-byte secret becomes a 17-byte marker, so the redacted context
+        # fits, but each step still checks the 600 KiB stored projection.
+        secret = "s" * 64
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            secret_redactor=SecretRedactor(secret),
+        )
+        app.register_provider(provider, default=True)
+
+        class _SecretHeavyTool(_GatewayOtherTool):
+            spec = _GatewayOtherTool.spec.model_copy(
+                update={"name": "secret_heavy", "description": secret * (600 * 16)}
+            )
+
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="call_tool",
+            tools=(_SecretHeavyTool(),),
+        )
+        with pytest.raises(ValueError, match=r"too large .* request_id 'cayu:secret_heavy'"):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="redacted-gateway",
+                    messages=[Message.text("user", "Use the granted tool.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="cayu:secret_heavy", tool_id="cayu:secret_heavy"
+                        ),
+                    ),
+                )
+            ):
+                pass
+        assert provider.requests == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("call_tool_fallback", [False, True])
+def test_call_tool_context_limit_applies_only_to_targets_that_deliver_through_call_tool(
+    call_tool_fallback: bool,
+) -> None:
+    from cayu.sessions import ModelFailoverPolicy, ModelTarget
+
+    async def run() -> None:
+        transport = _FinalOpenAITransport()
+        native = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        fallback = _Provider()
+        app = CayuApp(
+            session_store=InMemorySessionStore(public_authority_alias_codec=_codec()),
+            enable_logging=False,
+        )
+        app.register_provider(native, default=True)
+        app.register_provider(fallback)
+
+        # 600 KiB fits native delivery but not the 512 KiB call_tool context.
+        class _LargeTool(_GatewayOtherTool):
+            spec = _GatewayOtherTool.spec.model_copy(
+                update={"name": "large", "description": "d" * (600 * 1024)}
+            )
+
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools_or_call_tool",
+            tools=(_LargeTool(),),
+            tool_exposure_policy=StaticToolExposurePolicy(profile_id="targeted-only", tools=()),
+        )
+        request = RunRequest(
+            agent_name="assistant",
+            session_id="large-native-grant",
+            messages=[Message.text("user", "Use the granted tool.")],
+            tool_grants=(TargetedToolGrant(request_id="cayu:large", tool_id="cayu:large"),),
+            failover=(
+                ModelFailoverPolicy(
+                    fallbacks=(ModelTarget(provider_name=fallback.name, model="fake-model"),)
+                )
+                if call_tool_fallback
+                else None
+            ),
+        )
+        if call_tool_fallback:
+            with pytest.raises(ValueError, match=r"too large .* request_id 'cayu:large'"):
+                async for _event in app.run(request):
+                    pass
+            assert transport.calls == []
+            return
+        events = [event async for event in app.run(request)]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(transport.calls) == 1
+
+    asyncio.run(run())
+
+
 def test_openai_native_mode_keeps_only_the_inert_cache_anchor_without_an_active_grant(
     targeted_store,
 ) -> None:

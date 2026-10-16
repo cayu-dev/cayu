@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -9,6 +10,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.environments.admission import ExecutionRequirements, ExecutionToolRequirement
 from cayu.environments.factory import EnvironmentFactoryRequest
+from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.tools.base import (
     Tool,
     ToolEffect,
@@ -18,6 +20,10 @@ from cayu.tools.base import (
     ToolSpec,
 )
 from cayu.tools.catalogue import ToolDescriptor
+from cayu.tools.exposure import (
+    ToolCapabilityCeiling,
+    session_metadata_with_tool_capability_ceiling,
+)
 
 
 def _search_requirement() -> ToolExecutionRequirement:
@@ -115,6 +121,30 @@ def test_requirement_iterables_stop_at_the_bound() -> None:
     with pytest.raises(ValueError, match="more than 32"):
         ToolSpec(name="search", execution_requirements=requirements())
     assert consumed == 33
+
+
+def test_effective_requirements_admit_every_requirement_of_a_large_tool_set() -> None:
+    tools = [
+        _RequirementTool(
+            ToolSpec(
+                name=f"search_{index:03d}",
+                effect=ToolEffect.NONE,
+                execution_requirements=(_search_requirement(),),
+            )
+        )
+        for index in range(100)
+    ]
+    app = CayuApp(enable_logging=False)
+    app.register_agent(AgentSpec(name="agent", model="fake"), tools=tools)
+    registered = app._agents["agent"]
+    metadata = session_metadata_with_tool_capability_ceiling(
+        {}, ToolCapabilityCeiling(tool_names=tuple(sorted(registered.tools)))
+    )
+
+    requirements = effective_execution_requirements(SimpleNamespace(metadata=metadata), registered)
+
+    assert len(requirements.tool_requirements) == 100
+    assert requirements.executable_names() == ("rg",)
 
 
 def test_duplicate_alternatives_and_requirement_names_are_rejected() -> None:

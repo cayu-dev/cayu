@@ -17,9 +17,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cayu.vaults import SecretRedactor
+
+# Per-field limits apply to the HTML-escaped display text; the aggregate applies
+# to the UTF-8 JSON of the selected fields before escaping.
+_FIELD_LABEL_MAX_CHARS = 128
+_FIELD_TEXT_MAX_CHARS = 4096
+_FIELDS_MAX_BYTES = 16 * 1024
 
 
 class _ReviewModel(BaseModel):
@@ -45,8 +51,8 @@ class HumanReviewReference(_ReviewModel):
 class HumanReviewField(_ReviewModel):
     """Untrusted plain text selected by the application policy."""
 
-    label: str = Field(min_length=1, max_length=128)
-    text: str = Field(min_length=1, max_length=4096, repr=False)
+    label: str = Field(min_length=1, max_length=_FIELD_LABEL_MAX_CHARS)
+    text: str = Field(min_length=1, max_length=_FIELD_TEXT_MAX_CHARS, repr=False)
 
 
 class HumanReviewDisclosure(_ReviewModel):
@@ -55,6 +61,18 @@ class HumanReviewDisclosure(_ReviewModel):
     sensitive_content: Literal["reject_unknown_scope", "application_attested"] = (
         "reject_unknown_scope"
     )
+
+    @model_validator(mode="after")
+    def bound_escaped_fields(self) -> HumanReviewDisclosure:
+        # The view returns escaped text under the same field bounds, so admit only
+        # fields that still fit after escaping instead of failing the view later.
+        if any(
+            len(html.escape(item.label)) > _FIELD_LABEL_MAX_CHARS
+            or len(html.escape(item.text)) > _FIELD_TEXT_MAX_CHARS
+            for item in self.fields
+        ):
+            raise ValueError("Human-review field exceeds its size limit after HTML escaping.")
+        return self
 
 
 class HumanReviewCall(_ReviewModel):
@@ -213,7 +231,7 @@ def build_review(
         elif not fields:
             status = "unavailable"
         raw = json.dumps([item.model_dump() for item in fields], ensure_ascii=True)
-        if len(raw.encode()) > 16384 or redactor.redact_text(raw) != raw:
+        if redactor.redact_text(raw) != raw:
             status, fields = "redacted", ()
         # Check original scalars too: JSON escapes must not hide registered secrets.
         if any(
@@ -222,6 +240,9 @@ def build_review(
             for value in (item.label, item.text)
         ):
             status, fields = "redacted", ()
+        size = json.dumps([item.model_dump() for item in fields], ensure_ascii=False)
+        if len(size.encode("utf-8")) > _FIELDS_MAX_BYTES:
+            status, fields = "unavailable", ()
         escaped = tuple(
             HumanReviewField(label=html.escape(item.label), text=html.escape(item.text))
             for item in fields

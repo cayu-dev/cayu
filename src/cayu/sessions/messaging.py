@@ -38,6 +38,7 @@ from cayu.approvals.tools import ResolutionActor, copy_resolution_actor, resolut
 from cayu.events import Event, copy_event
 from cayu.messages import Message, MessageRole, PeerContentPart, detach_message
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 
 
 class _MessageLifecycleModel(BaseModel):
@@ -71,7 +72,7 @@ class SessionMessageSource(_MessageLifecycleModel):
     authority; the application must independently authorize the source session.
     """
 
-    session_id: StrictStr = Field(min_length=1, max_length=512)
+    session_id: StrictStr = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     session_instance_id: StrictStr = Field(min_length=1, max_length=512)
     run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
@@ -193,7 +194,7 @@ def copy_session_message_cursor(value: SessionMessageCursor) -> SessionMessageCu
 class SessionMessageQuery(_MessageLifecycleModel):
     """Bounded delivery-priority inspection, including terminal and unreadable rows."""
 
-    session_id: StrictStr = Field(min_length=1, max_length=512)
+    session_id: StrictStr = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     cursor: SessionMessageCursor | None = None
     limit: StrictInt = Field(default=50, ge=1, le=100)
 
@@ -213,7 +214,7 @@ class SessionMessageQuery(_MessageLifecycleModel):
 class SessionMessageActionRequest(_MessageLifecycleModel):
     """Compare-and-set withdrawal/quarantine of an inspected queue record."""
 
-    session_id: StrictStr = Field(min_length=1, max_length=512)
+    session_id: StrictStr = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     session_instance_id: StrictStr = Field(min_length=1, max_length=512)
     queue_id: StrictStr = Field(min_length=1, max_length=512)
     idempotency_key: StrictStr = Field(min_length=1, max_length=256)
@@ -510,7 +511,7 @@ class SessionMessageInspection(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    session_id: StrictStr = Field(min_length=1, max_length=512)
+    session_id: StrictStr = Field(min_length=1, max_length=MAX_SESSION_ID_BYTES)
     session_instance_id: StrictStr = Field(min_length=1, max_length=512)
     records: tuple[SessionMessageInspectionRecord, ...] = Field(default=(), max_length=100)
     next_cursor: SessionMessageCursor | None = None

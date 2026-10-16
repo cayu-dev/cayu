@@ -339,6 +339,15 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
         chars_per_token: int = DEFAULT_TOOL_RESULT_ESTIMATE_CHARS_PER_TOKEN,
     ) -> None:
         resolved_max_inline_bytes = _optional_nonnegative_int(max_inline_bytes, "max_inline_bytes")
+        if (
+            resolved_max_inline_bytes is not None
+            and resolved_max_inline_bytes > MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+        ):
+            raise ValueError(
+                "max_inline_bytes must be less than or equal to "
+                f"{MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES}, the projected tool-result "
+                "content size ceiling."
+            )
         resolved_max_inline_token_estimate = _optional_nonnegative_int(
             max_inline_token_estimate, "max_inline_token_estimate"
         )
@@ -550,6 +559,10 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
         byte_count: int,
         token_estimate: int,
     ) -> bool:
+        # The token-estimate threshold alone does not bound UTF-8 bytes, so content above
+        # the projection ceiling is externalized even when it is under that threshold.
+        if byte_count > MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES:
+            return True
         return (self.max_inline_bytes is not None and byte_count > self.max_inline_bytes) or (
             self.max_inline_token_estimate is not None
             and token_estimate > self.max_inline_token_estimate

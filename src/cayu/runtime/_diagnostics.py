@@ -53,6 +53,11 @@ def runtime_owned_exception_renderings_are_credential_safe(
     The complete traceback rendering matters when an explicit cause is present:
     Python inserts fixed separator text between two otherwise safe exceptions,
     and that composition can reconstruct a registered secret.
+
+    This is only the secret check. Size is bounded where the text is built:
+    messages are cut to ``MAX_DIAGNOSTIC_UTF8_BYTES`` and groups to
+    ``MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES``. Renderings add type names, quoting
+    and group structure on top, so an oversized rendering is not a leak.
     """
 
     if not isinstance(error, BaseException):
@@ -60,11 +65,7 @@ def runtime_owned_exception_renderings_are_credential_safe(
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
     rendered = _runtime_owned_exception_renderings(error)
-    return rendered is not None and all(
-        len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
-        and redactor.redact_text(value) == value
-        for value in rendered
-    )
+    return rendered is not None and all(redactor.redact_text(value) == value for value in rendered)
 
 
 @dataclass(frozen=True, slots=True)

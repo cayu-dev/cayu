@@ -25,6 +25,7 @@ from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAutho
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
+    RECOVERY_PLAN_MAX_TASK_CLAIMS,
     RecoveryBlockerCode,
     RecoveryDecision,
     RecoveryExecutionRequest,
@@ -534,6 +535,108 @@ def test_recovery_plan_hands_off_exact_expired_attached_task_owner(
                 await session_store.close()
             if isinstance(task_store, SQLiteTaskStore):
                 await task_store.close()
+
+    asyncio.run(exercise())
+
+
+def _add_session_tasks(
+    task_store: InMemoryTaskStore,
+    template,
+    *,
+    count: int,
+    status: TaskStatus,
+    updated_at: datetime,
+) -> None:
+    # Seed the store directly so the test can hold more than one query page.
+    for index in range(count):
+        task = template.model_copy(
+            update={
+                "id": f"{status.value}-{index:04d}",
+                "status": status,
+                "updated_at": updated_at,
+                **(
+                    {}
+                    if status is TaskStatus.RUNNING
+                    else {"worker_id": None, "lease_expires_at": None}
+                ),
+            },
+            deep=True,
+        )
+        task_store._tasks[task.id] = task
+
+
+def test_recovery_plan_sees_an_active_task_behind_a_page_of_newer_terminal_tasks() -> None:
+    async def exercise() -> None:
+        now = datetime(2026, 9, 3, tzinfo=UTC)
+        session_store = InMemorySessionStore(ownership_clock=lambda: now)
+        task_store = InMemoryTaskStore(ownership_clock=lambda: now)
+        app = _app(session_store, task_store=task_store, clock=lambda: now)
+        await _create_running_task_session(
+            session_store,
+            task_store,
+            app,
+            session_id="sess_paged_task_plan",
+            task_id="live-task-plan",
+        )
+        live = await task_store.load_task("live-task-plan")
+        assert live is not None
+        _add_session_tasks(
+            task_store,
+            live,
+            count=1000,
+            status=TaskStatus.COMPLETED,
+            updated_at=live.updated_at + timedelta(seconds=1),
+        )
+
+        plan = await app.plan_recovery(
+            RecoveryPlanRequest(
+                selection=RecoveryPlanSelection(session_ids=("sess_paged_task_plan",))
+            )
+        )
+
+        item = plan.items[0]
+        assert [claim.ownership_status for claim in item.task_claims] == ["active"]
+        assert RecoveryBlockerCode.ACTIVE_TASK_CLAIM in {blocker.code for blocker in item.blockers}
+        assert item.allowed_actions == (RecoveryPlanAction.LEAVE_INTACT,)
+
+    asyncio.run(exercise())
+
+
+def test_recovery_plan_blocks_more_active_tasks_than_one_item_carries() -> None:
+    async def exercise() -> None:
+        now = datetime(2026, 9, 3, tzinfo=UTC)
+        session_store = InMemorySessionStore(ownership_clock=lambda: now)
+        task_store = InMemoryTaskStore(ownership_clock=lambda: now)
+        app = _app(session_store, task_store=task_store, clock=lambda: now)
+        await _create_running_task_session(
+            session_store,
+            task_store,
+            app,
+            session_id="sess_overflow_task_plan",
+            task_id="live-task-plan",
+        )
+        live = await task_store.load_task("live-task-plan")
+        assert live is not None
+        _add_session_tasks(
+            task_store,
+            live,
+            count=RECOVERY_PLAN_MAX_TASK_CLAIMS,
+            status=TaskStatus.PAUSED,
+            updated_at=live.updated_at,
+        )
+
+        plan = await app.plan_recovery(
+            RecoveryPlanRequest(
+                selection=RecoveryPlanSelection(session_ids=("sess_overflow_task_plan",))
+            )
+        )
+
+        item = plan.items[0]
+        assert len(item.task_claims) == RECOVERY_PLAN_MAX_TASK_CLAIMS
+        assert RecoveryBlockerCode.INVALID_DURABLE_STATE in {
+            blocker.code for blocker in item.blockers
+        }
+        assert item.allowed_actions == (RecoveryPlanAction.LEAVE_INTACT,)
 
     asyncio.run(exercise())
 

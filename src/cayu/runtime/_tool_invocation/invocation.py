@@ -336,6 +336,7 @@ class ToolInvocation:
                     registered_agent.tool_discovery_mode,
                     provider=invocation_context.registered_provider.provider,
                     model=invocation_context.binding.model,
+                    catalogue=registered_agent.tool_catalogue,
                 )
                 is ToolDiscoveryProjectionKind.SEARCH_TOOLS
             ):

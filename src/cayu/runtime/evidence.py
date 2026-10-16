@@ -25,6 +25,7 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    MAX_SESSION_ID_BYTES,
     compact_json_utf8_size,
     require_clean_nonblank,
 )
@@ -310,7 +311,7 @@ class RuntimeEvidenceRequest(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    root_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     max_sessions: StrictInt = Field(ge=1, le=_HARD_MAX_SESSIONS)
     max_events: StrictInt = Field(ge=1, le=_HARD_MAX_EVENTS)
     include_descendants: StrictBool = True
@@ -393,7 +394,7 @@ class RuntimeEvidenceWarning(BaseModel):
     model_config = _MODEL_CONFIG
 
     code: RuntimeEvidenceWarningCode
-    session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     event_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     sequence: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
 
@@ -632,7 +633,7 @@ class RuntimeEvidenceTask(BaseModel):
     model_config = _MODEL_CONFIG
 
     task_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
-    session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     parent_task_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     status: Literal[
         "pending",
@@ -1034,11 +1035,11 @@ class RuntimeEvidenceSession(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
-    parent_session_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
+    parent_session_id: str | None = Field(default=None, max_length=MAX_SESSION_ID_BYTES)
     agent_name: str = Field(max_length=_MAX_IDENTITY_CHARS)
     task_ids: tuple[str, ...] = ()
-    causal_budget_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    causal_budget_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     provider_name: str = Field(max_length=_MAX_IDENTITY_CHARS)
     model: str = Field(max_length=_MAX_IDENTITY_CHARS)
     status: SessionStatus
@@ -1065,7 +1066,7 @@ class RuntimeEvidenceBranchTotals(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    branch_root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    branch_root_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     session_ids: tuple[str, ...] = Field(max_length=_HARD_MAX_SESSIONS)
     totals: RuntimeEvidenceTotals
 
@@ -1075,8 +1076,8 @@ class RuntimeEvidenceScope(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
-    causal_budget_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    root_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
+    causal_budget_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     descendant_session_ids: tuple[str, ...] = Field(max_length=_HARD_MAX_SESSIONS)
     causal_budget_session_ids: tuple[str, ...] | None = Field(
         default=None,
@@ -1090,7 +1091,7 @@ class RuntimeEvidenceReport(BaseModel):
     model_config = _MODEL_CONFIG
 
     schema_version: Literal[6] = RUNTIME_EVIDENCE_SCHEMA_VERSION
-    root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    root_session_id: str = Field(max_length=MAX_SESSION_ID_BYTES)
     scope: RuntimeEvidenceScope
     sessions: tuple[RuntimeEvidenceSession, ...] = Field(max_length=_HARD_MAX_SESSIONS)
     tasks: tuple[RuntimeEvidenceTask, ...] = Field(default=(), max_length=_MAX_TASKS)

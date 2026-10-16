@@ -12,6 +12,7 @@ from cayu.budgets.base import (
     BudgetPolicy,
     budget_limits_for_session,
     request_budget_execution_profile_ids,
+    require_budget_limits_fit_model_completion_recovery,
 )
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.context.structured_output import (
@@ -120,6 +121,12 @@ def _execution_profile_identity(
         process_identity=process_identity,
     )
     effective_thinking = thinking if thinking is not None else registered_agent.spec.thinking
+    require_budget_limits_fit_model_completion_recovery(
+        request_limits=request_budget_limits,
+        policy=budget_policy,
+        agent_name=registered_agent.spec.name,
+        causal_budget_id=causal_budget_id,
+    )
     app_limit_ids: tuple[str, ...] = ()
     request_limit_ids: tuple[str, ...] = ()
     if causal_budget_id is not None:

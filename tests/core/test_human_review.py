@@ -252,16 +252,55 @@ def test_unauthorized_and_unknown_scope_fail_closed(tmp_path):
         ("<img src=x onerror=alert(1)>", None, "permitted"),
         ("secret-value", "secret-value", "redacted"),
         ("x" * 4097, None, "unavailable"),
+        # Escaped display text exactly fills the per-field bound.
+        ("x" * 4091 + "&", None, "permitted"),
     ],
 )
 def test_display_bounds_escaping_and_secret_checks(text, secret, status):
+    view = _build_static_review(
+        [("Question", text)],
+        redactor=SecretRedactor() if secret is None else SecretRedactor().with_secret(secret),
+    )
+    assert view.status == status
+    if status == "permitted":
+        assert view.fields[0].text == html.escape(text)
+    else:
+        assert not view.fields
+
+
+def test_disclosure_rejects_fields_that_outgrow_their_bound_when_escaped():
+    # Admitted fields must never overflow the view's bound after escaping.
+    for field in (
+        HumanReviewField(label="Question", text="x" * 4095 + "&"),
+        HumanReviewField(label="<" * 33, text="text"),
+    ):
+        with pytest.raises(ValueError, match="size limit after HTML escaping"):
+            HumanReviewDisclosure(status="permitted", fields=(field,))
+
+
+def test_aggregate_display_bound_measures_utf8_and_reports_unavailable():
+    # 3 x 1500 CJK characters is 13.5 KB of UTF-8 but 27 KB of ASCII-escaped JSON.
+    fitting = [(f"Field {i}", "審" * 1500) for i in range(3)]
+    view = _build_static_review(fitting)
+    assert view.status == "permitted"
+    assert len(view.fields) == 3
+
+    oversized = [(f"Field {i}", "審" * 2000) for i in range(3)]
+    view = _build_static_review(oversized)
+    assert view.status == "unavailable"
+    assert not view.fields
+    assert "withheld" in view.guidance
+
+
+def _build_static_review(fields, *, redactor=None):
     class Projection(ReviewPolicy):
         def project(self, context, source):
             return HumanReviewDisclosure(
-                status="permitted", fields=(HumanReviewField(label="Question", text=text),)
+                status="permitted",
+                fields=tuple(HumanReviewField(label=label, text=text) for label, text in fields),
             )
 
-    view = build_review(
+    return build_review(
         policy=Projection(),
         context=CONTEXT,
         source=HumanReviewSource(
@@ -276,14 +315,9 @@ def test_display_bounds_escaping_and_secret_checks(text, secret, status):
         session_id="review-session",
         session_instance_id="incarnation",
         authoritative_content={},
-        redactor=SecretRedactor() if secret is None else SecretRedactor().with_secret(secret),
+        redactor=SecretRedactor() if redactor is None else redactor,
         now=datetime.now(UTC),
     )
-    assert view.status == status
-    if status == "permitted":
-        assert view.fields[0].text == html.escape(text)
-    else:
-        assert not view.fields
 
 
 @pytest.mark.parametrize("approval", [False, True])

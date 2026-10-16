@@ -27,6 +27,7 @@ from cayu._validation import (
 )
 from cayu.tasks.graphs import (
     TASK_GRAPH_MAX_BYTES,
+    TASK_GRAPH_MAX_NODES,
     GraphIdentifier,
     GraphIdentifiers,
     TaskGraphCreate,
@@ -34,7 +35,12 @@ from cayu.tasks.graphs import (
     TaskGraphMember,
     copy_task_graph_create,
 )
-from cayu.tasks.records import TaskStatus
+from cayu.tasks.records import TASK_RETRY_MAX_ATTEMPTS, TaskStatus
+
+# A group selects members from one graph, so the graph's node bound is its
+# member bound. Each member root may own one execution per automatic attempt.
+TASK_GROUP_MAX_MEMBERS = TASK_GRAPH_MAX_NODES
+TASK_GROUP_MAX_EXECUTIONS = TASK_GROUP_MAX_MEMBERS * TASK_RETRY_MAX_ATTEMPTS
 
 
 class TaskGroupConflict(ValueError):
@@ -164,8 +170,9 @@ class TaskGroupQuiescence(BaseModel):
     deadline: datetime | None = None
     loser_task_ids: GraphIdentifiers = ()
     unsettled_task_ids: GraphIdentifiers = ()
-    # At most 128 selected roots, each with at most 100 automatic attempts.
-    executions: tuple[TaskGroupExecutionObligation, ...] = Field(default=(), max_length=12_800)
+    executions: tuple[TaskGroupExecutionObligation, ...] = Field(
+        default=(), max_length=TASK_GROUP_MAX_EXECUTIONS
+    )
     finalizer_status: TaskGroupFinalizerStatus = TaskGroupFinalizerStatus.ABSENT
 
     @field_validator("deadline")
@@ -208,7 +215,7 @@ class TaskGroupPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["all", "first_success", "quorum"]
-    k: StrictInt | None = Field(default=None, ge=1, le=128)
+    k: StrictInt | None = Field(default=None, ge=1, le=TASK_GROUP_MAX_MEMBERS)
 
     @model_validator(mode="after")
     def validate_policy(self) -> TaskGroupPolicy:
@@ -248,7 +255,7 @@ class TaskGroupCreate(BaseModel):
     @field_validator("member_task_ids", mode="before")
     @classmethod
     def canonical_members(cls, value: object) -> tuple[str, ...]:
-        if not isinstance(value, (tuple, list)) or not 1 <= len(value) <= 128:
+        if not isinstance(value, (tuple, list)) or not 1 <= len(value) <= TASK_GROUP_MAX_MEMBERS:
             raise ValueError("Group member count is outside its bound.")
         if any(type(identity) is not str for identity in value):
             raise ValueError("Group member identity must be a string.")
@@ -392,7 +399,7 @@ class TaskGroupSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     receipt: TaskGroupCreationReceipt
-    members: tuple[TaskGraphMember, ...] = Field(min_length=1, max_length=128)
+    members: tuple[TaskGraphMember, ...] = Field(min_length=1, max_length=TASK_GROUP_MAX_MEMBERS)
     decision: TaskGroupDecision | None = None
     quiescence: TaskGroupQuiescence = Field(default_factory=TaskGroupQuiescence)
     last_sequence: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
