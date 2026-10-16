@@ -14360,6 +14360,31 @@ it never restores earlier preview text wholesale. Every valid projection
 status resynchronizes projected byte and token-estimate evidence to that
 current boundary-safe content.
 
+For a validated event projection, publication also
+enforces the 64 KiB ceiling after the other terminal-result policies finish.
+An oversized externalized preview retains its canonical artifact reference;
+its prefix uses the same marker-safe redaction boundary as inline content.
+If current-registry redaction expands inline content past that ceiling, Cayu
+retains a UTF-8-safe prefix without splitting redaction markers and appends a
+redacted truncation notice when that join remains safe under the current
+registry. Otherwise it omits the notice. Repeating publication with the same
+registry preserves the bounded content and its actual byte/token counts.
+Each preparation retains its redactor through final accounting. A later pass
+under a changed registry can change the text, including the truncation notice.
+Malformed sibling controls may discard otherwise valid projection evidence
+on public replay. Existing inline content is still bounded in that fallback;
+the adapter does not restore discarded evidence or insert absent content.
+This does not create an artifact or repeat the completed tool. An
+explicitly empty result stays empty; ordinary results without projection
+evidence retain the default-off behavior described above.
+
+Event and transcript container adapters share the runtime preparation owner.
+Transcript messages retain externalized references but do not store projection
+records for inline decisions. They therefore cannot distinguish a historical
+inline projection from an ordinary unprojected result. Cayu preserves this
+durable format and does not infer projection authority from the text; the new
+inline event bound does not impose a general transcript-content limit.
+
 The built-in policy derives an `art_...` identity from the session id, logical
 tool-call id, and SHA-256 of the redacted UTF-8 content. Its artifact metadata
 records the versioned policy/type, logical identity hash, content hash, and

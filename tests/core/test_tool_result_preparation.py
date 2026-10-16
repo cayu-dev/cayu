@@ -446,3 +446,255 @@ def test_transcript_adapter_does_not_reconstruct_invalid_or_ambiguous_references
         message, redactor=SecretRedactor("private-preview"), field_name="transcript"
     )
     assert projected.content[0].content == REDACTED_SECRET
+
+
+@pytest.mark.parametrize("status", ["unchanged", "failed"])
+@pytest.mark.parametrize("characters", ["x", "xé", "x界", "x🙂"])
+@pytest.mark.parametrize(
+    "project", [prepare_new_runtime_event, project_runtime_event, project_persisted_runtime_event]
+)
+def test_inline_projection_bounds_redaction_expansion_at_publication(status, characters, project):
+    payload = projection_payload(status, characters * 10000)
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    kwargs = {} if project is prepare_new_runtime_event else {"sequence": 1}
+    output = project(event, redactor=SecretRedactor("x"), **kwargs)
+    result = output.payload["result"]
+    record = output.payload["tool_result_projection"]
+    assert len(result["content"].encode("utf-8")) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert result["content"].endswith("[tool result truncated after redaction]")
+    assert "x" not in result["content"]
+    assert record["projected_bytes"] == len(result["content"].encode("utf-8"))
+    assert record["projected_token_estimate"] == (len(result["content"]) + 3) // 4
+    assert record["status"] == status
+    assert {key: result[key] for key in ("artifacts", "structured", "is_error")} == {
+        key: payload["result"][key] for key in ("artifacts", "structured", "is_error")
+    }
+    # Persisted reconstruction must not need the process-local prepared value.
+    restored = Event.model_validate(output.model_dump(mode="json"))
+    repeated = project_persisted_runtime_event(restored, sequence=2, redactor=SecretRedactor("x"))
+    assert repeated.payload["result"] == result
+    assert repeated.payload["tool_result_projection"] == record
+
+
+@pytest.mark.parametrize("status", ["unchanged", "failed"])
+@pytest.mark.parametrize(
+    "project", [prepare_new_runtime_event, project_runtime_event, project_persisted_runtime_event]
+)
+def test_inline_projection_truncation_preserves_redaction_markers_on_replay(status, project):
+    payload = projection_payload(status, "x" * 10000)
+    redactor = SecretRedactor(["x", "R", "redaction"])
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    kwargs = {} if project is prepare_new_runtime_event else {"sequence": 1}
+    output = project(event, redactor=redactor, **kwargs)
+    result = output.payload["result"]
+    record = output.payload["tool_result_projection"]
+    content = result["content"]
+    assert len(content.encode("utf-8")) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert redactor.redact_text(content) == content
+    assert record["projected_bytes"] == len(content.encode("utf-8"))
+    assert record["projected_token_estimate"] == (len(content) + 3) // 4
+    # Rebuild from durable data each time; no process-local authority is needed.
+    for sequence in (2, 3):
+        restored = Event.model_validate(output.model_dump(mode="json"))
+        output = project_persisted_runtime_event(restored, sequence=sequence, redactor=redactor)
+        assert output.payload["result"] == result
+        assert output.payload["tool_result_projection"] == record
+
+
+@pytest.mark.parametrize("status", ["unchanged", "failed"])
+def test_inline_projection_bounds_content_after_later_terminal_policy(monkeypatch, status):
+    from cayu.runtime import _event_projection as events
+
+    payload = projection_payload(status)
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    restore = events.restore_attested_event_result
+
+    def replace_after_preparation(event, **kwargs):
+        restore(event, **kwargs)
+        kwargs["redacted_payload"]["result"]["content"] = "界" * 30000
+
+    monkeypatch.setattr(events, "restore_attested_event_result", replace_after_preparation)
+    output = prepare_new_runtime_event(event, redactor=SecretRedactor())
+    content = output.payload["result"]["content"]
+    assert len(content.encode("utf-8")) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert content.endswith("[tool result truncated after redaction]")
+    assert output.payload["tool_result_projection"]["projected_bytes"] == len(content.encode())
+
+
+def test_unprojected_results_retain_default_off_content_semantics():
+    result = ToolResult(content="界" * 30000)
+    event = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="session",
+        payload={"result": result.model_dump(mode="json")},
+    )
+    assert prepare_new_runtime_event(event, redactor=SecretRedactor()).payload["result"] == (
+        result.model_dump(mode="json")
+    )
+    message = Message.tool_result(
+        results=[ToolResultPart(tool_call_id="call", tool_name="tool", content=result.content)]
+    )
+    assert (
+        redact_runtime_message_for_boundary(
+            message, redactor=SecretRedactor(), field_name="transcript"
+        )
+        == message
+    )
+
+
+def test_inline_truncation_cannot_reconstruct_a_secret_at_the_notice_boundary():
+    payload = projection_payload("unchanged")
+    source = read_runtime_tool_result_projection(payload)
+    redactor = SecretRedactor("z\n[tool")
+    prepared = PreparedToolResultProjection(
+        source, redacted_result=payload["result"], redactor=redactor
+    )
+    notice = "\n[tool result truncated after redaction]"
+    prefix_size = MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES - len(notice.encode())
+    final_content = "a" * (prefix_size - 1) + "z" + "tail" * 100
+    publication = prepared.finish(final_content)
+    assert "z\n[tool" not in publication.content
+    assert len(publication.content.encode()) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert publication.record_payload()["projected_bytes"] == len(publication.content.encode())
+
+
+@pytest.mark.parametrize("status", ["unchanged", "failed"])
+@pytest.mark.parametrize(
+    "malformed_control", ["effect", "workspace_mutation_capture_status", "registration_state"]
+)
+@pytest.mark.parametrize("project", [project_runtime_event, project_persisted_runtime_event])
+def test_malformed_replay_bounds_valid_inline_content(status, malformed_control, project):
+    payload = projection_payload(status, "x" * 10000)
+    payload[malformed_control] = "bogus"
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    redactor = SecretRedactor("x")
+    output = project(event, sequence=1, redactor=redactor)
+    content = output.payload["result"]["content"]
+    assert len(content.encode()) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert redactor.redact_text(content) == content
+    # Bounding content must not re-admit evidence discarded with bad controls.
+    assert output.payload["tool_result_projection"] == payload["tool_result_projection"]
+    if malformed_control == "workspace_mutation_capture_status":
+        assert output.payload[malformed_control] == "bogus"
+    else:
+        assert malformed_control not in output.payload
+    with pytest.raises(ValueError):
+        prepare_new_runtime_event(event, redactor=redactor)
+
+
+@pytest.mark.parametrize(
+    "project", [prepare_new_runtime_event, project_runtime_event, project_persisted_runtime_event]
+)
+def test_externalized_final_bound_retains_reference_after_later_policy(monkeypatch, project):
+    from cayu.runtime import _event_projection as events
+
+    payload = projection_payload()
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    restore = events.restore_attested_event_result
+
+    def replace_after_preparation(event, **kwargs):
+        restore(event, **kwargs)
+        kwargs["redacted_payload"]["result"]["content"] = "界" * 30000
+
+    with monkeypatch.context() as patch:
+        patch.setattr(events, "restore_attested_event_result", replace_after_preparation)
+        kwargs = {} if project is prepare_new_runtime_event else {"sequence": 1}
+        output = project(event, redactor=SecretRedactor(), **kwargs)
+    result = output.payload["result"]
+    assert len(result["content"].encode()) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert result["content"].count("[cayu tool-result projection reference]") == 1
+    assert payload["tool_result_projection"]["artifact_id"] in result["content"]
+    assert read_runtime_tool_result_projection(dict(output.payload)) is not None
+    repeated = project_persisted_runtime_event(
+        Event.model_validate(output.model_dump(mode="json")), sequence=2, redactor=SecretRedactor()
+    )
+    assert repeated.payload["result"] == result
+    assert repeated.payload["tool_result_projection"] == output.payload["tool_result_projection"]
+
+
+@pytest.mark.parametrize(
+    "project", [prepare_new_runtime_event, project_runtime_event, project_persisted_runtime_event]
+)
+def test_externalized_preview_retains_complete_markers_across_event_and_message_replay(project):
+    payload = projection_payload(content="x" * 10000)
+    redactor = SecretRedactor(["x", "R"])
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    kwargs = {} if project is prepare_new_runtime_event else {"sequence": 1}
+    output = project(event, redactor=redactor, **kwargs)
+    message = Message.tool_result(
+        results=[ToolResultPart(tool_call_id="call", tool_name="tool", **payload["result"])]
+    )
+    message = redact_runtime_message_for_boundary(
+        message, redactor=redactor, field_name="transcript"
+    )
+    result = output.payload["result"]
+    assert message.content[0].content == result["content"]
+    prefix = result["content"].split("\n[cayu tool-result projection reference]\n")[0]
+    assert prefix == REDACTED_SECRET * (len(prefix) // len(REDACTED_SECRET))
+    for sequence in (2, 3):
+        output = project_persisted_runtime_event(
+            Event.model_validate(output.model_dump(mode="json")),
+            sequence=sequence,
+            redactor=redactor,
+        )
+        message = redact_runtime_message_for_boundary(
+            Message.model_validate(message.model_dump(mode="json")),
+            redactor=redactor,
+            field_name="transcript",
+        )
+        assert output.payload["result"] == result
+        assert message.content[0].content == result["content"]
+        assert output.payload["tool_result_projection"]["projected_bytes"] == len(
+            result["content"].encode()
+        )
+
+
+@pytest.mark.parametrize("status", ["unchanged", "failed"])
+def test_rotated_registry_redacts_truncation_notice_and_replays_stably(status):
+    payload = projection_payload(status, "x" * 10000)
+    event = event_with_runtime_nested_payload_authority(
+        Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", payload=payload),
+        ("tool_result_projection", "policy_id"),
+    )
+    first = prepare_new_runtime_event(event, redactor=SecretRedactor("x"))
+    redactor = SecretRedactor(["x", "tool", "result"])
+    final = prepare_new_runtime_event(first, redactor=redactor)
+    content = final.payload["result"]["content"]
+    assert content != first.payload["result"]["content"]
+    assert "tool" not in content and "result" not in content
+    assert redactor.redact_text(content) == content
+    assert len(content.encode()) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
+    assert final.payload["tool_result_projection"]["projected_bytes"] == len(content.encode())
+    repeated = project_persisted_runtime_event(
+        Event.model_validate(final.model_dump(mode="json")), sequence=2, redactor=redactor
+    )
+    assert repeated.payload == final.payload
+
+
+def test_inline_transcript_without_projection_evidence_keeps_expanded_content():
+    message = Message.tool_result(
+        results=[ToolResultPart(tool_call_id="call", tool_name="tool", content="x" * 10000)]
+    )
+    projected = redact_runtime_message_for_boundary(
+        message, redactor=SecretRedactor("x"), field_name="transcript"
+    )
+    assert projected.content[0].content == REDACTED_SECRET * 10000
+    assert len(projected.content[0].content.encode()) > MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES

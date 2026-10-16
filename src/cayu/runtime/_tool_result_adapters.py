@@ -27,13 +27,17 @@ def prepare_tool_result_event(
 
     if projection is None:
         return None
-    if "tool_result_projection" not in controls and not projection.references():
-        # A malformed sibling control can discard inline evidence on exposure.
-        # Retain that fallback; externalized references still need preparation.
-        return None
     result = redacted_payload.get("result")
     if type(result) is not dict:
         raise AssertionError("Validated projection lost its result object.")
+    if (
+        "tool_result_projection" not in controls
+        and not projection.references()
+        and "content" not in result
+    ):
+        # Malformed legacy controls can discard inline evidence on exposure.
+        # Preserve omitted content while still bounding content that is present.
+        return None
     prepared = PreparedToolResultProjection(projection, redacted_result=result, redactor=redactor)
     result["content"] = prepared.content
     if "artifacts" in result:
@@ -49,17 +53,20 @@ def finish_tool_result_event(
 ) -> None:
     """Reinsert evidence after the event's other terminal-result policies."""
 
-    if type(controls.get("tool_result_projection")) is not dict:
+    restore_evidence = type(controls.get("tool_result_projection")) is dict
+    if prepared is None and not restore_evidence:
         return
     result = payload.get("result")
     record = payload.get("tool_result_projection")
-    if type(result) is not dict or type(record) is not dict or prepared is None:
+    if type(result) is not dict or prepared is None:
         raise AssertionError("Validated projection lost its result or evidence record.")
     publication = prepared.finish(result.get("content"))
-    evidence = publication.record_payload()
     result["content"] = publication.content
-    record.clear()
-    record.update(evidence)
+    if restore_evidence:
+        if type(record) is not dict:
+            raise AssertionError("Validated projection lost its evidence record.")
+        record.clear()
+        record.update(publication.record_payload())
 
 
 def prepare_tool_result_message(

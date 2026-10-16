@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, TypeGuard, cast
@@ -33,6 +33,7 @@ from cayu.artifacts.settlement import (
 )
 from cayu.tools.base import ToolResult
 from cayu.tools.files import _ARTIFACT_PAGE_METADATA_MAX_BYTES
+from cayu.vaults.redaction import SecretRedactor
 
 TOOL_RESULT_ARTIFACT_TYPE = "cayu.tool_result_artifact.v1"
 TOOL_RESULT_PROJECTION_AUTHORITY = "cayu.tool_result_projection.v1"
@@ -857,14 +858,14 @@ def redact_tool_result_projection_content(
     *,
     artifact_id: str,
     readback_max_bytes: int,
-    redact_text: Callable[[str], str],
+    redactor: SecretRedactor,
 ) -> str:
     """Re-redact projected text while rebuilding only its runtime-owned reference."""
 
     content = require_durable_text(content, "content")
     artifact_id = _bounded_reference_text(artifact_id, "artifact_id")
-    if not callable(redact_text):
-        raise TypeError("redact_text must be callable.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
     prefix, marker, suffix = content.rpartition(_TOOL_RESULT_PROJECTION_REFERENCE_MARKER)
     canonical_instruction = _tool_result_projection_reference_instruction(
         artifact_id,
@@ -872,15 +873,12 @@ def redact_tool_result_projection_content(
     )
     if not marker or f"{marker}{suffix}" != canonical_instruction:
         prefix = content
-    redacted_prefix = redact_text(prefix)
-    if type(redacted_prefix) is not str:
-        raise TypeError("redact_text must return a string.")
     instruction_bytes = len(canonical_instruction.encode("utf-8"))
-    if instruction_bytes > MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES:
+    if instruction_bytes >= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES:
         raise AssertionError("Runtime projection reference instruction exceeds its bound.")
-    redacted_prefix = _utf8_prefix(
-        redacted_prefix,
-        MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES - instruction_bytes,
+    redacted_prefix, _ = redactor.redact_text_head(
+        prefix,
+        max_bytes=MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES - instruction_bytes,
     )
     projected = f"{redacted_prefix}{canonical_instruction}"
     return projected

@@ -22,6 +22,7 @@ from cayu._validation import (
 from cayu.tools.base import ToolResult
 from cayu.tools.result_projection import (
     _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
+    MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES,
     TOOL_RESULT_ARTIFACT_TYPE,
     ToolResultProjection,
     ToolResultProjectionRecord,
@@ -32,6 +33,8 @@ from cayu.tools.result_projection import (
     reestimate_tool_result_projection_tokens,
 )
 from cayu.vaults.redaction import SecretRedactor
+
+_INLINE_TRUNCATION_MARKER = "\n[tool result truncated after redaction]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +153,8 @@ class PreparedToolResultProjection:
     content: str = field(repr=False)
     artifacts: tuple[Mapping[str, Any], ...] = field(repr=False)
     _record: Mapping[str, Any] | None = field(repr=False)
+    _redactor: SecretRedactor = field(repr=False)
+    _reference: Mapping[str, Any] | None = field(repr=False)
 
     def __init__(
         self,
@@ -199,6 +204,10 @@ class PreparedToolResultProjection:
         # directly; repeating durable admission here adds a full artifact walk.
         object.__setattr__(self, "artifacts", tuple(freeze_json_value(a) for a in artifacts))
         object.__setattr__(self, "_record", freeze_json_value(record))
+        object.__setattr__(self, "_redactor", redactor)
+        object.__setattr__(
+            self, "_reference", freeze_json_value(next(iter(references.values()), None))
+        )
 
     def artifact_payload(self) -> list[dict[str, Any]]:
         return [thaw_json_value(artifact) for artifact in self.artifacts]
@@ -214,6 +223,23 @@ class PreparedToolResultProjection:
             raise AssertionError("Validated projection lost its content.")
         if self._record is None:
             raise AssertionError("Only event projections carry publication evidence.")
+        if len(content.encode("utf-8")) > MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES:
+            # Keep redaction markers atomic so the same registry cannot change
+            # the bounded content again on replay. The shared helper omits the
+            # notice if appending it would reconstruct a registered secret.
+            if self._reference is not None:
+                content = redact_tool_result_projection_content(
+                    content,
+                    artifact_id=self._reference["artifact_id"],
+                    readback_max_bytes=self._reference["readback_max_bytes"],
+                    redactor=self._redactor,
+                )
+            else:
+                content, _ = self._redactor.redact_text_bounded_with_marker(
+                    content,
+                    max_bytes=MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES,
+                    truncation_marker=self._redactor.redact_text(_INLINE_TRUNCATION_MARKER),
+                )
         # Accounting replaces only top-level scalars. Retain immutable
         # nested evidence until the adapter requests its mutable payload.
         record = dict(self._record)
@@ -320,7 +346,7 @@ def _prepare_reference_content(
         original_content,
         artifact_id=artifact_id,
         readback_max_bytes=readback_max_bytes,
-        redact_text=redactor.redact_text,
+        redactor=redactor,
     )
     artifacts = list(redacted_artifacts)
     artifacts[artifact_index] = thaw_json_value(reference)

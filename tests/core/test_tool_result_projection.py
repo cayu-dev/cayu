@@ -1403,7 +1403,7 @@ def test_blocked_projection_restores_reference_after_denial_postprocessing() -> 
         "blocked projection",
         artifact_id=artifact_id,
         readback_max_bytes=64,
-        redact_text=SecretRedactor([]).redact_text,
+        redactor=SecretRedactor([]),
     )
     event = Event(
         type=EventType.TOOL_CALL_BLOCKED,
@@ -2222,7 +2222,7 @@ def test_rotated_secret_expansion_keeps_projected_content_bounded() -> None:
         "z" * 60_000,
         artifact_id=artifact_id,
         readback_max_bytes=64,
-        redact_text=SecretRedactor("z").redact_text,
+        redactor=SecretRedactor("z"),
     )
 
     assert len(projected.encode("utf-8")) <= MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES
