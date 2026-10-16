@@ -143,7 +143,14 @@ def test_parallel_tool_calls_keep_start_order_and_round_identity_after_roundtrip
     assert a.result.content == "A"
 
 
-@pytest.mark.parametrize("kind", [EventType.TOOL_CALL_BLOCKED, EventType.TOOL_CALL_APPROVAL_DENIED])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.TOOL_CALL_APPROVAL_EXPIRED,
+    ],
+)
 def test_policy_denial_without_a_start_is_one_blocked_call(kind):
     terminal = tool_event(
         kind,
@@ -354,3 +361,155 @@ def test_withheld_arguments_clear_earlier_available_arguments_and_preserve_preci
     assert final.tool_calls[0].requested_arguments is None
     assert final.tool_calls[0].effective_arguments is None
     assert final.tool_calls[0].arguments_exact is None
+
+
+@pytest.mark.parametrize("field", ["arguments", "effective_arguments", "result"])
+def test_malformed_tool_details_do_not_abort_live_consumption(field, monkeypatch):
+    import cayu.tools.outcomes as summaries
+
+    original_copy = summaries.copy_durable_json_object
+
+    def reject_summary_argument(value, label):
+        if value == {"value": "unavailable"}:
+            raise ValueError("Argument details unavailable to this projection.")
+        return original_copy(value, label)
+
+    # Event validates durable JSON first. Exercise a stricter summary validator
+    # independently so its failure cannot interrupt an otherwise valid stream.
+    monkeypatch.setattr(summaries, "copy_durable_json_object", reject_summary_argument)
+    payload = {
+        "arguments_state": "finalized",
+        "arguments": {"value": 1},
+        "effective_arguments": {"value": 2},
+        "arguments_exact": True,
+        "result": {"content": "done"},
+    }
+    payload[field] = {"content": 42} if field == "result" else {"value": "unavailable"}
+    records = [
+        tool_event(EventType.TOOL_CALL_STARTED),
+        tool_event(EventType.TOOL_CALL_COMPLETED, **payload),
+        event(EventType.SESSION_COMPLETED),
+    ]
+    consumed = []
+
+    class App:
+        async def run(self, request):
+            for record in records:
+                consumed.append(record.id)
+                yield record
+
+    outcome = asyncio.run(
+        run_to_completion(
+            App(), RunRequest(agent_name="assistant", messages=[Message.text("user", "go")])
+        )
+    )
+    assert outcome.ok
+    assert consumed == [record.id for record in records]
+    assert outcome == RunOutcome.from_events(records)
+    summary = outcome.tool_calls[0]
+    assert summary.disposition == "completed"
+    assert summary.terminal_event_id == records[1].id
+    if field == "result":
+        assert summary.result is None
+        assert summary.requested_arguments == {"value": 1}
+    else:
+        assert (
+            summary.requested_arguments
+            is summary.effective_arguments
+            is summary.arguments_exact
+            is None
+        )
+        assert summary.result.content == "done"
+
+
+@pytest.mark.parametrize("kind", [EventType.MODEL_STARTED, EventType.MODEL_TEXT_DELTA])
+def test_raised_provider_failure_preserves_active_interaction(kind):
+    class App:
+        async def run(self, request):
+            yield event(kind, interaction_id="active")
+            raise RuntimeError("provider unavailable")
+
+    outcome = asyncio.run(
+        run_to_completion(
+            App(), RunRequest(agent_name="assistant", messages=[Message.text("user", "go")])
+        )
+    )
+    assert outcome.status is SessionStatus.FAILED
+    assert outcome.interaction_id == "active"
+
+
+def test_missing_completed_interaction_does_not_erase_the_started_interaction():
+    outcome = RunOutcome.from_events(
+        [
+            event(EventType.MODEL_STARTED, interaction_id="active"),
+            completed(interaction_id=None),
+            event(EventType.SESSION_COMPLETED, interaction_id=None),
+        ]
+    )
+    assert outcome.interaction_id == "active"
+
+
+def test_restarted_call_discards_prior_terminal_details_and_deduplicates_start():
+    restarted = tool_event(EventType.TOOL_CALL_STARTED)
+    outcome = RunOutcome.from_events(
+        [
+            tool_event(EventType.TOOL_CALL_STARTED),
+            tool_event(
+                EventType.TOOL_CALL_FAILED,
+                arguments_state="finalized",
+                arguments={"old": 1},
+                result={"content": "old"},
+                reason="failed",
+                denied_by="old policy",
+            ),
+            restarted,
+            restarted,
+            event(EventType.SESSION_INTERRUPTED),
+        ]
+    )
+    assert outcome.tool_call_count == 1
+    call = outcome.tool_calls[0]
+    assert call.disposition == "incomplete"
+    assert call.start_event_id == restarted.id
+    assert call.start_index == 2
+    assert call.terminal_event_id is call.terminal_index is None
+    assert call.result is call.requested_arguments is call.reason is call.blocked_by is None
+
+
+def test_new_invocation_does_not_reuse_a_recovery_terminal_result():
+    outcome = RunOutcome.from_events(
+        [
+            event(EventType.MODEL_STARTED),
+            event(EventType.MODEL_TEXT_DELTA, delta="old"),
+            completed(),
+            event(EventType.SESSION_FAILED, error="old"),
+            event(EventType.SESSION_RESUMED, interaction_id="new"),
+        ]
+    )
+    assert outcome.status is SessionStatus.INTERRUPTED
+    assert outcome.error is None
+    assert outcome.final_text == ""
+    assert outcome.interaction_id == "new"
+
+
+def test_large_summary_sizes_each_event_a_bounded_number_of_times(monkeypatch):
+    from cayu._validation import JsonUtf8SizeCounter
+
+    outcome = RunOutcome.from_events(
+        [event("custom.observation", value="🙂" * 10) for _ in range(2000)]
+    )
+    visit = JsonUtf8SizeCounter.value
+    visited_events = 0
+
+    def count(self, value):
+        nonlocal visited_events
+        if isinstance(value, dict) and value.get("type") == "custom.observation":
+            visited_events += 1
+        return visit(self, value)
+
+    monkeypatch.setattr(JsonUtf8SizeCounter, "value", count)
+    summary = outcome.summary(max_bytes=4_194_304, include_events=True)
+    assert len(summary["events"]) == 2000
+    assert not summary["truncated"]
+    assert visited_events <= 3 * len(outcome.events)
+    assert len(json.dumps(summary, ensure_ascii=False, separators=(",", ":")).encode()) <= 4_194_304

@@ -8280,9 +8280,9 @@ assistant message contains text.
 
 ## Terminal-turn convenience
 
-`send_turn(app, TurnRequest(...))` composes `run_to_completion` with the existing
-`app.run` and `app.resume` APIs. It introduces no separate execution loop or
-result type. Import `TurnRequest` and `send_turn` from `cayu` or `cayu.sessions`.
+`send_turn(app, TurnRequest(...))` uses the same outcome collector as
+`run_to_completion` over the existing `app.run` and `app.resume` APIs. It
+introduces no separate execution loop or result type. Import `TurnRequest` and `send_turn` from `cayu` or `cayu.sessions`.
 
 - `agent_name` and `messages` are explicit. With no session ID, it creates a new
   generated session. A supplied ID creates that exact session when absent and
@@ -8301,11 +8301,18 @@ result type. Import `TurnRequest` and `send_turn` from `cayu` or `cayu.sessions`
   and `expected_run_epoch`. Deletion and recreation cannot redirect the request
   to a replacement. A competing turn invalidates the observed epoch before
   recovery or admission can take over its execution.
-- Pending, running and interrupting sessions raise `SessionStatusConflict`.
-  Request validation, lookup and selection errors raise before execution.
-  Failures while consuming the selected runtime stream become failed outcomes,
-  following `run_to_completion`. Cancellation and process-control exceptions
-  retain their normal propagation.
+- Native admission decides whether an existing session can continue. A live
+  execution owner raises `SessionExecutionInProgress` (a `SessionStatusConflict`).
+  A lost owner can be recovered by native resume before continuing the turn.
+  Native exceptions propagate, including creation/epoch conflicts, pending
+  approval/input refusals, access denials and incompatible checkpoints. They
+  do not become failed outcomes for sessions that never admitted the turn.
+  Model/tool failures emitted as `session.failed` return failed outcomes.
+  `run_to_completion` retains its existing exception-to-outcome behavior.
+- Pass `context=CollaborationAccessContext(...)` for participant-bound sessions.
+  Existing-session authorization precedes agent and creation-setting checks;
+  native resume rechecks it with that same context. `run_to_completion` also
+  accepts this context for explicit `ResumeRequest` calls.
 - Pending approval, user input, ambiguous effects, incompatible checkpoints and
   execution profiles keep native admission and recovery checks. The helper
   neither resolves a human decision nor takes over an active execution.
@@ -8322,6 +8329,8 @@ boundary. Without a terminal event its status remains `INTERRUPTED`.
 - `provider_name`, `requested_model` and `model` come from the latest
   `model.completed` event. Starting another model step clears them and
   `final_text`, so an empty or failed later step does not expose an old draft.
+  Started and text-delta model events retain the active `interaction_id` even
+  when the provider fails before completion; missing IDs do not erase it.
   Unrelated extension events do not change response interaction attribution.
 - `model_steps` counts distinct completed model events. `usage` is the existing
   `AggregateUsageMetrics` type, summed only from those events; it can exceed the
@@ -8337,7 +8346,10 @@ boundary. Without a terminal event its status remains `INTERRUPTED`.
   real argument value. `arguments_exact` preserves published precision evidence;
   `None` means unknown. Private idempotency markers become `None`, while a
   published idempotency key is retained. `tool_call_count` counts these distinct
-  observed calls.
+  observed calls. Approval expiry is a blocked terminal call. A new start for
+  the same call resets prior terminal details to `incomplete`. Malformed optional
+  tool arguments/results become unavailable in the summary; the original events
+  remain available, and collection continues to the actual terminal event.
 - Public tool lifecycle events include `tool_call_correlation_id`, derived from
   session, round and call identity through the existing HMAC alias codec. This
   observation handle groups start and terminal events whose resolution aliases

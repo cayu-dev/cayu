@@ -5622,6 +5622,10 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
     }
     observed_payload = dict(observed["payload"])
     observed_payload["tool_name"] = blocked.payload["tool_name"]
+    # Public correlation is derived after the private runtime hook runs.
+    assert "tool_call_correlation_id" not in observed_payload
+    assert blocked.payload["tool_call_correlation_id"]
+    observed_payload["tool_call_correlation_id"] = blocked.payload["tool_call_correlation_id"]
     private_authority_fields = {
         "idempotency_key",
         "model_attempt_id",

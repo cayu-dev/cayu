@@ -280,6 +280,7 @@ from cayu.sessions._model_completion_publication import (
 from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_LIMIT_REACHED,
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
@@ -350,9 +351,6 @@ _INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DEPTH = 8
 _INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DESCENDANTS = 32
 
 _ExceptionT = TypeVar("_ExceptionT", bound=BaseException)
-
-
-_INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 
 
 @dataclass(frozen=True, slots=True)

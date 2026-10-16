@@ -1839,13 +1839,20 @@ def test_approval_resolution_events_keep_all_execution_authority_private(
         redactor=SecretRedactor(),
     )
 
-    assert public.payload == {
+    expected = {
         "approval_id": public_event_linkage_id(11, "approval_id"),
         "model_attempt_id": PRIVATE_EVENT_AUTHORITY,
         "model_step_id": PRIVATE_EVENT_AUTHORITY,
         "tool_call_id": public_event_linkage_id(11, "tool_call_id"),
         "tool_round_id": public_event_linkage_id(11, "tool_round_id"),
     }
+    if event_type == EventType.TOOL_CALL_APPROVAL_EXPIRED:
+        correlation = public.payload["tool_call_correlation_id"]
+        assert correlation.startswith("cayu_authority_v1.")
+        assert "private-tool-call" not in correlation
+        assert "private-tool-round" not in correlation
+        expected["tool_call_correlation_id"] = correlation
+    assert public.payload == expected
 
 
 def test_manual_recovery_top_level_linkage_is_actionable_without_exposing_authority() -> None:

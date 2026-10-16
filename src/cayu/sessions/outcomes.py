@@ -31,6 +31,7 @@ from cayu.vaults import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
+    from cayu.collaboration.access import CollaborationAccessContext
     from cayu.sessions.requests import RunRequest
 
 
@@ -128,10 +129,7 @@ class RunOutcome:
         object.__setattr__(
             self,
             "tool_calls",
-            tuple(
-                ToolCallSummary.model_validate(call.model_dump(mode="python"))
-                for call in self.tool_calls
-            ),
+            tuple(call.model_copy(deep=True) for call in self.tool_calls),
         )
         if self.interruption is not None:
             object.__setattr__(
@@ -222,7 +220,12 @@ class RunOutcome:
         return self.status is SessionStatus.COMPLETED
 
 
-async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -> RunOutcome:
+async def run_to_completion(
+    app: CayuApp,
+    request: RunRequest | ResumeRequest,
+    *,
+    context: CollaborationAccessContext | None = None,
+) -> RunOutcome:
     """Run an agent to a terminal state and return a :class:`RunOutcome`.
 
     Consumes ``app.run(request)``, or ``app.resume(request)`` for a
@@ -237,12 +240,29 @@ async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -
     exception group, its leaf errors. Both are redacted with the app's secret
     redactor.
     """
+    return await _run_to_completion(app, request, context=context)
+
+
+async def _run_to_completion(
+    app: CayuApp,
+    request: RunRequest | ResumeRequest,
+    *,
+    context: CollaborationAccessContext | None = None,
+    propagate_exceptions: bool = False,
+) -> RunOutcome:
     collector = _OutcomeCollector(request.session_id or "")
     try:
-        stream = app.resume(request) if isinstance(request, ResumeRequest) else app.run(request)
+        if isinstance(request, ResumeRequest):
+            stream = (
+                app.resume(request) if context is None else app.resume(request, context=context)
+            )
+        else:
+            stream = app.run(request)
         async for event in stream:
             collector.observe(event)
     except Exception as exc:
+        if propagate_exceptions:
+            raise
         redactor = getattr(app, "_secret_redactor", None)
         if not isinstance(redactor, SecretRedactor):
             redactor = SecretRedactor()
@@ -278,7 +298,13 @@ class _OutcomeCollector:
         if not self.projection.observe(event, len(self.events) - 1):
             return
         payload = event.payload
-        if event.type == EventType.MODEL_STARTED:
+        if event.type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}:
+            self.status = SessionStatus.INTERRUPTED
+            self.error = self.error_detail = None
+            self.tool_completion = self.structured_output = None
+            self.current_turn_text = []
+            self.final_text = ""
+        elif event.type == EventType.MODEL_STARTED:
             self.current_turn_text = []
             self.final_text = ""
         elif event.type == EventType.MODEL_TEXT_DELTA:

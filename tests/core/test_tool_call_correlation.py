@@ -48,6 +48,10 @@ def test_public_correlation_is_scoped_opaque_and_cannot_be_supplied_by_a_produce
     public_start, public_end = project(started, 1), project(terminal, 2)
     key = public_start.payload["tool_call_correlation_id"]
     assert key == public_end.payload["tool_call_correlation_id"]
+    expired = project(
+        tool_event(EventType.TOOL_CALL_APPROVAL_EXPIRED, "private-call", "private-round"), 6
+    )
+    assert expired.payload["tool_call_correlation_id"] == key
     assert key != "forged"
     assert "private-call" not in key and "private-round" not in key
     assert public_start.payload["tool_call_id"] != public_end.payload["tool_call_id"]

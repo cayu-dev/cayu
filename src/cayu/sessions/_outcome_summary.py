@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from cayu._validation import copy_json_value, json_utf8_size_within_limit
+from cayu._validation import JsonUtf8SizeCounter, copy_json_value, json_utf8_size_within_limit
 from cayu.runtime._diagnostics import bound_diagnostic_text
 
 if TYPE_CHECKING:
@@ -40,17 +40,40 @@ def summarize_outcome(
         "tool_call_count": outcome.tool_call_count,
         "truncated": False,
         "omitted_fields": [],
+        "tool_calls": [],
     }
     omitted: set[str] = set()
     # Reserve enough for the finite set of omission labels. Nothing is silently
     # dropped, and user data never supplies an unbounded label or dictionary key.
     budget = max_bytes - 512
+    counter = JsonUtf8SizeCounter(budget)
+    counter.value(result)
+    remaining = counter.remaining
+
+    def reserve(value: Any, overhead: int) -> bool:
+        nonlocal remaining
+        if remaining < overhead:
+            return False
+        counter = JsonUtf8SizeCounter(remaining - overhead)
+        if not counter.value(value):
+            return False
+        remaining = counter.remaining
+        return True
 
     def put(container: dict[str, Any], key: str, value: Any, label: str) -> None:
-        container[key] = value
-        if not json_utf8_size_within_limit(result, max_bytes=budget):
-            del container[key]
+        # The singleton's braces replace the parent's existing braces. Account
+        # for just its member and the separator, without re-walking prior data.
+        if reserve({key: value}, int(bool(container)) - 2):
+            container[key] = value
+        else:
             omitted.add(label)
+
+    def append(container: list[Any], value: Any, label: str) -> bool:
+        if reserve(value, int(bool(container))):
+            container.append(value)
+            return True
+        omitted.add(label)
+        return False
 
     def text(value: str, label: str, limit: int = 1024) -> str:
         bounded = bound_diagnostic_text(value, max_bytes=min(limit, budget // 4))
@@ -80,7 +103,6 @@ def summarize_outcome(
                 put(item, "structured", completion.result.structured, "tool_completion")
             if include_artifacts:
                 put(item, "artifacts", completion.result.artifacts, "tool_completion")
-    result["tool_calls"] = []
     for call in outcome.tool_calls:
         item: dict[str, Any] = {
             "tool_call_id": call.tool_call_id,
@@ -91,10 +113,7 @@ def summarize_outcome(
             "start_event_id": call.start_event_id,
             "terminal_event_id": call.terminal_event_id,
         }
-        result["tool_calls"].append(item)
-        if not json_utf8_size_within_limit(result, max_bytes=budget):
-            result["tool_calls"].pop()
-            omitted.add("tool_calls")
+        if not append(result["tool_calls"], item, "tool_calls"):
             break
         for key in ("reason", "blocked_by"):
             value = getattr(call, key)
@@ -107,7 +126,7 @@ def summarize_outcome(
                 text(call.result.content, "tool_calls.content"),
                 "tool_calls.content",
             )
-            item["is_error"] = call.result.is_error
+            put(item, "is_error", call.result.is_error, "tool_calls.details")
             if include_structured:
                 put(item, "structured", call.result.structured, "tool_calls.structured")
             if include_artifacts:
@@ -128,13 +147,11 @@ def summarize_outcome(
             "structured_output",
         )
     if include_events:
-        result["events"] = []
-        for event in outcome.events:
-            result["events"].append(event.model_dump(mode="json"))
-            if not json_utf8_size_within_limit(result, max_bytes=budget):
-                result["events"].pop()
-                omitted.add("events")
-                break
+        put(result, "events", [], "events")
+        if "events" in result:
+            for event in outcome.events:
+                if not append(result["events"], event.model_dump(mode="json"), "events"):
+                    break
     result["truncated"] = bool(omitted)
     result["omitted_fields"] = sorted(omitted)
     # Final validation also protects against mutations to nested public models

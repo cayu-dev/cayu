@@ -51,6 +51,7 @@ from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.tasks.topology import TaskTopologyQuery
 from cayu.tools.inference import validate_inference_purpose
+from cayu.tools.outcomes import _TOOL_CALL_TERMINAL_DISPOSITIONS
 from cayu.tools.policy import taint_labels_from_metadata
 from cayu.workspaces.observation_recovery import (
     WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
@@ -2525,9 +2526,14 @@ def _project_tool_calls(
 ) -> tuple[RuntimeEvidenceToolCall, ...]:
     statuses: dict[EventType, _ToolCallStatus] = {
         EventType.TOOL_CALL_STARTED: "started",
-        EventType.TOOL_CALL_COMPLETED: "completed",
-        EventType.TOOL_CALL_FAILED: "failed",
-        EventType.TOOL_CALL_BLOCKED: "blocked",
+        **{
+            kind: _TOOL_CALL_TERMINAL_DISPOSITIONS[kind]
+            for kind in (
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+            )
+        },
     }
     builders: dict[str, _ToolCallRecord] = {}
     for record in records:

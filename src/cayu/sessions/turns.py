@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from cayu.sessions.outcomes import RunOutcome, run_to_completion
-from cayu.sessions.records import SessionStatus, SessionStatusConflict
+from cayu.sessions.outcomes import RunOutcome, _run_to_completion
 from cayu.sessions.requests import ResumeRequest, RunRequest
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
+    from cayu.collaboration.access import CollaborationAccessContext
 
 
 class TurnRequest(RunRequest):
@@ -22,11 +22,13 @@ class TurnRequest(RunRequest):
     """
 
 
-async def send_turn(app: CayuApp, request: TurnRequest) -> RunOutcome:
-    """Send one turn without taking over active sessions or resolving approvals.
+async def send_turn(
+    app: CayuApp, request: TurnRequest, *, context: CollaborationAccessContext | None = None
+) -> RunOutcome:
+    """Send one turn using native admission, authorization and abandoned-run recovery.
 
-    Request/selection errors raise before execution. Once execution starts,
-    failures follow run_to_completion's non-raising RunOutcome contract.
+    Native exceptions propagate, including admission conflicts and pending actions.
+    Model/tool failures emitted as terminal events return a failed RunOutcome.
     Existence is only a selection hint: native atomic creation and resume claims
     decide admission. A lost creation race is never retried as a resume.
     """
@@ -43,7 +45,8 @@ async def send_turn(app: CayuApp, request: TurnRequest) -> RunOutcome:
         session_id, _ = await app._resolve_public_session_authority(native.session_id)
         session = await app.session_store.load(session_id)
     if session is None:
-        return await run_to_completion(app, native)
+        return await _run_to_completion(app, native, propagate_exceptions=True)
+    await app._require_participant_execution(session, context)
     if session.agent_name != native.agent_name:
         raise ValueError("agent_name must match the existing session's agent.")
     creation_only = set(RunRequest.model_fields) - set(ResumeRequest.model_fields) - {"agent_name"}
@@ -56,8 +59,6 @@ async def send_turn(app: CayuApp, request: TurnRequest) -> RunOutcome:
             + ", ".join(sorted(supplied))
             + ". Omit them or create a new session."
         )
-    if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
-        raise SessionStatusConflict("The session has an active or incomplete execution.")
     values = {
         name: getattr(native, name)
         for name in RunRequest.model_fields.keys() & ResumeRequest.model_fields.keys()
@@ -72,4 +73,4 @@ async def send_turn(app: CayuApp, request: TurnRequest) -> RunOutcome:
         (supplied_fields & ResumeRequest.model_fields.keys())
         | {"expected_session_instance_id", "expected_run_epoch"},
     )
-    return await run_to_completion(app, resume)
+    return await _run_to_completion(app, resume, context=context, propagate_exceptions=True)

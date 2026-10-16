@@ -11,15 +11,13 @@ from pydantic import SecretStr
 from cayu import _event_schema
 from cayu.events import Event, EventType
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.tools.outcomes import _TOOL_CALL_TERMINAL_DISPOSITIONS
 
 TOOL_CALL_CORRELATION_FIELD = "tool_call_correlation_id"
 TOOL_CALL_CORRELATION_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_STARTED,
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
+        *_TOOL_CALL_TERMINAL_DISPOSITIONS,
     }
 )
 # Stores without a configured keyring can still correlate one consumed stream.

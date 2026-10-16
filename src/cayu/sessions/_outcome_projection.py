@@ -10,15 +10,14 @@ from cayu.budgets.usage import (
     usage_metrics_from_event_payload,
 )
 from cayu.events import Event, EventType
-from cayu.tools.base import ToolResult
-from cayu.tools.outcomes import ToolCallSummary
-
-_TERMINALS: dict[str, str] = {
-    EventType.TOOL_CALL_COMPLETED: "completed",
-    EventType.TOOL_CALL_FAILED: "failed",
-    EventType.TOOL_CALL_BLOCKED: "blocked",
-    EventType.TOOL_CALL_APPROVAL_DENIED: "blocked",
-}
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
+from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_LIMIT_REACHED,
+    _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+    _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+    _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+)
+from cayu.tools.outcomes import _TOOL_CALL_TERMINAL_DISPOSITIONS, ToolCallSummary
 
 
 def _text(value: object) -> str | None:
@@ -38,17 +37,29 @@ class InvocationProjection:
         self.interruption: dict[str, Any] | None = None
         self.seen: set[str] = set()
         self.calls: dict[tuple[str, str | None, str], dict[str, Any]] = {}
-        self.validated_calls: dict[tuple[str, str | None, str], ToolCallSummary] = {}
 
     def observe(self, event: Event, index: int) -> bool:
         if event.id in self.seen:
             return False
         self.seen.add(event.id)
         payload = event.payload
+        if (
+            event.type
+            in {
+                EventType.MODEL_STARTED,
+                EventType.MODEL_TEXT_DELTA,
+                EventType.MODEL_COMPLETED,
+                EventType.SESSION_STARTED,
+                EventType.SESSION_RESUMED,
+            }
+            and event.interaction_id is not None
+        ):
+            self.interaction_id = event.interaction_id
+        if event.type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}:
+            self.interruption = None
         if event.type == EventType.MODEL_STARTED:
             self.provider_name = self.requested_model = self.model = None
         elif event.type == EventType.MODEL_COMPLETED:
-            self.interaction_id = event.interaction_id
             self.provider_name = _text(payload.get("provider_name"))
             self.requested_model = _text(payload.get("requested_model"))
             self.model = _text(payload.get("model"))
@@ -71,7 +82,10 @@ class InvocationProjection:
             self.interruption = (
                 _interruption(payload) if event.type == EventType.SESSION_INTERRUPTED else None
             )
-        if event.type not in _TERMINALS and event.type != EventType.TOOL_CALL_STARTED:
+        if (
+            event.type not in _TOOL_CALL_TERMINAL_DISPOSITIONS
+            and event.type != EventType.TOOL_CALL_STARTED
+        ):
             return True
         call_id = _text(payload.get("tool_call_id"))
         if call_id is None:
@@ -98,19 +112,30 @@ class InvocationProjection:
                 "disposition": "incomplete",
             },
         )
+        if event.type == EventType.TOOL_CALL_STARTED:
+            # A new start is a new attempt, even when recovery retains the call
+            # identity. Keep call order, but discard the prior terminal evidence.
+            call.clear()
+            call.update(
+                session_id=event.session_id,
+                interaction_id=event.interaction_id,
+                tool_call_id=call_id,
+                correlation_id=correlation_id,
+                tool_round_id=round_id,
+                disposition="incomplete",
+                start_event_id=event.id,
+                start_index=index,
+            )
         if event.tool_name is not None:
             call["tool_name"] = event.tool_name
         if (idempotency_key := _text(payload.get("idempotency_key"))) is not None:
             call["idempotency_key"] = (
-                None if idempotency_key == "[PRIVATE_EVENT_AUTHORITY]" else idempotency_key
+                None if idempotency_key == PRIVATE_EVENT_AUTHORITY else idempotency_key
             )
         if event.type == EventType.TOOL_CALL_STARTED:
-            call.setdefault("start_event_id", event.id)
-            call.setdefault("start_index", index)
-            self.validated_calls[key] = ToolCallSummary(**call)
             return True
         call.update(
-            disposition=_TERMINALS[event.type],
+            disposition=_TOOL_CALL_TERMINAL_DISPOSITIONS[EventType(event.type)],
             terminal_event_id=event.id,
             terminal_index=index,
             reason=_text(payload.get("reason")),
@@ -128,11 +153,7 @@ class InvocationProjection:
             effective if available and isinstance(effective, dict) else None
         )
         result = payload.get("result")
-        try:
-            call["result"] = ToolResult.model_validate(result) if isinstance(result, dict) else None
-        except (TypeError, ValueError):
-            call["result"] = None
-        self.validated_calls[key] = ToolCallSummary(**call)
+        call["result"] = result if isinstance(result, dict) else None
         return True
 
     def result(self) -> dict[str, Any]:
@@ -143,7 +164,7 @@ class InvocationProjection:
             "model_steps": self.model_steps,
             "unmeasured_model_steps": self.unmeasured_model_steps,
             "usage": self.usage,
-            "tool_calls": tuple(self.validated_calls.values()),
+            "tool_calls": tuple(_summary(call) for call in self.calls.values()),
             "interaction_id": self.interaction_id,
             "interruption": self.interruption,
         }
@@ -152,10 +173,10 @@ class InvocationProjection:
 def _interruption(payload: dict[str, Any]) -> dict[str, Any]:
     source = _text(payload.get("interruption_type"))
     kind = {
-        "tool_approval_required": "tool_approval",
-        "user_input_required": "user_input",
-        "operator_requested": "operator",
-        "limit_reached": "limit",
+        _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED: "tool_approval",
+        _INTERRUPTION_TYPE_USER_INPUT_REQUIRED: "user_input",
+        _INTERRUPTION_TYPE_OPERATOR_REQUESTED: "operator",
+        _INTERRUPTION_TYPE_LIMIT_REACHED: "limit",
         "waiting_on_child_action": "delegated_action",
     }.get(source or "", "unclassified")
     if payload.get("manual_recovery_required") is True:
@@ -177,3 +198,25 @@ def _interruption(payload: dict[str, Any]) -> dict[str, Any]:
         "tool_call_id": _text(payload.get("tool_call_id")),
         "limit": _text(payload.get("limit")),
     }
+
+
+def _summary(call: dict[str, Any]) -> ToolCallSummary:
+    """Validate once after consumption; malformed optional details stay unavailable.
+
+    The raw events retain the original evidence. Derived presentation data must
+    never stop a live execution or turn its successful terminal event into failure.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return ToolCallSummary(**call)
+    except ValidationError as exc:
+        invalid = {error["loc"][0] for error in exc.errors(include_input=False)}
+        sanitized = dict(call)
+        if invalid & {"requested_arguments", "effective_arguments", "arguments_exact"}:
+            sanitized.update(
+                requested_arguments=None, effective_arguments=None, arguments_exact=None
+            )
+        if "result" in invalid:
+            sanitized["result"] = None
+        return ToolCallSummary(**sanitized)

@@ -107,9 +107,7 @@ def test_existing_agent_and_creation_settings_are_checked_before_execution(store
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    "status", [SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING]
-)
+@pytest.mark.parametrize("status", [SessionStatus.RUNNING, SessionStatus.INTERRUPTING])
 def test_active_sessions_raise_conflict_without_mutation(store_factory, status):
     async def scenario():
         async with store_factory(Store) as store:
@@ -148,9 +146,8 @@ def test_lost_creation_race_does_not_retry_as_resume(store_factory, monkeypatch)
                     yield value
 
             monkeypatch.setattr(app, "run", race)
-            outcome = await send_turn(app, request("race"))
-            assert outcome.status is SessionStatus.FAILED
-            assert outcome.error_detail is not None
+            with pytest.raises(ValueError, match="already exists"):
+                await send_turn(app, request("race"))
             assert len(provider.requests) == 1
             transcript = await store.load_transcript("race")
             assert [m.role for m in transcript] == ["user", "assistant"]
@@ -179,9 +176,8 @@ def test_replaced_session_cannot_receive_the_selected_resume(store_factory, monk
                     yield value
 
             monkeypatch.setattr(app, "resume", race)
-            outcome = await send_turn(app, request("reused"))
-            assert outcome.status is SessionStatus.FAILED
-            assert "SessionStatusConflict" in outcome.error
+            with pytest.raises(SessionStatusConflict, match="replaced"):
+                await send_turn(app, request("reused"))
             assert len(provider.requests) == 2
             assert len(await store.load_transcript("reused")) == 2
 
@@ -232,8 +228,8 @@ def test_approval_requires_dedicated_resolution_and_uses_the_same_outcome(store_
             assert paused.interruption.approval_id
             assert paused.resumable is False
             before = await store.load_checkpoint(f"approval-{approve}")
-            refused = await send_turn(app, request(f"approval-{approve}"))
-            assert not refused.ok
+            with pytest.raises(RuntimeError, match="pending tool approval"):
+                await send_turn(app, request(f"approval-{approve}"))
             assert await store.load_checkpoint(f"approval-{approve}") == before
             assert tool.calls == 0
             approval = next(e for e in paused.events if e.type == "tool.call.approval_requested")
@@ -280,15 +276,15 @@ def test_user_input_requires_dedicated_resolution_and_projects_its_result(store_
             assert paused.interruption.input_id
             assert paused.resumable is False
             before = await store.load_checkpoint("input")
-            refused = await send_turn(
-                app,
-                TurnRequest(
-                    agent_name="assistant",
-                    session_id="input",
-                    messages=[Message.text("user", "prod")],
-                ),
-            )
-            assert not refused.ok
+            with pytest.raises(RuntimeError, match="awaiting user input"):
+                await send_turn(
+                    app,
+                    TurnRequest(
+                        agent_name="assistant",
+                        session_id="input",
+                        messages=[Message.text("user", "prod")],
+                    ),
+                )
             assert await store.load_checkpoint("input") == before
             resolved = RunOutcome.from_events(
                 [
@@ -404,9 +400,10 @@ def test_future_checkpoint_is_rejected_before_new_messages_or_provider_calls(
                 }
 
             monkeypatch.setattr(store, "load_checkpoint", future_checkpoint)
-            outcome = await send_turn(app, request("future"))
-            assert not outcome.ok
-            assert "CheckpointCompatibilityError" in outcome.error
+            from cayu.sessions.checkpoints import CheckpointCompatibilityError
+
+            with pytest.raises(CheckpointCompatibilityError):
+                await send_turn(app, request("future"))
             assert await store.load_transcript("future") == before
             assert len(provider.requests) == 1
 
@@ -615,16 +612,15 @@ def test_concurrent_turn_cannot_be_taken_over_after_selection(store_factory, mon
 
                 monkeypatch.setattr(app._session_engine, "prepare_resume", prepare)
             try:
-                outcome = await send_turn(
-                    app,
-                    TurnRequest(
-                        agent_name="support",
-                        session_id=session_id,
-                        messages=[Message.text("user", "loser input")],
-                    ),
-                )
-                assert not outcome.ok
-                assert "SessionStatusConflict" in outcome.error
+                with pytest.raises(SessionStatusConflict, match="run changed"):
+                    await send_turn(
+                        app,
+                        TurnRequest(
+                            agent_name="support",
+                            session_id=session_id,
+                            messages=[Message.text("user", "loser input")],
+                        ),
+                    )
                 assert (await store.load(session_id)).status is SessionStatus.RUNNING
                 transcript = await store.load_transcript(session_id)
                 assert all("loser input" not in str(message) for message in transcript)

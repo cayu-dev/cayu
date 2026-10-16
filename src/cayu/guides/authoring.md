@@ -684,7 +684,11 @@ view. Full events, arguments, structured data, and artifacts require explicit
 summary options. The result itself retains all consumed events, so stream
 `app.run` or `app.resume` directly for long-running work.
 
-An active session raises `cayu.sessions.SessionStatusConflict`. Resolve an
+A live execution raises `cayu.sessions.SessionStatusConflict`; native resume
+can recover a lost owner. Admission exceptions propagate, while emitted
+`session.failed` events return failed outcomes. Pass `context=` for
+participant-bound sessions; access is checked before session-specific selection.
+Resolve an
 approval with `app.resolve_tool_approval`, a user question with
 `app.resolve_user_input`, and an ambiguous tool effect with the appropriate
 recovery API. `RunOutcome.from_events(collected_events)` can summarize those

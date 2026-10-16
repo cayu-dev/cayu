@@ -7,7 +7,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from cayu._validation import copy_durable_json_object
+from cayu.events import EventType
 from cayu.tools.base import ToolResult
+
+_TOOL_CALL_TERMINAL_DISPOSITIONS: dict[EventType, Literal["completed", "failed", "blocked"]] = {
+    EventType.TOOL_CALL_COMPLETED: "completed",
+    EventType.TOOL_CALL_FAILED: "failed",
+    EventType.TOOL_CALL_BLOCKED: "blocked",
+    EventType.TOOL_CALL_APPROVAL_DENIED: "blocked",
+    EventType.TOOL_CALL_APPROVAL_EXPIRED: "blocked",
+}
 
 
 class ToolCallSummary(BaseModel):
@@ -17,6 +26,8 @@ class ToolCallSummary(BaseModel):
     authority. ``None`` means unavailable; an empty object is a real argument
     value. Event indices refer to the invocation's consumed stream. A terminal
     event can appear without a start when resuming or recovering a prior call.
+    A restarted call reports its latest attempt. Malformed optional arguments
+    or results are unavailable; the original events remain in RunOutcome.events.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)

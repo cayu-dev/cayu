@@ -1504,6 +1504,7 @@ def test_search_text_durable_event_and_transcript_payloads_remain_bounded(tmp_pa
         persisted_tool,
         sequence=records[0].sequence,
         redactor=SecretRedactor(),
+        public_authority_alias_codec=store.public_authority_alias_codec,
     )
     result_payload = persisted_tool.payload["result"]
     assert result_payload["structured"]["projected_content_bytes"] <= 2_000
