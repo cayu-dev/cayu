@@ -1,5 +1,12 @@
 # Release notes
 
+## v0.11.4
+
+Cayu repairs release qualification customization drift and keeps release publication checks deterministic.
+
+- Accept an already-owned `RunLimits` scaffold import while preserving the qualification customizer's drift checks.
+- Restore release-state verification for historical notes and prevent reuse of an already-published package version.
+
 ## v0.11.3
 
 Cayu strengthens session lifecycle reporting, dashboard packaging, and guarded publication.
@@ -3005,7 +3012,7 @@ Applications that intentionally relied on implicit unrestricted networking
 must opt in visibly:
 
 ```python
-from cayu.runners import MicrosandboxRunner
+from cayu import MicrosandboxRunner
 from microsandbox import Network
 
 runner = await MicrosandboxRunner.create(
