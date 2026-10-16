@@ -364,6 +364,157 @@ compared with each other through the same compatibility projection and stable
 exit contract. These commands operate only on the supplied paths and do not
 perform project discovery.
 
+### Improvement objectives and evals
+
+An improvement loop proposes changes to an agent, runs evals on each candidate,
+and keeps the changes that make it better. A project tells any such loop what
+"better" means, which evals to run, and which files only the evaluator may read
+in `[tool.cayu.improvement]`, next to `eval_target`:
+
+```toml
+[tool.cayu]
+eval_target = "evals.assistant:build_eval"
+
+[tool.cayu.improvement]
+objectives = "cayu-objectives.toml"
+eval_targets = ["evals.improvement:build_eval"]
+corpora = ["evals/improvement.json"]
+benchmark_packages = ["benchmarks/refunds"]
+evaluator_only_paths = ["evals/reference", "evals/expected_states"]
+```
+
+All paths are normalized project-relative POSIX paths, and no list may repeat a
+path, ignoring case and Unicode normalization. `objectives` names the
+objectives file. `eval_targets` use the `module:attribute` form of `eval_target`,
+`corpora` are portable corpus files (schema version 4, suites referenced by
+`suite_id`), and `benchmark_packages` are package directories or manifest files.
+At least one of these three is required. `evaluator_only_paths` hold material a
+candidate must never see, such as reference answers and expected states, in
+addition to the suites and reference assertions a benchmark package already keeps
+on the evaluator side. Declared corpora and eval target modules are protected from
+edits but not hidden: they are development evals a candidate may read. Cases that
+must stay unseen belong in `evaluator_only_paths`, a benchmark package, or the
+evaluator's own sealed cohorts.
+
+The objectives live in their own file rather than in `pyproject.toml`, so they are
+easy to keep outside every candidate's mutable paths. The file is TOML with a
+schema defined by `ProjectObjectivesV1`:
+
+```toml
+schema_version = 1
+sampled_review_rate_bps = 500        # 5% of autonomously granted decisions
+
+[[correctness_floor]]                # must not regress
+suite_id = "refund-regressions"
+metrics = ["status", "score", "reliability"]
+
+[[mandatory_controls]]               # never removed or granted autonomy
+tool_name = "issue_refund"
+approval_gate = "refund-over-limit"
+
+[[mandatory_controls]]
+tool_name = "close_account"          # no approval_gate: every gate on the tool
+
+[targets]                            # goals per verified completion
+cost_per_verified_completion = { amount = "0.25", currency = "USD" }
+seconds_per_verified_completion = 90
+human_attention_requests_per_verified_completion = "0.2"
+
+[mutable_surfaces]                   # everything else stays fixed
+body_paths = ["prompts"]
+execution_profile = true
+model_per_step = true
+
+[approval_rules]                     # schema version 1 accepts only "person"
+body_paths = "person"
+execution_profile = "person"
+model_per_step = "person"
+autonomy_grant = "person"
+```
+
+- `correctness_floor` (required, at least one entry) names each suite once by its
+  portable suite ID. `metrics` are the regression dimensions `cayu eval compare`
+  reports (`status`, `score`, `reliability`); the default is all three.
+- `mandatory_controls` entries are an exact registered tool name and an optional
+  approval gate identifier. An entry without `approval_gate` covers every gate on
+  that tool, so a gate-specific entry for the same tool is rejected as redundant.
+- `targets` are optional goals, not limits. Cost is a canonical decimal amount and
+  currency, time is whole seconds, and human attention counts human-attention
+  requests (approvals and questions) per verified completion.
+- `mutable_surfaces` lists the body paths a candidate may edit and whether it may
+  change the execution profile or the model used for each step. Nothing is
+  mutable by default.
+- `approval_rules` says who approves each kind of change. Schema version 1 requires
+  a person for all of them, which is also the default.
+- `sampled_review_rate_bps` (required) is the share of autonomously granted
+  decisions a person still reviews, as an integer from 0 to 10000 basis points,
+  so the document never holds a float.
+
+`project_objectives_fingerprint(objectives)` returns the `sha256:` content
+revision of the validated document in canonical JSON, the same content
+addressing corpora and benchmark packages use. Defaults are included, and
+comments, formatting, key order and entry order do not change it.
+`project_improvement_fingerprint(config, objectives)` identifies the whole
+declaration: the `[tool.cayu.improvement]` table plus the objectives fingerprint,
+so changing which evals are declared or which paths stay evaluator-only changes
+it even when the objectives file does not. Entry order does not change it either.
+Missions and receipts cite the declaration fingerprint to record which evals and
+objectives they used; the content of each corpus and benchmark package is
+identified by its own revision.
+
+Each part is usable on its own and exported from `cayu.evals`:
+
+- `ProjectObjectivesV1` and its entry models, `project_objectives_from_toml(text)`
+  and `load_project_objectives(path)` parse and validate one objectives file;
+- `project_objectives_fingerprint(objectives)` computes its identity, and
+  `project_improvement_fingerprint(config, objectives)` the identity of the whole
+  declaration;
+- `ProjectImprovementConfigV1` validates a `[tool.cayu.improvement]` table;
+- `load_project_improvement(root)` reads `root/pyproject.toml` only, and
+  `discover_project_improvement(start)` searches upward the way `cayu eval run`
+  does, stopping at the nearest `pyproject.toml` whose `[tool.cayu]` declares
+  `factory`, `eval_target` or `improvement`, and returns `None` when that project
+  declares no improvement table. Both return a `ProjectImprovementDeclaration` with
+  the config, objectives, `objectives_fingerprint`, `declaration_fingerprint`, and
+  `protected_paths`: `pyproject.toml`,
+  the objectives file, the declared corpora, benchmark package directories and
+  evaluator-only paths, and for each eval target the files importing it runs: the
+  `__init__.py` of every enclosing package and the module's own file. The module
+  is located with Python's path-based finder, which runs no code, searching the
+  project root first as `cayu eval run` does, then `src/`, then the interpreter's
+  import path;
+- `validate_project_improvement(declaration)` checks the declaration against the
+  checkout and returns every problem it finds.
+
+The validator loads every corpus and benchmark package, requires evaluator-only
+and body paths to exist and each eval target's files to be inside the project,
+rejects a body path that overlaps a protected path (ignoring letter case, Unicode
+normalization and, as Windows does, trailing dots and spaces), rejects symbolic
+links inside body and protected directories, and requires each correctness-floor
+suite to appear in a declared corpus or package.
+It never imports project code, so when `eval_targets` are declared, floor suites
+missing from the static evals are assumed to come from those targets. Project
+paths may not contain symbolic links or leave the project.
+
+```bash
+cayu objectives validate              # search upward from the working directory
+cayu objectives validate path/to/agent --json
+```
+
+The command prints both fingerprints and exits `0` when the declaration is valid,
+and lists the problems and exits `2` otherwise. The report goes to standard output,
+or to the `--output` file, which every run rewrites after reading the project; an
+`--output` path that would replace a `pyproject.toml` or anything the declaration
+protects is refused. A declaration that cannot be loaded at all is reported on
+standard error. `--json` emits the whole
+declaration, its fingerprints, protected paths and problems for clients outside
+Python; when the declaration cannot be loaded at all it emits an `error` object
+with code `OBJECTIVES_COMMAND_FAILED` and a message instead. The Runtime defines and validates this declaration but does not enforce
+it: loading it runs no eval and grants or withholds no authority. Tools that
+propose changes, choose cohorts or grant autonomy read it and apply it themselves.
+[`examples/improvement_objectives`](../examples/improvement_objectives/) is a
+complete project that declares objectives and validates.
+
 ## Author-first suite contracts
 
 `EvalSuiteDraftV1` remains the closed deterministic authoring contract.

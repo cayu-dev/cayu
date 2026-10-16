@@ -48,6 +48,38 @@ from cayu.evals.suite_authoring import (
 BENCHMARK_PACKAGE_MAX_BYTES = 8 * 1024 * 1024
 BENCHMARK_FILE_MAX_BYTES = 16 * 1024 * 1024
 BENCHMARK_FILES_MAX_BYTES = 64 * 1024 * 1024
+_BENCHMARK_MANIFEST_NAME = "benchmark.json"
+
+
+def _is_normalized_relative_posix_path(value: str) -> bool:
+    path = PurePosixPath(value)
+    return not (
+        path.is_absolute()
+        or "\\" in value
+        or ":" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or path.as_posix() != value
+    )
+
+
+def _benchmark_manifest_path(path: Path) -> Path:
+    """The manifest a package path names: the path itself, or a directory's manifest."""
+
+    return path / _BENCHMARK_MANIFEST_NAME if path.is_dir() else path
+
+
+def _contains_symlink(root: Path, path: Path) -> bool:
+    """Whether any component of ``path`` below ``root`` is a symbolic link.
+
+    ``path`` must be lexically under ``root``; otherwise this raises ``ValueError``.
+    """
+
+    current = root
+    for part in path.relative_to(root).parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
 
 
 class BenchmarkFileV1(_PortableModel):
@@ -71,14 +103,7 @@ class BenchmarkFileV1(_PortableModel):
     @classmethod
     def validate_path(cls, value: str) -> str:
         _bounded_durable_text(value, "path", max_chars=512, nonblank=True, clean=True)
-        path = PurePosixPath(value)
-        if (
-            path.is_absolute()
-            or "\\" in value
-            or ":" in value
-            or any(part in {"", ".", ".."} for part in value.split("/"))
-            or path.as_posix() != value
-        ):
+        if not _is_normalized_relative_posix_path(value):
             raise ValueError("Benchmark files require normalized relative POSIX paths.")
         return value
 
@@ -263,9 +288,7 @@ def benchmark_package_from_json(source: str) -> BenchmarkPackageV1:
 def load_benchmark_package(path: str | Path) -> LoadedBenchmarkPackage:
     """Read a manifest (or directory/benchmark.json) and verify every named input file."""
 
-    source = Path(path)
-    if source.is_dir():
-        source = source / "benchmark.json"
+    source = _benchmark_manifest_path(Path(path))
     with source.open("rb") as stream:
         raw = stream.read(BENCHMARK_PACKAGE_MAX_BYTES + 1)
     if len(raw) > BENCHMARK_PACKAGE_MAX_BYTES:
@@ -276,11 +299,8 @@ def load_benchmark_package(path: str | Path) -> LoadedBenchmarkPackage:
     contents = []
     for binding in package.files:
         file_path = root.joinpath(*PurePosixPath(binding.path).parts)
-        current = file_path
-        while current != root:
-            if current.is_symlink():
-                raise ValueError("Benchmark input paths must not contain symbolic links.")
-            current = current.parent
+        if _contains_symlink(root, file_path):
+            raise ValueError("Benchmark input paths must not contain symbolic links.")
         if not file_path.resolve().is_relative_to(root) or not file_path.is_file():
             raise ValueError("Benchmark input file is missing or outside its package.")
         requirement = next(

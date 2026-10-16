@@ -164,6 +164,8 @@ def discover_cayu_project_configuration(
             config = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
+        except RecursionError as exc:
+            raise ProjectError(f"{pyproject} exceeds the supported TOML nesting.") from exc
         tool_config = config.get("tool", {})
         cayu_config = tool_config.get("cayu", {}) if isinstance(tool_config, dict) else {}
         if not isinstance(cayu_config, dict):

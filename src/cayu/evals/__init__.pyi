@@ -855,6 +855,32 @@ from cayu.evals.models import ProbeRequirements as ProbeRequirements
 from cayu.evals.models import Trajectory as Trajectory
 from cayu.evals.models import TrajectoryProbes as TrajectoryProbes
 from cayu.evals.models import WorkspaceFileProbe as WorkspaceFileProbe
+from cayu.evals.objectives import (
+    PROJECT_IMPROVEMENT_DOCUMENT_SCHEMA_VERSION as PROJECT_IMPROVEMENT_DOCUMENT_SCHEMA_VERSION,
+)
+from cayu.evals.objectives import PROJECT_OBJECTIVES_MAX_BYTES as PROJECT_OBJECTIVES_MAX_BYTES
+from cayu.evals.objectives import (
+    PROJECT_OBJECTIVES_SCHEMA_VERSION as PROJECT_OBJECTIVES_SCHEMA_VERSION,
+)
+from cayu.evals.objectives import SAMPLED_REVIEW_RATE_MAX_BPS as SAMPLED_REVIEW_RATE_MAX_BPS
+from cayu.evals.objectives import ApprovalRulesV1 as ApprovalRulesV1
+from cayu.evals.objectives import CorrectnessFloorV1 as CorrectnessFloorV1
+from cayu.evals.objectives import CostTargetV1 as CostTargetV1
+from cayu.evals.objectives import MandatoryControlV1 as MandatoryControlV1
+from cayu.evals.objectives import MutableSurfacesV1 as MutableSurfacesV1
+from cayu.evals.objectives import ObjectiveTargetsV1 as ObjectiveTargetsV1
+from cayu.evals.objectives import ProjectImprovementConfigV1 as ProjectImprovementConfigV1
+from cayu.evals.objectives import ProjectImprovementDeclaration as ProjectImprovementDeclaration
+from cayu.evals.objectives import ProjectImprovementError as ProjectImprovementError
+from cayu.evals.objectives import ProjectObjectivesV1 as ProjectObjectivesV1
+from cayu.evals.objectives import discover_project_improvement as discover_project_improvement
+from cayu.evals.objectives import load_project_improvement as load_project_improvement
+from cayu.evals.objectives import load_project_objectives as load_project_objectives
+from cayu.evals.objectives import project_improvement_document as project_improvement_document
+from cayu.evals.objectives import project_improvement_fingerprint as project_improvement_fingerprint
+from cayu.evals.objectives import project_objectives_fingerprint as project_objectives_fingerprint
+from cayu.evals.objectives import project_objectives_from_toml as project_objectives_from_toml
+from cayu.evals.objectives import validate_project_improvement as validate_project_improvement
 from cayu.evals.portable_assertions import compile_assertion_spec as compile_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_spec as evaluate_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_specs as evaluate_assertion_specs

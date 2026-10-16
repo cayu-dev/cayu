@@ -96,6 +96,9 @@ corresponding credentials or service.
 - [`cost_quality_comparison.py`](cost_quality_comparison.py) — deterministic paired
   accounting with `verified`, `measured_unmatched`, `unpriced`, and `unavailable`
   proof statuses.
+- [`improvement_objectives/`](improvement_objectives/) — a project declaring its
+  objectives file, improvement corpus, and evaluator-only paths in
+  `[tool.cayu.improvement]`; check it with `cayu objectives validate`.
 - [`tool_discovery_validation/`](tool_discovery_validation/) — credential-free
   discovery, resume, fork reset, copied-reference rejection, ranking, and bounded economics
   evidence through the real `search_tools` / `call_tool` path.

@@ -1,0 +1,12 @@
+[project]
+name = "refund-assistant"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+# Everything an improvement loop needs to know about this agent, with no
+# configuration of its own: which evals to run, which files only the evaluator
+# may read, and the objectives file that says what "better" means.
+[tool.cayu.improvement]
+objectives = "cayu-objectives.toml"
+corpora = ["evals/improvement.json"]
+evaluator_only_paths = ["evals/reference"]

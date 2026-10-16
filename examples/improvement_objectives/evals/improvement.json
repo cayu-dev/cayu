@@ -1,0 +1,83 @@
+{
+  "cases": [
+    {
+      "assertions": [
+        {
+          "description": null,
+          "id": "looked-up-order",
+          "kind": "tool_called",
+          "max_count": null,
+          "min_count": 1,
+          "tool_name": "lookup_order"
+        },
+        {
+          "description": null,
+          "expected": "refund",
+          "id": "confirms-refund",
+          "kind": "final_output_contains"
+        }
+      ],
+      "description": null,
+      "id": "refund-within-limit",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "text": "Order 1042 arrived broken. Please refund it."
+          }
+        ]
+      },
+      "name": "Refund within limit",
+      "revision": "sha256:6abf8415de652ffaf82da3bb1e01a5022934ce1aac810cdb397717688abb3244",
+      "source": {
+        "app_manifest_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "app_manifest_schema_version": "7",
+        "application_release_id": "refund-assistant-example",
+        "evidence_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "schema_version": 1
+      },
+      "suite_id": "refund-regressions"
+    }
+  ],
+  "evidence_policy": {
+    "event_projection": "runtime_public_alias_free_v1",
+    "include_artifact_text": false,
+    "include_event_payloads": false,
+    "include_tool_arguments": true,
+    "include_tool_results": false,
+    "include_transcript_text": false,
+    "max_child_sessions": 500,
+    "max_final_output_chars": 65536,
+    "max_model_steps": 4096,
+    "max_tool_calls": 4096,
+    "max_total_tokens": 9007199254740991,
+    "revision": "sha256:8033a00d4d12d6b34d720b0d0db1b8e93c92a20fc14b373e79d925d64abe245f",
+    "schema_version": 1
+  },
+  "pricing_profile": null,
+  "revision": "sha256:daea662a2477402b036467996c0f205144c0faa271ff8e9799bca7c87071b421",
+  "schema_version": 4,
+  "suites": [
+    {
+      "description": null,
+      "id": "refund-regressions",
+      "name": "Refund regressions",
+      "revision": "sha256:ed55fc0ddf94a7dd6ef6f7c17c16f65d7033ea58400e1eea939ec74c763938f0",
+      "trial_request": {
+        "timeout_seconds": 120,
+        "trial_policy": {
+          "max_concurrency": 1,
+          "minimum_passed_trials": 1,
+          "require_complete_required_evidence": true,
+          "require_zero_evaluator_errors": true,
+          "require_zero_runtime_errors": true,
+          "revision": "sha256:6eec71d36aca93895f962821d4e52c506d24228ad8bc162dd3f7b8a3a5a271db",
+          "schema_version": 1,
+          "trial_count": 1
+        },
+        "trials": 1
+      }
+    }
+  ],
+  "target_key": "refund-assistant"
+}

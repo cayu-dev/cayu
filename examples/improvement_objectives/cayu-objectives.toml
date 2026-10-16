@@ -1,0 +1,37 @@
+schema_version = 1
+
+# A person reviews 5% of the decisions that were granted autonomy.
+sampled_review_rate_bps = 500
+
+# Compared results of these suites must not regress.
+[[correctness_floor]]
+suite_id = "refund-regressions"
+metrics = ["status", "score", "reliability"]
+
+# Never removed and never granted autonomy. Without approval_gate an entry
+# covers every gate on the tool.
+[[mandatory_controls]]
+tool_name = "issue_refund"
+approval_gate = "refund-over-limit"
+
+[[mandatory_controls]]
+tool_name = "close_account"
+
+# Goals per verified completion. The Runtime records them; it does not enforce them.
+[targets]
+cost_per_verified_completion = { amount = "0.25", currency = "USD" }
+seconds_per_verified_completion = 90
+human_attention_requests_per_verified_completion = "0.2"
+
+# What a candidate change may touch. Everything else stays fixed.
+[mutable_surfaces]
+body_paths = ["prompts"]
+execution_profile = true
+model_per_step = true
+
+# Schema version 1 requires a person to approve every kind of change.
+[approval_rules]
+body_paths = "person"
+execution_profile = "person"
+model_per_step = "person"
+autonomy_grant = "person"
