@@ -147,7 +147,12 @@ def test_every_documented_root_import_is_exported() -> None:
     for path in paths:
         if not path.is_file() or path.suffix not in {".md", ".py"}:
             continue
-        for match in _ROOT_IMPORT_PATTERN.finditer(path.read_text(errors="ignore")):
+        source = path.read_text(errors="ignore")
+        if path == _REPO_ROOT / "docs" / "release-notes.md":
+            # Published notes describe their release's API and must stay intact.
+            # Continue auditing any examples in the unreleased section.
+            source = re.split(r"(?m)^## v\d+\.\d+\.\d+\b", source, maxsplit=1)[0]
+        for match in _ROOT_IMPORT_PATTERN.finditer(source):
             blob = match.group(2) or match.group(3) or ""
             for name in blob.split(","):
                 name = name.split("#")[0].strip()
