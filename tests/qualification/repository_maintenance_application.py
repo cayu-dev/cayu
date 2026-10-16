@@ -17,8 +17,12 @@ _PROBE_INPUT = "environments/range_probe.py"
 
 
 def _replace_once(source: str, original: str, replacement: str) -> str:
-    if source.count(original) != 1:
-        raise ValueError("Generated application customization no longer matches its owner.")
+    count = source.count(original)
+    if count != 1:
+        raise ValueError(
+            "Generated application customization no longer matches its owner: "
+            f"expected one {original!r}, found {count}."
+        )
     return source.replace(original, replacement, 1)
 
 
@@ -39,7 +43,9 @@ def _specialize_python(
                 continue
         body.append(node)
     if replacements:
-        raise ValueError("Generated application function owner is missing.")
+        raise ValueError(
+            f"Generated application function owner is missing: {', '.join(sorted(replacements))}."
+        )
     module.body = body
     # Removing the built-in profile and fixture-only Git materializer also removes
     # their imports. Generated code retains annotations as actual AST expressions.
@@ -743,8 +749,8 @@ def _named_checks(profile):
     )
     files["workflows/coding_product.py"] = _replace_once(
         files["workflows/coding_product.py"],
-        "    RunRequest,\n",
-        "    RunRequest,\n    RunLimits,\n",
+        "from cayu import CayuApp, Message, RunRequest\n",
+        "from cayu import CayuApp, Message, RunRequest\nfrom cayu.budgets import RunLimits\n",
     )
     files["workflows/coding_product.py"] = _replace_once(
         files["workflows/coding_product.py"],
