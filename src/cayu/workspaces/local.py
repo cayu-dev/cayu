@@ -100,6 +100,7 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPrune
             self.id = str(root_path)
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
+        self.workspace_id_explicit = workspace_id is not None
         self.root = root_path
         self.excluded_directory_names = _validate_excluded_directory_names(excluded_directory_names)
         self._excluded_directory_keys = frozenset(

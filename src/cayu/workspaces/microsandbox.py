@@ -80,6 +80,7 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
             self.id = f"microsandbox:{capability.sandbox_name}:{self.root}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
+        self.workspace_id_explicit = workspace_id is not None
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:

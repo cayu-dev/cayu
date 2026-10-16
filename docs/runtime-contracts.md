@@ -1671,6 +1671,16 @@ A policy demanding approval can also bound how long that demand stays valid: `To
 
 The approval primitive stays binary and single-party on purpose. Multi-tier business approvals — a product-computed routing tier deciding who may resolve, and approve/condition/decline outcomes mapped onto the binary decision with an audit projection of the business outcome next to the runtime decision — are an additive adapter over this surface: `TieredApprovalPolicy`, `resolve_business_approval`, and `business_approval_audit` in `cayu.approvals.business`. The audit projection treats equivalent enum-valued and plain-string known event types identically while preserving its fail-closed handling of malformed, contradictory, or identity-mismatched evidence. The adapter's tier gate is an application affordance enforced in the calling process, not a runtime security boundary (pass `resolved_by` for authenticated provenance); semantics live in the [business approvals recipe](recipes/business-approvals.md).
 
+Reusable authorization is separate policy state, not a third approval outcome.
+`ToolAuthorizationGrantPolicy` composes with any `ToolPolicy` and turns its
+REQUIRE_APPROVAL into ALLOW only when an active, unexpired grant matches the call's
+policy, tool, approval gate (`cayu:approval_gate`), scope, boundary, and exact
+matcher; it never overrides DENY and never applies to mandatory controls. Grants
+are created by `ToolAuthorizationGrantService` from the pending-approval
+checkpoint before the approval is resolved, stay inert until the runtime durably
+approves the call with the grant's own request, and record use evidence before
+each granted decision. See [tool authorization grants](tool-authorization-grants.md).
+
 For restart-safe human-attention delivery, see `cayu guide human-attention`
 ([source](../src/cayu/guides/human-attention.md)). It binds notification identity to
 the exact pending action and session incarnation, while resolution stays in Runtime.

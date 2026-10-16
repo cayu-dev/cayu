@@ -1029,6 +1029,7 @@ class RunnerWorkspace(
             self.id = f"runner:{getattr(runner, 'isolation', 'unknown')}:{self.cwd or '.'}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
+        self.workspace_id_explicit = workspace_id is not None
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:

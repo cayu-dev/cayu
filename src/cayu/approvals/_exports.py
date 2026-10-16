@@ -1,6 +1,10 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "AllowedActorsGrantAuthority": (
+        "cayu.approvals.authorization_grants",
+        "AllowedActorsGrantAuthority",
+    ),
     "BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY": (
         "cayu.approvals.business",
         "BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY",
@@ -29,6 +33,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "HumanReviewReference": ("cayu.approvals.review", "HumanReviewReference"),
     "HumanReviewSource": ("cayu.approvals.review", "HumanReviewSource"),
     "HumanReviewView": ("cayu.approvals.review", "HumanReviewView"),
+    "InMemoryToolAuthorizationGrantStore": (
+        "cayu.approvals.authorization_grants",
+        "InMemoryToolAuthorizationGrantStore",
+    ),
     "PendingToolApproval": ("cayu.approvals.tools", "PendingToolApproval"),
     "PendingToolApprovalEventView": ("cayu.approvals.tools", "PendingToolApprovalEventView"),
     "PendingToolCallApproval": ("cayu.approvals.tools", "PendingToolCallApproval"),
@@ -37,13 +45,139 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PendingToolCallApprovalEventView",
     ),
     "PendingUserInput": ("cayu.approvals.user_input", "PendingUserInput"),
+    "PreparedToolAuthorizationGrant": (
+        "cayu.approvals.authorization_grant_service",
+        "PreparedToolAuthorizationGrant",
+    ),
+    "ProcessCommandGrantMatcher": (
+        "cayu.approvals.authorization_grants",
+        "ProcessCommandGrantMatcher",
+    ),
     "ResolutionActor": ("cayu.approvals.actors", "ResolutionActor"),
     "ResolutionActorSource": ("cayu.approvals.actors", "ResolutionActorSource"),
+    "TOOL_APPROVAL_GATE_METADATA_KEY": (
+        "cayu.approvals.authorization_grants",
+        "TOOL_APPROVAL_GATE_METADATA_KEY",
+    ),
+    "TOOL_AUTHORIZATION_GRANT_METADATA_KEY": (
+        "cayu.approvals.authorization_grants",
+        "TOOL_AUTHORIZATION_GRANT_METADATA_KEY",
+    ),
+    "TOOL_AUTHORIZATION_GRANT_OFFER_METADATA_KEY": (
+        "cayu.approvals.authorization_grants",
+        "TOOL_AUTHORIZATION_GRANT_OFFER_METADATA_KEY",
+    ),
+    "TOOL_MANDATORY_APPROVAL_METADATA_KEY": (
+        "cayu.approvals.authorization_grants",
+        "TOOL_MANDATORY_APPROVAL_METADATA_KEY",
+    ),
     "TieredApprovalPolicy": ("cayu.approvals.business", "TieredApprovalPolicy"),
     "ToolApprovalDecision": ("cayu.approvals.tools", "ToolApprovalDecision"),
     "ToolApprovalRecoveryOutcome": ("cayu.approvals.tools", "ToolApprovalRecoveryOutcome"),
     "ToolApprovalRecoveryRequest": ("cayu.approvals.tools", "ToolApprovalRecoveryRequest"),
     "ToolApprovalRequest": ("cayu.approvals.tools", "ToolApprovalRequest"),
+    "ToolAuthorizationGrant": ("cayu.approvals.authorization_grants", "ToolAuthorizationGrant"),
+    "ToolAuthorizationGrantActor": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantActor",
+    ),
+    "ToolAuthorizationGrantAuthority": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantAuthority",
+    ),
+    "ToolAuthorizationGrantBoundary": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantBoundary",
+    ),
+    "ToolAuthorizationGrantConflict": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantConflict",
+    ),
+    "ToolAuthorizationGrantControl": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantControl",
+    ),
+    "ToolAuthorizationGrantCreation": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantCreation",
+    ),
+    "ToolAuthorizationGrantDenied": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantDenied",
+    ),
+    "ToolAuthorizationGrantError": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantError",
+    ),
+    "ToolAuthorizationGrantMatcherKind": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantMatcherKind",
+    ),
+    "ToolAuthorizationGrantNotFound": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantNotFound",
+    ),
+    "ToolAuthorizationGrantOffer": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantOffer",
+    ),
+    "ToolAuthorizationGrantOrigin": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantOrigin",
+    ),
+    "ToolAuthorizationGrantPrincipal": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantPrincipal",
+    ),
+    "ToolAuthorizationGrantPolicy": (
+        "cayu.approvals.authorization_grant_policy",
+        "ToolAuthorizationGrantPolicy",
+    ),
+    "ToolAuthorizationGrantQuery": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantQuery",
+    ),
+    "ToolAuthorizationGrantRequest": (
+        "cayu.approvals.authorization_grant_service",
+        "ToolAuthorizationGrantRequest",
+    ),
+    "ToolAuthorizationGrantScope": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantScope",
+    ),
+    "ToolAuthorizationGrantScopeKind": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantScopeKind",
+    ),
+    "ToolAuthorizationGrantService": (
+        "cayu.approvals.authorization_grant_service",
+        "ToolAuthorizationGrantService",
+    ),
+    "ToolAuthorizationGrantStatus": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantStatus",
+    ),
+    "ToolAuthorizationGrantStore": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantStore",
+    ),
+    "ToolAuthorizationGrantUnavailable": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantUnavailable",
+    ),
+    "ToolAuthorizationGrantUse": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantUse",
+    ),
+    "ToolAuthorizationGrantUseCursor": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantUseCursor",
+    ),
+    "ToolAuthorizationGrantUseDecision": (
+        "cayu.approvals.authorization_grants",
+        "ToolAuthorizationGrantUseDecision",
+    ),
+    "ToolCallGrantMatcher": ("cayu.approvals.authorization_grants", "ToolCallGrantMatcher"),
     "ToolPolicyEvidence": ("cayu.approvals.tools", "ToolPolicyEvidence"),
     "UserInputRecoveryRequest": ("cayu.approvals.user_input", "UserInputRecoveryRequest"),
     "UserInputResponse": ("cayu.approvals.user_input", "UserInputResponse"),
@@ -54,9 +188,18 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "business_approval_routing_metadata",
     ),
     "resolve_business_approval": ("cayu.approvals.business", "resolve_business_approval"),
+    "tool_authorization_grant_id": (
+        "cayu.approvals.authorization_grants",
+        "tool_authorization_grant_id",
+    ),
+    "tool_authorization_grant_sample_bucket": (
+        "cayu.approvals.authorization_grants",
+        "tool_authorization_grant_sample_bucket",
+    ),
 }
 
 PUBLIC_NAMES = [
+    "AllowedActorsGrantAuthority",
     "BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY",
     "BUSINESS_APPROVAL_ROUTING_METADATA_KEY",
     "BusinessApprovalError",
@@ -76,18 +219,52 @@ PUBLIC_NAMES = [
     "HumanReviewReference",
     "HumanReviewSource",
     "HumanReviewView",
+    "InMemoryToolAuthorizationGrantStore",
     "PendingToolApproval",
     "PendingToolApprovalEventView",
     "PendingToolCallApproval",
     "PendingToolCallApprovalEventView",
     "PendingUserInput",
+    "PreparedToolAuthorizationGrant",
+    "ProcessCommandGrantMatcher",
     "ResolutionActor",
     "ResolutionActorSource",
+    "TOOL_APPROVAL_GATE_METADATA_KEY",
+    "TOOL_AUTHORIZATION_GRANT_METADATA_KEY",
+    "TOOL_AUTHORIZATION_GRANT_OFFER_METADATA_KEY",
+    "TOOL_MANDATORY_APPROVAL_METADATA_KEY",
     "TieredApprovalPolicy",
     "ToolApprovalDecision",
     "ToolApprovalRecoveryOutcome",
     "ToolApprovalRecoveryRequest",
     "ToolApprovalRequest",
+    "ToolAuthorizationGrant",
+    "ToolAuthorizationGrantActor",
+    "ToolAuthorizationGrantAuthority",
+    "ToolAuthorizationGrantBoundary",
+    "ToolAuthorizationGrantConflict",
+    "ToolAuthorizationGrantControl",
+    "ToolAuthorizationGrantCreation",
+    "ToolAuthorizationGrantDenied",
+    "ToolAuthorizationGrantError",
+    "ToolAuthorizationGrantMatcherKind",
+    "ToolAuthorizationGrantNotFound",
+    "ToolAuthorizationGrantOffer",
+    "ToolAuthorizationGrantOrigin",
+    "ToolAuthorizationGrantPolicy",
+    "ToolAuthorizationGrantPrincipal",
+    "ToolAuthorizationGrantQuery",
+    "ToolAuthorizationGrantRequest",
+    "ToolAuthorizationGrantScope",
+    "ToolAuthorizationGrantScopeKind",
+    "ToolAuthorizationGrantService",
+    "ToolAuthorizationGrantStatus",
+    "ToolAuthorizationGrantStore",
+    "ToolAuthorizationGrantUnavailable",
+    "ToolAuthorizationGrantUse",
+    "ToolAuthorizationGrantUseCursor",
+    "ToolAuthorizationGrantUseDecision",
+    "ToolCallGrantMatcher",
     "ToolPolicyEvidence",
     "UserInputRecoveryRequest",
     "UserInputResponse",
@@ -95,4 +272,6 @@ PUBLIC_NAMES = [
     "business_approval_routing",
     "business_approval_routing_metadata",
     "resolve_business_approval",
+    "tool_authorization_grant_id",
+    "tool_authorization_grant_sample_bucket",
 ]

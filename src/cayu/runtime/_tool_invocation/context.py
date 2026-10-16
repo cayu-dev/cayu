@@ -45,6 +45,17 @@ def _workspace_id(
     return require_clean_nonblank(workspace_id, "workspace.id")
 
 
+def _workspace_id_explicit(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> bool:
+    if registered_environment is None or registered_environment.environment.workspace is None:
+        return False
+    return (
+        getattr(registered_environment.environment.workspace, "workspace_id_explicit", False)
+        is True
+    )
+
+
 def _workspace(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
     if registered_environment is None:
         return None

@@ -1229,6 +1229,30 @@ def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
         if downstream is None or any(guard is None for guard in guards):
             return None
         return {"then": downstream, "guards": guards}
+    from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+
+    if type(policy) is ToolAuthorizationGrantPolicy:
+        # Grant records are durable data, so only the policy's own configuration
+        # and its downstream decision participate in the profile.
+        material: dict[str, Any] = policy._execution_profile_material()
+        if policy.then is None:
+            return {**material, "then": None}
+        then = policy.then
+        downstream_material = _cayu_policy_material(then)
+        if downstream_material is not None:
+            return {
+                **material,
+                "then": {
+                    "component": f"{type(then).__module__}:{type(then).__qualname__}",
+                    "material": downstream_material,
+                },
+            }
+        then_identity = copy_execution_profile_behavior_identity(
+            getattr(then, "execution_profile_identity", None)
+        )
+        if then_identity is None:
+            return None
+        return {**material, "then": {"identity": then_identity.model_dump(mode="json")}}
     return _material_from_exact_type(policy, _cayu_policy_material_extractors())
 
 

@@ -1623,6 +1623,7 @@ class PendingToolRoundRecovery:
                     tool_call=tool_call,
                     request_metadata=pending_round.request_metadata,
                     taint_labels=approval_support.taint_labels_from_pending_tool_call(pending_call),
+                    tool_round_id=pending_round.tool_round_id,
                 )
                 if decision.decision is not ToolPolicyDecision.ALLOW:
                     continue

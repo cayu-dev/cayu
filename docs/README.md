@@ -32,6 +32,7 @@ authoritative only where a maintained guide points to the implementation or the
 - Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)
 - [GitHub delivery](github-delivery.md)
 - [Human review](human-review.md)
+- [Tool authorization grants: remembered approvals](tool-authorization-grants.md)
 - [Host-owned tool execution](host-owned-tool-execution.md)
 - [Exact immutable input resources](immutable-resources.md)
 - [Application-owned resource access](resource-access.md)

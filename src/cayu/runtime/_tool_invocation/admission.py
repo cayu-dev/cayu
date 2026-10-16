@@ -73,6 +73,7 @@ from cayu.runtime._tool_invocation.context import (
     _environment_name,
     _published_argument_presence,
     _workspace_id,
+    _workspace_id_explicit,
 )
 from cayu.runtime._tool_invocation.hooks import (
     _redact_event_for_invocation,
@@ -230,8 +231,17 @@ def _tool_effect(
 
 
 def _taint_policy(policy: ToolPolicy) -> TaintAwareToolPolicy | None:
-    while type(policy) is GuardedToolPolicy:
-        policy = policy.then
+    # Composition wrappers keep the downstream policy's protection; follow every layer.
+    from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+
+    while True:
+        if type(policy) is GuardedToolPolicy:
+            policy = policy.then
+            continue
+        downstream = policy.then if type(policy) is ToolAuthorizationGrantPolicy else None
+        if downstream is None:
+            break
+        policy = downstream
     return policy if isinstance(policy, TaintAwareToolPolicy) else None
 
 
@@ -1139,6 +1149,7 @@ class ToolInvocationAdmission:
         tool_call: runtime_records.ToolCallRequest,
         request_metadata: dict[str, Any],
         taint_labels: Iterable[str] | None = None,
+        tool_round_id: str | None = None,
     ) -> ToolPolicyResult:
         registered_tool = registered_agent.executable_tool(tool_call.name)
         error = _registered_tool_argument_error(registered_tool, tool_call.arguments)
@@ -1157,10 +1168,12 @@ class ToolInvocationAdmission:
                 agent=_copy_agent_spec(registered_agent.spec),
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
+                tool_round_id=tool_round_id,
                 tool_effect=_tool_effect(registered_agent, tool_call),
                 arguments=tool_call.arguments,
                 environment_name=_environment_name(registered_environment),
                 workspace_id=_workspace_id(registered_environment),
+                workspace_id_explicit=_workspace_id_explicit(registered_environment),
                 metadata=policy_metadata,
             )
         )

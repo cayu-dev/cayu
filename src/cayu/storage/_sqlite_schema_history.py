@@ -7,6 +7,7 @@ Migration execution, hooks and conditional column changes live in
 from __future__ import annotations
 
 from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL, SQLITE_AUXILIARY_ACCOUNTING_DDL
+from cayu.storage._authorization_grant_schema import SQLITE_TOOL_AUTHORIZATION_GRANT_DDL
 from cayu.storage._collaboration_schema import (
     SQLITE_COLLABORATION_CLARIFICATION_DDL,
     SQLITE_COLLABORATION_DDL,
@@ -719,6 +720,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     116: SQLITE_COMPLETION_VERIFIER_DISPATCH_DDL,
     117: SQLITE_COMPLETION_EVALUATION_DDL,
     118: SQLITE_RETENTION_AUDIT_DDL,
+    119: SQLITE_TOOL_AUTHORIZATION_GRANT_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,

@@ -224,6 +224,12 @@ from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
 from cayu.storage.application import ApplicationStores as ApplicationStores
 from cayu.storage.application import open_application_stores as open_application_stores
+from cayu.storage.authorization_grants_postgres import (
+    PostgresToolAuthorizationGrantStore as PostgresToolAuthorizationGrantStore,
+)
+from cayu.storage.authorization_grants_sqlite import (
+    SQLiteToolAuthorizationGrantStore as SQLiteToolAuthorizationGrantStore,
+)
 from cayu.storage.budget_ledger import SQLiteBudgetLedger as SQLiteBudgetLedger
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.evals_postgres import PostgresEvalStore as PostgresEvalStore
@@ -489,6 +495,7 @@ __all__ = [
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "SQLiteToolAuthorizationGrantStore",
     "SessionRetentionPolicy",
     "SessionRetentionTarget",
     "StorageRetentionPolicy",

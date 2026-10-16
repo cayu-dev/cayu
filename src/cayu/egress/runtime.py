@@ -1699,10 +1699,13 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         host_workspace_path: str | None,
     ) -> Workspace | None:
         if host_workspace_path is not None:
-            return LocalWorkspace(
+            workspace = LocalWorkspace(
                 host_workspace_path,
                 workspace_id=f"virtual-egress-host-mount:{host_workspace_path}",
             )
+            # The id is derived from a host path, not chosen by the application.
+            workspace.workspace_id_explicit = False
+            return workspace
         if self._workspace_factory is None:
             return None
         created = self._workspace_factory(runner)

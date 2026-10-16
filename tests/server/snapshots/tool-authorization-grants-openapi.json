@@ -1,0 +1,1314 @@
+{
+  "components": {
+    "ApiErrorResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "detail"
+      ],
+      "title": "ApiErrorResponse",
+      "type": "object"
+    },
+    "HTTPValidationError": {
+      "properties": {
+        "detail": {
+          "items": {
+            "$ref": "#/components/schemas/ValidationError"
+          },
+          "title": "Detail",
+          "type": "array"
+        }
+      },
+      "title": "HTTPValidationError",
+      "type": "object"
+    },
+    "ProcessCommandGrantMatcher": {
+      "additionalProperties": false,
+      "description": "Authorize one exact process command: argv, cwd, env, and stdin.\n\nThere are no prefixes, globs, substrings, or shell parsing. A request that\nis not an explicit process command never matches. Environment and stdin\noften carry credentials, so the grant keeps only their digest.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Argv",
+          "type": "array"
+        },
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cwd"
+        },
+        "kind": {
+          "const": "process_command",
+          "default": "process_command",
+          "title": "Kind",
+          "type": "string"
+        },
+        "private_inputs_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Private Inputs Digest",
+          "type": "string"
+        },
+        "version": {
+          "const": 1,
+          "default": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "argv",
+        "private_inputs_digest"
+      ],
+      "title": "ProcessCommandGrantMatcher",
+      "type": "object"
+    },
+    "ResolutionActorSource": {
+      "description": "How a ``ResolutionActor``'s identity claim was established.\n\n``HTTP_AUTH`` is produced only by the server layer from a verified\n``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or\nopen-access HTTP body); ``SYSTEM`` marks runtime-generated actors such as\ndeterministic approval expiry. Direct SDK callers are a trusted boundary\nand may construct system actors; HTTP bodies cannot \u2014 the server re-stamps\nopen-access bodies to ``REQUEST`` and rejects them entirely under auth.",
+      "enum": [
+        "http_auth",
+        "request",
+        "system"
+      ],
+      "title": "ResolutionActorSource",
+      "type": "string"
+    },
+    "ToolAuthorizationGrant": {
+      "additionalProperties": false,
+      "description": "Typed, versioned durable grant record.\n\n``status`` is stored lifecycle; :meth:`effective_status` adds deterministic\nexpiry. Only ``ACTIVE`` grants that have not reached ``expires_at`` can\nauthorize a call. ``STAGED`` grants are written before their approval is\nresolved and stay inert until that approval is durably approved by one of\n``resolution_request_digests``.",
+      "properties": {
+        "abandoned_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Abandoned At"
+        },
+        "abandonment_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Abandonment Reason"
+        },
+        "activated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Activated At"
+        },
+        "approval_gate": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Approval Gate"
+        },
+        "arguments_public": {
+          "default": false,
+          "title": "Arguments Public",
+          "type": "boolean"
+        },
+        "boundary": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantBoundary"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "additionalProperties": true,
+          "title": "Evidence",
+          "type": "object"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "grant_id": {
+          "title": "Grant Id",
+          "type": "string"
+        },
+        "justification": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Justification"
+        },
+        "lifetime_seconds": {
+          "anyOf": [
+            {
+              "maximum": 31622400.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lifetime Seconds"
+        },
+        "matcher": {
+          "discriminator": {
+            "mapping": {
+              "process_command": "#/components/schemas/ProcessCommandGrantMatcher",
+              "tool_call": "#/components/schemas/ToolCallGrantMatcher"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/ProcessCommandGrantMatcher"
+            },
+            {
+              "$ref": "#/components/schemas/ToolCallGrantMatcher"
+            }
+          ],
+          "title": "Matcher"
+        },
+        "origin": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantOrigin"
+        },
+        "policy_id": {
+          "title": "Policy Id",
+          "type": "string"
+        },
+        "resolution_request_digests": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Resolution Request Digests",
+          "type": "array"
+        },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revocation_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Revocation Reason"
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Revoked At"
+        },
+        "revoked_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sampled_review_rate_bps": {
+          "default": 0,
+          "maximum": 10000.0,
+          "minimum": 0.0,
+          "title": "Sampled Review Rate Bps",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantScope"
+        },
+        "status": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantStatus",
+          "default": "staged"
+        },
+        "tool_name": {
+          "title": "Tool Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "grant_id",
+        "policy_id",
+        "tool_name",
+        "matcher",
+        "scope",
+        "boundary",
+        "origin",
+        "resolution_request_digests",
+        "created_at"
+      ],
+      "title": "ToolAuthorizationGrant",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantActor": {
+      "additionalProperties": false,
+      "description": "Claims-free actor provenance recorded on grants.",
+      "properties": {
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActorSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tenant"
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "title": "ToolAuthorizationGrantActor",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantApproveBody": {
+      "additionalProperties": false,
+      "description": "Approve one pending tool call and remember it as a grant.\n\nThere is no ``resolved_by`` and no tool, argument, or decision field: the\nactor is the authenticated caller and the call is the pending snapshot.",
+      "properties": {
+        "approval_id": {
+          "minLength": 1,
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "grant": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantRequest"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "minLength": 1,
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_round_id": {
+          "minLength": 1,
+          "title": "Tool Round Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "approval_id",
+        "tool_round_id",
+        "tool_call_id",
+        "grant"
+      ],
+      "title": "ToolAuthorizationGrantApproveBody",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantBoundary": {
+      "additionalProperties": false,
+      "description": "Authorization boundary captured when the originating call paused.\n\nA grant applies only to a request with exactly the same agent, environment,\nworkspace, principal, and boundary-label values. ``principal`` is the\nsession's resource-access identity (absent matches only absent). Boundary\nlabels are session labels the application chose to require; clients can\nset labels, so they narrow a grant but are not an authority boundary.\n``workspace_explicit`` records whether the application named the workspace;\nonly such a workspace can carry workspace-scoped grants.",
+      "properties": {
+        "agent_name": {
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "principal": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workspace_explicit": {
+          "default": false,
+          "title": "Workspace Explicit",
+          "type": "boolean"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workspace Id"
+        }
+      },
+      "required": [
+        "agent_name"
+      ],
+      "title": "ToolAuthorizationGrantBoundary",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantCursor": {
+      "additionalProperties": false,
+      "description": "The exclusive position to continue a listing after.",
+      "properties": {
+        "after_created_at": {
+          "format": "date-time",
+          "title": "After Created At",
+          "type": "string"
+        },
+        "after_grant_id": {
+          "title": "After Grant Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "after_created_at",
+        "after_grant_id"
+      ],
+      "title": "ToolAuthorizationGrantCursor",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "grants": {
+          "items": {
+            "$ref": "#/components/schemas/ToolAuthorizationGrantView"
+          },
+          "title": "Grants",
+          "type": "array"
+        },
+        "next": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "grants"
+      ],
+      "title": "ToolAuthorizationGrantListResponse",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantOrigin": {
+      "additionalProperties": false,
+      "description": "Identity of the pending approval that created the grant.\n\n``session_instance_id`` is the originating session's incarnation. Session\nids can be reused after deletion, so a session grant applies only to the\nincarnation that approved it.",
+      "properties": {
+        "approval_id": {
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "session_instance_id": {
+          "title": "Session Instance Id",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_round_id": {
+          "title": "Tool Round Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "session_instance_id",
+        "approval_id",
+        "tool_round_id",
+        "tool_call_id"
+      ],
+      "title": "ToolAuthorizationGrantOrigin",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantPrincipal": {
+      "additionalProperties": false,
+      "description": "The application authorization identity a session runs under.\n\nTaken from the session's resource-access binding, which only trusted\napplication access control produces.",
+      "properties": {
+        "authority": {
+          "title": "Authority",
+          "type": "string"
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "subject"
+      ],
+      "title": "ToolAuthorizationGrantPrincipal",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantRequest": {
+      "additionalProperties": false,
+      "description": "The reusable authority a resolver asks to remember with one approval.\n\nEverything about the call itself (tool, gate, arguments, boundary) comes\nfrom the runtime's pending snapshot. ``pinned_argument_paths`` only names\nwhich snapshot values a class-of-decision grant keeps fixed.",
+      "properties": {
+        "evidence": {
+          "additionalProperties": true,
+          "title": "Evidence",
+          "type": "object"
+        },
+        "expires_in_seconds": {
+          "anyOf": [
+            {
+              "maximum": 31622400.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires In Seconds"
+        },
+        "justification": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Justification"
+        },
+        "pinned_argument_paths": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Pinned Argument Paths",
+          "type": "array"
+        },
+        "sampled_review_rate_bps": {
+          "anyOf": [
+            {
+              "maximum": 10000.0,
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sampled Review Rate Bps"
+        },
+        "scope": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantScopeKind"
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "title": "ToolAuthorizationGrantRequest",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantRevokeBody": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        }
+      },
+      "title": "ToolAuthorizationGrantRevokeBody",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantScope": {
+      "additionalProperties": false,
+      "description": "Where a grant applies: one session, or later sessions in one workspace.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantScopeKind"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ],
+      "title": "ToolAuthorizationGrantScope",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantScopeKind": {
+      "enum": [
+        "session",
+        "workspace"
+      ],
+      "title": "ToolAuthorizationGrantScopeKind",
+      "type": "string"
+    },
+    "ToolAuthorizationGrantStatus": {
+      "description": "Grant lifecycle. ``EXPIRED`` is observed, never stored.",
+      "enum": [
+        "staged",
+        "active",
+        "expired",
+        "abandoned",
+        "revoked"
+      ],
+      "title": "ToolAuthorizationGrantStatus",
+      "type": "string"
+    },
+    "ToolAuthorizationGrantUse": {
+      "additionalProperties": false,
+      "description": "Durable evidence that a grant decided one tool call.\n\nWritten before the policy returns, so the decision, its grant, scope, and\nsampling bucket can be reconstructed after a restart.",
+      "properties": {
+        "arguments_digest": {
+          "title": "Arguments Digest",
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantUseDecision"
+        },
+        "grant_id": {
+          "title": "Grant Id",
+          "type": "string"
+        },
+        "policy_id": {
+          "title": "Policy Id",
+          "type": "string"
+        },
+        "recorded_at": {
+          "format": "date-time",
+          "title": "Recorded At",
+          "type": "string"
+        },
+        "sample_bucket": {
+          "exclusiveMaximum": 10000.0,
+          "minimum": 0.0,
+          "title": "Sample Bucket",
+          "type": "integer"
+        },
+        "sampled_review_rate_bps": {
+          "maximum": 10000.0,
+          "minimum": 0.0,
+          "title": "Sampled Review Rate Bps",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantScope"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "session_instance_id": {
+          "title": "Session Instance Id",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_name": {
+          "title": "Tool Name",
+          "type": "string"
+        },
+        "tool_round_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Round Id"
+        }
+      },
+      "required": [
+        "grant_id",
+        "policy_id",
+        "scope",
+        "session_id",
+        "session_instance_id",
+        "tool_call_id",
+        "tool_name",
+        "arguments_digest",
+        "decision",
+        "sample_bucket",
+        "sampled_review_rate_bps",
+        "recorded_at"
+      ],
+      "title": "ToolAuthorizationGrantUse",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantUseDecision": {
+      "enum": [
+        "allowed",
+        "sampled_review"
+      ],
+      "title": "ToolAuthorizationGrantUseDecision",
+      "type": "string"
+    },
+    "ToolAuthorizationGrantUseListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "uses": {
+          "items": {
+            "$ref": "#/components/schemas/ToolAuthorizationGrantUse"
+          },
+          "title": "Uses",
+          "type": "array"
+        }
+      },
+      "required": [
+        "uses"
+      ],
+      "title": "ToolAuthorizationGrantUseListResponse",
+      "type": "object"
+    },
+    "ToolAuthorizationGrantView": {
+      "additionalProperties": false,
+      "description": "A grant with its expiry-aware status at response time.",
+      "properties": {
+        "effective_status": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrantStatus"
+        },
+        "grant": {
+          "$ref": "#/components/schemas/ToolAuthorizationGrant"
+        }
+      },
+      "required": [
+        "grant",
+        "effective_status"
+      ],
+      "title": "ToolAuthorizationGrantView",
+      "type": "object"
+    },
+    "ToolCallGrantMatcher": {
+      "additionalProperties": false,
+      "description": "Authorize a class of calls to one tool, optionally pinning exact values.\n\nEach pinned argument path must equal the value it had on the originating\napproval (type-strict JSON equality). Values come from the runtime's pending\nsnapshot, never from the client that creates the grant.",
+      "properties": {
+        "kind": {
+          "const": "tool_call",
+          "default": "tool_call",
+          "title": "Kind",
+          "type": "string"
+        },
+        "pinned_arguments": {
+          "additionalProperties": true,
+          "title": "Pinned Arguments",
+          "type": "object"
+        },
+        "version": {
+          "const": 1,
+          "default": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "title": "ToolCallGrantMatcher",
+      "type": "object"
+    },
+    "ValidationError": {
+      "properties": {
+        "ctx": {
+          "title": "Context",
+          "type": "object"
+        },
+        "input": {
+          "title": "Input"
+        },
+        "loc": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "title": "Location",
+          "type": "array"
+        },
+        "msg": {
+          "title": "Message",
+          "type": "string"
+        },
+        "type": {
+          "title": "Error Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "loc",
+        "msg",
+        "type"
+      ],
+      "title": "ValidationError",
+      "type": "object"
+    }
+  },
+  "paths": {
+    "/api/tool-authorization-grants": {
+      "get": {
+        "operation_id": "list_grants_api_tool_authorization_grants_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after_created_at",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Created At"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_grant_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Grant Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "origin_session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Origin Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "policy_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Policy Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ToolAuthorizationGrantScopeKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/ToolAuthorizationGrantStatus"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tool_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool Name"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolAuthorizationGrantListResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tool-authorization-grants/approve": {
+      "post": {
+        "operation_id": "approve_with_grant_api_tool_authorization_grants_approve_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantApproveBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {},
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tool-authorization-grants/{grant_id}": {
+      "get": {
+        "operation_id": "get_grant_api_tool_authorization_grants__grant_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "title": "Grant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolAuthorizationGrantView"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tool-authorization-grants/{grant_id}/reconcile": {
+      "post": {
+        "operation_id": "reconcile_grant_api_tool_authorization_grants__grant_id__reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "title": "Grant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolAuthorizationGrantView"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tool-authorization-grants/{grant_id}/revoke": {
+      "post": {
+        "operation_id": "revoke_grant_api_tool_authorization_grants__grant_id__revoke_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "title": "Grant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ToolAuthorizationGrantRevokeBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolAuthorizationGrantView"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tool-authorization-grants/{grant_id}/uses": {
+      "get": {
+        "operation_id": "list_uses_api_tool_authorization_grants__grant_id__uses_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "title": "Grant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolAuthorizationGrantUseListResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

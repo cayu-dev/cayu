@@ -542,6 +542,10 @@ class Workspace(ABC):
     """Filesystem/artifact area an agent can work in."""
 
     id: str
+    #: Whether the application chose ``id``. A derived default (a path, a
+    #: sandbox name, or a runner description) may be shared by unrelated
+    #: workspaces, so it cannot carry authority across sessions.
+    workspace_id_explicit: bool = False
 
     def reference_binding(self) -> WorkspaceReferenceBinding:
         """Bind application data to this workspace incarnation.

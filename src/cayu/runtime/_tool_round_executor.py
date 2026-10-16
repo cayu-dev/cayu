@@ -329,6 +329,7 @@ class ToolRoundExecutor:
         request_metadata: dict[str, Any],
         tool_exposure: ResolvedToolExposureAuthority | None = None,
         invocation_context: InvocationContext | None = None,
+        tool_round_id: str | None = None,
     ) -> runtime_records.ToolRoundPolicyPlan:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -392,6 +393,7 @@ class ToolRoundExecutor:
                 tool_call=tool_call,
                 request_metadata=request_metadata,
                 taint_labels=taint_labels,
+                tool_round_id=tool_round_id,
             )
             policy_outcomes.append(
                 runtime_records.ToolCallPolicyOutcome(
@@ -1285,6 +1287,7 @@ class ToolRoundRun:
                 request_metadata=self._request_metadata,
                 tool_exposure=tool_exposure,
                 invocation_context=self._invocation_context,
+                tool_round_id=tool_round_identity.tool_round_id,
             )
             await executor._session_control.raise_if_interrupted(session.id)
         except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:

@@ -235,6 +235,7 @@ def create_server(
     config: ServerConfig,
     project_context: ProjectControlPlaneContext | None = None,
     browser_recordings: Any | None = None,
+    tool_authorization_grants: Any | None = None,
     fastapi_options: Mapping[str, Any] | None = None,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -252,6 +253,9 @@ def create_server(
         project_context: Optional framework-owned project identity and storage
             assembled by ``cayu serve``. Embedded servers continue to use the
             explicit low-level Evals configuration APIs.
+        tool_authorization_grants: Optional ``ToolAuthorizationGrantServer``
+            from ``cayu.server.authorization_grants``. Its authenticated grant
+            routes are mounted under the API path; requires authenticated access.
         fastapi_options: Optional non-policy FastAPI constructor options. Cayu
             validates the option names and retains ownership of its title,
             documentation routes, and lifespan composition.
@@ -283,6 +287,16 @@ def create_server(
             raise ValueError(
                 "Recording playback requires authenticated access and application policy."
             )
+    if tool_authorization_grants is not None:
+        from cayu.server.authorization_grants import ToolAuthorizationGrantServer
+
+        if type(tool_authorization_grants) is not ToolAuthorizationGrantServer or api_auth is None:
+            raise ValueError(
+                "Tool authorization grant routes require a ToolAuthorizationGrantServer "
+                "and authenticated access."
+            )
+        if tool_authorization_grants.service.app is not app:
+            raise ValueError("Tool authorization grant routes must use this server's CayuApp.")
     dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
     lifecycle = resolved_config.lifecycle
     resolved_fastapi_options = _validate_fastapi_options(FastAPI, fastapi_options)
@@ -489,6 +503,10 @@ def create_server(
         if browser_recordings is not None:
             server.include_router(
                 browser_recordings.router(auth=api_auth), prefix=control_plane_path
+            )
+        if tool_authorization_grants is not None:
+            server.include_router(
+                tool_authorization_grants.router(auth=api_auth), prefix=control_plane_path
             )
 
     if resolved_config.dashboard.enabled:

@@ -524,6 +524,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Storage-retention audit runs and entries are new tables that older
     # binaries never read or write. Retention applies require them.
     Revision(revision=118, kind=RevisionKind.ADDITIVE, compatible_from=115),
+    # Tool authorization grants and their use evidence are new tables that
+    # older binaries never read or write. Grant stores require them.
+    Revision(revision=119, kind=RevisionKind.ADDITIVE, compatible_from=115),
 )
 
 #: The revision an empty database is initialized to.

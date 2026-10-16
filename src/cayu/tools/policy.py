@@ -8,7 +8,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from cayu._command_diagnostics import CommandDenialCode
 from cayu._validation import (
@@ -43,6 +43,9 @@ TAINT_LABELS_METADATA_KEY = "cayu:taint_labels"
 # before_tool_call hook modified the arguments. Stateful policies (rate limiters, counters, audit
 # sinks) can re-check the limit but skip re-incrementing so a hook-modified call counts once.
 TOOL_POLICY_REAUTHORIZATION_METADATA_KEY = "cayu:tool_policy_reauthorization"
+# Names the approval gate (class of decision) on a REQUIRE_APPROVAL result.
+# Re-exported as ``cayu.approvals.TOOL_APPROVAL_GATE_METADATA_KEY``.
+APPROVAL_GATE_METADATA_KEY = "cayu:approval_gate"
 
 
 class ToolPolicyRequest(BaseModel):
@@ -54,10 +57,15 @@ class ToolPolicyRequest(BaseModel):
     agent: AgentSpec
     tool_name: str
     tool_call_id: str
+    #: Runtime-owned identity of the tool round. A provider may reuse a call id
+    #: in a later round, so a logical invocation is the round and call id together.
+    tool_round_id: str | None = None
     tool_effect: ToolEffect = ToolEffect.EXTERNAL
     arguments: dict[str, Any] = Field(default_factory=dict)
     environment_name: str | None = None
     workspace_id: str | None = None
+    #: Whether the application named the workspace (see ``Workspace.workspace_id_explicit``).
+    workspace_id_explicit: StrictBool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("tool_name", "tool_call_id")
@@ -65,7 +73,7 @@ class ToolPolicyRequest(BaseModel):
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
 
-    @field_validator("environment_name", "workspace_id")
+    @field_validator("environment_name", "workspace_id", "tool_round_id")
     @classmethod
     def validate_optional_names(
         cls,
@@ -332,6 +340,9 @@ class AlwaysRequireApprovalToolPolicy(ToolPolicy):
     ``resolve_tool_approval`` without hand-writing a policy — instead of abusing a
     deny-everything rule. ``expires_in_seconds`` bounds how long the resulting
     pending approval stays resolvable before it deterministically denies.
+    ``approval_gate`` names the class of decision in the result metadata
+    (``cayu:approval_gate``), which authorization grants and mandatory controls
+    match on.
     """
 
     def __init__(
@@ -339,24 +350,39 @@ class AlwaysRequireApprovalToolPolicy(ToolPolicy):
         *,
         tools: Iterable[str] | None = None,
         expires_in_seconds: float | None = None,
+        approval_gate: str | None = None,
     ) -> None:
         self.tools = _copy_tool_name_set(tools, "tools") if tools is not None else None
+        self.approval_gate = (
+            None
+            if approval_gate is None
+            else require_clean_nonblank(approval_gate, "approval_gate")
+        )
         self.expires_in_seconds = ToolPolicyResult(
             decision=ToolPolicyDecision.REQUIRE_APPROVAL,
             approval_expires_in_seconds=expires_in_seconds,
         ).approval_expires_in_seconds
 
     def _execution_profile_material(self) -> dict[str, object]:
-        return {
+        material: dict[str, object] = {
             "tools": None if self.tools is None else sorted(self.tools),
             "expires_in_seconds": self.expires_in_seconds,
         }
+        # Omitted when unset so existing profiles keep their fingerprints.
+        if self.approval_gate is not None:
+            material["approval_gate"] = self.approval_gate
+        return material
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         if self.tools is None or request.tool_name in self.tools:
             return ToolPolicyResult(
                 decision=ToolPolicyDecision.REQUIRE_APPROVAL,
                 reason=f"Tool requires caller approval by policy: {request.tool_name}",
+                metadata=(
+                    {}
+                    if self.approval_gate is None
+                    else {APPROVAL_GATE_METADATA_KEY: self.approval_gate}
+                ),
                 approval_expires_in_seconds=self.expires_in_seconds,
             )
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)

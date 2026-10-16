@@ -110,6 +110,8 @@ _TABLES = (
     "cayu_eval_corpora",
     "cayu_storage_retention_entries",
     "cayu_storage_retention_runs",
+    "cayu_tool_authorization_grant_uses",
+    "cayu_tool_authorization_grants",
     "cayu_schema_migrations",
 )
 

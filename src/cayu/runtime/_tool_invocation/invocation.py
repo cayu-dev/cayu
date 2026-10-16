@@ -690,6 +690,7 @@ class ToolInvocation:
                     tool_call=tool_call,
                     request_metadata=request_metadata,
                     taint_labels=taint_labels,
+                    tool_round_id=tool_round_id,
                 )
             else:
                 resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
@@ -906,6 +907,7 @@ class ToolInvocation:
                     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True,
                 },
                 taint_labels=taint_labels,
+                tool_round_id=tool_round_id,
             )
             if reauthorization.decision != ToolPolicyDecision.ALLOW:
                 publication_snapshot = await publication.static_scope()
