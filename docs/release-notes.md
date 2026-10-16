@@ -1,19 +1,12 @@
 # Release notes
 
-## Unreleased
+## v0.11.3
 
-- **Breaking Python import change:** `cayu` now exposes common app/agent,
-  message/event, tool and run/resume contracts. Import specialized capabilities
-  from their public owners, such as `cayu.providers.OpenAIProvider` and
-  `cayu.storage.SQLiteSessionStore`. `cayu.runtime` exports runtime-owned
-  contracts; session requests, providers and other capabilities use their own
-  packages. Existing applications and generated projects need import updates.
-  The [migration guide](public-concepts.md#migrate-older-root-and-runtime-imports)
-  and [complete replacement map](public-api-imports.json) cover removed imports.
-  Removed names raise `ImportError` with their replacement statement, including
-  attribute access. `cayu check` reports `SCAFFOLD_IMPORT_REMOVED` before loading
-  a declared project with outdated imports. These diagnostics ship in the package.
-  Class identities, execution behavior and durable formats remain unchanged.
+Cayu strengthens session lifecycle reporting, dashboard packaging, and guarded publication.
+
+- Share typed pending-action headlines with lifecycle summaries and preserve interaction admission data across stores.
+- Derive dashboard label limits from the Python owners and validate packaged dashboard artifacts with a pinned build toolchain.
+- Harden guarded tree publication on container filesystems and improve session-store lifecycle conformance.
 
 ## v0.11.2
 
