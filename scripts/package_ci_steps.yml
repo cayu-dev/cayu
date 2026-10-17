@@ -63,6 +63,11 @@ steps:
     run: |
       unset PYTHONPATH
       .release-venv/bin/python -I scripts/smoke_built_wheel_basic_imports.py --installed-layout
+  - name: Report distribution size and core import closure
+    groups: core
+    run: |
+      unset PYTHONPATH
+      .release-venv/bin/python -I scripts/report_distribution_size.py --wheel dist/first/*.whl
   - name: Smoke-test workflow eval surface from the built wheel
     groups: core
     run: |

@@ -82,6 +82,7 @@ _RELEASE_EXACT_PATHS = {
     "scripts/check_ejected_dashboard_build.py",
     "scripts/extract_release_notes.py",
     "scripts/generate_sidecar_manifest.py",
+    "scripts/report_distribution_size.py",
     "scripts/smoke_ejected_dashboard.py",
     "scripts/smoke_built_wheel_serve.py",
     "scripts/verify_release_sidecar_artifacts.sh",

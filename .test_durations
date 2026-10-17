@@ -1,4 +1,9 @@
 {
+    "tests/core/test_distribution_size_report.py::test_closure_probe_measures_the_installed_package_without_credentials": 3.2969034580746666,
+    "tests/core/test_distribution_size_report.py::test_closure_summary_attributes_loaded_files_to_subpackages": 0.0008924159919843078,
+    "tests/core/test_distribution_size_report.py::test_physical_lines_match_python_line_endings": 0.00028083298821002245,
+    "tests/core/test_distribution_size_report.py::test_source_inventory_skips_bytecode": 0.0016317920526489615,
+    "tests/core/test_distribution_size_report.py::test_wheel_inventory_counts_only_cayu_files_by_subpackage": 0.0034503741189837456,
     "tests/core/test_send_turn_admission.py::test_turn_rejects_session_changes_after_abandoned_recovery[admission-replacement-postgres]": 4.893,
     "tests/core/test_send_turn_admission.py::test_turn_rejects_session_changes_after_abandoned_recovery[admission-replacement-sqlite]": 3.803,
     "tests/core/test_send_turn_admission.py::test_turn_rejects_session_changes_after_abandoned_recovery[admission-successor-postgres]": 4.631,
