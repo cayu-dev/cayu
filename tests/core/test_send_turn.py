@@ -24,6 +24,7 @@ from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import ToolCompletionPolicy
 from cayu.sessions import SessionStatusConflict
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.requests import ResumeRequest, copy_resume_request
 
 
@@ -612,7 +613,8 @@ def test_concurrent_turn_cannot_be_taken_over_after_selection(store_factory, mon
 
                 monkeypatch.setattr(app._session_engine, "prepare_resume", prepare)
             try:
-                with pytest.raises(SessionStatusConflict, match="run changed"):
+                # A resume pinned to the inspected epoch is fenced once another turn wins.
+                with pytest.raises(SessionRunFenced, match="expected run epoch"):
                     await send_turn(
                         app,
                         TurnRequest(

@@ -10,6 +10,7 @@ on:
       - 'tests/core/test_mcp*'
       - 'tests/fixtures/*mcp*'
       - 'tests/conftest.py'
+      - 'scripts/ci_shard_plan.py'
       - 'scripts/*mcp*'
       - 'pyproject.toml'
       - 'uv.lock'

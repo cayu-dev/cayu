@@ -648,6 +648,9 @@ def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_wait = asyncio.wait
+    # Reject heartbeats only once the model has completed, so a slow runner
+    # cannot lose the lease before model dispatch.
+    model_completed = asyncio.Event()
 
     async def force_terminal_item_and_heartbeat_into_same_done_set(
         tasks,
@@ -666,6 +669,7 @@ def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
                 and isinstance(result[0], Event)
                 and result[0].type == EventType.MODEL_COMPLETED
             ):
+                model_completed.set()
                 await asyncio.gather(*pending, return_exceptions=True)
                 return set(tasks), set()
         return done, pending
@@ -690,7 +694,9 @@ def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
             )
         ]
     )
-    ledger = RejectingHeartbeatBudgetLedger()
+    ledger = RejectingHeartbeatBudgetLedger(
+        successful_heartbeat_calls=0, reject_after=model_completed
+    )
     limit = BudgetLimit(
         scope="app",
         max_estimated_cost=Decimal("1"),

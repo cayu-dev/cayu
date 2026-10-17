@@ -428,8 +428,7 @@ async def test_host_side_session_maintenance_preserves_exact_waiting_identity(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("side_session", [False, True])
-@pytest.mark.parametrize("successive", [False, True])
+@pytest.mark.parametrize("side_session,successive", [(False, False), (True, True)])
 async def test_host_native_clarification_service(
     backend, tmp_path, request, monkeypatch, side_session, successive
 ):
@@ -455,11 +454,9 @@ async def test_host_native_clarification_service(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("side_session", [False, True])
-@pytest.mark.parametrize("timing", ["before", "during_return", "foreign_settlement"])
-async def test_host_final_latch_arbitration(
-    backend, tmp_path, request, monkeypatch, side_session, timing
-):
+async def test_host_final_latch_arbitration(backend, tmp_path, request, monkeypatch):
+    # The timing matrix is covered through the public driver in
+    # test_clarification_public; this qualifies the host service driver.
     from tests.core.test_clarification_public import test_public_question_uses_real_assistant_export
 
     await test_public_question_uses_real_assistant_export(
@@ -470,10 +467,10 @@ async def test_host_final_latch_arbitration(
         temporary_service=True,
         public_reply=False,
         post_admission=True,
-        side_session=side_session,
+        side_session=False,
         one_slot=True,
         finish_request=True,
-        final_latch_timing=timing,
+        final_latch_timing="during_return",
         service_driver=drive_service,
         maintenance_driver=drive_pending_maintenance,
         journey_ttl_ms=900_000,

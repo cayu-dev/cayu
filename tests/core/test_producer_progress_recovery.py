@@ -16,6 +16,7 @@ from cayu.collaboration.request_access import PreparedAdmissionRegistration, Req
 
 
 @pytest.mark.anyio
+@pytest.mark.store_semantics
 async def test_progress_independent_workers_reconcile_commit_ack_loss(native_stores, monkeypatch):
     values, _ = await completed_export_scenario(native_stores, monkeypatch)
     app, resolver, admission, provider, session, initialized, registration, _ = values

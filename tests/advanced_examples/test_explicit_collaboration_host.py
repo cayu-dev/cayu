@@ -235,6 +235,7 @@ async def test_example_team_rejects_invalid_roles_before_using_a_store(roles):
 
 
 @pytest.mark.anyio
+@pytest.mark.qualification
 async def test_shared_specialist_keeps_independent_inputs():
     first, second = await shared_specialist()
     assert first["request"].intent.request.sender != second["request"].intent.request.sender
@@ -748,8 +749,17 @@ async def test_example_cancellation_keeps_original_signal_and_host_handle(monkey
             await hosts[0].worker
 
 
+# One journey per target form runs on pull requests; the remaining stores
+# run in the scheduled qualification lane.
+_JOURNEY_STORES = [
+    pytest.param("memory", marks=pytest.mark.qualification),
+    pytest.param("sqlite", marks=pytest.mark.host_journey),
+    pytest.param("postgres", marks=pytest.mark.qualification),
+]
+
+
 @pytest.mark.anyio
-@pytest.mark.host_journey
+@pytest.mark.parametrize("native_stores", _JOURNEY_STORES, indirect=True)
 async def test_public_host_creation_bound_delivery_gates_continuation(
     native_stores, refusal_ledger, monkeypatch
 ):
@@ -759,7 +769,7 @@ async def test_public_host_creation_bound_delivery_gates_continuation(
 
 
 @pytest.mark.anyio
-@pytest.mark.host_journey
+@pytest.mark.parametrize("native_stores", _JOURNEY_STORES, indirect=True)
 async def test_public_host_example_delivers_and_continues_once(
     native_stores, refusal_ledger, monkeypatch, creation_bound=False
 ):

@@ -165,8 +165,21 @@ async def test_atomic_acceptance_and_exact_replay(stores):
     )
 
 
-@pytest.mark.parametrize("decision", ("continue", "fork", "fresh", "defer", "clarify", "decline"))
-@pytest.mark.parametrize("terminal_path", ("outcome", "control", "answer"))
+@pytest.mark.parametrize(
+    "decision,terminal_path",
+    # Decline returns before any terminal path, and defer/clarify reach only
+    # the control path or their own non-control branch.
+    (
+        ("continue", "answer"),
+        ("fork", "control"),
+        ("fresh", "outcome"),
+        ("defer", "outcome"),
+        ("defer", "control"),
+        ("clarify", "outcome"),
+        ("clarify", "control"),
+        ("decline", "outcome"),
+    ),
+)
 async def test_admission_progress_outcome_and_observation_are_exactly_replayable(
     stores, decision, terminal_path
 ):
@@ -924,6 +937,7 @@ async def test_public_accept_inspect_lookup_control(stores, kind):
     await application.drain_collaboration_requests()
 
 
+@pytest.mark.store_semantics
 async def test_independent_applications_accept_once(stores):
     first, resolver, values = await public_setup(stores())
     second = app(

@@ -13,6 +13,7 @@ _SCOPE_DEFINITION_PATHS = {
     ".github/workflows/qualification.yml",
     "scripts/package_ci_steps.yml",
     "scripts/run_ci.py",
+    "scripts/ci_shard_plan.py",
     "scripts/select_ci_jobs.py",
     "docs/public-api-migration.json",
     "docs/public-api-packages.json",

@@ -49,28 +49,44 @@ from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import DurableToolRecoveryEvidence, Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 
+_OUTCOME_FAULTS = (
+    ("completed", None, "completed"),
+    ("failed", None, "failed"),
+    ("not_found", None, "not_found"),
+    ("unsupported", None, "unsupported"),
+    ("conflict", None, "conflict"),
+    ("conflict", "observation-error", "conflict-postcommit"),
+    ("conflict", "observation-abandon", "conflict-abandon"),
+    ("completed", "terminal", "completed-postcommit"),
+    ("failed", "terminal", "failed-postcommit"),
+    ("not_found", "observation-error", "observation-postcommit"),
+    ("not_found", "observation-abandon", "observation-abandon"),
+    ("not_found", "unlisted-resource", "observation-unlisted-resource"),
+    ("completed", "unlisted-resource", "terminal-unlisted-resource"),
+)
+# Every row runs both modes and both gates; alternating rows cover all four
+# mode/gate pairs without the full cartesian product.
+_MODE_GATE_PAIRS = (
+    (("lookup", False), ("receipt", True)),
+    (("lookup", True), ("receipt", False)),
+)
+
 
 @pytest.mark.parametrize(
-    "outcome,fault_phase",
+    "outcome,fault_phase,mode,approval_gate",
     [
-        ("completed", None),
-        ("failed", None),
-        ("not_found", None),
-        ("unsupported", None),
-        ("conflict", None),
-        pytest.param("conflict", "observation-error", id="conflict-postcommit"),
-        pytest.param("conflict", "observation-abandon", id="conflict-abandon"),
-        pytest.param("completed", "terminal", id="completed-postcommit"),
-        pytest.param("failed", "terminal", id="failed-postcommit"),
-        pytest.param("not_found", "observation-error", id="observation-postcommit"),
-        pytest.param("not_found", "observation-abandon", id="observation-abandon"),
-        pytest.param("not_found", "unlisted-resource", id="observation-unlisted-resource"),
-        pytest.param("completed", "unlisted-resource", id="terminal-unlisted-resource"),
+        pytest.param(
+            outcome,
+            fault_phase,
+            mode,
+            approval_gate,
+            id=f"{name}-{mode}-{'approval' if approval_gate else 'ordinary'}",
+        )
+        for index, (outcome, fault_phase, name) in enumerate(_OUTCOME_FAULTS)
+        for mode, approval_gate in _MODE_GATE_PAIRS[index % 2]
     ],
 )
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("mode", ["lookup", "receipt"])
-@pytest.mark.parametrize("approval_gate", [False, True], ids=["ordinary", "approval"])
 def test_public_reconciliation_consumes_verified_outcome_without_external_replay(
     outcome,
     fault_phase,

@@ -358,7 +358,8 @@ def test_cancelled_synchronous_handler_keeps_renewing_until_thread_stops():
         )
         task = asyncio.create_task(app.run_event_watchers([watcher]))
         try:
-            async with asyncio.timeout(3):
+            # Liveness bounds only; a loaded runner can take seconds to start the thread.
+            async with asyncio.timeout(30):
                 while not started.is_set():
                     await asyncio.sleep(0.005)
             task.cancel("operator stopped waiting")
@@ -370,7 +371,7 @@ def test_cancelled_synchronous_handler_keeps_renewing_until_thread_stops():
             assert calls == 1
         finally:
             release.set()
-            async with asyncio.timeout(3):
+            async with asyncio.timeout(30):
                 while app._event_watcher_supervisor.active(watcher.name):
                     await asyncio.sleep(0.005)
         assert (

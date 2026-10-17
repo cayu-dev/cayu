@@ -14,6 +14,7 @@ INPUTS = {
     "tests/corpus.bin": b"\x00\xff\x01",
     "pyproject.toml": b"[project]\nname='fixture'\n",
     "scripts/run_runtime_qualification.py": b"# staged runner\n",
+    "scripts/ci_shard_plan.py": b"# staged store switch\n",
 }
 
 

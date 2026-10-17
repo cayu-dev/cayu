@@ -8,6 +8,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from scripts.ci_shard_plan import (
+    StoreVariant,
+    deselected_store_variants,
+    keeps_every_store,
+    store_mode,
+    store_slot,
+)
 
 from tests.sqlite_resources import SQLiteResourceScope
 
@@ -43,8 +50,12 @@ def pytest_configure(config: pytest.Config) -> None:
             "open, so the SQLite tests cannot run. Unset it; set "
             f"{_REQUIRE_POSTGRES_ENV_VAR}=1 to require the Postgres test tier."
         )
+    try:
+        store_mode()
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
     if os.environ.get("GITHUB_ACTIONS") != "true" or not (
-        config.getoption("splits", None) or config.getoption("ci_manifest", None)
+        config.getoption("splits", None) or config.getoption("ci_shard", None)
     ):
         return
     owner = os.environ.setdefault("CAYU_CI_REPORT_OWNER_PID", str(os.getpid()))
@@ -226,9 +237,9 @@ def _require_current_test_durations(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    # Manifest workers validate the exact snapshot that passed the full-suite
-    # gate. Reapplying its percentage to a smaller scope can reject valid shards.
-    if config.getoption("ci_manifest", None):
+    # The collection gate checks the full selection. Reapplying its percentage
+    # to one shard's smaller scope can reject valid shards.
+    if config.getoption("ci_shard", None):
         return
     required = (
         os.environ.get(_REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR, "").strip().lower()
@@ -251,8 +262,8 @@ def _require_current_test_durations(
     raise pytest.UsageError(
         ".test_durations is stale: "
         f"{len(unknown)} of {len(items)} collected tests lack timings "
-        f"(maximum {allowed}); run "
-        "`uv run pytest --store-durations --clean-durations`. "
+        f"(maximum {allowed}); merge CI timings with "
+        "`python3 scripts/merge_test_durations.py --run <run-id>`. "
         f"First missing tests: {examples}"
     )
 
@@ -261,14 +272,68 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    """Keep every Postgres consumer in its isolated CI lane."""
+    """Route Postgres consumers to their CI lane and apply the store switch."""
 
     for item in items:
         if item.nodeid.startswith("tests/qualification/"):
             item.add_marker(pytest.mark.qualification)
         if _requests_postgres(item):
             item.add_marker(pytest.mark.postgres)
+    _select_store_variants(config, items)
     _require_current_test_durations(config, items)
+
+
+def _comparable_parameter(callspec, name: str) -> object:
+    value = callspec.params[name]
+    simple = (str, int, float, bool, type(None))
+    if isinstance(value, simple) or (
+        isinstance(value, tuple) and all(isinstance(element, simple) for element in value)
+    ):
+        return value
+    # Objects compare by parameter position. Values from one multi-argument
+    # parameter set never match across store variants, so those stay selected.
+    return ("index", callspec.indices.get(name))
+
+
+def _store_variant(position: int, item: pytest.Item) -> StoreVariant:
+    function = f"{item.parent.nodeid}::{getattr(item, 'originalname', item.name)}"
+    protected = item.get_closest_marker("store_semantics") is not None or keeps_every_store(
+        item.nodeid
+    )
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return StoreVariant(position, (function, ()), None, protected)
+    names = tuple(sorted(callspec.params))
+    values = tuple(_comparable_parameter(callspec, name) for name in names)
+    store, masked = store_slot(values)
+    if store is None:
+        # A bool or None value can select the backend (durable=False/True with
+        # ids memory/sqlite); its parameter IDs then name the store. Every
+        # other value stays in the group, so cases that differ in anything but
+        # that selector are never twins.
+        id_store, id_masked = store_slot(tuple(getattr(callspec, "_idlist", ())))
+        if id_store is not None:
+            fixed = tuple(
+                (name, value)
+                for name, value in zip(names, values, strict=True)
+                if value is not None and type(value) is not bool
+            )
+            return StoreVariant(position, (function, "ids", id_masked, fixed), id_store, protected)
+    return StoreVariant(position, (function, names, masked), store, protected)
+
+
+def _select_store_variants(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Under ``CAYU_TEST_STORES=sqlite``, skip memory/Postgres twins of SQLite variants."""
+
+    skipped = deselected_store_variants(
+        (_store_variant(position, item) for position, item in enumerate(items)), store_mode()
+    )
+    if not skipped:
+        return
+    config.hook.pytest_deselected(
+        items=[item for position, item in enumerate(items) if position in skipped]
+    )
+    items[:] = [item for position, item in enumerate(items) if position not in skipped]
 
 
 @pytest.fixture(scope="session")

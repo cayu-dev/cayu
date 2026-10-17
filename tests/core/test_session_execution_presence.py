@@ -1190,7 +1190,9 @@ def test_sqlite_owner_writes_follow_heartbeat_cadence_not_delta_count(
                 )
             )
             try:
-                await asyncio.wait_for(streamed.wait(), 30)
+                # Liveness bound only; the cadence bound below scales with the
+                # measured elapsed time.
+                await asyncio.wait_for(streamed.wait(), 120)
                 await asyncio.sleep(0.2)
             finally:
                 finish.set()

@@ -6,6 +6,8 @@ from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
 _CI_WORKFLOW = _REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+_PYTHON_TESTS_WORKFLOW = _REPOSITORY_ROOT / ".github" / "workflows" / "python-tests.yml"
+_NIGHTLY_WORKFLOW = _REPOSITORY_ROOT / ".github" / "workflows" / "nightly.yml"
 _CI_RUNNER = _REPOSITORY_ROOT / "scripts" / "run_ci.py"
 _PACKAGE_MANIFEST = _REPOSITORY_ROOT / "scripts" / "package_ci_steps.yml"
 _TAG_VERIFIER = _REPOSITORY_ROOT / ".github" / "actions" / "verify-release-tag" / "action.yml"
@@ -45,14 +47,21 @@ def _job_ids(workflow: str) -> set[str]:
 
 def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     workflow = _CI_WORKFLOW.read_text()
+    tests = _PYTHON_TESTS_WORKFLOW.read_text()
+    test_references = [
+        reference
+        for job_name in ("test-collection", "test_shards", "test_specialists")
+        for reference in _action_references(_job_block(tests, job_name))
+        if not reference.startswith("./")
+    ]
+    assert test_references
+    assert all(_COMMIT_PIN.fullmatch(reference) for reference in test_references)
     references = [
         reference
         for job_name in (
             "verification-scope",
             "static",
-            "test-collection",
-            "test_shards",
-            "test_specialists",
+            "python-tests",
             "sqlite-cancellation",
             "package-build",
             "package",
@@ -75,9 +84,7 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
     assert _job_ids(workflow) == {
         "verification-scope",
         "static",
-        "test-collection",
-        "test_shards",
-        "test_specialists",
+        "python-tests",
         "sqlite-cancellation",
         "package-build",
         "package",
@@ -86,8 +93,11 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
         "publish",
         "github-release",
     }
-    for core_job in ("static", "test-collection", "test_shards", "test_specialists"):
+    for core_job in ("static", "python-tests"):
         assert "startsWith(github.ref, 'refs/tags/v')" not in _job_block(workflow, core_job)
+    tests = _job_block(workflow, "python-tests")
+    assert "uses: ./.github/workflows/python-tests.yml" in tests
+    assert "stores: ${{ github.event_name == 'pull_request' && 'sqlite' || 'all' }}" in tests
     scope = _job_block(workflow, "verification-scope")
     assert "python3 scripts/select_ci_jobs.py" in scope
     assert 'if test "$EVENT_NAME" != "pull_request"' in scope
@@ -97,8 +107,9 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
 
 
 def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
-    workflow = _CI_WORKFLOW.read_text()
+    workflow = _PYTHON_TESTS_WORKFLOW.read_text()
     runner = _CI_RUNNER.read_text()
+    plan = (_REPOSITORY_ROOT / "scripts" / "ci_shard_plan.py").read_text()
     shards = _job_block(workflow, "test_shards")
     specialists = _job_block(workflow, "test_specialists")
 
@@ -111,8 +122,12 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         "conformance-subset",
     )
     for job in (shards, specialists, qualification, mcp):
-        assert "actions/upload-artifact@" not in job
         assert "continue-on-error" not in job
+    for job in (shards, specialists, qualification):
+        # Only measured durations leave a test job.
+        assert job.count("actions/upload-artifact@") == 1
+        assert "name: test-durations-" in job
+    assert "actions/upload-artifact@" not in mcp
 
     for job, packages in (
         (shards, "packages: ripgrep ffmpeg\n          commands: rg ffmpeg"),
@@ -122,42 +137,47 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         assert packages in job
         assert job.index(packages) < job.index("scripts/run_ci.py")
 
+    # Matrices follow the caller's store mode; scripts/ci_shard_plan.py owns counts.
     assert "github.event_name == 'pull_request'" not in shards
-    assert "timeout-minutes: 45" in shards
-    assert (
-        "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]"
-        in shards
-    )
+    assert "timeout-minutes: 30" in shards
+    assert "shard: ${{ fromJSON(inputs.stores == 'sqlite' && '[1, 2, 3," in shards
+    assert "CAYU_TEST_STORES: ${{ inputs.stores }}" in shards
+    assert "needs:" not in shards
     assert 'scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"' in shards
-    assert '"not (stress or qualification or postgres or browser_docker or host_journey)"' in runner
-    assert "_GENERAL_SHARDS = 32" in runner
+    assert '"not (stress or qualification or postgres or browser_docker or host_journey)"' in plan
+    assert '"postgres and not (stress or qualification or host_journey)"' in plan
+    assert '"host_journey and not (stress or qualification)"' in plan
+    assert '"stress or qualification"' in plan
     assert "-n 2" not in runner
     assert "--cov" not in runner
     assert "COVERAGE_FILE" not in runner
 
     assert "github.event_name == 'pull_request'" not in specialists
-    assert "timeout-minutes: 45" in specialists
+    assert "timeout-minutes: 30" in specialists
     assert "stress-process" not in specialists
-    for group in range(1, 13):
-        assert f"- postgres-conformance-{group}\n" in specialists
-    assert "postgres-conformance-13" not in specialists
+    assert '"postgres-conformance-12"' in specialists
+    assert '"postgres-conformance-13"' not in specialists
     assert "scripts/run_ci.py --lane specialist" in specialists
     assert '--specialist-lane "${{ matrix.lane }}"' in specialists
-    assert '"stress or qualification", 8, group' in runner
-    assert '"postgres and not (stress or qualification or host_journey)"' in runner
-    for group in range(1, 4):
-        assert f"- host-journey-{group}\n" in specialists
+    assert '"host-journey-2"' in specialists
+    assert '"host-journey-3"' not in specialists
     assert "--cov" not in specialists
     assert "COVERAGE_FILE" not in specialists
+
+    nightly = _NIGHTLY_WORKFLOW.read_text()
+    assert "schedule:" in nightly and "workflow_dispatch:" in nightly
+    assert "uses: ./.github/workflows/python-tests.yml" in nightly
+    assert "stores: all" in nightly
 
 
 def test_every_apt_install_uses_the_bounded_shared_mirror_step() -> None:
     step = "        timeout-minutes: 5\n        uses: ./.github/actions/install-system-packages\n"
     ci = _CI_WORKFLOW.read_text()
+    tests = _PYTHON_TESTS_WORKFLOW.read_text()
     qualification = (_REPOSITORY_ROOT / ".github/workflows/qualification.yml").read_text()
     for workflow, job in (
-        (ci, "test_shards"),
-        (ci, "test_specialists"),
+        (tests, "test_shards"),
+        (tests, "test_specialists"),
         (ci, "package-build"),
         (ci, "package"),
         (qualification, "qualification"),
@@ -273,7 +293,7 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
-        "needs: [static, test-collection, test_shards, test_specialists, sqlite-cancellation, package-build, package, "
+        "needs: [static, python-tests, sqlite-cancellation, package-build, package, "
         "dashboard, release-qualification]" in publish
     )
     assert (
@@ -402,16 +422,11 @@ def test_ci_triggers_skip_main_pushes_and_cover_draft_transitions() -> None:
 def test_draft_prs_skip_every_independent_worker_before_allocation() -> None:
     workflow = _CI_WORKFLOW.read_text()
     draft_guard = "    if: github.event_name != 'pull_request' || !github.event.pull_request.draft"
-    for name in (
-        "verification-scope",
-        "static",
-        "test-collection",
-        "test_shards",
-        "test_specialists",
-    ):
+    for name in ("verification-scope", "static", "python-tests"):
         block = _job_block(workflow, name)
         assert draft_guard in block
-        assert block.index(draft_guard) < block.index("runs-on:")
+        start = block.index("runs-on:") if "runs-on:" in block else block.index("uses:")
+        assert block.index(draft_guard) < start
     for name in ("sqlite-cancellation", "package-build", "dashboard"):
         assert "needs: verification-scope" in _job_block(workflow, name)
     assert "needs: package-build" in _job_block(workflow, "package")

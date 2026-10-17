@@ -161,6 +161,11 @@ async def test_transport_failure_settles_or_fences_command(acknowledged, policy)
 
 @pytest.mark.anyio
 async def test_constructor_rollback_retains_stop_across_repeated_cancellation(monkeypatch):
+    # The registry is process-wide. Settle rollback an earlier test left behind
+    # on a loaded worker, then clear what it recorded, so the exact counts and
+    # removals below are this test's own.
+    reset_fake_module()
+    assert await MicrosandboxRunner.drain_failed_creations(timeout_s=30) == 0
     reset_fake_module()
     setup = asyncio.Event()
     cleaning = asyncio.Event()

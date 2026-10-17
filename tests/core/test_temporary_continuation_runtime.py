@@ -90,7 +90,7 @@ async def test_bound_participant_service_uses_real_resume_preparation(
             open_question=True,
             session_store=store,
             budget_binding=budget_binding,
-            service_timeout_ms=120_000 if registration_failure == "timeout" else None,
+            service_timeout_ms=30_000 if registration_failure == "timeout" else None,
         )
         async with source._transaction(initial.binding.application_scope, write=False) as tx:
             opening = ClarificationOpenReceipt.model_validate(

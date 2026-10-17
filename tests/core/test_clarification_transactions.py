@@ -309,6 +309,7 @@ async def test_native_competing_question_workers_replay_once(stores):
         )
 
 
+@pytest.mark.store_semantics
 async def test_native_reply_and_cancellation_workers_elect_once(stores):
     store = stores()
     initial, command = await preparation(store)

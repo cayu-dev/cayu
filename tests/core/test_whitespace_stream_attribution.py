@@ -150,7 +150,12 @@ async def test_http_adapter_preserves_whitespace_and_closes_locally(
         payload = events[-1].payload
         assert payload["provider_deadline_kind"] == "semantic_idle"
         assert payload["provider_semantic_idle_elapsed_s"] >= 0.15
-        assert payload["provider_excluded_semantic_pause_s"] > 0
+        # Consumer pauses are excluded only after a delta reaches the consumer.
+        # A loaded runner can expire the 0.15s budget before the first one.
+        if received:
+            assert payload["provider_excluded_semantic_pause_s"] > 0
+        else:
+            assert payload["provider_excluded_semantic_pause_s"] == 0
         assert payload["provider_effect_outcome"] == "unknown"
         assert payload["provider_recovery_disposition"] == "manual_settlement_required"
         restored = model_provider_error_from_payload(payload, fallback_provider="openai")

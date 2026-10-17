@@ -7,6 +7,7 @@ must never authenticate decoded protocol activity or semantic model progress.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
@@ -540,22 +541,48 @@ class ProviderStreamDeadlineController:
             raise ValueError("At least one deadline kind is required.")
         now = self._loop.time()
         remaining = min(self._deadline_at(kind) - now for kind in selected)
-        if remaining <= 0:
-            close = getattr(awaitable, "close", None)
-            if callable(close):
-                close()
+        if remaining <= 0 and inspect.iscoroutine(awaitable):
+            awaitable.close()
             expiry = self.evidence(selected, now=now)
             cleanup_failed = await self._confirm_cleanup_expiry(expiry)
             raise ProviderStreamDeadlineExceeded(expiry, stream_cleanup_failed=cleanup_failed)
+        # The decision is taken before the read starts: progress or terminal
+        # evidence the late read records during its start turn cannot revive it.
+        late_expiry = (
+            (self.evidence(selected, now=now), self._terminal_observed) if remaining <= 0 else None
+        )
+        # Once an expiry is decided, terminal evidence recorded afterwards can
+        # no longer let the read outlast that expiry or caller cancellation.
+        decided_terminal = None if late_expiry is None else late_expiry[1]
         operation = asyncio.ensure_future(awaitable)
         interrupted = False
         try:
+            if late_expiry is not None:
+                # Closing an unstarted __anext__() would throw GeneratorExit into
+                # the whole provider generator and run its async cleanup
+                # synchronously. Start the read for one turn so the expiry below
+                # cancels it and hands it to the iterator owner. The yield stays
+                # inside this try so caller cancellation still retains the read.
+                await asyncio.sleep(0)
             while True:
                 now = self._loop.time()
                 remaining = min(self._deadline_at(kind) - now for kind in selected)
-                if remaining <= 0:
-                    terminal_was_observed = self._terminal_observed
-                    expiry = self.evidence(selected, now=now)
+                if late_expiry is not None or remaining <= 0:
+                    if late_expiry is not None:
+                        expiry, terminal_was_observed = late_expiry
+                    else:
+                        terminal_was_observed = self._terminal_observed
+                        expiry = self.evidence(selected, now=now)
+                    decided_terminal = terminal_was_observed
+                    # A late read that finished in its start turn did not
+                    # resist cancellation; only its result is discarded.
+                    finished_unprompted = (
+                        late_expiry is not None
+                        and operation.done()
+                        and not operation.cancelled()
+                        and operation.exception() is None
+                    )
+                    late_expiry = None
                     interrupted = operation.cancel()
                     # Bundled semantic reads may join nested HTTP shutdown within
                     # a finite grace. Other deadline kinds keep immediate handoff;
@@ -592,7 +619,7 @@ class ProviderStreamDeadlineController:
                             operation_failure
                         ):
                             raise operation_failure
-                        cleanup_failed = True
+                        cleanup_failed = not finished_unprompted
                     self._await_ownership.retain(operation)
                     raise ProviderStreamDeadlineExceeded(
                         expiry,
@@ -651,7 +678,9 @@ class ProviderStreamDeadlineController:
                 ) from None
             raise
         except BaseException as failure:
-            terminal_was_observed = self._terminal_observed
+            terminal_was_observed = (
+                self._terminal_observed if decided_terminal is None else decided_terminal
+            )
             if not operation.done() and not interrupted:
                 interrupted = operation.cancel()
             if isinstance(failure, asyncio.CancelledError):

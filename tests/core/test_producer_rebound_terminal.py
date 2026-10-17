@@ -24,10 +24,11 @@ from cayu.tools.user_input import UserInputTool
 @pytest.mark.parametrize(
     ("termination", "gate", "closure_kind"),
     [(kind, "input", "cancel") for kind in ("failure", "stop", "cancel")]
+    # Cancellation races a gate-specific rebind; expiry has no race, so one gate covers it.
     + [
-        ("stop_paused", gate, kind)
-        for gate in ("input", "approval")
-        for kind in ("cancel", "expire")
+        ("stop_paused", "input", "cancel"),
+        ("stop_paused", "approval", "cancel"),
+        ("stop_paused", "approval", "expire"),
     ],
 )
 async def test_rebound_producer_terminal_and_progress(

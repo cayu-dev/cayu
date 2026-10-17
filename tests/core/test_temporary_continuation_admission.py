@@ -281,6 +281,7 @@ def test_admission_reconciliation_replays_competing_native_publication(store_fac
     asyncio.run(run_owned(store_factory, run))
 
 
+@pytest.mark.store_semantics
 def test_prepared_exclusion_and_native_admission_have_one_winner(store_factory):
     from cayu.collaboration._permits import ReceivingSettlementReceipt
     from cayu.sessions.memory import InMemorySessionStore

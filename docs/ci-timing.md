@@ -100,10 +100,8 @@ backend coverage and artifact checks remain intact.
 Use the same lane runner with optional process measurements:
 
 ```bash
-python3 scripts/run_ci.py --lane collection --test-manifest /tmp/ci-tests.json
 python3 scripts/run_ci.py --lane general --shard 1 \
-  --test-manifest /tmp/ci-tests.json --test-workers 4 \
-  --profile-tests /tmp/ci-profile
+  --test-workers 4 --profile-tests /tmp/ci-profile
 ```
 
 The report is written to `/tmp/ci-profile/general-1.json` and printed as one
@@ -115,9 +113,9 @@ The complete local CI runner accepts these options too; its parallel shards
 write separate reports to the requested directory.
 
 `--test-workers` accepts 1–8 workers for general and parallel specialist lanes.
-The default remains two. Qualification and host-journey lanes always retain one
-worker because their fixtures create their own concurrency. File scheduling,
-manifest assignments and required backend flags are unchanged.
+The default is four. Qualification and host-journey lanes always retain one
+worker because their fixtures create their own concurrency. Work-stealing
+distribution, shard plan assignments and required backend flags are unchanged.
 
 The report distinguishes these measurements:
 
@@ -152,8 +150,8 @@ and final process exit remain part of the outer command timing.
 ### Compare worker counts
 
 The manual **CI execution profiling** workflow runs general shard 1 and PostgreSQL
-shard 1 with 2, 4 and 8 workers, using an exact commit SHA and one preflight
-manifest. Each lane, worker count and repetition gets its own job: six jobs for
+shard 1 with 2, 4 and 8 workers, using an exact commit SHA and the pull request
+shard plan. Each lane, worker count and repetition gets its own job: six jobs for
 one repetition, twelve for the default two. At most two jobs run concurrently.
 Use one repetition for a preliminary observation and both before drawing a
 performance conclusion.

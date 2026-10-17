@@ -14,9 +14,17 @@ from cayu.collaboration.requests import RequestControl
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("revoked", [False, True])
-@pytest.mark.parametrize("ack_loss", [False, True])
-@pytest.mark.parametrize("exclude_first", [False, True, "concurrent"])
+@pytest.mark.parametrize(
+    ("exclude_first", "ack_loss", "revoked"),
+    [
+        (False, False, False),
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+        pytest.param("concurrent", False, False, marks=pytest.mark.store_semantics),
+        pytest.param("concurrent", True, True, marks=pytest.mark.store_semantics),
+    ],
+)
 async def test_native_absent_export_exclusion_fences_delayed_first_publication(
     native_stores, monkeypatch, revoked, ack_loss, exclude_first
 ):

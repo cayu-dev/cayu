@@ -33,8 +33,9 @@ Merging or pushing directly to `main` does not automatically run CI. Maintainers
 can run `ci.yml` manually against a selected branch or tag from the Actions UI or
 with `gh workflow run ci.yml --ref <branch-or-tag>`. Manual runs validate without
 publishing. `v*` tag pushes retain release validation and gated publishing.
-Full-scale qualification also retains its separate nightly schedule and manual
-trigger.
+`nightly.yml` runs the Python test jobs with every store each night and on
+manual dispatch. Full-scale qualification also retains its separate nightly
+schedule and manual trigger.
 
 ## Before you start: search first
 
@@ -148,8 +149,19 @@ make unsupported or upstream-blocked scenarios explicit.
 uv run pytest                                  # full suite, serial
 uv run pytest -n 3 --dist loadfile             # full suite, conservative parallelism
 uv run pytest tests/core -q                    # focused runs are fine while iterating
-uv run pytest --store-durations --clean-durations  # refresh CI's .test_durations snapshot
+CAYU_TEST_STORES=sqlite uv run pytest tests/core/test_x.py  # the store variants a PR runs
+python3 scripts/merge_test_durations.py --run <nightly-run-id>  # refresh .test_durations
 ```
+
+Store-parametrized tests run every store (memory, SQLite and Postgres) by default.
+`CAYU_TEST_STORES=sqlite`, which pull request CI sets, skips a memory or Postgres
+variant when the same test with otherwise identical parameters has a SQLite variant.
+Every store also runs for tests in storage modules (file names with `conformance`, `store`,
+`storage`, `repository`, `migration`, `ledger`, `race` or `concurrency`) and for tests
+whose names mention races, concurrency, competing, contention, interleaving, serializing,
+locks or clocks (`keeps_every_store` in `scripts/ci_shard_plan.py`). Mark any other test
+whose store variants all matter with `@pytest.mark.store_semantics`. Nightly,
+release-tag and manual CI runs use `CAYU_TEST_STORES=all`.
 
 The modern MCP stdio suite (`uv run pytest tests/core/test_mcp_stdio_modern.py -q`)
 runs both deterministic fault fixtures and a real official MCP Python SDK server.
@@ -353,43 +365,56 @@ configured job timeouts are ceilings, not measured completion times. See
 `.github/workflows/ci.yml` for current limits. A small fail-open path selector additionally
 runs the retained SQLite cancellation, package/sidecar, and dashboard gates whenever their
 contracts can change. Release tags and manual CI dispatch run every retained gate.
-Duration-balanced general tests run across 32 jobs, and Postgres conformance
-runs across twelve jobs. General and Postgres shards use two pytest workers with file-level scheduling
-to preserve module fixture isolation. Ordinary process recovery regressions remain in the PR gate.
-Tests marked `stress` or `qualification`, including full-scale evidence and capacity checks,
-run separately across eight shards in `qualification.yml`, daily and on manual dispatch.
-A single unsharded collection job runs before the general and specialist matrices. It
-reports import and collection errors directly and rejects a duration snapshot after more
-than 5% of collected tests lack timings. Run it locally with
-`python3 scripts/run_ci.py --lane collection` (no Docker daemon required). Record new test
-timings with `uv run pytest <changed-test-paths> --store-durations`; this preserves the
-existing snapshot entries. Use the full refresh command above when replacing the snapshot.
+The Python test jobs live in `.github/workflows/python-tests.yml`, which `ci.yml` and
+`nightly.yml` call with a store mode. Pull requests run SQLite store variants across 43
+general shards, six Postgres shards, two host-journey shards and the browser-docker lane.
+Release tags, manual runs and the nightly run every store across 32 general and twelve
+Postgres shards. General and Postgres shards use four pytest workers with work stealing, so
+idle workers take tests from a large file. Ordinary process recovery regressions remain
+in the PR gate. Tests marked `stress` or `qualification`, including full-scale evidence and
+capacity checks, run separately across eight shards in `qualification.yml`, daily and on
+manual dispatch.
 
-Hosted collection also writes a test manifest. Each shard downloads it and collects only
-files containing its assigned tests. The manifest retains pytest's marker selection,
-`least_duration` assignments, original test order and `loadfile` worker scheduling.
-Workers reject changed source, Python/pytest versions, timing snapshots, collected node IDs
-or routing markers. The duration freshness percentage is checked against the full preflight
-inventory. Worker collection time is printed when each worker finishes.
+Shards do not wait for collection. `scripts/ci_shard_plan.py` assigns whole test files to
+shards by bin-packing each file's summed `.test_durations` (files without timings get a
+default weight). A file is split across shards only when one lane would spend more than
+eight minutes on it; each piece takes a fixed subset of the file's node IDs. Each shard
+collects only its own files and applies its lane's marker expression, so every collected
+test runs in exactly one shard of its lane. Print the plan with
+`python3 scripts/run_ci.py --lane plan --stores sqlite` (or `--stores all`), and one shard's
+files with `python3 scripts/ci_shard_plan.py --lane general-3`.
 
-To use the same handoff locally, start from a clean source and test checkout:
+A single unsharded collection job runs alongside the shards. It reports import and
+collection errors directly, rejects a duration snapshot after more than 5% of collected tests
+lack timings, and fails if a collected test belongs to a lane whose shards would not collect
+its file (for example a `host_journey` marker applied from a helper the test module never
+names). Run it locally with `python3 scripts/run_ci.py --lane collection` (no Docker daemon
+required).
+
+Every test job uploads its measured timings as a `test-durations-<lane>` artifact. Refresh
+the snapshot from a completed nightly run, which also uploads the full `collected-test-ids`
+list so removed tests are dropped:
 
 ```bash
-python3 scripts/run_ci.py --lane collection --test-manifest /tmp/cayu-tests.json
-python3 scripts/run_ci.py --lane general --shard 1 --test-manifest /tmp/cayu-tests.json
+python3 scripts/merge_test_durations.py --run <run-id>
+python3 scripts/run_ci.py --lane plan --stores sqlite  # check the resulting balance
 ```
 
-Omitting `--test-manifest` retains ordinary full collection for a standalone lane. The complete
-local verification command below generates and uses a manifest automatically. Hosted manifests
-are retained for seven days; rerun collection with the dependent jobs if that artifact expires.
-CI and qualification use separate artifact names, including when release CI calls qualification.
-This reduces repeated collection work; it does not establish an end-to-end CI completion target.
+A pull request run refreshes the timings it measured but drops nothing; pass
+`--input DIRECTORY` to merge artifacts you already downloaded.
+
+Which lane runs a test depends on markers that only collection resolves, so the planner
+estimates it from the node ID and the test file. The collection job uploads
+`test-lanes-<stores>` with each collected test's lane, and the merge script records in
+`.test_lanes` the timed tests whose lane differs from that estimate. A nightly run refreshes
+the `all` corrections and a pull request run the `sqlite` ones; refresh both when the plan
+looks unbalanced.
 
 Use the [CI timing reporter](docs/ci-timing.md) to compare completed workflows,
 including retries, job waiting and individual step durations.
 The same guide describes optional per-worker CPU, memory and I/O profiling with
 `--profile-tests DIRECTORY` and worker-count experiments with
-`--test-workers 1..8`. Defaults remain two workers for parallel lanes and one
+`--test-workers 1..8`. Defaults are four workers for parallel lanes and one
 for qualification/host-journey lanes. The manual CI execution profiling workflow
 compares representative shards without changing ordinary PR verification.
 
@@ -415,10 +440,11 @@ exact checked-out head, rejects tracked worktree or index changes, and executes 
 fresh detached worktree. Source untracked paths are recorded but never copied into the execution
 checkout, so they cannot affect imports, test collection, or results attributed to the commit. The
 runner revalidates the detached head and tracked tree before issuing successful proof. It runs the
-hosted lanes with two concurrent general-shard workers and writes
+hosted pull request lanes (`--stores sqlite`; pass `--stores all` for the release set) with
+two concurrent general shards and writes
 `/tmp/cayu-local-ci-proof-<sha>.md` with commands, results, durations, pass/skip counts, platform,
 and limitations. Use `--all` to retain every optional PR lane regardless of changed paths. Set
-`--jobs 1` for the lowest local resource usage or increase it up to `--jobs 32` on a dedicated
+`--jobs 1` for the lowest local resource usage or increase it up to `--jobs 43` on a dedicated
 machine; specialist, database-conformance, SQLite, dashboard, and package lanes remain serial to
 avoid compounding their resource contention.
 

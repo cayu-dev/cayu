@@ -11,36 +11,49 @@ from types import SimpleNamespace
 
 import pytest
 from scripts import ci_test_profile as profile
-from tests.core.test_ci_test_manifest import _pytest as manifest_pytest
-from tests.core.test_ci_test_manifest import manifest_project as manifest_project
+from scripts.ci_shard_plan import build_plan
+from tests.core.test_ci_test_shards import _pytest as shard_pytest
+from tests.core.test_ci_test_shards import shard_project as shard_project
 
 _ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("workers", [2, 4, 8])
-def test_profile_composes_with_manifest_selection_without_changing_assignments(
-    manifest_project, tmp_path, workers
+def test_profile_composes_with_shard_selection_without_changing_assignments(
+    shard_project, tmp_path, workers
 ):
-    root, manifest = manifest_project
+    root = shard_project
+    lane = next(
+        lane.name
+        for lane in build_plan(root, "sqlite").lanes.values()
+        if lane.family == "general" and "tests/test_beta.py" in lane.paths
+    )
+    env = {"CAYU_TEST_STORES": "sqlite"}
+    nodes = [
+        line
+        for line in shard_pytest(
+            root, "--collect-only", "-q", "--ci-shard", lane, env=env
+        ).stdout.splitlines()
+        if line.startswith("tests/")
+    ]
     output = tmp_path / "profile.json"
-    result = manifest_pytest(
+    result = shard_pytest(
         root,
         "-q",
         "-n",
         str(workers),
         "--dist",
         "loadfile",
-        "--ci-manifest",
-        str(manifest),
-        "--ci-lane",
-        "general-1",
+        "--ci-shard",
+        lane,
         "-p",
         "scripts.ci_test_profile",
         "--ci-profile",
         str(output),
+        env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    nodes = json.loads(manifest.read_text())["lanes"]["general-1"]
+    assert nodes
     report = json.loads(output.read_text())
     expected = {"count": len(nodes), "nodeids_sha256": profile._digest(nodes)}
     assert report["executed"] == expected
@@ -387,8 +400,6 @@ def test_manual_workflow_profiles_each_requested_configuration_once(
                     [
                         "scripts/run_ci.py",
                         *selection,
-                        "--test-manifest",
-                        str(Path(env["RUNNER_TEMP"]) / "profile-manifest.json"),
                         "--test-workers",
                         str(count),
                         "--profile-tests",

@@ -90,6 +90,7 @@ async def test_terminal_original_wait_after_service(
 
 
 @pytest.mark.anyio
+@pytest.mark.store_semantics
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 @pytest.mark.parametrize("worker_offset", [-3600, 3600])
 async def test_public_service_clock_skew_keeps_dispatch_bounded(
@@ -109,31 +110,16 @@ async def test_public_service_clock_skew_keeps_dispatch_bounded(
 
 
 @pytest.mark.anyio
+@pytest.mark.store_semantics
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("timing", ["before", "during_return", "foreign_settlement"])
-async def test_public_side_service_final_latch_arbitration(
-    backend, tmp_path, request, monkeypatch, timing
-):
-    await test_public_question_uses_real_assistant_export(
-        backend,
-        tmp_path,
-        request,
-        monkeypatch,
-        temporary_service=True,
-        public_reply=False,
-        post_admission=True,
-        side_session=True,
-        finish_request=True,
-        final_latch_timing=timing,
-    )
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("timing", ["before", "during_return", "foreign_settlement"])
+@pytest.mark.parametrize(
+    "timing,side_session",
+    [("before", False), ("during_return", True), ("foreign_settlement", True)],
+)
 async def test_public_final_latch_arbitrates_temporary_service(
-    backend, tmp_path, request, monkeypatch, timing
+    backend, tmp_path, request, monkeypatch, timing, side_session
 ):
+    # The host driver covers during_return without a side session.
     await test_public_question_uses_real_assistant_export(
         backend,
         tmp_path,
@@ -142,13 +128,14 @@ async def test_public_final_latch_arbitrates_temporary_service(
         temporary_service=True,
         public_reply=False,
         post_admission=True,
-        side_session=False,
+        side_session=side_session,
         finish_request=True,
         final_latch_timing=timing,
     )
 
 
 @pytest.mark.anyio
+@pytest.mark.store_semantics
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 @pytest.mark.parametrize("registered_first", [False, True])
 async def test_public_service_permit_orders_disablement(
@@ -169,10 +156,7 @@ async def test_public_service_permit_orders_disablement(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("boundary", [-1, 0, 1])
-async def test_public_service_shares_prior_root_budget(
-    backend, tmp_path, request, monkeypatch, boundary
-):
+async def test_public_service_shares_prior_root_budget(backend, tmp_path, request, monkeypatch):
     await test_public_question_uses_real_assistant_export(
         backend,
         tmp_path,
@@ -182,16 +166,15 @@ async def test_public_service_shares_prior_root_budget(
         public_reply=False,
         post_admission=True,
         side_session=False,
-        budget_boundary=boundary,
+        # Refusal proves the prior root spend is shared; the exact boundaries
+        # are covered at ledger level below.
+        budget_boundary=-1,
     )
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("boundary", [-1, 0, 1])
-async def test_public_service_shares_ancestor_budget(
-    backend, tmp_path, request, monkeypatch, boundary
-):
+async def test_public_service_shares_ancestor_budget(backend, tmp_path, request, monkeypatch):
     await test_public_question_uses_real_assistant_export(
         backend,
         tmp_path,
@@ -201,9 +184,113 @@ async def test_public_service_shares_ancestor_budget(
         public_reply=False,
         post_admission=True,
         side_session=False,
-        budget_boundary=boundary,
+        budget_boundary=0,
         ancestor_budget=True,
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("ancestor", [False, True])
+@pytest.mark.parametrize("boundary", [-1, 0, 1])
+async def test_service_reservation_ceiling_includes_prior_settled_spend(
+    backend, ancestor, boundary, tmp_path, request
+):
+    from cayu.budgets._batch import BudgetBatchMember
+    from cayu.budgets.base import (
+        BudgetReservationRecord,
+        InMemoryBudgetLedger,
+        _effective_budget_limits,
+    )
+
+    # The ledger view of the public budget journeys above: two settled runs of
+    # $0.000015 each, then a $0.002048 service reservation at the ceiling.
+    # Postgres shares one database per module, so every case owns its keys and IDs.
+    case = uuid4().hex[:16]
+    ceiling = Decimal("0.002078") + Decimal(boundary) / Decimal(1_000_000)
+    root = BudgetLimit(
+        scope="causal",
+        key=f"root-{case}",
+        max_estimated_cost=Decimal("1") if ancestor else ceiling,
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="openai",
+                    model="gpt-test",
+                    match="exact",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+        reservation=BudgetReservation(max_input_tokens=1024, max_output_tokens=1024),
+    )
+    limits = _effective_budget_limits(
+        (root, root.model_copy(update={"key": f"ancestor-{case}", "max_estimated_cost": ceiling}))
+        if ancestor
+        else (root,),
+        identity_namespace=f"clarification-service-boundary-{case}",
+    )
+    if backend == "memory":
+        ledger = InMemoryBudgetLedger()
+    elif backend == "sqlite":
+        from cayu.storage.budget_ledger import SQLiteBudgetLedger
+
+        ledger = SQLiteBudgetLedger(tmp_path / "boundary.sqlite")
+    else:
+        from cayu.storage.budget_postgres import PostgresBudgetLedger
+        from cayu.storage.migrations import SchemaMode
+
+        ledger = PostgresBudgetLedger(
+            request.getfixturevalue("postgres_dsn"), schema_mode=SchemaMode.CREATE
+        )
+
+    def dispatch(index):
+        return tuple(
+            BudgetBatchMember(
+                limit=limit,
+                record=BudgetReservationRecord(
+                    reservation_id=f"bres_{case}{index * 16 + slot:016x}",
+                    budget_limit_id=limit.budget_limit_id,
+                    model_step_id=f"mstep_{case}{index:016x}",
+                    model_attempt_id=f"matt_{case}{index:016x}",
+                    scope=limit.scope,
+                    key=limit.key,
+                    currency=limit.currency,
+                    session_id="session",
+                    agent_name="reviewer",
+                    provider_name="openai",
+                    model="gpt-test",
+                    reserved_amount=Decimal("0.002048"),
+                ),
+            )
+            for slot, limit in enumerate(limits)
+        )
+
+    try:
+        for index in (1, 2):
+            prior = await ledger.reserve_batch(members=dispatch(index))
+            assert prior.failure is None
+            for record in prior.records:
+                await ledger.reconcile(
+                    reservation_id=record.reservation_id, actual_amount=Decimal("0.000015")
+                )
+        service = dispatch(3)
+        result = await ledger.reserve_batch(members=service)
+        if boundary >= 0:
+            assert result.failure is None
+            assert len(result.records) == len(limits)
+        else:
+            assert result.failure is not None and not result.records
+            assert result.failure.requested == Decimal("0.002048")
+            assert result.failure.key == f"{'ancestor' if ancestor else 'root'}-{case}"
+            # Atomic admission leaves no partial reservation on another ceiling.
+            for member in service:
+                assert await ledger.load_reservation(member.record.reservation_id) is None
+    finally:
+        if backend != "memory":
+            await ledger.close()
 
 
 @pytest.mark.anyio
@@ -763,7 +850,7 @@ async def test_public_question_uses_real_assistant_export(
     reader = _PublicExportReader(owner, context)
     receiver = SessionExportRequestReceivingOwner(audience=owner, reader=reader)
     policy = finite_policy(
-        service_timeout_ms=90_000 if service_clock_offset is not None else journey_ttl_ms,
+        service_timeout_ms=30_000 if service_clock_offset is not None else journey_ttl_ms,
         max_questions=2 if multiple_questions or nested_service else 32,
         max_service_turns=2 if multiple_questions or nested_service else 32,
         max_depth=2 if nested_service else 4,
@@ -1275,7 +1362,7 @@ async def test_public_question_uses_real_assistant_export(
             if question_recovery or service_clock_offset is not None:
                 async with collaboration._transaction(owner.application_scope, write=False) as tx:
                     deadline = await tx.now_ms() + (
-                        90_000 if service_clock_offset is not None else 15_000
+                        30_000 if service_clock_offset is not None else 15_000
                     )
                 question = question.model_copy(update={"deadline_at_ms": deadline})
                 command = command.model_copy(update={"question": question})

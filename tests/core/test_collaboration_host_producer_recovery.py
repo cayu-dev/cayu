@@ -322,7 +322,8 @@ async def test_host_recovers_planner_input_before_first_producer_attachment(
     )
     assert replay == execution
     assert len(provider.requests) == 1
-    if not cancel_observer:
+    # The output tail does not depend on how the producer was attached.
+    if not cancel_observer and not prepare_in_host:
         await qualify_host_output(application, resolver, command, token, session, provider)
 
 

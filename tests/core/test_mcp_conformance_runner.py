@@ -170,6 +170,13 @@ def test_docker_build_pins_the_same_official_revision():
     assert "uv sync --frozen" in dockerfile
 
 
+def test_docker_image_includes_the_shard_plan_that_conftest_imports():
+    dockerfile = (ROOT / "scripts/mcp-conformance.Dockerfile").read_text()
+    dockerignore = (ROOT / "scripts/mcp-conformance.Dockerfile.dockerignore").read_text()
+    assert "scripts/ci_shard_plan.py" in dockerfile
+    assert "!scripts/ci_shard_plan.py" in dockerignore.splitlines()
+
+
 @pytest.mark.parametrize("return_code", [0, 1])
 def test_nonzero_exit_or_missing_artifacts_fail_with_report(
     tmp_path, monkeypatch, return_code, capsys

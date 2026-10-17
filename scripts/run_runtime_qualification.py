@@ -18,7 +18,7 @@ from pathlib import Path
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES_RECIPE = "cayu.qualification-fixtures.v2"
+FIXTURES_RECIPE = "cayu.qualification-fixtures.v3"
 sys.path.insert(0, str(ROOT))
 from tests.qualification.postgres_cleanup import DATABASE_ENV, postgres_operation  # noqa: E402
 from tests.qualification.process_cleanup import (  # noqa: E402
@@ -50,10 +50,15 @@ print(json.dumps({'package': str(package), 'build': {
 """
 
 
+# tests/conftest.py imports the store switch from the shard plan.
+STAGED_SCRIPTS = (Path(__file__).name, "ci_shard_plan.py")
+
+
 def fixture_fingerprint(stage: Path) -> str:
     """Bind all staged inputs, including non-Python assets consumed by emitters."""
     files = [file for file in (stage / "tests").rglob("*") if file.is_file()]
-    files.extend((stage / "pyproject.toml", stage / "scripts" / Path(__file__).name))
+    files.append(stage / "pyproject.toml")
+    files.extend(stage / "scripts" / name for name in STAGED_SCRIPTS)
     digest = hashlib.sha256(FIXTURES_RECIPE.encode() + b"\0")
     for file in sorted(files, key=lambda file: file.relative_to(stage).as_posix()):
         relative = file.relative_to(stage).as_posix().encode()
@@ -242,7 +247,8 @@ def main():
             )
             shutil.copy(ROOT / "pyproject.toml", stage / "pyproject.toml")
             (stage / "scripts").mkdir()
-            shutil.copy(Path(__file__), stage / "scripts" / Path(__file__).name)
+            for name in STAGED_SCRIPTS:
+                shutil.copy(Path(__file__).with_name(name), stage / "scripts" / name)
             # This staged tree intentionally has no src directory. Fresh-process helpers
             # may add that nonexistent path; their imports still resolve to the wheel.
             env["PYTHONPATH"] = str(stage)

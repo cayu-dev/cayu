@@ -58,26 +58,16 @@ async def process_readback(backend, address, command, *, failure_resolution=None
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "rejection",
-    [
-        "validator_rejected",
-        "projection_too_large",
-        "projection_wrapped_envelope_overflow",
-        "projection_envelope_overflow",
-        "source_visible_overflow",
-        "source_private_overflow",
-    ],
-)
+# One projection-site and one source-site rejection;
+# test_export_rejection_trigger_retains_exact_reason below classifies every
+# rejection trigger without a producer lifecycle.
+@pytest.mark.parametrize("rejection", ["validator_rejected", "source_private_overflow"])
 async def test_output_validation_failure_elects_failed_and_cleans_up(
     native_stores, monkeypatch, rejection
 ):
     values, context = await completed_export_scenario(
         native_stores,
         monkeypatch,
-        visible_text="x" * (40 * 1024)
-        if rejection == "source_visible_overflow"
-        else "retained answer",
         private_text="private-canary" * 6000 if rejection == "source_private_overflow" else None,
         output_bytes=65536,
     )
@@ -86,13 +76,6 @@ async def test_output_validation_failure_elects_failed_and_cleans_up(
     projector = app._session_export_coordinator.projectors[destination.projector]
     if rejection == "validator_rejected":
         monkeypatch.setattr(projector, "validate", lambda *args: False)
-    elif not rejection.startswith("source_"):
-        size = {
-            "projection_too_large": 8192,
-            "projection_wrapped_envelope_overflow": 65520,
-            "projection_envelope_overflow": 65536,
-        }[rejection]
-        monkeypatch.setattr(projector, "project", lambda *args: {"text": "x" * size})
     with pytest.raises(CollaborationUnavailable):
         await app.export_producer_output(command, destination.operation, context=context)
 
@@ -141,6 +124,75 @@ async def test_output_validation_failure_elects_failed_and_cleans_up(
     assert not (
         await app.pending_producer_outputs(command.admission.prepared.recipient, context=CONTEXT)
     ).items
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("rejection", "reason"),
+    [
+        ("validator_rejected", "validator_rejected"),
+        ("projection_too_large", "projection_too_large"),
+        ("projection_wrapped_envelope_overflow", "projection_too_large"),
+        ("projection_envelope_overflow", "projection_too_large"),
+        ("source_visible_overflow", "source_too_large"),
+        ("source_private_overflow", "source_too_large"),
+    ],
+)
+async def test_export_rejection_trigger_retains_exact_reason(monkeypatch, rejection, reason):
+    from tests.core.test_session_exports import CONTEXT as EXPORT_CONTEXT
+    from tests.core.test_session_exports import Projector, harness, published
+    from tests.core.test_targeted_tool_grants import _codec
+
+    from cayu.collaboration import _export_validation_failure as validation
+    from cayu.collaboration.exports import SessionExportCapacityExceeded, SessionExportDenied
+    from cayu.messages import Message, TextPart, ThinkingPart
+    from cayu.sessions.memory import InMemorySessionStore
+
+    size = {
+        "projection_too_large": 8192,
+        "projection_wrapped_envelope_overflow": 65520,
+        "projection_envelope_overflow": 65536,
+    }.get(rejection)
+
+    class RejectingProjector(Projector):
+        def project(self, source):
+            output = super().project(source)
+            return output if size is None else {"text": "x" * size}
+
+        def validate(self, source, output, audience):
+            return rejection != "validator_rejected" and super().validate(source, output, audience)
+
+    store = InMemorySessionStore(public_authority_alias_codec=_codec())
+    projector = RejectingProjector()
+    retain = validation.retain_validation_failure
+    reasons = []
+
+    async def record(exports, session, preparation, reason, authorization, source):
+        reasons.append(reason)
+        return await retain(exports, session, preparation, reason, authorization, source)
+
+    monkeypatch.setattr(validation, "retain_validation_failure", record)
+    async with harness(("memory", lambda store_type=None: store)) as case:
+        export_app, _, _, _ = case.app(projectors=(projector,))
+        await case.create(store)
+        visible = "x" * (40 * 1024) if rejection == "source_visible_overflow" else "answer"
+        content = [TextPart(text=visible)]
+        if rejection == "source_private_overflow":
+            content.append(ThinkingPart(text="private-canary" * 6000))
+        await store.append_transcript_messages(
+            case.session_id, [Message(role="assistant", content=tuple(content))]
+        )
+        request = (await case.request(export_app)).model_copy(
+            update={"source_indices": (1,), "source_selection": "assistant_visible_text_v1"}
+        )
+        expected = (
+            SessionExportDenied if reason == "validator_rejected" else SessionExportCapacityExceeded
+        )
+        with pytest.raises(expected):
+            await export_app.export_session(request, context=EXPORT_CONTEXT)
+        assert reasons == [reason]
+        assert projector.calls == (0 if reason == "source_too_large" else 1)
+        assert not await published(store, case.session_id)
 
 
 @pytest.mark.anyio

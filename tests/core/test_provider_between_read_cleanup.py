@@ -239,3 +239,181 @@ def test_runtime_deadline_between_normalized_reads_keeps_close_owned(monkeypatch
                     await asyncio.sleep(0)
 
     asyncio.run(run())
+
+
+def test_expired_entry_leaves_a_pending_iterator_read_to_its_owner():
+    # Closing a pending __anext__() would run the generator's async cleanup
+    # synchronously and replace the deadline. Only the owner closes it, later.
+    async def run():
+        controller = ds.ProviderStreamDeadlineController(
+            ds.ProviderStreamDeadlines(
+                semantic_progress_timeout_s=0.01,
+                max_concurrent_streams=len(ds._PROVIDER_DEADLINE_AWAIT_OWNERS) + 1,
+            )
+        )
+        cleaned = []
+
+        async def provider_stream():
+            try:
+                yield "first"
+                yield "second"
+            finally:
+                await asyncio.sleep(0)
+                cleaned.append(True)
+
+        async def unstarted():
+            return "never"
+
+        stream = provider_stream()
+        try:
+            assert await stream.__anext__() == "first"
+            await asyncio.sleep(0.05)
+            with pytest.raises(ds.ProviderStreamDeadlineExceeded) as expired:
+                await controller.wait_for(
+                    stream.__anext__(), kinds=(ds.ProviderDeadlineKind.SEMANTIC_IDLE,)
+                )
+            assert expired.value.evidence.deadline_kind is ds.ProviderDeadlineKind.SEMANTIC_IDLE
+            assert cleaned == []
+            await stream.aclose()
+            assert cleaned == [True]
+            # A never-started coroutine is still closed rather than leaked.
+            coroutine = unstarted()
+            with pytest.raises(ds.ProviderStreamDeadlineExceeded):
+                await controller.wait_for(coroutine, kinds=(ds.ProviderDeadlineKind.SEMANTIC_IDLE,))
+            assert coroutine.cr_frame is None
+        finally:
+            controller.close()
+
+    asyncio.run(run())
+
+
+def test_caller_cancellation_while_a_late_read_starts_keeps_it_owned():
+    # The late read starts for one loop turn. Caller cancellation during that
+    # turn must still cancel, retain and hand off the read, so it cannot run on
+    # outside the stream's concurrency slot.
+    async def run():
+        controller = ds.ProviderStreamDeadlineController(
+            ds.ProviderStreamDeadlines(
+                semantic_progress_timeout_s=0.01,
+                max_concurrent_streams=len(ds._PROVIDER_DEADLINE_AWAIT_OWNERS) + 1,
+            )
+        )
+        handed_off = []
+
+        async def provider_stream():
+            yield "first"
+            await asyncio.Event().wait()
+            yield "never"
+
+        stream = provider_stream()
+        try:
+            assert await stream.__anext__() == "first"
+            await asyncio.sleep(0.05)
+            caller = asyncio.create_task(
+                controller.wait_for(
+                    stream.__anext__(),
+                    kinds=(ds.ProviderDeadlineKind.SEMANTIC_IDLE,),
+                    on_interrupted=handed_off.append,
+                )
+            )
+            # Let the caller start the read and suspend in its one-turn yield.
+            await asyncio.sleep(0)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            assert len(handed_off) == 1
+            read = handed_off[0]
+            await asyncio.wait((read,), timeout=1)
+            assert read.cancelled()
+            await stream.aclose()
+        finally:
+            controller.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("evidence", ["progress", "terminal"])
+def test_a_late_read_cannot_revive_an_expired_stream_in_its_start_turn(evidence):
+    # Progress or terminal evidence recorded while the late read starts must not
+    # turn an expiry that was already decided into a successful read.
+    async def run():
+        controller = ds.ProviderStreamDeadlineController(
+            ds.ProviderStreamDeadlines(
+                semantic_progress_timeout_s=0.01 if evidence == "progress" else 5,
+                absolute_stream_timeout_s=5 if evidence == "progress" else 0.01,
+                max_concurrent_streams=len(ds._PROVIDER_DEADLINE_AWAIT_OWNERS) + 1,
+            )
+        )
+        kind = (
+            ds.ProviderDeadlineKind.SEMANTIC_IDLE
+            if evidence == "progress"
+            else ds.ProviderDeadlineKind.ABSOLUTE
+        )
+
+        async def provider_stream():
+            yield "first"
+            controller.observe_semantic(
+                ds.ProviderProgressKind.CONTENT
+                if evidence == "progress"
+                else ds.ProviderProgressKind.TERMINAL
+            )
+            yield "late"
+
+        stream = provider_stream()
+        try:
+            assert await stream.__anext__() == "first"
+            await asyncio.sleep(0.03)
+            with pytest.raises(ds.ProviderStreamDeadlineExceeded) as expired:
+                await controller.wait_for(
+                    stream.__anext__(),
+                    kinds=(kind,),
+                    accept_cancelled_result=lambda value: value == "late",
+                )
+            assert expired.value.evidence.deadline_kind is kind
+            assert expired.value.stream_cleanup_failed is False
+            await stream.aclose()
+        finally:
+            controller.close()
+
+    asyncio.run(run())
+
+
+# Turn 1 cancels during the start turn; turn 2 during the expiry's cleanup wait.
+@pytest.mark.parametrize("turns", [1, 2])
+def test_caller_cancellation_during_a_late_start_rejects_late_terminal_evidence(turns):
+    async def run():
+        controller = ds.ProviderStreamDeadlineController(
+            ds.ProviderStreamDeadlines(
+                absolute_stream_timeout_s=0.01,
+                max_concurrent_streams=len(ds._PROVIDER_DEADLINE_AWAIT_OWNERS) + 1,
+            )
+        )
+
+        async def provider_stream():
+            yield "first"
+            controller.observe_semantic(ds.ProviderProgressKind.TERMINAL)
+            yield "late"
+
+        stream = provider_stream()
+        try:
+            assert await stream.__anext__() == "first"
+            await asyncio.sleep(0.03)
+            caller = asyncio.create_task(
+                controller.wait_for(
+                    stream.__anext__(),
+                    kinds=(ds.ProviderDeadlineKind.ABSOLUTE,),
+                    accept_cancelled_result=lambda value: value == "late",
+                )
+            )
+            # The read records terminal evidence and finishes before the
+            # cancellation lands.
+            for _ in range(turns):
+                await asyncio.sleep(0)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            await stream.aclose()
+        finally:
+            controller.close()
+
+    asyncio.run(run())

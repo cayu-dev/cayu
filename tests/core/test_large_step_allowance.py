@@ -39,6 +39,40 @@ class _Tick(Tool):
         return ToolResult(content="ok")
 
 
+def test_large_step_allowance_admits_a_durable_run(tmp_path):
+    async def run():
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("finished"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ],
+        )
+        store = SQLiteSessionStore(tmp_path / "large-allowance.sqlite")
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="scripted"), tools=[_Tick()])
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Finish.")],
+                        max_steps=10000,
+                    )
+                )
+            ]
+            assert len(provider.requests) == 1
+            assert events[-1].type == EventType.SESSION_COMPLETED
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.qualification
 @pytest.mark.parametrize("max_steps,completed", [(257, False), (258, True)])
 def test_deterministic_run_beyond_256_steps(max_steps, completed, tmp_path):
     async def run():

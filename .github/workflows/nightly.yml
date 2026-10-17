@@ -1,0 +1,22 @@
+name: Nightly full-store tests
+
+# Pull requests run SQLite store variants only. This runs the same jobs with
+# every store (memory, SQLite and Postgres) on main each night.
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  python-tests:
+    name: Python tests
+    uses: ./.github/workflows/python-tests.yml
+    with:
+      stores: all

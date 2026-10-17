@@ -20,6 +20,6 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --extra dev --extra server --no-install-project --no-cache
 COPY src ./src
 COPY tests ./tests
-COPY scripts/mcp_conformance_client.py scripts/run_mcp_conformance.py scripts/mcp_conformance_build.py ./scripts/
+COPY scripts/mcp_conformance_client.py scripts/run_mcp_conformance.py scripts/mcp_conformance_build.py scripts/ci_shard_plan.py ./scripts/
 ENTRYPOINT ["/opt/venv/bin/python", "scripts/run_mcp_conformance.py", "--upstream", "/opt/conformance"]
 CMD ["--output", "/results/run"]

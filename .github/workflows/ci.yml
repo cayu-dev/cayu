@@ -61,111 +61,12 @@ jobs:
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: python3 scripts/run_ci.py --lane static
 
-  test-collection:
+  python-tests:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    name: Test collection
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - name: Validate collection before starting test workers
-        run: python3 scripts/run_ci.py --lane collection --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
-      - name: Share validated test assignments
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-test-manifest
-          path: ${{ runner.temp }}/ci-tests/manifest.json
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 7
-
-  test_shards:
-    needs: test-collection
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    name: Test shard ${{ matrix.shard }}/32 (Python 3.14)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
-    # Includes setup, collection, and loaded-runner headroom beyond measured calls.
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
-    env:
-      CAYU_REQUIRE_POSTGRES_TESTS: "1"
-      CAYU_REQUIRE_DOCKER_RUNNER: "1"
-      CAYU_REQUIRE_DOCKER_EGRESS: "1"
-      CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - name: Install test system dependencies
-        timeout-minutes: 5
-        uses: ./.github/actions/install-system-packages
-        with:
-          packages: ripgrep ffmpeg
-          commands: rg ffmpeg
-      - name: Download validated test assignments
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ci-test-manifest
-          path: ${{ runner.temp }}/ci-tests
-      - name: Test duration-balanced shard
-        run: python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}" --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
-
-  test_specialists:
-    needs: test-collection
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    name: Test specialist ${{ matrix.lane }} (Python 3.14)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
-    # Match general shards: PostgreSQL reconstruction also needs collection,
-    # database setup, and loaded-runner headroom beyond measured test calls.
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        lane:
-          - browser-docker
-          - postgres-conformance-1
-          - postgres-conformance-2
-          - postgres-conformance-3
-          - postgres-conformance-4
-          - postgres-conformance-5
-          - postgres-conformance-6
-          - postgres-conformance-7
-          - postgres-conformance-8
-          - postgres-conformance-9
-          - postgres-conformance-10
-          - postgres-conformance-11
-          - postgres-conformance-12
-          - host-journey-1
-          - host-journey-2
-          - host-journey-3
-    env:
-      CAYU_REQUIRE_POSTGRES_TESTS: "1"
-      CAYU_REQUIRE_DOCKER_RUNNER: "1"
-      CAYU_REQUIRE_DOCKER_EGRESS: "1"
-      CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"
-      CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - name: Install test search dependency
-        timeout-minutes: 5
-        uses: ./.github/actions/install-system-packages
-        with:
-          packages: ripgrep
-          commands: rg
-      - name: Download validated test assignments
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ci-test-manifest
-          path: ${{ runner.temp }}/ci-tests
-      - name: Test specialist lane
-        run: >-
-          python3 scripts/run_ci.py --lane specialist
-          --specialist-lane "${{ matrix.lane }}"
-          --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
+    name: Python tests
+    uses: ./.github/workflows/python-tests.yml
+    with:
+      stores: ${{ github.event_name == 'pull_request' && 'sqlite' || 'all' }}
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})
@@ -311,7 +212,7 @@ jobs:
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, test-collection, test_shards, test_specialists, sqlite-cancellation, package-build, package, dashboard, release-qualification]
+    needs: [static, python-tests, sqlite-cancellation, package-build, package, dashboard, release-qualification]
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     environment:

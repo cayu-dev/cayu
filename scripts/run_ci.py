@@ -39,21 +39,33 @@ _SPECIALIST_TEST_ENV = {
     **_GENERAL_TEST_ENV,
     "CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT": "1",
 }
-_GENERAL_SHARDS = 32
-_GENERAL_MARKER = "not (stress or qualification or postgres or browser_docker or host_journey)"
-_SPECIALIST_LANES = {
-    "browser-docker": ("browser_docker", 1, 1),
-    **{f"host-journey-{group}": ("host_journey", 3, group) for group in range(1, 4)},
-    **{f"qualification-{group}": ("stress or qualification", 8, group) for group in range(1, 9)},
-    **{
-        f"postgres-conformance-{group}": (
-            "postgres and not (stress or qualification or host_journey)",
-            12,
-            group,
-        )
-        for group in range(1, 13)
-    },
-}
+# Run as a script, the scripts directory is already the import root. Loaded with
+# runpy by tests it is not, so append it rather than shadow other modules.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
+import ci_shard_plan  # noqa: E402
+
+_STORE_MODES = ci_shard_plan.STORE_MODES
+# Pull request CI runs SQLite store variants; nightly and release runs pass all.
+_DEFAULT_STORES = "sqlite"
+_DEFAULT_TEST_WORKERS = ci_shard_plan.DEFAULT_WORKERS
+_CI_SPECIALIST_FAMILIES = tuple(name for name in ci_shard_plan.CI_FAMILIES if name != "general")
+_MAX_GENERAL_SHARDS = max(ci_shard_plan.family("general").shards.values())
+
+
+def _general_shards(stores: str) -> int:
+    return ci_shard_plan.family("general").shards[stores]
+
+
+def _specialist_lanes(
+    stores: str, families: Sequence[str] = _CI_SPECIALIST_FAMILIES
+) -> tuple[str, ...]:
+    return tuple(lane for name in families for lane in ci_shard_plan.family(name).lanes(stores))
+
+
+_ALL_SPECIALIST_LANES = tuple(
+    lane for lane in ci_shard_plan.all_lanes() if not lane.startswith("general-")
+)
 _SQLITE_PYTHON_VERSIONS = ("3.11", "3.12", "3.13", "3.14")
 _MINIMUM_NODE_VERSION = (22, 18, 0)
 
@@ -175,16 +187,22 @@ class LocalCiRunner:
         root: Path,
         dry_run: bool,
         keep_going: bool,
-        test_workers: int = 2,
+        test_workers: int = _DEFAULT_TEST_WORKERS,
         profile_tests: Path | None = None,
+        stores: str = _DEFAULT_STORES,
+        durations_output: Path | None = None,
     ) -> None:
         if test_workers not in range(1, 9):
             raise ValueError("test workers must be between 1 and 8")
+        if stores not in _STORE_MODES:
+            raise ValueError(f"stores must be one of {', '.join(_STORE_MODES)}")
         self.root = root
         self.dry_run = dry_run
         self.keep_going = keep_going
         self.test_workers = test_workers
         self.profile_tests = profile_tests
+        self.stores = stores
+        self.durations_output = durations_output
         self.evidence: list[CommandEvidence] = []
         self.failed = False
 
@@ -590,11 +608,21 @@ def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> No
     )
 
 
-def _run_test_collection(runner: LocalCiRunner, *, manifest: Path | None = None) -> bool:
-    # Keep collection errors on the controller: xdist can mask a UsageError as
-    # an internal worker-finished assertion before any test has executed.
+_SHARD_PLUGIN = ("--rootdir", ".", "-c", "pyproject.toml", "-p", "scripts.ci_test_shards")
+
+
+def _store_env(runner: LocalCiRunner, env: dict[str, str]) -> dict[str, str]:
+    return {**env, ci_shard_plan.STORES_ENV: runner.stores}
+
+
+def _run_test_collection(
+    runner: LocalCiRunner, *, collected: Path | None = None, lanes: Path | None = None
+) -> bool:
+    # Serial full collection gates import errors, the duration snapshot and the
+    # shard plan. Keep it off xdist: a worker can mask a UsageError as an
+    # internal worker-finished assertion before any test has executed.
     return runner.run(
-        "Python 3.14 test collection and duration snapshot",
+        f"Python 3.14 test collection, duration snapshot and shard plan ({runner.stores} stores)",
         (
             "uv",
             "run",
@@ -604,57 +632,34 @@ def _run_test_collection(runner: LocalCiRunner, *, manifest: Path | None = None)
             "-qq",
             "-n",
             "0",
-            *(
-                (
-                    "--rootdir",
-                    ".",
-                    "-c",
-                    "pyproject.toml",
-                    "-p",
-                    "scripts.ci_test_manifest",
-                    "--ci-write-manifest",
-                    str(manifest),
-                )
-                if manifest is not None
-                else ()
-            ),
+            *_SHARD_PLUGIN,
+            "--ci-check-plan",
+            *(("--ci-collected", str(collected)) if collected is not None else ()),
+            *(("--ci-lanes", str(lanes)) if lanes is not None else ()),
         ),
-        env={"CAYU_REQUIRE_CURRENT_TEST_DURATIONS": "1"},
+        env=_store_env(runner, {"CAYU_REQUIRE_CURRENT_TEST_DURATIONS": "1"}),
     )
 
 
-def _test_selection(
-    marker: str, splits: int, group: int, lane: str, manifest: Path | None
-) -> tuple[str, ...]:
-    if manifest is not None:
-        return (
-            "--rootdir",
-            ".",
-            "-c",
-            "pyproject.toml",
-            "-p",
-            "scripts.ci_test_manifest",
-            "--ci-manifest",
-            str(manifest),
-            "--ci-lane",
-            lane,
-        )
-    return (
-        "-m",
-        marker,
-        "--splits",
-        str(splits),
-        "--group",
-        str(group),
-        "--splitting-algorithm",
-        "least_duration",
-    )
+def _test_selection(lane: str) -> tuple[str, ...]:
+    return (*_SHARD_PLUGIN, "--ci-shard", lane)
 
 
 def _test_execution_options(runner: LocalCiRunner, lane: str) -> tuple[str, ...]:
+    family, _ = ci_shard_plan.lane_family(lane)
+    # Work stealing lets idle workers take tests from a large file, which the
+    # planner assumes when it predicts a lane as seconds / workers.
     # Capacity fixtures already create their own concurrent workers.
-    workers = 1 if lane.startswith(("qualification-", "host-journey-")) else runner.test_workers
-    options = ("-n", str(workers), "--dist", "loadfile", "--durations=20")
+    workers = family.workers or runner.test_workers
+    options: tuple[str, ...] = (
+        "-n",
+        str(workers),
+        "--dist",
+        family.distribution,
+        "--durations=20",
+    )
+    if runner.durations_output is not None:
+        options += ("--ci-durations", str(runner.durations_output / f"{lane}.json"))
     if runner.profile_tests is not None:
         options += (
             "--rootdir",
@@ -669,22 +674,24 @@ def _test_execution_options(runner: LocalCiRunner, lane: str) -> tuple[str, ...]
     return options
 
 
-def _run_general_shard(runner: LocalCiRunner, shard: int, *, manifest: Path | None = None) -> None:
-    if shard not in range(1, _GENERAL_SHARDS + 1):
-        raise ValueError(f"general shard must be between 1 and {_GENERAL_SHARDS}")
+def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
+    shards = _general_shards(runner.stores)
+    if shard not in range(1, shards + 1):
+        raise ValueError(f"general shard must be between 1 and {shards}")
+    lane = f"general-{shard}"
     runner.run("Verify recording encoder prerequisite", ("ffmpeg", "-version"))
     runner.run(
-        f"Python 3.14 general shard {shard}/{_GENERAL_SHARDS}",
+        f"Python 3.14 general shard {shard}/{shards}",
         (
             "uv",
             "run",
             "--no-sync",
             "pytest",
             "-q",
-            *_test_selection(_GENERAL_MARKER, _GENERAL_SHARDS, shard, f"general-{shard}", manifest),
-            *_test_execution_options(runner, f"general-{shard}"),
+            *_test_selection(lane),
+            *_test_execution_options(runner, lane),
         ),
-        env=_GENERAL_TEST_ENV,
+        env=_store_env(runner, _GENERAL_TEST_ENV),
     )
 
 
@@ -696,11 +703,11 @@ def _install_playwright_chromium(runner: LocalCiRunner) -> None:
     runner.run("Install Playwright Chromium", tuple(playwright_command))
 
 
-def _run_specialist_lane(runner: LocalCiRunner, lane: str, *, manifest: Path | None = None) -> None:
-    try:
-        marker, splits, group = _SPECIALIST_LANES[lane]
-    except KeyError as exc:
-        raise ValueError(f"unknown specialist lane: {lane}") from exc
+def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
+    if lane.startswith("general-") or lane not in _specialist_lanes(
+        runner.stores, (*_CI_SPECIALIST_FAMILIES, "qualification")
+    ):
+        raise ValueError(f"unknown specialist lane for {runner.stores} stores: {lane}")
     runner.run(
         f"Python 3.14 specialist lane {lane}",
         (
@@ -709,19 +716,20 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str, *, manifest: Path | N
             "--no-sync",
             "pytest",
             "-q",
-            *_test_selection(marker, splits, group, lane, manifest),
+            *_test_selection(lane),
             *_test_execution_options(runner, lane),
         ),
-        env=_SPECIALIST_TEST_ENV,
+        env=_store_env(runner, _SPECIALIST_TEST_ENV),
     )
 
 
-def _run_general_shards(runner: LocalCiRunner, *, jobs: int, manifest: Path | None = None) -> None:
-    if jobs not in range(1, _GENERAL_SHARDS + 1):
-        raise ValueError(f"local general-shard jobs must be between 1 and {_GENERAL_SHARDS}")
+def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
+    shards = _general_shards(runner.stores)
+    if jobs not in range(1, _MAX_GENERAL_SHARDS + 1):
+        raise ValueError(f"local general-shard jobs must be between 1 and {_MAX_GENERAL_SHARDS}")
     if runner.dry_run or jobs == 1:
-        for shard in range(1, _GENERAL_SHARDS + 1):
-            _run_general_shard(runner, shard, manifest=manifest)
+        for shard in range(1, shards + 1):
+            _run_general_shard(runner, shard)
         return
 
     shard_runners = {
@@ -731,13 +739,15 @@ def _run_general_shards(runner: LocalCiRunner, *, jobs: int, manifest: Path | No
             keep_going=False,
             test_workers=runner.test_workers,
             profile_tests=runner.profile_tests,
+            stores=runner.stores,
+            durations_output=runner.durations_output,
         )
-        for shard in range(1, _GENERAL_SHARDS + 1)
+        for shard in range(1, shards + 1)
     }
     failures: list[str] = []
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="cayu-ci-shard") as executor:
         futures = {
-            shard: executor.submit(_run_general_shard, shard_runner, shard, manifest=manifest)
+            shard: executor.submit(_run_general_shard, shard_runner, shard)
             for shard, shard_runner in shard_runners.items()
         }
         for shard, future in futures.items():
@@ -757,15 +767,15 @@ def _run_general_shards(runner: LocalCiRunner, *, jobs: int, manifest: Path | No
 
 def _run_python_suite(runner: LocalCiRunner, *, jobs: int) -> None:
     _sync_python_test_environment(runner, browser=False)
-    manifest = runner.root / ".pytest_cache" / "ci-test-manifest.json"
-    if not _run_test_collection(runner, manifest=manifest):
+    # Hosted shards start alongside collection; locally a failed gate stops fan-out.
+    if not _run_test_collection(runner):
         return
     _run_docker_prerequisite(runner)
-    _run_general_shards(runner, jobs=jobs, manifest=manifest)
+    _run_general_shards(runner, jobs=jobs)
     _sync_python_test_environment(runner, browser=True)
     _install_playwright_chromium(runner)
-    for lane in _SPECIALIST_LANES:
-        _run_specialist_lane(runner, lane, manifest=manifest)
+    for lane in _specialist_lanes(runner.stores, (*_CI_SPECIALIST_FAMILIES, "qualification")):
+        _run_specialist_lane(runner, lane)
 
 
 def _run_sqlite_cancellation_version(runner: LocalCiRunner, python_version: str) -> None:
@@ -1012,6 +1022,7 @@ def _write_proof(
     execution_untracked: Sequence[str],
     open_file_limits: tuple[int, int],
     jobs: int,
+    stores: str,
     publishing: bool,
     evidence: Sequence[CommandEvidence],
     error: str | None,
@@ -1034,7 +1045,8 @@ def _write_proof(
         f"`{open_file_limits[0]}` before runner setup; `{open_file_limits[1]}` during tests",
         f"- Started: `{started_at.isoformat()}`",
         f"- Finished: `{finished_at.isoformat()}`",
-        f"- Execution: GitHub's {_GENERAL_SHARDS} general Python shards run with `{jobs}` local "
+        f"- Execution: GitHub's {_general_shards(stores)} general Python shards "
+        f"({stores} stores) run with `{jobs}` local "
         "worker(s); specialist lanes remain serial; this does not claim the Ubuntu "
         "runner or its separate-machine topology",
         "- Command counts: "
@@ -1101,35 +1113,61 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         choices=(
             "static",
             "collection",
+            "plan",
             "general",
             "specialist",
             "sqlite-cancellation",
             "dashboard",
             "package",
         ),
-        help="run one canonical lane (used by GitHub Actions)",
+        help="run one canonical lane (used by GitHub Actions); plan prints the shard plan",
     )
     parser.add_argument(
-        "--shard", type=int, help=f"general lane shard, from 1 through {_GENERAL_SHARDS}"
+        "--shard",
+        type=int,
+        help="general lane shard, from 1 through the general shard count for --stores",
     )
     parser.add_argument(
         "--specialist-lane",
-        choices=tuple(_SPECIALIST_LANES),
+        choices=_ALL_SPECIALIST_LANES,
         help="specialist lane identity",
     )
     parser.add_argument("--package-group", choices=_PACKAGE_GROUPS)
     parser.add_argument("--package-artifacts", type=Path)
     parser.add_argument(
-        "--test-manifest",
+        "--stores",
+        choices=_STORE_MODES,
+        # Normalized like ci_shard_plan.store_mode(); argparse skips choices for defaults.
+        default=(os.environ.get(ci_shard_plan.STORES_ENV) or "").strip().lower() or _DEFAULT_STORES,
+        help=(
+            "store variants to test: sqlite (pull requests) or all (nightly and releases); "
+            f"default: ${ci_shard_plan.STORES_ENV} or {_DEFAULT_STORES}"
+        ),
+    )
+    parser.add_argument(
+        "--test-collected",
         type=Path,
-        help="write in the collection lane; consume in general/specialist lanes",
+        help="collection lane: write every collected node ID to this file",
+    )
+    parser.add_argument(
+        "--test-lanes",
+        type=Path,
+        help="collection lane: write each collected test's lane family to this JSON file",
+    )
+    parser.add_argument(
+        "--test-durations",
+        type=Path,
+        help="test lanes: write measured per-test seconds to DIRECTORY/<lane>.json",
     )
     parser.add_argument(
         "--test-workers",
         type=int,
         choices=range(1, 9),
-        default=2,
-        help="workers per general/parallel specialist job (default: 2; capacity lanes stay at 1)",
+        default=_DEFAULT_TEST_WORKERS,
+        help=(
+            f"workers per general/parallel specialist job (default: {_DEFAULT_TEST_WORKERS}; "
+            "capacity lanes stay at 1)"
+        ),
     )
     parser.add_argument(
         "--profile-tests",
@@ -1170,7 +1208,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--jobs",
         type=int,
-        choices=range(1, _GENERAL_SHARDS + 1),
+        choices=range(1, _MAX_GENERAL_SHARDS + 1),
         default=2,
         help="concurrent local general shards (default: 2; specialist lanes stay serial)",
     )
@@ -1180,8 +1218,9 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="include immutable release-note and published-version checks",
     )
     args = parser.parse_args(argv)
-    if args.profile_tests is not None:
-        args.profile_tests = args.profile_tests.resolve()
+    for name in ("profile_tests", "test_collected", "test_lanes", "test_durations"):
+        if getattr(args, name) is not None:
+            setattr(args, name, getattr(args, name).resolve())
     return args
 
 
@@ -1199,19 +1238,24 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
         keep_going=False,
         test_workers=args.test_workers,
         profile_tests=args.profile_tests,
+        stores=args.stores,
+        durations_output=args.test_durations,
     )
     try:
         if args.lane == "static":
             _run_static(runner)
         elif args.lane == "collection":
             _sync_python_test_environment(runner, browser=False)
-            _run_test_collection(runner, manifest=args.test_manifest)
+            _run_test_collection(runner, collected=args.test_collected, lanes=args.test_lanes)
+        elif args.lane == "plan":
+            plan = ci_shard_plan.build_plan(root, args.stores)
+            print("\n".join(ci_shard_plan.describe(plan, ci_shard_plan.CI_FAMILIES)))
         elif args.lane == "general":
             if args.shard is None:
                 raise ValueError("--lane general requires --shard")
             _run_docker_prerequisite(runner)
             _sync_python_test_environment(runner, browser=False)
-            _run_general_shard(runner, args.shard, manifest=args.test_manifest)
+            _run_general_shard(runner, args.shard)
         elif args.lane == "specialist":
             if args.specialist_lane is None:
                 raise ValueError("--lane specialist requires --specialist-lane")
@@ -1219,7 +1263,7 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
             _sync_python_test_environment(runner, browser=True)
             if args.specialist_lane.startswith("qualification-"):
                 _install_playwright_chromium(runner)
-            _run_specialist_lane(runner, args.specialist_lane, manifest=args.test_manifest)
+            _run_specialist_lane(runner, args.specialist_lane)
         elif args.lane == "sqlite-cancellation":
             if args.python_version is None:
                 raise ValueError("--lane sqlite-cancellation requires --python-version")
@@ -1320,6 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 keep_going=args.keep_going,
                 test_workers=args.test_workers,
                 profile_tests=args.profile_tests,
+                stores=args.stores,
             )
             error: str | None = None
             interrupted = False
@@ -1382,6 +1427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 execution_untracked=execution_untracked,
                 open_file_limits=open_file_limits,
                 jobs=args.jobs,
+                stores=runner.stores,
                 publishing=args.publishing,
                 evidence=runner.evidence,
                 error=error,

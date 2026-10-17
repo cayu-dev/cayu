@@ -15,6 +15,7 @@ from cayu.collaboration.requests import RequestControl
 
 
 @pytest.mark.anyio
+@pytest.mark.store_semantics
 async def test_public_cancelled_cleanup_cannot_publish_after_native_retirement(
     native_stores, monkeypatch
 ):

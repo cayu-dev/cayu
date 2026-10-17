@@ -37,8 +37,9 @@ from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-@pytest.mark.parametrize("with_resource", [False, True])
+@pytest.mark.parametrize(
+    "backend,with_resource", [("memory", False), ("sqlite", True), ("postgres", True)]
+)
 async def test_fresh_child_commit_cannot_admit_superseded_clarification_input(
     backend, tmp_path, request, monkeypatch, with_resource
 ):

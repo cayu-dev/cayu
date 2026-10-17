@@ -8479,7 +8479,8 @@ introduces no separate execution loop or result type. Import `TurnRequest` and `
   session incarnation and run epoch through `ResumeRequest.expected_session_instance_id`
   and `expected_run_epoch`. Deletion and recreation cannot redirect the request
   to a replacement. A competing turn invalidates the observed epoch before
-  recovery or admission can take over its execution. After abandoned-owner
+  recovery or admission can take over its execution, and the losing turn raises
+  `SessionRunFenced`. After abandoned-owner
   recovery, resume retains that recovery's exact claim and cleanup release
   epoch through final atomic admission. Session changes while recovery events
   are delivered still reject the turn before its messages are appended.

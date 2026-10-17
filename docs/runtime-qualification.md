@@ -145,10 +145,10 @@ package against installed distribution metadata. Each scenario checks the same
 Runtime build fingerprint. Editable source imports are rejected. An
 unavailable identity remains explicitly unavailable. The report also binds the
 registry manifest digest and fixture-content digest; use the matching checkout to
-interpret hashed test IDs. `fixtures_recipe: cayu.qualification-fixtures.v2`
+interpret hashed test IDs. `fixtures_recipe: cayu.qualification-fixtures.v3`
 hashes relative paths and content digests for every staged test file, including
-non-Python guide and corpus assets, plus the staged project configuration and
-runner script. Temporary-directory names are not part of that identity.
+non-Python guide and corpus assets, plus the staged project configuration, the
+runner script and the shard plan module that the test configuration imports. Temporary-directory names are not part of that identity.
 
 The default profile repeats every scenario twice. Each scenario process has a
 five-minute wall-clock bound (ten minutes for stress), except capacity, which gets

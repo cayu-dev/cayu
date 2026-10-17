@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -32,9 +33,11 @@ def test_maintenance_partition_selects_every_collected_case_exactly_once() -> No
         for scenario in MAINTENANCE_SCENARIOS
         for selector in scenario.selectors
     )
+    # Qualification runs every store, whatever this run's store mode is.
     collected = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", *sorted(modules)],
         cwd=root,
+        env=os.environ | {"CAYU_TEST_STORES": "all"},
         capture_output=True,
         text=True,
         timeout=90,
@@ -63,6 +66,37 @@ def test_maintenance_partition_selects_every_collected_case_exactly_once() -> No
     assert all(count == 1 for count in coverage.values()), {
         node: count for node, count in coverage.items() if count != 1
     }
+
+
+# Races between separate store instances whose PostgreSQL variants pull
+# requests must keep, whatever their names.
+_POSTGRES_RACES = (
+    "tests/core/test_clarification_transactions.py::"
+    "test_native_reply_and_cancellation_workers_elect_once",
+    "tests/core/test_collaboration_request_foundation.py::test_independent_applications_accept_once",
+    "tests/core/test_temporary_continuation_admission.py::"
+    "test_prepared_exclusion_and_native_admission_have_one_winner",
+    "tests/core/test_clarification_public.py::test_public_final_latch_arbitrates_temporary_service",
+    "tests/core/test_clarification_public.py::test_public_service_permit_orders_disablement",
+)
+
+
+def test_pull_request_store_mode_keeps_postgres_race_variants() -> None:
+    root = Path(__file__).resolve().parents[2]
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *_POSTGRES_RACES],
+        cwd=root,
+        env=os.environ | {"CAYU_TEST_STORES": "sqlite"},
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    nodes = [line for line in collected.stdout.splitlines() if line.startswith("tests/")]
+    for race in _POSTGRES_RACES:
+        variants = [node for node in nodes if node.startswith(race + "[")]
+        assert any("postgres" in node for node in variants), (race, variants)
+        assert any("sqlite" in node for node in variants), (race, variants)
 
 
 def test_dynamic_postgres_parameter_is_routed_to_the_postgres_lane() -> None:

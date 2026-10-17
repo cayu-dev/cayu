@@ -135,8 +135,6 @@ def artifact_store(tmp_path):
         "ack",
         "planner",
         "planner_restart",
-        "planner_fork",
-        "planner_fork_restart",
         "planner_fork_parent",
         "planner_cancel_acquire",
         "planner_cancel_transfer",
@@ -144,7 +142,6 @@ def artifact_store(tmp_path):
         "planner_ack_acquire",
         "planner_ack_transfer",
         "planner_expired",
-        "planner_fork_expired",
     ],
 )
 async def test_exact_resource_preparation_creates_one_inert_child(

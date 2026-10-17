@@ -14,25 +14,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Runs alongside the shards as the full-suite collection and shard-plan gate.
   test-collection:
     name: Test collection
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 5
+    env:
+      CAYU_TEST_STORES: all
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - run: python3 scripts/run_ci.py --lane collection --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
-      - name: Share validated test assignments
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: qualification-test-manifest
-          path: ${{ runner.temp }}/ci-tests/manifest.json
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 7
+      - run: python3 scripts/run_ci.py --lane collection
 
   qualification:
-    needs: test-collection
     name: Qualification ${{ matrix.shard }}/8 (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 60
@@ -41,6 +35,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
+      CAYU_TEST_STORES: all
       CAYU_REQUIRE_POSTGRES_TESTS: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
@@ -55,13 +50,18 @@ jobs:
         with:
           packages: ripgrep
           commands: rg
-      - name: Download validated test assignments
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: qualification-test-manifest
-          path: ${{ runner.temp }}/ci-tests
       - name: Run full-scale evidence and capacity checks
         run: >-
           python3 scripts/run_ci.py --lane specialist
           --specialist-lane "qualification-${{ matrix.shard }}"
-          --test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"
+          --test-durations "$RUNNER_TEMP/test-durations"
+      - name: Share measured test durations
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-durations-qualification-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-durations
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14

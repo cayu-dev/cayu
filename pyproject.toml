@@ -211,6 +211,7 @@ markers = [
   "sigkill_recovery: real process-death recovery coverage run in its own lane",
   "stress: deterministic concurrency and fault-injection coverage",
   "qualification: full-scale evidence, capacity, and end-to-end acceptance checks",
+  "store_semantics: keep every store variant in PR CI",
 ]
 
 [tool.ruff]

@@ -36,6 +36,7 @@ def _dry_runner() -> object:
 
 def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> None:
     workflow = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    workflow += (_ROOT / ".github" / "workflows" / "python-tests.yml").read_text()
 
     for command in (
         "python3 scripts/run_ci.py --lane static",
@@ -57,19 +58,21 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
     assert all("uses:" not in step.command for step in package_steps)
 
 
-def test_collection_preflight_gates_hosted_test_matrices() -> None:
-    workflow = (_ROOT / ".github/workflows/ci.yml").read_text()
-    for job in ("test_shards", "test_specialists"):
-        assert f"  {job}:\n    needs: test-collection\n" in workflow
-    qualification = (_ROOT / ".github/workflows/qualification.yml").read_text()
-    assert "  qualification:\n    needs: test-collection\n" in qualification
+def test_collection_gate_runs_alongside_hosted_test_matrices() -> None:
+    for name in ("python-tests.yml", "qualification.yml"):
+        workflow = (_ROOT / ".github/workflows" / name).read_text()
+        assert "needs:" not in workflow
+        assert "manifest" not in workflow
+        assert "python3 scripts/run_ci.py --lane collection" in workflow
 
     runner = _dry_runner()
-    assert _run_test_collection(runner) is True
+    assert _run_test_collection(runner, collected=Path("/tmp/ids.txt")) is True
     assert len(runner.evidence) == 1
     command = runner.evidence[0].command
     assert "CAYU_REQUIRE_CURRENT_TEST_DURATIONS=1" in command
+    assert "CAYU_TEST_STORES=sqlite" in command
     assert "--collect-only -qq -n 0" in command
+    assert "-p scripts.ci_test_shards --ci-check-plan --ci-collected /tmp/ids.txt" in command
     assert "--splits" not in command
 
 
@@ -92,8 +95,7 @@ def test_collection_failure_prevents_local_fanout_even_with_keep_going(monkeypat
         namespace, "_sync_python_test_environment", lambda *_args, **_kwargs: phases.append("sync")
     )
 
-    def failed_collection(_runner, *, manifest):
-        assert manifest.name == "ci-test-manifest.json"
+    def failed_collection(_runner, **_kwargs):
         phases.append("collection")
         return False
 
@@ -116,63 +118,58 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
     _run_general_shard(runner, 4)
     assert len(runner.evidence) == 2
     assert runner.evidence[0].command == "ffmpeg -version"
-    assert "--splits 32 --group 4" in runner.evidence[-1].command
-    assert "--splitting-algorithm least_duration" in runner.evidence[-1].command
-    assert (
-        "not (stress or qualification or postgres or browser_docker or host_journey)"
-        in runner.evidence[-1].command
-    )
+    assert "general shard 4/43" in runner.evidence[-1].label
+    assert "-p scripts.ci_test_shards --ci-shard general-4" in runner.evidence[-1].command
 
-    specialist = _dry_runner()
-    _run_specialist_lane(specialist, "postgres-conformance-2")
-    assert len(specialist.evidence) == 1
-    assert "--splits 12 --group 2" in specialist.evidence[0].command
-    assert "--splitting-algorithm least_duration" in specialist.evidence[0].command
-    assert (
-        "postgres and not (stress or qualification or host_journey)"
-        in specialist.evidence[0].command
-    )
-    final_specialist = _dry_runner()
-    _run_specialist_lane(final_specialist, "postgres-conformance-12")
-    assert "--splits 12 --group 12" in final_specialist.evidence[0].command
-    for group in range(1, 4):
+    every = LocalCiRunner(root=_ROOT, dry_run=True, keep_going=False, stores="all")
+    _run_general_shard(every, 32)
+    assert "CAYU_TEST_STORES=all" in every.evidence[-1].command
+    _run_specialist_lane(every, "postgres-conformance-12")
+    assert "--ci-shard postgres-conformance-12" in every.evidence[-1].command
+
+    for group in range(1, 3):
         journey = _dry_runner()
         _run_specialist_lane(journey, f"host-journey-{group}")
         command = journey.evidence[0].command
-        assert "-m host_journey" in command
-        assert f"--splits 3 --group {group}" in command
-        assert "--splitting-algorithm least_duration" in command
+        assert f"--ci-shard host-journey-{group}" in command
         assert "-n 1" in command
 
-    with pytest.raises(ValueError, match="between 1 and 32"):
-        _run_general_shard(_dry_runner(), 33)
+    with pytest.raises(ValueError, match="between 1 and 43"):
+        _run_general_shard(_dry_runner(), 44)
+    with pytest.raises(ValueError, match="unknown specialist lane"):
+        _run_specialist_lane(_dry_runner(), "postgres-conformance-7")
     with pytest.raises(ValueError, match="unknown specialist lane"):
         _run_specialist_lane(_dry_runner(), "unknown")
+    with pytest.raises(ValueError, match="stores must be one of"):
+        LocalCiRunner(root=_ROOT, dry_run=True, keep_going=False, stores="memory")
 
 
-def test_manifest_handoff_preserves_workers_and_required_test_environment(tmp_path):
-    manifest = tmp_path / "manifest.json"
-    collection = _dry_runner()
-    _run_test_collection(collection, manifest=manifest)
-    assert f"--ci-write-manifest {manifest}" in collection.evidence[0].command
-    for lane, workers in (
-        ("general-4", 2),
-        ("postgres-conformance-2", 2),
-        ("qualification-1", 1),
-        ("host-journey-1", 1),
+def test_shards_select_their_own_files_with_required_environment(tmp_path):
+    for lane, workers, distribution in (
+        ("general-4", 4, "worksteal"),
+        ("postgres-conformance-2", 4, "worksteal"),
+        ("qualification-1", 1, "worksteal"),
+        ("host-journey-1", 1, "worksteal"),
+        # One module fixture builds the browser image tag; keep its file together.
+        ("browser-docker", 4, "loadfile"),
     ):
-        runner = _dry_runner()
+        runner = LocalCiRunner(
+            root=_ROOT, dry_run=True, keep_going=False, durations_output=tmp_path
+        )
         if lane == "general-4":
-            _run_general_shard(runner, 4, manifest=manifest)
+            _run_general_shard(runner, 4)
         else:
-            _run_specialist_lane(runner, lane, manifest=manifest)
+            _run_specialist_lane(runner, lane)
         command = runner.evidence[-1].command
-        assert f"--ci-manifest {manifest} --ci-lane {lane}" in command
-        assert f"-n {workers} --dist loadfile" in command
-        assert "--rootdir . -c pyproject.toml" in command
+        assert (
+            f"--rootdir . -c pyproject.toml -p scripts.ci_test_shards --ci-shard {lane}" in command
+        )
+        assert f"-n {workers} --dist {distribution}" in command
+        assert f"--ci-durations {tmp_path / (lane + '.json')}" in command
         assert "CAYU_REQUIRE_POSTGRES_TESTS=1" in command
-        assert "CAYU_REQUIRE_CURRENT_TEST_DURATIONS=1" in command
+        assert "CAYU_TEST_STORES=sqlite" in command
         assert "--splits" not in command
+        assert "manifest" not in command
 
 
 @pytest.mark.parametrize("workers", [2, 4, 8])
@@ -196,12 +193,13 @@ def test_worker_override_and_optional_profile_preserve_capacity_lane_limits(tmp_
         else:
             _run_specialist_lane(runner, lane)
         command = runner.evidence[-1].command
-        assert f"-n {expected} --dist loadfile" in command
+        distribution = "loadfile" if lane == "browser-docker" else "worksteal"
+        assert f"-n {expected} --dist {distribution}" in command
         assert f"--ci-profile {tmp_path / (lane + '.json')}" in command
         assert "--rootdir . -c pyproject.toml -p scripts.ci_test_profile" in command
         assert "CAYU_REQUIRE_POSTGRES_TESTS=1" in command
     assert _dry_runner().profile_tests is None
-    assert _dry_runner().test_workers == 2
+    assert _dry_runner().test_workers == 4
 
 
 def test_profile_paths_survive_the_isolated_local_checkout(tmp_path, monkeypatch):
@@ -214,12 +212,12 @@ def test_profile_paths_survive_the_isolated_local_checkout(tmp_path, monkeypatch
             LocalCiRunner(root=_ROOT, dry_run=True, keep_going=False, test_workers=workers)
 
 
-def test_hosted_manifest_artifacts_connect_each_producer_to_its_consumers():
+def test_hosted_test_jobs_share_measured_durations_and_collected_ids():
     import re
 
-    for filename, name, consumers in (
-        ("ci.yml", "ci-test-manifest", ("test_shards", "test_specialists")),
-        ("qualification.yml", "qualification-test-manifest", ("qualification",)),
+    for filename, consumers in (
+        ("python-tests.yml", ("test_shards", "test_specialists")),
+        ("qualification.yml", ("qualification",)),
     ):
         workflow = (_ROOT / ".github/workflows" / filename).read_text()
         jobs = dict(
@@ -227,19 +225,18 @@ def test_hosted_manifest_artifacts_connect_each_producer_to_its_consumers():
                 r"^  ([a-z_-]+):\n(.*?)(?=^  [a-z_-]+:|\Z)", workflow, re.MULTILINE | re.DOTALL
             )
         )
-        producer = jobs["test-collection"]
-        assert "actions/upload-artifact@" in producer
-        assert f"name: {name}\n" in producer
-        assert "overwrite: true" in producer
-        assert "if-no-files-found: error" in producer
-        assert "path: ${{ runner.temp }}/ci-tests/manifest.json" in producer
-        assert '--test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"' in producer
         for consumer in consumers:
             job = jobs[consumer]
-            assert "actions/download-artifact@" in job
-            assert f"name: {name}\n" in job
-            assert "path: ${{ runner.temp }}/ci-tests\n" in job
-            assert '--test-manifest "$RUNNER_TEMP/ci-tests/manifest.json"' in job
+            assert '--test-durations "$RUNNER_TEMP/test-durations"' in job
+            upload = job.split("Share measured test durations", 1)[1]
+            assert "if: always()" in upload
+            assert "actions/upload-artifact@" in upload
+            assert "name: test-durations-" in upload
+            assert "path: ${{ runner.temp }}/test-durations\n" in upload
+    collection = (_ROOT / ".github/workflows/python-tests.yml").read_text().split("test_shards:")[0]
+    assert '--test-collected "$RUNNER_TEMP/ci-tests/collected-test-ids.txt"' in collection
+    assert "if: inputs.stores == 'all'" in collection
+    assert "name: collected-test-ids\n" in collection
 
 
 def test_local_general_shards_use_bounded_parallel_workers(monkeypatch, tmp_path) -> None:
@@ -247,10 +244,12 @@ def test_local_general_shards_use_bounded_parallel_workers(monkeypatch, tmp_path
 
     rendezvous = Barrier(2)
 
-    def fake_shard(runner, shard: int, *, manifest=None) -> None:
+    def fake_shard(runner, shard: int) -> None:
         assert runner.test_workers == 4
         assert runner.profile_tests == tmp_path
-        rendezvous.wait(timeout=2)
+        # The first two shards meet, which proves they run concurrently.
+        if shard <= 2:
+            rendezvous.wait(timeout=2)
         runner.evidence.append(
             CommandEvidence(
                 label=f"shard {shard}",
@@ -273,9 +272,9 @@ def test_local_general_shards_use_bounded_parallel_workers(monkeypatch, tmp_path
     )
     _run_general_shards(runner, jobs=2)
 
-    assert [item.label for item in runner.evidence] == [f"shard {n}" for n in range(1, 33)]
-    with pytest.raises(ValueError, match="between 1 and 32"):
-        _run_general_shards(_dry_runner(), jobs=33)
+    assert [item.label for item in runner.evidence] == [f"shard {n}" for n in range(1, 44)]
+    with pytest.raises(ValueError, match="between 1 and 43"):
+        _run_general_shards(_dry_runner(), jobs=44)
 
 
 def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:
@@ -506,6 +505,7 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
         execution_untracked=("?? generated-output.txt",),
         open_file_limits=(256, 8192),
         jobs=2,
+        stores="all",
         publishing=False,
         evidence=(
             CommandEvidence(
@@ -525,6 +525,7 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
     assert "Status: **PASS**" in rendered
     assert "`0 passed`, `0 failed`, `1 skipped`, `0 planned`" in rendered
     assert "`publishing=false`" in rendered
+    assert "32 general Python shards (all stores)" in rendered
     assert "### SKIP: Publishing only: Verify immutable release state" in rendered
     assert "Commit tested: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`" in rendered
     assert "`local-proof.md`" in rendered
@@ -596,15 +597,15 @@ def test_package_group_checks_copied_archive_bytes_and_preserves_input(tmp_path,
 def test_pr_gate_keeps_process_regressions_and_release_waits_for_qualification():
     general = _dry_runner()
     _run_general_shard(general, 1)
-    assert (
+    assert "--ci-shard general-1" in general.evidence[-1].command
+    assert _RUNNER["ci_shard_plan"].family("general").marker == (
         "not (stress or qualification or postgres or browser_docker or host_journey)"
-        in general.evidence[-1].command
     )
     qualification = _dry_runner()
     _run_specialist_lane(qualification, "qualification-1")
-    assert "stress or qualification" in qualification.evidence[0].command
+    assert "--ci-shard qualification-1" in qualification.evidence[0].command
     assert "-n 1" in qualification.evidence[0].command
-    assert "-n 2" in general.evidence[-1].command
+    assert "-n 4" in general.evidence[-1].command
     workflow = (_ROOT / ".github/workflows/ci.yml").read_text()
     assert "uses: ./.github/workflows/qualification.yml" in workflow
     publish = workflow.split("  publish:", 1)[1].split("  github-release:", 1)[0]
@@ -613,3 +614,11 @@ def test_pr_gate_keeps_process_regressions_and_release_waits_for_qualification()
     assert "workflow_dispatch:" in nightly
     assert "workflow_call:" in nightly
     assert "schedule:" in nightly
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(" SQLite ", "sqlite"), ("ALL", "all"), ("", "sqlite")]
+)
+def test_store_mode_default_is_normalized_like_pytest(monkeypatch, value, expected):
+    monkeypatch.setenv("CAYU_TEST_STORES", value)
+    assert _RUNNER["_parse_args"]([]).stores == expected

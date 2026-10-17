@@ -1464,9 +1464,15 @@ def test_httpx_upstream_rejects_codec_unavailable_in_environment(
         _send_direct(upstream)
 
 
+# mtime=0 keeps the gzip header, and so every worker's collected IDs, stable.
 @pytest.mark.parametrize(
     "encoded",
-    [gzip.compress(_DECODED_PAGE)[:-9], b"not gzip at all", gzip.compress(b"x") + b"junk"],
+    [
+        gzip.compress(_DECODED_PAGE, mtime=0)[:-9],
+        b"not gzip at all",
+        gzip.compress(b"x", mtime=0) + b"junk",
+    ],
+    ids=["truncated", "not-gzip", "trailing-junk"],
 )
 def test_httpx_upstream_rejects_malformed_or_truncated_encoding(encoded: bytes) -> None:
     upstream = _encoded_upstream(encoded, content_encoding="gzip")

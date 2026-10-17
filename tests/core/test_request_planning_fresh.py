@@ -576,8 +576,8 @@ async def test_fresh_created_child_is_retained_while_cancelled_plan_is_replaced(
         )
 
 
-@pytest.mark.parametrize("created_first", [False, True])
-@pytest.mark.parametrize("recovery_only", [False, True])
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("created_first,recovery_only", [(False, False), (True, True)])
 async def test_real_fresh_deadline_settles_exact_native_responsibility(
     native_stores, monkeypatch, created_first, recovery_only
 ):

@@ -3,6 +3,12 @@
 **Status:** capability-report runner exists; scheduled GitHub Actions automation
 is not yet implemented.
 
+Separately, `.github/workflows/nightly.yml` runs the regular Python test jobs each
+night with `CAYU_TEST_STORES=all`, covering the memory and Postgres store variants
+that pull requests skip, and uploads per-test timings for
+`scripts/merge_test_durations.py` (see CONTRIBUTING.md). It does not produce this
+capability report.
+
 Run the current report with:
 
 ```bash
