@@ -57,8 +57,12 @@ from cayu.execution_profiles import (
 from cayu.fork_controllers import (
     ForkControllerDenied,
     VerifiedForkController,
+    fork_controller_host_tool_ceiling,
     fork_overlay_agent_name,
     fork_overlay_tool_capability_ceiling,
+    require_fork_controller_host_tools,
+    require_fork_controller_hosted_tools,
+    require_requested_fork_controller_host_tools,
     require_verified_fork_controller,
 )
 from cayu.messages import Message, MessageRole, detach_message
@@ -130,7 +134,11 @@ from cayu.sessions._execution_profile_rules import (
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.fork_overlays import FORK_OVERLAY_METADATA_KEY, ForkOverlayRecord
+from cayu.sessions.fork_overlays import (
+    FORK_OVERLAY_METADATA_KEY,
+    ForkOverlayRecord,
+    fork_overlay_record_from_metadata,
+)
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
     FORK_EXECUTION_PROFILE_METADATA_KEY,
@@ -909,6 +917,13 @@ class SessionFork:
             verified_controller = require_verified_fork_controller(fork_controller)
             if overlay.controller != verified_controller.controller.name:
                 raise ForkControllerDenied("The overlay names a different controller.")
+            require_requested_fork_controller_host_tools(
+                verified_controller.controller,
+                request.tool_capability_ceiling,
+                None
+                if request.initial_invocation is None
+                else request.initial_invocation.tool_capability_ceiling,
+            )
         elif fork_controller is not None:
             raise ValueError("Controller forks require an overlay.")
         if (
@@ -950,13 +965,23 @@ class SessionFork:
                 # Replay returns durable evidence, so it needs current enrollment
                 # for the child's own agent; the source may be gone by now.
                 try:
-                    child_host_agent = self._get_registered_agent(
+                    child_registered_agent = self._get_registered_agent(
                         existing_descendant.agent_name
-                    ).policy_agent_name
+                    )
                 except KeyError:
-                    child_host_agent = None
-                if child_host_agent not in verified_controller.controller.agents:
+                    raise ForkControllerDenied(
+                        "The fork is not an agent this controller may fork."
+                    ) from None
+                if (
+                    child_registered_agent.policy_agent_name
+                    not in verified_controller.controller.agents
+                ):
                     raise ForkControllerDenied("The fork is not an agent this controller may fork.")
+                require_fork_controller_host_tools(
+                    verified_controller.controller,
+                    tool_capability_ceiling_from_session_metadata(existing_descendant.metadata),
+                    child_registered_agent,
+                )
             if existing_descendant is not None:
                 relationship: SessionForkProfileRelationship | None = None
                 malformed_relationship = False
@@ -1213,9 +1238,18 @@ class SessionFork:
                 "Source agent must be registered to derive inherited taint before forking: "
                 f"{source_session.agent_name}"
             ) from exc
-        if source_registered_agent.fork_controller_name is not None and (
-            overlay is None or overlay.controller != source_registered_agent.fork_controller_name
-        ):
+        # An overlay fork belongs to its controller whether or not it carries that
+        # controller's body; its durable overlay record names the owner too.
+        source_overlay_record = fork_overlay_record_from_metadata(source_session.metadata)
+        source_owners = {
+            owner
+            for owner in (
+                source_registered_agent.fork_controller_name,
+                None if source_overlay_record is None else source_overlay_record.overlay.controller,
+            )
+            if owner is not None
+        }
+        if source_owners and (overlay is None or source_owners != {overlay.controller}):
             raise ForkControllerDenied(
                 "Only the enrolling controller can fork one of its overlay forks."
             )
@@ -1279,6 +1313,15 @@ class SessionFork:
             registered_agent,
             overlay,
         )
+        if verified_controller is not None:
+            # Hosted tools ride on the agent, not the ceiling, so they are refused.
+            require_fork_controller_hosted_tools(verified_controller.controller, registered_agent)
+            # An inherited ceiling keeps only the host tools this controller's
+            # enrollment allows; an explicit request outside it was denied above.
+            effective_tool_capability_ceiling = fork_controller_host_tool_ceiling(
+                verified_controller.controller,
+                effective_tool_capability_ceiling,
+            )
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
         )

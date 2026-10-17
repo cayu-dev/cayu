@@ -228,7 +228,9 @@ def _host_app(
     enroll: bool = True,
     extra_tools: tuple[Tool, ...] = (),
     enrolled_agents: tuple[str, ...] = (HOST_AGENT,),
+    host_tools: tuple[str, ...] | None = None,
     extra_agents: tuple[str, ...] = (),
+    hosted_tools: tuple[Any, ...] = (),
     environment: Environment | None = None,
     **app_options: Any,
 ) -> tuple[CayuApp, PostJournal]:
@@ -240,16 +242,20 @@ def _host_app(
     app.register_agent(
         AgentSpec(name=HOST_AGENT, model="fake-model", system_prompt="Close the books."),
         tools=[journal, *extra_tools],
+        **({"hosted_tools": hosted_tools} if hosted_tools else {}),
     )
     for name in extra_agents:
         app.register_agent(AgentSpec(name=name, model="fake-model"))
     if enroll:
+        # ``host_tools=None`` keeps the enrollment default, which allows no host tool.
+        allowance: dict[str, Any] = {} if host_tools is None else {"host_tools": host_tools}
         app.enroll_fork_controller(
             ForkController(
                 name=CONTROLLER,
                 subjects=(SUBJECT,),
                 agents=enrolled_agents,
                 mcp_toolsets=() if toolset is None else (toolset,),
+                **allowance,
             )
         )
     return app, journal
@@ -450,7 +456,7 @@ def test_instructions_and_memory_overlay_keeps_the_inherited_profile() -> None:
     async def scenario():
         provider = ScriptedProvider([_completed("closed"), _completed("finding")])
         store = InMemorySessionStore()
-        app, _journal = _host_app(store, provider)
+        app, _journal = _host_app(store, provider, host_tools=("post_journal",))
         await _run_trunk(app)
         controller = app.fork_controller_access(SUBJECT)
         overlay = _overlay(tools=())
@@ -1208,6 +1214,7 @@ def test_overlay_forks_cannot_publish_host_knowledge() -> None:
             extra_tools=(
                 RememberKnowledgeTool(policy=RememberKnowledgePolicy(default_namespace="finance")),
             ),
+            host_tools=("remember_knowledge",),
             environment=Environment(
                 EnvironmentSpec(name="finance"),
                 knowledge_store=knowledge,
@@ -1570,3 +1577,821 @@ def test_fork_replay_requires_current_enrollment(
     sdk, http, _server = asyncio.run(restarted((HOST_AGENT,)))
     assert not isinstance(sdk, BaseException) and [event.id for event in sdk] == [fork_event_id]
     assert http.status_code == 200 and fork_event_id in http.text
+
+
+def _controller_server(app: CayuApp, authenticate=None):
+    from fastapi import FastAPI
+
+    from cayu.server.fork_controller import create_fork_controller_router
+
+    async def default_authenticate(_request):
+        return SUBJECT
+
+    server = FastAPI()
+    server.include_router(
+        create_fork_controller_router(app, authenticate=authenticate or default_authenticate)
+    )
+    return server
+
+
+async def _http(server, method: str, path: str, **options: Any):
+    import httpx
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server), base_url="http://test"
+    ) as client:
+        return await client.request(method, path, **options)
+
+
+def test_an_omitted_ceiling_narrows_to_the_host_tool_allowance() -> None:
+    async def scenario():
+        toolset, controller_server = _controller_toolset()
+        provider = ScriptedProvider(
+            [_completed("closed"), _calls("post_journal", {"amount": 100}), _completed("no")]
+        )
+        store = InMemorySessionStore()
+        app, journal = _host_app(store, provider, toolset=toolset)
+        await _run_trunk(app)
+        controller = app.fork_controller_access(SUBJECT)
+        # Neither fork sends a ceiling, so both would inherit the trunk's host tools.
+        await _drain(controller.fork(_fork_request(tool_capability_ceiling=None)))
+        await _drain(
+            controller.fork(
+                ForkSessionRequest(
+                    source_session_id="trunk",
+                    session_id="memory-only",
+                    overlay=_overlay(tools=()),
+                )
+            )
+        )
+        await _drain(
+            controller.resume(
+                ResumeRequest(session_id="compass-child", messages=[Message.text("user", "Post.")])
+            )
+        )
+        return store, provider, journal, controller_server
+
+    store, provider, journal, controller_server = asyncio.run(scenario())
+    trunk = asyncio.run(store.load("trunk"))
+    assert trunk is not None and "post_journal" in trunk.tool_capability_ceiling.tool_names
+    child = asyncio.run(store.load("compass-child"))
+    assert child is not None
+    # Controller-served tools are unaffected; host tools are narrowed to the allowance.
+    assert child.tool_capability_ceiling.tool_names == (LOOKUP,)
+    memory_only = asyncio.run(store.load("memory-only"))
+    assert memory_only is not None and memory_only.tool_capability_ceiling.tool_names == ()
+    assert [tool["name"] for tool in provider.requests[1].tools] == [LOOKUP]
+    assert journal.contexts == []
+    assert controller_server.calls == []
+
+
+def test_an_explicit_host_tool_outside_the_allowance_is_denied() -> None:
+    async def scenario():
+        toolset, controller_server = _controller_toolset()
+        provider = ScriptedProvider([_completed("closed")])
+        store = InMemorySessionStore()
+        app, journal = _host_app(store, provider, toolset=toolset)
+        await _run_trunk(app)
+        controller = app.fork_controller_access(SUBJECT)
+        post_journal = ToolCapabilityCeiling(tool_names=("post_journal",))
+        sdk = await _forbidden(controller.fork(_fork_request(tool_capability_ceiling=post_journal)))
+        source = await controller.snapshot_source("trunk")
+        first_invocation = await _forbidden(
+            controller.fork(
+                _fork_request(
+                    tool_capability_ceiling=None,
+                    expected_source=source,
+                    initial_invocation=ResumeRequest(
+                        session_id="compass-child",
+                        messages=[Message.text("user", "Post.")],
+                        tool_capability_ceiling=post_journal,
+                    ),
+                    initial_dispatch_id="compass-dispatch-1",
+                )
+            )
+        )
+        # A fork without the tool cannot gain it on resume either.
+        await _drain(
+            controller.fork(_fork_request("compass-allowed", tool_capability_ceiling=None))
+        )
+        resumed = await _forbidden(
+            controller.resume(
+                ResumeRequest(
+                    session_id="compass-allowed",
+                    messages=[Message.text("user", "Post.")],
+                    tool_capability_ceiling=post_journal,
+                )
+            )
+        )
+        http = await _http(
+            _controller_server(app),
+            "POST",
+            "/fork-controller/fork",
+            json=_fork_request(
+                session_id="compass-http",
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("post_journal",)),
+            ).model_dump(mode="json"),
+        )
+        return store, provider, journal, controller_server, (sdk, first_invocation, resumed), http
+
+    store, provider, journal, controller_server, denials, http = asyncio.run(scenario())
+    assert all(isinstance(denial, ForkControllerDenied) for denial in denials)
+    assert http.status_code == 403
+    assert http.json() == {"detail": "Fork controller access denied."}
+    for session_id in ("compass-child", "compass-http"):
+        assert asyncio.run(store.load(session_id)) is None
+    assert len(provider.requests) == 1
+    assert journal.contexts == []
+    assert controller_server.calls == []
+
+
+def test_an_allowed_host_tool_runs_in_a_controller_fork() -> None:
+    async def scenario():
+        toolset, controller_server = _controller_toolset()
+        provider = ScriptedProvider(
+            [_completed("closed"), _calls("post_journal", {"amount": 100}), _completed("posted")]
+        )
+        store = InMemorySessionStore()
+        app, journal = _host_app(store, provider, toolset=toolset, host_tools=("post_journal",))
+        await _run_trunk(app)
+        controller = app.fork_controller_access(SUBJECT)
+        await _drain(
+            controller.fork(
+                _fork_request(
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("post_journal",))
+                )
+            )
+        )
+        await _drain(
+            controller.resume(
+                ResumeRequest(session_id="compass-child", messages=[Message.text("user", "Post.")])
+            )
+        )
+        return store, provider, journal, controller_server
+
+    store, provider, journal, controller_server = asyncio.run(scenario())
+    child = asyncio.run(store.load("compass-child"))
+    assert child is not None
+    assert child.tool_capability_ceiling.tool_names == ("post_journal", LOOKUP)
+    assert sorted(tool["name"] for tool in provider.requests[1].tools) == sorted(
+        ["post_journal", LOOKUP]
+    )
+    assert len(journal.contexts) == 1
+    assert controller_server.calls == []
+
+
+def test_narrowing_the_allowance_revokes_an_existing_fork_on_resume_and_replay(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "host.sqlite"
+    adoption = _fork_request().profile_adoption
+    assert adoption is not None
+    # The HTTP entrance records this provenance, so SDK and HTTP replay match.
+    request = _fork_request(
+        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("post_journal",)),
+        profile_adoption=adoption.model_copy(
+            update={
+                "requested_by": ResolutionActor(
+                    subject=SUBJECT, source=ResolutionActorSource.HTTP_AUTH
+                )
+            }
+        ),
+    )
+    resume = ResumeRequest(session_id="compass-child", messages=[Message.text("user", "Post.")])
+
+    async def first_process() -> str:
+        toolset, _server = _controller_toolset()
+        app, _journal = _host_app(
+            SQLiteSessionStore(database),
+            ScriptedProvider([_completed("closed")]),
+            toolset=toolset,
+            host_tools=("post_journal",),
+        )
+        await _run_trunk(app)
+        events = await _drain(app.fork_controller_access(SUBJECT).fork(request))
+        return events[0].id
+
+    async def restarted(host_tools: tuple[str, ...] | None):
+        toolset, controller_server = _controller_toolset()
+        provider = ScriptedProvider([])
+        app, journal = _host_app(
+            SQLiteSessionStore(database), provider, toolset=toolset, host_tools=host_tools
+        )
+        controller = app.fork_controller_access(SUBJECT)
+        replay: list[Event] | BaseException
+        try:
+            replay = await _drain(controller.fork(request))
+        except ForkControllerDenied as exc:
+            replay = exc
+        resumed = await _forbidden(controller.resume(resume))
+        server = _controller_server(app)
+        http_replay = await _http(
+            server, "POST", "/fork-controller/fork", json=request.model_dump(mode="json")
+        )
+        http_resume = await _http(
+            server, "POST", "/fork-controller/resume", json=resume.model_dump(mode="json")
+        )
+        return replay, resumed, http_replay, http_resume, provider, journal, controller_server
+
+    fork_event_id = asyncio.run(first_process())
+    replay, resumed, http_replay, http_resume, provider, journal, server = asyncio.run(
+        restarted(None)
+    )
+    assert isinstance(replay, ForkControllerDenied)
+    assert isinstance(resumed, ForkControllerDenied)
+    assert http_replay.status_code == 403 and "data:" not in http_replay.text
+    assert http_resume.status_code == 403 and "data:" not in http_resume.text
+    assert provider.requests == []
+    assert journal.contexts == []
+    assert server.calls == []
+    child = asyncio.run(SQLiteSessionStore(database).load("compass-child"))
+    # The durable ceiling is never rewritten; the allowance is re-checked against it.
+    assert child is not None
+    assert child.tool_capability_ceiling.tool_names == ("post_journal", LOOKUP)
+
+    # With the allowance restored, the same fork replays exactly.
+    replay, *_rest = asyncio.run(restarted(("post_journal",)))
+    assert not isinstance(replay, BaseException)
+    assert [event.id for event in replay] == [fork_event_id]
+
+
+def test_host_tool_allowance_is_validated_at_enrollment() -> None:
+    store = InMemorySessionStore()
+    for host_tools, message in (
+        (("post_jornal",), "no enrolled agent registers: post_jornal"),
+        # A tool of an agent outside the enrollment is not an allowance this controller can use.
+        (("void_journal",), "no enrolled agent registers: void_journal"),
+    ):
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedProvider([]), default=True)
+        app.register_agent(AgentSpec(name=HOST_AGENT, model="fake-model"), tools=[PostJournal()])
+        app.register_agent(AgentSpec(name="payroll", model="fake-model"), tools=[VoidJournal()])
+        with pytest.raises(ValueError, match=message):
+            app.enroll_fork_controller(
+                ForkController(
+                    name=CONTROLLER,
+                    subjects=(SUBJECT,),
+                    agents=(HOST_AGENT,),
+                    host_tools=host_tools,
+                )
+            )
+        # A rejected enrollment leaves nothing enrolled.
+        with pytest.raises(ForkControllerDenied):
+            app.fork_controller_access(SUBJECT)
+    with pytest.raises(ValueError, match="must not repeat"):
+        ForkController(
+            name=CONTROLLER,
+            subjects=(SUBJECT,),
+            agents=(HOST_AGENT,),
+            host_tools=("post_journal", "post_journal"),
+        )
+    with pytest.raises(TypeError, match="iterable of strings"):
+        ForkController(
+            name=CONTROLLER,
+            subjects=(SUBJECT,),
+            agents=(HOST_AGENT,),
+            host_tools="post_journal",  # ty: ignore[invalid-argument-type]
+        )
+
+
+def test_controller_mode_is_observe_only() -> None:
+    from cayu.fork_controllers import ForkControllerMode
+
+    def enroll(**options: Any) -> ForkController:
+        return ForkController(name=CONTROLLER, subjects=(SUBJECT,), agents=(HOST_AGENT,), **options)
+
+    assert enroll().mode is ForkControllerMode.OBSERVE
+    assert enroll(mode="observe").mode is ForkControllerMode.OBSERVE
+    assert [mode.value for mode in ForkControllerMode] == ["observe"]
+    for future in ("assist", "guard", "OBSERVE"):
+        with pytest.raises(ValueError, match="no other mode exists"):
+            enroll(mode=future)
+    with pytest.raises(TypeError, match="ForkControllerMode"):
+        enroll(mode=1)
+
+
+def test_observe_mode_controller_has_no_trunk_write_path() -> None:
+    from cayu.fork_controllers import ForkControllerAccess
+
+    async def scenario():
+        toolset, controller_server = _controller_toolset()
+        provider = ScriptedProvider(
+            [_completed("closed"), _calls(LOOKUP, {"q": "accruals"}), _completed("finding")]
+        )
+        store = InMemorySessionStore()
+        app, _journal = _host_app(store, provider, toolset=toolset)
+        await _run_trunk(app)
+        before = (
+            await store.load("trunk"),
+            await store.load_transcript("trunk"),
+            await store.load_events("trunk"),
+        )
+        controller = app.fork_controller_access(SUBJECT)
+        await _drain(controller.fork(_fork_request()))
+        await _drain(
+            controller.resume(
+                ResumeRequest(session_id="compass-child", messages=[Message.text("user", "go")])
+            )
+        )
+        to_trunk = {
+            "resume_trunk": await _forbidden(
+                controller.resume(
+                    ResumeRequest(session_id="trunk", messages=[Message.text("user", "Steer.")])
+                )
+            ),
+            "fork_into_trunk": await _forbidden(controller.fork(_fork_request("trunk"))),
+        }
+        server = _controller_server(app)
+        http_resume = await _http(
+            server,
+            "POST",
+            "/fork-controller/resume",
+            json=ResumeRequest(
+                session_id="trunk", messages=[Message.text("user", "Steer.")]
+            ).model_dump(mode="json"),
+        )
+        after = (
+            await store.load("trunk"),
+            await store.load_transcript("trunk"),
+            await store.load_events("trunk"),
+        )
+        routes = {
+            (method, route.path)
+            for route in server.routes
+            if route.path.startswith("/fork-controller")
+            for method in getattr(route, "methods", ())
+        }
+        return before, after, to_trunk, http_resume, routes, controller_server
+
+    before, after, to_trunk, http_resume, routes, controller_server = asyncio.run(scenario())
+    assert after == before
+    assert all(isinstance(error, ForkControllerDenied) for error in to_trunk.values())
+    assert http_resume.status_code == 403
+    assert controller_server.calls == [("lookup", {"q": "accruals"})]
+    # The whole controller surface: no message, steering or approval entrance exists.
+    assert {name for name in vars(ForkControllerAccess) if not name.startswith("_")} == {
+        "controller_name",
+        "subject",
+        "enrollment",
+        "fork",
+        "resume",
+        "snapshot_source",
+    }
+    assert routes == {
+        ("GET", "/fork-controller/enrollment"),
+        ("GET", "/fork-controller/sources/{session_id}/snapshot"),
+        ("POST", "/fork-controller/fork"),
+        ("POST", "/fork-controller/resume"),
+    }
+
+
+def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
+    from cayu.fork_controllers import ForkControllerEnrollment, ForkControllerMode
+
+    async def scenario():
+        toolset, _server = _controller_toolset(
+            ControllerMcpSession(_definitions(names=("lookup", "search")))
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedProvider([]), default=True)
+        app.register_agent(
+            AgentSpec(name=HOST_AGENT, model="fake-model"), tools=[PostJournal(), VoidJournal()]
+        )
+        app.register_agent(AgentSpec(name="payroll", model="fake-model"), tools=[PostJournal()])
+        app.enroll_fork_controller(
+            ForkController(
+                name=CONTROLLER,
+                subjects=(SUBJECT, "svc:compass-standby"),
+                agents=(HOST_AGENT,),
+                host_tools=("post_journal",),
+                mcp_toolsets=(toolset,),
+            )
+        )
+        app.enroll_fork_controller(
+            ForkController(
+                name="auditor",
+                subjects=("svc:auditor",),
+                agents=("payroll",),
+                host_tools=("post_journal",),
+            )
+        )
+        sdk = app.fork_controller_access(SUBJECT).enrollment()
+        subject = SUBJECT
+
+        async def authenticate(_request):
+            return subject
+
+        server = _controller_server(app, authenticate)
+        http = await _http(server, "GET", "/fork-controller/enrollment")
+        subject = "svc:auditor"
+        auditor = await _http(server, "GET", "/fork-controller/enrollment")
+        subject = "svc:unknown"
+        unknown = await _http(server, "GET", "/fork-controller/enrollment")
+        subject = ""
+        anonymous = await _http(server, "GET", "/fork-controller/enrollment")
+        return sdk, http, auditor, unknown, anonymous
+
+    sdk, http, auditor, unknown, anonymous = asyncio.run(scenario())
+    assert sdk == ForkControllerEnrollment(
+        controller=CONTROLLER,
+        subject=SUBJECT,
+        mode=ForkControllerMode.OBSERVE,
+        agents=(HOST_AGENT,),
+        host_tools=("post_journal",),
+        served_tools=(LOOKUP, "mcp__compass__search"),
+    )
+    with pytest.raises(ValueError):
+        sdk.__setattr__("subject", "svc:other")
+    assert http.status_code == 200
+    assert http.json() == sdk.model_dump(mode="json")
+    for hidden in ("svc:compass-standby", "auditor", "payroll", "void_journal"):
+        assert hidden not in http.text
+    assert auditor.json() == {
+        "controller": "auditor",
+        "subject": "svc:auditor",
+        "mode": "observe",
+        "agents": ["payroll"],
+        "host_tools": ["post_journal"],
+        "served_tools": [],
+    }
+    assert unknown.status_code == 403
+    assert anonymous.status_code == 401
+
+
+def test_bearer_authenticator_maps_tokens_to_subjects_in_constant_time(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    import logging
+
+    from cayu.server.auth import AuthConfigurationError
+    from cayu.server.fork_controller import ForkControllerBearerAuth
+
+    primary = "cmp-primary-" + "a" * 32
+    rotated = "cmp-rotated-" + "b" * 32
+    auditor_token = "aud-" + "c" * 40
+    tokens = {primary: SUBJECT, rotated: SUBJECT, auditor_token: "svc:auditor"}
+    auth = ForkControllerBearerAuth(tokens)
+    env_auth = ForkControllerBearerAuth.from_environment(
+        environ={"CAYU_FORK_CONTROLLER_TOKENS": json.dumps(tokens)}
+    )
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text(json.dumps(tokens), encoding="utf-8")
+    file_auth = ForkControllerBearerAuth.from_file(token_file)
+
+    compared: list[bytes] = []
+    real_compare = hmac.compare_digest
+
+    def counting_compare(left, right):
+        compared.append(right)
+        return real_compare(left, right)
+
+    async def scenario():
+        app, _journal = _host_app(
+            InMemorySessionStore(), ScriptedProvider([]), extra_agents=("payroll",)
+        )
+        app.enroll_fork_controller(
+            ForkController(name="auditor", subjects=("svc:auditor",), agents=("payroll",))
+        )
+        results: dict[str, list[Any]] = {}
+        for name, authenticator in {"mapping": auth, "env": env_auth, "file": file_auth}.items():
+            server = _controller_server(app, authenticator)
+            responses = []
+            for headers in (
+                {"Authorization": f"Bearer {primary}"},
+                {"Authorization": f"bearer {rotated}"},
+                {"Authorization": f"Bearer {auditor_token}"},
+                {"Authorization": f"Bearer {primary}x"},
+                {},
+                {"Authorization": "Bearer"},
+                {"Authorization": f"Bearer  {primary}"},
+                {"Authorization": f"Basic {primary}"},
+                {"Authorization": f"Bearer {primary} extra"},
+                [(b"Authorization", f"Bearer {primary}\u00e9".encode("latin-1"))],
+            ):
+                responses.append(
+                    await _http(server, "GET", "/fork-controller/enrollment", headers=headers)
+                )
+            responses.append(
+                await _http(
+                    server,
+                    "GET",
+                    "/fork-controller/enrollment",
+                    headers=[("Authorization", f"Bearer {primary}")] * 2,
+                )
+            )
+            results[name] = responses
+        return results
+
+    monkeypatch.setattr(hmac, "compare_digest", counting_compare)
+    with caplog.at_level(logging.DEBUG):
+        results = asyncio.run(scenario())
+    monkeypatch.undo()
+
+    for responses in results.values():
+        subjects = [
+            response.json()["subject"] if response.status_code == 200 else response.status_code
+            for response in responses
+        ]
+        assert subjects == [SUBJECT, SUBJECT, "svc:auditor", 401, 401, 401, 401, 401, 401, 401, 401]
+        for response in responses:
+            assert all(token not in response.text for token in tokens)
+    # Every well-formed presentation is compared with every entry, even after a match.
+    assert len(compared) == 3 * 4 * len(tokens)
+
+    failures: list[BaseException] = []
+    for build in (
+        lambda: ForkControllerBearerAuth({}),
+        lambda: ForkControllerBearerAuth(
+            {f"{index:02d}-{primary}": SUBJECT for index in range(65)}
+        ),
+        lambda: ForkControllerBearerAuth({"short-" + primary[:8]: SUBJECT}),
+        lambda: ForkControllerBearerAuth({primary + " space": SUBJECT}),
+        lambda: ForkControllerBearerAuth({primary: " svc:compass"}),
+        lambda: ForkControllerBearerAuth.from_environment(environ={}),
+        lambda: ForkControllerBearerAuth.from_environment(
+            environ={"CAYU_FORK_CONTROLLER_TOKENS": "{" + primary}
+        ),
+        lambda: ForkControllerBearerAuth.from_environment(
+            environ={"CAYU_FORK_CONTROLLER_TOKENS": json.dumps([primary])}
+        ),
+        lambda: ForkControllerBearerAuth.from_file(tmp_path / "missing.json"),
+    ):
+        with pytest.raises(AuthConfigurationError) as raised:
+            build()
+        failures.append(raised.value)
+    rendered = [repr(auth), str(auth), *(f"{error!s} {error!r}" for error in failures)]
+    rendered.extend(record.getMessage() for record in caplog.records)
+    output = capsys.readouterr()
+    rendered.extend((output.out, output.err))
+    for text in rendered:
+        assert primary[:16] not in text and rotated not in text and auditor_token not in text
+    assert repr(auth) == "ForkControllerBearerAuth(tokens=3)"
+    # Only digests are kept, never the tokens themselves.
+    assert all(token not in repr(auth._entries) for token in tokens)
+    assert (
+        len(ForkControllerBearerAuth({f"{i:02d}-{primary}": SUBJECT for i in range(64)})._entries)
+        == 64
+    )
+
+
+def test_instructions_only_fork_asking_for_current_child_needs_a_policy() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        provider = ScriptedProvider([_completed("closed")])
+        app, _journal = _host_app(store, provider)
+        await _run_trunk(app)
+        controller = app.fork_controller_access(SUBJECT)
+        with pytest.raises(ExecutionProfileAdoptionRejected):
+            await _drain(
+                controller.fork(
+                    _fork_request(
+                        overlay=_overlay(tools=()),
+                        tool_capability_ceiling=None,
+                    )
+                )
+            )
+        return store, provider
+
+    store, provider = asyncio.run(scenario())
+    assert asyncio.run(store.load("compass-child")) is None
+    assert len(provider.requests) == 1
+
+
+def test_fork_controller_options_are_keyword_only() -> None:
+    import inspect
+
+    parameters = inspect.signature(ForkController).parameters
+    positional = [
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ]
+    assert positional == ["name", "subjects", "agents"]
+    toolset, _session = _controller_toolset()
+    with pytest.raises(TypeError):
+        ForkController(CONTROLLER, (SUBJECT,), (HOST_AGENT,), (toolset,))  # ty: ignore[too-many-positional-arguments]
+
+
+@pytest.mark.parametrize("source", ["file_not_utf8", "file_not_json", "env_not_json"])
+def test_bearer_token_configuration_errors_never_carry_the_tokens(
+    tmp_path: Path, source: str
+) -> None:
+    from cayu.server.auth import AuthConfigurationError
+    from cayu.server.fork_controller import ForkControllerBearerAuth
+
+    token = "t" * 40
+    token_file = tmp_path / "tokens.json"
+    if source == "file_not_utf8":
+        token_file.write_bytes(b'{"' + token.encode() + b'\xff": "svc:compass"}')
+    else:
+        token_file.write_text('{"' + token + '": "svc:compass",}', encoding="utf-8")
+    with pytest.raises(AuthConfigurationError) as raised:
+        if source == "env_not_json":
+            ForkControllerBearerAuth.from_environment(
+                environ={"CAYU_FORK_CONTROLLER_TOKENS": token_file.read_text(encoding="utf-8")}
+            )
+        else:
+            ForkControllerBearerAuth.from_file(token_file)
+    error = raised.value
+    # Neither the error nor anything it chains may hold the tokens.
+    assert error.__cause__ is None and error.__context__ is None
+    rendered = [str(error), repr(error), repr(error.args), repr(vars(error))]
+    assert not any(token in text for text in rendered)
+
+
+def test_a_controller_cannot_fork_or_snapshot_another_controllers_fork() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        provider = ScriptedProvider([_completed("closed")])
+        app, _journal = _host_app(store, provider)
+        app.enroll_fork_controller(
+            ForkController(name="auditor", subjects=("svc:auditor",), agents=(HOST_AGENT,))
+        )
+        await _run_trunk(app)
+        compass = app.fork_controller_access(SUBJECT)
+        auditor = app.fork_controller_access("svc:auditor")
+
+        def instructions_only(session_id: str, source: str, controller: str) -> ForkSessionRequest:
+            return ForkSessionRequest(
+                source_session_id=source,
+                session_id=session_id,
+                overlay=_overlay(controller=controller, tools=()),
+            )
+
+        await _drain(compass.fork(instructions_only("compass-child", "trunk", CONTROLLER)))
+        denied: dict[str, BaseException | None] = {
+            "sdk_fork": await _forbidden(
+                auditor.fork(instructions_only("auditor-copy", "compass-child", "auditor"))
+            ),
+            "host_fork": await _forbidden(
+                app.fork_session(
+                    ForkSessionRequest(source_session_id="compass-child", session_id="host-copy")
+                )
+            ),
+        }
+        try:
+            await auditor.snapshot_source("compass-child")
+            denied["sdk_snapshot"] = None
+        except ForkControllerDenied as exc:
+            denied["sdk_snapshot"] = exc
+
+        async def authenticate_auditor(_request):
+            return "svc:auditor"
+
+        server = _controller_server(app, authenticate_auditor)
+        http_fork = await _http(
+            server,
+            "POST",
+            "/fork-controller/fork",
+            json=instructions_only("auditor-http", "compass-child", "auditor").model_dump(
+                mode="json"
+            ),
+        )
+        http_snapshot = await _http(
+            server, "GET", "/fork-controller/sources/compass-child/snapshot"
+        )
+        own_refork = await _drain(
+            compass.fork(instructions_only("compass-again", "compass-child", CONTROLLER))
+        )
+        trunk_fork = await _drain(
+            auditor.fork(instructions_only("auditor-trunk", "trunk", "auditor"))
+        )
+        return store, denied, http_fork, http_snapshot, own_refork, trunk_fork
+
+    store, denied, http_fork, http_snapshot, own_refork, trunk_fork = asyncio.run(scenario())
+    assert all(isinstance(error, ForkControllerDenied) for error in denied.values()), denied
+    assert http_fork.status_code == 403 and "data:" not in http_fork.text
+    assert http_snapshot.status_code == 403
+    for session_id in ("auditor-copy", "host-copy", "auditor-http"):
+        assert asyncio.run(store.load(session_id)) is None
+    # A controller still re-forks its own forks and forks the host's sessions.
+    assert [event.type for event in own_refork] == [EventType.SESSION_FORKED]
+    assert [event.type for event in trunk_fork] == [EventType.SESSION_FORKED]
+
+
+def test_a_stale_source_snapshot_is_a_conflict_over_http() -> None:
+    async def scenario():
+        toolset, controller_server = _controller_toolset()
+        store = InMemorySessionStore()
+        provider = ScriptedProvider([_completed("closed"), _completed("closed again")])
+        app, _journal = _host_app(store, provider, toolset=toolset)
+        await _run_trunk(app)
+        server = _controller_server(app)
+        snapshot = await _http(server, "GET", "/fork-controller/sources/trunk/snapshot")
+        # The host continues the source after the controller captured it.
+        await _drain(
+            app.resume(
+                ResumeRequest(session_id="trunk", messages=[Message.text("user", "One more.")])
+            )
+        )
+        from cayu.sessions.forks import ForkSourceSnapshot
+
+        request = _fork_request(
+            expected_source=ForkSourceSnapshot.model_validate(snapshot.json()),
+            initial_invocation=ResumeRequest(
+                session_id="compass-child",
+                messages=[Message.text("user", "Investigate accruals.")],
+            ),
+            initial_dispatch_id="compass-dispatch-1",
+        ).model_dump(mode="json")
+        forked = await _http(server, "POST", "/fork-controller/fork", json=request)
+        return store, snapshot, forked, controller_server
+
+    store, snapshot, forked, controller_server = asyncio.run(scenario())
+    assert snapshot.status_code == 200
+    assert forked.status_code == 409
+    assert forked.json() == {"detail": "The session changed during the request; read it again."}
+    assert asyncio.run(store.load("compass-child")) is None
+    assert controller_server.calls == []
+
+
+class HostedSearchProvider(ScriptedProvider):
+    """A scripted provider that accepts OpenAI hosted web search."""
+
+    def preflight_hosted_tools(self, *, model, hosted_tools, options) -> None:
+        return None
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_hosted_tools_need_the_host_tool_allowance(tmp_path: Path, allowed: bool) -> None:
+    from cayu.providers.hosted import OpenAIWebSearch
+
+    database = tmp_path / "host.sqlite"
+    allowance = ("openai_web_search",) if allowed else ()
+
+    def instructions_only() -> ForkSessionRequest:
+        return ForkSessionRequest(
+            source_session_id="trunk", session_id="compass-child", overlay=_overlay(tools=())
+        )
+
+    async def process(host_tools: tuple[str, ...], batches):
+        provider = HostedSearchProvider(batches)
+        app, _journal = _host_app(
+            SQLiteSessionStore(database),
+            provider,
+            hosted_tools=(OpenAIWebSearch(),),
+            host_tools=host_tools,
+        )
+        return app, provider
+
+    async def first() -> dict[str, Any]:
+        app, provider = await process(allowance, [_completed("closed"), _completed("finding")])
+        await _run_trunk(app)
+        controller = app.fork_controller_access(SUBJECT)
+        outcome: dict[str, Any] = {
+            "sdk_fork": await _forbidden(controller.fork(instructions_only()))
+        }
+        http = await _http(
+            _controller_server(app),
+            "POST",
+            "/fork-controller/fork",
+            json=instructions_only().model_dump(mode="json"),
+        )
+        outcome["http_status"] = http.status_code
+        if allowed:
+            await _drain(
+                controller.resume(
+                    ResumeRequest(session_id="compass-child", messages=[Message.text("user", "go")])
+                )
+            )
+        outcome["requests"] = provider.requests
+        outcome["child"] = await app.session_store.load("compass-child")
+        return outcome
+
+    outcome = asyncio.run(first())
+    if not allowed:
+        assert isinstance(outcome["sdk_fork"], ForkControllerDenied)
+        assert outcome["http_status"] == 403
+        assert outcome["child"] is None
+        assert len(outcome["requests"]) == 1
+        return
+    assert outcome["sdk_fork"] is None and outcome["http_status"] == 200
+    assert outcome["child"] is not None
+    assert [tool.type for tool in outcome["requests"][-1].hosted_tools] == ["openai_web_search"]
+
+    async def narrowed():
+        # The host withdraws web search: the existing fork's replay and resume fail closed.
+        app, provider = await process((), [])
+        controller = app.fork_controller_access(SUBJECT)
+        replay = await _forbidden(controller.fork(instructions_only()))
+        resume = await _forbidden(
+            controller.resume(
+                ResumeRequest(session_id="compass-child", messages=[Message.text("user", "go")])
+            )
+        )
+        return replay, resume, provider.requests
+
+    replay, resume, requests = asyncio.run(narrowed())
+    assert isinstance(replay, ForkControllerDenied)
+    assert isinstance(resume, ForkControllerDenied)
+    assert requests == []
+
+
+def test_a_hosted_tool_no_enrolled_agent_has_fails_enrollment() -> None:
+    with pytest.raises(ValueError, match="no enrolled agent registers"):
+        _host_app(InMemorySessionStore(), ScriptedProvider([]), host_tools=("openai_web_search",))

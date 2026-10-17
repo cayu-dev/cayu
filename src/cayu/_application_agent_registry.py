@@ -728,11 +728,24 @@ class ApplicationAgentRegistry:
                     "A refreshable host MCP source cannot also serve a fork controller."
                 )
             adapters.extend(sorted(toolset.tools, key=lambda tool: tool.name))
+        enrolled_bases = tuple(
+            self._get_registered_agent(agent_name) for agent_name in controller.agents
+        )
+        if any(base.fork_controller_name is not None for base in enrolled_bases):
+            raise ValueError("A fork-controller body cannot be enrolled again.")
+        enrolled_host_tools = {name for base in enrolled_bases for name in base.tools} | {
+            tool.type for base in enrolled_bases for tool in base.hosted_tools
+        }
+        unknown_host_tools = [
+            name for name in controller.host_tools if name not in enrolled_host_tools
+        ]
+        if unknown_host_tools:
+            raise ValueError(
+                "host_tools names tools that no enrolled agent registers: "
+                + ", ".join(unknown_host_tools)
+            )
         bodies: dict[str, runtime_records.RegisteredAgentState] = {}
-        for agent_name in controller.agents:
-            base = self._get_registered_agent(agent_name)
-            if base.fork_controller_name is not None:
-                raise ValueError("A fork-controller body cannot be enrolled again.")
+        for agent_name, base in zip(controller.agents, enrolled_bases, strict=True):
             if not adapters:
                 continue
             body_name = fork_controller_agent_name(agent_name, controller.name)
