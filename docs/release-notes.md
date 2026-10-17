@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Upgrade: Existing streaming applications continue unchanged. Applications can use
+`send_turn` to create or continue a conversation and await one result.
+
 - Add `send_turn` and `TurnRequest` for applications that create or continue a
   conversation and await one result. Creation races and session replacement
   retain native admission checks. `RunOutcome` now reports invocation usage,
@@ -9,6 +12,10 @@
   bounded presentation exports and a shared collector for recovery streams.
   Streaming APIs remain available. See the
   [terminal-turn contract](runtime-contracts.md#terminal-turn-convenience).
+
+### Breaking changes
+
+None.
 
 ## v0.11.4
 

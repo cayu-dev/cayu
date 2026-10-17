@@ -5,7 +5,11 @@ Only public `v*` tag pushes publish. Leave PR merges and release tags to a maint
 
 1. Choose an unused version. Update `pyproject.toml`, `src/cayu/_version.py`,
    `uv.lock`, and `dashboard/src/lib/release-metadata.ts`. Add one short,
-   matching, non-empty `## vX.Y.Z` section to `docs/release-notes.md`.
+   matching, non-empty `## vX.Y.Z` section to `docs/release-notes.md`. Start it
+   with an upgrade summary paragraph that begins with `Upgrade:`, and give it a
+   `### Breaking changes` heading that says "None." when nothing breaks. See the
+   [stability policy](stability.md#release-notes-format) for the format and for
+   when a release must be a minor rather than a patch.
 2. Regenerate versioned assets:
 
    ```bash
@@ -22,7 +26,10 @@ Only public `v*` tag pushes publish. Leave PR merges and release tags to a maint
 3. Pass CI, `qualification.yml`, and
    `uv run python -m maintenance.model_catalog.check` on the release commit.
    Check note integrity with
-   `uv run python scripts/verify_release_state.py --notes docs/release-notes.md`.
+   `uv run python scripts/verify_release_state.py --notes docs/release-notes.md`
+   before tagging. It also rejects `## Unreleased` or any release section newer
+   than `v0.11.4` that lacks the upgrade summary or the `### Breaking changes`
+   heading; publication runs the same check on the tagged release.
    Branch pushes do not start CI; use the PR or `workflow_dispatch`.
 4. Sync the approved commit to the public repo and push its matching `vX.Y.Z`
    tag. Verify the tag and commit before approving the `pypi` deployment.
@@ -39,7 +46,7 @@ matching release-note section verbatim.
 Never reuse a published version, move its tag, or edit its tagged release notes.
 If PyPI succeeds but GitHub release creation fails, rerun only the failed job.
 After release, give the development branch a distinct development version and one
-`## Unreleased` section.
+`## Unreleased` section in the same format.
 
 CI retains the shared wheel and source archives for three days so package checks,
 approval, and publication consume the same bytes. Complete approval within that

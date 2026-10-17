@@ -475,6 +475,10 @@ and immutable-tag configuration in addition to the checked-in workflow. Follow
 [the release runbook](docs/releasing.md) exactly; in particular, do not push a
 release tag until every one-time security prerequisite is active.
 
+Releases follow the [stability policy](docs/stability.md): it decides whether a
+change needs a minor or a patch release, and every new release-note section
+needs an upgrade summary and a `### Breaking changes` heading.
+
 ## Reporting issues
 
 Use the issue templates. The short version:

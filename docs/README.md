@@ -91,6 +91,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [MCP client conformance coverage](mcp-conformance.md)
 - [Release notes](release-notes.md)
 - [Releasing](releasing.md)
+- [Stability policy and release cadence](stability.md)
 - [Session-operation fault harness](session-operation-fault-harness.md)
 - [SQLite store performance](sqlite-store-performance.md)
 
