@@ -46,6 +46,7 @@ only when the requested behavior requires it.
 | Durable operational changes | proposal, policy-bound approval, action receipt, verification, recovery | `cayu guide durable-operations` |
 | Rebuild service-backed tools after a restart | component behavior identities, injected or environment-bound knowledge | `cayu guide durable-service-tools` |
 | Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
+| Prove a paused session survives a restart | `RestartHarness`, durable stores, pending actions | `cayu guide restart-tests` |
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
 | Application workspace references or inventories | `WorkspaceReferenceBinding`, `ToolContext.require_workspace_binding` | `cayu guide authoring#workspace-references-and-inventories` |
 | Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |
@@ -746,6 +747,8 @@ cayu eval run
 
 Tests should exercise `CayuApp.run` or `run_to_completion` with a
 `ScriptedModelProvider`, not private methods or a fake replacement runtime.
+To prove that a session paused for approval or user input continues in a new
+process, use `cayu.testing.RestartHarness`; see `cayu guide restart-tests`.
 Trajectory evals should assert domain behavior plus important runtime events:
 tool calls, approval interruption, artifacts, child sessions, usage, or final
 state as appropriate.

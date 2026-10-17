@@ -696,6 +696,16 @@ and generated `run.py` entrypoints call `aclose()` for you. The server and `run.
 start model policy workers and leave stopping them to `aclose()`, so a stalled
 policy stop is bounded by that deadline and reported like any other step.
 
+`cayu.testing.RestartHarness` uses this lifecycle to test restarts. Each restart
+calls `aclose()` on the current app and stops with an error unless the outcome
+settled. It then closes the stores it opened with `open_application_stores` and
+calls the application factory again, passing new stores on the same database and
+a new `ScriptedModelProvider` that holds the scripted turns not used yet.
+Approvals and user input go through `resolve_tool_approval` and
+`resolve_user_input`, so execution-profile admission and the other runtime checks
+apply unchanged. The harness refuses in-memory session and task stores and does
+not inject faults. See `cayu guide restart-tests`.
+
 ## Transcript search and recall
 
 `SessionStore.search_transcript(TranscriptSearchQuery)` is an indexed,

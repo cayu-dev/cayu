@@ -47,3 +47,5 @@ from cayu.testing.base import (
     verify_provider_credential_isolation as verify_provider_credential_isolation,
 )
 from cayu.testing.base import verify_tool_effect as verify_tool_effect
+from cayu.testing.restart import RestartHarness as RestartHarness
+from cayu.testing.restart import RestartStep as RestartStep

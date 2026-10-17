@@ -796,3 +796,21 @@ def test_unknown_guide_topic_suggests_topics_and_explains_repository_docs(capsys
     assert report["code"] == "UNKNOWN_GUIDE_TOPIC"
     assert "docs/project-server.md are not shipped with the package" in report["message"]
     assert isinstance(report["suggestions"], list)
+
+
+def test_restart_tests_guide_example_runs_across_a_restart(capsys, tmp_path: Path) -> None:
+    assert main(["guide", "restart-tests"]) == 0
+    guide = capsys.readouterr().out
+    example = re.search(r"```python\n(.*?)```", guide, re.DOTALL)
+    assert example is not None
+    namespace: dict[str, Any] = {}
+    exec(compile(example.group(1), "restart-tests", "exec"), namespace)
+
+    namespace["test_refund_survives_restart_before_approval"](tmp_path)
+    assert namespace["REFUNDS"] == ["A-1"]
+
+    for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
+        assert main(["guide", reference]) == 0, reference
+        capsys.readouterr()
+    assert main(["guide", "authoring"]) == 0
+    assert "cayu guide restart-tests" in capsys.readouterr().out

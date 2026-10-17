@@ -59,6 +59,10 @@ _GUIDES = {
         "Primary integrations and compatible Chat Completions endpoints.",
     ),
     "references": ("references.md", "Offline references for optional capabilities."),
+    "restart-tests": (
+        "restart-tests.md",
+        "Test pause, restart, and resume with RestartHarness on durable stores.",
+    ),
     "structured-output": (
         "structured-output.md",
         "Credential-free structured-output runtime proof.",
@@ -105,6 +109,7 @@ _RELATED = {
     "providers": ("thinking", "authoring", "diagnostics"),
     "thinking": ("providers", "authoring"),
     "references": ("authoring", "durable-operations"),
+    "restart-tests": ("durable-operations", "durable-service-tools", "order-support"),
     "structured-output": ("authoring", "diagnostics"),
     "tool-effects": ("authoring", "durable-operations"),
     "verified-work": ("durable-operations", "tool-effects", "evals-ai-quality", "authoring"),
