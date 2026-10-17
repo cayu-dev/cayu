@@ -609,7 +609,7 @@ def test_modern_stdio_default_containment_discovers_and_reaps(tmp_path: Path) ->
 
 def test_modern_stdio_interoperates_with_official_sdk(tmp_path: Path) -> None:
     # This is a locked dev dependency, not a silently skipped optional tier.
-    assert version("mcp") == "2.1.1"
+    assert version("mcp") == "2.2.0"
     request_log = tmp_path / "sdk-requests.jsonl"
     fixture = _FAKE_SERVER.with_name("official_mcp_2026_stdio_server.py")
     spec = McpServerSpec(

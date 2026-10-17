@@ -18,7 +18,7 @@ qualify Cayu against the upstream release's complete SDK requirements.
 | Extensions | No claim for MRTR, tasks, OAuth/CIMD, elicitation, sampling, prompts, logging, skills, or resource/prompt subscriptions | Not included in this conformance gate |
 
 The implementation and deterministic regression tests live in `src/cayu/mcp/`
-and `tests/core/test_mcp*.py`. The official SDK is pinned to `mcp==2.1.1` in the
+and `tests/core/test_mcp*.py`. The official SDK is pinned to `mcp==2.2.0` in the
 development dependencies and `uv.lock`; neither it nor the conformance runner is
 a Cayu production dependency.
 
