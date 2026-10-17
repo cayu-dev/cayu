@@ -2,8 +2,11 @@
 
 `cayu check` renders these stable findings from the public application manifest.
 Run the correction, then rerun `cayu inspect --json` and `cayu check --json`.
-The last section, [request-cost](#request-cost), covers what a running server
-spends on each HTTP route and how to check it.
+Two sections cover runtime behavior instead of check findings:
+[execution-profile-mismatch](#execution-profile-mismatch) explains the error a
+resumed session raises after the agent's code changed, and
+[request-cost](#request-cost) covers what a running server spends on each HTTP
+route and how to check it.
 
 ## scaffold-import-removed
 
@@ -251,6 +254,216 @@ provider credential, remote service, sandbox, network path, or deployment is
 live. The manifest reports `has_system_prompt` but never prompt text; its
 fingerprint records prompt presence, not prompt contents. A prompt edit between
 two non-empty values therefore needs a runtime test or eval for verification.
+
+## execution-profile-mismatch
+
+`ExecutionProfileMismatchError` is a runtime error, not a `cayu check` finding.
+A session records an execution profile on its first run: a digest and an
+identity kind for each class of component (tools, policies, provider, model and
+so on). Every later resume or continuation rebuilds the profile from the
+current code and compares the two. When they differ, Cayu refuses before any
+model call, tool call or other governed work. This happens most often while
+you edit code and rerun against the same local store.
+
+### Reading the message
+
+The first line lists the changed component classes. The `What changed` lines
+show, for each class, how the stored and the current profile identified it:
+
+- `declared`: the components declare an `ExecutionProfileBehaviorIdentity`.
+- `structural`: Cayu identifies them from their configuration, as it does for
+  built-in providers, built-in policies and tool descriptors.
+- `opaque`: at least one component has no declared identity, so Cayu can only
+  identify it within one process and one `CayuApp` instance. A request loop
+  policy without a declared identity is identified per policy object.
+- `unavailable`: the identity could not be resolved.
+
+| Stored → current | What it usually means |
+| --- | --- |
+| `opaque` → `opaque` | Nothing may have changed. An undeclared component never matches in a new process or `CayuApp` instance. Declare an identity and start a new session. |
+| `declared` or `structural` → `opaque` | A component without a declared identity was added, or a declaration was removed. |
+| `opaque` → anything else | The stored baseline can't be matched by any later process. Declaring an identity now doesn't repair it; start a new session or adopt. |
+| `declared` → `declared` | A real change: a declared name or version changed, or a component was added, removed or reconfigured. |
+| `structural` → `structural` | A real change in configuration, such as a tool's description or schema, a budget limit, or the model. |
+
+Stored profiles keep one digest per class, so the message can't name the
+individual tool, policy or version that changed. `error.differences` carries
+the same evidence as data: `component_class`, `category`, `expected_strength`
+and `candidate_strength`. `error.boundary` is `"resume"` for an ordinary resume
+with nothing pending, `"continuation"` when pending work had to continue under
+its recorded profile, or `None` when unknown.
+
+To see the same comparison before resuming, run
+`cayu execution-profile compare SESSION_ID` in the project. It builds the
+application, compares the stored profile with the current one class by class,
+prints the same explanation, and exits 3 when the session would not resume.
+It builds the current profile the way Runtime does at the session's next
+boundary. For pending work it restores the run settings recorded with the
+approval, user input or tool round, such as `thinking` and budget limits. At a
+resume boundary, resume inherits `max_steps`, `limits` and `retry_policy`, but
+a finished interaction keeps no `thinking`, `budget_limits` or
+`structured_output`, so a difference in those classes is listed under "not
+compared" with the reason instead of as a change. Request `loop_policies` are
+never stored, so `invocation_policies` is not compared when the session used
+them. The command runs in a new process, so classes with opaque identity
+always show as changed there. That includes request `loop_policies` without a
+declared identity: no later call can match them, so the command predicts the
+rejection instead of listing them as not compared. If the session's agent,
+provider or environment is no longer registered, for example after a rename,
+the command fails with `REGISTRATION_MISSING` and the registry error the
+continuation would raise; register it under the recorded name again.
+
+### Fix the cause
+
+Tools. Give every custom tool a declared identity in its `ToolSpec`, as
+`cayu generate tool` does, and bump `behavior_version` when its behavior
+changes:
+
+```python
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+
+lookup_identity = ExecutionProfileBehaviorIdentity(
+    name="lookup", behavior_version="1", implementation_version="1"
+)
+```
+
+Adding, removing or redescribing a tool changes the session's tool authority,
+so a changed tool set needs a new session or adoption.
+
+Policies and hooks. A custom `LoopPolicy`, `ToolPolicy`, `CommandPolicy` or
+`RuntimeHook` without a declared identity is opaque. Override its
+`execution_profile_identity` property. Built-ins such as `RequireFinalTool`
+already declare one. Request `loop_policies` on `RunRequest` and
+`ResumeRequest` are part of the session's profile, so pass the same policies on
+every run and resume of the session, including in each simulated process of a
+test. A request loop policy used together with profile adoption must also
+return a stable `adoption_replay_identity`:
+
+```python
+from cayu.runtime import ExecutionProfileBehaviorIdentity, LoopPolicy
+
+class CompletionCheck(LoopPolicy):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="completion-check", behavior_version="1", implementation_version="1"
+        )
+
+    @property
+    def adoption_replay_identity(self) -> str:
+        return "completion-check:1:1"
+```
+
+Provider. Built-in providers and a `ScriptedModelProvider` built from
+positional event batches keep the same identity in every process.
+`ScriptedModelProvider(response_factory=...)`, provider subclasses and custom
+`ModelProvider` classes are opaque unless they override
+`execution_profile_identity`. In a test that simulates several processes with
+several `CayuApp` instances on one store, build the provider the same way in
+each one:
+
+```python
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+
+def scripted_provider() -> ScriptedModelProvider:
+    return ScriptedModelProvider(
+        [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed()]]
+    )
+```
+
+Provider options, thinking and failover settings are part of the profile too
+(`provider_request_policy`).
+
+Model. `provider_target` means the agent now resolves to a different provider
+or model than the session uses. Register the same provider name and model, or
+switch explicitly with `ResumeRequest(..., target=ModelTarget(provider_name=...,
+model=...))`, which Cayu adopts at a clean resume boundary.
+
+Cayu itself. `runtime` means the Cayu version or build changed. When it is the
+only change and no `ExecutionProfilePolicy` is configured, resume adopts it
+automatically at a clean boundary.
+
+Other components. Custom environments, runners, environment factories and
+context policies declare `execution_profile_identity` the same way. Structural
+settings such as budget limits, structured output, `max_steps`, run limits and
+egress must match the stored session.
+
+### Next steps
+
+Start a new session when the change is real or the baseline is opaque:
+`app.run(RunRequest(agent_name=..., session_id="<new id>", messages=[...]))`.
+
+To keep the session instead, adopt the current profile at a clean resume
+boundary, meaning the previous interaction finished and nothing is pending.
+Adoption needs two things: an `ExecutionProfilePolicy` on the `CayuApp` that
+returns `adopt` for explicit requests, and a `ResumeRequest` that carries
+`profile_adoption`. Without a configured policy, every adoption request is
+rejected with `ExecutionProfileAdoptionRejected`. This policy adopts any
+explicit request, which suits local development; in production, check
+`request.intent.requested_by` and `request.changed_component_classes` before
+adopting:
+
+```python
+from cayu import CayuApp, Message, ResumeRequest
+from cayu.approvals import ResolutionActor, ResolutionActorSource
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+)
+
+class AdoptExplicitRequests(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "my-app:adopt-explicit-requests:v1"
+
+    async def decide(self, request: ExecutionProfilePolicyRequest) -> ExecutionProfilePolicyResult:
+        if request.intent is None:
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.REJECT,
+                reason="The profile changed and no adoption was requested.",
+            )
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason=request.intent.reason,
+            authority_decision=(
+                ExecutionProfileAuthorityDecision.AUTHORIZED
+                if request.authority_review_required
+                else ExecutionProfileAuthorityDecision.NOT_REQUIRED
+            ),
+        )
+
+async def adopt_current_profile(app: CayuApp, session_id: str, key: str) -> None:
+    async for event in app.resume(ResumeRequest(
+        session_id=session_id,
+        messages=[Message.text("user", "Continue with the updated agent.")],
+        profile_adoption=ExecutionProfileAdoptionIntent(
+            idempotency_key=key,
+            reason="Local development: adopt the edited agent code.",
+            requested_by=ResolutionActor(subject="developer", source=ResolutionActorSource.REQUEST),
+        ),
+    )):
+        print(event.type)
+```
+
+Pass the policy as `CayuApp(..., execution_profile_policy=AdoptExplicitRequests())`
+and call `adopt_current_profile(app, session_id, "adopt-1")`. Use a new
+idempotency key for each adoption; reusing a key with a different request
+fails. Adoption records a durable `session.execution_profile.decided` event
+with your reason and actor. If the adopted profile is still opaque, the next
+process or `CayuApp` instance mismatches again, so declare identities first.
+
+When `error.boundary` is `"continuation"`, the session has pending work, such
+as an approval, user input, a tool round or an unfinished invocation, and that
+work must continue under the profile it started with. Adoption is not available
+there. Restore the previous code or identities and finish the pending work,
+then adopt on a later resume, or start a new session. Cayu never adopts a
+changed profile on its own, apart from the runtime-only and explicit
+`ModelTarget` cases above.
 
 ## request-cost
 

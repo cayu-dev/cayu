@@ -68,7 +68,11 @@ def test_changed_identity_rejected_before_provider_or_effect(tmp_path: Path, opt
     }[option]
     assert expected_class in output
     assert "Class-level digest evidence" in output
+    assert f"{expected_class} (" in output and "declared -> declared" in output
     assert "Process-local" not in output
+    # A pending approval is not an adoption boundary; the message says so.
+    assert "adoption is not available here" in output
+    assert "profile_adoption=" not in output
     assert observations(state, "approve") == {"searches": 0, "provider_requests": 0}
     assert not (state / "effects.sqlite").exists()
 
@@ -80,6 +84,8 @@ def test_undeclared_service_identity_remains_fail_closed(tmp_path: Path) -> None
     assert "ExecutionProfileMismatchError" in output
     assert "Process-local (opaque) identity is present in: tool_implementations" in output
     assert "does not repair an already persisted opaque baseline" in output
+    assert "tool_implementations (tool implementations): opaque -> opaque" in output
+    assert "profile_adoption=ExecutionProfileAdoptionIntent(" in output
     assert observations(state, "resume") == {"searches": 0, "provider_requests": 0}
 
 

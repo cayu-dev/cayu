@@ -387,6 +387,11 @@ from cayu.runtime._event_projection import (
 from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor, dispatch_event_watchers
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_classification import ExecutionProfileClassifier
+from cayu.runtime._execution_profile_comparison import (
+    ComparedSessionNotFound,
+    SessionExecutionProfileComparison,
+    compare_session_execution_profile,
+)
 from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
@@ -6523,6 +6528,40 @@ class CayuApp:
         stage = await store.load_active_model_completion_stage(session_id)
         return session_execution_profiles(
             session, checkpoint, model_completion_pending=stage is not None
+        )
+
+    async def _compare_session_execution_profile(
+        self,
+        session_id: str,
+    ) -> SessionExecutionProfileComparison:
+        """Build this registration's candidate for one session's next boundary, read-only.
+
+        Used by ``cayu execution-profile compare``. Raises
+        ``ComparedSessionNotFound`` for an unknown session,
+        ``SessionRegistrationMissing`` when a registration the session needs is
+        missing, and ``SessionExecutionProfileUnavailable`` when the session has
+        no comparable stored profile.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        store = self._runtime_session_store
+        session = await store.load(session_id)
+        if session is None:
+            raise ComparedSessionNotFound(session_id)
+        return await compare_session_execution_profile(
+            store=store,
+            session=session,
+            continuation=self._execution_profile_continuation,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment=self._get_registered_environment,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_identities=self._loop_policy_execution_profile_identities,
+            budget_policy=self.budget_policy,
+            effective_retry_policy=self._effective_retry_policy,
+            process_identity=self._execution_profile_process_identity,
+            redactor=self._secret_redactor,
         )
 
     @_tracked_entrance

@@ -501,6 +501,97 @@ class ExecutionProfileContinuation:
     ) -> execution_profile_admission.ExecutionProfileContinuationPlan:
         """Resolve a recovery continuation against its durable invocation profile."""
 
+        plan, active_model_completion = await self._prepare_plan(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_failover=request_failover,
+            request_loop_policies=request_loop_policies,
+            budget_policy=budget_policy,
+            request_budget_limits=request_budget_limits,
+            structured_output=structured_output,
+            thinking=thinking,
+            max_steps=max_steps,
+            limits=limits,
+            retry_policy=retry_policy,
+            invocation_semantics_available=invocation_semantics_available,
+            frozen_candidate_profile=frozen_candidate_profile,
+            additional_profile_fingerprints=additional_profile_fingerprints,
+            tool_completion=tool_completion,
+        )
+        return await self._settle_plan(
+            plan,
+            session=session,
+            active_model_completion=active_model_completion,
+            frozen_candidate_profile=frozen_candidate_profile,
+            require_open_interaction=require_open_interaction,
+            record_rejection=record_rejection,
+        )
+
+    async def inspect_plan(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        budget_policy: BudgetPolicy | None = None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int | None = None,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
+        tool_completion: ToolCompletionPolicy | None = None,
+    ) -> execution_profile_admission.ExecutionProfileContinuationPlan:
+        """Reconstruct the continuation candidate exactly as ``resolve`` does, read-only.
+
+        Unlike ``resolve``, this never records a rejection, repairs a historical
+        handoff, or requires an open interaction; it only reads session state.
+        """
+
+        plan, _ = await self._prepare_plan(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_loop_policies=request_loop_policies,
+            budget_policy=budget_policy,
+            request_budget_limits=request_budget_limits,
+            structured_output=structured_output,
+            thinking=thinking,
+            max_steps=max_steps,
+            limits=limits,
+            retry_policy=retry_policy,
+            invocation_semantics_available=invocation_semantics_available,
+            tool_completion=tool_completion,
+        )
+        return plan
+
+    async def _prepare_plan(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        request_failover: ModelFailoverPolicy | None = None,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        budget_policy: BudgetPolicy | None = None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int | None = None,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
+        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
+        additional_profile_fingerprints: tuple[str, ...] = (),
+        tool_completion: ToolCompletionPolicy | None = None,
+    ) -> tuple[execution_profile_admission.ExecutionProfileContinuationPlan, Any]:
         if invocation_semantics_available and max_steps is None:
             raise ValueError("Recovery requires recorded invocation max_steps.")
         active_model_completion = await self._session_store.load_active_model_completion_stage(
@@ -636,6 +727,18 @@ class ExecutionProfileContinuation:
                 )
             ),
         )
+        return plan, active_model_completion
+
+    async def _settle_plan(
+        self,
+        plan: execution_profile_admission.ExecutionProfileContinuationPlan,
+        *,
+        session: Session,
+        active_model_completion: Any,
+        frozen_candidate_profile: ExecutionProfileIdentity | None,
+        require_open_interaction: bool,
+        record_rejection: bool,
+    ) -> execution_profile_admission.ExecutionProfileContinuationPlan:
         snapshot = plan.snapshot
         if snapshot.profile.model_failover is not None or plan.model_failover is not None:
             self._session_store._require_model_failover_stage_protocol()
@@ -684,6 +787,7 @@ class ExecutionProfileContinuation:
                 changed_component_classes=changed,
                 expected_profile=snapshot.profile,
                 candidate_profile=candidate,
+                boundary="continuation",
             )
 
         policy_identity = "cayu:active-invocation-profile:v1"
@@ -724,6 +828,7 @@ class ExecutionProfileContinuation:
             changed_component_classes=changed,
             expected_profile=snapshot.profile,
             candidate_profile=candidate,
+            boundary="continuation",
         )
 
     async def _repair_historical_queued_profile_handoff(

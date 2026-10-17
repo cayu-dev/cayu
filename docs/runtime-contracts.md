@@ -4269,7 +4269,7 @@ A profile-adoption safe boundary exists only after the previous interaction is t
 
 Applications can configure one versioned `ExecutionProfilePolicy` on `CayuApp`. The policy receives bounded redacted expected/candidate identities, changed component classes, model target, actor-bearing intent, and whether direct-tool authority changed. It returns `compatible_reuse`, `adopt`, `migration_required`, or `reject`; Cayu defensively copies the result and verifies that the configured policy identity remains stable across its await. Unknown or unavailable identity is never compatible by absence of evidence: compatibility requires this explicit attributable policy decision. `compatible_reuse` admits the invocation without advancing the durable expected profile. `adopt` requires explicit caller intent, except that the existing explicit `ModelTarget` request remains a built-in system-attributed adoption. An `authority_decision="denied"` result never admits the changed profile. Direct-tool changes are conservatively authority-broadening and require both `adopt` and the distinct `authority_decision="authorized"`; generic compatibility can never widen them.
 
-Every considered boundary records a typed decision: `exact_reuse`, `compatible_reuse`, `adopted`, `migration_required`, or `rejected`. Accepted decisions use `session.execution_profile.decided`; rejections use `session.execution_profile.rejected`. Evidence includes the redacted complete expected and candidate identities, changed classes, actor without authorization claims, policy identity/reason, authority decision, caller reason, session identity, durable ordering, and idempotency identity. A rejected boundary raises `ExecutionProfileMismatchError` or `ExecutionProfileAdoptionRejected`; migration classification raises `ExecutionProfileMigrationRequired`. Session status, run epoch, checkpoint, transcript, and interaction state remain unchanged for either non-admitting outcome.
+Every considered boundary records a typed decision: `exact_reuse`, `compatible_reuse`, `adopted`, `migration_required`, or `rejected`. Accepted decisions use `session.execution_profile.decided`; rejections use `session.execution_profile.rejected`. Evidence includes the redacted complete expected and candidate identities, changed classes, actor without authorization claims, policy identity/reason, authority decision, caller reason, session identity, durable ordering, and idempotency identity. A rejected boundary raises `ExecutionProfileMismatchError` or `ExecutionProfileAdoptionRejected`; migration classification raises `ExecutionProfileMigrationRequired`. Session status, run epoch, checkpoint, transcript, and interaction state remain unchanged for either non-admitting outcome. The exception message names each changed class with its stored and current identity strength (`declared`, `structural`, `opaque`, or `unavailable`), adds fixed guidance for the affected component families, and states the next step: a new session, or explicit adoption with an `ExecutionProfilePolicy` and `ResumeRequest.profile_adoption`. `differences` carries the same evidence as `expected_strength` and `candidate_strength`, taken only from authoritative runtime profile objects. `boundary` (`resume`, `continuation`, or `None`) and `application_policy_configured` only shape that guidance: at a `continuation` boundary the message withholds adoption advice, and without a configured policy it says that adoption would be rejected. The message never includes component names, declared identity strings, configuration, or object representations, and building it never calls application code. `cayu guide diagnostics#execution-profile-mismatch` documents the same message.
 
 For an accepted boundary, the decision event, optional expected-profile advance, optional model switch, status/run-epoch transition, checkpoint claim, interaction start, and resume input are one store transaction in that order. Thus no provider, tool, verifier, policy hook after admission, or other governed effect can start before durable decision evidence. The immutable `baseline` never changes; only `adopted` advances `expected`. Concurrent attempts serialize on the store's session row/lock. Explicit idempotency keys derive a stable event identity and bind it to a canonical fingerprint of the complete copied `ResumeRequest`, including messages, actor authorization claims, target, semantic metadata, run controls, structured-output and thinking settings, and ordered request loop-policy identity. Positively runtime-attested `traceparent` and `tracestate` values added by the HTTP transport are carried in a separate per-attempt tracing channel: they remain available to the emitted resume event but are not exposed through request metadata to policies, hooks, tools, providers, or other governed behavior, so tracing a retry does not change its semantic identity. Identical raw SDK metadata remains untrusted, governed input and is bound by the fingerprint. A request loop policy used with explicit adoption must expose a stable, versioned, non-secret `adoption_replay_identity` that changes whenever behavior-affecting configuration changes; policies without that identity fail the combination closed before profile policy or governed work. Exact replay returns the first decision without rerunning policy or governed work; changing any bound request material under the same key fails closed. The fingerprint is internal durable runtime-generated evidence, contains no raw request content, and is omitted from public event projection so rejected private request material cannot be tested through a published unkeyed digest. Decisions without caller keys are scoped to the run epoch, profile pair, and versioned policy identity, so a later policy version can supersede a prior default rejection without overwriting its evidence while conflicting answers from one unchanged policy identity fail closed. Another process loads the advanced expectation from durable session metadata. Queued dispatch profile binding and adoption are separate contracts. A resumed session continues to use its already-durable system projection, so changing the live `AgentSpec.system_prompt` or workspace source alone does not claim that either was re-injected.
 
@@ -4406,7 +4406,35 @@ target, and causal budget id, and exits `0` when every entry is admitted and
 and emit `{"schema_version": "1", "error": {"code", "message"}}` for `--json`.
 Neither starts the application, loads or writes sessions, or dispatches
 provider, tool, hook, or environment-factory work, and both close the
-application before exiting. Whatever the project factory does while
+application before exiting.
+
+`cayu execution-profile compare SESSION_ID --json` reads one session from the
+project's session store and builds this build's candidate the way Runtime does
+at the session's next boundary. At `continuation` it compares the active
+invocation's profile with the candidate from Runtime's continuation
+reconstruction, using the run settings recorded with the pending approval,
+user input or tool round, as a continuation without explicit overrides does.
+At `resume` it compares the expected profile with the resume builder's
+candidate, using the `max_steps`, `limits`, and `retry_policy` that resume
+inherits from the last model step. It prints both strengths for every component
+class, the prediction, and the same guidance the runtime error would give.
+Classes it cannot reconstruct from stored data are listed in `not_compared`
+with a reason and kept out of the prediction: `invocation_policies` when the
+session used request `loop_policies`, which are never stored; at `resume`,
+`provider_request_policy`, `invocation_budget_policy`, and `structured_output`
+when they differ, because each `ResumeRequest` sets them; and the recorded
+request classes for pending work other than an approval, user input, or tool
+round. A class whose stored identity is opaque is never moved to `not_compared`:
+no later caller or process can reproduce it, so it stays changed and the
+prediction is the rejection Runtime records. It exits `0` when the session is
+predicted to resume, `3` when it may not, and `1` with `SESSION_NOT_FOUND`,
+`REGISTRATION_MISSING` (the session exists, but its agent, provider,
+environment, or a failover provider is not registered, which its continuation
+or resume reports with the same registry error), `PROFILE_UNAVAILABLE`,
+`CANDIDATE_UNAVAILABLE`, or `PROJECT_BOOT_FAILED`. It reads the session record,
+checkpoint, and model-completion stage only; it never claims or admits the
+session or writes evidence. Its process-local components always differ, as
+in any new process. Whatever the project factory does while
 constructing the application, such as opening a store, still happens.
 
 ### Resume requests

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
@@ -256,12 +257,19 @@ class _ExecutionProfileAdmissionRequestRejected(RuntimeError):
 
 
 class ExecutionProfileDifference(BaseModel):
-    """Bounded class-level evidence; profile digests do not identify members."""
+    """Bounded class-level evidence; profile digests do not identify members.
+
+    ``expected_strength`` and ``candidate_strength`` report how the stored and
+    current profiles identified this class. They are ``None`` when that profile
+    does not record the class or is not authoritative runtime evidence.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     component_class: ExecutionProfileComponentClass
     category: Literal["opaque_identity", "other_or_unknown"]
+    expected_strength: ExecutionProfileIdentityStrength | None = None
+    candidate_strength: ExecutionProfileIdentityStrength | None = None
 
 
 def _profile_differences(
@@ -282,25 +290,251 @@ def _profile_differences(
         and candidate.fingerprint == candidate_fingerprint
     )
     opaque = set()
+    strengths: tuple[
+        dict[ExecutionProfileComponentClass, ExecutionProfileIdentityStrength],
+        dict[ExecutionProfileComponentClass, ExecutionProfileIdentityStrength],
+    ] = ({}, {})
     if trusted:
-        for profile in profiles:
+        for profile, by_class in zip(profiles, strengths, strict=True):
             assert profile is not None
             for component in profile.components:
-                if type(component) is ExecutionProfileComponentIdentity and (
-                    component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
-                ):
+                if type(component) is not ExecutionProfileComponentIdentity:
+                    continue
+                by_class[component.component_class] = component.strength
+                if component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL:
                     opaque.add(component.component_class)
     return tuple(
         ExecutionProfileDifference(
             component_class=component,
             category="opaque_identity" if component in opaque else "other_or_unknown",
+            expected_strength=strengths[0].get(component),
+            candidate_strength=strengths[1].get(component),
         )
         for component in changed
     )
 
 
+# Fixed, non-secret wording only. Messages never include component names,
+# declared identity strings, configuration, or object representations.
+_COMPONENT_LABELS: dict[ExecutionProfileComponentClass, str] = {
+    ExecutionProfileComponentClass.RUNTIME: "Cayu version or build",
+    ExecutionProfileComponentClass.PROVIDER_TARGET: "provider name and model",
+    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION: "stored system prompt projection",
+    ExecutionProfileComponentClass.DIRECT_TOOLS: "the agent's tool set and tool descriptors",
+    ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS: "tool implementations",
+    ExecutionProfileComponentClass.TOOL_VIEW_GRANTS: "tool capability ceiling and grants",
+    ExecutionProfileComponentClass.EXECUTION_POLICIES: (
+        "tool, command, exposure and app or agent loop policies"
+    ),
+    ExecutionProfileComponentClass.INVOCATION_POLICIES: "request loop_policies",
+    ExecutionProfileComponentClass.RUNTIME_HOOKS: "runtime hooks",
+    ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT: "environment and runner",
+    ExecutionProfileComponentClass.EFFECT_AUTHORITY: "tool effects and credential authority",
+    ExecutionProfileComponentClass.EGRESS_AUTHORITY: "egress authority",
+    ExecutionProfileComponentClass.CONTEXT_SELECTION: "context policy",
+    ExecutionProfileComponentClass.AUTOMATIC_RECALL: "automatic recall",
+    ExecutionProfileComponentClass.CONTEXT_COMPACTION: "context compaction",
+    ExecutionProfileComponentClass.LIVE_STATE_PROJECTION: "live state projection",
+    ExecutionProfileComponentClass.PROVIDER_ADAPTER: "model provider adapter",
+    ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY: (
+        "provider options, thinking and failover"
+    ),
+    ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY: "application budget limits",
+    ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY: "request budget limits",
+    ExecutionProfileComponentClass.STRUCTURED_OUTPUT: "structured output",
+    ExecutionProfileComponentClass.FINALIZATION: (
+        "max_steps, run limits, retry policy and tool completion"
+    ),
+}
+
+_STRENGTH_LABELS: dict[ExecutionProfileIdentityStrength, str] = {
+    ExecutionProfileIdentityStrength.APPLICATION_VERSIONED: "declared",
+    ExecutionProfileIdentityStrength.STRUCTURAL: "structural",
+    ExecutionProfileIdentityStrength.PROCESS_LOCAL: "opaque",
+    ExecutionProfileIdentityStrength.UNAVAILABLE: "unavailable",
+}
+
+_MAX_LISTED_DIFFERENCES = 8
+_MAX_SNIPPET_SESSION_ID_CHARS = 128
+
+_TOOL_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+    }
+)
+_POLICY_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ExecutionProfileComponentClass.RUNTIME_HOOKS,
+    }
+)
+_PROVIDER_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+    }
+)
+_OTHER_COMPONENT_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+        ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL,
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+        ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
+        ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
+        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+    }
+)
+
+_DECLARE_IDENTITY = (
+    'ExecutionProfileBehaviorIdentity(name=..., behavior_version="1", implementation_version="1")'
+)
+
+
+def _difference_interpretation(difference: ExecutionProfileDifference) -> str:
+    """Explain one class change from its two identity strengths only."""
+
+    stored, current = difference.expected_strength, difference.candidate_strength
+    if stored is None or current is None:
+        return "Cayu cannot tell more from the stored evidence."
+    opaque = ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    if ExecutionProfileIdentityStrength.UNAVAILABLE in (stored, current):
+        return "Its identity could not be resolved, so it cannot be compared."
+    if stored is opaque and current is opaque:
+        return (
+            "An undeclared component gets a new identity in every process and CayuApp "
+            "instance (a request loop policy, for every new policy object), so this "
+            "differs even when your code did not change."
+        )
+    if current is opaque:
+        return "A component without a declared identity was added, or a declaration was removed."
+    if stored is opaque:
+        return (
+            "The stored identity is opaque, so no later process can match it; declaring "
+            "an identity now does not repair this session."
+        )
+    declared = ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+    if stored is declared and current is declared:
+        return (
+            "A declared name or version changed, or a component was added, removed or reconfigured."
+        )
+    if stored is declared:
+        return "A component with a declared identity was removed, or lost its declaration."
+    if current is declared:
+        return "A component with a declared identity was added."
+    return "Its configuration changed, or a component was added or removed."
+
+
+def _difference_lines(differences: tuple[ExecutionProfileDifference, ...]) -> list[str]:
+    lines = []
+    for difference in differences[:_MAX_LISTED_DIFFERENCES]:
+        label = _COMPONENT_LABELS.get(difference.component_class, "component")
+        stored, current = difference.expected_strength, difference.candidate_strength
+        kinds = (
+            ""
+            if stored is None or current is None
+            else f" {_STRENGTH_LABELS[stored]} -> {_STRENGTH_LABELS[current]}:"
+        )
+        lines.append(
+            f"- {difference.component_class.value} ({label}):{kinds} "
+            f"{_difference_interpretation(difference)}"
+        )
+    remaining = len(differences) - _MAX_LISTED_DIFFERENCES
+    if remaining > 0:
+        lines.append(f"- and {remaining} more component classes.")
+    return lines
+
+
+def _component_guidance(changed: frozenset[ExecutionProfileComponentClass]) -> list[str]:
+    """Return class-specific fixes. Every changed class receives one line."""
+
+    guidance = []
+    if changed & _TOOL_CLASSES:
+        guidance.append(
+            "Tools: if you added or edited a tool, give every custom tool "
+            f"`execution_profile_identity={_DECLARE_IDENTITY}` in its ToolSpec, as "
+            "`cayu generate tool` does, and bump behavior_version when its behavior "
+            "changes. Adding, removing or redescribing a tool changes the session's "
+            "tool authority, so the changed tool set needs a new session or adoption."
+        )
+    if changed & _POLICY_CLASSES:
+        line = (
+            "Policies and hooks: a custom LoopPolicy, ToolPolicy, CommandPolicy or "
+            "RuntimeHook without a declared identity is opaque. Override its "
+            f"`execution_profile_identity` property to return `{_DECLARE_IDENTITY}` "
+            "(built-ins such as RequireFinalTool already declare one)."
+        )
+        if ExecutionProfileComponentClass.INVOCATION_POLICIES in changed:
+            line += (
+                " Request loop_policies are part of the session's profile: pass the same "
+                "policies on every RunRequest and ResumeRequest of the session, including "
+                "in each simulated process of a test."
+            )
+        guidance.append(line)
+    if changed & _PROVIDER_CLASSES:
+        guidance.append(
+            "Provider: built-in providers and `ScriptedModelProvider` built from "
+            "positional event batches keep the same identity in every process. "
+            "`ScriptedModelProvider(response_factory=...)`, provider subclasses and "
+            "custom ModelProvider classes are opaque unless they override "
+            "`execution_profile_identity`. In a test that simulates several processes, "
+            "build the provider the same way in each one, with the same options, "
+            "thinking and failover settings."
+        )
+    if ExecutionProfileComponentClass.PROVIDER_TARGET in changed:
+        guidance.append(
+            "Model: the session's provider or model differs from what the agent resolves "
+            "to now. Register the same provider name and model, or switch explicitly with "
+            "`ResumeRequest(..., target=ModelTarget(provider_name=..., model=...))` "
+            "(`from cayu.sessions import ModelTarget`)."
+        )
+    if ExecutionProfileComponentClass.RUNTIME in changed:
+        guidance.append(
+            "Cayu: the Cayu version or build changed. When that is the only change and "
+            "no ExecutionProfilePolicy is configured, resume adopts it automatically at "
+            "a clean boundary."
+        )
+    if changed & _OTHER_COMPONENT_CLASSES:
+        guidance.append(
+            "Other components: custom environments, runners, environment factories and "
+            "context policies declare `execution_profile_identity` the same way. "
+            "Structural settings such as budget limits, structured output, max_steps, "
+            "run limits and egress must match the stored session."
+        )
+    return guidance
+
+
+def _snippet_session_id(session_id: object) -> str:
+    if (
+        type(session_id) is str
+        and 0 < len(session_id) <= _MAX_SNIPPET_SESSION_ID_CHARS
+        and session_id.isprintable()
+    ):
+        return json.dumps(session_id)
+    return "..."
+
+
+ExecutionProfileMismatchBoundary = Literal["resume", "continuation"]
+
+
 class ExecutionProfileMismatchError(RuntimeError):
-    """Raised after durable evidence rejects a changed execution profile."""
+    """Raised after durable evidence rejects a changed execution profile.
+
+    ``boundary`` is ``"resume"`` when the rejected attempt was an ordinary resume
+    with nothing pending, ``"continuation"`` when pending work had to continue
+    under its recorded profile, and ``None`` when the raising path does not know.
+    ``application_policy_configured`` reports whether the ``CayuApp`` had an
+    ``ExecutionProfilePolicy``, or ``None`` when unknown. Both only shape the
+    guidance; they never change admission.
+    """
 
     def __init__(
         self,
@@ -311,11 +545,17 @@ class ExecutionProfileMismatchError(RuntimeError):
         changed_component_classes: tuple[ExecutionProfileComponentClass, ...],
         expected_profile: ExecutionProfileIdentity | None = None,
         candidate_profile: ExecutionProfileIdentity | None = None,
+        boundary: ExecutionProfileMismatchBoundary | None = None,
+        application_policy_configured: bool | None = None,
     ) -> None:
         self.session_id = session_id
         self.expected_profile_fingerprint = expected_profile_fingerprint
         self.candidate_profile_fingerprint = candidate_profile_fingerprint
         self.changed_component_classes = changed_component_classes
+        self.boundary = boundary if boundary in ("resume", "continuation") else None
+        self.application_policy_configured = (
+            application_policy_configured if type(application_policy_configured) is bool else None
+        )
         changed = ", ".join(component.value for component in changed_component_classes) or (
             "decision-bearing authority outside the structural profile"
         )
@@ -326,40 +566,85 @@ class ExecutionProfileMismatchError(RuntimeError):
             expected_profile_fingerprint,
             candidate_profile_fingerprint,
         )
-        guidance = (
-            " Class-level digest evidence cannot identify individual components, "
-            "changed declared versions, or additions/removals. Inspect the persisted "
-            "execution-profile decision and your component declarations; "
-            "see `cayu guide durable-service-tools`."
-        )
+        lines = [self._message(session_id=session_id, changed=changed)]
+        if self.differences:
+            lines.append(
+                "What changed (stored -> current identity). Class-level digest evidence "
+                "cannot name the individual tool, policy or version:"
+            )
+            lines.extend(_difference_lines(self.differences))
         opaque = ", ".join(
             item.component_class.value
             for item in self.differences
             if item.category == "opaque_identity"
         )
         if opaque:
-            guidance += (
-                f" Process-local (opaque) identity is present in: {opaque}. "
-                "Reconstructed components need explicit stable behavior and implementation "
-                "identities declared from the first run. Adding a declaration does not "
-                "repair an already persisted opaque baseline."
+            lines.append(
+                f"Process-local (opaque) identity is present in: {opaque}. Reconstructed "
+                "components need explicit stable behavior and implementation identities "
+                "declared from the first run. Adding a declaration does not repair an "
+                "already persisted opaque baseline. Adopting a profile that is still "
+                "opaque only lasts until the next process or CayuApp instance."
             )
-        if ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS in changed_component_classes:
-            guidance += (
-                " If you added or edited a tool: give every custom tool "
-                "`execution_profile_identity=ExecutionProfileBehaviorIdentity(name=..., "
-                'behavior_version="1", implementation_version="1")` in its ToolSpec, as '
-                "`cayu generate tool` does, bump behavior_version when its behavior "
-                "changes, and start a new session for the changed tool set."
-            )
-        super().__init__(self._message(session_id=session_id, changed=changed) + guidance)
+        lines.extend(_component_guidance(frozenset(changed_component_classes)))
+        lines.extend(self._next_steps(session_id=session_id))
+        lines.append(
+            "Details: `cayu guide diagnostics#execution-profile-mismatch`; component "
+            "identities: `cayu guide durable-service-tools`."
+        )
+        super().__init__("\n".join(lines))
 
     def _message(self, *, session_id: str, changed: str) -> str:
         return (
             f"Session {session_id} execution profile changed in: {changed}. "
-            "Pending recovery requires a restored compatible registration and a fresh recovery plan. "
-            "Start a new session or, at a clean resume boundary, request explicit profile adoption."
+            "No resumed work was admitted."
         )
+
+    def _new_session_step(self) -> str:
+        return (
+            "- Start a new session: "
+            'app.run(RunRequest(agent_name=..., session_id="<new id>", messages=[...])).'
+        )
+
+    def _adoption_steps(self, *, session_id: str) -> list[str]:
+        steps = [
+            "- Or keep this session: at a clean resume boundary (nothing pending), adopt "
+            "the current profile with an ExecutionProfilePolicy on "
+            "CayuApp(execution_profile_policy=...) that adopts explicit requests, then "
+            f"app.resume(ResumeRequest(session_id={_snippet_session_id(session_id)}, "
+            "messages=[...], profile_adoption=ExecutionProfileAdoptionIntent("
+            'idempotency_key="adopt-1", reason="...", requested_by=ResolutionActor('
+            'subject="...", source=ResolutionActorSource.REQUEST)))).'
+        ]
+        if self.application_policy_configured is False:
+            steps.append(
+                "- This CayuApp has no ExecutionProfilePolicy, so an adoption request is "
+                "rejected until you configure one."
+            )
+        return steps
+
+    def _next_steps(self, *, session_id: str) -> list[str]:
+        if self.boundary == "continuation":
+            return [
+                "Next steps: this session has pending work (an approval, user input, tool "
+                "round or unfinished invocation) that must continue under the profile it "
+                "started with, so adoption is not available here.",
+                "- Restore the previous code or identities and finish the pending work; a "
+                "later resume can then adopt the new profile. Or",
+                self._new_session_step(),
+            ]
+        steps = [
+            "Next steps:",
+            self._new_session_step(),
+            *self._adoption_steps(session_id=session_id),
+        ]
+        if self.boundary is None:
+            steps.append(
+                "- If the session has pending work, adoption is not available: pending "
+                "recovery requires a restored compatible registration and a fresh "
+                "recovery plan."
+            )
+        return steps
 
 
 class ExecutionProfileAdoptionRejected(ExecutionProfileMismatchError):
@@ -371,6 +656,27 @@ class ExecutionProfileAdoptionRejected(ExecutionProfileMismatchError):
             f"{changed}. Inspect the durable decision evidence or start a new session."
         )
 
+    def _next_steps(self, *, session_id: str) -> list[str]:
+        if self.application_policy_configured is False:
+            reason = (
+                "- This CayuApp has no ExecutionProfilePolicy, and without one Cayu rejects "
+                "every adoption request. Configure CayuApp(execution_profile_policy=...) "
+                "with a policy that returns adopt for explicit requests (and "
+                "authority_decision=authorized when authority changes), then retry with a "
+                "new idempotency_key."
+            )
+        elif self.application_policy_configured is True:
+            reason = (
+                "- The configured ExecutionProfilePolicy rejected it. Adoption needs "
+                "action=adopt, plus authority_decision=authorized when authority changes."
+            )
+        else:
+            reason = (
+                "- Adoption needs an ExecutionProfilePolicy that returns adopt, plus "
+                "authority_decision=authorized when authority changes."
+            )
+        return ["Next steps:", reason, self._new_session_step()]
+
 
 class ExecutionProfileMigrationRequired(ExecutionProfileMismatchError):
     """Raised after policy records that an explicit migration is required."""
@@ -380,6 +686,13 @@ class ExecutionProfileMigrationRequired(ExecutionProfileMismatchError):
             f"Session {session_id} requires an execution-profile migration before changes in: "
             f"{changed}. No resumed work was admitted."
         )
+
+    def _next_steps(self, *, session_id: str) -> list[str]:
+        return [
+            "Next steps: the application's ExecutionProfilePolicy classified this change "
+            "as needing a migration. Follow the application's migration path, or",
+            self._new_session_step(),
+        ]
 
 
 class ExecutionProfilePolicyError(RuntimeError):

@@ -432,9 +432,11 @@ To check this before publishing a release:
    `changed_component_classes`, for example `direct_tools` when a tool changed.
 
 `cayu execution-profile candidates --json` prints each agent's candidate
-profile on its own. Both commands build the application from the project
-factory, never start it, load or write sessions, or call models or tools, and
-close it before exiting. Whatever the factory does while constructing the
+profile on its own, and `cayu execution-profile compare SESSION_ID` compares one
+session in the project's store with this build class by class and explains
+each change. These commands build the application from the project
+factory, never start it, write sessions, or call models or tools, and close it
+before exiting; only `compare` reads a stored session. Whatever the factory does while constructing the
 application, such as opening a store, still happens. Profiles include the typed
 egress authority (policy names, destinations, allowed methods and paths), so
 keep the files as private as the release configuration. See

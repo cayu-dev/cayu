@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileIdentityStrength,
@@ -9,7 +11,10 @@ from cayu.execution_profiles import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._execution_profile_admission import model_finalization_material
-from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionRecoveryContext,
+    model_completion_recovery_context_from_stage,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_matches_session_epoch,
@@ -21,22 +26,23 @@ from cayu.sessions.requests import ResumeRequest
 from cayu.sessions.store import SessionStore
 
 
-async def inherit_resume_configuration(
-    store: SessionStore, session: Session, request: ResumeRequest, default_retry: RetryPolicy
-) -> tuple[ResumeRequest, tuple[str, ...]]:
-    """Return detached controls and safe diagnostics; never infer values from hashes.
+async def recorded_invocation_semantics(
+    store: SessionStore,
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+) -> ModelCompletionRecoveryContext | None:
+    """Return the latest published model step's run semantics for the active invocation.
 
-    Legacy/fork sessions without a matching completed step retain existing defaults.
-    Admission still checks the full profile and current resource authority afterward.
+    The context is returned only when it belongs to the session's current active
+    invocation and its exact profile; otherwise ``None``. It is read-only.
     """
-    checkpoint = await store.load_checkpoint(session.id)
     pointer = model_step_publication_from_checkpoint(checkpoint)
     active = active_invocation_execution_profile_from_checkpoint(checkpoint)
     if pointer is None or active is None:
-        return request, ()
+        return None
     stage = await store.load_model_completion_stage(session.id, pointer.stage_id)
     if stage is None or stage.logical_step_id != pointer.logical_step_id:
-        return request, ()
+        return None
     context = model_completion_recovery_context_from_stage(stage)
     if (
         context is None
@@ -46,7 +52,24 @@ async def inherit_resume_configuration(
         or context.interaction_id != active.interaction_id
         or context.execution_profile_fingerprint != active.profile.fingerprint
     ):
+        return None
+    return context
+
+
+async def inherit_resume_configuration(
+    store: SessionStore, session: Session, request: ResumeRequest, default_retry: RetryPolicy
+) -> tuple[ResumeRequest, tuple[str, ...]]:
+    """Return detached controls and safe diagnostics; never infer values from hashes.
+
+    Legacy/fork sessions without a matching completed step retain existing defaults.
+    Admission still checks the full profile and current resource authority afterward.
+    """
+    checkpoint = await store.load_checkpoint(session.id)
+    context = await recorded_invocation_semantics(store, session, checkpoint)
+    if context is None:
         return request, ()
+    active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    assert active is not None
     expected = execution_profile_from_session_metadata(session.metadata)
     component = _available_component(
         ExecutionProfileComponentClass.FINALIZATION,

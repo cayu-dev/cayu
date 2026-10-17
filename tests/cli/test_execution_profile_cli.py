@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 from cayu.cli import main
+from cayu.execution_profiles import ExecutionProfileComponentClass
 
 _PROJECT = """import os
 from pathlib import Path
@@ -188,3 +192,507 @@ def test_a_close_failure_does_not_replace_resolved_candidates(
     captured = capsys.readouterr()
     assert len(json.loads(captured.out)["candidates"]) == 1
     assert "closing the application failed: RuntimeError: drain failed" in captured.err
+
+
+_COMPARE_PROJECT = """import json
+import os
+from pathlib import Path
+
+from cayu import AgentSpec, CayuApp, Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.runtime import LoopPolicy
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.storage import SQLiteSessionStore
+from cayu.tools import AlwaysRequireApprovalToolPolicy
+
+# Tests fill this before creating sessions; positional batches keep the same
+# provider identity in the CLI's process, where it stays empty.
+BATCHES = []
+
+
+class CompletionCheck(LoopPolicy):
+    @property
+    def execution_profile_identity(self):
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:completion-check", behavior_version="1", implementation_version="1"
+        )
+
+
+# A request loop policy without a declared identity.
+class OpaqueCheck(LoopPolicy):
+    pass
+
+
+class LookupTool(Tool):
+    def __init__(self):
+        version = os.environ.get("TOOL_VERSION", "1")
+        self.spec = ToolSpec(
+            name="lookup",
+            description="Look something up.",
+            effect=ToolEffect.NONE,
+            input_schema={"type": "object", "additionalProperties": False},
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:lookup", behavior_version=version, implementation_version=version
+            ),
+        )
+        super().__init__()
+
+    async def run(self, ctx, args):
+        return ToolResult(content="found")
+
+
+def build_app():
+    app = CayuApp(session_store=SQLiteSessionStore(Path("sessions.db")), enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(list(BATCHES), name=os.environ.get("PROVIDER_NAME", "scripted")),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(
+            name=os.environ.get("AGENT_NAME", "reviewer"),
+            model="test-model",
+            provider_options=json.loads(os.environ.get("PROVIDER_OPTIONS", "{}")),
+        ),
+        tools=[LookupTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=["lookup"]),
+    )
+    return app
+"""
+
+
+def _compare_project(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.cayu]\nfactory = "compare_project:build_app"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "compare_project.py").write_text(_COMPARE_PROJECT, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("compare_project", None)
+
+
+def _create_session(
+    session_id: str,
+    *,
+    pause_for_approval: bool,
+    thinking=None,
+    loop_policies: bool = False,
+    opaque_loop_policy: bool = False,
+) -> None:
+    import compare_project
+
+    from cayu import Message, RunRequest
+    from cayu.providers import ModelStreamEvent
+
+    first_step = (
+        [
+            ModelStreamEvent.tool_call(id="call-1", name="lookup", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+        if pause_for_approval
+        else [ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed()]
+    )
+    compare_project.BATCHES[:] = [first_step]
+
+    async def run() -> None:
+        app = compare_project.build_app()
+        try:
+            request = RunRequest(
+                agent_name="reviewer",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+                thinking=thinking,
+                loop_policies=(
+                    (compare_project.OpaqueCheck(),)
+                    if opaque_loop_policy
+                    else (compare_project.CompletionCheck(),)
+                    if loop_policies
+                    else ()
+                ),
+            )
+            _ = [event async for event in app.run(request)]
+        finally:
+            await app.aclose()
+
+    asyncio.run(run())
+    sys.modules.pop("compare_project", None)
+
+
+def _approve_pending(
+    session_id: str, *, loop_policies: bool = False, opaque_loop_policy: bool = False
+) -> None:
+    """Resolve the pending approval in a fresh app, as a real continuation would."""
+
+    import compare_project
+
+    from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions import PendingActionQuery
+
+    compare_project.BATCHES[:] = [
+        [ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed()]
+    ]
+
+    async def resolve() -> None:
+        app = compare_project.build_app()
+        try:
+            pending = await app.session_store.query_pending_actions(
+                PendingActionQuery(session_id=session_id)
+            )
+            (action,) = pending.actions
+            request = ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=action.approval_id,
+                tool_round_id=action.round_id,
+                tool_call_id=action.tool_call_id,
+                decision=ToolApprovalDecision.APPROVE,
+                reason="test operator",
+                loop_policies=(
+                    (compare_project.OpaqueCheck(),)
+                    if opaque_loop_policy
+                    else (compare_project.CompletionCheck(),)
+                    if loop_policies
+                    else ()
+                ),
+            )
+            _ = [event async for event in app.resolve_tool_approval(request)]
+        finally:
+            await app.aclose()
+
+    asyncio.run(resolve())
+    sys.modules.pop("compare_project", None)
+
+
+# Runs the first step in a child process that exits at the named event, with no
+# pending approval, user input or tool round.
+_CRASH_AT_EVENT = """import asyncio
+import os
+import sys
+
+import compare_project
+from cayu import Message, RunRequest
+from cayu.providers import ModelStreamEvent
+
+compare_project.BATCHES[:] = [[ModelStreamEvent.text_delta("first"), ModelStreamEvent.completed()]]
+
+
+async def main():
+    app = compare_project.build_app()
+    request = RunRequest(
+        agent_name="reviewer", session_id=sys.argv[1], messages=[Message.text("user", "hello")]
+    )
+    async for event in app.run(request):
+        if event.type == sys.argv[2]:
+            os._exit(42)
+
+
+asyncio.run(main())
+raise SystemExit("the run never reached the crash event")
+"""
+
+
+def _crash_at_event(tmp_path: Path, session_id: str, event_type: str) -> None:
+    import os
+    import subprocess
+
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(path for path in sys.path if path)}
+    result = subprocess.run(
+        [sys.executable, "-c", _CRASH_AT_EVENT, session_id, event_type],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 42, result.stderr
+
+
+def _resume(session_id: str) -> str:
+    """Continue the session in a fresh app and return its last event type."""
+
+    import compare_project
+
+    from cayu import Message, ResumeRequest
+    from cayu.providers import ModelStreamEvent
+
+    compare_project.BATCHES[:] = [
+        [ModelStreamEvent.text_delta("second"), ModelStreamEvent.completed()]
+    ]
+
+    async def resume() -> str:
+        app = compare_project.build_app()
+        try:
+            request = ResumeRequest(
+                session_id=session_id, messages=[Message.text("user", "continue")]
+            )
+            events = [event async for event in app.resume(request)]
+            return str(events[-1].type)
+        finally:
+            await app.aclose()
+
+    try:
+        return asyncio.run(resume())
+    finally:
+        sys.modules.pop("compare_project", None)
+
+
+def _event_count(path: Path) -> int:
+    with sqlite3.connect(path) as connection:
+        return connection.execute("SELECT COUNT(*) FROM cayu_events").fetchone()[0]
+
+
+def test_compare_shows_stored_and_current_profiles_without_touching_the_session(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _compare_project(tmp_path, monkeypatch)
+    _create_session("finished", pause_for_approval=False)
+    events = _event_count(tmp_path / "sessions.db")
+
+    assert main(["execution-profile", "compare", "finished", "--json"]) == 0
+    unchanged = json.loads(capsys.readouterr().out)
+    assert unchanged["boundary"] == "resume"
+    assert unchanged["prediction"]["outcome"] == "exact_reuse"
+    assert unchanged["guidance"] == []
+    assert not any(item["changed"] for item in unchanged["components"])
+    assert unchanged["stored_fingerprint"] == unchanged["candidate_fingerprint"]
+
+    # Editing the tool's declared version is a real change, explained class by class.
+    monkeypatch.setenv("TOOL_VERSION", "2")
+    sys.modules.pop("compare_project", None)
+    assert main(["execution-profile", "compare", "finished", "--json"]) == 3
+    edited = json.loads(capsys.readouterr().out)
+    assert edited["prediction"]["admits"] is False
+    changed = [item for item in edited["components"] if item["changed"]]
+    assert changed == [
+        {
+            "component_class": "tool_implementations",
+            "stored": "application_versioned",
+            "current": "application_versioned",
+            "compared": True,
+            "changed": True,
+        }
+    ]
+    guidance = "\n".join(edited["guidance"])
+    assert "tool_implementations (tool implementations): declared -> declared" in guidance
+    assert 'app.resume(ResumeRequest(session_id="finished"' in guidance
+    assert "profile_adoption=ExecutionProfileAdoptionIntent(" in guidance
+    assert "has no ExecutionProfilePolicy" in guidance
+
+    assert main(["execution-profile", "compare", "finished", "--table"]) == 3
+    table = capsys.readouterr().out
+    assert "tool_implementations" in table and "changed" in table
+
+    # Comparison is read-only: no admission, decision or rejection evidence.
+    assert _event_count(tmp_path / "sessions.db") == events
+    assert _session_count(tmp_path / "sessions.db") == 1
+
+
+def test_compare_withholds_adoption_while_work_is_pending(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _compare_project(tmp_path, monkeypatch)
+    _create_session("paused", pause_for_approval=True)
+
+    monkeypatch.setenv("TOOL_VERSION", "2")
+    assert main(["execution-profile", "compare", "paused", "--json"]) == 3
+    report = json.loads(capsys.readouterr().out)
+    assert report["boundary"] == "continuation"
+    guidance = "\n".join(report["guidance"])
+    assert "adoption is not available here" in guidance
+    assert "profile_adoption=" not in guidance
+
+
+def test_compare_reports_a_missing_session(tmp_path: Path, monkeypatch, capsys) -> None:
+    _compare_project(tmp_path, monkeypatch)
+
+    assert main(["execution-profile", "compare", "missing", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "SESSION_NOT_FOUND"
+
+
+@pytest.mark.parametrize(
+    ("renamed", "expected_error"),
+    [
+        ("AGENT_NAME", "Agent not registered: reviewer"),
+        ("PROVIDER_NAME", "Provider not registered: scripted"),
+    ],
+    ids=["agent", "provider"],
+)
+def test_compare_reports_a_missing_registration_as_the_continuation_does(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    renamed: str,
+    expected_error: str,
+) -> None:
+    _compare_project(tmp_path, monkeypatch)
+    _create_session("paused", pause_for_approval=True)
+    monkeypatch.setenv(renamed, "renamed")
+
+    assert main(["execution-profile", "compare", "paused", "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "REGISTRATION_MISSING"
+    assert error["message"].startswith(f"{expected_error}. The session is still stored")
+    assert "register the" in error["message"]
+    assert _session_count(tmp_path / "sessions.db") == 1
+
+    # The real continuation fails on the same registry lookup.
+    with pytest.raises(KeyError) as raised:
+        _approve_pending("paused")
+    assert raised.value.args == (expected_error,)
+
+
+@pytest.mark.parametrize("fresh_policy", [False, True])
+def test_compare_predicts_the_rejection_of_an_opaque_request_loop_policy(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    fresh_policy: bool,
+) -> None:
+    from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+
+    _compare_project(tmp_path, monkeypatch)
+    _create_session("paused", pause_for_approval=True, opaque_loop_policy=True)
+
+    assert main(["execution-profile", "compare", "paused", "--json"]) == 3
+    report = json.loads(capsys.readouterr().out)
+    assert report["boundary"] == "continuation"
+    assert report["prediction"]["outcome"] == "rejected"
+    assert report["prediction"]["admits"] is False
+    assert report["prediction"]["changed_component_classes"] == ["invocation_policies"]
+    assert report["not_compared"] == []
+    rows = {item["component_class"]: item for item in report["components"]}
+    assert rows["invocation_policies"]["stored"] == "process_local"
+    assert rows["invocation_policies"]["compared"] is True
+    assert "no later process can match it" in "\n".join(report["guidance"])
+
+    # Runtime rejects the continuation whether or not the caller passes a new
+    # instance of the same undeclared policy.
+    with pytest.raises(ExecutionProfileMismatchError) as raised:
+        _approve_pending("paused", opaque_loop_policy=fresh_policy)
+    assert raised.value.changed_component_classes == (
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+    )
+
+
+@pytest.mark.parametrize("loop_policies", [False, True])
+def test_compare_reuses_recorded_request_settings_for_a_pending_continuation(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    loop_policies: bool,
+) -> None:
+    from cayu.context.thinking import ThinkingConfig
+
+    _compare_project(tmp_path, monkeypatch)
+    _create_session(
+        "paused",
+        pause_for_approval=True,
+        thinking=ThinkingConfig(effort="low"),
+        loop_policies=loop_policies,
+    )
+
+    assert main(["execution-profile", "compare", "paused", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["boundary"] == "continuation"
+    assert report["prediction"]["changed_component_classes"] == []
+    assert report["guidance"] == []
+    not_compared = {item["component_class"] for item in report["not_compared"]}
+    assert not_compared == ({"invocation_policies"} if loop_policies else set())
+    rows = {item["component_class"]: item for item in report["components"]}
+    assert rows["provider_request_policy"]["compared"] is True
+    assert rows["provider_request_policy"]["changed"] is False
+    assert rows["invocation_policies"]["compared"] is not loop_policies
+
+    # The prediction matches Runtime: the unchanged continuation is admitted.
+    _approve_pending("paused", loop_policies=loop_policies)
+
+
+def test_compare_reuses_recorded_request_settings_at_a_resume_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.context.thinking import ThinkingConfig
+
+    _compare_project(tmp_path, monkeypatch)
+    _create_session(
+        "finished",
+        pause_for_approval=False,
+        thinking=ThinkingConfig(effort="low"),
+        loop_policies=True,
+    )
+
+    assert main(["execution-profile", "compare", "finished", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["boundary"] == "resume"
+    assert report["prediction"]["outcome"] == "exact_reuse"
+    # Each ResumeRequest sets thinking again and a finished interaction keeps no
+    # value for it, so the class is reported as not compared rather than changed.
+    not_compared = {item["component_class"]: item["reason"] for item in report["not_compared"]}
+    assert set(not_compared) == {"provider_request_policy", "invocation_policies"}
+    assert "thinking" in not_compared["provider_request_policy"]
+    assert report["guidance"] == []
+
+    # A real change is still reported next to the request settings it reused.
+    monkeypatch.setenv("TOOL_VERSION", "2")
+    assert main(["execution-profile", "compare", "finished", "--json"]) == 3
+    changed = json.loads(capsys.readouterr().out)["prediction"]["changed_component_classes"]
+    assert changed == ["tool_implementations"]
+
+
+@pytest.mark.parametrize(
+    ("crash_event", "boundary"),
+    [
+        # Nothing is pending, so the continuation first closes the abandoned run
+        # and then admits the new request at the resume boundary.
+        ("model.completed", "resume"),
+        # The lost model call keeps the invocation open; Runtime rebuilds the
+        # recorded request classes from the next request.
+        ("model.text.delta", "continuation"),
+    ],
+)
+@pytest.mark.parametrize("opaque_options", [False, True])
+def test_compare_agrees_with_the_continuation_of_a_crashed_run(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    crash_event: str,
+    boundary: str,
+    opaque_options: bool,
+) -> None:
+    from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+
+    # A top-level option has no privacy-safe projection, so its identity is opaque.
+    monkeypatch.setenv("PROVIDER_OPTIONS", '{"temperature": 0.2}' if opaque_options else "{}")
+    _compare_project(tmp_path, monkeypatch)
+    _crash_at_event(tmp_path, "crashed", crash_event)
+    events = _event_count(tmp_path / "sessions.db")
+
+    code = main(["execution-profile", "compare", "crashed", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert _event_count(tmp_path / "sessions.db") == events
+    rows = {item["component_class"]: item for item in report["components"]}
+    if not opaque_options:
+        assert code == 0
+        assert report["prediction"]["outcome"] == "exact_reuse"
+        assert report["boundary"] == boundary
+        assert _resume("crashed") == "session.completed"
+        return
+    assert code == 3
+    assert report["prediction"]["outcome"] == "rejected"
+    assert report["prediction"]["admits"] is False
+    assert report["prediction"]["changed_component_classes"] == ["provider_request_policy"]
+    assert report["boundary"] == boundary
+    assert rows["provider_request_policy"]["stored"] == "process_local"
+    assert rows["provider_request_policy"]["compared"] is True
+    with pytest.raises(ExecutionProfileMismatchError) as raised:
+        _resume("crashed")
+    assert raised.value.changed_component_classes == (
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+    )

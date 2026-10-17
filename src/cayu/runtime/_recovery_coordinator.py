@@ -79,6 +79,7 @@ from cayu.approvals.user_input import (
     event_with_pending_user_input_authority,
     event_with_user_input_supersession_authority,
     pending_user_input_digest,
+    pending_user_input_from_checkpoint,
     pending_user_input_identity,
     pending_user_input_interruption_payload,
     require_resolution_intent_matches_pending,
@@ -9016,3 +9017,74 @@ def _structured_output_specs_equal(
 
 def _has_run_budget_limit(limits: tuple[BudgetLimit, ...]) -> bool:
     return any(limit.scope == "run" for limit in limits)
+
+
+def recorded_pending_invocation_semantics(
+    checkpoint: dict[str, Any] | None,
+    *,
+    session: Session,
+    redactor: SecretRedactor,
+    effective_retry_policy: EffectiveRetryPolicy,
+) -> _RecoveryInvocationSemantics | None:
+    """Return the semantics a continuation without overrides would restore, read-only.
+
+    This uses the same recorded fields and defaults as approval, user-input and
+    tool-round continuation when the resolver supplies no explicit values. It
+    returns ``None`` when no such pending record exists.
+    """
+
+    pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
+        checkpoint, redactor=redactor
+    )
+    if pending_approval is not None:
+        return _RecoveryInvocationSemantics(
+            max_steps=_effective_approval_max_steps(
+                max_steps=None, pending_approval=pending_approval
+            ),
+            limits=_effective_approval_run_limits(limits=None, pending_approval=pending_approval),
+            budget_limits=_effective_approval_budget_limits(
+                budget_limits=None, pending_approval=pending_approval
+            ),
+            retry_policy=effective_retry_policy(
+                _effective_approval_retry_policy(
+                    retry_policy=None, pending_approval=pending_approval
+                )
+            ),
+            structured_output=_effective_approval_structured_output(
+                structured_output=None, pending_approval=pending_approval
+            ),
+            thinking=_effective_approval_thinking(thinking=None, pending_approval=pending_approval),
+        )
+    pending_input = pending_user_input_from_checkpoint(
+        checkpoint, redactor=redactor, runtime_session=session
+    )
+    if pending_input is not None:
+        return _RecoveryInvocationSemantics(
+            max_steps=_effective_user_input_max_steps(max_steps=None, pending=pending_input),
+            limits=_effective_user_input_run_limits(limits=None, pending=pending_input),
+            budget_limits=_effective_user_input_budget_limits(
+                budget_limits=None, pending=pending_input
+            ),
+            retry_policy=effective_retry_policy(
+                _effective_user_input_retry_policy(retry_policy=None, pending=pending_input)
+            ),
+            structured_output=_effective_user_input_structured_output(
+                structured_output=None, pending=pending_input
+            ),
+            thinking=pending_input.thinking,
+        )
+    pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+        checkpoint, redactor=redactor, runtime_session=session
+    )
+    if pending_round is not None:
+        return _RecoveryInvocationSemantics(
+            max_steps=_require_recovery_max_steps(pending_round.max_steps),
+            limits=copy_run_limits(pending_round.limits or RunLimits()),
+            budget_limits=copy_request_budget_limits(pending_round.budget_limits or ()),
+            retry_policy=effective_retry_policy(pending_round.retry_policy),
+            structured_output=_effective_tool_round_structured_output(
+                structured_output=None, pending_round=pending_round
+            ),
+            thinking=pending_round.thinking,
+        )
+    return None

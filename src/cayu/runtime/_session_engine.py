@@ -1346,6 +1346,10 @@ class SessionEngine:
                 changed_component_classes=changed,
                 expected_profile=expected_profile,
                 candidate_profile=persisted_candidate,
+                boundary="resume",
+                application_policy_configured=(
+                    self._profile_classifier.policy_identity is not None
+                ),
             )
         return copy_event(event)
 
@@ -4634,6 +4638,10 @@ class SessionEngine:
                     changed_component_classes=changed_profile_components,
                     expected_profile=expected_execution_profile,
                     candidate_profile=candidate_execution_profile,
+                    boundary="resume",
+                    application_policy_configured=(
+                        self._profile_classifier.policy_identity is not None
+                    ),
                 )
         if continuing_recovery_boundary:
             continuing_profile_resolution = await self._execution_profile_continuation.resolve(
@@ -4677,6 +4685,7 @@ class SessionEngine:
                     ),
                     expected_profile=required_execution_profile,
                     candidate_profile=continuing_execution_profile_snapshot.profile,
+                    boundary="continuation",
                 )
         # Provider-owned schema validation runs only after the current process's
         # execution profile has been frozen and any ordinary-resume drift has

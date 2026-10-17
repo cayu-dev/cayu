@@ -189,6 +189,8 @@ an approval.
 `ExecutionProfileMismatchError.differences` reports bounded class-level categories:
 `opaque_identity` means at least one compared class has process-local identity;
 `other_or_unknown` means the available evidence cannot diagnose the change.
+Each difference also reports `expected_strength` and `candidate_strength`, and
+the message explains each pair; see `cayu guide diagnostics#execution-profile-mismatch`.
 An opaque category is evidence about identity strength, not proof that reconstruction
 caused the mismatch. Declare stable behavior and implementation identities from the
 first run. Adding one later does not repair an existing opaque baseline.
