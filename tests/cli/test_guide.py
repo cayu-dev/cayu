@@ -12,6 +12,7 @@ from tests._session_provenance import session_fixture
 from cayu import AgentSpec, ToolContext
 from cayu.approvals import ResolutionActor, ResolutionActorSource
 from cayu.cli import main
+from cayu.cli._identity import CAYU_CAPABILITIES, CAYU_IDENTITY, CAYU_IS_NOT
 from cayu.cli.guide import _GUIDES
 from cayu.tools import ToolPolicyDecision, ToolPolicyRequest
 
@@ -95,6 +96,20 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     help_output = capsys.readouterr().out
     assert "TOPIC[#SECTION]" in help_output
     assert "Primary integrations and compatible Chat Completions endpoints." in help_output
+
+
+def test_bare_guide_starts_with_the_cayu_identity_and_capability_parts(capsys) -> None:
+    assert main(["guide"]) == 0
+    listing = capsys.readouterr().out
+
+    assert listing.startswith(CAYU_IDENTITY + "\n")
+    for capability, parts in CAYU_CAPABILITIES:
+        assert f"| {capability} | {parts} |" in listing
+    assert CAYU_IS_NOT in listing
+    assert listing.index(CAYU_IS_NOT) < listing.index("Package-shipped Cayu guides:")
+
+    assert main(["guide", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["identity"] == CAYU_IDENTITY
 
 
 def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> None:

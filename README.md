@@ -3,13 +3,27 @@
 [Find public concepts](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md) ·
 [Run the example](https://github.com/cayu-dev/cayu/blob/main/examples/application/README.md)
 
-Cayu is an open-source Python framework for building and running domain-specific
-long-horizon agents, with a durable runtime built in.
+Cayu is a Python runtime for long-running agents: durable sessions that survive
+restarts and redeploys, human approval before side effects, spend caps enforced
+before each model call, and multi-agent collaboration.
 
-Build your agent's harness from Python components and defaults: model providers,
-context, tools, integrations, knowledge, memory, policies, domain logic and
-verification. Choose the capabilities your job needs, then evaluate and operate
-the resulting agent on your infrastructure or with optional Cayu Cloud.
+| Capability | Cayu parts |
+| --- | --- |
+| Durable sessions and recovery | `SQLiteSessionStore` or `PostgresSessionStore` (`cayu.storage`) with `ResumeRequest`; `ExecutionProfilePolicy` (`cayu.runtime`) governs resumes on a new build |
+| Approval before side effects | `ToolPolicy` returning `ToolPolicyDecision.REQUIRE_APPROVAL` (`cayu.tools`), resolved through `cayu.approvals` |
+| Spend caps | `BudgetLimit` per request and `BudgetPolicy` per app (`cayu.budgets`), checked before each model call |
+| Timers and background work | `TaskStore` workers and `TaskSchedulePolicy` for scheduled follow-ups (`cayu.tasks`) |
+| Multi-agent collaboration | `SubagentTool` (`cayu.tools`), forks, and participants with durable requests (`cayu.collaboration`) |
+
+Cayu is Python only and is not a graph DSL: agents, tools and workflows are
+ordinary Python. It is not only a hosted service: run it on your own
+infrastructure or deploy to the optional Cayu Cloud.
+
+Cayu is open source. Build your agent's harness from Python components and
+defaults: model providers, context, tools, integrations, knowledge, memory,
+policies, domain logic and verification. Choose the capabilities your job
+needs, then evaluate and operate the resulting agent on your infrastructure or
+with optional Cayu Cloud.
 
 The integrated runtime carries that work through model and tool calls, durable
 sessions, task dispatch, leased workers, resumable workflow steps, approvals and

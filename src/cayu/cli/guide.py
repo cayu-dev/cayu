@@ -9,6 +9,7 @@ from importlib.resources import files
 from typing import Any
 
 from cayu._version import package_version
+from cayu.cli._identity import CAYU_IDENTITY, identity_markdown
 
 _GUIDES = {
     "order-support": (
@@ -177,6 +178,7 @@ def run_guide(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "schema_version": 1,
+                        "identity": CAYU_IDENTITY,
                         "installed_cayu_version": package_version(),
                         "topics": [
                             {
@@ -193,6 +195,7 @@ def run_guide(args: argparse.Namespace) -> int:
                 )
             )
             return 0
+        print(identity_markdown())
         print("Package-shipped Cayu guides:")
         for name, (_, description) in _GUIDES.items():
             print(f"  {name:<18} {description}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -62,3 +63,54 @@ def test_examples_index_routes_from_simple_to_advanced_examples() -> None:
             continue
         resolved = (index_path.parent / target.split("#", 1)[0]).resolve()
         assert resolved.exists(), f"missing examples index target: {target}"
+
+
+def test_readme_and_overview_docs_open_with_the_cayu_identity() -> None:
+    from cayu.cli._identity import CAYU_CAPABILITIES, CAYU_IDENTITY, CAYU_IS_NOT
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    first_screen = " ".join(readme.split("\n## ", 1)[0].split())
+    assert CAYU_IDENTITY in first_screen
+    for capability, parts in CAYU_CAPABILITIES:
+        assert f"| {capability} | {parts} |" in first_screen
+    assert CAYU_IS_NOT in first_screen
+
+    for relative in ("docs/architecture.md", "docs/public-concepts.md"):
+        overview = " ".join((ROOT / relative).read_text(encoding="utf-8").split())
+        assert CAYU_IDENTITY in overview, relative
+
+
+# Exact `cayu==<version>` pins go stale and get copied into new projects. Prose should
+# say `pip install cayu` or `uvx cayu ...`. Generated projects pin their dependency in
+# pyproject.toml, which is not prose and is not scanned here.
+_CAYU_VERSION_PIN = re.compile(r"\bcayu(?:\[[^\]]*\])?\s*==\s*\d")
+_INTENTIONAL_CAYU_PINS = {
+    "docs/release-notes.md": "upgrade notes name the exact release they describe",
+    "docs/cayu-cloud.md": "shows how `cayu cloud init` rewrites an existing pinned requirement",
+}
+
+
+def test_prose_does_not_pin_cayu_versions() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("utf-8")
+    offenders = []
+    for relative in filter(None, tracked.split("\0")):
+        if relative.startswith("tests/") or relative in _INTENTIONAL_CAYU_PINS:
+            continue
+        for number, line in enumerate(
+            (ROOT / relative).read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if _CAYU_VERSION_PIN.search(line):
+                offenders.append(f"{relative}:{number}: {line.strip()}")
+    assert not offenders, "use `pip install cayu` or `uvx cayu` instead:\n" + "\n".join(offenders)
+
+
+def test_cayu_version_pin_pattern_matches_install_commands() -> None:
+    for pinned in ("uvx --from cayu==0.9.1 cayu new", 'pip install "cayu[postgres]==0.11.3"'):
+        assert _CAYU_VERSION_PIN.search(pinned), pinned
+    for unpinned in ("pip install cayu", "uvx cayu new", "install `cayu==X.Y.Z`", "mycayu==1"):
+        assert _CAYU_VERSION_PIN.search(unpinned) is None, unpinned

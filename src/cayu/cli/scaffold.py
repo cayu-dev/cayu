@@ -37,6 +37,7 @@ from cayu.cli._guarded_tree_publication import (
     GuardedTreeStage,
     publish_guarded_tree,
 )
+from cayu.cli._identity import identity_markdown
 from cayu.cli.scaffold_convention import (
     application_guidance,
     convention_files,
@@ -970,8 +971,10 @@ if __name__ == "__main__":
     raise SystemExit(main())
 """
 
-_AGENTS_MD = """# Coding-agent instructions
-
+_AGENTS_MD = (
+    "# Coding-agent instructions\n\n"
+    + identity_markdown()
+    + """
 __AGENT_OWNERSHIP__
 
 ## When the user asks for...
@@ -1051,6 +1054,7 @@ Then replace the generated sample schema, implementation, test, and eval with
 domain behavior; `cayu check` keeps the tracer-bullet warning active until the
 explicit authoring marker is removed.
 """
+)
 
 _SERVICE_SETTINGS_APPEND = '''
 

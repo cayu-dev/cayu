@@ -2735,6 +2735,24 @@ def test_cayu_new_uses_an_explicit_agent_name_across_the_generated_contract(
     assert json.loads(eval_result.stdout)["status"] == "passed"
 
 
+@pytest.mark.parametrize("preset", ("agent", "service", "coding"))
+def test_generated_agent_instructions_open_with_the_cayu_identity(preset: str) -> None:
+    from cayu.cli._identity import CAYU_CAPABILITIES, CAYU_IDENTITY, CAYU_IS_NOT
+    from cayu.cli.scaffold import project_files
+
+    files = project_files("identity-agent", preset=preset)
+    instructions = files["AGENTS.md"]
+
+    assert instructions.startswith(f"# Coding-agent instructions\n\n{CAYU_IDENTITY}\n")
+    intro = instructions.split("\n## ", 1)[0]
+    for capability, parts in CAYU_CAPABILITIES:
+        assert f"| {capability} | {parts} |" in intro
+    assert CAYU_IS_NOT in intro
+    assert files["CLAUDE.md"] == "@AGENTS.md\n"
+    for guidance in ("README.md", "AGENTS.md"):
+        assert re.search(r"cayu(\[[^\]]*\])?==\d", files[guidance]) is None, guidance
+
+
 @pytest.mark.parametrize("reserved_token", _RESERVED_TEMPLATE_TOKENS)
 def test_cayu_new_preserves_reserved_tokens_in_the_default_agent_identity(
     tmp_path: Path,

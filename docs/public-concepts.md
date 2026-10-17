@@ -1,6 +1,6 @@
 # Public concepts and source ownership
 
-Cayu is an open-source Python framework for building and running domain-specific long-horizon agents, with a durable runtime built in.
+Cayu is a Python runtime for long-running agents: durable sessions that survive restarts and redeploys, human approval before side effects, spend caps enforced before each model call, and multi-agent collaboration. It is open source.
 
 ## Framework, harness, runtime and agent
 
