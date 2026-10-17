@@ -777,6 +777,24 @@ def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
     assert "../src/cayu/guides/app-ui.md" in bring_your_own_ui
 
 
+def test_cost_control_reference_states_spend_cap_behavior(capsys) -> None:
+    assert main(["guide", "references#cost-control"]) == 0
+    content = " ".join(capsys.readouterr().out.split())
+    for rule in (
+        "budget_limits=(BudgetLimit.usd(5),)",
+        "priced by `default_price_book()`",
+        "default_price_book().with_prices(ModelPrice.fixed(...))",
+        "refused before dispatch unless `allow_unpriced=True`",
+        'ends `interrupted` with `interruption_type="limit_reached"`',
+        "A session cap does not reserve",
+        "`budget.reservation_failed`",
+        "profile_adoption=...",
+        "is a deployment-wide cap",
+        "is not a hard cap across processes",
+    ):
+        assert rule in content, rule
+
+
 def test_guide_accepts_the_file_name_a_topic_is_published_under(capsys) -> None:
     assert main(["guide", "application-anatomy"]) == 0
     by_file = capsys.readouterr().out

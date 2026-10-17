@@ -243,9 +243,63 @@ of predetermined behavior, not live prompt comprehension.
 
 ## cost-control
 
-Usage events feed session summaries, pricing, budgets, and run limits. Configure
-the model catalog and price book explicitly, distinguish unpriced usage, and
-test the stop boundary. Estimated cost is evidence with provenance, not a bill.
+Usage events feed session summaries, pricing, budgets, and run limits. Estimated
+cost is evidence with provenance, not a bill. Read it with
+`app.get_session_cost(session_id, pricing)`; unpriced usage is counted, not zero.
+
+A per-session dollar cap is one line:
+
+```python
+from cayu.budgets import BudgetLimit
+
+RunRequest(agent_name="support", messages=[...], budget_limits=(BudgetLimit.usd(5),))
+```
+
+`BudgetLimit.usd(5)` is `scope="session"`, priced by `default_price_book()`: the
+dated public prices shipped with your Cayu release, each with a source URL and
+`as_of` date. To change one price, pass
+`pricing=default_price_book().with_prices(ModelPrice.fixed(...))`, or pass your
+own `PriceBook`. A model the book does not price is refused before dispatch
+unless `allow_unpriced=True`. Other scopes: `"run"`, `"agent"` (key = agent name), `"causal"` (key = causal budget id, which
+defaults to the root session id and is shared by its subagents) and `"app"`;
+the last three can also go in `CayuApp(budget_policy=BudgetPolicy(limits=...))`.
+`window=BudgetWindow.rolling(seconds=3600)` or
+`BudgetWindow.calendar(period="day")` limits the spend counted; the default is
+all time. `action="notify"` only emits `budget.limit_reached`.
+
+At the cap: spend is checked before every model call. Once it reaches the cap
+the session emits `session.limit_reached` (`limit="estimated_cost"`), records
+that step's tool calls as failed with `reason="limit_reached"` without running
+them, and ends `interrupted` with `interruption_type="limit_reached"`. A session
+cap does not reserve, so the call admitted just under it can end above it. For a
+hard ceiling, reserve against the session's causal budget:
+
+```python
+BudgetLimit.usd(5, scope="causal", key=session_id,
+                reservation=BudgetReservation(max_input_tokens=200_000, max_output_tokens=32_000))
+```
+
+A call whose reservation would pass the cap is refused before dispatch with
+`budget.reservation_failed`. Size the reservation for the largest call; a call
+that uses more than it reserved is still charged in full.
+
+Resume: resuming with the same cap stops again without a provider call. The cap
+and its prices are part of the session's execution profile, so a raised cap
+needs an `ExecutionProfilePolicy` that returns `ADOPT` with
+`authority_decision=AUTHORIZED` when only `INVOCATION_BUDGET_POLICY`,
+`APPLICATION_BUDGET_POLICY` or `RUNTIME` changed, plus
+`ResumeRequest(budget_limits=(BudgetLimit.usd(10),), profile_adoption=...)`.
+No tool call from before the stop runs again, including those skipped at the
+cap. Bundled prices can change on
+upgrade; sessions that must resume across upgrades should load a saved book
+(`dump_price_book`/`load_price_book`) instead.
+
+Deployment-wide: `scope="app"` with a reservation, on a `PostgresBudgetLedger`
+or a single-host `SQLiteBudgetLedger` that every process shares, is a
+deployment-wide cap; reservations are atomic in the ledger. Every process must
+configure the identical limit, price book included, because the ledger counts
+spend per limit definition. Without a reservation, or with the default
+in-memory ledger, an app-scope limit is not a hard cap across processes.
 
 ## observability
 

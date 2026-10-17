@@ -56,6 +56,7 @@ from cayu.budgets.pricing import (
     _normalize_provider,
     _resolve_price_book,
     _ResolvedPrice,
+    default_price_book,
     estimate_session_cost,
     resolve_price_book,
     session_cost_totals,
@@ -1169,6 +1170,45 @@ class BudgetLimit(BaseModel):
     allow_unpriced: StrictBool = False
     reservation: BudgetReservation | None = None
     action: BudgetAction = "interrupt"
+
+    @classmethod
+    def usd(
+        cls,
+        amount: Decimal | int | str,
+        *,
+        scope: BudgetScope = "session",
+        key: str | None = None,
+        pricing: PriceBook | None = None,
+        window: BudgetWindow | None = None,
+        allow_unpriced: bool = False,
+        reservation: BudgetReservation | None = None,
+        action: BudgetAction = "interrupt",
+    ) -> BudgetLimit:
+        """Cap estimated spend at ``amount`` US dollars.
+
+        ``BudgetLimit.usd(5)`` is a per-session cap priced with Cayu's bundled,
+        dated ``default_price_book()``. Pass ``pricing=`` to use an
+        application-owned book instead. Models the book does not price are
+        refused before dispatch unless ``allow_unpriced=True``.
+        """
+
+        if isinstance(amount, bool) or not isinstance(amount, Decimal | int | str):
+            raise TypeError("amount must be a Decimal, int, or decimal string, not a float.")
+        try:
+            max_estimated_cost = Decimal(amount)
+        except DecimalException as exc:
+            raise ValueError(f"amount is not a decimal number: {amount!r}") from exc
+        return cls(
+            scope=scope,
+            key=key,
+            max_estimated_cost=max_estimated_cost,
+            pricing=default_price_book() if pricing is None else pricing,
+            currency="USD",
+            window=BudgetWindow.all_time() if window is None else window,
+            allow_unpriced=allow_unpriced,
+            reservation=reservation,
+            action=action,
+        )
 
     @field_validator("currency")
     @classmethod

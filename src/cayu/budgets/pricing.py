@@ -558,6 +558,42 @@ class PriceBook(BaseModel):
             raise ValueError("Price book contains duplicate resource mappings.")
         return self
 
+    def with_prices(
+        self,
+        *prices: ModelPrice,
+        price_book_version: str | None = None,
+    ) -> PriceBook:
+        """Return a new book where ``prices`` override or extend this one.
+
+        Each given price replaces the entry with the same provider, model and
+        pricing context; any other price is added. This book is not changed.
+        The result is validated like any ``PriceBook``, so an override whose
+        aliases or prefixes collide with another entry is rejected.
+        """
+
+        def identity(price: ModelPrice) -> tuple[str, str, object]:
+            context = None if price.pricing_context is None else price.pricing_context.storage_key()
+            return (_normalize_provider(price.provider_name), price.model, context)
+
+        for price in prices:
+            if type(price) is not ModelPrice:
+                raise TypeError("with_prices accepts ModelPrice values.")
+        overrides = {identity(price): price for price in prices}
+        if len(overrides) != len(prices):
+            raise ValueError("with_prices received the same model price more than once.")
+        kept = tuple(price for price in self.prices if identity(price) not in overrides)
+        return PriceBook(
+            price_book_version=(
+                f"{self.price_book_version}+application"
+                if price_book_version is None
+                else price_book_version
+            ),
+            generated_at=self.generated_at,
+            prices=(*kept, *prices),
+            contextual_pricing_requirements=self.contextual_pricing_requirements,
+            resource_mappings=self.resource_mappings,
+        )
+
     def _requires_cache_write_ttls(self, provider_name: str) -> bool:
         requirement = next(
             (

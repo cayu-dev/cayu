@@ -22,6 +22,10 @@ selected = models.route(needs_tools=True, min_context=200_000)
 limit = BudgetLimit(max_estimated_cost=Decimal("5.00"), pricing=prices)
 ```
 
+`BudgetLimit.usd("5.00")` builds the same per-session limit in one call; it asks
+for the bundled book by name, so the choice stays visible where the cap is
+configured. `cayu guide references#cost-control` covers what happens at the cap.
+
 ## Why they are separate
 
 Model facts and commercial prices have different owners and change on different
@@ -57,7 +61,9 @@ unavailable rather than zero. The bundled book is a convenient public-rate snaps
 not a universal default: private gateways, negotiated rates, historical reconstruction,
 and identities outside its reviewed subset require a complete application-owned
 `PriceBook`. Cayu does not merge that book with the bundled snapshot or silently price
-unknown rows.
+unknown rows. To start from the bundled book, derive a new one explicitly:
+`default_price_book().with_prices(ModelPrice.fixed(...))` replaces the entry with
+the same provider, model and pricing context and adds any other price.
 
 ## Coverage and provider keys
 

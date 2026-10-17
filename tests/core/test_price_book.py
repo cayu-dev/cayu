@@ -26,8 +26,9 @@ from cayu.budgets import (
     default_price_book,
     estimate_session_cost,
 )
-from cayu.budgets.base import budget_check_from_events
+from cayu.budgets.base import budget_check_from_events, budget_pricing_preflight_error
 from cayu.budgets.billing import resolved_billing_identity
+from cayu.budgets.pricing import _BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS
 from cayu.providers import bedrock_billing_identity
 
 _PROVENANCE = Provenance(
@@ -934,3 +935,155 @@ def test_run_rejects_price_books_too_large_for_model_completion_recovery() -> No
     assert (
         asyncio.run(run(policy=BudgetPolicy(limits=(reserving,)), limits=(request_limit,) * 2)) == 0
     )
+
+
+def test_usd_budget_limit_is_a_session_cap_priced_by_the_bundled_book() -> None:
+    limit = BudgetLimit.usd(5)
+
+    assert limit.scope == "session"
+    assert limit.max_estimated_cost == Decimal("5")
+    assert limit.currency == "USD"
+    assert limit.pricing == default_price_book()
+    assert limit.allow_unpriced is False
+    assert limit.action == "interrupt"
+    assert limit.reservation is None
+    assert limit == BudgetLimit(max_estimated_cost=Decimal("5"), pricing=default_price_book())
+
+
+def test_usd_budget_limit_keeps_every_part_configurable() -> None:
+    prices = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="gateway",
+                model="frontier",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        )
+    )
+    reservation = BudgetReservation(max_input_tokens=1_000, max_output_tokens=1_000)
+
+    limit = BudgetLimit.usd(
+        "0.25",
+        scope="agent",
+        key="assistant",
+        pricing=prices,
+        reservation=reservation,
+    )
+
+    assert limit.scope == "agent"
+    assert limit.key == "assistant"
+    assert limit.max_estimated_cost == Decimal("0.25")
+    assert limit.pricing == prices
+    assert limit.reservation == reservation
+
+
+@pytest.mark.parametrize("amount", [5.0, True, None])
+def test_usd_budget_limit_rejects_inexact_amount_types(amount: object) -> None:
+    with pytest.raises(TypeError, match="not a float"):
+        BudgetLimit.usd(amount)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("amount", ["five", "0", "-1", "NaN"])
+def test_usd_budget_limit_rejects_non_positive_or_malformed_amounts(amount: str) -> None:
+    with pytest.raises(ValueError):
+        BudgetLimit.usd(amount)
+
+
+def test_with_prices_overrides_one_bundled_price_and_adds_another() -> None:
+    bundled = default_price_book()
+    negotiated = ModelPrice.fixed(
+        provider_name="anthropic",
+        model="claude-sonnet-5",
+        match="exact",
+        input_per_million=Decimal("1.50"),
+        output_per_million=Decimal("7.50"),
+    )
+    gateway = ModelPrice.fixed(
+        provider_name="gateway",
+        model="frontier",
+        input_per_million=Decimal("1"),
+        output_per_million=Decimal("2"),
+    )
+
+    prices = bundled.with_prices(negotiated, gateway)
+
+    assert prices.price_book_version == f"{bundled.price_book_version}+application"
+    assert len(prices.prices) == len(bundled.prices) + 1
+    sonnet = [
+        price
+        for price in prices.prices
+        if price.provider_name == "anthropic" and price.model == "claude-sonnet-5"
+    ]
+    assert sonnet == [negotiated]
+    assert bundled == default_price_book()
+    on = datetime(2026, 10, 15, tzinfo=UTC)
+    limit = BudgetLimit.usd(5, pricing=prices)
+    assert limit.pricing == prices
+    for provider_name, model in (("anthropic", "claude-sonnet-5"), ("gateway", "frontier")):
+        assert (
+            budget_pricing_preflight_error(
+                prices, provider_name=provider_name, model=model, currency="USD", effective_at=on
+            )
+            is None
+        )
+
+
+def test_with_prices_rejects_duplicate_and_colliding_overrides() -> None:
+    bundled = default_price_book()
+    price = ModelPrice.fixed(
+        provider_name="openai",
+        model="gpt-6-sol",
+        match="exact",
+        input_per_million=Decimal("1"),
+        output_per_million=Decimal("2"),
+    )
+    with pytest.raises(ValueError, match="more than once"):
+        bundled.with_prices(price, price)
+    with pytest.raises(TypeError, match="ModelPrice"):
+        bundled.with_prices("gpt-6-sol")  # type: ignore[arg-type]
+    colliding_alias = ModelPrice.fixed(
+        provider_name="openai",
+        model="custom-sol",
+        match="exact",
+        aliases=("gpt-6-sol",),
+        input_per_million=Decimal("1"),
+        output_per_million=Decimal("2"),
+    )
+    with pytest.raises(ValidationError, match="duplicate"):
+        bundled.with_prices(colliding_alias)
+
+
+def test_bundled_price_book_prices_every_catalogued_model_for_a_usd_cap() -> None:
+    """A one-line cap must not refuse a model Cayu ships in its catalog.
+
+    Deterministic and offline: it checks the bundled resources on their own
+    snapshot date, not against wall-clock time or provider pages.
+    """
+
+    catalog = default_model_catalog()
+    limit = BudgetLimit.usd(5)
+    snapshot = date.fromisoformat(limit.pricing.generated_at)
+    assert catalog.generated_at == limit.pricing.generated_at
+    for price in limit.pricing.prices:
+        for schedule in price.schedules:
+            assert date.fromisoformat(schedule.provenance.as_of) <= snapshot
+            assert schedule.provenance.url.startswith("https://")
+    effective_at = datetime.combine(snapshot, datetime.min.time(), tzinfo=UTC)
+    contextual = {
+        requirement.provider_name for requirement in _BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS
+    }
+    checked = 0
+    for model in catalog.models:
+        if model.provider_name in contextual:
+            continue
+        error = budget_pricing_preflight_error(
+            limit.pricing,
+            provider_name=model.provider_name,
+            model=model.model,
+            currency=limit.currency,
+            effective_at=effective_at,
+        )
+        assert error is None, f"{model.provider_name}/{model.model}: {error}"
+        checked += 1
+    assert checked >= 10
