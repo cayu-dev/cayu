@@ -49,6 +49,7 @@ These are supported discovery contracts:
 | `PendingActionSession.instance_id` | Session incarnation, read in the same store snapshot as the action |
 | `HumanAttentionRequest.from_pending_action(action)` | Fixed content-free summary plus exact SDK correlation reference |
 | `CayuApp.get_human_attention_state(reference)` | Current action or positive terminal evidence; absence alone is unavailable |
+| Protected `GET /api/human-attention/{attention_id}` | The same state and reason over the optional server, for a reference a receiver already holds |
 | `EventSink.emit(event)` | At-least-once refresh hint delivery, acknowledged only after durable destination acceptance |
 | `CayuApp.recover_persisted_event_side_effects(limit=...)` | Bounded recovery of committed event fan-out |
 
@@ -60,6 +61,35 @@ execution authority. SDK `HumanAttentionReference` values belong inside the
 trusted consumer/resolver boundary; HTTP responses use the server's normal
 public-ID projection instead. Do not reconstruct an SDK reference from arbitrary
 callback data or a public event payload.
+
+### Read settled state over HTTP
+
+A receiver that was handed a reference, for example through the handoff below, can
+check its exact state through the Agent's own protected server instead of running
+code in the Agent:
+
+```http
+GET /api/human-attention/{attention_id}?session_id=...&session_instance_id=...&kind=user_input&action_id=...&source_sequence=12
+```
+
+Pass the reference fields as query parameters, with `round_id` and `tool_call_id`
+when the reference has them. `session_id` may also be the server's public session
+alias. The route calls `get_human_attention_state` and returns its result as is:
+
+```json
+{"attention_id": "attention_...", "state": "resolved", "observed_at": "...", "reason": "durable_closure"}
+```
+
+The response never carries question text, choices, tool arguments, receipts or
+exception text, and is sent with `Cache-Control: private, no-store`. The route uses
+the server's configured authentication like `/api/pending-actions`. When the
+authenticated identity has a verified tenant, only sessions whose invocation origin
+has that same tenant are visible. An unknown session, an unresolvable alias, a
+reference whose `attention_id` does not match its fields, and another tenant's
+session all return the same `unavailable` / `session_unavailable` answer, so the
+route does not reveal whether an identity exists. Without a tenant on the
+authenticated identity it remains an operator read, like the rest of the mounted
+surface. It is a read and never answers, approves or resumes anything.
 
 ## One underlying action
 
@@ -188,6 +218,10 @@ without them the handoff is inert, so the same code runs locally. Pass
   reference leave the process. The requester reference is the session label named by
   `requester_label`, set by application code through `RunRequest(labels=...)`; a delegated
   child inherits its nearest ancestor's. Delegated parents are never handed off.
+- A receiver that can reach the Agent's protected server can also confirm settlement
+  itself with `GET /api/human-attention/{attention_id}` and a reference it was handed
+  (see "Read settled state over HTTP"). Treat `unavailable` there the same way: it never
+  settles a request.
 - Run `run()` in one long-lived process. A second one is harmless because receiver writes
   are idempotent. An SDK-only worker without the server preset passes
   `recover_event_side_effects=True` so the loop also runs bounded event recovery.

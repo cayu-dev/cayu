@@ -7388,6 +7388,54 @@
       "title": "HostedToolUsageMetrics",
       "type": "object"
     },
+    "HumanAttentionObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "attention_id": {
+          "title": "Attention Id",
+          "type": "string"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "current_action",
+            "durable_closure",
+            "durable_supersession",
+            "session_unavailable",
+            "session_replaced",
+            "incomplete_query",
+            "no_terminal_evidence",
+            "store_unavailable"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "resolved",
+            "cancelled",
+            "superseded",
+            "expired",
+            "unavailable"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attention_id",
+        "state",
+        "observed_at",
+        "reason"
+      ],
+      "title": "HumanAttentionObservation",
+      "type": "object"
+    },
     "HumanReviewCall": {
       "additionalProperties": false,
       "properties": {
@@ -17017,6 +17065,140 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HealthResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/human-attention/{attention_id}": {
+      "get": {
+        "operation_id": "get_human_attention_state_api_human_attention__attention_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attention_id",
+            "required": true,
+            "schema": {
+              "pattern": "^attention_[0-9a-f]{64}$",
+              "title": "Attention Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "user_input",
+                "tool_approval",
+                "manual_recovery"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "round_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Round Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_instance_id",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Session Instance Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_sequence",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "title": "Source Sequence",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tool_call_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool Call Id"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HumanAttentionObservation"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
               }
             }
           }

@@ -9842,6 +9842,28 @@ export type HostedToolUsageMetrics = {
 };
 
 /**
+ * HumanAttentionObservation
+ */
+export type HumanAttentionObservation = {
+    /**
+     * Attention Id
+     */
+    attention_id: string;
+    /**
+     * Observed At
+     */
+    observed_at: string;
+    /**
+     * Reason
+     */
+    reason: 'current_action' | 'durable_closure' | 'durable_supersession' | 'session_unavailable' | 'session_replaced' | 'incomplete_query' | 'no_terminal_evidence' | 'store_unavailable';
+    /**
+     * State
+     */
+    state: 'active' | 'resolved' | 'cancelled' | 'superseded' | 'expired' | 'unavailable';
+};
+
+/**
  * HumanReviewCall
  */
 export type HumanReviewCall = {
@@ -22848,6 +22870,69 @@ export type HealthApiHealthGetResponses = {
 };
 
 export type HealthApiHealthGetResponse = HealthApiHealthGetResponses[keyof HealthApiHealthGetResponses];
+
+export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Attention Id
+         */
+        attention_id: string;
+    };
+    query: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Session Instance Id
+         */
+        session_instance_id: string;
+        /**
+         * Kind
+         */
+        kind: 'user_input' | 'tool_approval' | 'manual_recovery';
+        /**
+         * Action Id
+         */
+        action_id: string;
+        /**
+         * Source Sequence
+         */
+        source_sequence: number;
+        /**
+         * Round Id
+         */
+        round_id?: string | null;
+        /**
+         * Tool Call Id
+         */
+        tool_call_id?: string | null;
+    };
+    url: '/api/human-attention/{attention_id}';
+};
+
+export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetErrors = {
+    /**
+     * The request has no valid authenticated identity.
+     */
+    401: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetError = GetHumanAttentionStateApiHumanAttentionAttentionIdGetErrors[keyof GetHumanAttentionStateApiHumanAttentionAttentionIdGetErrors];
+
+export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponses = {
+    /**
+     * Bounded state and reason only. An unknown, unresolvable, mismatched or other-tenant reference is `unavailable` with reason `session_unavailable`.
+     */
+    200: HumanAttentionObservation;
+};
+
+export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponse = GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponses[keyof GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponses];
 
 export type ListPendingKnowledgeApiKnowledgePendingGetData = {
     body?: never;

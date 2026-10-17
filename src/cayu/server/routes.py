@@ -139,6 +139,12 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.runtime.human_attention import (
+    AttentionKind,
+    AttentionReason,
+    HumanAttentionObservation,
+    HumanAttentionReference,
+)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -194,6 +200,7 @@ from cayu.server.contracts import (
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
+    HUMAN_ATTENTION_ENDPOINT_RESPONSES,
     MAX_CAPTURED_EVALUATION_REQUEST_BYTES,
     MAX_CONTROL_PLANE_METADATA_BYTES,
     MAX_CONTROL_PLANE_METADATA_MEMBERS,
@@ -1031,6 +1038,7 @@ MutationIdHeader = Annotated[
     ),
 ]
 ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
+HumanAttentionIdPath = Annotated[str, StringConstraints(pattern=r"^attention_[0-9a-f]{64}$")]
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
@@ -6916,6 +6924,73 @@ def create_router(
             "total_count": result.total_count,
             "inspected_candidate_count": result.inspected_candidate_count,
         }
+
+    @router.get(
+        "/human-attention/{attention_id}",
+        response_model=HumanAttentionObservation,
+        responses=HUMAN_ATTENTION_ENDPOINT_RESPONSES,
+        description=(
+            "Read one human-attention request's exact state through "
+            "`CayuApp.get_human_attention_state`. Query parameters are the exact "
+            "reference a `cayu.human-attention-handoff/v1` observation carries; "
+            "`session_id` may also be its public alias. The response carries state "
+            "and reason only, never question text, choices or tool arguments. When "
+            "the authenticated identity has a verified tenant, only sessions whose "
+            "invocation origin has that tenant are visible."
+        ),
+    )
+    async def get_human_attention_state(
+        attention_id: HumanAttentionIdPath,
+        response: Response,
+        session_id: Annotated[str, Query(min_length=1, max_length=2048)],
+        session_instance_id: Annotated[str, Query(min_length=1, max_length=512)],
+        kind: AttentionKind,
+        action_id: Annotated[str, Query(min_length=1, max_length=4096)],
+        source_sequence: Annotated[int, Query(ge=1)],
+        round_id: Annotated[str | None, Query(max_length=512)] = None,
+        tool_call_id: Annotated[str | None, Query(max_length=512)] = None,
+        auth_context: AuthContext | None = optional_auth_context,
+    ) -> HumanAttentionObservation:
+        response.headers["Cache-Control"] = "private, no-store"
+
+        def unavailable(reason: AttentionReason) -> HumanAttentionObservation:
+            return HumanAttentionObservation(
+                attention_id=attention_id,
+                state="unavailable",
+                observed_at=datetime.now(UTC),
+                reason=reason,
+            )
+
+        # Unknown, unresolvable, mismatched and other-tenant references share
+        # one answer so the route cannot become an existence oracle.
+        try:
+            private_session_id = await cayu_app._resolve_public_session_id(session_id)
+        except ValueError:
+            return unavailable("session_unavailable")
+        except Exception:
+            return unavailable("store_unavailable")
+        try:
+            reference = HumanAttentionReference(
+                attention_id=attention_id,
+                session_id=private_session_id,
+                session_instance_id=session_instance_id,
+                kind=kind,
+                action_id=action_id,
+                round_id=round_id,
+                tool_call_id=tool_call_id,
+                source_sequence=source_sequence,
+            )
+        except ValidationError:
+            return unavailable("session_unavailable")
+        tenant = None if auth_context is None else auth_context.tenant
+        if tenant is not None:
+            try:
+                session = await session_store.load(private_session_id)
+            except Exception:
+                return unavailable("store_unavailable")
+            if session is None or session.invocation.origin.tenant != tenant:
+                return unavailable("session_unavailable")
+        return await cayu_app.get_human_attention_state(reference)
 
     @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)
     async def list_sessions(

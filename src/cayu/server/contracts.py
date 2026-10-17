@@ -2608,6 +2608,19 @@ PENDING_ACTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
 }
 
+HUMAN_ATTENTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": (
+            "Bounded state and reason only. An unknown, unresolvable, mismatched or "
+            "other-tenant reference is `unavailable` with reason `session_unavailable`."
+        ),
+    },
+    401: {
+        "description": "The request has no valid authenticated identity.",
+        "model": ApiErrorResponse,
+    },
+}
+
 
 class ApiToolSummary(ApiBaseModel):
     name: str
