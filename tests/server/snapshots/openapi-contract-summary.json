@@ -2950,6 +2950,66 @@
               "type": "null"
             }
           ]
+        },
+        "approval_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApprovalRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Application-declared proposed and approved revision digests."
+        },
+        "attention_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Human-attention identity of the request this touch settled; the same value pending-action reads report as attention_id. Never resolution authority.",
+          "title": "Attention Id"
+        },
+        "attention_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "resolved",
+                "cancelled",
+                "expired"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Attention State"
+        },
+        "authorization_grant_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Authorization Grant Id"
+        },
+        "authorization_grant_role": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/SupervisionGrantRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -12672,6 +12732,7 @@
       "description": "Closed set of supervision touches the runtime records durably.",
       "enum": [
         "approve",
+        "edit",
         "deny",
         "expire",
         "answer",
@@ -16115,6 +16176,37 @@
       ],
       "title": "WebSearchSource",
       "type": "object"
+    },
+    "ApprovalRevision": {
+      "additionalProperties": false,
+      "description": "The proposed and approved versions of one approved call, as digests.",
+      "properties": {
+        "approved_digest": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+=-]{0,127}$",
+          "title": "Approved Digest",
+          "type": "string"
+        },
+        "proposed_digest": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+=-]{0,127}$",
+          "title": "Proposed Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "proposed_digest",
+        "approved_digest"
+      ],
+      "title": "ApprovalRevision",
+      "type": "object"
+    },
+    "SupervisionGrantRole": {
+      "description": "How a tool authorization grant took part in one approval.",
+      "enum": [
+        "sampled_review",
+        "created"
+      ],
+      "title": "SupervisionGrantRole",
+      "type": "string"
     }
   },
   "info": {

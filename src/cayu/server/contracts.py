@@ -29,6 +29,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.approvals.actors import ResolutionActorSource
+from cayu.approvals.revisions import ApprovalRevision
 from cayu.budgets.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -209,8 +210,10 @@ from cayu.sessions.supervision_events import (
     SUPERVISION_EVENT_MAX_CURSOR_BYTES,
     SUPERVISION_EVENT_MAX_LIMIT,
     SUPERVISION_EVENT_MAX_RESULT_BYTES,
+    SupervisionAttentionState,
     SupervisionEventKind,
     SupervisionEventOutcome,
+    SupervisionGrantRole,
     SupervisionMessageOrigin,
 )
 from cayu.sessions.topology import (
@@ -775,6 +778,20 @@ class ApiSupervisionEvent(ApiBaseModel):
     message_origin: SupervisionMessageOrigin | None = None
     actor: ApiSupervisionActor | None = None
     reason: str | None = None
+    attention_id: str | None = Field(
+        default=None,
+        description=(
+            "Human-attention identity of the request this touch settled; the same value "
+            "pending-action reads report as attention_id. Never resolution authority."
+        ),
+    )
+    attention_state: SupervisionAttentionState | None = None
+    approval_revision: ApprovalRevision | None = Field(
+        default=None,
+        description="Application-declared proposed and approved revision digests.",
+    )
+    authorization_grant_id: str | None = None
+    authorization_grant_role: SupervisionGrantRole | None = None
     requested_at: datetime | None = None
     resolved_at: datetime
     usage: UsageMetrics | None = None

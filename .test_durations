@@ -47223,5 +47223,18 @@
   "tests/evals/test_project_objectives.py::test_paths_that_differ_only_in_unicode_normalization_overlap": 0.005295041017234325,
   "tests/evals/test_project_objectives.py::test_python_eval_targets_cover_unresolved_floor_suites_and_protect_their_module": 0.005982999806292355,
   "tests/evals/test_project_objectives.py::test_symbolic_links_inside_body_and_protected_directories_are_reported": 0.004421876044943929,
-  "tests/evals/test_project_objectives.py::test_validator_reports_every_file_level_problem": 0.005818292032927275
+  "tests/evals/test_project_objectives.py::test_validator_reports_every_file_level_problem": 0.005818292032927275,
+  "tests/core/test_supervision_events_stores.py::test_every_store_reports_declared_edits_and_attention_identity[memory]": 5.118,
+  "tests/core/test_supervision_events_stores.py::test_every_store_reports_declared_edits_and_attention_identity[sqlite]": 5.456,
+  "tests/runtime/test_runtime_supervision_attention.py::test_approval_recovery_names_the_open_approval_request": 1.988,
+  "tests/runtime/test_runtime_supervision_attention.py::test_approval_requests_reject_malformed_or_misplaced_revisions[declaration0-approve]": 0.002,
+  "tests/runtime/test_runtime_supervision_attention.py::test_approval_requests_reject_malformed_or_misplaced_revisions[declaration1-approve]": 0.001,
+  "tests/runtime/test_runtime_supervision_attention.py::test_approval_requests_reject_malformed_or_misplaced_revisions[declaration2-approve]": 0.001,
+  "tests/runtime/test_runtime_supervision_attention.py::test_approval_requests_reject_malformed_or_misplaced_revisions[declaration3-deny]": 0.0,
+  "tests/runtime/test_runtime_supervision_attention.py::test_approval_touches_name_their_attention_request_and_settled_state": 3.717,
+  "tests/runtime/test_runtime_supervision_attention.py::test_declared_revision_classifies_an_approval_as_an_edit": 3.432,
+  "tests/runtime/test_runtime_supervision_attention.py::test_grant_linkage_and_usage_cost_are_read_from_recorded_events": 0.01,
+  "tests/runtime/test_runtime_supervision_attention.py::test_round_recovery_names_its_manual_recovery_request": 1.27,
+  "tests/runtime/test_runtime_supervision_attention.py::test_user_input_recovery_names_the_manual_recovery_request": 3.794,
+  "tests/server/test_server_supervision_events.py::test_attention_identity_and_declared_edit_cross_http_without_content": 2.028
 }

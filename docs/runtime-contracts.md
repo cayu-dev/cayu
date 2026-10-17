@@ -2294,6 +2294,48 @@ sessions whose invocation origin carries that tenant; an identity without a
 tenant reads the configured session store. The host-authenticated
 `POST /resources/supervision-events/query` returns scoped records.
 
+Settled touches name the human-attention request they settled. `attention_id`
+uses the identity rule of pending-action reads and `get_human_attention_state`
+(`human_attention_id` in `cayu.sessions.pending_action_contracts`): an approval
+or its recovery is a tool approval, a question or its recovery is user input,
+and a round recovery without either is manual recovery; steering opens no
+request. `attention_state` is `resolved` for `approve`, `edit` and `answer`,
+`cancelled` for `deny` and `expired` for `expire`. A `recover` reports the state
+`manual_recovery_settlement` (in `cayu.runtime.human_attention`) decides, the
+same rule human-attention reads apply to the recovery terminal, so an
+outcome-unknown failure reports `null`. When the runtime handed the recovered
+call off with a `session.interrupted` carrying `manual_recovery_required` for
+that round and call, pending-action reads open a manual-recovery request in
+place of the approval or question, and the `recover` record names that
+manual-recovery request. An `interrupt` carries the closed
+request's `attention_id` and no state; read the exact state with
+`get_human_attention_state`.
+
+The approval primitive has no edit decision, so an application that lets a
+person change a proposal declares the approved version on the approval.
+`approval_revision_metadata(proposed_digest=..., approved_digest=...)` in
+`cayu.approvals` returns the entry for `ToolApprovalRequest.metadata` under
+`cayu:approval_revision`: exactly `proposed_digest` and `approved_digest`, each
+an opaque digest token matching `^[A-Za-z0-9][A-Za-z0-9._:+=-]{0,127}$`, so a
+declaration cannot carry the revised content. Approval requests reject a
+malformed declaration or one on a denial. The runtime publishes the validated
+declaration as the `approval_revision` field of `tool.call.approved`, outside the
+bounded and secret-scoped audit `metadata`, so unrelated metadata cannot drop it
+and classification never reads it from `metadata`. An approval whose declared digests
+differ is an `edit`; one whose digests are equal stays `approve`. Both report
+the declaration as `approval_revision`. Approvals without one are `approve` and
+the runtime never infers an edit.
+
+A call a tool authorization grant allows never pauses, so it is not a touch. A
+call a grant sends to sampled review is an ordinary approval touch whose
+`authorization_grant_id` names that grant, read from the request's
+`cayu:authorization_grant` policy metadata, with `authorization_grant_role`
+`sampled_review`. An approval that created a grant names it with role
+`created`. `price_supervision_events(page, pricing)` estimates each event's
+joined usage with an application `PriceBook` through
+`estimate_model_step_cost`, on the request date, or the touch date when no
+request was found; it reads no store and is separate from the query.
+
 Task topology is an independent optional `TaskStore` capability.
 `query_task_topology(...)` batch-loads tasks attached to a bounded set of
 session IDs and direct children for a bounded set of task-parent IDs. Each

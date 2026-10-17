@@ -162,6 +162,34 @@ class DelegatedActionReference(BaseModel):
         return value
 
 
+def human_attention_id(
+    *,
+    session_id: str,
+    session_instance_id: str,
+    kind: PendingActionKind,
+    discriminator: str,
+    tool_call_id: str | None,
+) -> str:
+    """Stable human-attention identity of one exact pending action incarnation.
+
+    Pending-action reads and supervision queries share this rule so a settled
+    supervision event names the same attention request a notifier tracked.
+    """
+    identity = [
+        session_id,
+        session_instance_id,
+        kind.value,
+        discriminator,
+        tool_call_id if kind is PendingActionKind.MANUAL_RECOVERY else None,
+    ]
+    return (
+        "attention_"
+        + hashlib.sha256(
+            json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+
+
 class PendingActionRecord(BaseModel):
     """One current action derived from a session checkpoint and its source event."""
 
@@ -212,18 +240,12 @@ class PendingActionRecord(BaseModel):
             discriminator = self.round_id or self.id
         if discriminator is None:
             return None
-        identity = [
-            self.session.id,
-            self.session.instance_id,
-            self.kind.value,
-            discriminator,
-            self.tool_call_id if self.kind is PendingActionKind.MANUAL_RECOVERY else None,
-        ]
-        return (
-            "attention_"
-            + hashlib.sha256(
-                json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode()
-            ).hexdigest()
+        return human_attention_id(
+            session_id=self.session.id,
+            session_instance_id=self.session.instance_id,
+            kind=self.kind,
+            discriminator=discriminator,
+            tool_call_id=self.tool_call_id,
         )
 
     @model_validator(mode="after")

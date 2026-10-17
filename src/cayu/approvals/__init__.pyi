@@ -141,6 +141,11 @@ from cayu.approvals.review import HumanReviewPolicy as HumanReviewPolicy
 from cayu.approvals.review import HumanReviewReference as HumanReviewReference
 from cayu.approvals.review import HumanReviewSource as HumanReviewSource
 from cayu.approvals.review import HumanReviewView as HumanReviewView
+from cayu.approvals.revisions import (
+    APPROVAL_REVISION_METADATA_KEY as APPROVAL_REVISION_METADATA_KEY,
+)
+from cayu.approvals.revisions import ApprovalRevision as ApprovalRevision
+from cayu.approvals.revisions import approval_revision_metadata as approval_revision_metadata
 from cayu.approvals.tools import PendingToolApproval as PendingToolApproval
 from cayu.approvals.tools import PendingToolApprovalEventView as PendingToolApprovalEventView
 from cayu.approvals.tools import PendingToolCallApproval as PendingToolCallApproval

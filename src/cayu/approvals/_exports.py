@@ -1,6 +1,12 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "APPROVAL_REVISION_METADATA_KEY": (
+        "cayu.approvals.revisions",
+        "APPROVAL_REVISION_METADATA_KEY",
+    ),
+    "ApprovalRevision": ("cayu.approvals.revisions", "ApprovalRevision"),
+    "approval_revision_metadata": ("cayu.approvals.revisions", "approval_revision_metadata"),
     "AllowedActorsGrantAuthority": (
         "cayu.approvals.authorization_grants",
         "AllowedActorsGrantAuthority",
@@ -199,6 +205,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "APPROVAL_REVISION_METADATA_KEY",
+    "ApprovalRevision",
+    "approval_revision_metadata",
     "AllowedActorsGrantAuthority",
     "BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY",
     "BUSINESS_APPROVAL_ROUTING_METADATA_KEY",

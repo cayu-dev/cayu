@@ -583,6 +583,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "SupervisionEventResultTooLarge",
     ),
     "SupervisionMessageOrigin": ("cayu.sessions.supervision_events", "SupervisionMessageOrigin"),
+    "SupervisionGrantRole": ("cayu.sessions.supervision_events", "SupervisionGrantRole"),
+    "price_supervision_events": ("cayu.sessions.supervision_events", "price_supervision_events"),
     "decode_supervision_event_cursor": (
         "cayu.sessions.supervision_events",
         "decode_supervision_event_cursor",
@@ -1002,6 +1004,8 @@ PUBLIC_NAMES = [
     "SupervisionEventCursorInvalid",
     "SupervisionEventResultTooLarge",
     "SupervisionMessageOrigin",
+    "SupervisionGrantRole",
+    "price_supervision_events",
     "decode_supervision_event_cursor",
     "encode_supervision_event_cursor",
     "checkpoint_root_field_projection_from_storage",

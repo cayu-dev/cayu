@@ -18,6 +18,7 @@ from cayu.approvals.user_input import (
     USER_INPUT_SUPERSESSION_INTENT_KEY,
     UserInputSupersessionIntent,
 )
+from cayu.events import Event
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionRecord
 from cayu.sessions.records import PendingActionKind
@@ -244,23 +245,33 @@ async def _terminal_state(
                 and payload.get("tool_round_id") == ref.round_id
                 and payload.get("tool_call_id") == ref.tool_call_id
             ):
-                if row.event.type == EventType.TOOL_CALL_COMPLETED:
-                    return "resolved", "durable_closure"
-                if (
-                    row.event.type == EventType.TOOL_CALL_FAILED
-                    and payload.get("manual_recovery") is True
-                ):
-                    result = ToolResult.model_validate(payload.get("result"))
-                    # A committed operator failure settles the attention request,
-                    # but synthetic outcome-unknown failures do not prove closure.
-                    if result.is_error and all(
-                        controls.get("outcome_unknown", False) is False
-                        and controls.get("manual_reconciliation_required", False) is False
-                        for controls in (payload, result.structured or {})
-                    ):
-                        return "resolved", "durable_closure"
-                if row.event.type == EventType.TOOL_CALL_BLOCKED:
-                    return "cancelled", "durable_closure"
+                settled = manual_recovery_settlement(row.event)
+                if settled is not None:
+                    return settled, "durable_closure"
         if len(rows) == 100:
             return "unavailable", "incomplete_query"
     return "unavailable", "no_terminal_evidence"
+
+
+def manual_recovery_settlement(event: Event) -> Literal["resolved", "cancelled"] | None:
+    """How one terminal tool event settles a manual-recovery attention request.
+
+    Supervision queries apply the same rule, so a recovery touch reports the
+    state human-attention reads would report for the request it answered.
+    """
+    payload = event.payload
+    if event.type == EventType.TOOL_CALL_COMPLETED:
+        return "resolved"
+    if event.type == EventType.TOOL_CALL_FAILED and payload.get("manual_recovery") is True:
+        result = ToolResult.model_validate(payload.get("result"))
+        # A committed operator failure settles the attention request,
+        # but synthetic outcome-unknown failures do not prove closure.
+        if result.is_error and all(
+            controls.get("outcome_unknown", False) is False
+            and controls.get("manual_reconciliation_required", False) is False
+            for controls in (payload, result.structured or {})
+        ):
+            return "resolved"
+    if event.type == EventType.TOOL_CALL_BLOCKED:
+        return "cancelled"
+    return None

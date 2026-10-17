@@ -24,6 +24,8 @@ from pydantic import ValidationError
 
 from cayu._validation import canonical_durable_json_bytes, json_utf8_size_within_limit
 from cayu.approvals.actors import ResolutionActor
+from cayu.approvals.authorization_grants import TOOL_AUTHORIZATION_GRANT_METADATA_KEY
+from cayu.approvals.revisions import ApprovalRevision
 from cayu.budgets.usage import UsageMetrics
 from cayu.events import Event, EventType
 from cayu.execution_profiles import ExecutionProfileDecisionKind
@@ -39,9 +41,11 @@ from cayu.sessions._terminal_evidence import (
     INTERRUPTION_ORIGIN_PAYLOAD_KEY,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
+from cayu.sessions.pending_action_contracts import human_attention_id
 from cayu.sessions.queries import SessionQuery, session_query_from_aggregate_filter
-from cayu.sessions.records import EventRecord, Session
+from cayu.sessions.records import EventRecord, PendingActionKind, Session
 from cayu.sessions.supervision_events import (
+    SupervisionAttentionState,
     SupervisionEvent,
     SupervisionEventContent,
     SupervisionEventKind,
@@ -49,6 +53,7 @@ from cayu.sessions.supervision_events import (
     SupervisionEventPage,
     SupervisionEventQuery,
     SupervisionEventResultTooLarge,
+    SupervisionGrantRole,
     SupervisionMessageOrigin,
     decode_supervision_event_cursor,
     encode_supervision_event_cursor,
@@ -80,6 +85,7 @@ _MESSAGE_OUTCOMES = {
 }
 _ANCHOR_TYPES = {
     SupervisionEventKind.APPROVE: (EventType.TOOL_CALL_APPROVED,),
+    SupervisionEventKind.EDIT: (EventType.TOOL_CALL_APPROVED,),
     SupervisionEventKind.DENY: (EventType.TOOL_CALL_APPROVAL_DENIED,),
     SupervisionEventKind.EXPIRE: (EventType.TOOL_CALL_APPROVAL_EXPIRED,),
     SupervisionEventKind.ANSWER: (EventType.SESSION_RESUMED,),
@@ -397,9 +403,16 @@ async def _classify(
 ) -> SupervisionEvent | None:
     event_type = record.event.type
     if event_type == EventType.TOOL_CALL_APPROVED:
+        # An edit is an approval whose application declared a different
+        # approved revision than the proposal; the runtime cannot infer one.
+        revision = _approval_revision(record.event.payload)
         return await _approval_record(
             record,
-            kind=SupervisionEventKind.APPROVE,
+            kind=(
+                SupervisionEventKind.EDIT
+                if revision is not None and revision.edited
+                else SupervisionEventKind.APPROVE
+            ),
             outcome=SupervisionEventOutcome.APPROVED,
             counts=lambda payload: True,
             session=session,
@@ -492,6 +505,8 @@ async def _approval_record(
     tool_call_ids = _distinct(_text(peer.event.payload, "tool_call_id") for peer in peers) or (
         _distinct([_text(payload, "tool_call_id")])
     )
+    approved = kind in {SupervisionEventKind.APPROVE, SupervisionEventKind.EDIT}
+    grant_id, grant_role = _authorization_grant(request, payload if approved else None)
     return await _record(
         record,
         kind=kind,
@@ -507,6 +522,10 @@ async def _approval_record(
         actor=payload.get("resolved_by"),
         reason=None if kind is SupervisionEventKind.EXPIRE else payload.get("reason"),
         requested_at=request.event.timestamp if request is not None else None,
+        attention_state=_APPROVAL_ATTENTION_STATES[kind],
+        approval_revision=_approval_revision(payload) if approved else None,
+        authorization_grant_id=grant_id,
+        authorization_grant_role=grant_role,
         content=(
             SupervisionEventContent(
                 tool_arguments=await _published_arguments(
@@ -578,6 +597,7 @@ async def _resumed_record(
         input_id=input_id,
         actor=payload.get("resolved_by"),
         requested_at=request.event.timestamp if request is not None else None,
+        attention_state="resolved",
         content=(
             SupervisionEventContent(
                 question=question if type(question) is str else None,
@@ -627,6 +647,25 @@ async def _recovery_record(
         return None
     approval_id = _text(payload, "approval_id")
     input_id = _text(payload, "input_id")
+
+    def manual_handoff(event: Event) -> bool:
+        # The same evidence pending-action reads use to open a manual-recovery
+        # request in place of the approval or question that started the round.
+        handoff = event.payload
+        if handoff.get("manual_recovery_required") is not True:
+            return False
+        handoff_call = _text(handoff, "tool_call_id") or _text(
+            _object(handoff, "user_input") or {}, "tool_call_id"
+        )
+        return handoff_call == tool_call_id and _text(handoff, "tool_round_id") == tool_round_id
+
+    manual_request = await evidence.first_after(
+        session.id,
+        (EventType.SESSION_INTERRUPTED,),
+        started.sequence if started is not None else 0,
+        manual_handoff,
+        before=record.sequence,
+    )
     request = None
     if approval_id is not None:
         request = await evidence.latest_before(
@@ -663,6 +702,8 @@ async def _recovery_record(
         actor=payload.get("resolved_by"),
         reason=payload.get("reason"),
         requested_at=request.event.timestamp if request is not None else None,
+        attention_kind=PendingActionKind.MANUAL_RECOVERY if manual_request is not None else None,
+        attention_state=_recovery_attention_state(terminal.event),
     )
 
 
@@ -794,12 +835,27 @@ async def _record(
     fingerprint_payload: dict[str, Any] | None = None,
     reason: object = None,
     requested_at: datetime | None = None,
+    attention_kind: PendingActionKind | None = None,
+    attention_state: SupervisionAttentionState | None = None,
+    approval_revision: ApprovalRevision | None = None,
+    authorization_grant_id: str | None = None,
+    authorization_grant_role: SupervisionGrantRole | None = None,
     content: SupervisionEventContent | None = None,
 ) -> SupervisionEvent:
     anchor = record.event
     step = anchor.payload if step_payload is None else step_payload
     model_step_id = _text(step, "model_step_id")
     model_attempt_id = _text(step, "model_attempt_id")
+    tool_round_id = _text(step, "tool_round_id")
+    attention_id = _attention_id(
+        kind,
+        session,
+        attention_kind=attention_kind,
+        approval_id=approval_id,
+        input_id=input_id,
+        tool_round_id=tool_round_id,
+        tool_call_ids=tool_call_ids,
+    )
     return SupervisionEvent(
         supervision_id=sha256(
             canonical_durable_json_bytes(
@@ -823,7 +879,7 @@ async def _record(
         ),
         model_step_id=model_step_id,
         model_attempt_id=model_attempt_id,
-        tool_round_id=_text(step, "tool_round_id"),
+        tool_round_id=tool_round_id,
         tool_call_ids=tool_call_ids,
         approval_id=approval_id,
         input_id=input_id,
@@ -832,6 +888,11 @@ async def _record(
         message_origin=message_origin,
         actor=_actor(actor),
         reason=reason if type(reason) is str else None,
+        attention_id=attention_id,
+        attention_state=attention_state if attention_id is not None else None,
+        approval_revision=approval_revision,
+        authorization_grant_id=authorization_grant_id,
+        authorization_grant_role=authorization_grant_role,
         requested_at=requested_at,
         resolved_at=anchor.timestamp,
         usage=await _usage(session.id, model_step_id, model_attempt_id, evidence=evidence),
@@ -907,6 +968,109 @@ async def _published_arguments(
         if (call_id := _text(terminal.event.payload, "tool_call_id")) is not None
     }
     return published or None
+
+
+_APPROVAL_ATTENTION_STATES: dict[SupervisionEventKind, SupervisionAttentionState] = {
+    SupervisionEventKind.APPROVE: "resolved",
+    SupervisionEventKind.EDIT: "resolved",
+    SupervisionEventKind.DENY: "cancelled",
+    SupervisionEventKind.EXPIRE: "expired",
+}
+
+
+def _attention_id(
+    kind: SupervisionEventKind,
+    session: Session,
+    *,
+    attention_kind: PendingActionKind | None,
+    approval_id: str | None,
+    input_id: str | None,
+    tool_round_id: str | None,
+    tool_call_ids: tuple[str, ...],
+) -> str | None:
+    """Name the human-attention request a touch settled, as pending-action reads do.
+
+    A recovery settles the manual-recovery request when the runtime handed the
+    call off to one (``attention_kind``), even if an approval or question started
+    the round. Otherwise an approval or its recovery is a tool approval, a
+    question or its recovery is user input, and a round recovery without either
+    is manual recovery. Steering opens no attention request.
+    """
+
+    if kind is SupervisionEventKind.STEER:
+        return None
+    tool_call_id = tool_call_ids[0] if tool_call_ids else None
+    if attention_kind is PendingActionKind.MANUAL_RECOVERY or (
+        kind is SupervisionEventKind.RECOVER and approval_id is None and input_id is None
+    ):
+        if tool_round_id is None or tool_call_id is None:
+            return None
+        attention_kind, discriminator = PendingActionKind.MANUAL_RECOVERY, tool_round_id
+    elif approval_id is not None:
+        attention_kind, discriminator = PendingActionKind.TOOL_APPROVAL, approval_id
+    elif input_id is not None:
+        attention_kind, discriminator = PendingActionKind.USER_INPUT, input_id
+    else:
+        return None
+    return human_attention_id(
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+        kind=attention_kind,
+        discriminator=discriminator,
+        tool_call_id=tool_call_id,
+    )
+
+
+def _recovery_attention_state(terminal: Event) -> SupervisionAttentionState | None:
+    from cayu.runtime.human_attention import manual_recovery_settlement
+
+    try:
+        return manual_recovery_settlement(terminal)
+    except (ValidationError, ValueError, TypeError):
+        return None
+
+
+def _approval_revision(payload: dict[str, Any]) -> ApprovalRevision | None:
+    """Read the declaration the runtime published as its own approval field.
+
+    Bounded audit metadata may drop it, so metadata never decides an edit.
+    """
+
+    value = _object(payload, "approval_revision")
+    if value is None:
+        return None
+    try:
+        return ApprovalRevision.model_validate(value)
+    except ValidationError:
+        return None
+
+
+def _authorization_grant(
+    request: EventRecord | None, resolution: dict[str, Any] | None
+) -> tuple[str | None, SupervisionGrantRole | None]:
+    """Read grant linkage already recorded on the approval.
+
+    A grant-allowed call never pauses, so it is not a touch. A call a grant sent
+    to sampled review carries the grant in its request's policy metadata, and an
+    approval that created a grant carries it in its resolution metadata.
+    """
+
+    created = _object(
+        _object(resolution or {}, "metadata") or {}, TOOL_AUTHORIZATION_GRANT_METADATA_KEY
+    )
+    if created is not None and (grant_id := _text(created, "grant_id")) is not None:
+        return grant_id, SupervisionGrantRole.CREATED
+    approval = _object(request.event.payload, "approval") if request is not None else None
+    sampled = _object(
+        _object(approval or {}, "metadata") or {}, TOOL_AUTHORIZATION_GRANT_METADATA_KEY
+    )
+    if (
+        sampled is not None
+        and sampled.get("decision") == "sampled_review"
+        and (grant_id := _text(sampled, "grant_id")) is not None
+    ):
+        return grant_id, SupervisionGrantRole.SAMPLED_REVIEW
+    return None, None
 
 
 def _actor(value: object) -> ResolutionActor | None:

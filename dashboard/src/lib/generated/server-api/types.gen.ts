@@ -1599,6 +1599,25 @@ export type ApiSupervisionEvent = {
      */
     approval_id?: string | null;
     /**
+     * Application-declared proposed and approved revision digests.
+     */
+    approval_revision?: ApprovalRevision | null;
+    /**
+     * Attention Id
+     *
+     * Human-attention identity of the request this touch settled; the same value pending-action reads report as attention_id. Never resolution authority.
+     */
+    attention_id?: string | null;
+    /**
+     * Attention State
+     */
+    attention_state?: 'resolved' | 'cancelled' | 'expired' | null;
+    /**
+     * Authorization Grant Id
+     */
+    authorization_grant_id?: string | null;
+    authorization_grant_role?: SupervisionGrantRole | null;
+    /**
      * Environment Name
      */
     environment_name?: string | null;
@@ -2355,6 +2374,22 @@ export type ApplicationDefaultsManifest = {
      * Provider
      */
     provider: string | null;
+};
+
+/**
+ * ApprovalRevision
+ *
+ * The proposed and approved versions of one approved call, as digests.
+ */
+export type ApprovalRevision = {
+    /**
+     * Approved Digest
+     */
+    approved_digest: string;
+    /**
+     * Proposed Digest
+     */
+    proposed_digest: string;
 };
 
 /**
@@ -17524,7 +17559,7 @@ export type StructuredRubricV1 = {
  *
  * Closed set of supervision touches the runtime records durably.
  */
-export type SupervisionEventKind = 'approve' | 'deny' | 'expire' | 'answer' | 'recover' | 'interrupt' | 'steer';
+export type SupervisionEventKind = 'approve' | 'edit' | 'deny' | 'expire' | 'answer' | 'recover' | 'interrupt' | 'steer';
 
 /**
  * SupervisionEventOutcome
@@ -17595,6 +17630,13 @@ export type SupervisionEventsResponse = {
      */
     next_cursor: string;
 };
+
+/**
+ * SupervisionGrantRole
+ *
+ * How a tool authorization grant took part in one approval.
+ */
+export type SupervisionGrantRole = 'sampled_review' | 'created';
 
 /**
  * SupervisionMessageOrigin

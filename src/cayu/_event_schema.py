@@ -2400,12 +2400,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.TOOL_CALL_APPROVED] = _policy(
         "approval_id",
+        "approval_revision",
         "execution_profile_fingerprint",
         "reason",
         "resolved_by",
         "tool_call_id",
         "tool_round_id",
-        owned_nested_paths=tool_actor_paths,
+        owned_nested_paths=tool_actor_paths
+        | {("approval_revision", "proposed_digest"), ("approval_revision", "approved_digest")},
         authority_keys={
             "approval_id",
             "execution_profile_fingerprint",

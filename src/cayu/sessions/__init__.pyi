@@ -515,6 +515,7 @@ from cayu.sessions.supervision_events import SupervisionEventQuery as Supervisio
 from cayu.sessions.supervision_events import (
     SupervisionEventResultTooLarge as SupervisionEventResultTooLarge,
 )
+from cayu.sessions.supervision_events import SupervisionGrantRole as SupervisionGrantRole
 from cayu.sessions.supervision_events import SupervisionMessageOrigin as SupervisionMessageOrigin
 from cayu.sessions.supervision_events import (
     decode_supervision_event_cursor as decode_supervision_event_cursor,
@@ -522,6 +523,7 @@ from cayu.sessions.supervision_events import (
 from cayu.sessions.supervision_events import (
     encode_supervision_event_cursor as encode_supervision_event_cursor,
 )
+from cayu.sessions.supervision_events import price_supervision_events as price_supervision_events
 from cayu.sessions.terminal_evidence import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
 )
@@ -865,6 +867,7 @@ __all__ = [
     "SupervisionEventPage",
     "SupervisionEventQuery",
     "SupervisionEventResultTooLarge",
+    "SupervisionGrantRole",
     "SupervisionMessageOrigin",
     "TaskExecutionSource",
     "TaskInvocation",
@@ -891,6 +894,7 @@ __all__ = [
     "encode_supervision_event_cursor",
     "exception_detail",
     "is_runtime_owned_session_metadata_key",
+    "price_supervision_events",
     "project_terminal_child_session_result",
     "replace_session_user_metadata",
     "run_to_completion",

@@ -25,6 +25,7 @@ from tests.runtime.runtime_supervision_support import (
 )
 
 from cayu._event_schema import private_event_linkage_value
+from cayu.approvals import approval_revision_metadata
 from cayu.approvals.tools import ToolApprovalDecision
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
@@ -307,3 +308,46 @@ def test_cursor_with_a_non_ascii_digest_returns_422_without_echo():
 
     assert response.status_code == 422
     assert cursor not in response.text
+
+
+def test_attention_identity_and_declared_edit_cross_http_without_content():
+    store = InMemorySessionStore()
+    app, client = _tenant_server(store)
+    _run_over_http(client, "sess_http_edit", "acme")
+    pending_actions = client.get("/api/pending-actions", headers={"x-tenant": "acme"}).json()
+    (action,) = pending_actions["actions"]
+    pending = pending_approval_reader.pending_approval_from_checkpoint(
+        asyncio.run(store.load_checkpoint("sess_http_edit"))
+    )
+    assert pending is not None
+    asyncio.run(
+        collect_tool_approval_events(
+            app,
+            resolve_approval(
+                "sess_http_edit",
+                pending,
+                ToolApprovalDecision.APPROVE,
+                metadata=approval_revision_metadata(
+                    proposed_digest="a" * 64, approved_digest="b" * 64
+                ),
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/supervision-events/query",
+        headers={"x-tenant": "acme"},
+        json={**_WINDOW, "kinds": ["edit"]},
+    )
+
+    assert response.status_code == 200, response.text
+    (record,) = response.json()["events"]
+    assert record["kind"] == "edit"
+    assert record["attention_id"] == action["attention_id"]
+    assert record["attention_state"] == "resolved"
+    assert record["approval_revision"] == {
+        "proposed_digest": "a" * 64,
+        "approved_digest": "b" * 64,
+    }
+    assert record["authorization_grant_id"] is None
+    assert ARGUMENT_CANARY not in response.text

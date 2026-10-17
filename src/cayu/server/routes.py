@@ -2477,6 +2477,16 @@ def _serialize_supervision_event(
         "execution_profile_fingerprint": event.execution_profile_fingerprint,
         "tool_call_count": len(event.tool_call_ids),
         "message_origin": None if event.message_origin is None else event.message_origin.value,
+        # Notification identity and content-free digests, never resolution authority.
+        "attention_id": event.attention_id,
+        "attention_state": event.attention_state,
+        "approval_revision": (
+            None if event.approval_revision is None else event.approval_revision.model_dump()
+        ),
+        "authorization_grant_id": event.authorization_grant_id,
+        "authorization_grant_role": (
+            None if event.authorization_grant_role is None else event.authorization_grant_role.value
+        ),
         "requested_at": event.requested_at,
         "resolved_at": event.resolved_at,
         "usage": None if event.usage is None else event.usage.model_dump(mode="json"),

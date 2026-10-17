@@ -88,7 +88,7 @@ def test_query_accepts_the_maximum_window():
         {"execution_profile_fingerprint": "a" * 63},
         {"execution_profile_fingerprint": ""},
         {"kinds": ("approve", "approve")},
-        {"kinds": ("edit",)},
+        {"kinds": ("take_over",)},
         {"actor_sources": ("http_auth", "http_auth")},
         {"actor_sources": ("operator",)},
         {"cursor": ""},
@@ -113,6 +113,7 @@ def test_query_accepts_every_kind_and_actor_source_filter():
 
     assert set(query.kinds) == {
         SupervisionEventKind.APPROVE,
+        SupervisionEventKind.EDIT,
         SupervisionEventKind.DENY,
         SupervisionEventKind.EXPIRE,
         SupervisionEventKind.ANSWER,

@@ -53,6 +53,7 @@ from cayu.approvals.review import (
     require_current_review,
     require_review_authority,
 )
+from cayu.approvals.revisions import validate_approval_revision_metadata
 from cayu.approvals.tools import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -398,6 +399,17 @@ def _public_manual_recovery_result(
         },
         is_error=result.is_error,
     )
+
+
+def _approval_revision_field(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Publish a declared approval revision outside the bounded audit metadata.
+
+    The request validated the declaration as digest tokens, so it carries no
+    content and is published whatever the secret scope or metadata size.
+    """
+
+    revision = validate_approval_revision_metadata(metadata)
+    return {} if revision is None else {"approval_revision": revision.model_dump(mode="json")}
 
 
 def _public_resolution_audit_fields(
@@ -5615,6 +5627,7 @@ class RecoveryCoordinator:
                                 metadata=metadata,
                                 redactor=self._secret_redactor,
                             ),
+                            **_approval_revision_field(metadata),
                             "resolved_by": resolved_by_payload,
                         },
                     ),

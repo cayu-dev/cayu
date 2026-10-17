@@ -32,6 +32,7 @@ from cayu.approvals.actors import copy_resolution_actor as copy_resolution_actor
 from cayu.approvals.actors import expiry_resolution_actor as expiry_resolution_actor
 from cayu.approvals.actors import resolution_actor_payload as resolution_actor_payload
 from cayu.approvals.review import HumanReviewReference
+from cayu.approvals.revisions import validate_approval_revision_metadata
 from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
@@ -120,6 +121,17 @@ class ToolApprovalRequest(BaseModel):
     def validate_task_handoff_authority(self) -> ToolApprovalRequest:
         if self.task_handoff_id is not None and self.task_worker_id is None:
             raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_approval_revision(self) -> ToolApprovalRequest:
+        # A declared revision names what was approved, so it must be well formed
+        # and accompany an approval; it never carries the revised content.
+        if (
+            validate_approval_revision_metadata(self.metadata) is not None
+            and self.decision is not ToolApprovalDecision.APPROVE
+        ):
+            raise ValueError("An approval revision requires decision=approve.")
         return self
 
     @field_validator("reason")

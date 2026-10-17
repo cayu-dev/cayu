@@ -16,7 +16,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -31,8 +31,12 @@ from pydantic import (
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.approvals.revisions import ApprovalRevision
 from cayu.budgets.usage import UsageMetrics
 from cayu.sessions.queries import SessionAggregateFilter
+
+if TYPE_CHECKING:
+    from cayu.budgets.pricing import ModelStepCostEstimate, PriceBook
 
 SUPERVISION_EVENT_MAX_WINDOW = timedelta(days=366)
 SUPERVISION_EVENT_DEFAULT_LIMIT = 100
@@ -52,6 +56,7 @@ class SupervisionEventKind(StrEnum):
     """Closed set of supervision touches the runtime records durably."""
 
     APPROVE = "approve"
+    EDIT = "edit"
     DENY = "deny"
     EXPIRE = "expire"
     ANSWER = "answer"
@@ -83,6 +88,18 @@ class SupervisionMessageOrigin(StrEnum):
     SESSION = "session"
     PEER = "peer"
     UNKNOWN = "unknown"
+
+
+# Settled human-attention states a touch can report; the same vocabulary as
+# ``cayu.runtime.human_attention.AttentionState``.
+SupervisionAttentionState = Literal["resolved", "cancelled", "expired"]
+
+
+class SupervisionGrantRole(StrEnum):
+    """How a tool authorization grant took part in one approval."""
+
+    SAMPLED_REVIEW = "sampled_review"
+    CREATED = "created"
 
 
 class SupervisionEventQuery(BaseModel):
@@ -165,7 +182,17 @@ class SupervisionEventContent(BaseModel):
 
 
 class SupervisionEvent(BaseModel):
-    """One settled supervision touch, keyed by a stable runtime identity."""
+    """One settled supervision touch, keyed by a stable runtime identity.
+
+    ``attention_id`` names the human-attention request the touch settled, with
+    the identity pending-action reads and ``get_human_attention_state`` use.
+    ``attention_state`` is that request's settled state when the shared
+    settlement rule decides it, and ``None`` otherwise. ``approval_revision`` is
+    the application's content-free declaration of the approved version.
+    ``authorization_grant_id`` names the tool authorization grant that sent the
+    call to sampled review or that this approval created, per
+    ``authorization_grant_role``.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -193,6 +220,11 @@ class SupervisionEvent(BaseModel):
     message_origin: SupervisionMessageOrigin | None = None
     actor: ResolutionActor | None = None
     reason: StrictStr | None = None
+    attention_id: StrictStr | None = Field(default=None, pattern=r"^attention_[0-9a-f]{64}$")
+    attention_state: SupervisionAttentionState | None = None
+    approval_revision: ApprovalRevision | None = None
+    authorization_grant_id: StrictStr | None = None
+    authorization_grant_role: SupervisionGrantRole | None = None
     requested_at: datetime | None = None
     resolved_at: datetime
     usage: UsageMetrics | None = None
@@ -327,3 +359,30 @@ def decode_supervision_event_cursor(
     if not secrets.compare_digest(decoded["query_sha256"], expected):
         raise SupervisionEventCursorInvalid("Supervision event cursor belongs to another query.")
     return decoded["after_sequence"]
+
+
+def price_supervision_events(
+    page: SupervisionEventPage, pricing: PriceBook
+) -> dict[str, ModelStepCostEstimate]:
+    """Estimate each event's joined model-step usage with an application price book.
+
+    The result is keyed by ``supervision_id``; events without usage are absent.
+    Prices are taken on the request date, since the model step ends just before
+    its request is published, or on the touch date when no request was found.
+    """
+
+    from cayu.budgets.pricing import PriceBook, estimate_model_step_cost
+
+    if type(page) is not SupervisionEventPage:
+        raise TypeError("page must be a SupervisionEventPage.")
+    if type(pricing) is not PriceBook:
+        raise TypeError("pricing must be a PriceBook.")
+    return {
+        event.supervision_id: estimate_model_step_cost(
+            metrics=event.usage,
+            pricing=pricing,
+            effective_on=(event.requested_at or event.resolved_at).astimezone(UTC).date(),
+        )
+        for event in page.events
+        if event.usage is not None
+    }
