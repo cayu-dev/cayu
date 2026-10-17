@@ -17,6 +17,7 @@ from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 from cayu.external_waits import ExternalEventWaits, ExternalWaitContext
 from cayu.providers.base import ModelStreamEvent
+from cayu.releases import RELEASE_ID_ENV, ReleaseIdentity, recorded_release_identity
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
@@ -139,6 +140,8 @@ def test_completed_turn_recovers_to_wait_without_another_provider_dispatch(
 
             restored_store = reopen()
             restored_waits = ExternalEventWaits(store=restored_store, access_policy=Policy())
+            # Recovery runs in a process on the Release a rollout deployed.
+            monkeypatch.setenv(RELEASE_ID_ENV, "release-recovering")
             restored = app_for(restored_store)
             adapter = SessionExternalWaitAdapter(restored, restored_waits)
             prior_session = await restored_store.load(session_id)
@@ -233,6 +236,12 @@ def test_completed_turn_recovers_to_wait_without_another_provider_dispatch(
             receipt = await adapter.recover_to_wait(
                 registered, context=CONTEXT, inactive_for_seconds=0
             )
+            assert {
+                recorded_release_identity(event.payload)
+                for event in await restored_store.load_events(session_id)
+                if event.type == EventType.SESSION_RESUMED
+                and event.payload.get("recovered_external_wait") is True
+            } == {ReleaseIdentity(id="release-recovering")}
             monkeypatch.setattr(_ExternalExecutionToWait, "park", original_park)
             preparation_requests = 1 + int(recovery_case == "policy_continue")
             assert len(provider.requests) == preparation_requests

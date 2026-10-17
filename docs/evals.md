@@ -2764,8 +2764,10 @@ When a project is started with `cayu serve`, Cayu assembles the non-executable
 part of this configuration from project-owned declarations:
 
 - `[project].name` becomes the normalized project identity.
-- `CAYU_RELEASE_ID` selects the application release identity. When it is
-  absent, Cayu uses the bounded public application-manifest fingerprint.
+- The [Release the application records](runtime-contracts.md#release-identity)
+  on its runs, from `CAYU_RELEASE_ID` or `CayuApp(release_identity=...)`, is the
+  application release identity. When neither states one, Cayu uses the bounded
+  public application-manifest fingerprint for Evals only; runs record no Release.
 - `CAYU_DATABASE_URL` or `[tool.cayu.session_store]` selects the durable
   `EvalStore` backend. Trusted loopback `cayu serve --dev` may instead create
   the project-local `data/cayu.db` default.

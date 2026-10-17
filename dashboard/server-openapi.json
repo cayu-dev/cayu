@@ -3357,6 +3357,28 @@
             ],
             "title": "Reason"
           },
+          "release_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Id"
+          },
+          "release_snapshot_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Snapshot Root"
+          },
           "requested_at": {
             "anyOf": [
               {
@@ -34866,6 +34888,19 @@
             "title": "Max Bytes",
             "type": "integer"
           },
+          "release_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Id"
+          },
           "session_filter": {
             "$ref": "#/components/schemas/SessionAggregateFilter"
           },
@@ -47517,7 +47552,7 @@
     },
     "/api/supervision-events/query": {
       "post": {
-        "description": "Page settled approvals, denials, expiries, answers, manual recoveries, operator interrupts and steering messages across sessions, in durable sequence order, for a UTC-normalized half-open resolution-time window. Content is never included. Session identity and step linkage are public aliases. An identity with a verified tenant sees only sessions whose invocation origin carries that tenant; an identity without a tenant reads the configured session store.",
+        "description": "Page settled approvals, denials, expiries, answers, manual recoveries, operator interrupts and steering messages across sessions, in durable sequence order, for a UTC-normalized half-open resolution-time window. Content is never included. Each record names the Release of the work it belongs to, and `release_id` filters by it. Session identity and step linkage are public aliases. An identity with a verified tenant sees only sessions whose invocation origin carries that tenant; an identity without a tenant reads the configured session store.",
         "operationId": "query_supervision_events_api_supervision_events_query_post",
         "requestBody": {
           "content": {

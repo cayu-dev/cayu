@@ -23,6 +23,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
+from cayu.releases import RELEASE_ID_ENV, ReleaseIdentity, recorded_release_identity
 from cayu.runtime import _incomplete_session_recovery as incomplete_recovery_module
 from cayu.runtime._invocation_lifecycle import (
     PreparedInvocationBinding,
@@ -437,6 +438,7 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
             )
         )
         try:
+            monkeypatch.setenv(RELEASE_ID_ENV, "release-before")
             app, request, execution = await _configured_public_initial_admission(
                 prefix="entry-crash", sessions=sessions, tasks=tasks, redactor=SecretRedactor()
             )
@@ -466,6 +468,8 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
                 async for _ in app._execute_work_attempt(run_request):
                     pytest.fail("Uncertain setup must not permit same-generation redispatch.")
             now[0] = entered.claim.lease_expires_at + timedelta(seconds=1)
+            # The replacement worker runs on the Release a rollout deployed.
+            monkeypatch.setenv(RELEASE_ID_ENV, "release-after")
             replacement = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
             provider = _RecordingProvider()
             replacement.register_provider(provider, default=True)
@@ -530,6 +534,11 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
             ):
                 pass
             assert len(provider.requests) == 1
+            assert [
+                recorded_release_identity(event.payload)
+                for event in await sessions.load_events(admission.session_id)
+                if event.type == EventType.MODEL_STARTED
+            ] == [ReleaseIdentity(id="release-after")]
             assert (await sessions.load(admission.session_id)).status is SessionStatus.COMPLETED
             assert (await tasks.load_task(admission.task_id)).status is TaskStatus.RUNNING
         finally:

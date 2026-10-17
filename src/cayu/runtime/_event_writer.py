@@ -23,6 +23,7 @@ from cayu.observability.events import (
     _EventSinkDelivery,
 )
 from cayu.observability.timing import RuntimeTimingConfig, RuntimeTimingSink
+from cayu.releases import ReleaseIdentity
 from cayu.runtime._event_projection import (
     prepare_budget_settlement_event_template,
     prepare_new_runtime_event,
@@ -96,6 +97,7 @@ class RuntimeEventWriter:
         | None = None,
         runtime_timing: RuntimeTimingConfig | None = None,
         timing_sinks: Iterable[RuntimeTimingSink] = (),
+        release_identity: ReleaseIdentity | None = None,
     ) -> None:
         if secret_redactor is not None and not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("secret_redactor must be a SecretRedactor.")
@@ -120,6 +122,7 @@ class RuntimeEventWriter:
         self._public_authority_alias_codec = store_alias_codec
         self._prepared_event_owner = object()
         self._continue_foreground_parent = continue_foreground_parent
+        self._release_identity = release_identity
         self.timing = RuntimeTimingRecorder(
             config=runtime_timing,
             sinks=(
@@ -145,6 +148,12 @@ class RuntimeEventWriter:
                 "A secret-redacting RuntimeEventWriter requires a durable indexed "
                 "public-authority alias store and codec before publication."
             )
+
+    @property
+    def release_identity(self) -> ReleaseIdentity | None:
+        """The Release this process records on the events that begin its work."""
+
+        return self._release_identity
 
     async def emit(self, event: Event) -> Event:
         prepared = self._prepare_for_append(event)

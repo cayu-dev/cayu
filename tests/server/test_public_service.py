@@ -46,6 +46,7 @@ from cayu.project_control_plane import (
     _create_project_control_plane_context,
 )
 from cayu.providers import ModelStreamEvent
+from cayu.releases import RELEASE_ID_ENV
 from cayu.runtime import ExecutionProfilePolicy
 from cayu.server import (
     AuthenticatedAccess,
@@ -2413,12 +2414,14 @@ def test_public_service_keeps_operator_control_plane_separate_and_authenticated(
     assert service.manifest.host_routing == "maintained"
 
 
-def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_path) -> None:
+def test_maintained_service_uses_the_same_generated_eval_target_registry(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv(RELEASE_ID_ENV, "release-current")
     eval_store = SQLiteEvalStore(tmp_path / "service.db")
     context = _create_project_control_plane_context(
         project_root=tmp_path.resolve(),
         project_id="maintained-service",
-        configured_release_id="release-current",
         eval_store=eval_store,
         store_backend="sqlite",
         store_source="project",

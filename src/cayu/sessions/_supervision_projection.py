@@ -29,6 +29,7 @@ from cayu.approvals.revisions import ApprovalRevision
 from cayu.budgets.usage import UsageMetrics
 from cayu.events import Event, EventType
 from cayu.execution_profiles import ExecutionProfileDecisionKind
+from cayu.releases import ReleaseIdentity, recorded_release_identity
 from cayu.sessions import _access_rules as session_access_rules
 from cayu.sessions import queries as session_query_rules
 from cayu.sessions._execution_profile_checkpoint import (
@@ -76,6 +77,12 @@ _ADMITTED_PROFILE_DECISIONS = frozenset(
     }
 )
 _TOOL_TERMINAL_TYPES = (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED)
+# The events that begin a process's work on a session, and so record its Release.
+_RELEASE_MARKER_TYPES = (
+    EventType.SESSION_STARTED,
+    EventType.SESSION_RESUMED,
+    EventType.MODEL_STARTED,
+)
 _MESSAGE_OUTCOMES = {
     EventType.SESSION_MESSAGE_DELIVERED: SupervisionEventOutcome.DELIVERED,
     EventType.SESSION_MESSAGE_WITHDRAWN: SupervisionEventOutcome.WITHDRAWN,
@@ -159,6 +166,20 @@ class _SessionEvidence:
             async for record in self._scan(session_id, event_types, after=after)
             if predicate(record.event)
         ]
+
+    async def nearest_before(
+        self, session_id: str, event_types: tuple[EventType, ...], before: int
+    ) -> EventRecord | None:
+        records = await self._page(
+            EventQuery(
+                session_id=session_id,
+                event_types=event_types,
+                before_sequence=before,
+                limit=1,
+                order_by=EventOrder.SEQUENCE_DESC,
+            )
+        )
+        return records[0] if records else None
 
     async def model_completions(self, session_id: str, model_step_id: str) -> list[EventRecord]:
         return await self._page(
@@ -388,6 +409,8 @@ def _selected(
         and event.execution_profile_fingerprint != query.execution_profile_fingerprint
     ):
         return False
+    if query.release_id is not None and event.release_id != query.release_id:
+        return False
     if query.actor_sources:
         return event.actor is not None and event.actor.source in query.actor_sources
     return True
@@ -522,6 +545,7 @@ async def _approval_record(
         actor=payload.get("resolved_by"),
         reason=None if kind is SupervisionEventKind.EXPIRE else payload.get("reason"),
         requested_at=request.event.timestamp if request is not None else None,
+        release_position=request.sequence if request is not None else None,
         attention_state=_APPROVAL_ATTENTION_STATES[kind],
         approval_revision=_approval_revision(payload) if approved else None,
         authorization_grant_id=grant_id,
@@ -597,6 +621,7 @@ async def _resumed_record(
         input_id=input_id,
         actor=payload.get("resolved_by"),
         requested_at=request.event.timestamp if request is not None else None,
+        release_position=request.sequence if request is not None else None,
         attention_state="resolved",
         content=(
             SupervisionEventContent(
@@ -702,6 +727,9 @@ async def _recovery_record(
         actor=payload.get("resolved_by"),
         reason=payload.get("reason"),
         requested_at=request.event.timestamp if request is not None else None,
+        release_position=next(
+            (origin.sequence for origin in (request, started) if origin is not None), None
+        ),
         attention_kind=PendingActionKind.MANUAL_RECOVERY if manual_request is not None else None,
         attention_state=_recovery_attention_state(terminal.event),
     )
@@ -761,6 +789,7 @@ async def _interrupt_record(
         step_payload=closed,
         actor=payload.get("requested_by"),
         reason=payload.get("reason"),
+        release_position=record.sequence,
     )
 
 
@@ -811,6 +840,7 @@ async def _steer_record(
         step_payload={},
         actor=queued_payload.get("actor"),
         requested_at=queued.event.timestamp if queued is not None else None,
+        release_position=record.sequence,
     )
 
 
@@ -824,6 +854,7 @@ async def _record(
     evidence: _SessionEvidence,
     identity: tuple[str, ...],
     actor: object,
+    release_position: int | None,
     tool_name: str | None = None,
     tool_call_ids: tuple[str, ...] = (),
     approval_id: str | None = None,
@@ -856,6 +887,13 @@ async def _record(
         tool_round_id=tool_round_id,
         tool_call_ids=tool_call_ids,
     )
+    # A settled request belongs to the invocation that proposed it, so callers pass
+    # the request's position; interrupts and steering pass their own.
+    release = (
+        None
+        if release_position is None
+        else await _in_force_release(session.id, release_position, evidence=evidence)
+    )
     return SupervisionEvent(
         supervision_id=sha256(
             canonical_durable_json_bytes(
@@ -877,6 +915,8 @@ async def _record(
             session=session,
             evidence=evidence,
         ),
+        release_id=None if release is None else release.id,
+        release_snapshot_root=None if release is None else release.snapshot_root,
         model_step_id=model_step_id,
         model_attempt_id=model_attempt_id,
         tool_round_id=tool_round_id,
@@ -926,6 +966,15 @@ async def _in_force_fingerprint(
         return execution_profile_baseline_from_session_metadata(session.metadata).fingerprint
     except (TypeError, ValueError, ValidationError):
         return None
+
+
+async def _in_force_release(
+    session_id: str, position: int, *, evidence: _SessionEvidence
+) -> ReleaseIdentity | None:
+    """Return the Release recorded by the last event before ``position`` that begins work."""
+
+    marker = await evidence.nearest_before(session_id, _RELEASE_MARKER_TYPES, position)
+    return None if marker is None else recorded_release_identity(marker.event.payload)
 
 
 async def _usage(

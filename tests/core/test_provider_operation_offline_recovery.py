@@ -73,6 +73,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.releases import RELEASE_ID_ENV, ReleaseIdentity, recorded_release_identity
 from cayu.runtime import _provider_disposition_recovery as provider_disposition_module
 from cayu.runtime import _provider_operation_cancellation_owner as cancellation_owner
 from cayu.runtime import _session_engine as session_engine_module
@@ -3814,13 +3815,16 @@ def test_sqlite_fallback_pre_dispatch_failure_remains_recoverable_after_restart(
     asyncio.run(scenario())
 
 
-def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_new_attempt() -> None:
+def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_new_attempt(
+    monkeypatch,
+) -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
         session_id = "offline-fallback-resolution"
         provider = _OfflineOperationProvider(ProviderOperationStatus.EXPIRED)
         tool = _RecordingLookupTool()
         exposure_policy = _RecomputedEmptyExposurePolicy()
+        monkeypatch.setenv(RELEASE_ID_ENV, "release-recovering")
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(
@@ -3905,6 +3909,10 @@ def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_ne
         assert [event.payload["step"] for event in model_started] == [2, 2]
         assert (
             model_started[0].payload["model_step_id"] == model_started[1].payload["model_step_id"]
+        )
+        # The fallback attempt records the Release of the process that dispatched it.
+        assert recorded_release_identity(model_started[1].payload) == ReleaseIdentity(
+            id="release-recovering"
         )
         assert (
             sum(event.type is EventType.PROVIDER_OPERATION_RESOLVED for event in stored_events) == 1

@@ -53,7 +53,6 @@ def captured_route_server(tmp_path):
             context = _create_project_control_plane_context(
                 project_root=Path(__file__).resolve().parents[2],
                 project_id="captured-route-contract",
-                configured_release_id="release-current",
                 eval_store=store,
                 store_backend="sqlite" if store is not None else None,
                 store_source="project" if store is not None else None,
@@ -538,7 +537,6 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
     context = _create_project_control_plane_context(
         project_root=Path(__file__).resolve().parents[2],
         project_id="captured-workflow",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",
@@ -859,7 +857,6 @@ def test_captured_preview_remains_usable_when_scenario_source_was_redacted(tmp_p
     context = _create_project_control_plane_context(
         project_root=Path(__file__).resolve().parents[2],
         project_id="captured-redacted-scenario",
-        configured_release_id="release-current",
         eval_store=SQLiteEvalStore(tmp_path / "cayu.db"),
         store_backend="sqlite",
         store_source="project",
@@ -903,7 +900,6 @@ def test_baseline_rejects_an_authenticated_actor_that_cannot_be_published(tmp_pa
     context = _create_project_control_plane_context(
         project_root=Path(__file__).resolve().parents[2],
         project_id="captured-actor-boundary",
-        configured_release_id="release-current",
         eval_store=SQLiteEvalStore(tmp_path / "cayu.db"),
         store_backend="sqlite",
         store_source="project",
@@ -963,7 +959,6 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
     context = _create_project_control_plane_context(
         project_root=Path(__file__).resolve().parents[2],
         project_id="fresh-captured-workflow",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",
@@ -1175,7 +1170,6 @@ def test_fresh_launch_rejects_incompatible_cost_budget_before_writing(
     context = _create_project_control_plane_context(
         project_root=Path(__file__).resolve().parents[2],
         project_id="fresh-cost-preflight",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",

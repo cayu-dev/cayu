@@ -390,7 +390,8 @@ Before application or service assembly, project serving creates one opaque
 durable `EvalStore`; applications may pass it through the maintained service
 factory seam but cannot construct it, replace its fields, inspect its storage
 location or connection, or use it as general application state. Resolution
-binds normalized `[project].name`, `CAYU_RELEASE_ID` or the public manifest
+binds normalized `[project].name`, the app's
+[release identity](#release-identity) or the public manifest
 fingerprint, and the selected project store to the exact `CayuApp`, then checks
 all public identity through the application's workload-secret redaction
 boundary. Construction or redaction failure occurs before the server starts,
@@ -2290,6 +2291,18 @@ call's terminal event; content withheld at publication stays withheld.
 `execution_profile_fingerprint` is the profile bound to the anchor, from the
 anchor itself, else the latest admitted `session.execution_profile.decided`
 before it, else the session's immutable baseline; filtering by it is exact.
+`release_id` and `release_snapshot_root` are the [Release](#release-identity)
+in force for the work a touch belongs to, consistent with its step linkage,
+usage and profile. An approval, edit, denial, expiry, answer or manual recovery
+belongs to the invocation that proposed the call, so it uses the Release in
+force at the request it settles (for a recovery without an approval or
+question, the call's start), even when a process on a later Release resolved
+it; when that lookup finds nothing within its bound, both fields are null. An
+interrupt or steering message belongs to the work in force at its anchor. Both
+fields are null when that work recorded no Release. Filtering by `release_id`
+is exact and applied after classification, like the other record filters, so a
+rarely seen Release can return empty pages with `has_more` true; continue with
+`next_cursor`.
 `exclude_forked_sessions` drops sessions whose origin is `session.forked`;
 subagent children remain included and every record carries
 `parent_session_id`. A non-empty `actor_sources` filter drops records without a
@@ -4328,6 +4341,65 @@ Every considered boundary records a typed decision: `exact_reuse`, `compatible_r
 For an accepted boundary, the decision event, optional expected-profile advance, optional model switch, status/run-epoch transition, checkpoint claim, interaction start, and resume input are one store transaction in that order. Thus no provider, tool, verifier, policy hook after admission, or other governed effect can start before durable decision evidence. The immutable `baseline` never changes; only `adopted` advances `expected`. Concurrent attempts serialize on the store's session row/lock. Explicit idempotency keys derive a stable event identity and bind it to a canonical fingerprint of the complete copied `ResumeRequest`, including messages, actor authorization claims, target, semantic metadata, run controls, structured-output and thinking settings, and ordered request loop-policy identity. Positively runtime-attested `traceparent` and `tracestate` values added by the HTTP transport are carried in a separate per-attempt tracing channel: they remain available to the emitted resume event but are not exposed through request metadata to policies, hooks, tools, providers, or other governed behavior, so tracing a retry does not change its semantic identity. Identical raw SDK metadata remains untrusted, governed input and is bound by the fingerprint. A request loop policy used with explicit adoption must expose a stable, versioned, non-secret `adoption_replay_identity` that changes whenever behavior-affecting configuration changes; policies without that identity fail the combination closed before profile policy or governed work. Exact replay returns the first decision without rerunning policy or governed work; changing any bound request material under the same key fails closed. The fingerprint is internal durable runtime-generated evidence, contains no raw request content, and is omitted from public event projection so rejected private request material cannot be tested through a published unkeyed digest. Decisions without caller keys are scoped to the run epoch, profile pair, and versioned policy identity, so a later policy version can supersede a prior default rejection without overwriting its evidence while conflicting answers from one unchanged policy identity fail closed. Another process loads the advanced expectation from durable session metadata. Queued dispatch profile binding and adoption are separate contracts. A resumed session continues to use its already-durable system projection, so changing the live `AgentSpec.system_prompt` or workspace source alone does not claim that either was re-injected.
 
 Custom `SessionStore` implementations must opt into `supports_execution_profile_admission`, repeat the complete decision/profile comparison inside `admit_execution_profile_resume(...)`'s status/checkpoint transaction, append accepted decision evidence before other admission events, and implement `reject_execution_profile_resume(...)` as an atomic conditional event append. Active invocation authority additionally requires the complete lifecycle-command contract described above: the concrete store class must explicitly declare `invocation_lifecycle_command_version = 1`, and every create/admit/rebind/reject/settle/release primitive must preserve the command's complete compare-and-swap and receipt semantics. The older `supports_active_invocation_execution_profiles` declaration or an inherited built-in implementation is not sufficient proof; incomplete or inherited custom capability fails closed before any adapter method is called. In-memory, SQLite, and Postgres stores share conformance coverage for baseline creation, exact admission, changed-profile rejection, active continuation and rejection, accepted adoption, immutable baseline/advanced expectation, atomic event ordering, rollback, acknowledgement loss, restart, and replay. Historical behavior-version identity, contracted verifier-attempt carriage, and complete fork lineage rules are separate contracts. Every runtime operation that executes or derives a durable session—including resume, recovery, explicit compaction, and fork—requires complete execution-profile and tool-capability-ceiling authority. Cayu never reconstructs missing authority from the current agent registration; an incomplete record fails closed before admission or descendant creation.
+
+### Release identity
+
+A host that deploys an application can state which Release each process runs.
+The host assigns the Release after the build, so it normally states it in the
+environment: `CayuApp` reads `CAYU_RELEASE_ID` and, optionally,
+`CAYU_RELEASE_SNAPSHOT_ROOT` when it is constructed. A host that constructs the
+application itself can instead pass
+`CayuApp(release_identity=ReleaseIdentity(id=..., snapshot_root=...))` from
+`cayu.releases`. The environment is validated whenever it is set. When both
+state a Release they must be equal, id and snapshot root alike; a different
+configured value fails application construction rather than replacing the
+environment's statement. A host that runs several applications for different
+Releases in one process must therefore pass each Release explicitly and leave
+both variables unset. When neither states a Release, as in local runs, the
+process records none. The Release id is nonblank text of at most 256
+characters, without surrounding whitespace or control characters; the snapshot
+root is the lowercase SHA-256 root of the `AgentSnapshot` the Release was built
+from. A snapshot root without a Release id, an invalid value, a conflict, or a
+value that matches a configured workload secret fails application
+construction, and the error never echoes the value. `CayuApp.release_identity`
+returns the resolved Release.
+
+The Release is a label the host states. Cayu records it and never acts on it:
+it is not part of the execution profile, is not compared at admission, and does
+not select providers, tools, or policies, so processes that differ only in
+Release admit the same sessions.
+
+A process records its Release, as `release` with `id` and `snapshot_root`, on
+each event that begins its work on a session: `session.started` for a new
+session, `session.resumed` for each later invocation (including approval and
+user-input resolutions and manual recoveries), and `model.started` for every
+model attempt it dispatches. Model attempts cover the work that begins without
+a start event: work attempts, recovery continuations after a restart, provider
+operation fallback, foreground child continuations, and context compaction. A
+session that resumes or is recovered on a newer Release after a rollout
+therefore records the Release of the process that did each part of its work.
+The Release in force for any session event is the one recorded on the nearest
+of these events before it, or none when that event recorded none. Session event
+reads through the store and `GET /api/sessions/{session_id}/events` return the
+recorded `release`.
+
+An invocation records its Release only once it reaches its start event, which
+follows setup: a new run or a resume emits `session.started` or
+`session.resumed` after its environment is created and bound, and an approval
+or user-input resolution reconnects its environment before its
+`session.resumed`. An invocation that fails during that setup therefore records
+no Release of its own. Its failure is attributed to the Release in force before
+it, and a new session that fails there records none. `interaction.started`,
+which precedes setup, does not carry the Release: it is part of the admission
+that processes on different Releases must agree on, and earlier Cayu releases
+read it strictly.
+
+Supervision events report the Release of the work a touch belongs to, as
+described under [SessionStore](#sessionstore), and
+`SupervisionEventQuery.release_id` filters by it. `cayu serve` uses the same
+Release id as the Evals application release identity and falls back to the
+public manifest fingerprint for Evals only; that fallback is never recorded as
+a Release.
 
 ### Predicting profile admission before a release
 

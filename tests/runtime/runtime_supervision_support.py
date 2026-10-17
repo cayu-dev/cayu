@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from tests.runtime.runtime_provider_support import FakeProvider
+from tests.runtime.runtime_provider_support import FakeProvider, VersionedFakeProvider
 from tests.runtime.runtime_session_support import (
     _pending_tool_approval_from_public_event,
     collect_events,
+    collect_tool_approval_events,
 )
 from tests.runtime.runtime_tool_support import RequireApprovalPolicy, SideEffectTool
 
@@ -17,7 +18,10 @@ from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
+from cayu.releases import ReleaseIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import SupervisionEventPage, SupervisionEventQuery
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.requests import RunRequest
 
@@ -120,3 +124,74 @@ def resolve_approval(
         decision=decision,
         **changes,
     )
+
+
+class VersionedApprovalPolicy(RequireApprovalPolicy):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:supervision:require-approval",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
+def rollout_provider() -> VersionedFakeProvider:
+    """Script one session that asks for approval three times, then finishes."""
+
+    return VersionedFakeProvider(
+        [
+            *(
+                [
+                    ModelStreamEvent.tool_call(id=call_id, name="side_effect", arguments={}),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+                for call_id in ("call_1", "call_2", "call_3")
+            ),
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+
+
+def release_app(store, provider: VersionedFakeProvider, release: ReleaseIdentity | None) -> CayuApp:
+    """One process of a rollout: the same agent, stated as running ``release``."""
+
+    app = CayuApp(session_store=store, release_identity=release)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=VersionedApprovalPolicy(),
+    )
+    return app
+
+
+async def approve_pending(app: CayuApp, store, session_id: str) -> None:
+    pending = pending_approval_reader.pending_approval_from_checkpoint(
+        await store.load_checkpoint(session_id)
+    )
+    assert pending is not None
+    await collect_tool_approval_events(
+        app, resolve_approval(session_id, pending, ToolApprovalDecision.APPROVE)
+    )
+
+
+async def run_across_releases(
+    store, session_id: str, first: ReleaseIdentity, second: ReleaseIdentity
+) -> None:
+    """Run a session across a rollout from ``first`` to ``second``.
+
+    ``first`` proposes ``call_1`` and, after approving it, ``call_2``. After the
+    rollout, ``second`` approves ``call_2``, proposes ``call_3`` and approves it.
+    """
+
+    provider = rollout_provider()
+    before = release_app(store, provider, first)
+    await pause_for_approval(before, store, session_id)
+    await approve_pending(before, store, session_id)
+    after = release_app(store, provider, second)
+    await approve_pending(after, store, session_id)
+    await approve_pending(after, store, session_id)

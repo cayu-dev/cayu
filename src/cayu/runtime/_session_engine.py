@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from cayu.releases import release_event_fields
 from cayu.resource_access import ResourceAccessPolicy, ResourceSessionStream, restore_session_stream
 from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime import (
@@ -2276,6 +2277,7 @@ class SessionEngine:
                             }
                         ),
                         **_session_trace_event_fields(session, request.metadata),
+                        **release_event_fields(self._event_writer.release_identity),
                     },
                 )
                 lineage_fields = (
@@ -6784,6 +6786,7 @@ class SessionEngine:
                         **_session_trace_event_fields(
                             outcome_state.session, request_trace_metadata
                         ),
+                        **release_event_fields(self._event_writer.release_identity),
                     },
                 )
                 lineage_fields = tuple(

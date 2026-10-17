@@ -1665,6 +1665,14 @@ export type ApiSupervisionEvent = {
      */
     reason?: string | null;
     /**
+     * Release Id
+     */
+    release_id?: string | null;
+    /**
+     * Release Snapshot Root
+     */
+    release_snapshot_root?: string | null;
+    /**
      * Requested At
      */
     requested_at?: string | null;
@@ -17628,6 +17636,10 @@ export type SupervisionEventsRequest = {
      * Max Bytes
      */
     max_bytes?: number;
+    /**
+     * Release Id
+     */
+    release_id?: string | null;
     session_filter?: SessionAggregateFilter;
     /**
      * Start At

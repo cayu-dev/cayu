@@ -16,6 +16,7 @@ from cayu.artifacts.local import LocalArtifactStore
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
+from cayu.releases import RELEASE_ID_ENV, recorded_release_identity
 from cayu.runtime._tool_effect_state import ToolEffectRecord
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import (
@@ -32,7 +33,7 @@ from cayu.tools.base import Tool, ToolEffect, ToolSpec
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("image_only", [False, True])
 def test_partial_round_receipt_selection_does_not_replay_siblings(
-    backend, reverse, image_only, tmp_path
+    backend, reverse, image_only, tmp_path, monkeypatch
 ):
     artifacts = []
 
@@ -145,6 +146,7 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(
             return result
 
         try:
+            monkeypatch.setenv(RELEASE_ID_ENV, "release-before")
             app = build_app()
             if image_only:
                 part = await app.attach_file(
@@ -167,6 +169,8 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(
             assert {record.state for record in original.values()} == {"outcome_unknown"}
             order = sorted(original, reverse=reverse)
             requests = []
+            # Reconciliation runs in processes on the Release a rollout deployed.
+            monkeypatch.setenv(RELEASE_ID_ENV, "release-after")
             for index, call_id in enumerate(order):
                 app = build_app()
                 current = (await records())[call_id]
@@ -217,6 +221,11 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(
             assert lookups == order
             assert len(calls) == 2
             assert len(provider.requests) == 2
+            assert [
+                recorded_release_identity(event.payload).id
+                for event in before_events
+                if event.type.value == "model.started"
+            ] == ["release-before", "release-after"]
             terminals = [
                 event for event in before_events if event.type.value == "tool.call.completed"
             ]

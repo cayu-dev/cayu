@@ -29,6 +29,7 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.releases import ReleaseIdentity, release_event_fields
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_results as tool_results
@@ -544,6 +545,7 @@ def resumed_event(
     environment_name: str | None,
     approval: PendingToolApproval,
     decision: ToolApprovalDecision,
+    release_identity: ReleaseIdentity | None,
     resolved_by: ResolutionActor | None = None,
     expired: bool = False,
 ) -> Event:
@@ -567,6 +569,7 @@ def resumed_event(
             ),
             "resolved_by": resolution_actor_payload(resolved_by),
             "expired": expired,
+            **release_event_fields(release_identity),
         },
     )
     return event_with_runtime_payload_authority(

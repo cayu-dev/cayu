@@ -12,8 +12,15 @@ import asyncio
 import base64
 import json
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from tests.core.session_store_conformance.support import (
+    _close_store,
+    _open_store,
+    conformance_postgres_dsn,
+    session_store_case,
+)
 from tests.runtime.runtime_session_support import collect_tool_approval_events
 from tests.runtime.runtime_supervision_support import (
     ARGUMENT_CANARY,
@@ -22,13 +29,16 @@ from tests.runtime.runtime_supervision_support import (
     approval_app,
     pause_for_approval,
     resolve_approval,
+    run_across_releases,
 )
 
 from cayu._event_schema import private_event_linkage_value
+from cayu.applications import CayuApp
 from cayu.approvals import approval_revision_metadata
 from cayu.approvals.tools import ToolApprovalDecision
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
+from cayu.releases import RELEASE_EVENT_PAYLOAD_KEY, ReleaseIdentity
 from cayu.resource_access import ResourceAccessPolicy
 from cayu.runtime._event_projection import public_event_id, public_event_linkage_id
 from cayu.server import ServerConfig, create_server
@@ -39,7 +49,16 @@ from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, S
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 
+__all__ = ["conformance_postgres_dsn", "session_store_case"]
+
 _WINDOW = {"start_at": WINDOW_START.isoformat(), "end_at": WINDOW_END.isoformat()}
+# A cursor at sequence 41 that the Cayu release before the Release filter issued
+# for this fixed window, which holds no touches.
+_EARLIER_RELEASE_WINDOW = {"start_at": "2026-10-01T00:00:00Z", "end_at": "2026-10-08T00:00:00Z"}
+_EARLIER_RELEASE_CURSOR = (
+    "eyJhZnRlcl9zZXF1ZW5jZSI6NDEsInF1ZXJ5X3NoYTI1NiI6ImQ1NmZiNTlmZDI3NzdlN2M5YTY1MmYwY2Q3OWNl"
+    "OWFmYzQzNTllNWZjZWU5NWJlNjJkM2M5Mzg3ZGRlNTkwODIiLCJ2ZXJzaW9uIjoxfQ=="
+)
 
 
 def _authenticate(request: Request) -> AuthContext:
@@ -175,6 +194,27 @@ def test_cursor_from_another_query_is_rejected_without_echo():
 
     assert response.status_code == 422
     assert first["next_cursor"] not in response.text
+
+
+def test_cursor_issued_before_the_release_filter_keeps_paging():
+    store = InMemorySessionStore()
+    _app, client = _tenant_server(store)
+
+    def resume(**changes) -> httpx.Response:
+        return client.post(
+            "/api/supervision-events/query",
+            json={**_EARLIER_RELEASE_WINDOW, **changes, "cursor": _EARLIER_RELEASE_CURSOR},
+        )
+
+    resumed, filtered = resume(), resume(release_id="release-1")
+
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json() == {
+        "events": [],
+        "next_cursor": _EARLIER_RELEASE_CURSOR,
+        "has_more": False,
+    }
+    assert filtered.status_code == 422
 
 
 def test_content_cannot_be_requested_over_http():
@@ -351,3 +391,66 @@ def test_attention_identity_and_declared_edit_cross_http_without_content():
     }
     assert record["authorization_grant_id"] is None
     assert ARGUMENT_CANARY not in response.text
+
+
+def test_every_store_filters_touches_and_reads_events_by_release_over_http(session_store_case):
+    first = ReleaseIdentity(id="release-1")
+    second = ReleaseIdentity(id="release-2", snapshot_root="cd" * 32)
+
+    async def run():
+        store = await _open_store(session_store_case)
+        try:
+            await run_across_releases(store, "sess_http_release", first, second)
+            app = CayuApp(session_store=store)
+            transport = httpx.ASGITransport(
+                app=create_server(app, config=ServerConfig.protected(_authenticate))
+            )
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+
+                async def touches(release_id: str) -> httpx.Response:
+                    return await client.post(
+                        "/api/supervision-events/query", json={**_WINDOW, "release_id": release_id}
+                    )
+
+                session_id = app.project_session_id_for_exposure("sess_http_release")
+                return (
+                    await touches("release-1"),
+                    await touches("release-2"),
+                    await touches("other"),
+                    [await touches(value) for value in (" padded ", "a\nb", "a\u0000b")],
+                    await client.get(f"/api/sessions/{session_id}/events"),
+                )
+        finally:
+            await _close_store(store)
+
+    before, after, unknown, invalid, events = asyncio.run(run())
+
+    def releases(response: httpx.Response) -> list[tuple[str, str | None, str | None]]:
+        assert response.status_code == 200, response.text
+        return [
+            (touch["kind"], touch["release_id"], touch["release_snapshot_root"])
+            for touch in response.json()["events"]
+        ]
+
+    assert releases(before) == [("approve", "release-1", None), ("approve", "release-1", None)]
+    assert releases(after) == [("approve", "release-2", second.snapshot_root)]
+    assert releases(unknown) == []
+    assert [response.status_code for response in invalid] == [422, 422, 422]
+    assert events.status_code == 200, events.text
+    assert [
+        (event["type"], event["payload"][RELEASE_EVENT_PAYLOAD_KEY])
+        for event in events.json()["events"]
+        if event["type"] in {"session.started", "session.resumed"}
+    ] == [
+        ("session.started", first.model_dump(mode="json")),
+        ("session.resumed", first.model_dump(mode="json")),
+        ("session.resumed", second.model_dump(mode="json")),
+        ("session.resumed", second.model_dump(mode="json")),
+    ]
+    assert [
+        event["payload"][RELEASE_EVENT_PAYLOAD_KEY]["id"]
+        for event in events.json()["events"]
+        if event["type"] == "model.started"
+    ] == ["release-1", "release-1", "release-2", "release-2"]

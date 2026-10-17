@@ -230,7 +230,8 @@ through your own proxy or transport.
 
 The command also assembles project identity, release identity, and durable
 Evals storage before it constructs the server. It reads `[project].name`,
-`CAYU_RELEASE_ID`, and the same `CAYU_DATABASE_URL` or
+the application's [release identity](runtime-contracts.md#release-identity)
+(usually `CAYU_RELEASE_ID`), and the same `CAYU_DATABASE_URL` or
 `[tool.cayu.session_store]` declaration used by session tooling. Development
 may create the project-local `data/cayu.db` default; production without an
 explicit or already-discovered durable store keeps Evals storage gated rather

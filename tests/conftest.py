@@ -16,7 +16,15 @@ from scripts.ci_shard_plan import (
     store_slot,
 )
 
+from cayu.releases import RELEASE_ID_ENV, RELEASE_SNAPSHOT_ROOT_ENV
 from tests.sqlite_resources import SQLiteResourceScope
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a Release stated by the surrounding environment out of every test."""
+    monkeypatch.delenv(RELEASE_ID_ENV, raising=False)
+    monkeypatch.delenv(RELEASE_SNAPSHOT_ROOT_ENV, raising=False)
 
 
 @pytest.fixture

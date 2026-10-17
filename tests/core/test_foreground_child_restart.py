@@ -22,6 +22,7 @@ from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
+from cayu.releases import RELEASE_ID_ENV, recorded_release_identity
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
@@ -681,7 +682,10 @@ async def _worker(path: str, action: str, phase: str) -> None:
         )
         == 1
     )
-    assert [event.payload["step"] for event in events if event.type == "model.started"] == [1, 2]
+    started = [event for event in events if event.type == "model.started"]
+    assert [event.payload["step"] for event in started] == [1, 2]
+    # The continuation's step records the Release of the process that recovered it.
+    assert recorded_release_identity(started[-1].payload) == app.release_identity
     from cayu.runtime.execution_profiles import (
         active_invocation_execution_profile_from_checkpoint,
         active_invocation_execution_profile_is_released,
@@ -809,6 +813,7 @@ def test_foreground_wait_survives_process_kill_and_public_child_resolution(
     environment = {
         **os.environ,
         "PYTHONPATH": os.pathsep.join((str(Path.cwd() / "src"), str(Path.cwd()))),
+        RELEASE_ID_ENV: "release-before",
     }
     process = subprocess.Popen(
         [*command, "action-close" if boundary.startswith("action-close") else boundary],
@@ -899,7 +904,8 @@ def test_foreground_wait_survives_process_kill_and_public_child_resolution(
         ],
         capture_output=True,
         text=True,
-        env=environment,
+        # The process that recovers the parent runs on the Release a rollout deployed.
+        env={**environment, RELEASE_ID_ENV: "release-after"},
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr

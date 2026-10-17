@@ -1033,6 +1033,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
                     environment_name="approval-environment",
                     approval=approval,
                     decision=historical_decision,
+                    release_identity=None,
                 ),
             )
             await store.append_event(
@@ -1240,6 +1241,7 @@ def test_session_store_conformance_lossy_legacy_grant_cannot_authorize_pending_s
                     environment_name=None,
                     approval=approval,
                     decision=ToolApprovalDecision.APPROVE,
+                    release_identity=None,
                     resolved_by=ResolutionActor(subject="legacy-operator"),
                 ),
             )

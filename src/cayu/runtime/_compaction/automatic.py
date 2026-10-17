@@ -92,6 +92,7 @@ from cayu.providers.deadlines import (
     bind_provider_deadline_admission,
     reset_provider_deadline_admission,
 )
+from cayu.releases import release_event_fields
 from cayu.runtime import _context_events
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._compaction import identity as _compaction_identity
@@ -2474,6 +2475,9 @@ class AutomaticCompactionRun:
                                     "max_attempts": max_attempts,
                                     "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
                                     **model_attempt_identity.payload(),
+                                    **release_event_fields(
+                                        self._owner._event_writer.release_identity
+                                    ),
                                 },
                             ),
                             model_attempt_identity,

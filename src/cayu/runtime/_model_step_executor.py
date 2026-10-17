@@ -182,6 +182,7 @@ from cayu.providers.operations import (
     ProviderOperationStartIdempotencySupport,
 )
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.releases import release_event_fields
 from cayu.runtime import _context_events
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -1891,6 +1892,7 @@ class ModelStepExecutor:
                                 else {}
                             ),
                             **model_attempt_identity.payload(),
+                            **release_event_fields(self._event_writer.release_identity),
                         },
                         environment_name=environment_name,
                     ),

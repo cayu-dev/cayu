@@ -12,6 +12,21 @@ Upgrade: Existing streaming applications continue unchanged. Applications can us
   bounded presentation exports and a shared collector for recovery streams.
   Streaming APIs remain available. See the
   [terminal-turn contract](runtime-contracts.md#terminal-turn-convenience).
+- Record which Release each run came from. A host states the Release a process
+  runs with `CAYU_RELEASE_ID` and optionally `CAYU_RELEASE_SNAPSHOT_ROOT`, or with
+  `CayuApp(release_identity=...)`; when both are set they must agree, and
+  without either the process records none. The process records it as `release`
+  on `session.started`, `session.resumed` and every `model.started`, so a
+  session resumed or recovered after a rollout reports the Release of each part
+  of its work. An invocation that fails while its environment is created, bound
+  or reconnected, before its start event, records no Release of its own, so its
+  failure is attributed to the Release in force before it. Supervision events
+  report `release_id` and `release_snapshot_root` for the invocation a touch
+  belongs to, and `SupervisionEventQuery.release_id` filters by Release on every
+  built-in store, through the SDK and over HTTP. Cayu never acts on the Release.
+  `cayu serve` labels Evals results with the same Release id, and an invalid
+  `CAYU_RELEASE_ID` now fails application construction. See
+  [release identity](runtime-contracts.md#release-identity).
 
 ### Breaking changes
 

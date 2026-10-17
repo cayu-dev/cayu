@@ -126,7 +126,6 @@ class ProjectControlPlaneContext:
         "_assembly_token",
         "_close_lock",
         "_closed",
-        "_configured_release_id",
         "_eval_judge_configuration",
         "_eval_price_book",
         "_eval_store",
@@ -141,7 +140,6 @@ class ProjectControlPlaneContext:
         *,
         project_root: Path,
         project_id: str | None,
-        configured_release_id: str | None,
         eval_judge_configuration: ProjectEvalJudgeConfiguration | None,
         eval_price_book: PriceBook | None,
         eval_store: EvalStore | None,
@@ -159,12 +157,6 @@ class ProjectControlPlaneContext:
         if project_id is not None:
             project_id = require_clean_nonblank(project_id, "project_id")
             require_unicode_scalar_text(project_id, "project_id")
-        if configured_release_id is not None:
-            configured_release_id = require_clean_nonblank(
-                configured_release_id,
-                "configured_release_id",
-            )
-            require_unicode_scalar_text(configured_release_id, "configured_release_id")
         if (
             eval_judge_configuration is not None
             and type(eval_judge_configuration) is not ProjectEvalJudgeConfiguration
@@ -188,7 +180,6 @@ class ProjectControlPlaneContext:
 
         self._project_root = project_root
         self._project_id = project_id
-        self._configured_release_id = configured_release_id
         self._eval_judge_configuration = eval_judge_configuration
         self._eval_price_book = (
             None if eval_price_book is None else copy_price_book(eval_price_book)
@@ -248,7 +239,13 @@ class ProjectControlPlaneContext:
             if self._closed:
                 raise RuntimeError("Project Control Plane context is already closed.")
         manifest = app.describe(project_root=self._project_root)
-        release_id = self._configured_release_id or f"manifest-{manifest.fingerprint}"
+        # Evals results name the Release the app records on its runs. The manifest
+        # fallback identifies Evals results only and is never recorded as a Release.
+        release_id = (
+            f"manifest-{manifest.fingerprint}"
+            if app.release_identity is None
+            else app.release_identity.id
+        )
         public_identity: dict[str, str] = {
             "application_release_id": release_id,
             "app_manifest_fingerprint": manifest.fingerprint,
@@ -333,7 +330,6 @@ def _create_project_control_plane_context(
     *,
     project_root: Path,
     project_id: str | None,
-    configured_release_id: str | None,
     eval_store: EvalStore | None,
     store_backend: Literal["sqlite", "postgres"] | None,
     store_source: str | None,
@@ -344,7 +340,6 @@ def _create_project_control_plane_context(
     return ProjectControlPlaneContext(
         project_root=project_root,
         project_id=project_id,
-        configured_release_id=configured_release_id,
         eval_judge_configuration=eval_judge_configuration,
         eval_price_book=eval_price_book,
         eval_store=eval_store,

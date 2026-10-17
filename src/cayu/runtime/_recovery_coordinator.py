@@ -133,6 +133,7 @@ from cayu.failure_evidence import exception_evidence
 from cayu.messages import Message, detach_message
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.releases import release_event_fields
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -3547,6 +3548,7 @@ class RecoveryCoordinator:
                                     "input_id": pending.input_id,
                                     "tool_call_id": pending.tool_call_id,
                                     "resolved_by": resolution_actor_payload(response.resolved_by),
+                                    **release_event_fields(self._event_writer.release_identity),
                                 },
                             ),
                             "model_step_id",
@@ -4487,6 +4489,7 @@ class RecoveryCoordinator:
                         decision=request.decision,
                         resolved_by=request.resolved_by,
                         expired=expired,
+                        release_identity=self._event_writer.release_identity,
                     )
                 )
             if expired:
@@ -5893,6 +5896,7 @@ class RecoveryCoordinator:
                             "input_id": pending.input_id,
                             "tool_call_id": pending.tool_call_id,
                             "resolved_by": resolution_actor_payload(request.resolved_by),
+                            **release_event_fields(self._event_writer.release_identity),
                         },
                     ),
                     execution_profile_snapshot.profile,
@@ -6317,6 +6321,7 @@ class RecoveryCoordinator:
                         decision=ToolApprovalDecision.APPROVE,
                         resolved_by=request.resolved_by,
                         expired=recovered_after_expiry,
+                        release_identity=self._event_writer.release_identity,
                     ),
                     recovery_tool_event,
                 ]
@@ -7806,6 +7811,7 @@ class RecoveryCoordinator:
                             **pending_rounds.pending_tool_round_identity(pending_round).payload(),
                             "tool_call_id": pending_tool_call.tool_call_id,
                             "resolved_by": resolution_actor_payload(request.resolved_by),
+                            **release_event_fields(self._event_writer.release_identity),
                         },
                     ),
                     execution_profile_snapshot.profile,

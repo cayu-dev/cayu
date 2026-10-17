@@ -116,6 +116,7 @@ from cayu.evals.suite_authoring import (
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.events import EVENT_ID_MAX_CHARS
 from cayu.knowledge.records import MAX_KNOWLEDGE_REVISION
+from cayu.releases import RELEASE_ID_MAX_CHARS
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.system_diagnostics import (
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS as MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
@@ -732,6 +733,9 @@ class SupervisionEventsRequest(ApiBaseModel):
     session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
     exclude_forked_sessions: StrictBool = False
     execution_profile_fingerprint: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    release_id: StrictStr | None = Field(
+        default=None, min_length=1, max_length=RELEASE_ID_MAX_CHARS
+    )
     kinds: tuple[SupervisionEventKind, ...] = ()
     actor_sources: tuple[ResolutionActorSource, ...] = ()
     limit: StrictInt = Field(
@@ -767,6 +771,8 @@ class ApiSupervisionEvent(ApiBaseModel):
     environment_name: str | None = None
     tool_name: str | None = None
     execution_profile_fingerprint: str | None = None
+    release_id: str | None = None
+    release_snapshot_root: str | None = None
     model_step_id: str | None = None
     model_attempt_id: str | None = None
     tool_round_id: str | None = None

@@ -49,7 +49,6 @@ async def _server(resources, monkeypatch, *, prefix="/api", authenticate=_authen
         _create_project_control_plane_context(
             project_root=Path(__file__).resolve().parents[2],
             project_id="captured-launch-contract",
-            configured_release_id="release-current",
             eval_store=store,
             store_backend="sqlite",
             store_source="project",

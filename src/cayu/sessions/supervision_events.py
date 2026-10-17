@@ -33,6 +33,7 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_by
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
 from cayu.approvals.revisions import ApprovalRevision
 from cayu.budgets.usage import UsageMetrics
+from cayu.releases import validate_release_id
 from cayu.sessions.queries import SessionAggregateFilter
 
 if TYPE_CHECKING:
@@ -47,6 +48,9 @@ SUPERVISION_EVENT_MAX_CURSOR_BYTES = 4_096
 _SUPERVISION_EVENT_CURSOR_VERSION = 1
 _SUPERVISION_EVENT_CURSOR_DOMAIN = "cayu.supervision-events.cursor.v1"
 _SUPERVISION_EVENT_CURSOR_KEYS = frozenset({"version", "query_sha256", "after_sequence"})
+_SUPERVISION_EVENT_PAGE_FIELDS = frozenset({"cursor", "limit", "max_bytes"})
+# Filters added after cursors were first issued.
+_SUPERVISION_EVENT_FILTERS_DIGESTED_WHEN_SET = frozenset({"release_id"})
 _LOWER_HEX_SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _ASCII_PATTERN = r"^[\x21-\x7e]+$"
 _LOWER_HEX_SHA256 = re.compile(_LOWER_HEX_SHA256_PATTERN)
@@ -106,7 +110,8 @@ class SupervisionEventQuery(BaseModel):
     """Half-open ``[start_at, end_at)`` window over settled supervision touches.
 
     ``kinds`` and ``actor_sources`` are empty for "any". A non-empty
-    ``actor_sources`` excludes touches without a recorded actor.
+    ``actor_sources`` excludes touches without a recorded actor. ``release_id``
+    keeps touches whose work ran on that Release.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -118,6 +123,7 @@ class SupervisionEventQuery(BaseModel):
     execution_profile_fingerprint: StrictStr | None = Field(
         default=None, pattern=_LOWER_HEX_SHA256_PATTERN
     )
+    release_id: StrictStr | None = None
     kinds: tuple[SupervisionEventKind, ...] = Field(
         default_factory=tuple, max_length=len(SupervisionEventKind)
     )
@@ -145,6 +151,13 @@ class SupervisionEventQuery(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(f"{info.field_name} must be timezone-aware.")
         return value.astimezone(UTC)
+
+    @field_validator("release_id")
+    @classmethod
+    def require_valid_release_id(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return validate_release_id(value, info.field_name)
 
     @field_validator("kinds", "actor_sources")
     @classmethod
@@ -191,7 +204,10 @@ class SupervisionEvent(BaseModel):
     the application's content-free declaration of the approved version.
     ``authorization_grant_id`` names the tool authorization grant that sent the
     call to sampled review or that this approval created, per
-    ``authorization_grant_role``.
+    ``authorization_grant_role``. ``release_id`` and ``release_snapshot_root``
+    name the Release of the work the touch belongs to: the invocation that
+    proposed the call it settles, or the work in force at an interrupt or
+    steering message. Both are ``None`` when that work recorded no Release.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -209,6 +225,8 @@ class SupervisionEvent(BaseModel):
     execution_profile_fingerprint: StrictStr | None = Field(
         default=None, pattern=_LOWER_HEX_SHA256_PATTERN
     )
+    release_id: StrictStr | None = None
+    release_snapshot_root: StrictStr | None = Field(default=None, pattern=_LOWER_HEX_SHA256_PATTERN)
     model_step_id: StrictStr | None = None
     model_attempt_id: StrictStr | None = None
     tool_round_id: StrictStr | None = None
@@ -272,7 +290,10 @@ def supervision_event_query_fingerprint(
     """Digest every decision-bearing query field except cursor and page bounds.
 
     ``audience`` names the reader the page was produced for, such as an access
-    scope or a verified tenant, so a cursor cannot move between readers.
+    scope or a verified tenant, so a cursor cannot move between readers. A filter
+    added after cursors were first issued is digested only when set, so a query
+    that leaves it unset keeps the digest earlier Cayu releases issued cursors
+    for and those cursors keep paging across an upgrade or rollback.
     """
 
     if type(query) is not SupervisionEventQuery:
@@ -281,9 +302,17 @@ def supervision_event_query_fingerprint(
         raise TypeError("include_content must be a bool.")
     if audience is not None and type(audience) is not str:
         raise TypeError("audience must be a string or None.")
+    undigested = {
+        *_SUPERVISION_EVENT_PAGE_FIELDS,
+        *(
+            field_name
+            for field_name in _SUPERVISION_EVENT_FILTERS_DIGESTED_WHEN_SET
+            if getattr(query, field_name) is None
+        ),
+    }
     material = {
         "domain": _SUPERVISION_EVENT_CURSOR_DOMAIN,
-        "query": query.model_dump(mode="json", exclude={"cursor", "limit", "max_bytes"}),
+        "query": query.model_dump(mode="json", exclude=undigested),
         "include_content": include_content,
         "audience": audience,
     }

@@ -2450,6 +2450,7 @@ def _serialize_supervision_event(
         {
             "agent_name": event.agent_name,
             "environment_name": event.environment_name,
+            "release_id": event.release_id,
             "tool_name": event.tool_name,
             "reason": event.reason,
             "actor": (
@@ -2483,6 +2484,7 @@ def _serialize_supervision_event(
         ),
         "forked": event.forked,
         "execution_profile_fingerprint": event.execution_profile_fingerprint,
+        "release_snapshot_root": event.release_snapshot_root,
         "tool_call_count": len(event.tool_call_ids),
         "message_origin": None if event.message_origin is None else event.message_origin.value,
         # Notification identity and content-free digests, never resolution authority.
@@ -5051,6 +5053,7 @@ def create_router(
                 sessions=body.session_filter,
                 exclude_forked_sessions=body.exclude_forked_sessions,
                 execution_profile_fingerprint=body.execution_profile_fingerprint,
+                release_id=body.release_id,
                 kinds=body.kinds,
                 actor_sources=body.actor_sources,
                 limit=body.limit,
@@ -5104,9 +5107,10 @@ def create_router(
             "Page settled approvals, denials, expiries, answers, manual recoveries, operator "
             "interrupts and steering messages across sessions, in durable sequence order, for "
             "a UTC-normalized half-open resolution-time window. Content is never included. "
-            "Session identity and step linkage are public aliases. An identity with a verified "
-            "tenant sees only sessions whose invocation origin carries that tenant; an identity "
-            "without a tenant reads the configured session store."
+            "Each record names the Release of the work it belongs to, and `release_id` filters "
+            "by it. Session identity and step linkage are public aliases. An identity with a "
+            "verified tenant sees only sessions whose invocation origin carries that tenant; an "
+            "identity without a tenant reads the configured session store."
         ),
         route_class_override=_BoundedSupervisionEventsRoute,
     )

@@ -10,6 +10,7 @@ from cayu import CayuApp
 from cayu.cli.project import ProjectError
 from cayu.cli.project_control_plane import build_project_control_plane_context
 from cayu.project_control_plane import resolve_project_control_plane_context
+from cayu.releases import RELEASE_ID_ENV, ReleaseIdentity
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.storage.evals_postgres import PostgresEvalStore
 from cayu.storage.migrations import SchemaMode
@@ -37,13 +38,12 @@ def test_project_context_normalizes_identity_and_uses_manifest_release_fallback(
         environ={},
     )
     try:
-        resolved = resolve_project_control_plane_context(
-            context,
-            CayuApp(enable_logging=False),
-        )
+        app = CayuApp(enable_logging=False)
+        resolved = resolve_project_control_plane_context(context, app)
         assert resolved is not None
         assert resolved.project_id == "example-project"
         assert resolved.application_release_id == f"manifest-{resolved.app_manifest_fingerprint}"
+        assert app.release_identity is None
         assert resolved.store_backend == "sqlite"
         assert resolved.store_source == "project"
         assert context.project_identity_configured is True
@@ -122,29 +122,27 @@ def test_diagnostic_project_context_forces_postgres_eval_store_read_only(
             asyncio.run(context.close())
 
 
-def test_project_context_uses_explicit_release_without_exposing_store_credentials(
+def test_project_context_uses_the_stated_release_without_exposing_store_credentials(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _project(
         tmp_path,
         store=('\n[tool.cayu.session_store]\nbackend = "postgres"\nenv = "PROJECT_DATABASE_URL"\n'),
     )
     secret = "postgresql://operator:do-not-print@db.example/cayu"
+    monkeypatch.setenv(RELEASE_ID_ENV, "release-42")
     context = build_project_control_plane_context(
         tmp_path,
         mode="production",
-        environ={
-            "PROJECT_DATABASE_URL": secret,
-            "CAYU_RELEASE_ID": "release-42",
-        },
+        environ={"PROJECT_DATABASE_URL": secret},
     )
     try:
-        resolved = resolve_project_control_plane_context(
-            context,
-            CayuApp(enable_logging=False),
-        )
+        app = CayuApp(enable_logging=False)
+        resolved = resolve_project_control_plane_context(context, app)
         assert resolved is not None
         assert resolved.application_release_id == "release-42"
+        assert app.release_identity == ReleaseIdentity(id="release-42")
         assert resolved.store_backend == "postgres"
         assert secret not in repr(context)
         assert secret not in str(resolved.safe_summary())
@@ -333,18 +331,19 @@ def test_project_context_reports_missing_project_identity_without_guessing(
         asyncio.run(context.close())
 
 
-def test_project_context_rejects_invalid_release_without_echoing_it(tmp_path: Path) -> None:
+def test_project_context_uses_the_release_the_app_records_on_its_runs(tmp_path: Path) -> None:
     _project(tmp_path)
-    secret = "do-not-print\n"
-
-    with pytest.raises(ProjectError) as excinfo:
-        build_project_control_plane_context(
-            tmp_path,
-            mode="production",
-            environ={"CAYU_RELEASE_ID": secret},
+    context = build_project_control_plane_context(tmp_path, mode="production", environ={})
+    try:
+        app = CayuApp(
+            enable_logging=False,
+            release_identity=ReleaseIdentity(id="release-configured"),
         )
-
-    assert secret not in str(excinfo.value)
+        resolved = resolve_project_control_plane_context(context, app)
+        assert resolved is not None
+        assert resolved.application_release_id == "release-configured"
+    finally:
+        asyncio.run(context.close())
 
 
 def test_project_context_redacts_store_initialization_failures(
@@ -371,16 +370,16 @@ def test_project_context_redacts_store_initialization_failures(
 def test_project_context_rejects_identity_colliding_with_a_workload_secret(
     tmp_path: Path,
 ) -> None:
-    _project(tmp_path)
+    _project(tmp_path, name="secret-project-value")
     context = build_project_control_plane_context(
         tmp_path,
         mode="production",
-        environ={"CAYU_RELEASE_ID": "secret-release-value"},
+        environ={},
     )
     try:
         app = CayuApp(
             enable_logging=False,
-            secret_redactor=SecretRedactor("secret-release-value"),
+            secret_redactor=SecretRedactor("secret-project-value"),
         )
         with pytest.raises(ValueError, match="contains a workload secret"):
             resolve_project_control_plane_context(context, app)

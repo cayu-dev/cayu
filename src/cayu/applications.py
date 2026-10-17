@@ -341,6 +341,7 @@ from cayu.observability.watchers import (
 from cayu.providers.base import ModelProvider, ModelRequest
 from cayu.providers.hosted import OpenAIWebSearch
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.releases import ReleaseIdentity, resolve_release_identity
 from cayu.resource_access import (
     ResourceAccessPolicy,
     ResourceSessionStream,
@@ -1004,6 +1005,7 @@ class CayuApp:
         clock: Callable[[], datetime] | None = None,
         session_execution: SessionExecutionConfig | None = None,
         model_policy: ModelPolicy | None = None,
+        release_identity: ReleaseIdentity | None = None,
         owned_resources: Iterable[SupportsAsyncClose] = (),
     ) -> None:
         if model_policy is not None and type(model_policy) is not ModelPolicy:
@@ -1243,6 +1245,7 @@ class CayuApp:
             owned_store_ids.append(TaskSessionClosureStore(self.task_store))
         owned_store_ids.append(BudgetSessionClosureStore())
         self._secret_redactor = resolved_secret_redactor
+        self._release_identity = resolve_release_identity(release_identity, self._secret_redactor)
         self._environment_registry = ApplicationEnvironmentRegistry(
             session_store=self.session_store,
             secret_redactor=self._secret_redactor,
@@ -1306,6 +1309,7 @@ class CayuApp:
             continue_foreground_parent=self._continue_foreground_parent,
             runtime_timing=runtime_timing,
             timing_sinks=() if timing_sinks is None else tuple(timing_sinks),
+            release_identity=self._release_identity,
         )
         self._verified_completion = VerifiedCompletionCoordinator(
             task_store=self.task_store,
@@ -6332,6 +6336,12 @@ class CayuApp:
         """Return the configured ``ExecutionProfilePolicy`` identity, if any."""
 
         return self._execution_profile_classifier.policy_identity
+
+    @property
+    def release_identity(self) -> ReleaseIdentity | None:
+        """Return the Release this process records on the work it runs, if one is stated."""
+
+        return self._release_identity
 
     @property
     def default_environment_name(self) -> str | None:

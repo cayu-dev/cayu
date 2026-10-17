@@ -18,7 +18,8 @@ loopback development only.
 
 `cayu serve` assembles the durable, non-executable Evals foundation without
 requiring an application to construct `EvalsConfig`: normalized project
-identity from `[project].name`, release identity from `CAYU_RELEASE_ID` or the
+identity from `[project].name`, release identity from the
+[Release the application records](runtime-contracts.md#release-identity) or the
 public application-manifest fingerprint, and a matching SQLite or PostgreSQL
 `EvalStore` from the project's session-store declaration. Trusted loopback
 `cayu serve --dev` may create `data/cayu.db` as the local default; production

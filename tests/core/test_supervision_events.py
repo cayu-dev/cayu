@@ -21,11 +21,15 @@ from cayu.sessions.supervision_events import (
     SUPERVISION_EVENT_MAX_LIMIT,
     SUPERVISION_EVENT_MAX_RESULT_BYTES,
     SUPERVISION_EVENT_MAX_WINDOW,
+    supervision_event_query_fingerprint,
 )
 
 START = datetime(2026, 10, 1, tzinfo=UTC)
 END = datetime(2026, 10, 8, tzinfo=UTC)
 FINGERPRINT = "a" * 64
+# Digests computed by the Cayu release before the Release filter existed.
+EARLIER_UNFILTERED_DIGEST = "d56fb59fd2777e7c9a652f0cd79ce9afc4359e5fcee95be62d3c9387dde59082"
+EARLIER_EVERY_FILTER_DIGEST = "b7fa2bace14f9a0829a1489f7a9ce1e33c8c603f33d785dd463088f6b2581acc"
 
 
 def _query(**changes) -> SupervisionEventQuery:
@@ -163,6 +167,7 @@ def test_query_without_cursor_decodes_to_the_start():
         {"exclude_forked_sessions": True},
         {"sessions": SessionAggregateFilter(agent_name="other-agent")},
         {"sessions": SessionAggregateFilter(labels={"org": "globex"})},
+        {"release_id": "release-1"},
     ],
 )
 def test_cursor_from_another_query_is_rejected(changes):
@@ -170,6 +175,31 @@ def test_cursor_from_another_query_is_rejected(changes):
 
     with pytest.raises(ValueError, match="another query"):
         decode_supervision_event_cursor(_query(**changes, cursor=cursor))
+
+
+def test_queries_without_a_release_filter_keep_the_earlier_cursor_digest():
+    every_filter = _query(
+        sessions=SessionAggregateFilter(agent_name="assistant", labels={"org": "acme"}),
+        exclude_forked_sessions=True,
+        execution_profile_fingerprint=FINGERPRINT,
+        kinds=(SupervisionEventKind.APPROVE, SupervisionEventKind.DENY),
+        actor_sources=(ResolutionActorSource.SYSTEM,),
+    )
+
+    assert supervision_event_query_fingerprint(_query()) == EARLIER_UNFILTERED_DIGEST
+    assert (
+        supervision_event_query_fingerprint(every_filter, include_content=True, audience="tenant-a")
+        == EARLIER_EVERY_FILTER_DIGEST
+    )
+
+
+def test_cursor_from_a_release_filtered_query_resumes_only_that_query():
+    cursor = encode_supervision_event_cursor(_query(release_id="release-1"), after_sequence=5)
+
+    assert decode_supervision_event_cursor(_query(release_id="release-1", cursor=cursor)) == 5
+    for other in ({}, {"release_id": "release-2"}):
+        with pytest.raises(ValueError, match="another query"):
+            decode_supervision_event_cursor(_query(**other, cursor=cursor))
 
 
 def test_cursor_binds_content_visibility():

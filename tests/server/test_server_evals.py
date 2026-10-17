@@ -329,7 +329,6 @@ def test_framework_owned_local_context_allows_loopback_cli_evals_without_relaxin
     context = _create_project_control_plane_context(
         project_root=tmp_path.resolve(),
         project_id="local-project",
-        configured_release_id="local-release",
         eval_store=automatic_store,
         store_backend="sqlite",
         store_source="project",
@@ -1121,7 +1120,6 @@ def test_memory_report_routes_preserve_unconfigured_and_unavailable_storage(
         _create_project_control_plane_context(
             project_root=tmp_path.resolve(),
             project_id="memory-report-contract",
-            configured_release_id="current-release",
             eval_store=None,
             store_backend=None,
             store_source=None,

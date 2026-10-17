@@ -49,6 +49,7 @@ from cayu.execution_profiles import (
 from cayu.messages import detach_message
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.releases import release_event_fields
 from cayu.resource_access import ResourceAccessPolicy, resource_recovery
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -2069,6 +2070,7 @@ class IncompleteSessionRecovery:
                             payload={
                                 "recovered_external_wait": True,
                                 "run_epoch": claim.session.run_epoch,
+                                **release_event_fields(self._event_writer.release_identity),
                             },
                         )
                     )

@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, cast
 
-from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.budgets.pricing import PriceBook, default_price_book
 from cayu.cli.project import ProjectError
 from cayu.cli.store_targets import (
@@ -33,7 +32,6 @@ _DISTRIBUTION_NAME_RE = re.compile(
 )
 _DISTRIBUTION_NAME_SEPARATOR_RE = re.compile(r"[-_.]+")
 _MAX_PROJECT_ID_CHARS = 256
-_MAX_RELEASE_ID_CHARS = 256
 _DEFAULT_JUDGE_KEYS = {
     "allow_same_model",
     "cost_currency",
@@ -68,7 +66,6 @@ def build_project_control_plane_context(
         raise ValueError("mode must be development or production.")
     environment = os.environ if environ is None else environ
     project_id, eval_judge_configuration, eval_price_book = _project_metadata(root)
-    configured_release_id = _configured_release_id(environment)
     try:
         target = resolve_project_session_store_target(
             environ=environment,
@@ -88,7 +85,6 @@ def build_project_control_plane_context(
     return _create_project_control_plane_context(
         project_root=root,
         project_id=project_id,
-        configured_release_id=configured_release_id,
         eval_judge_configuration=eval_judge_configuration,
         eval_price_book=eval_price_book,
         eval_store=eval_store,
@@ -275,20 +271,6 @@ def _project_evals_configuration(
             '[tool.cayu.evals].price_book = "bundled-public".'
         )
     return judge, eval_price_book
-
-
-def _configured_release_id(environ: Mapping[str, str]) -> str | None:
-    value = environ.get("CAYU_RELEASE_ID")
-    if value is None:
-        return None
-    try:
-        value = require_clean_nonblank(value, "CAYU_RELEASE_ID")
-        require_unicode_scalar_text(value, "CAYU_RELEASE_ID")
-    except (TypeError, ValueError) as exc:
-        raise ProjectError("CAYU_RELEASE_ID must be clean nonblank text.") from exc
-    if len(value) > _MAX_RELEASE_ID_CHARS:
-        raise ProjectError(f"CAYU_RELEASE_ID cannot exceed {_MAX_RELEASE_ID_CHARS} characters.")
-    return value
 
 
 def _create_eval_store(target: SessionStoreTarget | None):

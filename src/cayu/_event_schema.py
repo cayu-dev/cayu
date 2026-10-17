@@ -10,6 +10,7 @@ from cayu.artifacts.settlement import ArtifactWriteSettlementEvidence
 from cayu.egress.authority import EgressAuthorityTransitionState
 from cayu.events import SESSION_EXPORT_EVENT_FIELDS, SESSION_EXPORT_EVENT_TYPES, Event, EventType
 from cayu.providers._retry_decision import RetryDecision
+from cayu.releases import RELEASE_EVENT_PAYLOAD_KEY, ReleaseIdentity
 from cayu.tools._shared_artifact_result_schema import (
     SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
     SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS,
@@ -57,6 +58,11 @@ _MODEL_POLICY_PATHS = frozenset(
         ("model_policy", "snapshot", key)
         for key in ("snapshot_id", "effective_revision", "config_sha256")
     ]
+)
+
+
+_RELEASE_PATHS = frozenset(
+    (RELEASE_EVENT_PAYLOAD_KEY, field_name) for field_name in ReleaseIdentity.model_fields
 )
 
 
@@ -1253,8 +1259,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     model_started = _observed_policy(
         "actor attempt attempt_id compactor execution_profile_fingerprint instruction_digest instruction_present max_attempts "
         "file_attachment_attestations mode model model_attempt_id model_step_id operation_id provider purpose reason request_id "
-        "source_run_epoch source_transcript_cursor step",
-        owned_nested_paths=_resolution_actor_nested_paths("actor"),
+        f"source_run_epoch source_transcript_cursor step {RELEASE_EVENT_PAYLOAD_KEY}",
+        owned_nested_paths=_resolution_actor_nested_paths("actor") | _RELEASE_PATHS,
         authority_keys=(_MODEL_EXECUTION_AUTHORITY_KEYS | {"file_attachment_attestations"}),
         internal_authority_keys={"file_attachment_attestations"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
@@ -2539,16 +2545,18 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_STARTED] = _observed_policy(
         "agent_name input_contract model_policy parent_session_id prompt_contribution_manifest run_epoch "
-        "traceparent tracestate",
-        owned_nested_paths=_PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS | _MODEL_POLICY_PATHS,
+        f"traceparent tracestate {RELEASE_EVENT_PAYLOAD_KEY}",
+        owned_nested_paths=(
+            _PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS | _MODEL_POLICY_PATHS | _RELEASE_PATHS
+        ),
         authority_keys={"input_contract"},
         internal_authority_keys={"input_contract"},
     )
     policies[EventType.SESSION_RESUMED] = _observed_policy(
         "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_contract input_id "
         "interruption_type model_attempt_id model_step_id parent_session_id resolved_by "
-        "run_epoch task_id tool_call_id tool_round_id traceparent tracestate",
-        owned_nested_paths=_resolution_actor_nested_paths("resolved_by"),
+        f"run_epoch task_id tool_call_id tool_round_id traceparent tracestate {RELEASE_EVENT_PAYLOAD_KEY}",
+        owned_nested_paths=_resolution_actor_nested_paths("resolved_by") | _RELEASE_PATHS,
         authority_keys={"execution_profile_fingerprint", "input_contract"},
         internal_authority_keys={"input_contract"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,

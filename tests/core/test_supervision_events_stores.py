@@ -21,6 +21,7 @@ from tests.runtime.runtime_supervision_support import (
     approval_app,
     pause_for_approval,
     resolve_approval,
+    run_across_releases,
     supervision_page,
     supervision_window,
     two_call_provider,
@@ -31,8 +32,9 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals import approval_revision_metadata
 from cayu.approvals.tools import ToolApprovalDecision
+from cayu.releases import ReleaseIdentity
 from cayu.resource_access import ResourceAccessPolicy
-from cayu.sessions import SessionStore, SupervisionEventKind
+from cayu.sessions import SessionStore, SupervisionEventCursorInvalid, SupervisionEventKind
 from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.requests import InterruptSessionRequest
@@ -178,6 +180,42 @@ def test_every_store_reports_declared_edits_and_attention_identity(session_store
         assert event.approval_revision is not None
         assert event.approval_revision.approved_digest == "b" * 64
     assert page.events[2].approval_revision is None
+
+
+def test_every_store_filters_touches_by_the_release_their_invocation_recorded(
+    session_store_case,
+):
+    async def run():
+        store = await _open_store(session_store_case)
+        try:
+            await run_across_releases(
+                store,
+                "sess_parity_release",
+                ReleaseIdentity(id="release-1"),
+                ReleaseIdentity(id="release-2"),
+            )
+            operator = CayuApp(session_store=store, release_identity=ReleaseIdentity(id="reader"))
+            first = await supervision_page(store, release_id="release-1")
+            with pytest.raises(SupervisionEventCursorInvalid):
+                await supervision_page(store, release_id="release-2", cursor=first.next_cursor)
+            return (
+                first,
+                await operator.query_supervision_events(supervision_window(release_id="release-2")),
+                await supervision_page(store, release_id="reader"),
+            )
+        finally:
+            await _close_store(store)
+
+    first, second, unrecorded = asyncio.run(run())
+
+    assert [(event.tool_call_ids, event.release_id) for event in first.events] == [
+        (("call_1",), "release-1"),
+        (("call_2",), "release-1"),
+    ]
+    assert [(event.tool_call_ids, event.release_id) for event in second.events] == [
+        (("call_3",), "release-2")
+    ]
+    assert unrecorded.events == ()
 
 
 def test_store_without_the_capability_fails_closed_before_reading():

@@ -112,6 +112,7 @@ from cayu.providers.base import (
     _detach_model_request,
     copy_usage_dialect,
 )
+from cayu.releases import release_event_fields
 from cayu.runtime import (
     _prompt_transition,
     _session_checkpoint_admission,
@@ -2107,6 +2108,7 @@ class SessionCompaction:
                                     "max_attempts": max_dispatch_attempts,
                                     "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
                                     **model_attempt_identity.payload(),
+                                    **release_event_fields(self._event_writer.release_identity),
                                 },
                                 request=request,
                                 operation_id=operation_id,

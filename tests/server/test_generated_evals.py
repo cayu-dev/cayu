@@ -43,7 +43,6 @@ def test_project_eval_pricing_rejects_a_conflicting_server_price_book(tmp_path) 
     context = _create_project_control_plane_context(
         project_root=project_root,
         project_id="generated-project",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",
@@ -79,7 +78,6 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
     context = _create_project_control_plane_context(
         project_root=project_root,
         project_id="generated-project",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",
@@ -253,7 +251,6 @@ def test_production_project_context_does_not_enable_evals_under_open_access(tmp_
     context = _create_project_control_plane_context(
         project_root=tmp_path.resolve(),
         project_id="production-project",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",
@@ -286,7 +283,6 @@ def test_generated_eval_worker_rejects_manifest_drift_after_catalog_publication(
     context = _create_project_control_plane_context(
         project_root=Path(__file__).resolve().parents[2],
         project_id="drift-project",
-        configured_release_id="release-current",
         eval_store=store,
         store_backend="sqlite",
         store_source="project",
