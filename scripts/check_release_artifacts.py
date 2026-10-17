@@ -119,6 +119,46 @@ _ACT_ONCE_GUIDANCE_MARKERS = {
     ),
     "durable-operations.md": (b"cayu guide tool-effects#act-once-recovery",),
 }
+# PyPI is often the first page people and coding agents read about Cayu, so a
+# release must keep the summary, classifiers, keywords and links that describe it.
+_PUBLICATION_SUMMARY = (
+    "Python runtime for long-running agents: durable sessions that survive restarts, "
+    "human approval before side effects, spend caps, and multi-agent collaboration."
+)
+_PUBLICATION_CLASSIFIERS = (
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+)
+_DEVELOPMENT_STATUS_PREFIX = "Development Status :: "
+_PUBLICATION_KEYWORDS = (
+    "agents",
+    "ai-agents",
+    "llm",
+    "durable-execution",
+    "long-running",
+    "human-in-the-loop",
+    "approvals",
+    "budgets",
+    "spend-limits",
+    "multi-agent",
+    "workflow",
+)
+_PUBLICATION_PROJECT_URLS = {
+    "Homepage": "https://cayu.dev",
+    "Repository": "https://github.com/cayu-dev/cayu",
+    "Documentation": "https://cayu.dev/docs",
+    "Issues": "https://github.com/cayu-dev/cayu/issues",
+    "Changelog": "https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md",
+}
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}
 _NON_PUBLIC_IDENTIFIERS = (
     b"vertex" + b"kg",
@@ -232,6 +272,46 @@ def _validate_metadata_document_links(contents: bytes, *, archive: Path, member_
             _fail(f"{archive}: {member_name} contains relative local-document link: {destination}")
 
 
+def _validate_publication_metadata(contents: bytes, *, archive: Path, member_name: str) -> None:
+    metadata = BytesParser().parsebytes(contents)
+    problems: list[str] = []
+    summary = metadata.get("Summary")
+    if summary is None or summary.strip() != _PUBLICATION_SUMMARY:
+        problems.append(f"summary is {summary!r}, expected {_PUBLICATION_SUMMARY!r}")
+    classifiers = {value.strip() for value in metadata.get_all("Classifier") or ()}
+    problems.extend(
+        f"missing classifier {classifier!r}"
+        for classifier in _PUBLICATION_CLASSIFIERS
+        if classifier not in classifiers
+    )
+    statuses = sorted(
+        value for value in classifiers if value.startswith(_DEVELOPMENT_STATUS_PREFIX)
+    )
+    if len(statuses) != 1:
+        problems.append(f"expected exactly one Development Status classifier, found {statuses}")
+    keywords = {
+        keyword.strip()
+        for value in metadata.get_all("Keywords") or ()
+        for keyword in value.split(",")
+    }
+    problems.extend(
+        f"missing keyword {keyword!r}"
+        for keyword in _PUBLICATION_KEYWORDS
+        if keyword not in keywords
+    )
+    project_urls: dict[str, str] = {}
+    for value in metadata.get_all("Project-URL") or ():
+        label, _separator, url = value.partition(",")
+        project_urls[label.strip()] = url.strip()
+    for label, url in _PUBLICATION_PROJECT_URLS.items():
+        if project_urls.get(label) != url:
+            problems.append(
+                f"project URL {label!r} is {project_urls.get(label)!r}, expected {url!r}"
+            )
+    if problems:
+        _fail(f"{archive}: {member_name} publication metadata: {'; '.join(problems)}")
+
+
 def _validate_sidecar(
     contents: dict[str, bytes],
     *,
@@ -300,6 +380,9 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
         contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
     )
     _validate_metadata_document_links(
+        contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
+    )
+    _validate_publication_metadata(
         contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
     )
     prefix = f"{_SDIST_SIDECAR_PREFIX}/"
@@ -398,6 +481,9 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
         file_contents[metadata_name], archive=archive, member_name=metadata_name
     )
     _validate_metadata_document_links(
+        file_contents[metadata_name], archive=archive, member_name=metadata_name
+    )
+    _validate_publication_metadata(
         file_contents[metadata_name], archive=archive, member_name=metadata_name
     )
     prefix = f"{_WHEEL_SIDECAR_PREFIX}/"

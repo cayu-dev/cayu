@@ -125,7 +125,7 @@ def test_release_facing_metadata_uses_public_urls() -> None:
     assert project["urls"] == {
         "Homepage": "https://cayu.dev",
         "Repository": "https://github.com/cayu-dev/cayu",
-        "Documentation": "https://github.com/cayu-dev/cayu#readme",
+        "Documentation": "https://cayu.dev/docs",
         "Issues": "https://github.com/cayu-dev/cayu/issues",
         "Changelog": "https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md",
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import re
@@ -12,6 +13,7 @@ import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,7 +26,8 @@ _SIDECAR_SOURCE = _ROOT / "examples" / "aws" / "lambda_microvm_sidecar"
 _COMPILED_DASHBOARD_SOURCE = _ROOT / "src" / "cayu" / "server" / "dashboard"
 _MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
 with (_ROOT / "pyproject.toml").open("rb") as _project_file:
-    _VERSION = tomllib.load(_project_file)["project"]["version"]
+    _PROJECT = tomllib.load(_project_file)["project"]
+_VERSION = _PROJECT["version"]
 _WHEEL_DIST_INFO = f"cayu-{_VERSION}.dist-info"
 _DASHBOARD_SOURCE_BUNDLE_NAME = f"cayu-dashboard-source-{_VERSION}.zip"
 _DASHBOARD_SOURCE_BUNDLE = (
@@ -124,6 +127,19 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
     }
 
 
+def _core_metadata(project: dict[str, Any] | None = None) -> str:
+    """Render the core-metadata headers Hatchling derives from ``[project]``."""
+    project = _PROJECT if project is None else project
+    lines = ["Metadata-Version: 2.4", "Name: cayu", f"Version: {project['version']}"]
+    if "description" in project:
+        lines.append(f"Summary: {project['description']}")
+    lines.extend(f"Project-URL: {label}, {url}" for label, url in project.get("urls", {}).items())
+    if project.get("keywords"):
+        lines.append(f"Keywords: {','.join(project['keywords'])}")
+    lines.extend(f"Classifier: {classifier}" for classifier in project.get("classifiers", ()))
+    return "\n".join(lines) + "\n"
+
+
 def _as_bytes(value: str | bytes) -> bytes:
     return value if isinstance(value, bytes) else value.encode()
 
@@ -160,7 +176,7 @@ def _write_wheel(
             if name == _WHEEL_DASHBOARD_SOURCE:
                 content = _DASHBOARD_SOURCE_BUNDLE.read_bytes()
             if name == f"{_WHEEL_DIST_INFO}/METADATA":
-                content = f"Metadata-Version: 2.4\nName: cayu\nVersion: {_VERSION}\n"
+                content = _core_metadata()
             if name in contents_by_name:
                 content = contents_by_name[name]
             if (
@@ -220,7 +236,7 @@ def _write_sdist(
             if relative_name == "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
                 content = compiled_dashboard["THIRD_PARTY_LICENSES.md"]
             if relative_name == "PKG-INFO":
-                content = f"Metadata-Version: 2.4\nName: cayu\nVersion: {_VERSION}\n"
+                content = _core_metadata()
             if relative_name in contents_by_name:
                 content = contents_by_name[relative_name]
             data = _as_bytes(content)
@@ -311,8 +327,7 @@ def test_release_metadata_rejects_relative_local_document_links(
     metadata_name: str,
 ) -> None:
     metadata = (
-        f"Metadata-Version: 2.4\nName: cayu\nVersion: {_VERSION}\n"
-        "Description-Content-Type: text/markdown\n\n"
+        _core_metadata() + "Description-Content-Type: text/markdown\n\n"
         "See [runtime contracts](docs/runtime-contracts.md).\n"
     )
     if kind == "wheel":
@@ -329,6 +344,94 @@ def test_release_metadata_rejects_relative_local_document_links(
         validator = validate_sdist
     with pytest.raises(ValueError, match="relative local-document link"):
         validator(archive)
+
+
+def test_project_metadata_names_the_published_niche() -> None:
+    artifact_validator["_validate_publication_metadata"](
+        _core_metadata().encode(),
+        archive=Path("pyproject.toml"),
+        member_name="[project]",
+    )
+
+
+def _without_list_item(field: str, item: str):
+    def remove(project: dict[str, Any]) -> None:
+        project[field] = [value for value in project[field] if value != item]
+
+    return remove
+
+
+def _without_url(label: str):
+    def remove(project: dict[str, Any]) -> None:
+        del project["urls"][label]
+
+    return remove
+
+
+def _without_development_status(project: dict[str, Any]) -> None:
+    project["classifiers"] = [
+        classifier
+        for classifier in project["classifiers"]
+        if not classifier.startswith("Development Status :: ")
+    ]
+
+
+def _with_previous_summary(project: dict[str, Any]) -> None:
+    project["description"] = (
+        "Cayu is an open-source Python framework for building and running "
+        "domain-specific long-horizon agents, with a durable runtime built in."
+    )
+
+
+def _with_readme_documentation(project: dict[str, Any]) -> None:
+    project["urls"]["Documentation"] = "https://github.com/cayu-dev/cayu#readme"
+
+
+_PUBLICATION_METADATA_DAMAGE = [
+    pytest.param(_with_previous_summary, "summary", id="summary"),
+    pytest.param(_without_development_status, "Development Status", id="development-status"),
+    pytest.param(_with_readme_documentation, "Documentation", id="documentation-readme"),
+    *(
+        pytest.param(_without_list_item("classifiers", classifier), classifier, id=classifier)
+        for classifier in artifact_validator["_PUBLICATION_CLASSIFIERS"]
+    ),
+    *(
+        pytest.param(_without_list_item("keywords", keyword), keyword, id=f"keyword-{keyword}")
+        for keyword in artifact_validator["_PUBLICATION_KEYWORDS"]
+    ),
+    *(
+        pytest.param(_without_url(label), label, id=f"url-{label}")
+        for label in artifact_validator["_PUBLICATION_PROJECT_URLS"]
+    ),
+]
+
+
+@pytest.mark.parametrize(("damage", "reported"), _PUBLICATION_METADATA_DAMAGE)
+def test_validate_wheel_rejects_missing_publication_metadata(
+    tmp_path: Path, damage, reported: str
+) -> None:
+    project = copy.deepcopy(_PROJECT)
+    damage(project)
+    wheel = tmp_path / "cayu.whl"
+    _write_wheel(
+        wheel,
+        _valid_wheel_names(),
+        contents_by_name={f"{_WHEEL_DIST_INFO}/METADATA": _core_metadata(project)},
+    )
+    with pytest.raises(ValueError, match="publication metadata") as error:
+        validate_wheel(wheel)
+    assert reported in str(error.value)
+
+
+def test_validate_sdist_rejects_missing_publication_metadata(tmp_path: Path) -> None:
+    project = copy.deepcopy(_PROJECT)
+    _with_readme_documentation(project)
+    sdist = tmp_path / "cayu.tar.gz"
+    _write_sdist(sdist, contents_by_name={"PKG-INFO": _core_metadata(project)})
+    with pytest.raises(
+        ValueError, match="PKG-INFO publication metadata: project URL 'Documentation'"
+    ):
+        validate_sdist(sdist)
 
 
 def test_validate_wheel_requires_provider_compatibility_guide(tmp_path: Path) -> None:

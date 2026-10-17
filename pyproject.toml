@@ -5,12 +5,39 @@ build-backend = "hatchling.build"
 [project]
 name = "cayu"
 version = "0.11.4"
-description = "Cayu is an open-source Python framework for building and running domain-specific long-horizon agents, with a durable runtime built in."
+description = "Python runtime for long-running agents: durable sessions that survive restarts, human approval before side effects, spend caps, and multi-agent collaboration."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [
   { name = "Cayu Technologies, Inc." }
+]
+keywords = [
+  "agents",
+  "ai-agents",
+  "llm",
+  "durable-execution",
+  "long-running",
+  "human-in-the-loop",
+  "approvals",
+  "budgets",
+  "spend-limits",
+  "multi-agent",
+  "workflow",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Typing :: Typed",
 ]
 dependencies = [
   # Keep HTTPX's transitive TLS/process backend above its security-fix floor.
@@ -159,7 +186,7 @@ non-runtime-extras = { dev = "Contributor test and development tools are not run
 [project.urls]
 Homepage = "https://cayu.dev"
 Repository = "https://github.com/cayu-dev/cayu"
-Documentation = "https://github.com/cayu-dev/cayu#readme"
+Documentation = "https://cayu.dev/docs"
 Issues = "https://github.com/cayu-dev/cayu/issues"
 Changelog = "https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md"
 
