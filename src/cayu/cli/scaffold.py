@@ -977,6 +977,13 @@ _AGENTS_MD = (
     + """
 __AGENT_OWNERSHIP__
 
+## Jobs that wait, approve, or spend
+
+If the job waits for a person or an outside reply, needs approval before a side
+effect, sends reminders or expires requests, or must cap model spending, read
+`uv run --no-sync cayu guide long-running` first. It names the Cayu part for
+each pattern and the restart test that proves it.
+
 ## When the user asks for...
 
 Users describe product behavior, not Cayu concepts. Before building one of these
@@ -991,6 +998,7 @@ yourself, use the Cayu feature that already does it:
 | A new capability: call an API, read data, compute | A typed tool with a declared `ToolEffect` | `cayu guide references#domain-tool` |
 | A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from the served `client.js`. Do not poll on a fixed timer. | `cayu guide app-ui` |
 | Work that runs in the background or later | `TaskStore`, dispatcher and worker | `cayu guide references#background-work` |
+| Reminders, chasing, or expiry ("remind after 24 hours", "expire after a week") | A one-shot task with `available_at` and `TaskSchedulePolicy`, run by `run_task_worker`. Do not write a polling loop over timestamps. | `cayu guide long-running#timers` |
 | Remembering facts across conversations | The knowledge tools (remember, search) | `cayu guide references#knowledge` |
 | Running a fixed command or parsing files in isolation | `cayu new NAME --execution docker` on the agent preset: a hardened per-session sandbox your tools reach with `require_sandbox_runner(ctx)`. Don't switch to the coding preset for this. | `cayu guide references#environments` |
 | Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
@@ -2578,7 +2586,10 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--preset",
         choices=tuple(spec.name for spec in PRESETS),
-        help="Coherent application shape: agent (default), service, or coding.",
+        help=(
+            "Coherent application shape: agent (default), service, coding, or "
+            "long-running (approval, waits, timers, spend cap and restart tests)."
+        ),
     )
     # Deprecated: every project now selects its database at runtime through
     # CAYU_DATABASE_URL. Existing scripts and generated AGENTS.md commands may
@@ -2863,6 +2874,10 @@ def _rendered_project_files(
                 and {"delegation", "knowledge", "human-input"} <= set(plan.capabilities)
                 else "A maintained coding composition for a trusted Git repository. Its explicit\nconstructors expose only the capabilities selected in the scaffold profile."
                 if plan.preset == "coding"
+                else "A small invoice-payment agent that shows each long-running pattern: approval\nbefore a side effect, a waited-for reply, reminder and deadline timers, a\nper-session spend cap, and a restart test for each pause. Its registered agent\nidentity is `__AGENT_NAME__`.".replace(
+                    "__AGENT_NAME__", resolved_agent_name
+                )
+                if plan.preset == "long-running"
                 else "A Cayu application with the standard capability layout. Its registered agent\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
@@ -2970,6 +2985,11 @@ def _rendered_project_files(
         )
         return files
     if plan.preset == "agent":
+        return files
+    if plan.preset == "long-running":
+        from cayu.cli.scaffold_long_running import long_running_project_files
+
+        files.update(long_running_project_files(files=files, render=render, plan=plan))
         return files
     files.update(
         {

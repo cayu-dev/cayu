@@ -1,4 +1,13 @@
 {
+    "tests/cli/test_guide.py::test_every_registered_guide_is_listed_and_readable[long-running]": 0.03908629098441452,
+    "tests/cli/test_guide.py::test_every_registered_guide_is_listed_and_readable[restart-tests]": 0.03728391695767641,
+    "tests/cli/test_guide.py::test_long_running_guide_snippets_run_together": 3.860490374965593,
+    "tests/cli/test_scaffold_long_running.py::test_every_preset_points_waiting_and_spending_jobs_to_the_guide[agent]": 0.07208183303009719,
+    "tests/cli/test_scaffold_long_running.py::test_every_preset_points_waiting_and_spending_jobs_to_the_guide[coding]": 0.227296833996661,
+    "tests/cli/test_scaffold_long_running.py::test_every_preset_points_waiting_and_spending_jobs_to_the_guide[service]": 0.07668237399775535,
+    "tests/cli/test_scaffold_long_running.py::test_long_running_preset_is_listed_and_requires_its_patterns": 0.01546050002798438,
+    "tests/cli/test_scaffold_long_running.py::test_long_running_project_passes_its_own_tests_eval_and_check": 22.39827591716312,
+    "tests/cli/test_scaffold_long_running.py::test_optional_evals_can_be_left_out": 0.05318583396729082,
     "tests/cli/test_guide.py::test_cost_control_reference_states_spend_cap_behavior": 0.012109666015021503,
     "tests/core/test_price_book.py::test_bundled_price_book_prices_every_catalogued_model_for_a_usd_cap": 0.007793541066348553,
     "tests/core/test_price_book.py::test_usd_budget_limit_is_a_session_cap_priced_by_the_bundled_book": 0.008929500007070601,

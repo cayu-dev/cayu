@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
@@ -28,6 +29,7 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._model_failover import ModelTarget
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -35,7 +37,8 @@ from cayu.sessions.checkpoints import (
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import EventRecord, Session, SessionStatus
-from cayu.sessions.requests import ResumeRequest, RunRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest, copy_resume_request
+from cayu.storage import SQLiteSessionStore
 
 
 class OtherProvider(FakeProvider):
@@ -106,6 +109,173 @@ def test_cayu_app_resumes_completed_session_from_stored_transcript():
     session = asyncio.run(store.load("sess_resume"))
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+
+
+def test_resume_with_expected_run_epoch_is_refused_after_another_run():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta(text),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+            for text in ("first answer", "second answer", "unexpected answer")
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_conditional",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    inspected = asyncio.run(store.load("sess_conditional"))
+    assert inspected is not None
+
+    def continuation() -> ResumeRequest:
+        return ResumeRequest(
+            session_id="sess_conditional",
+            messages=[Message.text("user", "continue")],
+            expected_run_epoch=inspected.run_epoch,
+        )
+
+    request = continuation()
+    assert copy_resume_request(request).expected_run_epoch == inspected.run_epoch
+    assert "expected_run_epoch" not in ResumeRequest(
+        session_id="sess_conditional", messages=[Message.text("user", "x")]
+    ).model_dump(mode="json")
+
+    # The first continuation bound to the inspected epoch runs.
+    events = asyncio.run(collect_resume_events(app, request))
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len(provider.requests) == 2
+
+    # A second caller that inspected the same state is refused without a turn.
+    with pytest.raises(SessionRunFenced, match="expected run epoch"):
+        asyncio.run(collect_resume_events(app, continuation()))
+    assert len(provider.requests) == 2
+    session = asyncio.run(store.load("sess_conditional"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    transcript = asyncio.run(store.load_transcript("sess_conditional"))
+    assert [message.content[0].text for message in transcript][-1] == "second answer"
+
+
+@pytest.mark.parametrize("competitor", [None, "before_repair", "after_repair"])
+def test_resume_expected_run_epoch_survives_own_terminal_repair_only(tmp_path, competitor):
+    """The caller's own terminal repair keeps its expectation; another run does not."""
+
+    def make_app(store: SQLiteSessionStore, text: str) -> tuple[CayuApp, FakeProvider]:
+        provider = VersionedFakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta(text),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        return app, provider
+
+    async def scenario() -> None:
+        session_id = "sess_conditional_repair"
+        stale_store = SQLiteSessionStore(tmp_path / "sessions.db")
+        other_store = SQLiteSessionStore(tmp_path / "sessions.db")
+        stale_app, stale_provider = make_app(stale_store, "stale answer")
+        other_app, other_provider = make_app(other_store, "other answer")
+        try:
+            # A completed session whose terminal evidence was never published,
+            # so the next continuation must repair it before admission.
+            await stale_store.create(
+                run_request_with_registered_tool_ceiling(
+                    stale_app,
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=profiled_session_identity(
+                    provider_name="fake", model="fake-model", app=stale_app
+                ),
+            )
+            await stale_store.append_transcript_messages(
+                session_id, [Message.text("user", "start")]
+            )
+            await stale_store.append_event(
+                session_id,
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+            )
+            await stale_store.update_status(session_id, SessionStatus.COMPLETED)
+            inspected = await stale_store.load(session_id)
+            assert inspected is not None
+
+            finalization = stale_app._terminal_finalization
+            original_repair_owned = type(finalization).repair_owned
+
+            async def other_continuation() -> None:
+                await collect_resume_events(
+                    other_app,
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "other continuation")],
+                    ),
+                )
+
+            async def repair_owned(self, **kwargs):
+                if self is finalization and competitor == "before_repair":
+                    await other_continuation()
+                result = await original_repair_owned(self, **kwargs)
+                if self is finalization and competitor == "after_repair":
+                    await other_continuation()
+                return result
+
+            request = ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "stale continuation")],
+                expected_run_epoch=inspected.run_epoch,
+            )
+            with patch.object(type(finalization), "repair_owned", repair_owned):
+                if competitor is None:
+                    events = await collect_resume_events(stale_app, request)
+                    # Admitted after its own repair moved the epoch from 0 to 2.
+                    assert events[0].type == EventType.SESSION_RESUMED
+                    assert events[0].payload["run_epoch"] == inspected.run_epoch + 3
+                    assert events[-1].type == EventType.SESSION_COMPLETED
+                    assert len(stale_provider.requests) == 1
+                    return
+                with pytest.raises(SessionRunFenced, match="expected run epoch"):
+                    await collect_resume_events(stale_app, request)
+            assert len(other_provider.requests) == 1
+            assert len(stale_provider.requests) == 0
+            session = await stale_store.load(session_id)
+            assert session is not None
+            assert session.status is SessionStatus.COMPLETED
+            # The refused caller left the winner's session exactly as it was.
+            assert session.run_epoch == inspected.run_epoch + 4
+            transcript = await stale_store.load_transcript(session_id)
+            assert [message.content[0].text for message in transcript] == [
+                "start",
+                "other continuation",
+                "other answer",
+            ]
+        finally:
+            await stale_app.aclose()
+            await other_app.aclose()
+            await stale_store.close()
+            await other_store.close()
+
+    asyncio.run(scenario())
 
 
 def test_cayu_app_rejects_completed_session_with_pending_tool_round():

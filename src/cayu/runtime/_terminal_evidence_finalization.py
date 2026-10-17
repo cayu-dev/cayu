@@ -91,6 +91,7 @@ from cayu.sessions._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,
@@ -1146,6 +1147,7 @@ class TerminalEvidenceFinalization:
         session: Session,
         inactive_for_seconds: int | None,
         previous_status: SessionStatus,
+        required_run_epoch: int | None = None,
     ) -> IncompleteSessionRecoveryResult:
         claim: _IncompleteRecoveryClaim | None = None
         authoritative_failure: BaseException | None = None
@@ -1153,6 +1155,7 @@ class TerminalEvidenceFinalization:
             claim = await self._recovery.claim(
                 session=session,
                 inactive_for_seconds=inactive_for_seconds,
+                required_run_epoch=required_run_epoch,
             )
             if claim is None:
                 current = await self._recovery.require_session(session.id)
@@ -1189,8 +1192,15 @@ class TerminalEvidenceFinalization:
         *,
         session: Session,
         checkpoint: dict[str, Any] | None,
+        expected_run_epoch: int | None = None,
     ) -> tuple[Session, dict[str, Any] | None]:
-        """Finish a previous run's terminal publication before claiming the next run."""
+        """Finish a previous run's terminal publication before claiming the next run.
+
+        With ``expected_run_epoch``, the repair runs only from that epoch, and the
+        returned session must be exactly the one this repair released. Admission
+        compares the returned session's run epoch, so any run started by
+        another caller after the inspection fences the continuation.
+        """
         if session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES:
             if _session_run_operation_from_checkpoint(checkpoint) is None:
                 return session, checkpoint
@@ -1210,8 +1220,16 @@ class TerminalEvidenceFinalization:
             session=session,
             inactive_for_seconds=None,
             previous_status=session.status,
+            required_run_epoch=expected_run_epoch,
         )
         current = await self._recovery.require_session(session.id)
+        # The repair claim fences the expected epoch once and its release
+        # advances it once more. Any other epoch means someone else ran.
+        if expected_run_epoch is not None and current.run_epoch != expected_run_epoch + 2:
+            raise SessionRunFenced(
+                f"Resume expected run epoch {expected_run_epoch}, but the session moved to "
+                f"{current.run_epoch} during terminal repair."
+            )
         current_checkpoint = await self._session_store.load_checkpoint(session.id)
         if await self.repair_required(
             session=current,

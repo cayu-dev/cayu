@@ -54,6 +54,10 @@ _GUIDES = {
         "human-attention.md",
         "Durable notifications over canonical pending actions.",
     ),
+    "long-running": (
+        "long-running.md",
+        "Approvals, outside replies, timers, spend caps and restart tests on one page.",
+    ),
     "providers": (
         "providers.md",
         "Primary integrations and compatible Chat Completions endpoints.",
@@ -106,6 +110,7 @@ _RELATED = {
     "evals-ai-quality": ("evals-first", "evals-production", "authoring"),
     "evals-first": ("evals-ai-quality", "evals-production", "authoring"),
     "evals-production": ("evals-first", "evals-ai-quality", "durable-operations"),
+    "long-running": ("restart-tests", "durable-operations", "human-attention", "references"),
     "providers": ("thinking", "authoring", "diagnostics"),
     "thinking": ("providers", "authoring"),
     "references": ("authoring", "durable-operations"),

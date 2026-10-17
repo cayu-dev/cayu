@@ -832,3 +832,72 @@ def test_restart_tests_guide_example_runs_across_a_restart(capsys, tmp_path: Pat
         capsys.readouterr()
     assert main(["guide", "authoring"]) == 0
     assert "cayu guide restart-tests" in capsys.readouterr().out
+
+
+def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from cayu.messages import Message
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions import PendingActionKind
+    from cayu.sessions.requests import RunRequest
+    from cayu.testing import RestartHarness
+
+    assert main(["guide", "long-running"]) == 0
+    guide = capsys.readouterr().out
+    assert len(guide.splitlines()) <= 160
+    snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
+    assert len(snippets) == 5
+    namespace: dict[str, Any] = {}
+    for snippet in snippets:
+        exec(compile(snippet, "long-running", "exec"), namespace)
+
+    # Approval and restart: the guide's own restart test.
+    namespace["test_payment_survives_restart"](tmp_path / "approval")
+    assert list(namespace["PAID"].values()) == ["INV-7"]
+
+    # Spend cap: the request carries the session limit priced by the default book.
+    [limit] = namespace["request"].budget_limits
+    assert limit.scope == "session"
+    assert limit.max_estimated_cost == 5
+
+    # Outside reply and timer: pause on ask_user, build the reminder, restart, reply.
+    ask = ModelStreamEvent.tool_call(name="ask_user", arguments={"question": "Amount?"})
+    script = [
+        [ask, ModelStreamEvent.completed()],
+        [ModelStreamEvent.text_delta("Done."), ModelStreamEvent.completed()],
+    ]
+
+    async def scenario() -> None:
+        async with RestartHarness(
+            namespace["build_app"], store_dir=tmp_path / "reply", model_script=script
+        ) as harness:
+            paused = await harness.run(
+                RunRequest(
+                    agent_name="invoices",
+                    session_id="inv-8",
+                    messages=[Message.text("user", "Pay INV-8.")],
+                )
+            )
+            [question] = paused.pending_user_inputs
+            assert question.kind is PendingActionKind.USER_INPUT
+            created = await harness.app.create_task(namespace["reminder_task"](question))
+            assert created.available_at == question.event.event.timestamp + timedelta(hours=24)
+            again = await harness.app.create_task(namespace["reminder_task"](question))
+            assert again.id == created.id
+
+            await harness.restart()
+            assert await harness.app.task_store.load_task(created.id) is not None
+            await namespace["record_reply"](harness.app, "inv-8", "$125.00")
+            session = await harness.app.session_store.load("inv-8")
+            assert session is not None and session.status.value == "completed"
+
+    asyncio.run(scenario())
+
+    for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
+        assert main(["guide", reference]) == 0, reference
+        capsys.readouterr()
+    assert main(["guide", "authoring#cayu-map"]) == 0
+    cayu_map = capsys.readouterr().out
+    for phrase in ("Remind after N hours", "Cap spending", "Wait for an email reply"):
+        assert phrase in cayu_map

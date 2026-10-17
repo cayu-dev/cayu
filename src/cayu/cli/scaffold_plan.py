@@ -14,7 +14,7 @@ from cayu._operator_credentials import OPERATOR_PASSWORD_VARIABLE, OPERATOR_USER
 
 SCAFFOLD_CONVENTION_VERSION = 1
 
-PresetName = Literal["agent", "service", "coding"]
+PresetName = Literal["agent", "service", "coding", "long-running"]
 ProviderName = Literal[
     "neutral",
     "openai",
@@ -154,6 +154,22 @@ PRESETS: tuple[PresetSpec, ...] = (
         supported_executions=("none", "docker"),
         environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
     ),
+    PresetSpec(
+        name="long-running",
+        summary=(
+            "Agent example with approval, a waited-for reply, reminder and deadline "
+            "timers, a spend cap, and restart tests."
+        ),
+        default_capabilities=(
+            "approvals",
+            "evals",
+            "human-input",
+            "observability",
+            "recovery",
+            "tasks",
+        ),
+        environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
+    ),
 )
 
 ADAPTERS: tuple[AdapterSpec, ...] = (
@@ -161,47 +177,47 @@ ADAPTERS: tuple[AdapterSpec, ...] = (
         name="neutral",
         kind="provider",
         summary="Credential-free provider-neutral construction.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
     ),
     AdapterSpec(
         name="openai",
         kind="provider",
         summary="OpenAI Platform API provider.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         environment=("OPENAI_API_KEY",),
     ),
     AdapterSpec(
         name="anthropic",
         kind="provider",
         summary="Anthropic API provider.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         environment=("ANTHROPIC_API_KEY",),
     ),
     AdapterSpec(
         name="cayu-gateway",
         kind="provider",
         summary="Cayu Gateway Chat Completions provider.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         environment=("CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL", "CAYU_MODEL"),
     ),
     AdapterSpec(
         name="openrouter",
         kind="provider",
         summary="OpenRouter compatible chat-completions provider.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         environment=("OPENROUTER_API_KEY", "CAYU_MODEL"),
     ),
     AdapterSpec(
         name="openai-subscription",
         kind="provider",
         summary="Local OpenAI subscription development provider.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
     ),
     AdapterSpec(
         name="none",
         kind="execution",
         summary="No generated command-execution backend.",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
     ),
     AdapterSpec(
         name="docker",
@@ -238,14 +254,14 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="mcp",
         summary="External MCP clients, protocols, and hosted-tool adapters.",
         status="extension-only",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         files=("integrations/mcp.py",),
     ),
     CapabilitySpec(
         name="tasks",
         summary="Durable tasks and application-owned operation lifecycle wiring.",
         status="preset-owned",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         files=("operations/tasks.py",),
     ),
     CapabilitySpec(
@@ -268,14 +284,14 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="human-input",
         summary="Durable pause and application-owned human input resolution.",
         status="preset-owned",
-        supported_presets=("agent", "coding"),
+        supported_presets=("agent", "coding", "long-running"),
         files=("operations/approvals.py",),
     ),
     CapabilitySpec(
         name="approvals",
         summary="Explicit approval policy and settlement boundaries.",
         status="preset-owned",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         files=("operations/approvals.py", "policies/tools.py"),
     ),
     CapabilitySpec(
@@ -291,7 +307,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="recovery",
         summary="Durable interruption inspection and explicit recovery entry points.",
         status="preset-owned",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         files=("operations/recovery.py", "operations/workers.py"),
         verification=("uv run --no-sync cayu inspect --json",),
     ),
@@ -299,7 +315,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="evals",
         summary="Credential-free behavioral acceptance and durable eval evidence.",
         status="preset-owned",
-        supported_presets=("agent", "service", "coding"),
+        supported_presets=("agent", "service", "coding", "long-running"),
         files=("evals/",),
         verification=("uv run --no-sync cayu eval run",),
     ),
@@ -307,7 +323,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="observability",
         summary="Event sinks, logging, tracing, and metrics adapters.",
         status="selectable",
-        supported_presets=("agent", "service"),
+        supported_presets=("agent", "service", "long-running"),
         files=("configuration/runtime.py", "observability/"),
         verification=("uv run --no-sync cayu inspect --json", "uv run --no-sync pytest"),
     ),
@@ -377,6 +393,7 @@ class ApplicationPlan:
             "agent": "uv run --no-sync pytest",
             "service": "uv run --no-sync pytest -q tests/test_public_service_security.py",
             "coding": "uv run --no-sync pytest -q tests/test_coding_composition.py",
+            "long-running": "uv run --no-sync pytest",
         }[self.preset]
         if self.execution == "docker" and self.preset == "agent":
             setup: tuple[str, ...] = (
@@ -568,6 +585,9 @@ def normalize_application_plan(
                 )
 
     required = {"tasks"} if preset == "service" else set()
+    if preset == "long-running":
+        # The example's approval, reply and timer patterns are built on these.
+        required.update(("approvals", "human-input", "tasks"))
     if preset == "coding" and execution == "docker":
         required.add("artifacts")
     missing = sorted(required - capabilities)

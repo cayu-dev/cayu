@@ -614,6 +614,14 @@ def _fork_initial_profile_actor() -> ResolutionActor:
     )
 
 
+def _require_expected_resume_run_epoch(session: Session, request: ResumeRequest) -> None:
+    expected = request.expected_run_epoch
+    if expected is not None and session.run_epoch != expected:
+        raise SessionRunFenced(
+            f"Resume expected run epoch {expected}, but the session is at {session.run_epoch}."
+        )
+
+
 def _require_exact_fork_initial_invocation_profile(
     session: Session,
     request: ResumeRequest,
@@ -3646,17 +3654,13 @@ class SessionEngine:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
         await self._require_participant_execution(loaded_session, participant_context)
+        # Refuse a stale conditional resume before recovery or admission mutates.
+        _require_expected_resume_run_epoch(loaded_session, request)
         if (
             request.expected_session_instance_id is not None
             and loaded_session.instance_id != request.expected_session_instance_id
         ):
             raise SessionStatusConflict("The session was replaced before this turn could resume.")
-        if (
-            request.expected_run_epoch is not None
-            and loaded_session.run_epoch != request.expected_run_epoch
-        ):
-            raise SessionStatusConflict("The session run changed before this turn could resume.")
-
         if (
             required_task_session_instance_id is not None
             and loaded_session.instance_id != required_task_session_instance_id
@@ -3765,6 +3769,10 @@ class SessionEngine:
                     "The session run changed before this turn could resume."
                 )
             await self._require_participant_execution(loaded_session, participant_context)
+        else:
+            # Recovery above binds its own released epoch; otherwise retain the
+            # caller's inspected epoch through the atomic admission below.
+            _require_expected_resume_run_epoch(loaded_session, request)
         fork_initial_profile = _require_exact_fork_initial_invocation_profile(
             loaded_session,
             request,
@@ -4359,6 +4367,9 @@ class SessionEngine:
         ) = await self._terminal_finalization.reconcile_before_continuation(
             session=loaded_session,
             checkpoint=checkpoint,
+            expected_run_epoch=(
+                loaded_session.run_epoch if request.expected_run_epoch is not None else None
+            ),
         )
         validate_resumable_checkpoint(loaded_session, checkpoint)
 

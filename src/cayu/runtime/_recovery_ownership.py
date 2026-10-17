@@ -1289,6 +1289,7 @@ class RecoveryOwnership:
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
         target_status: SessionStatus | None = None,
+        required_run_epoch: int | None = None,
     ) -> _IncompleteRecoveryClaim | None:
         if required_expired_claim_id is not None:
             required_expired_claim_id = require_clean_nonblank(
@@ -1330,6 +1331,10 @@ class RecoveryOwnership:
             ):
                 raise _IncompleteRecoveryClaimLost(
                     "Incomplete-session recovery target incarnation changed."
+                )
+            if required_run_epoch is not None and current_session.run_epoch != required_run_epoch:
+                raise _IncompleteRecoveryClaimLost(
+                    "Incomplete-session recovery target run epoch changed."
                 )
             if (
                 active_provider_operation_cancellation_claim_from_checkpoint(

@@ -47,6 +47,10 @@ only when the requested behavior requires it.
 | Rebuild service-backed tools after a restart | component behavior identities, injected or environment-bound knowledge | `cayu guide durable-service-tools` |
 | Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
 | Prove a paused session survives a restart | `RestartHarness`, durable stores, pending actions | `cayu guide restart-tests` |
+| "Require approval before it pays, sends or deletes" | `ToolPolicy` with `REQUIRE_APPROVAL` (`AlwaysRequireApprovalToolPolicy`), `ToolEffect.IDEMPOTENT`, idempotency key | `cayu guide long-running#approval-before-a-side-effect` |
+| "Wait for an email reply", a document or a goods receipt | `UserInputTool` (`ask_user`), `UserInputResponse`, `resolve_user_input` | `cayu guide long-running#waiting-for-an-outside-reply` |
+| "Remind after N hours", chase, or expire a request | `TaskCreate(available_at=...)`, `TaskSchedulePolicy(expires_at=...)`, `run_task_worker` | `cayu guide long-running#timers` |
+| "Cap spending" per session or job | `BudgetLimit(scope="session")`, `default_price_book()`, `BudgetPolicy` for app or agent caps | `cayu guide long-running#spend-cap` |
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
 | Application workspace references or inventories | `WorkspaceReferenceBinding`, `ToolContext.require_workspace_binding` | `cayu guide authoring#workspace-references-and-inventories` |
 | Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |

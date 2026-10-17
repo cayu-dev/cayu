@@ -219,7 +219,11 @@ run requires a clean committed Git source baseline. It also requires `git`,
 application construction. Its local workspace and runner are trusted-host
 development adapters, not a hostile-code sandbox. The default scaffold is the
 complete Cayu application convention. Select `--preset agent`, `--preset service`,
-or `--preset coding`; optional capabilities share the same application layout.
+`--preset coding`, or `--preset long-running`; optional capabilities share the same
+application layout. The long-running preset is a small working example of
+approval before a side effect, a waited-for reply, reminder and deadline timers,
+a per-session spend cap, and restart tests; `cayu guide long-running` explains
+each part on one page.
 
 Discover or review the Rails-style generation plan before writing:
 

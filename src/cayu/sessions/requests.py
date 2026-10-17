@@ -474,6 +474,13 @@ class ResumeRequest(BaseModel):
     profile-bound model completion when available. Explicit values still pass
     normal execution-profile admission. Legacy/fork sessions without matching
     evidence use application defaults. This does not reset session-scoped limits.
+
+    ``expected_run_epoch`` makes the resume conditional: it is admitted only
+    while ``Session.run_epoch`` still has that value, checked in the same
+    durable admission that starts the run. Any run admitted after the caller
+    read the session advances the epoch, so a caller that inspected a session
+    and decided to continue it gets ``SessionRunFenced`` instead of a second
+    turn when another process continued it first.
     """
 
     model_config = ConfigDict(

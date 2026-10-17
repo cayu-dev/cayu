@@ -15,7 +15,7 @@ it cannot see every account, so prefer a parent that is not group-writable there
 
 ## Convention
 
-Normal agent, service, and coding presets share these ownership boundaries:
+Normal agent, service, coding, and long-running presets share these ownership boundaries:
 
 | Concern | Canonical home |
 | --- | --- |
@@ -192,7 +192,10 @@ owning-file diff and update the existing source plus `[tool.cayu.scaffold]`
 explicitly. `cayu new`, `cayu check`, and `cayu inspect` never migrate a project.
 
 All presets use the same application convention. Use `--preset` and `--execution`
-to select the application and execution environment.
+to select the application and execution environment. `--preset long-running` is
+the agent layout plus a worked example of approval, a waited-for reply,
+reminder and deadline timers, a spend cap, and restart tests; see
+`cayu guide long-running`.
 
 ## Durable data
 

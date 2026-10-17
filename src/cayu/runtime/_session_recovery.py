@@ -1382,7 +1382,11 @@ class SessionRecovery:
         if request.expected_run_epoch is not None and (
             session is None or session.run_epoch != request.expected_run_epoch
         ):
-            raise SessionStatusConflict("The session run changed before this turn could resume.")
+            actual_epoch = None if session is None else session.run_epoch
+            raise SessionRunFenced(
+                f"Resume expected run epoch {request.expected_run_epoch}, "
+                f"but the session is at {actual_epoch}."
+            )
         from cayu.runtime._resume_configuration import inherit_resume_configuration
 
         # Bind adoption replay to the caller's request before resolving controls
