@@ -13,6 +13,7 @@ from tests.core.test_agent_snapshots import _capture_request, _providers
 from tests.core.test_agent_snapshots import _snapshot as _memory_snapshot
 
 from cayu.snapshots import (
+    AgentSnapshot,
     AgentSnapshotAuthorityRef,
     AgentSnapshotAuthorizationError,
     AgentSnapshotComponentKind,
@@ -487,6 +488,128 @@ async def test_materialization_progress_is_compare_and_set_and_finalization_repl
     )
     with pytest.raises(AgentSnapshotStoreConflict, match="another identity"):
         await store.save_materialization(different)
+
+
+def _tenant_snapshots():
+    """Two authority scopes that registered identical content at one shared root."""
+
+    evaluator = AgentSnapshotAuthorityRef(
+        identity=AgentSnapshotLogicalRef(fingerprint=_digest("evaluator"), revision="evaluator-v1")
+    )
+    first, second = (
+        AgentSnapshot.model_validate(
+            _snapshot(authority_scope=scope)
+            .model_copy(update={"evaluator": evaluator})
+            .model_dump(mode="json")
+        )
+        for scope in (_digest("first-tenant"), _digest("second-tenant"))
+    )
+    assert first.snapshot_root == second.snapshot_root
+    assert first.authority_scope_fingerprint != second.authority_scope_fingerprint
+    return first, second
+
+
+def _tenant_request(snapshot, *, state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL):
+    return AgentSnapshotMaterializationRequest(
+        access=_access(snapshot),
+        candidate_id="candidate-a",
+        trial_id="trial-1",
+        state_mode=state_mode,
+    )
+
+
+@pytest.mark.parametrize(
+    "state_mode",
+    [
+        AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
+        AgentSnapshotTrialStateMode.ACCUMULATE_WITHIN_CANDIDATE,
+    ],
+)
+async def test_materialization_is_never_reused_across_authority_scopes(backend, state_mode) -> None:
+    first, second = _tenant_snapshots()
+    store = backend.open()
+    await store.put_snapshot(first, first.identity_binding)
+    await store.put_snapshot(second, second.identity_binding)
+    first_request = _tenant_request(first, state_mode=state_mode)
+    second_request = _tenant_request(second, state_mode=state_mode)
+    assert first_request.state_scope_id != second_request.state_scope_id
+
+    first_providers = _providers(first)
+    first_coordinator = AgentSnapshotCoordinator(first_providers, store=store)
+    first_materialization = await first_coordinator.materialize(first_request)
+    assert first_materialization.authority_scope_fingerprint == first.authority_scope_fingerprint
+
+    second_providers = _providers(second)
+    second_coordinator = AgentSnapshotCoordinator(second_providers, store=backend.open())
+    second_materialization = await second_coordinator.materialize(second_request)
+
+    assert second_materialization.fingerprint != first_materialization.fingerprint
+    assert second_materialization.authority_scope_fingerprint == (
+        second.authority_scope_fingerprint
+    )
+    assert sum(provider.materialize_calls for provider in second_providers) == len(
+        second.components
+    )
+    first_overlays = {
+        component.overlay.fingerprint
+        for component in first_materialization.components
+        if component.overlay is not None
+    }
+    second_overlays = [
+        component.overlay
+        for component in second_materialization.components
+        if component.overlay is not None
+    ]
+    assert second_overlays
+    for overlay in second_overlays:
+        assert overlay.state_scope_id == second_request.state_scope_id
+        assert overlay.fingerprint not in first_overlays
+
+    reopened = backend.open()
+    assert await reopened.load_materialization_for_scope(first_request) == (first_materialization)
+    assert await reopened.load_materialization_for_scope(second_request) == (second_materialization)
+    with pytest.raises(AgentSnapshotAuthorizationError, match="authority scope"):
+        await second_coordinator.recover_materialization(
+            first_materialization.fingerprint, access=_access(second)
+        )
+
+    # The shared root manifest belongs to whichever scope stored it first; each
+    # scope's trial still derives its own materialization scope.
+    for coordinator, materialization in (
+        (first_coordinator, first_materialization),
+        (second_coordinator, second_materialization),
+    ):
+        trial = await coordinator.begin_trial(
+            materialization,
+            case_id="case-1",
+            trial_id="trial-1",
+            evaluator_fingerprint=_digest("evaluator"),
+        )
+        assert trial.materialization_fingerprint == materialization.fingerprint
+
+
+async def test_materialization_progress_is_scoped_to_the_requesting_authority(backend) -> None:
+    first, second = _tenant_snapshots()
+    store = backend.open()
+    first_request = _tenant_request(first)
+    second_request = _tenant_request(second)
+    created_at = datetime(2026, 8, 23, tzinfo=UTC)
+    first_progress = await store.begin_materialization(
+        AgentSnapshotMaterializationProgress.create(
+            request=first_request, created_at=created_at, components=first.components
+        )
+    )
+    assert await backend.open().load_materialization_progress_for_scope(second_request) is None
+    assert first_progress.authority_scope_fingerprint == first.authority_scope_fingerprint
+    second_initial = AgentSnapshotMaterializationProgress.create(
+        request=second_request, created_at=created_at, components=second.components
+    )
+    assert second_initial.progress_id != first_progress.progress_id
+    second_progress = await store.begin_materialization(second_initial)
+    assert second_progress == second_initial
+    assert await backend.open().load_materialization_progress_for_scope(first_request) == (
+        first_progress
+    )
 
 
 async def test_postgres_writes_wait_for_a_retention_share_fence_without_deadlock(

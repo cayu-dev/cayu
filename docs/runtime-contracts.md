@@ -17155,12 +17155,19 @@ to the exact snapshot, candidate, and state scope, and the overlay kind must
 match the owning memory or workspace component. `reset_each_trial` derives a
 distinct scope for every trial; `accumulate_within_candidate` deliberately
 reuses only one candidate-local scope. State never accumulates implicitly
-across candidates.
+across candidates. Snapshot roots are shared by every authority scope that
+registers the same content, so the state scope also includes the authority
+scope of the requesting access, and the materialization and its progress record
+it: the same root, candidate and trial ids under another authority scope get
+their own durable progress, provider operations and overlays, and recovering a
+materialization through another scope's access fails with
+`AgentSnapshotAuthorizationError`.
 The returned `AgentSnapshotTrialBinding` binds snapshot, materialization,
 candidate, overlay, hidden-case alias, trial, and evaluator identities and can
 be placed in ordinary Cayu `RunRequest.metadata` with `session_metadata()`.
 Beginning a trial reloads and validates the exact starting snapshot and
-materialization, re-derives a reset scope from the supplied trial id, and
+materialization, re-derives a reset scope from the supplied trial id and the
+materialization's authority scope, and
 requires the evaluator identity declared by the snapshot; an absent or changed
 evaluator fails closed.
 `AgentSnapshotResultBinding` then binds the durable trial to its Cayu session,

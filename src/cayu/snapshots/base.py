@@ -2019,7 +2019,17 @@ class AgentSnapshotMaterializationRequest(_SnapshotModel):
         trial_id: str,
         state_mode: AgentSnapshotTrialStateMode,
         state_partition_fingerprint: str | None = None,
+        authority_scope_fingerprint: str | None = None,
     ) -> str:
+        """Derive the private state scope one materialization request owns.
+
+        Snapshot roots are shared across authority scopes, so the scope includes
+        the authority scope of the access that requested it: identical content,
+        candidate and trial ids under two authority scopes never share durable
+        progress, a final materialization or provider overlays. Omitting the
+        authority scope derives the scope of records written before it was bound.
+        """
+
         snapshot_fingerprint = _sha256_hex(snapshot_fingerprint, "snapshot_fingerprint")
         candidate_id = _clean(candidate_id, "candidate_id", max_chars=256)
         trial_id = _clean(trial_id, "trial_id", max_chars=256)
@@ -2040,7 +2050,16 @@ class AgentSnapshotMaterializationRequest(_SnapshotModel):
         }
         if state_partition_fingerprint is not None:
             material["state_partition_fingerprint"] = state_partition_fingerprint
+        if authority_scope_fingerprint is not None:
+            material["authority_scope_fingerprint"] = _sha256_hex(
+                authority_scope_fingerprint,
+                "authority_scope_fingerprint",
+            )
         return _content_sha256(material, "snapshot_state_scope")
+
+    @property
+    def authority_scope_fingerprint(self) -> str:
+        return self.access.authority_scope_fingerprint
 
     @property
     def state_scope_id(self) -> str:
@@ -2050,6 +2069,7 @@ class AgentSnapshotMaterializationRequest(_SnapshotModel):
             trial_id=self.trial_id,
             state_mode=self.state_mode,
             state_partition_fingerprint=self.state_partition_fingerprint,
+            authority_scope_fingerprint=self.authority_scope_fingerprint,
         )
 
 
@@ -2166,6 +2186,12 @@ class AgentSnapshotMaterialization(_SnapshotModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # None only on records written before materialization scopes were bound to
+    # the requesting authority scope (#2556).
+    authority_scope_fingerprint: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     created_at: datetime
     components: tuple[AgentSnapshotMaterializedComponent, ...]
 
@@ -2174,6 +2200,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
         "progress_id",
         "snapshot_fingerprint",
         "state_partition_fingerprint",
+        "authority_scope_fingerprint",
     )
     @classmethod
     def validate_fingerprint(cls, value: str | None, info) -> str | None:
@@ -2221,6 +2248,8 @@ class AgentSnapshotMaterialization(_SnapshotModel):
         }
         if self.state_partition_fingerprint is not None:
             material["state_partition_fingerprint"] = self.state_partition_fingerprint
+        if self.authority_scope_fingerprint is not None:
+            material["authority_scope_fingerprint"] = self.authority_scope_fingerprint
         return material
 
     @classmethod
@@ -2241,6 +2270,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
             state_partition_fingerprint=request.state_partition_fingerprint,
+            authority_scope_fingerprint=request.authority_scope_fingerprint,
             created_at=created_at,
             components=ordered,
         )
@@ -2254,6 +2284,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
             state_partition_fingerprint=request.state_partition_fingerprint,
+            authority_scope_fingerprint=request.authority_scope_fingerprint,
             created_at=created_at,
             components=ordered,
         )
@@ -2275,6 +2306,12 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # None only on records written before materialization scopes were bound to
+    # the requesting authority scope (#2556).
+    authority_scope_fingerprint: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     created_at: datetime
     operations: tuple[AgentSnapshotMaterializationOperation, ...]
     revision: StrictInt = Field(ge=0)
@@ -2286,6 +2323,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
         "progress_id",
         "snapshot_fingerprint",
         "state_partition_fingerprint",
+        "authority_scope_fingerprint",
         "active_operation_id",
         "materialization_fingerprint",
     )
@@ -2371,6 +2409,8 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
         }
         if self.state_partition_fingerprint is not None:
             material["state_partition_fingerprint"] = self.state_partition_fingerprint
+        if self.authority_scope_fingerprint is not None:
+            material["authority_scope_fingerprint"] = self.authority_scope_fingerprint
         return material
 
     @classmethod
@@ -2400,6 +2440,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
             state_partition_fingerprint=request.state_partition_fingerprint,
+            authority_scope_fingerprint=request.authority_scope_fingerprint,
             created_at=created_at,
             operations=operations,
             revision=0,
@@ -2416,6 +2457,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
             state_partition_fingerprint=request.state_partition_fingerprint,
+            authority_scope_fingerprint=request.authority_scope_fingerprint,
             created_at=created_at,
             operations=operations,
             revision=0,
@@ -3298,6 +3340,7 @@ def _final_progress(
         or materialization.state_scope_id != progress.state_scope_id
         or materialization.state_mode is not progress.state_mode
         or materialization.state_partition_fingerprint != progress.state_partition_fingerprint
+        or materialization.authority_scope_fingerprint != progress.authority_scope_fingerprint
         or tuple(component.identity_material() for component in materialization.components)
         != tuple(component.identity_material() for component in progress.components)
     ):
@@ -3361,6 +3404,7 @@ def _require_scope_materialization(
     try:
         if (
             _scope_key(progress) != _scope_key(request)
+            or progress.authority_scope_fingerprint != request.authority_scope_fingerprint
             or progress.materialization_fingerprint != materialization.fingerprint
         ):
             raise AgentSnapshotStoreConflict(
@@ -6527,6 +6571,13 @@ class AgentSnapshotCoordinator:
             raise AgentSnapshotAuthorizationError(
                 "Materialization access belongs to another snapshot."
             )
+        if materialization.authority_scope_fingerprint not in {
+            None,
+            access.authority_scope_fingerprint,
+        }:
+            raise AgentSnapshotAuthorizationError(
+                "Materialization belongs to another authority scope."
+            )
         snapshot = await self.store.get_snapshot(access)
         if snapshot.fingerprint != materialization.snapshot_fingerprint:
             raise AgentSnapshotMaterializationError("Starting snapshot identity changed.")
@@ -6574,8 +6625,13 @@ class AgentSnapshotCoordinator:
             recovered.append(value)
         # Accumulating candidates derive the same scope without a trial id. A
         # reset-each-trial materialization cannot be reconstructed from a made-up
-        # trial id, so retain and directly validate its durable identity instead.
-        if materialization.state_mode is AgentSnapshotTrialStateMode.RESET_EACH_TRIAL:
+        # trial id, and a record written before scopes carried the authority scope
+        # cannot be reconstructed from a current request, so retain and directly
+        # validate their durable identity instead.
+        if (
+            materialization.state_mode is AgentSnapshotTrialStateMode.RESET_EACH_TRIAL
+            or materialization.authority_scope_fingerprint is None
+        ):
             candidate = AgentSnapshotMaterialization.model_validate(
                 materialization.model_copy(update={"components": tuple(recovered)}).model_dump(
                     mode="json"
@@ -6643,18 +6699,17 @@ class AgentSnapshotCoordinator:
             raise AgentSnapshotMaterializationError("Starting snapshot identity changed.")
         await self.verify(snapshot)
         self._validate_materialization_against_snapshot(snapshot, stored)
-        trial_request = AgentSnapshotMaterializationRequest(
-            access=AgentSnapshotAccess(
-                snapshot=snapshot.ref,
-                binding_id=snapshot.identity_binding.binding_id,
-                authority_scope_fingerprint=snapshot.authority_scope_fingerprint,
-            ),
+        # The root manifest is shared by every authority scope that registered
+        # it, so the trial scope comes from the materialization's own authority.
+        trial_scope_id = AgentSnapshotMaterializationRequest.derive_state_scope_id(
+            snapshot_fingerprint=stored.snapshot_fingerprint,
             candidate_id=stored.candidate_id,
             trial_id=trial_id,
             state_mode=stored.state_mode,
             state_partition_fingerprint=stored.state_partition_fingerprint,
+            authority_scope_fingerprint=stored.authority_scope_fingerprint,
         )
-        if trial_request.state_scope_id != stored.state_scope_id:
+        if trial_scope_id != stored.state_scope_id:
             raise AgentSnapshotMaterializationError(
                 "Trial identity does not match the materialization state scope."
             )

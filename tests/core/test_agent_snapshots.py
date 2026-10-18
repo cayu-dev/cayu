@@ -5,6 +5,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from functools import wraps
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -1149,6 +1150,130 @@ def test_default_materialization_identity_preserves_base_record_shape() -> None:
     assert partitioned_operation.model_dump(mode="json")["state_partition_fingerprint"] == _digest(
         "partition-a"
     )
+
+
+def test_materialization_scope_binds_the_requesting_authority_scope() -> None:
+    snapshot = _snapshot()
+    request = AgentSnapshotMaterializationRequest(
+        access=_access(snapshot),
+        candidate_id="candidate-a",
+        trial_id="trial-1",
+        state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
+    )
+    other_scope = request.model_copy(
+        update={
+            "access": request.access.model_copy(
+                update={"authority_scope_fingerprint": _digest("other-scope")}
+            )
+        }
+    )
+    derived = {
+        "snapshot_fingerprint": request.snapshot_fingerprint,
+        "candidate_id": request.candidate_id,
+        "trial_id": request.trial_id,
+        "state_mode": request.state_mode,
+    }
+
+    assert request.state_scope_id != other_scope.state_scope_id
+    assert request.state_scope_id == AgentSnapshotMaterializationRequest.derive_state_scope_id(
+        **derived, authority_scope_fingerprint=snapshot.authority_scope_fingerprint
+    )
+    assert request.state_scope_id != (
+        AgentSnapshotMaterializationRequest.derive_state_scope_id(**derived)
+    )
+
+    progress = AgentSnapshotMaterializationProgress.create(
+        request=request,
+        created_at=datetime(2026, 8, 23, tzinfo=UTC),
+        components=snapshot.components,
+    )
+    payload = progress.model_dump(mode="json")
+    assert payload["authority_scope_fingerprint"] == snapshot.authority_scope_fingerprint
+    assert AgentSnapshotMaterializationProgress.model_validate(payload) == progress
+    with pytest.raises(ValidationError, match="immutable plan"):
+        AgentSnapshotMaterializationProgress.model_validate(
+            {**payload, "authority_scope_fingerprint": _digest("other-scope")}
+        )
+
+
+@_async_test
+async def test_materializations_recorded_before_authority_binding_still_begin_trials() -> None:
+    evaluator_fingerprint = _digest("hidden-evaluator-v1")
+    snapshot = _snapshot(
+        evaluator=AgentSnapshotAuthorityRef(
+            identity=AgentSnapshotLogicalRef(
+                fingerprint=evaluator_fingerprint, revision="hidden-evaluator-v1"
+            )
+        )
+    )
+    for state_mode in AgentSnapshotTrialStateMode:
+        store = InMemoryAgentSnapshotStore()
+        await store.put_snapshot(snapshot, snapshot.identity_binding)
+        request = AgentSnapshotMaterializationRequest(
+            access=_access(snapshot),
+            candidate_id="candidate-a",
+            trial_id="trial-1",
+            state_mode=state_mode,
+        )
+        # Records written before #2556 derived their scope without the authority
+        # scope and do not record one.
+        legacy_request = SimpleNamespace(
+            snapshot_fingerprint=request.snapshot_fingerprint,
+            candidate_id=request.candidate_id,
+            trial_id=request.trial_id,
+            state_mode=state_mode,
+            state_partition_fingerprint=None,
+            authority_scope_fingerprint=None,
+            state_scope_id=AgentSnapshotMaterializationRequest.derive_state_scope_id(
+                snapshot_fingerprint=request.snapshot_fingerprint,
+                candidate_id=request.candidate_id,
+                trial_id=request.trial_id,
+                state_mode=state_mode,
+            ),
+        )
+        providers = _providers(snapshot)
+        by_kind = {provider.kind: provider for provider in providers}
+        progress = await store.begin_materialization(
+            AgentSnapshotMaterializationProgress.create(
+                request=cast("AgentSnapshotMaterializationRequest", legacy_request),
+                created_at=datetime(2026, 8, 23, tzinfo=UTC),
+                components=snapshot.components,
+            )
+        )
+        for operation in progress.operations:
+            claimed = await store.claim_materialization_operation(progress, operation.operation_id)
+            progress = await store.complete_materialization_operation(
+                claimed,
+                operation.operation_id,
+                by_kind[operation.component_kind]._new_materialization(
+                    snapshot.component(operation.component_kind),
+                    cast("AgentSnapshotMaterializationRequest", legacy_request),
+                ),
+            )
+        legacy = await store.finalize_materialization(
+            progress,
+            AgentSnapshotMaterialization.create(
+                progress_id=progress.progress_id,
+                request=cast("AgentSnapshotMaterializationRequest", legacy_request),
+                created_at=progress.created_at,
+                components=progress.components,
+            ),
+        )
+        assert "authority_scope_fingerprint" not in legacy.model_dump(mode="json")
+
+        coordinator = AgentSnapshotCoordinator(providers, store=store)
+        recovered = await coordinator.recover_materialization(
+            legacy.fingerprint, access=_access(snapshot)
+        )
+        assert recovered.fingerprint == legacy.fingerprint
+        trial = await coordinator.begin_trial(
+            legacy,
+            case_id="case-1",
+            trial_id="trial-1",
+            evaluator_fingerprint=evaluator_fingerprint,
+        )
+        assert trial.materialization_fingerprint == legacy.fingerprint
+        assert (await coordinator.materialize(request)).fingerprint != legacy.fingerprint
 
 
 def test_sqlite_memory_snapshot_store_does_not_claim_filesystem_durability() -> None:

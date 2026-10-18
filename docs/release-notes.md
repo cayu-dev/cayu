@@ -6,6 +6,15 @@ Upgrade: Stop all older writers and run `cayu storage migrate` before starting
 this build. Schema revision 122 preserves restartable task policy and requires
 exact worker claims for their session attachments.
 
+- Stop agent snapshot materializations from being reused across authority
+  scopes. Two scopes that register the same snapshot content share a root, so a
+  request with another scope's candidate and trial ids used to receive that
+  scope's materialization and overlays. The materialization state scope now
+  includes the requesting authority scope on the in-memory, SQLite and
+  PostgreSQL stores, and materializations record it. No migration is needed.
+  Materializations recorded before this release still begin trials and recover,
+  but a new `materialize()` call starts a fresh scope instead of resuming one.
+
 - Skip stale recovery observers when another recovery owner closes the active
   interaction during execution profile inspection.
 
