@@ -356,6 +356,9 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     updated.pop(producers.ROOT_KEY, None)
     if producer_root is not None:
         updated[producers.ROOT_KEY] = producer_root
+    from cayu.sessions._abandonment_checkpoint import preserve_abandonment_checkpoint
+
+    preserve_abandonment_checkpoint(authoritative_current, updated)
     # Restored private authority counts toward the same complete document
     # ceiling as the callback's ordinary state, before either side is written.
     return copy_durable_json_object(updated, "checkpoint")

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -740,6 +740,24 @@ class TaskSessionClosureClaim(BaseModel):
     )
     plan_id: str = Field(strict=True, pattern=r"^[0-9a-f]{64}$")
     task_ids: tuple[str, ...]
+    purpose: Literal["deletion", "retention"] = Field(
+        default="deletion", exclude_if=lambda value: value == "deletion"
+    )
+
+    retention_instance_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    retention_run_epoch: int | None = Field(
+        default=None, strict=True, ge=0, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_retention_owner(self):
+        if (self.retention_instance_id is None) != (self.retention_run_epoch is None):
+            raise ValueError("Retention authority requires both session instance and epoch.")
+        if self.retention_instance_id is not None:
+            if self.purpose != "retention":
+                raise ValueError("Only retention claims have a releasable invocation owner.")
+            SessionInvocationBinding.validate_session_instance_id(self.retention_instance_id)
+        return self
 
     @field_validator("session_id")
     @classmethod
@@ -751,7 +769,7 @@ class TaskSessionClosureClaim(BaseModel):
     def validate_task_ids(cls, value):
         if type(value) not in (tuple, list) or len(value) > 100_000:
             raise ValueError("Invalid closure task set.")
-        if any(type(item) is not str or not 0 < len(item) <= 256 for item in value):
+        if any(type(item) is not str or not item for item in value):
             raise ValueError("Invalid closure task identity.")
         copied = tuple(require_clean_nonblank(item, "task_id") for item in value)
         if len(set(copied)) != len(copied):
@@ -761,10 +779,10 @@ class TaskSessionClosureClaim(BaseModel):
     @model_validator(mode="after")
     def validate_claim_bound(self):
         inspect_bounded_durable_json(
-            {"session_id": self.session_id, "plan_id": self.plan_id, "task_ids": self.task_ids},
+            self.model_dump(mode="python"),
             "task closure claim",
             max_bytes=8 * 1024 * 1024,
-            max_nodes=100_010,
+            max_nodes=100_020,
             allow_tuples=True,
         )
         return self
@@ -774,5 +792,10 @@ def copy_task_session_closure_claim(claim: TaskSessionClosureClaim) -> TaskSessi
     if type(claim) is not TaskSessionClosureClaim:
         raise TypeError("A typed task closure claim is required.")
     return TaskSessionClosureClaim(
-        session_id=claim.session_id, plan_id=claim.plan_id, task_ids=claim.task_ids
+        session_id=claim.session_id,
+        plan_id=claim.plan_id,
+        task_ids=claim.task_ids,
+        purpose=claim.purpose,
+        retention_instance_id=claim.retention_instance_id,
+        retention_run_epoch=claim.retention_run_epoch,
     )

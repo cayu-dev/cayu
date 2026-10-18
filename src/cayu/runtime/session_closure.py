@@ -938,7 +938,12 @@ class TaskSessionClosureStore:
         existing = await self._store.load_session_closure_claim(session_id)
         if existing is not None:
             claim = copy_task_session_closure_claim(existing)
-            if claim.session_id != session_id or claim.plan_id != plan_id:
+            from cayu.runtime._session_abandonment_fence import abandonment_task_plan_id
+
+            if claim.session_id != session_id or claim.plan_id not in {
+                plan_id,
+                abandonment_task_plan_id(session_id),
+            }:
                 raise ValueError("Task closure claim conflicts with its retained authority.")
         else:
             tasks = await self._tasks(session_id, policy)

@@ -210,3 +210,13 @@ def test_transform_result_rejects_malformed_retained_completion_reservation():
             current, {}, session_id="session"
         )
     assert current == original
+
+
+def test_generic_lifecycle_checkpoint_cannot_manufacture_abandonment():
+    replacement = {"ordinary": "kept", "abandoned_session": {"reason": "forged"}}
+    with preservation._invocation_lifecycle_authority_mutation_scope():
+        result = preservation._replace_checkpoint_preserving_completion_result_event_publications(
+            None, replacement, session_id="session"
+        )
+    assert result == {"ordinary": "kept"}
+    assert "abandoned_session" in replacement

@@ -81,6 +81,7 @@ from cayu.runtime import (
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._checkpoint_store import advance_task_retention_epoch
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime._durable_tool_round import _environment_name as _environment_name
 from cayu.runtime._environment_allocation import (
@@ -1119,6 +1120,11 @@ class SessionFork:
                             # other source-publication failures remain visible.
                             if await self.session_store.load(request.source_session_id) is not None:
                                 raise
+                await advance_task_retention_epoch(
+                    existing_descendant,
+                    session_store=self.session_store,
+                    task_store=self._task_store,
+                )
                 delivered = await self._event_writer.fan_out_persisted(persisted_events)
                 delivered_fork_event = next(
                     (event for event in delivered if event.type is EventType.SESSION_FORKED),
@@ -2350,6 +2356,9 @@ class SessionFork:
                     relationship=relationship,
                     events=recovered_events,
                 )
+                await advance_task_retention_epoch(
+                    existing, session_store=self.session_store, task_store=self._task_store
+                )
                 recovered = ProfiledSessionForkResult(
                     session=existing,
                     events=tuple(recovered_events),
@@ -2406,6 +2415,11 @@ class SessionFork:
                         fork=result.session,
                         relationship=relationship,
                         events=result.events,
+                    )
+                    await advance_task_retention_epoch(
+                        result.session,
+                        session_store=self.session_store,
+                        task_store=self._task_store,
                     )
                     return result, None
                 except Exception as invalid_result:

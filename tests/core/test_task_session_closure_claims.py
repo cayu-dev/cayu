@@ -343,3 +343,12 @@ def test_postgres_task_closure_requires_enabled_database_guard(postgres_dsn, sch
             await store.close()
 
     asyncio.run(run())
+
+
+def test_long_task_identifiers_keep_the_total_closure_bound():
+    claim = TaskSessionClosureClaim(session_id="session", plan_id="a" * 64, task_ids=("x" * 257,))
+    assert claim.task_ids == ("x" * 257,)
+    with pytest.raises(ValueError):
+        TaskSessionClosureClaim(
+            session_id="session", plan_id="a" * 64, task_ids=("x" * (8 * 1024 * 1024),)
+        )

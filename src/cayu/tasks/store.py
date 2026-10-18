@@ -249,6 +249,9 @@ class TaskStore(ABC):
     supports_local_execution_attempts: ClassVar[bool] = False
     supports_session_closure_deletion: ClassVar[bool] = False
     supports_session_closure_claims: ClassVar[bool] = False
+    # Retention-purpose closure claims and both monotonic epoch methods.
+    # Deletion-only closure support does not imply this capability.
+    supports_session_retention_epochs: ClassVar[bool] = False
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
@@ -898,6 +901,31 @@ class TaskStore(ABC):
     ) -> list[Task]:
         """List tasks for dashboards, queues, and orchestration."""
 
+    async def load_session_retention_epoch(self, session_id: str) -> tuple[str, int] | None:
+        """Read the current incarnation before verifying its replacement in the session store."""
+        raise NotImplementedError("Task store does not support retention epoch fencing.")
+
+    async def advance_session_retention_epoch(
+        self,
+        session_id: str,
+        *,
+        session_instance_id: str,
+        run_epoch: int,
+        expected_session_instance_id: str | None = None,
+    ) -> None:
+        """Fence older provisional retention claims and release their task admission.
+
+        Call only after durable session admission, or after a failed abandonment
+        whose atomic checkpoint still lacks its terminal abandonment record.
+        The monotonic floor must reject delayed claims from older invocations.
+        Replacing an incarnation compares against expected_session_instance_id,
+        which must be read before checking the session store's current identity.
+        A new session incarnation retires earlier incarnations of its public ID;
+        their claims and later epoch advances must never regain authority.
+        Permanent deletion and unowned retention claims remain unchanged.
+        """
+        raise NotImplementedError("Task store does not support retention epoch fencing.")
+
     async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
         """Read the retained task-set authority without reopening admission."""
         raise NotImplementedError("Task store does not support session closure claims.")
@@ -905,10 +933,13 @@ class TaskStore(ABC):
     async def claim_session_closure(
         self, claim: TaskSessionClosureClaim
     ) -> TaskSessionClosureClaim:
-        """Reserve an exact, complete quiescent task set before independent deletion.
+        """Reserve an exact, complete quiescent terminal task set.
 
         Retain the claim after deletion so future creation/attachment cannot
         revive the retired session's task namespace. Exact retries are read-only.
+        Deletion claims require terminal graphs. Retention claims preserve task
+        evidence and allow other sessions' graph members to remain active;
+        subsequent deletion still checks the complete graph independently.
         """
         raise NotImplementedError("This TaskStore does not support session closure claims.")
 

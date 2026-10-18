@@ -257,6 +257,7 @@ from cayu.sessions._invocation_scope import (
     _current_session_interaction_recovered_active_through,
     _current_session_interaction_started_at,
     _current_session_invocation_interaction_ids,
+    _current_session_run_epoch,
     _deactivate_session_interaction,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
@@ -5159,6 +5160,43 @@ class SessionFinalization:
             )
         )
         return True
+
+    async def finalize_failed_retention_admission(
+        self, session: Session, failure: BaseException
+    ) -> None:
+        """Join cleanup when a task-store failure follows committed admission."""
+        if (
+            session.status is not SessionStatus.RUNNING
+            or _current_session_run_epoch(session.id) != session.run_epoch
+        ):
+            return
+
+        async def finalize() -> None:
+            current = await self.session_store.load(session.id)
+            if (
+                current is not None
+                and current.instance_id == session.instance_id
+                and current.run_epoch == session.run_epoch
+                and current.status is SessionStatus.RUNNING
+            ):
+                checkpoint = await self.session_store.load_checkpoint(session.id)
+                profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+                if profile is None or profile.run_epoch != session.run_epoch:
+                    raise SessionRunFenced("Failed admission lost its exact invocation profile.")
+                _activate_session_interaction(session.id, profile.interaction_id)
+                await self.finalize_abandoned_session_by_id(
+                    session.id,
+                    propagate_interaction_publication_rejection=True,
+                    execution_profile=profile.profile,
+                )
+                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                    session_id=session.id
+                )
+
+        await self._recovery_ownership.run_cleanup_steps(
+            authoritative_failure=failure,
+            steps=(("failed task-retention admission finalization and release", finalize),),
+        )
 
     async def finalize_abandoned_session_by_id(
         self,

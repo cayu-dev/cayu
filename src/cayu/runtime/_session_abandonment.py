@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from cayu._validation import copy_durable_metadata
 from cayu.events import EventType
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
 from cayu.sessions._completion_finalization import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
 )
@@ -19,7 +20,6 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
-    _ABANDONED_SESSION_CHECKPOINT_KEY,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -33,11 +33,6 @@ if TYPE_CHECKING:
     from cayu.runtime._session_recovery import SessionRecovery
     from cayu.sessions.store import SessionStore
     from cayu.tasks.store import TaskStore
-
-# Retains the abandoned round and the calls whose outcome stays unknown. Its
-# presence on a failed session tells recovery to release the bound environment
-# and to publish this reason as the session's terminal failure.
-ABANDONED_SESSION_CHECKPOINT_KEY = _ABANDONED_SESSION_CHECKPOINT_KEY
 
 
 def abandoned_session_record(

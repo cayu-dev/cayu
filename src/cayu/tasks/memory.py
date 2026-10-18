@@ -441,6 +441,7 @@ class InMemoryTaskStore(TaskStore):
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
     supports_session_closure_claims: ClassVar[bool] = True
+    supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
@@ -469,6 +470,8 @@ class InMemoryTaskStore(TaskStore):
         self._schedule_receipts: dict[tuple[str, str], TaskScheduleReceipt] = {}
         self._schedule_events: dict[str, list[TaskScheduleEvent]] = {}
         self._session_closure_claims: dict[str, TaskSessionClosureClaim] = {}
+        self._session_retention_epochs: dict[str, tuple[str, int]] = {}
+        self._retired_retention_instances: set[tuple[str, str]] = set()
         self._task_id_by_interrupted_handoff_id: dict[str, str] = {}
         self._interrupted_continuation_claims: dict[str, tuple[str, str]] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
@@ -2515,7 +2518,13 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             from cayu.tasks._memory_graphs import require_graph_deletion_ready
 
-            require_graph_deletion_ready(self, claim.task_ids)
+            if claim.purpose == "deletion":
+                require_graph_deletion_ready(self, claim.task_ids)
+            from cayu.tasks._session_retention_fence import require_current_retention_claim
+
+            require_current_retention_claim(
+                claim, self._session_retention_epochs.get(claim.session_id)
+            )
             existing = self._session_closure_claims.get(claim.session_id)
             if existing is not None:
                 existing = copy_task_session_closure_claim(existing)
@@ -2543,8 +2552,51 @@ class InMemoryTaskStore(TaskStore):
                     or task.lease_expires_at is not None
                 ):
                     raise ValueError("Task closure requires quiescent terminal tasks.")
+            if claim.retention_run_epoch is not None:
+                assert claim.retention_instance_id is not None
+                self._session_retention_epochs.setdefault(
+                    claim.session_id, (claim.retention_instance_id, claim.retention_run_epoch)
+                )
             self._session_closure_claims[claim.session_id] = claim
             return copy_task_session_closure_claim(claim)
+
+    async def load_session_retention_epoch(self, session_id: str) -> tuple[str, int] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            return self._session_retention_epochs.get(session_id)
+
+    async def advance_session_retention_epoch(
+        self,
+        session_id: str,
+        *,
+        session_instance_id: str,
+        run_epoch: int,
+        expected_session_instance_id: str | None = None,
+    ) -> None:
+        from cayu.tasks._session_retention_fence import (
+            require_retention_predecessor,
+            retention_claim_superseded,
+            retention_epoch,
+        )
+
+        session_id, session_instance_id, run_epoch = retention_epoch(
+            session_id, session_instance_id, run_epoch
+        )
+        async with self._lock:
+            if (session_id, session_instance_id) in self._retired_retention_instances:
+                raise ValueError("Task retention epoch belongs to a retired session instance.")
+            floor = self._session_retention_epochs.get(session_id)
+            require_retention_predecessor(floor, session_instance_id, expected_session_instance_id)
+            if floor is not None and floor[0] != session_instance_id:
+                self._retired_retention_instances.add((session_id, floor[0]))
+                floor = None
+            run_epoch = max(run_epoch, 0 if floor is None else floor[1])
+            self._session_retention_epochs[session_id] = (session_instance_id, run_epoch)
+            claim = self._session_closure_claims.get(session_id)
+            if claim is not None and retention_claim_superseded(
+                claim, session_instance_id, run_epoch
+            ):
+                del self._session_closure_claims[session_id]
 
     async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
         session_id = require_clean_nonblank(session_id, "session_id")

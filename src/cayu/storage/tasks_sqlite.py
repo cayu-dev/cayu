@@ -355,7 +355,7 @@ from cayu.tasks.work_receipts import (
 _T = TypeVar("_T")
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 122
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 123
 
 
 @model_store_surface("tasks")
@@ -477,6 +477,7 @@ class SQLiteTaskStore(TaskStore):
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
     supports_session_closure_claims: ClassVar[bool] = True
+    supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
 
     def __init__(
@@ -4086,6 +4087,75 @@ class SQLiteTaskStore(TaskStore):
             ).fetchall()
             return [sqlite_records.task_from_row(row) for row in rows]
 
+    def _current_retention_floor_unlocked(self, session_id: str) -> tuple[str, int] | None:
+        row = self._connection.execute(
+            "SELECT session_instance_id, run_epoch FROM cayu_task_session_retention_epochs "
+            "WHERE session_id = ? AND retired = 0",
+            (session_id,),
+        ).fetchone()
+        return None if row is None else (row[0], row[1])
+
+    async def load_session_retention_epoch(self, session_id: str) -> tuple[str, int] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            return self._current_retention_floor_unlocked(session_id)
+
+    async def advance_session_retention_epoch(
+        self,
+        session_id: str,
+        *,
+        session_instance_id: str,
+        run_epoch: int,
+        expected_session_instance_id: str | None = None,
+    ) -> None:
+        from cayu.tasks._session_retention_fence import (
+            require_retention_predecessor,
+            retention_claim_superseded,
+            retention_epoch,
+        )
+
+        session_id, session_instance_id, run_epoch = retention_epoch(
+            session_id, session_instance_id, run_epoch
+        )
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                floor = self._connection.execute(
+                    "SELECT run_epoch, retired FROM cayu_task_session_retention_epochs WHERE session_id = ? AND session_instance_id = ?",
+                    (session_id, session_instance_id),
+                ).fetchone()
+                if floor is not None and floor[1]:
+                    raise ValueError("Task retention epoch belongs to a retired session instance.")
+                current = self._current_retention_floor_unlocked(session_id)
+                require_retention_predecessor(
+                    current,
+                    session_instance_id,
+                    expected_session_instance_id,
+                )
+                run_epoch = max(run_epoch, 0 if floor is None else floor[0])
+                self._connection.execute(
+                    "UPDATE cayu_task_session_retention_epochs SET retired = 1 "
+                    "WHERE session_id = ? AND session_instance_id != ? AND retired = 0",
+                    (session_id, session_instance_id),
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_task_session_retention_epochs (session_id, session_instance_id, run_epoch) VALUES (?, ?, ?) "
+                    "ON CONFLICT(session_id, session_instance_id) DO UPDATE SET run_epoch=excluded.run_epoch",
+                    (session_id, session_instance_id, run_epoch),
+                )
+                row = self._connection.execute(
+                    "SELECT claim_json FROM cayu_task_session_closure_claims WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is not None and retention_claim_superseded(
+                    TaskSessionClosureClaim.model_validate_json(row[0]),
+                    session_instance_id,
+                    run_epoch,
+                ):
+                    self._connection.execute(
+                        "DELETE FROM cayu_task_session_closure_claims WHERE session_id = ?",
+                        (session_id,),
+                    )
+
     async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
@@ -4109,7 +4179,13 @@ class SQLiteTaskStore(TaskStore):
             with self._verified_transaction_unlocked():
                 from cayu.storage._sqlite_task_graphs import require_deletion_ready
 
-                require_deletion_ready(self, claim.task_ids)
+                if claim.purpose == "deletion":
+                    require_deletion_ready(self, claim.task_ids)
+                from cayu.tasks._session_retention_fence import require_current_retention_claim
+
+                if claim.retention_run_epoch is not None:
+                    floor = self._current_retention_floor_unlocked(claim.session_id)
+                    require_current_retention_claim(claim, floor)
                 row = self._connection.execute(
                     "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
                     "WHERE session_id = ?",
@@ -4121,26 +4197,33 @@ class SQLiteTaskStore(TaskStore):
                         raise ValueError(
                             "Task closure claim conflicts with its retained authority."
                         )
-                    return existing
-                rows = self._connection.execute(
-                    "SELECT id, status, worker_id, lease_expires_at FROM cayu_tasks "
-                    "WHERE session_id = ? LIMIT ?",
-                    (claim.session_id, len(claim.task_ids) + 1),
-                ).fetchall()
-                if {row["id"] for row in rows} != set(claim.task_ids):
-                    raise ValueError("Task closure set changed before admission.")
-                if any(
-                    row["status"] not in {"completed", "failed", "cancelled", "dependency_skipped"}
-                    or row["worker_id"] is not None
-                    or row["lease_expires_at"] is not None
-                    for row in rows
-                ):
-                    raise ValueError("Task closure requires quiescent terminal tasks.")
-                self._connection.execute(
-                    "INSERT INTO cayu_task_session_closure_claims "
-                    "(session_id, plan_id, claim_json) VALUES (?, ?, ?)",
-                    (claim.session_id, claim.plan_id, claim.model_dump_json()),
-                )
+                else:
+                    rows = self._connection.execute(
+                        "SELECT id, status, worker_id, lease_expires_at FROM cayu_tasks "
+                        "WHERE session_id = ? LIMIT ?",
+                        (claim.session_id, len(claim.task_ids) + 1),
+                    ).fetchall()
+                    if {row["id"] for row in rows} != set(claim.task_ids):
+                        raise ValueError("Task closure set changed before admission.")
+                    if any(
+                        row["status"]
+                        not in {"completed", "failed", "cancelled", "dependency_skipped"}
+                        or row["worker_id"] is not None
+                        or row["lease_expires_at"] is not None
+                        for row in rows
+                    ):
+                        raise ValueError("Task closure requires quiescent terminal tasks.")
+                    self._connection.execute(
+                        "INSERT INTO cayu_task_session_closure_claims "
+                        "(session_id, plan_id, claim_json) VALUES (?, ?, ?)",
+                        (claim.session_id, claim.plan_id, claim.model_dump_json()),
+                    )
+                if claim.retention_run_epoch is not None and floor is None:
+                    self._connection.execute(
+                        "INSERT INTO cayu_task_session_retention_epochs "
+                        "(session_id, session_instance_id, run_epoch) VALUES (?, ?, ?)",
+                        (claim.session_id, claim.retention_instance_id, claim.retention_run_epoch),
+                    )
                 return claim
 
     async def delete_session_tasks(

@@ -535,6 +535,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=121, kind=RevisionKind.BREAKING, compatible_from=121),
     # Retired sessions must remain fenced after a restart detaches their task.
     Revision(revision=122, kind=RevisionKind.BREAKING, compatible_from=122),
+    # Provisional task retention must honor durable invocation epoch floors.
+    Revision(revision=123, kind=RevisionKind.BREAKING, compatible_from=123),
 )
 
 #: The revision an empty database is initialized to.

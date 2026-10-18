@@ -234,7 +234,7 @@ from cayu.tasks.topology import (
     decode_task_topology_cursor,
 )
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 122
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 123
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -361,6 +361,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
     supports_session_closure_claims: ClassVar[bool] = True
+    supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
@@ -1564,6 +1565,82 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             rows = await cur.fetchall()
             return [pg_support.task_from_row(row) for row in rows]
 
+    async def _current_retention_floor(self, cur: Any, session_id: str) -> tuple[str, int] | None:
+        await cur.execute(
+            "SELECT session_instance_id, run_epoch FROM cayu_task_session_retention_epochs "
+            "WHERE session_id = %s AND NOT retired",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else (row[0], row[1])
+
+    async def load_session_retention_epoch(self, session_id: str) -> tuple[str, int] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._ready_connection() as conn, conn.cursor() as cur:
+            return await self._current_retention_floor(cur, session_id)
+
+    async def advance_session_retention_epoch(
+        self,
+        session_id: str,
+        *,
+        session_instance_id: str,
+        run_epoch: int,
+        expected_session_instance_id: str | None = None,
+    ) -> None:
+        from cayu.tasks._session_retention_fence import (
+            require_retention_predecessor,
+            retention_claim_superseded,
+            retention_epoch,
+        )
+
+        session_id, session_instance_id, run_epoch = retention_epoch(
+            session_id, session_instance_id, run_epoch
+        )
+        async with self._ready_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    ("cayu-task-session-closure:" + session_id,),
+                )
+                await cur.execute(
+                    "SELECT run_epoch, retired FROM cayu_task_session_retention_epochs WHERE session_id = %s AND session_instance_id = %s",
+                    (session_id, session_instance_id),
+                )
+                floor = await cur.fetchone()
+                if floor is not None and floor[1]:
+                    raise ValueError("Task retention epoch belongs to a retired session instance.")
+                current = await self._current_retention_floor(cur, session_id)
+                require_retention_predecessor(
+                    current,
+                    session_instance_id,
+                    expected_session_instance_id,
+                )
+                run_epoch = max(run_epoch, 0 if floor is None else floor[0])
+                await cur.execute(
+                    "UPDATE cayu_task_session_retention_epochs SET retired = TRUE "
+                    "WHERE session_id = %s AND session_instance_id != %s AND NOT retired",
+                    (session_id, session_instance_id),
+                )
+                await cur.execute(
+                    "INSERT INTO cayu_task_session_retention_epochs (session_id, session_instance_id, run_epoch) VALUES (%s, %s, %s) "
+                    "ON CONFLICT(session_id, session_instance_id) DO UPDATE SET run_epoch=excluded.run_epoch",
+                    (session_id, session_instance_id, run_epoch),
+                )
+                await cur.execute(
+                    "SELECT claim_json FROM cayu_task_session_closure_claims WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                if row is not None and retention_claim_superseded(
+                    TaskSessionClosureClaim.model_validate(row[0]), session_instance_id, run_epoch
+                ):
+                    await cur.execute(
+                        "DELETE FROM cayu_task_session_closure_claims WHERE session_id = %s",
+                        (session_id,),
+                    )
+            await conn.commit()
+
     async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
@@ -1588,13 +1665,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         await self._ensure_ready()
         async with self._connection() as conn:
             async with conn.cursor() as cur:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                 from cayu.storage._postgres_task_graphs import (
                     lock_task_graphs,
                     require_deletion_ready,
                 )
 
                 await lock_task_graphs(cur, claim.task_ids)
-                await require_deletion_ready(cur, claim.task_ids)
+                if claim.purpose == "deletion":
+                    await require_deletion_ready(cur, claim.task_ids)
                 # Writers acquire a shared lock in their INSERT/UPDATE trigger;
                 # closure exclusively excludes all of them before inspecting.
                 # Do not take task row locks here: a writer can already own one
@@ -1603,6 +1682,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     ("cayu-task-session-closure:" + claim.session_id,),
                 )
+                from cayu.tasks._session_retention_fence import require_current_retention_claim
+
+                if claim.retention_run_epoch is not None:
+                    floor = await self._current_retention_floor(cur, claim.session_id)
+                    require_current_retention_claim(claim, floor)
                 await cur.execute(
                     "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
                     "WHERE session_id = %s",
@@ -1615,27 +1699,33 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         raise ValueError(
                             "Task closure claim conflicts with its retained authority."
                         )
-                    return existing
-                await cur.execute(
-                    "SELECT id, status, worker_id, lease_expires_at FROM cayu_tasks "
-                    "WHERE session_id = %s LIMIT %s",
-                    (claim.session_id, len(claim.task_ids) + 1),
-                )
-                rows = await cur.fetchall()
-                if {row[0] for row in rows} != set(claim.task_ids):
-                    raise ValueError("Task closure set changed before admission.")
-                if any(
-                    row[1] not in {"completed", "failed", "cancelled", "dependency_skipped"}
-                    or row[2] is not None
-                    or row[3] is not None
-                    for row in rows
-                ):
-                    raise ValueError("Task closure requires quiescent terminal tasks.")
-                await cur.execute(
-                    "INSERT INTO cayu_task_session_closure_claims "
-                    "(session_id, plan_id, claim_json) VALUES (%s, %s, %s)",
-                    (claim.session_id, claim.plan_id, Jsonb(claim.model_dump(mode="json"))),
-                )
+                else:
+                    await cur.execute(
+                        "SELECT id, status, worker_id, lease_expires_at FROM cayu_tasks "
+                        "WHERE session_id = %s LIMIT %s",
+                        (claim.session_id, len(claim.task_ids) + 1),
+                    )
+                    rows = await cur.fetchall()
+                    if {row[0] for row in rows} != set(claim.task_ids):
+                        raise ValueError("Task closure set changed before admission.")
+                    if any(
+                        row[1] not in {"completed", "failed", "cancelled", "dependency_skipped"}
+                        or row[2] is not None
+                        or row[3] is not None
+                        for row in rows
+                    ):
+                        raise ValueError("Task closure requires quiescent terminal tasks.")
+                    await cur.execute(
+                        "INSERT INTO cayu_task_session_closure_claims "
+                        "(session_id, plan_id, claim_json) VALUES (%s, %s, %s)",
+                        (claim.session_id, claim.plan_id, Jsonb(claim.model_dump(mode="json"))),
+                    )
+                if claim.retention_run_epoch is not None and floor is None:
+                    await cur.execute(
+                        "INSERT INTO cayu_task_session_retention_epochs "
+                        "(session_id, session_instance_id, run_epoch) VALUES (%s, %s, %s)",
+                        (claim.session_id, claim.retention_instance_id, claim.retention_run_epoch),
+                    )
             await conn.commit()
         return claim
 

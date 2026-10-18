@@ -131,7 +131,6 @@ from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
 from cayu.runtime._session_abandonment import (
-    ABANDONED_SESSION_CHECKPOINT_KEY,
     abandoned_session_from_checkpoint,
     abandoned_session_record,
 )
@@ -194,6 +193,7 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
+from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
 from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     runtime_publication_checkpoint_value_digest,
@@ -4510,12 +4510,55 @@ class IncompleteSessionRecovery:
             )
             return copied
 
-        return await self._session_store.transition_status_and_checkpoint(
-            session.id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.FAILED,
-            checkpoint_transform=abandon,
-        )
+        from cayu.runtime._session_abandonment_fence import claim_abandonment_task_fence
+        from cayu.sessions._abandonment_checkpoint import abandonment_checkpoint_publication
+
+        tasks = self._session_tasks.task_store
+
+        async def release_uncommitted_abandonment() -> None:
+            if tasks is None or not tasks.supports_session_closure_claims:
+                return
+            from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
+            from cayu.tasks._session_retention_fence import RetentionEpochConflict
+
+            while True:
+                predecessor = await tasks.load_session_retention_epoch(session.id)
+                current, checkpoint = await load_runtime_session_checkpoint_snapshot(
+                    self._session_store, session.id
+                )
+                if (
+                    current.instance_id != session.instance_id
+                    or ABANDONED_SESSION_CHECKPOINT_KEY in (checkpoint or {})
+                ):
+                    return
+                try:
+                    await tasks.advance_session_retention_epoch(
+                        session.id,
+                        session_instance_id=session.instance_id,
+                        run_epoch=session.run_epoch + 1,
+                        expected_session_instance_id=None
+                        if predecessor is None
+                        else predecessor[0],
+                    )
+                except RetentionEpochConflict:
+                    continue
+                return
+
+        try:
+            await claim_abandonment_task_fence(tasks, session, task_id=pending_round.task_id)
+            with abandonment_checkpoint_publication():
+                return await self._session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={SessionStatus.INTERRUPTED},
+                    to_status=SessionStatus.FAILED,
+                    checkpoint_transform=abandon,
+                )
+        except BaseException as failure:
+            await self._recovery_ownership.run_cleanup_steps(
+                authoritative_failure=failure,
+                steps=(("release_uncommitted_abandonment", release_uncommitted_abandonment),),
+            )
+            raise
 
     async def _finalize_interrupting_for_recovery(
         self,

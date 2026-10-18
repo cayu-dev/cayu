@@ -81,6 +81,25 @@ def test_abandon_session_fails_unknown_tool_outcome_without_redispatch(
                 checkpoint["abandoned_session"]["unknown_tool_calls"]
                 == (failed.payload["tool_effect_outcome_unknown"])
             )
+            retained_abandonment = checkpoint["abandoned_session"]
+            for replacement in (
+                {"application": "ordinary state"},
+                {"abandoned_session": {"reason": "forged"}},
+            ):
+                await observer.checkpoint(sid, replacement)
+                assert (await observer.load_checkpoint(sid))[
+                    "abandoned_session"
+                ] == retained_abandonment
+                with pytest.raises(SessionStatusConflict, match="abandoned session"):
+                    _ = [
+                        event
+                        async for event in app.resume(
+                            ResumeRequest(
+                                session_id=sid, messages=[Message.text("user", "Continue")]
+                            )
+                        )
+                    ]
+            assert not provider.requests
             effect = await ToolEffectStateOwner(observer).resolve_call(
                 session, tool_round_id=round_id, tool_call_id="proposal"
             )

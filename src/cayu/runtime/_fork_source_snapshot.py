@@ -6,6 +6,7 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_record
+from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
 )
@@ -18,7 +19,6 @@ from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
-from cayu.sessions.recovery import _ABANDONED_SESSION_CHECKPOINT_KEY
 
 _SESSION_OPERATIONS_CHECKPOINT_KEY = "session_operations"
 _SESSION_RUN_OPERATION_CHECKPOINT_KEY = "session_run_operation"
@@ -50,7 +50,7 @@ _SOURCE_OWNED_CHECKPOINT_KEYS = frozenset(
         "session_continuations",
         "execution_snapshots",
         # Abandonment ends the source session only; a fork may still run.
-        _ABANDONED_SESSION_CHECKPOINT_KEY,
+        ABANDONED_SESSION_CHECKPOINT_KEY,
     }
 )
 

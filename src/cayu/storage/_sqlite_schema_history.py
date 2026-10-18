@@ -670,6 +670,15 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    123: """CREATE TABLE IF NOT EXISTS cayu_task_session_retention_epochs (
+        session_id TEXT NOT NULL,
+        session_instance_id TEXT NOT NULL,
+        run_epoch BIGINT NOT NULL CHECK (run_epoch >= 0),
+        retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+        PRIMARY KEY (session_id, session_instance_id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS cayu_task_session_retention_current
+    ON cayu_task_session_retention_epochs (session_id) WHERE retired = 0;""",
     122: """CREATE TABLE IF NOT EXISTS cayu_retired_task_sessions (
         session_id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL

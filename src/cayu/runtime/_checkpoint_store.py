@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast, overload
 
@@ -24,11 +26,13 @@ if TYPE_CHECKING:
         ReleaseInvocationCommand,
         SettleInvocationCommand,
     )
+    from cayu.tasks.store import TaskStore
 
 from cayu._validation import copy_durable_json_object
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
 from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_read_scope,
     _replace_checkpoint_preserving_completion_result_event_publications,
@@ -54,6 +58,7 @@ from cayu.sessions.store import (
     _session_continuation_methods_owned,
     _session_export_methods_owned,
 )
+from cayu.tasks._session_retention_fence import RetentionEpochConflict
 
 _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(
     key=CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -64,8 +69,36 @@ _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(
 class _RuntimeCheckpointSessionStore:
     """Intercept checkpoint reads and writes without teaching stores their schema."""
 
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        *,
+        task_store: TaskStore | None = None,
+        on_retention_admission_failure: Callable[[Session, BaseException], Awaitable[None]]
+        | None = None,
+    ) -> None:
         self._store = store
+        self._task_store = task_store
+        self._on_retention_admission_failure = on_retention_admission_failure
+        self._settling_retention_failure: ContextVar[bool] = ContextVar(
+            "cayu_settling_retention_failure", default=False
+        )
+
+    async def _advance_task_retention_epoch(self, session: Session) -> None:
+        if self._settling_retention_failure.get():
+            return
+        try:
+            await advance_task_retention_epoch(
+                session, session_store=cast("SessionStore", self), task_store=self._task_store
+            )
+        except BaseException as failure:
+            if self._on_retention_admission_failure is not None:
+                token = self._settling_retention_failure.set(True)
+                try:
+                    await self._on_retention_admission_failure(session, failure)
+                finally:
+                    self._settling_retention_failure.reset(token)
+            raise
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
@@ -169,10 +202,22 @@ class _RuntimeCheckpointSessionStore:
             )
         from cayu.runtime._invocation_lifecycle import apply_invocation_lifecycle_command
 
-        return await apply_invocation_lifecycle_command(
+        result = await apply_invocation_lifecycle_command(
             cast("SessionStore", self),
             cast("InvocationLifecycleCommand", command),
         )
+        from cayu.sessions._invocation_lifecycle import (
+            InvocationMutationResult,
+            RebindInvocationCommand,
+        )
+
+        if isinstance(result, InvocationMutationResult) and (
+            result.replayed
+            or not isinstance(command, RebindInvocationCommand)
+            or command.target_status is not None
+        ):
+            await self._advance_task_retention_epoch(result.session)
+        return result
 
     async def create(
         self,
@@ -617,7 +662,7 @@ class _RuntimeCheckpointSessionStore:
         result_checkpoint_transform: CheckpointTransform | None = None,
         **kwargs: Any,
     ) -> Session:
-        return await self._store.fence_run_and_transform_checkpoint(
+        session = await self._store.fence_run_and_transform_checkpoint(
             session_id,
             checkpoint_transform=checkpoint_transforms._versioned_checkpoint_transform(
                 session_id,
@@ -630,6 +675,9 @@ class _RuntimeCheckpointSessionStore:
             ),
             **kwargs,
         )
+
+        await self._advance_task_retention_epoch(session)
+        return session
 
     async def reserve_stalled_run_recovery(
         self,
@@ -868,6 +916,10 @@ class _RuntimeCheckpointSessionStore:
 
 def runtime_checkpoint_session_store(
     store: SessionStore,
+    *,
+    task_store: TaskStore | None = None,
+    on_retention_admission_failure: Callable[[Session, BaseException], Awaitable[None]]
+    | None = None,
 ) -> SessionStore:
     """Return a runtime-only schema adapter while preserving the public raw store."""
 
@@ -875,7 +927,11 @@ def runtime_checkpoint_session_store(
         return cast("SessionStore", store)
     return cast(
         "SessionStore",
-        _RuntimeCheckpointSessionStore(store),
+        _RuntimeCheckpointSessionStore(
+            store,
+            task_store=task_store,
+            on_retention_admission_failure=on_retention_admission_failure,
+        ),
     )
 
 
@@ -888,3 +944,35 @@ async def load_runtime_session_checkpoint_snapshot(
     if not isinstance(store, _RuntimeCheckpointSessionStore):
         raise TypeError("Runtime checkpoint snapshots require the private store adapter.")
     return await store.load_session_checkpoint_snapshot(session_id)
+
+
+async def advance_task_retention_epoch(
+    session: Session, *, session_store: SessionStore, task_store: TaskStore | None
+) -> None:
+    if (
+        task_store is None
+        or not task_store.supports_session_closure_claims
+        or not task_store.supports_session_retention_epochs
+    ):
+        return
+    while True:
+        predecessor = await task_store.load_session_retention_epoch(session.id)
+        current, checkpoint = await load_runtime_session_checkpoint_snapshot(
+            session_store, session.id
+        )
+        if current.instance_id != session.instance_id:
+            raise RuntimeError("Session instance changed before task-retention admission.")
+        if ABANDONED_SESSION_CHECKPOINT_KEY in (checkpoint or {}):
+            return
+        try:
+            await task_store.advance_session_retention_epoch(
+                session.id,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+                expected_session_instance_id=None if predecessor is None else predecessor[0],
+            )
+        except RetentionEpochConflict:
+            # A delayed predecessor may publish after this incarnation was
+            # checked. Re-read both stores in order before replacing it.
+            continue
+        return

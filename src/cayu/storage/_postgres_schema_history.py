@@ -689,6 +689,17 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    123: (
+        """CREATE TABLE IF NOT EXISTS cayu_task_session_retention_epochs (
+        session_id TEXT NOT NULL,
+        session_instance_id TEXT NOT NULL,
+        run_epoch BIGINT NOT NULL CHECK (run_epoch >= 0),
+        retired BOOLEAN NOT NULL DEFAULT FALSE,
+        PRIMARY KEY (session_id, session_instance_id)
+    )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS cayu_task_session_retention_current "
+        "ON cayu_task_session_retention_epochs (session_id) WHERE NOT retired",
+    ),
     122: (
         """CREATE TABLE IF NOT EXISTS cayu_retired_task_sessions (
             session_id TEXT PRIMARY KEY,

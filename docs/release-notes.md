@@ -106,6 +106,22 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
   through the factory with the usual lifecycle evidence. No model call is made.
   It refuses while any task of the session is not terminal. Abandonment is
   permanent: the session can no longer be resumed, while a fork of it can.
+  Generic checkpoint writes preserve its immutable abandonment record. Before
+  failing the session, Runtime atomically freezes its complete terminal task set;
+  later task creation and attachment are refused. A custom task store must support
+  session closure claims and opt into `supports_session_retention_epochs` with
+  monotonic epoch reads and advances for abandonment. Closure-only custom stores
+  keep their ordinary run and deletion behavior. A retention-store failure after
+  admission joins interruption and invocation release before propagating; failed
+  resumes can be retried after the store recovers.
+  If session failure does not commit, cleanup or the next admitted recovery
+  releases the provisional task fence; delayed writes from its old owner are
+  refused. A committed abandonment retains its fence, including after a lost
+  acknowledgement. Reusing a deleted session ID starts fresh retention authority
+  while permanently rejecting the previous incarnation. Incarnation replacement
+  compares the task-store predecessor observed before the session snapshot, so a
+  delayed first write cannot displace a newer session. Database stores require
+  schema revision 123.
   `recover_abandoned_sessions(abandon_sessions_of_terminal_tasks=True)` does
   the same during the sweep for sessions whose tasks are all terminal, and
   revisits sessions left interrupted or half cleaned up by an earlier sweep.

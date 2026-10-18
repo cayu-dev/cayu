@@ -932,9 +932,6 @@ __all__ = [
 
 
 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY = "incomplete_session_recovery_claim"
-# A failed session abandoned with unknown tool outcomes. Invocation admission
-# refuses it, so no continuation can replace the abandonment or its cleanup.
-_ABANDONED_SESSION_CHECKPOINT_KEY = "abandoned_session"
 
 
 def _incomplete_recovery_claim_from_checkpoint(

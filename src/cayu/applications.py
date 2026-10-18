@@ -1230,7 +1230,13 @@ class CayuApp:
                 "A secret-redacting CayuApp requires a SessionStore configured with "
                 "durable public authority aliases and an explicit alias keyring."
             )
-        self._runtime_session_store = runtime_checkpoint_session_store(self.session_store)
+        self._runtime_session_store = runtime_checkpoint_session_store(
+            self.session_store,
+            task_store=task_store,
+            on_retention_admission_failure=lambda session, failure: (
+                self._session_finalization.finalize_failed_retention_admission(session, failure)
+            ),
+        )
         self._resource_session_stream = ResourceSessionStream(
             get_store=lambda: self.session_store,
             get_policy=lambda: self.resource_access_policy,
