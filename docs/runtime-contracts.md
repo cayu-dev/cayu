@@ -91,7 +91,8 @@ variable with the same code, so application stores and Cayu tooling agree.
 `CAYU_REQUIRE_POSTGRES=1` makes every Cayu SQLite store raise
 `PostgresRequiredError` at construction. The service preset also passes
 `product_operations=True`, so its product operation store lives in the same
-database and, on PostgreSQL, the same pool. Per-run overrides
+database and, on PostgreSQL, the same pool. `agent_snapshots=True` adds an
+`AgentSnapshotStore` the same way. Per-run overrides
 remain at the invocation boundary. Schema versions and internal validation
 ceilings remain feature-owned contracts rather than application settings.
 
@@ -17165,9 +17166,19 @@ or provider continuations observed at settlement. These records recommend or
 compare successors only; they cannot activate code, profiles, policies,
 knowledge, or permissions.
 
-`SQLiteAgentSnapshotStore` and `InMemoryAgentSnapshotStore` retain root
-manifests, Merkle nodes, logical bindings, materializations, trial bindings, and
-result bindings. `put_snapshot()` atomically validates and stores one complete
+`SQLiteAgentSnapshotStore`, `PostgresAgentSnapshotStore`, and
+`InMemoryAgentSnapshotStore` retain root manifests, Merkle nodes, logical
+bindings, materializations, trial bindings, and result bindings. The PostgreSQL
+store keeps the SQLite store's tables and checks in the shared database
+(storage revision 120, created by `cayu storage migrate`) and serializes its
+writes with one transaction-scoped advisory lock, so service processes on
+several hosts share one snapshot history. Pick the backend with
+`open_agent_snapshot_store(configured_database_url(), sqlite_path=...)`, or pass
+`agent_snapshots=True` to `open_application_stores` to share its pool. Snapshot
+stores hold manifests and records only: provider objects live in a separate
+`AgentSnapshotObjectStore` the application composes with them, today
+`FileSystemAgentSnapshotObjectStore`, so a host can put objects in another
+durable store without changing the snapshot store. `put_snapshot()` atomically validates and stores one complete
 closure plus one binding; concurrent exact puts converge and conflicting node,
 root, or binding identities fail. `save_snapshot()` returns that canonical
 persisted manifest, so a repeated capture of the same root and logical binding
@@ -17202,7 +17213,7 @@ any remaining root are preserved.
 
 The stores also bind each snapshot/candidate/state scope to exactly one
 immutable materialization operation plan and one final materialization identity.
-In-memory and SQLite progress updates compare the entire expected state as well
+In-memory, SQLite, and PostgreSQL progress updates compare the entire expected state as well
 as its revision, so a stale or forged same-revision writer cannot replace active
 or completed component evidence. Competing coordinators converge through those
 durable claims rather than relying on an in-process lock. A compare-and-set
@@ -17217,8 +17228,8 @@ must durably make that operation id idempotent, safely finish or recover the
 same result, and fail closed when its outcome cannot be proven. A different
 operation plan for an occupied scope fails as a store conflict.
 Every content-addressed load revalidates the document and requires its internal
-root or fingerprint to match the requested store key. SQLite additionally
-cross-checks closure indexes and byte counts plus materialization scope,
+root or fingerprint to match the requested store key. SQLite and PostgreSQL
+additionally cross-check closure indexes and byte counts plus materialization scope,
 progress id, revision, and final-materialization pointer columns against the
 validated documents. Coordinator trust boundaries revalidate store save/load
 and transition results before capture return, provider dispatch, trial

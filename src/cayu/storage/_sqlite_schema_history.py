@@ -721,6 +721,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     117: SQLITE_COMPLETION_EVALUATION_DDL,
     118: SQLITE_RETENTION_AUDIT_DDL,
     119: SQLITE_TOOL_AUTHORIZATION_GRANT_DDL,
+    120: "",  # PostgreSQL agent snapshot tables; SQLiteAgentSnapshotStore creates its own.
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,

@@ -218,6 +218,17 @@ _POSTGRES_TABLES = (
     "cayu_storage_retention_runs",
     "cayu_tool_authorization_grant_uses",
     "cayu_tool_authorization_grants",
+    "cayu_agent_snapshot_records",
+    "cayu_agent_snapshot_materialization_progress",
+    "cayu_agent_snapshot_nodes",
+    "cayu_agent_snapshot_roots",
+    "cayu_agent_snapshot_root_nodes",
+    "cayu_agent_snapshot_bindings",
+    "cayu_agent_snapshot_pins",
+    "cayu_agent_snapshot_protections",
+    "cayu_agent_snapshot_lifecycle_operations",
+    "cayu_agent_snapshot_gc_plans",
+    "cayu_agent_snapshot_gc_receipts",
     "cayu_schema_migrations",
 )
 _POSTGRES_DATA_TABLES = (

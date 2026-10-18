@@ -222,7 +222,11 @@ from cayu.knowledge.search import KnowledgeListResult as KnowledgeListResult
 from cayu.knowledge.search import KnowledgeQuery as KnowledgeQuery
 from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
+from cayu.storage.agent_snapshots_postgres import (
+    PostgresAgentSnapshotStore as PostgresAgentSnapshotStore,
+)
 from cayu.storage.application import ApplicationStores as ApplicationStores
+from cayu.storage.application import open_agent_snapshot_store as open_agent_snapshot_store
 from cayu.storage.application import open_application_stores as open_application_stores
 from cayu.storage.authorization_grants_postgres import (
     PostgresToolAuthorizationGrantStore as PostgresToolAuthorizationGrantStore,
@@ -507,6 +511,7 @@ __all__ = [
     "copy_knowledge_revision_refs",
     "knowledge_access_scope_sha256",
     "knowledge_chunk_embedding_identity",
+    "open_agent_snapshot_store",
     "open_application_stores",
     "prepare_knowledge_activation_request",
     "prepare_knowledge_maintenance_decision",

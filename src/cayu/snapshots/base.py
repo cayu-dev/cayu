@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -3373,8 +3373,14 @@ def _require_scope_materialization(
         ) from error
 
 
-def _validated_sqlite_progress_row(
-    row: sqlite3.Row,
+class _StoreRow(Protocol):
+    """One database row read by column name (``sqlite3.Row`` or a psycopg dict row)."""
+
+    def __getitem__(self, key: str, /) -> Any: ...
+
+
+def _validated_progress_row(
+    row: _StoreRow,
     *,
     expected_scope: tuple[str, str, str, str] | None = None,
 ) -> AgentSnapshotMaterializationProgress:
@@ -3401,6 +3407,394 @@ def _validated_sqlite_progress_row(
             "Materialization scope index does not match its durable progress."
         )
     return progress
+
+
+# Durable snapshot stores share these row checks so every backend fails closed
+# on the same corrupt, non-canonical or conflicting rows. Each store runs its own
+# SQL inside its own write serialization and passes the rows it read.
+
+
+def _verified_binding_row(
+    access: AgentSnapshotAccess,
+    row: _StoreRow | None,
+) -> tuple[AgentSnapshotIdentityBinding, AgentSnapshot]:
+    """Validate a stored binding row for one already-validated access."""
+
+    if row is None:
+        raise AgentSnapshotAuthorizationError("Snapshot identity binding is unavailable.")
+    binding_document = cast("str", row["binding_document"])
+    try:
+        binding = AgentSnapshotIdentityBinding.model_validate_json(binding_document)
+    except Exception as error:
+        raise AgentSnapshotAuthorizationError("Snapshot identity binding is invalid.") from error
+    if binding_document != _snapshot_model_json(binding):
+        raise AgentSnapshotAuthorizationError(
+            "Snapshot identity binding document is not canonical."
+        )
+    _validate_snapshot_access(access, binding)
+    if (
+        row["snapshot_root"] != binding.snapshot.snapshot_root
+        or row["authority_scope_fingerprint"] != binding.authority_scope_fingerprint
+    ):
+        raise AgentSnapshotAuthorizationError(
+            "Snapshot identity binding columns contradict its document."
+        )
+    snapshot_document = cast("str", row["snapshot_document"])
+    try:
+        snapshot = AgentSnapshot.model_validate_json(snapshot_document)
+    except Exception as error:
+        raise AgentSnapshotVerificationError(
+            "Snapshot binding manifest document is invalid."
+        ) from error
+    if snapshot_document != _snapshot_model_json(snapshot):
+        raise AgentSnapshotVerificationError("Snapshot binding manifest document is not canonical.")
+    if snapshot.snapshot_root != access.snapshot.snapshot_root:
+        raise AgentSnapshotVerificationError("Snapshot binding manifest names another root.")
+    return binding, snapshot
+
+
+def _verified_root_closure(
+    snapshot: AgentSnapshot,
+    root_row: _StoreRow | None,
+    node_rows: Iterable[_StoreRow],
+) -> tuple[AgentSnapshotNode, ...]:
+    """Verify a stored root row and its ordinal-ordered closure index rows."""
+
+    if root_row is None:
+        raise AgentSnapshotVerificationError("AgentSnapshot root closure is unavailable.")
+    root_manifest_document = cast("str", root_row["manifest_document"])
+    try:
+        stored_root_manifest = AgentSnapshotNode.model_validate_json(root_manifest_document)
+    except Exception as error:
+        raise AgentSnapshotVerificationError(
+            "AgentSnapshot root manifest node is invalid."
+        ) from error
+    if root_manifest_document != _snapshot_model_json(stored_root_manifest):
+        raise AgentSnapshotVerificationError("AgentSnapshot root manifest node is not canonical.")
+    nodes: dict[str, AgentSnapshotNode] = {}
+    indexed: list[str] = []
+    for ordinal, row in enumerate(node_rows):
+        if row["ordinal"] != ordinal:
+            raise AgentSnapshotVerificationError(
+                "AgentSnapshot closure index has a non-contiguous ordinal."
+            )
+        digest = cast("str", row["node_digest"])
+        indexed.append(digest)
+        if row["document"] is None:
+            continue
+        try:
+            node_document = cast("str", row["document"])
+            node = AgentSnapshotNode.model_validate_json(node_document)
+        except Exception as error:
+            raise AgentSnapshotVerificationError(
+                "AgentSnapshot Merkle closure contains a corrupt node."
+            ) from error
+        if (
+            node.digest != digest
+            or row["node_kind"] != node.node_kind.value
+            or row["schema_id"] != node.schema_id
+            or row["byte_count"] != len(_snapshot_model_bytes(node, "agent_snapshot_node"))
+            or node_document != _snapshot_model_json(node)
+        ):
+            raise AgentSnapshotVerificationError(
+                "AgentSnapshot node columns contradict its envelope."
+            )
+        nodes[digest] = node
+    closure = _verify_snapshot_nodes(snapshot, nodes)
+    if stored_root_manifest != nodes[snapshot.snapshot_root]:
+        raise AgentSnapshotVerificationError(
+            "AgentSnapshot root manifest row differs from its content-addressed node."
+        )
+    if tuple(indexed) != tuple(sorted(node.digest for node in closure)):
+        raise AgentSnapshotVerificationError(
+            "AgentSnapshot closure index differs from reachable nodes."
+        )
+    if root_row["object_count"] != len(closure) or root_row["closure_bytes"] != sum(
+        len(_snapshot_model_bytes(node, "agent_snapshot_node")) for node in closure
+    ):
+        raise AgentSnapshotVerificationError("AgentSnapshot root metrics contradict its closure.")
+    if root_row["manifest_bytes"] != len(
+        _snapshot_model_bytes(nodes[snapshot.snapshot_root], "agent_snapshot_root_manifest")
+    ):
+        raise AgentSnapshotVerificationError("AgentSnapshot root manifest byte count is invalid.")
+    return closure
+
+
+class _PreparedSnapshotPut:
+    """Canonical documents and metrics one put writes, computed once per backend."""
+
+    __slots__ = (
+        "binding",
+        "binding_document",
+        "closure",
+        "closure_bytes",
+        "manifest_bytes",
+        "node_digests",
+        "node_rows",
+        "receipt",
+        "receipt_document",
+        "root_manifest",
+        "root_manifest_document",
+        "snapshot",
+        "snapshot_document",
+    )
+
+    def __init__(self, snapshot: AgentSnapshot, binding: AgentSnapshotIdentityBinding) -> None:
+        self.snapshot, self.binding = _validate_snapshot_binding(snapshot, binding)
+        self.closure = _verify_snapshot_nodes(
+            self.snapshot,
+            {node.digest: node for node in self.snapshot.merkle_nodes()},
+        )
+        self.node_digests = tuple(sorted(node.digest for node in self.closure))
+        self.receipt = AgentSnapshotPutReceipt.create(
+            snapshot=self.snapshot.ref,
+            binding_id=self.binding.binding_id,
+            node_digests=self.node_digests,
+        )
+        self.snapshot_document = _snapshot_model_json(self.snapshot)
+        self.binding_document = _snapshot_model_json(self.binding)
+        self.receipt_document = _snapshot_model_json(self.receipt)
+        self.root_manifest = self.snapshot.root_node()
+        self.root_manifest_document = _snapshot_model_json(self.root_manifest)
+        self.manifest_bytes = len(
+            _snapshot_model_bytes(self.root_manifest, "agent_snapshot_root_manifest")
+        )
+        # (digest, node_kind, schema_id, byte_count, document) for each node.
+        self.node_rows: tuple[tuple[str, str, str, int, str], ...] = tuple(
+            (
+                node.digest,
+                node.node_kind.value,
+                node.schema_id,
+                len(_snapshot_model_bytes(node, "agent_snapshot_node")),
+                _snapshot_model_json(node),
+            )
+            for node in self.closure
+        )
+        self.closure_bytes = sum(row[3] for row in self.node_rows)
+
+    @property
+    def access(self) -> AgentSnapshotAccess:
+        return AgentSnapshotAccess(
+            snapshot=self.snapshot.ref,
+            binding_id=self.binding.binding_id,
+            authority_scope_fingerprint=self.binding.authority_scope_fingerprint,
+        )
+
+    def require_replay(self, row: _StoreRow) -> None:
+        """Refuse an existing binding row that is not this exact put."""
+
+        try:
+            existing_binding = AgentSnapshotIdentityBinding.model_validate_json(
+                cast("str", row["binding_document"])
+            )
+            existing_snapshot = AgentSnapshot.model_validate_json(
+                cast("str", row["snapshot_document"])
+            )
+            existing_receipt = AgentSnapshotPutReceipt.model_validate_json(
+                cast("str", row["put_receipt_document"])
+            )
+        except Exception as error:
+            raise AgentSnapshotStoreConflict("Stored snapshot binding is invalid.") from error
+        if (
+            not _same_record_identity(existing_binding, self.binding)
+            or existing_snapshot.snapshot_root != self.snapshot.snapshot_root
+            or existing_receipt != self.receipt
+            or row["put_receipt_document"] != _snapshot_model_json(existing_receipt)
+        ):
+            raise AgentSnapshotStoreConflict("Snapshot binding is already bound to another put.")
+
+    @staticmethod
+    def require_stored_node(
+        row: _StoreRow | None,
+        node_row: tuple[str, str, str, int, str],
+    ) -> None:
+        _, node_kind, schema_id, byte_count, document = node_row
+        if row is None or (
+            row["node_kind"] != node_kind
+            or row["schema_id"] != schema_id
+            or row["byte_count"] != byte_count
+            or row["document"] != document
+        ):
+            raise AgentSnapshotStoreConflict(
+                "Snapshot node digest is already bound to another envelope."
+            )
+
+    def require_stored_root(self, root_row: _StoreRow, indexed: tuple[str, ...]) -> None:
+        try:
+            stored_manifest = AgentSnapshotNode.model_validate_json(
+                cast("str", root_row["manifest_document"])
+            )
+        except Exception as error:
+            raise AgentSnapshotStoreConflict("Stored root manifest is invalid.") from error
+        if (
+            indexed != self.node_digests
+            or stored_manifest != self.root_manifest
+            or root_row["manifest_document"] != self.root_manifest_document
+            or root_row["manifest_bytes"] != self.manifest_bytes
+            or root_row["closure_bytes"] != self.closure_bytes
+            or root_row["object_count"] != len(self.closure)
+        ):
+            raise AgentSnapshotStoreConflict("Snapshot root is already bound to another closure.")
+
+    def require_stored_record(self, row: _StoreRow | None) -> None:
+        if row is None:
+            raise AgentSnapshotStoreConflict("Snapshot manifest record was not stored.")
+        try:
+            stored = AgentSnapshot.model_validate_json(cast("str", row["document"]))
+        except Exception as error:
+            raise AgentSnapshotStoreConflict(
+                "Stored snapshot manifest record is invalid."
+            ) from error
+        if stored.snapshot_root != self.snapshot.snapshot_root:
+            raise AgentSnapshotStoreConflict("Stored snapshot manifest record names another root.")
+
+
+def _verified_stored_binding(
+    row: _StoreRow | None,
+    binding_id: str,
+) -> str | None:
+    """Return a stored binding's canonical document after checking its columns."""
+
+    if row is None:
+        return None
+    document = cast("str", row["binding_document"])
+    try:
+        binding = AgentSnapshotIdentityBinding.model_validate_json(document)
+    except Exception as error:
+        raise AgentSnapshotStoreConflict("Stored snapshot binding is invalid.") from error
+    if (
+        binding.binding_id != binding_id
+        or row["snapshot_root"] != binding.snapshot.snapshot_root
+        or row["authority_scope_fingerprint"] != binding.authority_scope_fingerprint
+        or document != _snapshot_model_json(binding)
+    ):
+        raise AgentSnapshotStoreConflict(
+            "Stored snapshot binding columns contradict its canonical document."
+        )
+    return document
+
+
+def _replayed_operation(
+    row: _StoreRow | None,
+    *,
+    kind: str,
+    request_digest: str,
+    model: type[BaseModel],
+) -> BaseModel | None:
+    """Return the recorded response of an exact replay, refusing a different request."""
+
+    if row is None:
+        return None
+    if row["request_digest"] != request_digest or row["response_model"] != model.__name__:
+        raise AgentSnapshotStoreConflict(
+            f"Snapshot {kind} operation_id is already bound to another request."
+        )
+    document = cast("str", row["response_document"])
+    try:
+        response = model.model_validate_json(document)
+    except Exception as error:
+        raise AgentSnapshotStoreConflict(
+            f"Snapshot {kind} operation receipt is invalid."
+        ) from error
+    if document != _snapshot_model_json(response):
+        raise AgentSnapshotStoreConflict(f"Snapshot {kind} operation receipt is not canonical.")
+    return response
+
+
+def _require_stored_pin(row: _StoreRow | None, receipt: AgentSnapshotPinReceipt) -> None:
+    if row is None:
+        raise AgentSnapshotStoreConflict("Snapshot pin was not stored.")
+    try:
+        stored = AgentSnapshotPinReceipt.model_validate_json(cast("str", row["document"]))
+    except Exception as error:
+        raise AgentSnapshotStoreConflict("Stored snapshot pin is invalid.") from error
+    if (
+        stored.snapshot != receipt.snapshot
+        or stored.binding_id != receipt.binding_id
+        or stored.owner != receipt.owner
+        or stored.reason != receipt.reason
+        or stored.retention_class is not receipt.retention_class
+    ):
+        raise AgentSnapshotStoreConflict("Snapshot pin identity conflicts.")
+
+
+def _releasable_pin(
+    row: _StoreRow | None,
+    request: AgentSnapshotReleaseRequest,
+) -> AgentSnapshotPinReceipt:
+    if row is None:
+        raise AgentSnapshotStoreConflict("Snapshot pin is unavailable.")
+    try:
+        pin = AgentSnapshotPinReceipt.model_validate_json(cast("str", row["document"]))
+    except Exception as error:
+        raise AgentSnapshotStoreConflict("Stored snapshot pin is invalid.") from error
+    if pin.snapshot != request.access.snapshot or pin.binding_id != request.access.binding_id:
+        raise AgentSnapshotAuthorizationError("Snapshot release names a pin outside its binding.")
+    if pin.owner != request.owner:
+        raise AgentSnapshotAuthorizationError("Snapshot release owner does not own the pin.")
+    return pin
+
+
+def _releasable_protection(
+    row: _StoreRow | None,
+    access: AgentSnapshotAccess,
+) -> AgentSnapshotProtection:
+    if row is None:
+        raise AgentSnapshotStoreConflict("Snapshot protection is unavailable.")
+    try:
+        protection = AgentSnapshotProtection.model_validate_json(cast("str", row["document"]))
+    except Exception as error:
+        raise AgentSnapshotStoreConflict("Stored snapshot protection is invalid.") from error
+    if protection.access != access:
+        raise AgentSnapshotAuthorizationError(
+            "Snapshot protection is outside the supplied binding."
+        )
+    return protection
+
+
+def _require_saved_record(
+    stored_document: str,
+    validated: BaseModel,
+    fingerprint: str,
+) -> None:
+    """Refuse a stored content-addressed record bound to another logical identity."""
+
+    try:
+        stored = type(validated).model_validate_json(stored_document)
+    except Exception as error:
+        raise AgentSnapshotStoreConflict("Stored record is invalid for its fingerprint.") from error
+    if getattr(stored, "fingerprint", None) != fingerprint:
+        raise AgentSnapshotStoreConflict(
+            "Stored record fingerprint does not match its content-addressed key."
+        )
+    if not _same_record_identity(stored, validated):
+        raise AgentSnapshotStoreConflict(
+            "Record fingerprint is already bound to another logical identity."
+        )
+
+
+def _require_loaded_record(document: str, model: type[BaseModel], fingerprint: str) -> None:
+    try:
+        stored = model.model_validate_json(document)
+    except Exception as error:
+        raise AgentSnapshotStoreConflict("Stored record is invalid for its fingerprint.") from error
+    if getattr(stored, "fingerprint", None) != fingerprint:
+        raise AgentSnapshotStoreConflict(
+            "Stored record fingerprint does not match its content-addressed key."
+        )
+
+
+def _gc_deletable_nodes(
+    collectable_roots: set[str],
+    roots_by_node: dict[str, set[str]],
+) -> tuple[set[str], set[str]]:
+    """Split candidate nodes into those only collectable roots reach and the rest."""
+
+    deleting: set[str] = set()
+    retained: set[str] = set()
+    for digest, roots in roots_by_node.items():
+        (deleting if roots <= collectable_roots else retained).add(digest)
+    return deleting, retained
 
 
 class InMemoryAgentSnapshotStore(AgentSnapshotStore):
@@ -4156,6 +4550,126 @@ class InMemoryAgentSnapshotStore(AgentSnapshotStore):
         )
 
 
+# Tables and indexes every SQLite snapshot store creates when it opens.
+_SQLITE_AGENT_SNAPSHOT_DDL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_records (
+        record_kind TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        document TEXT NOT NULL,
+        PRIMARY KEY (record_kind, fingerprint)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_materialization_progress (
+        snapshot_fingerprint TEXT NOT NULL,
+        candidate_id TEXT NOT NULL,
+        state_scope_id TEXT NOT NULL,
+        state_mode TEXT NOT NULL,
+        progress_id TEXT NOT NULL UNIQUE,
+        revision INTEGER NOT NULL,
+        document TEXT NOT NULL,
+        materialization_fingerprint TEXT,
+        PRIMARY KEY (
+            snapshot_fingerprint,
+            candidate_id,
+            state_scope_id,
+            state_mode
+        )
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_nodes (
+        digest TEXT PRIMARY KEY,
+        node_kind TEXT NOT NULL,
+        schema_id TEXT NOT NULL,
+        byte_count INTEGER NOT NULL,
+        document TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_roots (
+        snapshot_root TEXT PRIMARY KEY,
+        manifest_document TEXT NOT NULL,
+        manifest_bytes INTEGER NOT NULL,
+        closure_bytes INTEGER NOT NULL,
+        object_count INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_root_nodes (
+        snapshot_root TEXT NOT NULL,
+        node_digest TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        PRIMARY KEY (snapshot_root, node_digest),
+        UNIQUE (snapshot_root, ordinal)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_bindings (
+        binding_id TEXT PRIMARY KEY,
+        snapshot_root TEXT NOT NULL,
+        authority_scope_fingerprint TEXT NOT NULL,
+        binding_document TEXT NOT NULL,
+        snapshot_document TEXT NOT NULL,
+        put_receipt_document TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_pins (
+        pin_id TEXT PRIMARY KEY,
+        snapshot_root TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        document TEXT NOT NULL,
+        released INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_protections (
+        protection_id TEXT PRIMARY KEY,
+        snapshot_root TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        document TEXT NOT NULL,
+        released INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_lifecycle_operations (
+        operation_kind TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        response_model TEXT NOT NULL,
+        response_document TEXT NOT NULL,
+        PRIMARY KEY (operation_kind, operation_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_gc_plans (
+        operation_id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL UNIQUE,
+        request_digest TEXT NOT NULL,
+        request_document TEXT NOT NULL,
+        plan_document TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_gc_receipts (
+        plan_id TEXT PRIMARY KEY,
+        receipt_document TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_root_nodes_by_node "
+    "ON cayu_agent_snapshot_root_nodes (node_digest, snapshot_root)",
+    "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_bindings_by_root "
+    "ON cayu_agent_snapshot_bindings (snapshot_root)",
+    "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_active_pins_by_root "
+    "ON cayu_agent_snapshot_pins (snapshot_root, released)",
+    "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_active_protections_by_root "
+    "ON cayu_agent_snapshot_protections (snapshot_root, released)",
+)
+
+
 class SQLiteAgentSnapshotStore(AgentSnapshotStore):
     """Small durable journal for manifests and evaluation lineage records."""
 
@@ -4163,7 +4677,30 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         require_sqlite_store_allowed("SQLiteAgentSnapshotStore")
         self.path = Path(path)
         self._write_lock = threading.RLock()
+        self._diagnostic_view: Literal["empty", "file"] | None = None
+        from cayu.storage._diagnostic_inspection import current_diagnostic_store_inspection
+
+        if current_diagnostic_store_inspection() is not None and self.path != Path(":memory:"):
+            # Diagnostic inspection must neither create nor change the database:
+            # read an existing snapshot file read-only, otherwise an empty schema.
+            self._diagnostic_view = "empty" if self._diagnostic_source_empty() else "file"
+            return
         self._initialize()
+
+    def _diagnostic_source_empty(self) -> bool:
+        from cayu.storage import _sqlite_connection as sqlite_connection
+
+        if sqlite_connection.diagnostic_sqlite_source_missing(self.path):
+            return True
+        connection = sqlite_connection.connect_read_only_inspection(self.path)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_agent_snapshot_bindings'"
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is None
 
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return the primary SQLite file for state-boundary validation."""
@@ -4197,9 +4734,21 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0)
+        if self._diagnostic_view == "file":
+            from cayu.storage import _sqlite_connection as sqlite_connection
+
+            connection = sqlite_connection.connect_read_only_inspection(self.path)
+            connection.row_factory = sqlite3.Row
+            return connection
+        connection = sqlite3.connect(
+            ":memory:" if self._diagnostic_view == "empty" else self.path, timeout=30.0
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 30000")
+        if self._diagnostic_view == "empty":
+            for statement in _SQLITE_AGENT_SNAPSHOT_DDL:
+                connection.execute(statement)
+            connection.execute("PRAGMA query_only = ON")
         return connection
 
     @contextmanager
@@ -4221,151 +4770,8 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write_connection() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_records (
-                    record_kind TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    document TEXT NOT NULL,
-                    PRIMARY KEY (record_kind, fingerprint)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_materialization_progress (
-                    snapshot_fingerprint TEXT NOT NULL,
-                    candidate_id TEXT NOT NULL,
-                    state_scope_id TEXT NOT NULL,
-                    state_mode TEXT NOT NULL,
-                    progress_id TEXT NOT NULL UNIQUE,
-                    revision INTEGER NOT NULL,
-                    document TEXT NOT NULL,
-                    materialization_fingerprint TEXT,
-                    PRIMARY KEY (
-                        snapshot_fingerprint,
-                        candidate_id,
-                        state_scope_id,
-                        state_mode
-                    )
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_nodes (
-                    digest TEXT PRIMARY KEY,
-                    node_kind TEXT NOT NULL,
-                    schema_id TEXT NOT NULL,
-                    byte_count INTEGER NOT NULL,
-                    document TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_roots (
-                    snapshot_root TEXT PRIMARY KEY,
-                    manifest_document TEXT NOT NULL,
-                    manifest_bytes INTEGER NOT NULL,
-                    closure_bytes INTEGER NOT NULL,
-                    object_count INTEGER NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_root_nodes (
-                    snapshot_root TEXT NOT NULL,
-                    node_digest TEXT NOT NULL,
-                    ordinal INTEGER NOT NULL,
-                    PRIMARY KEY (snapshot_root, node_digest),
-                    UNIQUE (snapshot_root, ordinal)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_bindings (
-                    binding_id TEXT PRIMARY KEY,
-                    snapshot_root TEXT NOT NULL,
-                    authority_scope_fingerprint TEXT NOT NULL,
-                    binding_document TEXT NOT NULL,
-                    snapshot_document TEXT NOT NULL,
-                    put_receipt_document TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_pins (
-                    pin_id TEXT PRIMARY KEY,
-                    snapshot_root TEXT NOT NULL,
-                    binding_id TEXT NOT NULL,
-                    document TEXT NOT NULL,
-                    released INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_protections (
-                    protection_id TEXT PRIMARY KEY,
-                    snapshot_root TEXT NOT NULL,
-                    binding_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    document TEXT NOT NULL,
-                    released INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_lifecycle_operations (
-                    operation_kind TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    response_model TEXT NOT NULL,
-                    response_document TEXT NOT NULL,
-                    PRIMARY KEY (operation_kind, operation_id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_gc_plans (
-                    operation_id TEXT PRIMARY KEY,
-                    plan_id TEXT NOT NULL UNIQUE,
-                    request_digest TEXT NOT NULL,
-                    request_document TEXT NOT NULL,
-                    plan_document TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_gc_receipts (
-                    plan_id TEXT PRIMARY KEY,
-                    receipt_document TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_root_nodes_by_node "
-                "ON cayu_agent_snapshot_root_nodes (node_digest, snapshot_root)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_bindings_by_root "
-                "ON cayu_agent_snapshot_bindings (snapshot_root)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_active_pins_by_root "
-                "ON cayu_agent_snapshot_pins (snapshot_root, released)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS cayu_agent_snapshot_active_protections_by_root "
-                "ON cayu_agent_snapshot_protections (snapshot_root, released)"
-            )
+            for statement in _SQLITE_AGENT_SNAPSHOT_DDL:
+                connection.execute(statement)
 
     def _load_access_closure_sync(
         self,
@@ -4383,117 +4789,26 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             "snapshot_document FROM cayu_agent_snapshot_bindings WHERE binding_id = ?",
             (validated_access.binding_id,),
         ).fetchone()
-        if binding_row is None:
-            raise AgentSnapshotAuthorizationError("Snapshot identity binding is unavailable.")
-        binding_document = cast("str", binding_row["binding_document"])
-        try:
-            binding = AgentSnapshotIdentityBinding.model_validate_json(binding_document)
-        except Exception as error:
-            raise AgentSnapshotAuthorizationError(
-                "Snapshot identity binding is invalid."
-            ) from error
-        if binding_document != _snapshot_model_json(binding):
-            raise AgentSnapshotAuthorizationError(
-                "Snapshot identity binding document is not canonical."
-            )
-        _validate_snapshot_access(validated_access, binding)
-        if (
-            binding_row["snapshot_root"] != binding.snapshot.snapshot_root
-            or binding_row["authority_scope_fingerprint"] != binding.authority_scope_fingerprint
-        ):
-            raise AgentSnapshotAuthorizationError(
-                "Snapshot identity binding columns contradict its document."
-            )
-        snapshot_document = cast("str", binding_row["snapshot_document"])
-        try:
-            snapshot = AgentSnapshot.model_validate_json(snapshot_document)
-        except Exception as error:
-            raise AgentSnapshotVerificationError(
-                "Snapshot binding manifest document is invalid."
-            ) from error
-        if snapshot_document != _snapshot_model_json(snapshot):
-            raise AgentSnapshotVerificationError(
-                "Snapshot binding manifest document is not canonical."
-            )
-        if snapshot.snapshot_root != validated_access.snapshot.snapshot_root:
-            raise AgentSnapshotVerificationError("Snapshot binding manifest names another root.")
+        binding, snapshot = _verified_binding_row(validated_access, binding_row)
         root_row = connection.execute(
             "SELECT manifest_document, manifest_bytes, closure_bytes, object_count "
             "FROM cayu_agent_snapshot_roots WHERE snapshot_root = ?",
             (validated_access.snapshot.snapshot_root,),
         ).fetchone()
-        if root_row is None:
-            raise AgentSnapshotVerificationError("AgentSnapshot root closure is unavailable.")
-        root_manifest_document = cast("str", root_row["manifest_document"])
-        try:
-            stored_root_manifest = AgentSnapshotNode.model_validate_json(root_manifest_document)
-        except Exception as error:
-            raise AgentSnapshotVerificationError(
-                "AgentSnapshot root manifest node is invalid."
-            ) from error
-        if root_manifest_document != _snapshot_model_json(stored_root_manifest):
-            raise AgentSnapshotVerificationError(
-                "AgentSnapshot root manifest node is not canonical."
-            )
-        rows = connection.execute(
-            "SELECT link.node_digest, link.ordinal, node.node_kind, node.schema_id, "
-            "node.byte_count, node.document "
-            "FROM cayu_agent_snapshot_root_nodes AS link "
-            "LEFT JOIN cayu_agent_snapshot_nodes AS node ON node.digest = link.node_digest "
-            "WHERE link.snapshot_root = ? ORDER BY link.ordinal",
-            (validated_access.snapshot.snapshot_root,),
-        ).fetchall()
-        nodes: dict[str, AgentSnapshotNode] = {}
-        indexed: list[str] = []
-        for ordinal, row in enumerate(rows):
-            if row["ordinal"] != ordinal:
-                raise AgentSnapshotVerificationError(
-                    "AgentSnapshot closure index has a non-contiguous ordinal."
-                )
-            digest = cast("str", row["node_digest"])
-            indexed.append(digest)
-            if row["document"] is None:
-                continue
-            try:
-                node_document = cast("str", row["document"])
-                node = AgentSnapshotNode.model_validate_json(node_document)
-            except Exception as error:
-                raise AgentSnapshotVerificationError(
-                    "AgentSnapshot Merkle closure contains a corrupt node."
-                ) from error
-            if (
-                node.digest != digest
-                or row["node_kind"] != node.node_kind.value
-                or row["schema_id"] != node.schema_id
-                or row["byte_count"] != len(_snapshot_model_bytes(node, "agent_snapshot_node"))
-                or node_document != _snapshot_model_json(node)
-            ):
-                raise AgentSnapshotVerificationError(
-                    "AgentSnapshot node columns contradict its envelope."
-                )
-            nodes[digest] = node
-        closure = _verify_snapshot_nodes(snapshot, nodes)
-        if stored_root_manifest != nodes[snapshot.snapshot_root]:
-            raise AgentSnapshotVerificationError(
-                "AgentSnapshot root manifest row differs from its content-addressed node."
-            )
-        if tuple(indexed) != tuple(sorted(node.digest for node in closure)):
-            raise AgentSnapshotVerificationError(
-                "AgentSnapshot closure index differs from reachable nodes."
-            )
-        if root_row["object_count"] != len(closure) or root_row["closure_bytes"] != sum(
-            len(_snapshot_model_bytes(node, "agent_snapshot_node")) for node in closure
-        ):
-            raise AgentSnapshotVerificationError(
-                "AgentSnapshot root metrics contradict its closure."
-            )
-        if root_row["manifest_bytes"] != len(
-            _snapshot_model_bytes(nodes[snapshot.snapshot_root], "agent_snapshot_root_manifest")
-        ):
-            raise AgentSnapshotVerificationError(
-                "AgentSnapshot root manifest byte count is invalid."
-            )
-        return snapshot, binding, closure, root_row
+        rows = (
+            ()
+            if root_row is None
+            else connection.execute(
+                "SELECT link.node_digest, link.ordinal, node.node_kind, node.schema_id, "
+                "node.byte_count, node.document "
+                "FROM cayu_agent_snapshot_root_nodes AS link "
+                "LEFT JOIN cayu_agent_snapshot_nodes AS node ON node.digest = link.node_digest "
+                "WHERE link.snapshot_root = ? ORDER BY link.ordinal",
+                (validated_access.snapshot.snapshot_root,),
+            ).fetchall()
+        )
+        closure = _verified_root_closure(snapshot, root_row, rows)
+        return snapshot, binding, closure, cast("sqlite3.Row", root_row)
 
     def _put_snapshot_sync(
         self,
@@ -4502,26 +4817,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         *,
         connection: sqlite3.Connection | None = None,
     ) -> str:
-        validated_snapshot, validated_binding = _validate_snapshot_binding(snapshot, binding)
-        closure = _verify_snapshot_nodes(
-            validated_snapshot,
-            {node.digest: node for node in validated_snapshot.merkle_nodes()},
-        )
-        node_digests = tuple(sorted(node.digest for node in closure))
-        receipt = AgentSnapshotPutReceipt.create(
-            snapshot=validated_snapshot.ref,
-            binding_id=validated_binding.binding_id,
-            node_digests=node_digests,
-        )
-        snapshot_document = _snapshot_model_json(validated_snapshot)
-        binding_document = _snapshot_model_json(validated_binding)
-        receipt_document = _snapshot_model_json(receipt)
-        root_manifest = validated_snapshot.root_node()
-        root_manifest_document = _snapshot_model_json(root_manifest)
-        manifest_bytes = len(_snapshot_model_bytes(root_manifest, "agent_snapshot_root_manifest"))
-        closure_bytes = sum(
-            len(_snapshot_model_bytes(node, "agent_snapshot_node")) for node in closure
-        )
+        put = _PreparedSnapshotPut(snapshot, binding)
         connection_context = (
             self._write_connection() if connection is None else nullcontext(connection)
         )
@@ -4529,68 +4825,28 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             existing_binding_row = connection.execute(
                 "SELECT binding_document, snapshot_document, put_receipt_document "
                 "FROM cayu_agent_snapshot_bindings WHERE binding_id = ?",
-                (validated_binding.binding_id,),
+                (put.binding.binding_id,),
             ).fetchone()
             if existing_binding_row is not None:
-                try:
-                    existing_binding = AgentSnapshotIdentityBinding.model_validate_json(
-                        cast("str", existing_binding_row["binding_document"])
-                    )
-                    existing_snapshot = AgentSnapshot.model_validate_json(
-                        cast("str", existing_binding_row["snapshot_document"])
-                    )
-                    existing_receipt = AgentSnapshotPutReceipt.model_validate_json(
-                        cast("str", existing_binding_row["put_receipt_document"])
-                    )
-                except Exception as error:
-                    raise AgentSnapshotStoreConflict(
-                        "Stored snapshot binding is invalid."
-                    ) from error
-                if (
-                    not _same_record_identity(existing_binding, validated_binding)
-                    or existing_snapshot.snapshot_root != validated_snapshot.snapshot_root
-                    or existing_receipt != receipt
-                    or existing_binding_row["put_receipt_document"]
-                    != _snapshot_model_json(existing_receipt)
-                ):
-                    raise AgentSnapshotStoreConflict(
-                        "Snapshot binding is already bound to another put."
-                    )
-                self._load_access_closure_sync(
-                    connection,
-                    AgentSnapshotAccess(
-                        snapshot=validated_snapshot.ref,
-                        binding_id=validated_binding.binding_id,
-                        authority_scope_fingerprint=(validated_binding.authority_scope_fingerprint),
-                    ),
-                )
+                put.require_replay(existing_binding_row)
+                self._load_access_closure_sync(connection, put.access)
                 return cast("str", existing_binding_row["put_receipt_document"])
-            for node in closure:
-                document = _snapshot_model_json(node)
-                byte_count = len(_snapshot_model_bytes(node, "agent_snapshot_node"))
+            for node_row in put.node_rows:
                 connection.execute(
                     "INSERT OR IGNORE INTO cayu_agent_snapshot_nodes "
                     "(digest, node_kind, schema_id, byte_count, document) VALUES (?, ?, ?, ?, ?)",
-                    (node.digest, node.node_kind.value, node.schema_id, byte_count, document),
+                    node_row,
                 )
                 row = connection.execute(
                     "SELECT node_kind, schema_id, byte_count, document "
                     "FROM cayu_agent_snapshot_nodes WHERE digest = ?",
-                    (node.digest,),
+                    (node_row[0],),
                 ).fetchone()
-                if row is None or (
-                    row["node_kind"] != node.node_kind.value
-                    or row["schema_id"] != node.schema_id
-                    or row["byte_count"] != byte_count
-                    or row["document"] != document
-                ):
-                    raise AgentSnapshotStoreConflict(
-                        "Snapshot node digest is already bound to another envelope."
-                    )
+                put.require_stored_node(row, node_row)
             root_row = connection.execute(
                 "SELECT manifest_document, manifest_bytes, closure_bytes, object_count "
                 "FROM cayu_agent_snapshot_roots WHERE snapshot_root = ?",
-                (validated_snapshot.snapshot_root,),
+                (put.snapshot.snapshot_root,),
             ).fetchone()
             if root_row is None:
                 connection.execute(
@@ -4598,18 +4854,18 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                     "(snapshot_root, manifest_document, manifest_bytes, closure_bytes, object_count) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (
-                        validated_snapshot.snapshot_root,
-                        root_manifest_document,
-                        manifest_bytes,
-                        closure_bytes,
-                        len(closure),
+                        put.snapshot.snapshot_root,
+                        put.root_manifest_document,
+                        put.manifest_bytes,
+                        put.closure_bytes,
+                        len(put.closure),
                     ),
                 )
-                for ordinal, digest in enumerate(node_digests):
+                for ordinal, digest in enumerate(put.node_digests):
                     connection.execute(
                         "INSERT INTO cayu_agent_snapshot_root_nodes "
                         "(snapshot_root, node_digest, ordinal) VALUES (?, ?, ?)",
-                        (validated_snapshot.snapshot_root, digest, ordinal),
+                        (put.snapshot.snapshot_root, digest, ordinal),
                     )
             else:
                 indexed = tuple(
@@ -4617,62 +4873,35 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                     for row in connection.execute(
                         "SELECT node_digest FROM cayu_agent_snapshot_root_nodes "
                         "WHERE snapshot_root = ? ORDER BY ordinal",
-                        (validated_snapshot.snapshot_root,),
+                        (put.snapshot.snapshot_root,),
                     ).fetchall()
                 )
-                try:
-                    stored_manifest = AgentSnapshotNode.model_validate_json(
-                        cast("str", root_row["manifest_document"])
-                    )
-                except Exception as error:
-                    raise AgentSnapshotStoreConflict("Stored root manifest is invalid.") from error
-                if (
-                    indexed != node_digests
-                    or stored_manifest != root_manifest
-                    or root_row["manifest_document"] != root_manifest_document
-                    or root_row["manifest_bytes"] != manifest_bytes
-                    or root_row["closure_bytes"] != closure_bytes
-                    or root_row["object_count"] != len(closure)
-                ):
-                    raise AgentSnapshotStoreConflict(
-                        "Snapshot root is already bound to another closure."
-                    )
+                put.require_stored_root(root_row, indexed)
             connection.execute(
                 "INSERT INTO cayu_agent_snapshot_bindings "
                 "(binding_id, snapshot_root, authority_scope_fingerprint, binding_document, "
                 "snapshot_document, put_receipt_document) VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    validated_binding.binding_id,
-                    validated_snapshot.snapshot_root,
-                    validated_binding.authority_scope_fingerprint,
-                    binding_document,
-                    snapshot_document,
-                    receipt_document,
+                    put.binding.binding_id,
+                    put.snapshot.snapshot_root,
+                    put.binding.authority_scope_fingerprint,
+                    put.binding_document,
+                    put.snapshot_document,
+                    put.receipt_document,
                 ),
             )
             connection.execute(
                 "INSERT OR IGNORE INTO cayu_agent_snapshot_records "
                 "(record_kind, fingerprint, document) VALUES ('snapshot', ?, ?)",
-                (validated_snapshot.snapshot_root, snapshot_document),
+                (put.snapshot.snapshot_root, put.snapshot_document),
             )
             record = connection.execute(
                 "SELECT document FROM cayu_agent_snapshot_records "
                 "WHERE record_kind = 'snapshot' AND fingerprint = ?",
-                (validated_snapshot.snapshot_root,),
+                (put.snapshot.snapshot_root,),
             ).fetchone()
-            if record is None:
-                raise AgentSnapshotStoreConflict("Snapshot manifest record was not stored.")
-            try:
-                stored = AgentSnapshot.model_validate_json(cast("str", record["document"]))
-            except Exception as error:
-                raise AgentSnapshotStoreConflict(
-                    "Stored snapshot manifest record is invalid."
-                ) from error
-            if stored.snapshot_root != validated_snapshot.snapshot_root:
-                raise AgentSnapshotStoreConflict(
-                    "Stored snapshot manifest record names another root."
-                )
-        return receipt_document
+            put.require_stored_record(record)
+        return put.receipt_document
 
     async def put_snapshot(
         self,
@@ -4739,23 +4968,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                     "WHERE binding_id = ?",
                     (binding_id,),
                 ).fetchone()
-            if row is None:
-                return None
-            document = cast("str", row["binding_document"])
-            try:
-                binding = AgentSnapshotIdentityBinding.model_validate_json(document)
-            except Exception as error:
-                raise AgentSnapshotStoreConflict("Stored snapshot binding is invalid.") from error
-            if (
-                binding.binding_id != binding_id
-                or row["snapshot_root"] != binding.snapshot.snapshot_root
-                or row["authority_scope_fingerprint"] != binding.authority_scope_fingerprint
-                or document != _snapshot_model_json(binding)
-            ):
-                raise AgentSnapshotStoreConflict(
-                    "Stored snapshot binding columns contradict its canonical document."
-                )
-            return document
+            return _verified_stored_binding(row, binding_id)
 
         document = await asyncio.to_thread(load)
         if document is None:
@@ -4825,29 +5038,18 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         request_material: object,
         model: type[BaseModel],
     ) -> BaseModel | None:
-        request_digest = _content_sha256(request_material, f"{kind}_request")
         row = connection.execute(
             "SELECT request_digest, response_model, response_document "
             "FROM cayu_agent_snapshot_lifecycle_operations "
             "WHERE operation_kind = ? AND operation_id = ?",
             (kind, operation_id),
         ).fetchone()
-        if row is None:
-            return None
-        if row["request_digest"] != request_digest or row["response_model"] != model.__name__:
-            raise AgentSnapshotStoreConflict(
-                f"Snapshot {kind} operation_id is already bound to another request."
-            )
-        document = cast("str", row["response_document"])
-        try:
-            response = model.model_validate_json(document)
-        except Exception as error:
-            raise AgentSnapshotStoreConflict(
-                f"Snapshot {kind} operation receipt is invalid."
-            ) from error
-        if document != _snapshot_model_json(response):
-            raise AgentSnapshotStoreConflict(f"Snapshot {kind} operation receipt is not canonical.")
-        return response
+        return _replayed_operation(
+            row,
+            kind=kind,
+            request_digest=_content_sha256(request_material, f"{kind}_request"),
+            model=model,
+        )
 
     def _record_sqlite_operation(
         self,
@@ -4908,20 +5110,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                 "SELECT document FROM cayu_agent_snapshot_pins WHERE pin_id = ?",
                 (receipt.pin_id,),
             ).fetchone()
-            if row is None:
-                raise AgentSnapshotStoreConflict("Snapshot pin was not stored.")
-            try:
-                stored = AgentSnapshotPinReceipt.model_validate_json(cast("str", row["document"]))
-            except Exception as error:
-                raise AgentSnapshotStoreConflict("Stored snapshot pin is invalid.") from error
-            if (
-                stored.snapshot != receipt.snapshot
-                or stored.binding_id != receipt.binding_id
-                or stored.owner != receipt.owner
-                or stored.reason != receipt.reason
-                or stored.retention_class is not receipt.retention_class
-            ):
-                raise AgentSnapshotStoreConflict("Snapshot pin identity conflicts.")
+            _require_stored_pin(row, receipt)
             self._record_sqlite_operation(
                 connection,
                 kind="pin",
@@ -4954,23 +5143,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                 "WHERE pin_id = ?",
                 (validated.pin_id,),
             ).fetchone()
-            if row is None:
-                raise AgentSnapshotStoreConflict("Snapshot pin is unavailable.")
-            try:
-                pin = AgentSnapshotPinReceipt.model_validate_json(cast("str", row["document"]))
-            except Exception as error:
-                raise AgentSnapshotStoreConflict("Stored snapshot pin is invalid.") from error
-            if (
-                pin.snapshot != validated.access.snapshot
-                or pin.binding_id != validated.access.binding_id
-            ):
-                raise AgentSnapshotAuthorizationError(
-                    "Snapshot release names a pin outside its binding."
-                )
-            if pin.owner != validated.owner:
-                raise AgentSnapshotAuthorizationError(
-                    "Snapshot release owner does not own the pin."
-                )
+            pin = _releasable_pin(row, validated)
             receipt = AgentSnapshotReleaseReceipt.from_request(validated)
             connection.execute(
                 "UPDATE cayu_agent_snapshot_pins SET released = 1 WHERE pin_id = ?",
@@ -5069,20 +5242,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                 "SELECT document FROM cayu_agent_snapshot_protections WHERE protection_id = ?",
                 (protection_id,),
             ).fetchone()
-            if row is None:
-                raise AgentSnapshotStoreConflict("Snapshot protection is unavailable.")
-            try:
-                protection = AgentSnapshotProtection.model_validate_json(
-                    cast("str", row["document"])
-                )
-            except Exception as error:
-                raise AgentSnapshotStoreConflict(
-                    "Stored snapshot protection is invalid."
-                ) from error
-            if protection.access != access:
-                raise AgentSnapshotAuthorizationError(
-                    "Snapshot protection is outside the supplied binding."
-                )
+            protection = _releasable_protection(row, access)
             connection.execute(
                 "UPDATE cayu_agent_snapshot_protections SET released = 1 WHERE protection_id = ?",
                 (protection_id,),
@@ -5180,18 +5340,20 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                         (root,),
                     ).fetchall()
                 )
-            deleting: set[str] = set()
-            retained: set[str] = set()
-            for digest in candidate_nodes:
-                roots = {
-                    row["snapshot_root"]
-                    for row in connection.execute(
-                        "SELECT snapshot_root FROM cayu_agent_snapshot_root_nodes "
-                        "WHERE node_digest = ?",
-                        (digest,),
-                    ).fetchall()
-                }
-                (deleting if roots <= collectable_set else retained).add(digest)
+            deleting, retained = _gc_deletable_nodes(
+                collectable_set,
+                {
+                    digest: {
+                        row["snapshot_root"]
+                        for row in connection.execute(
+                            "SELECT snapshot_root FROM cayu_agent_snapshot_root_nodes "
+                            "WHERE node_digest = ?",
+                            (digest,),
+                        ).fetchall()
+                    }
+                    for digest in candidate_nodes
+                },
+            )
             bytes_to_delete = 0
             for digest in deleting:
                 node_row = connection.execute(
@@ -5299,18 +5461,20 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                         (root,),
                     ).fetchall()
                 )
-            actual_deleting: set[str] = set()
-            for digest in candidate_nodes:
-                roots = {
-                    row["snapshot_root"]
-                    for row in connection.execute(
-                        "SELECT snapshot_root FROM cayu_agent_snapshot_root_nodes "
-                        "WHERE node_digest = ?",
-                        (digest,),
-                    ).fetchall()
-                }
-                if roots <= collectable:
-                    actual_deleting.add(digest)
+            actual_deleting, _ = _gc_deletable_nodes(
+                collectable,
+                {
+                    digest: {
+                        row["snapshot_root"]
+                        for row in connection.execute(
+                            "SELECT snapshot_root FROM cayu_agent_snapshot_root_nodes "
+                            "WHERE node_digest = ?",
+                            (digest,),
+                        ).fetchall()
+                    }
+                    for digest in candidate_nodes
+                },
+            )
             if actual_deleting != set(validated.node_digests_to_delete):
                 raise AgentSnapshotStoreConflict("Snapshot GC reachability changed after planning.")
             deleted_bytes = 0
@@ -5377,12 +5541,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             raise AgentSnapshotStoreConflict(
                 "Record fingerprint does not match its content-addressed key."
             )
-        document = json.dumps(
-            validated.model_dump(mode="json"),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        document = _snapshot_model_json(validated)
         with self._write_connection() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO cayu_agent_snapshot_records "
@@ -5397,20 +5556,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         if row is None:
             raise RuntimeError("SQLite failed to persist the snapshot record.")
         stored_document = cast("str", row["document"])
-        try:
-            stored = type(value).model_validate_json(stored_document)
-        except Exception as error:
-            raise AgentSnapshotStoreConflict(
-                "Stored record is invalid for its fingerprint."
-            ) from error
-        if getattr(stored, "fingerprint", None) != fingerprint:
-            raise AgentSnapshotStoreConflict(
-                "Stored record fingerprint does not match its content-addressed key."
-            )
-        if not _same_record_identity(stored, validated):
-            raise AgentSnapshotStoreConflict(
-                "Record fingerprint is already bound to another logical identity."
-            )
+        _require_saved_record(stored_document, validated, fingerprint)
         return stored_document
 
     def _load_sync(
@@ -5429,16 +5575,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         if row is None:
             return None
         document = cast("str", row["document"])
-        try:
-            stored = model.model_validate_json(document)
-        except Exception as error:
-            raise AgentSnapshotStoreConflict(
-                "Stored record is invalid for its fingerprint."
-            ) from error
-        if getattr(stored, "fingerprint", None) != fingerprint:
-            raise AgentSnapshotStoreConflict(
-                "Stored record fingerprint does not match its content-addressed key."
-            )
+        _require_loaded_record(document, model, fingerprint)
         return document
 
     def _begin_materialization_sync(
@@ -5473,7 +5610,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         if row is None:
             raise RuntimeError("SQLite failed to persist materialization progress.")
         stored_document = cast("str", row["document"])
-        stored = _validated_sqlite_progress_row(row, expected_scope=scope_values)
+        stored = _validated_progress_row(row, expected_scope=scope_values)
         if row["progress_id"] != validated.progress_id or not _same_record_identity(
             stored, validated
         ):
@@ -5498,7 +5635,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             ).fetchone()
         if row is None:
             return None
-        _validated_sqlite_progress_row(row, expected_scope=scope_values)
+        _validated_progress_row(row, expected_scope=scope_values)
         return cast("str", row["document"])
 
     def _transition_materialization_progress_sync(
@@ -5588,7 +5725,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             ).fetchone()
         if current_row is None:
             raise AgentSnapshotStoreConflict("Materialization scope progress is missing.")
-        current = _validated_sqlite_progress_row(
+        current = _validated_progress_row(
             current_row,
             expected_scope=_scope_key(progress),
         )
@@ -5683,7 +5820,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
                     raise AgentSnapshotStoreConflict(
                         "Materialization finalization compare-and-set failed."
                     )
-                current = _validated_sqlite_progress_row(
+                current = _validated_progress_row(
                     current_row,
                     expected_scope=_scope_key(progress),
                 )
@@ -5709,7 +5846,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             raise AgentSnapshotStoreConflict(
                 "Materialization has no durable pre-effect progress record."
             )
-        progress = _validated_sqlite_progress_row(row)
+        progress = _validated_progress_row(row)
         if progress.materialization_fingerprint is not None:
             if progress.materialization_fingerprint != materialization.fingerprint:
                 raise AgentSnapshotStoreConflict(
@@ -5755,7 +5892,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             ).fetchone()
         if row is None:
             return None
-        progress = _validated_sqlite_progress_row(row, expected_scope=_scope_key(request))
+        progress = _validated_progress_row(row, expected_scope=_scope_key(request))
         if progress.materialization_fingerprint is None:
             return None
         materialization_document = row["materialization_document"]

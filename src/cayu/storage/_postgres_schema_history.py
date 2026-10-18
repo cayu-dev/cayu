@@ -15,6 +15,7 @@ from cayu.storage._accounting_schema import (
     POSTGRES_ACCOUNTING_DDL,
     POSTGRES_AUXILIARY_ACCOUNTING_DDL,
 )
+from cayu.storage._agent_snapshot_schema import POSTGRES_AGENT_SNAPSHOT_DDL
 from cayu.storage._authorization_grant_schema import POSTGRES_TOOL_AUTHORIZATION_GRANT_DDL
 from cayu.storage._collaboration_schema import (
     POSTGRES_COLLABORATION_CLARIFICATION_DDL,
@@ -762,6 +763,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     117: POSTGRES_COMPLETION_EVALUATION_DDL,
     118: POSTGRES_RETENTION_AUDIT_DDL,
     119: POSTGRES_TOOL_AUTHORIZATION_GRANT_DDL,
+    120: POSTGRES_AGENT_SNAPSHOT_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (

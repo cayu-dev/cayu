@@ -38,6 +38,7 @@ from cayu.knowledge.records import MAX_KNOWLEDGE_CHUNK_ID_BYTES, MAX_KNOWLEDGE_E
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _postgres_schema_history as postgres_schema_history
 from cayu.storage import migrations as schema
+from cayu.storage._agent_snapshot_schema import validate_postgres_agent_snapshot_schema
 from cayu.storage._collaboration_schema import validate_postgres_collaboration_schema
 from cayu.storage._collaboration_wait_schema import validate_postgres_wait_discovery
 from cayu.storage._context_selection_schema import validate_postgres_context_selection_schema
@@ -936,6 +937,8 @@ class _PostgresStoreBase:
                             await validate_postgres_wait_discovery(cur)
                         if current_state.revision >= 112:
                             await validate_postgres_product_operation_schema(cur)
+                        if current_state.revision >= 120:
+                            await validate_postgres_agent_snapshot_schema(cur)
                         if self._min_required_revision >= 36:
                             await postgres_session_schema._validate_session_invocation_column(cur)
                         if self._min_required_revision >= 38:
@@ -1326,6 +1329,8 @@ class _PostgresStoreBase:
             await validate_postgres_wait_discovery(cur)
         if state.revision >= 112:
             await validate_postgres_product_operation_schema(cur)
+        if state.revision >= 120:
+            await validate_postgres_agent_snapshot_schema(cur)
         if state.revision >= 93:
             await validate_postgres_collaboration_schema(
                 cur,
@@ -1476,6 +1481,8 @@ class _PostgresStoreBase:
             await validate_postgres_wait_discovery(cur)
         if revision.revision == 112:
             await validate_postgres_product_operation_schema(cur)
+        if revision.revision == 120:
+            await validate_postgres_agent_snapshot_schema(cur)
         if revision.revision == 102:
             await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:

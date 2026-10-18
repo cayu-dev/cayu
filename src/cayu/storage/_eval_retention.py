@@ -198,7 +198,12 @@ class _References:
     snapshot_digests: frozenset[str]
 
 
-async def _read_references(sql: RetentionSql, backend: EvalRetentionBackend) -> _References:
+async def _read_references(
+    sql: RetentionSql,
+    backend: EvalRetentionBackend,
+    *,
+    lock: bool = False,
+) -> _References:
     retry_sources = {
         row[0]
         for row in await sql.all(
@@ -208,6 +213,13 @@ async def _read_references(sql: RetentionSql, backend: EvalRetentionBackend) -> 
     }
     snapshot_text = ""
     if set(audit.SNAPSHOT_TABLES) <= await sql.existing_tables(audit.SNAPSHOT_TABLES):
+        if lock and sql.postgres:
+            # Snapshot pins and protections publish without the run lock. SHARE
+            # holds their writes off until this deletion commits, as SQLite's
+            # BEGIN IMMEDIATE does for a snapshot store in the same database.
+            await sql.run(
+                "LOCK TABLE " + ", ".join(sorted(audit.SNAPSHOT_TABLES)) + " IN SHARE MODE"
+            )
         snapshot_text = await audit.snapshot_pin_text(sql)
     return _References(
         retry_sources=frozenset(retry_sources),
@@ -475,7 +487,7 @@ async def _delete_run(
         raise _Blocked(
             _protected_item(planned, (RetentionProtection.CHANGED,), "run changed after planning")
         )
-    references = await _read_references(sql, backend)
+    references = await _read_references(sql, backend, lock=True)
     reasons = await _protections(backend, sql, planned, references, caller_protected)
     if reasons:
         raise _Blocked(_protected_item(planned, reasons))

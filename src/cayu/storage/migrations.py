@@ -527,6 +527,10 @@ REVISIONS: tuple[Revision, ...] = (
     # Tool authorization grants and their use evidence are new tables that
     # older binaries never read or write. Grant stores require them.
     Revision(revision=119, kind=RevisionKind.ADDITIVE, compatible_from=115),
+    # PostgreSQL agent snapshot manifests, bindings, pins and lifecycle records
+    # are new tables that older binaries never read or write. The PostgreSQL
+    # snapshot store requires them; SQLite snapshot stores keep their own tables.
+    Revision(revision=120, kind=RevisionKind.ADDITIVE, compatible_from=115),
 )
 
 #: The revision an empty database is initialized to.

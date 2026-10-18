@@ -114,6 +114,7 @@ async def reference_databases(stores: Iterable[Any]) -> tuple[_Database, ...] | 
         for module_name, name in (
             ("cayu.storage.postgres", "PostgresSessionStore"),
             ("cayu.storage.evals_postgres", "PostgresEvalStore"),
+            ("cayu.storage.agent_snapshots_postgres", "PostgresAgentSnapshotStore"),
         )
         if (module := sys.modules.get(module_name)) is not None
     )

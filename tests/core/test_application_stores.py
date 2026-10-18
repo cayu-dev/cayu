@@ -11,7 +11,11 @@ import pytest
 
 from cayu.sessions import SessionQuery
 from cayu.storage import KnowledgeAccessScope, KnowledgeQuery
-from cayu.storage.application import ApplicationStores, open_application_stores
+from cayu.storage.application import (
+    ApplicationStores,
+    open_agent_snapshot_store,
+    open_application_stores,
+)
 from cayu.storage.targets import (
     PostgresRequiredError,
     SessionStoreBackend,
@@ -208,6 +212,111 @@ def test_product_operation_store_is_opt_in_and_shares_the_sqlite_database(
         open_application_stores(None, sqlite_path=database, product_operations="yes")
 
 
+def test_agent_snapshot_store_is_opt_in_and_shares_the_sqlite_database(
+    tmp_path: Path,
+) -> None:
+    from tests.core.test_agent_snapshot_merkle import _access, _snapshot
+
+    from cayu.snapshots import SQLiteAgentSnapshotStore
+
+    database = tmp_path / "data" / "cayu.db"
+    snapshot = _snapshot()
+
+    async def scenario() -> None:
+        async with open_application_stores(None, sqlite_path=database) as stores:
+            assert stores.agent_snapshot_store is None
+        async with open_application_stores(
+            None, sqlite_path=database, agent_snapshots=True
+        ) as stores:
+            assert isinstance(stores.agent_snapshot_store, SQLiteAgentSnapshotStore)
+            assert stores.agent_snapshot_store.path == database
+            assert "agent_snapshots=True" in repr(stores)
+            await stores.agent_snapshot_store.put_snapshot(snapshot, snapshot.identity_binding)
+        standalone = open_agent_snapshot_store(None, sqlite_path=database)
+        assert isinstance(standalone, SQLiteAgentSnapshotStore)
+        assert await standalone.get_snapshot(_access(snapshot)) == snapshot
+
+    asyncio.run(scenario())
+    with pytest.raises(TypeError, match="agent_snapshots"):
+        open_application_stores(None, sqlite_path=database, agent_snapshots="yes")
+
+
+def test_diagnostic_inspection_reads_sqlite_snapshots_without_changing_files(
+    tmp_path: Path,
+) -> None:
+    from tests.core.test_agent_snapshot_merkle import _access, _snapshot
+
+    from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
+
+    missing = tmp_path / "missing" / "cayu.db"
+    with diagnostic_store_inspection() as inspection:
+        stores = open_application_stores(None, sqlite_path=missing, agent_snapshots=True)
+        assert stores.agent_snapshot_store is not None
+        assert (
+            asyncio.run(stores.agent_snapshot_store.load_snapshot(_snapshot().snapshot_root))
+            is None
+        )
+        asyncio.run(stores.close())
+    inspection.verify()
+    assert not missing.exists()
+
+    existing = tmp_path / "existing" / "snapshots.db"
+    snapshot = _snapshot()
+    asyncio.run(
+        open_agent_snapshot_store(None, sqlite_path=existing).put_snapshot(
+            snapshot, snapshot.identity_binding
+        )
+    )
+    before = existing.stat().st_mtime_ns, existing.stat().st_size
+    with diagnostic_store_inspection() as inspection:
+        store = open_agent_snapshot_store(None, sqlite_path=existing)
+        assert asyncio.run(store.get_snapshot(_access(snapshot))) == snapshot
+    inspection.verify()
+    assert (existing.stat().st_mtime_ns, existing.stat().st_size) == before
+
+
+def test_required_postgres_refuses_the_sqlite_agent_snapshot_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", "1")
+    database = tmp_path / "state" / "snapshots.db"
+
+    with pytest.raises(PostgresRequiredError, match="SQLiteAgentSnapshotStore"):
+        open_agent_snapshot_store(configured_database_url(), sqlite_path=database)
+    assert not database.parent.exists()
+
+
+def test_postgres_selects_the_postgres_agent_snapshot_store_without_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cayu.storage import PostgresAgentSnapshotStore
+    from cayu.storage.migrations import SchemaMode
+
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", "1")
+    monkeypatch.setenv("CAYU_DATABASE_POOL_MAX", "3")
+    url = "postgresql://app@127.0.0.1:1/unreachable"
+    stores = open_application_stores(url, sqlite_path=tmp_path / "cayu.db", agent_snapshots=True)
+    assert isinstance(stores.agent_snapshot_store, PostgresAgentSnapshotStore)
+    assert stores.agent_snapshot_store._pool is stores.session_store._pool
+    assert stores.agent_snapshot_store._owns_pool is False
+    assert stores.agent_snapshot_store._schema_mode is SchemaMode.VALIDATE
+    assert stores.connection_budget == 4
+    asyncio.run(stores.close())
+
+    standalone = open_agent_snapshot_store(url, sqlite_path=tmp_path / "snapshots.db")
+    assert isinstance(standalone, PostgresAgentSnapshotStore)
+    assert standalone._owns_pool is True
+    assert standalone._pool.max_size == 3
+    assert standalone._schema_mode is SchemaMode.VALIDATE
+    asyncio.run(standalone.close())
+    with pytest.raises(ValueError, match="pool_max_size"):
+        open_agent_snapshot_store(url, sqlite_path=tmp_path / "snapshots.db", pool_max_size=0)
+    assert not (tmp_path / "cayu.db").exists()
+    assert not (tmp_path / "snapshots.db").exists()
+
+
 def test_application_sqlite_path_must_be_absolute() -> None:
     with pytest.raises(SessionStoreTargetError, match="absolute"):
         open_application_stores(None, sqlite_path="data/cayu.db")
@@ -369,10 +478,14 @@ def test_diagnostic_inspection_builds_read_only_store_owned_pools(tmp_path: Path
             "postgresql://app@127.0.0.1:1/unreachable",
             sqlite_path=tmp_path / "cayu.db",
             product_operations=True,
+            agent_snapshots=True,
         )
     assert stores.product_store is not None
     assert stores.product_store._owns_pool is True
     assert stores.product_store._read_only is True
+    assert stores.agent_snapshot_store is not None
+    assert stores.agent_snapshot_store._owns_pool is True
+    assert stores.agent_snapshot_store._read_only is True
     asyncio.run(stores.close())
 
 
@@ -441,6 +554,62 @@ def test_postgres_application_product_store_uses_the_migrated_database(
                 await stores.product_store.find_by_session_id(session_id=f"session_{token}")
                 == reservation.operation
             )
+        assert not (tmp_path / "unused.db").exists()
+
+    asyncio.run(scenario())
+
+
+def test_postgres_application_snapshot_store_captures_and_reads_under_required_postgres(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.core.test_agent_snapshot_merkle import _access, _snapshot
+    from tests.core.test_agent_snapshots import _capture_request, _providers
+    from tests.core.test_agent_snapshots import _snapshot as _captured_snapshot
+
+    from cayu.snapshots import (
+        AgentSnapshotCoordinator,
+        AgentSnapshotPinRequest,
+        AgentSnapshotRetentionClass,
+    )
+
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", "1")
+    monkeypatch.setenv("CAYU_DATABASE_URL", migrated_postgres_url)
+    snapshot = _snapshot(agent_id=f"agent-{uuid4().hex}")
+    seed = _captured_snapshot(capture_request_id=f"capture-{uuid4().hex}")
+
+    async def scenario() -> None:
+        async with open_application_stores(
+            configured_database_url(),
+            sqlite_path=tmp_path / "unused.db",
+            agent_snapshots=True,
+        ) as stores:
+            store = stores.agent_snapshot_store
+            assert store is not None
+            await store.put_snapshot(snapshot, snapshot.identity_binding)
+            pin = await store.pin_snapshot(
+                AgentSnapshotPinRequest(
+                    operation_id=f"pin-{uuid4().hex}",
+                    access=_access(snapshot),
+                    owner="operator",
+                    reason="seed",
+                    retention_class=AgentSnapshotRetentionClass.CHAMPION,
+                )
+            )
+            assert pin.snapshot == snapshot.ref
+            captured = await AgentSnapshotCoordinator(_providers(seed), store=store).capture(
+                _capture_request(seed)
+            )
+        reopened = open_agent_snapshot_store(
+            configured_database_url(), sqlite_path=tmp_path / "unused.db"
+        )
+        try:
+            assert await reopened.get_snapshot(_access(snapshot)) == snapshot
+            assert await reopened.load_snapshot(captured.snapshot_root) == captured
+            assert snapshot.snapshot_root in await reopened.retention_held_identifiers()
+        finally:
+            await reopened.close()
         assert not (tmp_path / "unused.db").exists()
 
     asyncio.run(scenario())

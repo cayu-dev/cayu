@@ -29,6 +29,16 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
   `cayu serve` labels Evals results with the same Release id, and an invalid
   `CAYU_RELEASE_ID` now fails application construction. See
   [release identity](runtime-contracts.md#release-identity).
+- Add `PostgresAgentSnapshotStore`, so hosts that require PostgreSQL
+  (`CAYU_REQUIRE_POSTGRES=1`) can capture, pin, read and collect agent
+  snapshots. It keeps the SQLite store's records and checks in the shared
+  database. Additive storage revision 120 adds its tables; run
+  `cayu storage migrate` before using it. `open_agent_snapshot_store` picks the
+  SQLite or PostgreSQL store from `CAYU_DATABASE_URL`, and
+  `open_application_stores(..., agent_snapshots=True)` adds one on the shared
+  pool. Provider objects stay in the `AgentSnapshotObjectStore` composed with
+  it. Storage retention on PostgreSQL now also keeps sessions, eval runs and
+  artifacts that pinned PostgreSQL snapshots name.
 
 - Add `reconcile_abandoned_task_cancellation` for an ordinary task whose worker
   process died while its cancellation was draining. Such a task stayed `claimed`

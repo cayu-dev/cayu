@@ -1,4 +1,4 @@
-"""Environment-selected session, task, knowledge, and product stores for applications."""
+"""Environment-selected session, task, knowledge, product and snapshot stores."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
     from cayu.server import ProductOperationStore
     from cayu.sessions.store import SessionStore
+    from cayu.snapshots.base import AgentSnapshotStore
     from cayu.tasks.store import TaskStore
 
 
@@ -41,6 +42,7 @@ class ApplicationStores:
     """
 
     __slots__ = (
+        "_agent_snapshot_store",
         "_backend",
         "_close_lock",
         "_closed",
@@ -65,6 +67,7 @@ class ApplicationStores:
         knowledge_store: KnowledgeStore | None,
         product_store: ProductOperationStore | None = None,
         model_policy_store: ModelPolicyStore | None = None,
+        agent_snapshot_store: AgentSnapshotStore | None = None,
         pool: Any | None = None,
         pool_max_size: int | None = None,
         task_admission_listener: bool = False,
@@ -75,6 +78,7 @@ class ApplicationStores:
         self._knowledge_store = knowledge_store
         self._product_store = product_store
         self._model_policy_store = model_policy_store
+        self._agent_snapshot_store = agent_snapshot_store
         self._pool = pool
         self._pool_max_size = pool_max_size
         self._task_admission_listener = task_admission_listener
@@ -90,6 +94,7 @@ class ApplicationStores:
             f"tasks={self._task_store is not None!r}, "
             f"knowledge={self._knowledge_store is not None!r}, "
             f"product_operations={self._product_store is not None!r}, "
+            f"agent_snapshots={self._agent_snapshot_store is not None!r}, "
             f"pool_max_size={self._pool_max_size!r})"
         )
 
@@ -118,6 +123,12 @@ class ApplicationStores:
     @property
     def model_policy_store(self) -> ModelPolicyStore | None:
         return self._model_policy_store
+
+    @property
+    def agent_snapshot_store(self) -> AgentSnapshotStore | None:
+        """The agent snapshot manifest store, when requested."""
+
+        return self._agent_snapshot_store
 
     @property
     def pool_max_size(self) -> int | None:
@@ -160,6 +171,7 @@ class ApplicationStores:
             self._task_store,
             self._product_store,
             self._model_policy_store,
+            self._agent_snapshot_store,
             self._knowledge_store,
             self._session_store,
             self._pool,
@@ -195,6 +207,7 @@ def open_application_stores(
     knowledge_scope: KnowledgeAccessScope | None = None,
     product_operations: bool = False,
     model_policy: bool = False,
+    agent_snapshots: bool = False,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     pool_max_size: int | None = None,
     direct_database_url: str | None = None,
@@ -219,7 +232,11 @@ def open_application_stores(
     ``tasks`` and ``knowledge_scope`` choose which optional stores exist.
     ``product_operations=True`` adds the maintained service's product operation
     store (it requires the server extra); on PostgreSQL it shares the pool, so the
-    connection budget is unchanged. Nothing connects during construction.
+    connection budget is unchanged. ``agent_snapshots=True`` adds an
+    ``AgentSnapshotStore`` for snapshot manifests, bindings and pins: SQLite in the
+    same file, or PostgreSQL on the shared pool. Snapshot provider objects stay in
+    the ``AgentSnapshotObjectStore`` the application composes with it. Nothing
+    connects during construction.
     """
 
     if type(tasks) is not bool:
@@ -228,6 +245,8 @@ def open_application_stores(
         raise TypeError("model_policy must be a bool.")
     if type(product_operations) is not bool:
         raise TypeError("product_operations must be a bool.")
+    if type(agent_snapshots) is not bool:
+        raise TypeError("agent_snapshots must be a bool.")
     target = application_store_target(database_url, sqlite_path=sqlite_path)
     if target.backend is SessionStoreBackend.SQLITE:
         assert target.sqlite_path is not None
@@ -237,6 +256,7 @@ def open_application_stores(
             knowledge_scope=knowledge_scope,
             product_operations=product_operations,
             model_policy=model_policy,
+            agent_snapshots=agent_snapshots,
             public_authority_alias_codec=public_authority_alias_codec,
         )
     assert target.postgres_dsn is not None
@@ -262,6 +282,7 @@ def open_application_stores(
         knowledge_scope=knowledge_scope,
         product_operations=product_operations,
         model_policy=model_policy,
+        agent_snapshots=agent_snapshots,
         public_authority_alias_codec=public_authority_alias_codec,
     )
 
@@ -273,6 +294,7 @@ def _open_sqlite_stores(
     knowledge_scope: KnowledgeAccessScope | None,
     product_operations: bool,
     model_policy: bool,
+    agent_snapshots: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -301,6 +323,11 @@ def _open_sqlite_stores(
         from cayu.storage.model_policy_sqlite import SQLiteModelPolicyStore
 
         policy_store = SQLiteModelPolicyStore(path)
+    snapshot_store = None
+    if agent_snapshots:
+        from cayu.snapshots.base import SQLiteAgentSnapshotStore
+
+        snapshot_store = SQLiteAgentSnapshotStore(path)
     return ApplicationStores(
         backend=SessionStoreBackend.SQLITE,
         session_store=session_store,
@@ -308,6 +335,7 @@ def _open_sqlite_stores(
         knowledge_store=knowledge_store,
         product_store=product_store,
         model_policy_store=policy_store,
+        agent_snapshot_store=snapshot_store,
     )
 
 
@@ -320,6 +348,7 @@ def _open_postgres_stores(
     knowledge_scope: KnowledgeAccessScope | None,
     product_operations: bool,
     model_policy: bool,
+    agent_snapshots: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     try:
@@ -338,6 +367,11 @@ def _open_postgres_stores(
 
     product_store_type: Any = None
     policy_store_type: Any = None
+    snapshot_store_type: Any = None
+    if agent_snapshots:
+        from cayu.storage.agent_snapshots_postgres import PostgresAgentSnapshotStore
+
+        snapshot_store_type = PostgresAgentSnapshotStore
     if model_policy:
         from cayu.storage.model_policy_postgres import PostgresModelPolicyStore
 
@@ -372,6 +406,9 @@ def _open_postgres_stores(
             ),
             model_policy_store=(
                 policy_store_type(dsn, max_size=pool_max_size) if policy_store_type else None
+            ),
+            agent_snapshot_store=(
+                snapshot_store_type(dsn, max_size=pool_max_size) if snapshot_store_type else None
             ),
         )
 
@@ -424,13 +461,61 @@ def _open_postgres_stores(
             if policy_store_type
             else None
         ),
+        agent_snapshot_store=(
+            snapshot_store_type(pool=pool, schema_mode=SchemaMode.VALIDATE)
+            if snapshot_store_type
+            else None
+        ),
         pool=pool,
         pool_max_size=pool_max_size,
         task_admission_listener=task_store is not None,
     )
 
 
-__all__ = ["ApplicationStores", "open_application_stores"]
+def open_agent_snapshot_store(
+    database_url: str | None,
+    *,
+    sqlite_path: str | os.PathLike[str],
+    pool_max_size: int | None = None,
+) -> AgentSnapshotStore:
+    """Build one agent snapshot store from the same selection as the application stores.
+
+    ``database_url`` is normally ``configured_database_url()``. A PostgreSQL URL
+    builds a ``PostgresAgentSnapshotStore`` with its own pool of at most
+    ``pool_max_size`` connections (default ``CAYU_DATABASE_POOL_MAX``, else 5). It
+    validates revision 120 at first use, so run ``cayu storage migrate`` first.
+    ``None`` builds a ``SQLiteAgentSnapshotStore`` at the absolute ``sqlite_path``,
+    which refuses to open under ``CAYU_REQUIRE_POSTGRES=1``. The caller owns the
+    store; close a PostgreSQL one with ``await store.close()``. Applications that
+    already open their stores with :func:`open_application_stores` pass
+    ``agent_snapshots=True`` instead to share its pool.
+    """
+
+    target = application_store_target(database_url, sqlite_path=sqlite_path)
+    if target.backend is SessionStoreBackend.SQLITE:
+        from cayu.snapshots.base import SQLiteAgentSnapshotStore
+
+        assert target.sqlite_path is not None
+        return SQLiteAgentSnapshotStore(target.sqlite_path)
+    assert target.postgres_dsn is not None
+    if pool_max_size is None:
+        pool_max_size = configured_database_pool_max()
+    elif type(pool_max_size) is not int or pool_max_size < 1:
+        raise ValueError("pool_max_size must be a positive integer.")
+    try:
+        import psycopg_pool  # noqa: F401 - report a missing extra before the store's import guard
+
+        from cayu.storage.agent_snapshots_postgres import PostgresAgentSnapshotStore
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").partition(".")[0] not in {"psycopg", "psycopg_pool"}:
+            raise
+        raise SessionStoreTargetError(
+            'The PostgreSQL agent snapshot store requires the postgres extra. Install "cayu[postgres]".'
+        ) from exc
+    return PostgresAgentSnapshotStore(target.postgres_dsn, max_size=pool_max_size)
+
+
+__all__ = ["ApplicationStores", "open_agent_snapshot_store", "open_application_stores"]
 
 
 def _retrieve_close_outcome(closing: asyncio.Future[None]) -> None:

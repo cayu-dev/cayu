@@ -125,9 +125,19 @@ def _postgres_scenario(dsn: str, scenario) -> None:
                 await connection.execute(statement.replace("?", "%s"), parameters)
                 await connection.commit()
 
+        async def snapshot_tables():
+            # Revision 120 puts the agent snapshot tables in the migrated database.
+            return None
+
         try:
             await scenario(
-                RetentionHarness(store=store, tasks=tasks, execute=execute, postgres=True)
+                RetentionHarness(
+                    store=store,
+                    tasks=tasks,
+                    execute=execute,
+                    postgres=True,
+                    snapshot_tables=snapshot_tables,
+                )
             )
         finally:
             await store.close()

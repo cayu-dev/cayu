@@ -1095,6 +1095,17 @@ _TABLES = (
     "cayu_storage_retention_runs",
     "cayu_tool_authorization_grant_uses",
     "cayu_tool_authorization_grants",
+    "cayu_agent_snapshot_records",
+    "cayu_agent_snapshot_materialization_progress",
+    "cayu_agent_snapshot_nodes",
+    "cayu_agent_snapshot_roots",
+    "cayu_agent_snapshot_root_nodes",
+    "cayu_agent_snapshot_bindings",
+    "cayu_agent_snapshot_pins",
+    "cayu_agent_snapshot_protections",
+    "cayu_agent_snapshot_lifecycle_operations",
+    "cayu_agent_snapshot_gc_plans",
+    "cayu_agent_snapshot_gc_receipts",
     "cayu_schema_migrations",
 )
 
@@ -1528,6 +1539,114 @@ def test_recorded_revision_52_requires_both_targeted_grant_tables(
                 await validator.ensure_schema()
         finally:
             await validator.close()
+
+    asyncio.run(runner())
+
+
+async def _create_then_rewind_agent_snapshot_revision(postgres_dsn: str) -> None:
+    """Leave a database recorded at revision 119, before the snapshot tables."""
+
+    import psycopg
+
+    from cayu.storage._agent_snapshot_schema import AGENT_SNAPSHOT_TABLES
+
+    await _drop_all(postgres_dsn)
+    creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+    try:
+        await creator.ensure_schema()
+    finally:
+        await creator.close()
+    async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+        await conn.execute("DROP TABLE " + ", ".join(AGENT_SNAPSHOT_TABLES))
+        await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 120")
+        await conn.commit()
+
+
+def test_revision_120_adds_agent_snapshot_tables_without_raising_the_floor(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage import PostgresAgentSnapshotStore
+
+    assert schema.revision(120).kind is schema.RevisionKind.ADDITIVE
+    assert schema.revision(120).compatible_from == schema.revision(119).compatible_from
+
+    async def runner() -> None:
+        await _create_then_rewind_agent_snapshot_revision(postgres_dsn)
+        # A revision-119 database still serves every older store.
+        session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            await session_store.ensure_schema()
+        finally:
+            await session_store.close()
+        snapshot_store = PostgresAgentSnapshotStore(postgres_dsn)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="cayu storage migrate"):
+                await snapshot_store.ensure_schema()
+        finally:
+            await snapshot_store.close()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+        snapshot_store = PostgresAgentSnapshotStore(postgres_dsn)
+        try:
+            await snapshot_store.ensure_schema()
+            assert await snapshot_store.retention_held_identifiers() == frozenset()
+        finally:
+            await snapshot_store.close()
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("DROP TABLE cayu_agent_snapshot_gc_receipts", "gc_receipts is missing"),
+        (
+            "ALTER TABLE cayu_agent_snapshot_nodes ALTER COLUMN document TYPE JSONB "
+            "USING document::jsonb",
+            "nodes is missing or conflicting",
+        ),
+        (
+            "ALTER TABLE cayu_agent_snapshot_gc_plans DROP CONSTRAINT "
+            "cayu_agent_snapshot_gc_plans_plan_id_key",
+            "identity constraints",
+        ),
+        (
+            "ALTER TABLE cayu_agent_snapshot_pins DROP CONSTRAINT "
+            "cayu_agent_snapshot_pins_released_check",
+            "release flags",
+        ),
+        ("DROP INDEX cayu_agent_snapshot_root_nodes_by_node", "root_nodes_by_node"),
+    ],
+)
+def test_recorded_revision_120_rejects_missing_or_conflicting_snapshot_schema(
+    postgres_dsn: str, damage: str, message: str
+) -> None:
+    from cayu.storage import PostgresAgentSnapshotStore
+
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresAgentSnapshotStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            await conn.execute(damage)
+            await conn.commit()
+        for store_type in (PostgresAgentSnapshotStore, PostgresSessionStore):
+            validator = store_type(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+            try:
+                with pytest.raises(schema.SchemaError, match=message):
+                    await validator.ensure_schema()
+            finally:
+                await validator.close()
 
     asyncio.run(runner())
 

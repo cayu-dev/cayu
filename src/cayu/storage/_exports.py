@@ -303,6 +303,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_KNOWLEDGE_REVISION_SEARCH_REFS",
     ),
     "MAX_RETENTION_ITEMS_PER_RUN": ("cayu.storage.retention", "MAX_RETENTION_ITEMS_PER_RUN"),
+    "PostgresAgentSnapshotStore": (
+        "cayu.storage.agent_snapshots_postgres",
+        "PostgresAgentSnapshotStore",
+    ),
     "PostgresAgentWorkContextStore": (
         "cayu.storage.work_context_postgres",
         "PostgresAgentWorkContextStore",
@@ -390,6 +394,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.indexing",
         "knowledge_chunk_embedding_identity",
     ),
+    "open_agent_snapshot_store": ("cayu.storage.application", "open_agent_snapshot_store"),
     "open_application_stores": ("cayu.storage.application", "open_application_stores"),
     "prepare_knowledge_activation_request": (
         "cayu.knowledge.activation_contracts",
@@ -545,6 +550,7 @@ PUBLIC_NAMES = [
     "MAX_KNOWLEDGE_REVISION",
     "MAX_KNOWLEDGE_REVISION_SEARCH_REFS",
     "MAX_RETENTION_ITEMS_PER_RUN",
+    "PostgresAgentSnapshotStore",
     "PostgresAgentWorkContextStore",
     "PostgresBudgetLedger",
     "PostgresEmbeddingKnowledgeStore",
@@ -593,6 +599,7 @@ PUBLIC_NAMES = [
     "copy_knowledge_revision_refs",
     "knowledge_access_scope_sha256",
     "knowledge_chunk_embedding_identity",
+    "open_agent_snapshot_store",
     "open_application_stores",
     "prepare_knowledge_activation_request",
     "prepare_knowledge_maintenance_decision",
