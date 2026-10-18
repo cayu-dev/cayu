@@ -17,6 +17,14 @@ exact worker claims for their session attachments.
 
 - Skip stale recovery observers when another recovery owner closes the active
   interaction during execution profile inspection.
+- Keep budget reservations durable by default. `open_application_stores` now
+  also builds a budget ledger in the same database: a `SQLiteBudgetLedger` in
+  the SQLite file, or a `PostgresBudgetLedger` on the shared pool, exposed as
+  `ApplicationStores.budget_ledger`. A `CayuApp` built on those stores' session
+  store without its own `budget_ledger` uses it instead of the in-memory ledger,
+  so `create_server`, `mount_cayu`, `cayu serve` and a fork controller enrolled
+  from `CAYU_FORK_CONTROLLER_*` get durable reservations with no app code. An
+  app-supplied `budget_ledger` still wins; `budget_ledger=False` builds none.
 
 - Cancel a restartable task on worker shutdown when it is running as the
   continuation of an interrupted session. Shutdown previously tried to requeue

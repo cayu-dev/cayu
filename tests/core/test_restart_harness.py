@@ -129,22 +129,6 @@ def store_location(request, tmp_path: Path) -> dict[str, Any]:
     return {"database_url": request.getfixturevalue("migrated_postgres_url")}
 
 
-@pytest.fixture(scope="module")
-def migrated_postgres_url(postgres_dsn: str, postgres_url: str) -> str:
-    from cayu.storage import PostgresSessionStore
-    from cayu.storage.migrations import SchemaMode
-
-    async def create_schema() -> None:
-        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
-        try:
-            await creator.ensure_schema()
-        finally:
-            await creator.close()
-
-    asyncio.run(create_schema())
-    return postgres_url
-
-
 def _harness(ledger: RefundLedger, script, **location: Any) -> RestartHarness:
     return RestartHarness(
         lambda **parts: build_app(ledger=ledger, **parts),

@@ -70,6 +70,14 @@ same store for every combination of the variable and that section. Explicit
 | `CAYU_DATABASE_DIRECT_URL` | `open_application_stores` | Optional Postgres URL for the task-admission `LISTEN` connection. `LISTEN` does not survive transaction pooling, so set it to a direct server address when `CAYU_DATABASE_URL` points at PgBouncer or a similar proxy. Pooled store traffic keeps using `CAYU_DATABASE_URL`. |
 | `CAYU_REQUIRE_POSTGRES` | Every Cayu SQLite store | `1` makes SQLite stores raise at construction; `0` or unset changes nothing. Deployments set it so a missing `CAYU_DATABASE_URL` fails at startup. |
 
+The application stores also include a durable budget ledger in the same
+database (`ApplicationStores.budget_ledger`): a `SQLiteBudgetLedger` in the
+SQLite file, or a `PostgresBudgetLedger` on the shared pool, so it adds no
+connections. A `CayuApp` built on those stores' session store without its own
+`budget_ledger` uses it, so budget reservations survive restarts. Pass
+`CayuApp(budget_ledger=...)` to use another ledger, or
+`open_application_stores(..., budget_ledger=False)` to build none.
+
 A PostgreSQL-backed application process therefore opens at most
 `CAYU_DATABASE_POOL_MAX` pooled connections, one dedicated listener connection,
 and, when `cayu serve` or `cayu check` assembles the project, the Evals store's

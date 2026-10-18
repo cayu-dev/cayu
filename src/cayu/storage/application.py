@@ -1,4 +1,4 @@
-"""Environment-selected session, task, knowledge, product and snapshot stores."""
+"""Environment-selected session, task, knowledge, product and snapshot stores and ledger."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from cayu.storage.targets import (
 )
 
 if TYPE_CHECKING:
+    from cayu.budgets.base import BudgetLedger
     from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.runtime._policy_storage import ModelPolicyStore
@@ -39,11 +40,15 @@ class ApplicationStores:
     most once; after a failed close, calling it again retries only what did not
     close. Cayu's server does not close application stores; long-lived processes
     keep them for their lifetime, and tests or scripts close them explicitly.
+
+    ``budget_ledger`` is recorded beside ``session_store``: a ``CayuApp`` built
+    on that session store without its own ``budget_ledger`` uses it.
     """
 
     __slots__ = (
         "_agent_snapshot_store",
         "_backend",
+        "_budget_ledger",
         "_close_lock",
         "_closed",
         "_closed_parts",
@@ -68,10 +73,15 @@ class ApplicationStores:
         product_store: ProductOperationStore | None = None,
         model_policy_store: ModelPolicyStore | None = None,
         agent_snapshot_store: AgentSnapshotStore | None = None,
+        budget_ledger: BudgetLedger | None = None,
         pool: Any | None = None,
         pool_max_size: int | None = None,
         task_admission_listener: bool = False,
     ) -> None:
+        if budget_ledger is not None:
+            from cayu.budgets._store_ledgers import attach_session_store_budget_ledger
+
+            attach_session_store_budget_ledger(session_store, budget_ledger)
         self._backend = backend
         self._session_store = session_store
         self._task_store = task_store
@@ -79,6 +89,7 @@ class ApplicationStores:
         self._product_store = product_store
         self._model_policy_store = model_policy_store
         self._agent_snapshot_store = agent_snapshot_store
+        self._budget_ledger = budget_ledger
         self._pool = pool
         self._pool_max_size = pool_max_size
         self._task_admission_listener = task_admission_listener
@@ -95,6 +106,7 @@ class ApplicationStores:
             f"knowledge={self._knowledge_store is not None!r}, "
             f"product_operations={self._product_store is not None!r}, "
             f"agent_snapshots={self._agent_snapshot_store is not None!r}, "
+            f"budget_ledger={self._budget_ledger is not None!r}, "
             f"pool_max_size={self._pool_max_size!r})"
         )
 
@@ -129,6 +141,12 @@ class ApplicationStores:
         """The agent snapshot manifest store, when requested."""
 
         return self._agent_snapshot_store
+
+    @property
+    def budget_ledger(self) -> BudgetLedger | None:
+        """The durable budget ledger in the same database, when built."""
+
+        return self._budget_ledger
 
     @property
     def pool_max_size(self) -> int | None:
@@ -172,6 +190,7 @@ class ApplicationStores:
             self._product_store,
             self._model_policy_store,
             self._agent_snapshot_store,
+            self._budget_ledger,
             self._knowledge_store,
             self._session_store,
             self._pool,
@@ -208,6 +227,7 @@ def open_application_stores(
     product_operations: bool = False,
     model_policy: bool = False,
     agent_snapshots: bool = False,
+    budget_ledger: bool = True,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     pool_max_size: int | None = None,
     direct_database_url: str | None = None,
@@ -235,8 +255,15 @@ def open_application_stores(
     connection budget is unchanged. ``agent_snapshots=True`` adds an
     ``AgentSnapshotStore`` for snapshot manifests, bindings and pins: SQLite in the
     same file, or PostgreSQL on the shared pool. Snapshot provider objects stay in
-    the ``AgentSnapshotObjectStore`` the application composes with it. Nothing
-    connects during construction.
+    the ``AgentSnapshotObjectStore`` the application composes with it.
+
+    ``budget_ledger=True`` (the default) adds a durable budget ledger: a
+    ``SQLiteBudgetLedger`` in the same SQLite file, or a ``PostgresBudgetLedger``
+    on the shared pool. A ``CayuApp`` built on this session store without its own
+    ``budget_ledger`` uses it, so budget reservations, such as a fork controller's
+    per-fork caps, survive restarts. Passing ``CayuApp(budget_ledger=...)`` still
+    selects any other ledger; ``budget_ledger=False`` builds none. Diagnostic
+    inspection never builds one. Nothing connects during construction.
     """
 
     if type(tasks) is not bool:
@@ -247,6 +274,8 @@ def open_application_stores(
         raise TypeError("product_operations must be a bool.")
     if type(agent_snapshots) is not bool:
         raise TypeError("agent_snapshots must be a bool.")
+    if type(budget_ledger) is not bool:
+        raise TypeError("budget_ledger must be a bool.")
     target = application_store_target(database_url, sqlite_path=sqlite_path)
     if target.backend is SessionStoreBackend.SQLITE:
         assert target.sqlite_path is not None
@@ -257,6 +286,7 @@ def open_application_stores(
             product_operations=product_operations,
             model_policy=model_policy,
             agent_snapshots=agent_snapshots,
+            budget_ledger=budget_ledger,
             public_authority_alias_codec=public_authority_alias_codec,
         )
     assert target.postgres_dsn is not None
@@ -283,6 +313,7 @@ def open_application_stores(
         product_operations=product_operations,
         model_policy=model_policy,
         agent_snapshots=agent_snapshots,
+        budget_ledger=budget_ledger,
         public_authority_alias_codec=public_authority_alias_codec,
     )
 
@@ -295,6 +326,7 @@ def _open_sqlite_stores(
     product_operations: bool,
     model_policy: bool,
     agent_snapshots: bool,
+    budget_ledger: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -328,6 +360,12 @@ def _open_sqlite_stores(
         from cayu.snapshots.base import SQLiteAgentSnapshotStore
 
         snapshot_store = SQLiteAgentSnapshotStore(path)
+    ledger = None
+    # Diagnostic inspection is read-only and never reserves budget.
+    if budget_ledger and current_diagnostic_store_inspection() is None:
+        from cayu.storage.budget_ledger import SQLiteBudgetLedger
+
+        ledger = SQLiteBudgetLedger(path)
     return ApplicationStores(
         backend=SessionStoreBackend.SQLITE,
         session_store=session_store,
@@ -336,6 +374,7 @@ def _open_sqlite_stores(
         product_store=product_store,
         model_policy_store=policy_store,
         agent_snapshot_store=snapshot_store,
+        budget_ledger=ledger,
     )
 
 
@@ -349,11 +388,13 @@ def _open_postgres_stores(
     product_operations: bool,
     model_policy: bool,
     agent_snapshots: bool,
+    budget_ledger: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     try:
         from psycopg_pool import AsyncConnectionPool
 
+        from cayu.storage.budget_postgres import PostgresBudgetLedger
         from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
         from cayu.storage.migrations import SchemaMode
         from cayu.storage.postgres import PostgresSessionStore
@@ -464,6 +505,11 @@ def _open_postgres_stores(
         agent_snapshot_store=(
             snapshot_store_type(pool=pool, schema_mode=SchemaMode.VALIDATE)
             if snapshot_store_type
+            else None
+        ),
+        budget_ledger=(
+            PostgresBudgetLedger(pool=pool, schema_mode=SchemaMode.VALIDATE)
+            if budget_ledger
             else None
         ),
         pool=pool,

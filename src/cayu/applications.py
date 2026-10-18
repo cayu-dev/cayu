@@ -72,11 +72,11 @@ from cayu.artifacts.resources import (
     ResourceOwnerUnavailable,
     ResourceTransferReceipt,
 )
+from cayu.budgets._store_ledgers import resolve_budget_ledger
 from cayu.budgets.base import (
     BudgetLedger,
     BudgetPolicy,
     BudgetStore,
-    InMemoryBudgetLedger,
     SessionBudgetStore,
     copy_budget_policy,
 )
@@ -1274,7 +1274,7 @@ class CayuApp:
         self.budget_store = (
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
-        self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
+        self.budget_ledger = resolve_budget_ledger(budget_ledger, self.session_store)
         self.budget_binding_receiver = budget_binding_receiver
         self.enable_common_root_budget_binding = enable_common_root_budget_binding
         self._event_watcher_supervisor = EventWatcherSupervisor()

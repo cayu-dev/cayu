@@ -92,7 +92,10 @@ variable with the same code, so application stores and Cayu tooling agree.
 `PostgresRequiredError` at construction. The service preset also passes
 `product_operations=True`, so its product operation store lives in the same
 database and, on PostgreSQL, the same pool. `agent_snapshots=True` adds an
-`AgentSnapshotStore` the same way. Per-run overrides
+`AgentSnapshotStore` the same way. The stores always include a durable budget
+ledger in the same database (`ApplicationStores.budget_ledger`), which a
+`CayuApp` built on their session store uses unless it is given its own
+`budget_ledger`. Per-run overrides
 remain at the invocation boundary. Schema versions and internal validation
 ceilings remain feature-owned contracts rather than application settings.
 

@@ -495,22 +495,6 @@ def _named(url: str, application_name: str) -> str:
     return f"{url}?application_name={quote(application_name, safe='')}"
 
 
-@pytest.fixture(scope="module")
-def migrated_postgres_url(postgres_dsn: str, postgres_url: str) -> str:
-    from cayu.storage import PostgresSessionStore
-    from cayu.storage.migrations import SchemaMode
-
-    async def create_schema() -> None:
-        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
-        try:
-            await creator.ensure_schema()
-        finally:
-            await creator.close()
-
-    asyncio.run(create_schema())
-    return postgres_url
-
-
 async def _connections_by_application(dsn: str, *names: str) -> dict[str, int]:
     import psycopg
 

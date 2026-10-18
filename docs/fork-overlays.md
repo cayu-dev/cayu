@@ -109,6 +109,12 @@ curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/fork-controller
   unregistered agent, an unknown host tool, or a name or subject already
   enrolled differently in code. Errors never include digests.
 - Mounting the same app twice reuses the one enrollment.
+- Budget reservations, such as each fork's spend, go through the app's budget
+  ledger. An app whose session store comes from `open_application_stores`
+  already uses the durable ledger built beside it (`SQLiteBudgetLedger` locally,
+  `PostgresBudgetLedger` with a PostgreSQL `CAYU_DATABASE_URL`), so enrolling
+  from the environment needs no ledger code. A `budget_ledger` the app passes to
+  `CayuApp` still wins.
 - A `create_server` configuration with the API disabled serves no fork-controller
   routes and enrolls nothing.
 - The parts are usable on their own:

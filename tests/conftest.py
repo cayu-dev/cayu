@@ -428,3 +428,22 @@ def postgres_url(postgres_dsn: str) -> str:
     port = params.get("port", 5432)
     database = quote(str(params["dbname"]), safe="")
     return f"postgresql://{credentials}@{host}:{port}/{database}"
+
+
+@pytest.fixture(scope="module")
+def migrated_postgres_url(postgres_dsn: str, postgres_url: str) -> str:
+    """The module database URL after Cayu's schema was created in it."""
+    import asyncio
+
+    from cayu.storage import PostgresSessionStore
+    from cayu.storage.migrations import SchemaMode
+
+    async def create_schema() -> None:
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+    asyncio.run(create_schema())
+    return postgres_url
