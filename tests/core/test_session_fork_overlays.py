@@ -1947,6 +1947,8 @@ def test_observe_mode_controller_has_no_trunk_write_path() -> None:
         "events",
         "query_events",
         "supervision_events",
+        "event_correlation_ids",
+        "supervision_correlation_ids",
     }
     assert routes == {
         ("GET", "/fork-controller/enrollment"),

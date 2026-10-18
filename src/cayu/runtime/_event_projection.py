@@ -35,11 +35,7 @@ from cayu.providers._credential_boundary import copy_provider_cancellation_failu
 from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_results as tool_results
-from cayu.runtime._tool_call_correlation import (
-    TOOL_CALL_CORRELATION_EVENT_TYPES,
-    TOOL_CALL_CORRELATION_FIELD,
-    public_tool_call_correlation,
-)
+from cayu.runtime._tool_call_correlation import public_tool_call_correlation
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.runtime._tool_result_adapters import (
     finish_tool_result_event,
@@ -57,6 +53,10 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
 )
 from cayu.runtime.retry_policy import RetryDisposition, RetryReason, RetrySuppression
+from cayu.sessions._correlation import (
+    TOOL_CALL_CORRELATION_EVENT_TYPES,
+    TOOL_CALL_CORRELATION_FIELD,
+)
 from cayu.sessions._terminal_evidence import (
     INTERRUPTION_ORIGIN_BACKGROUND_CASCADE,
     INTERRUPTION_ORIGIN_PAYLOAD_KEY,

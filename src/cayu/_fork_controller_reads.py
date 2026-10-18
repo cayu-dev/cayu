@@ -13,16 +13,22 @@ from typing import TYPE_CHECKING, TypeVar
 from cayu._fork_controller_errors import ForkControllerDenied
 from cayu._resource_access_errors import ResourceAccessDenied
 from cayu.sessions import _access_rules as session_access_rules
+from cayu.sessions import _correlation as correlation
 from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
 from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.fork_overlays import fork_controller_agent_name
 from cayu.sessions.queries import SessionListResult, SessionQuery, copy_session_query
 from cayu.sessions.records import EventRecord, Session
-from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
+from cayu.sessions.supervision_events import (
+    SupervisionEvent,
+    SupervisionEventPage,
+    SupervisionEventQuery,
+)
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.fork_controllers import ForkController
+    from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 
 FORK_CONTROLLER_READ_DEFAULT_BYTES = 1_048_576
 FORK_CONTROLLER_READ_MAX_BYTES = 4_194_304
@@ -100,6 +106,34 @@ class ForkControllerReads:
             return await self._app._resolve_public_session_id(session_id)
         except ValueError:
             return None
+
+    def _codec(self) -> PublicAuthorityAliasCodec | None:
+        # Without a configured keyring there is no stable key, so correlation
+        # values are withheld rather than derived from a process-local one.
+        return self._app._public_authority_alias_codec
+
+    def event_correlation_ids(self, record: EventRecord) -> dict[str, str]:
+        if type(record) is not EventRecord:
+            raise TypeError("record must be an EventRecord.")
+        codec = self._codec()
+        return {} if codec is None else correlation.event_correlation_ids(record.event, codec)
+
+    def supervision_correlation_ids(
+        self, event: SupervisionEvent
+    ) -> dict[str, str | list[str] | None]:
+        if type(event) is not SupervisionEvent:
+            raise TypeError("event must be a SupervisionEvent.")
+        codec = self._codec()
+        if codec is None:
+            return {}
+        return correlation.supervision_correlation_ids(
+            codec,
+            session_id=event.session_id,
+            tool_round_id=event.tool_round_id,
+            tool_call_ids=event.tool_call_ids,
+            model_step_id=event.model_step_id,
+            model_attempt_id=event.model_attempt_id,
+        )
 
     async def sessions(self, query: SessionQuery | None) -> SessionListResult:
         query = copy_session_query(query)

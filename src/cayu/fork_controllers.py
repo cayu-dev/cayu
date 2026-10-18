@@ -38,7 +38,11 @@ from cayu.sessions.fork_overlays import (
     validate_fork_controller_name,
 )
 from cayu.sessions.queries import SessionListResult, SessionQuery
-from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
+from cayu.sessions.supervision_events import (
+    SupervisionEvent,
+    SupervisionEventPage,
+    SupervisionEventQuery,
+)
 from cayu.tools.exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     ToolCapabilityCeiling,
@@ -337,6 +341,31 @@ class ForkControllerAccess:
             # private to that controller even without its own body.
             raise ForkControllerDenied("The source is not an agent this controller may fork.")
         return await self.__app.snapshot_fork_source(source_session_id)
+
+    def event_correlation_ids(self, record: EventRecord) -> dict[str, str]:
+        """Keyed correlation values for one event this controller read.
+
+        SDK reads return the store's private records; these are the values the
+        HTTP routes add to the same record's public payload. They join events of
+        one session, stay the same across reads and restarts while the keyring
+        keeps its active key, and carry no authority: no resolver accepts them.
+        Without a configured alias keyring the result is empty.
+        """
+
+        return self.__reads.event_correlation_ids(record)
+
+    def supervision_correlation_ids(
+        self, event: SupervisionEvent
+    ) -> dict[str, str | list[str] | None]:
+        """Keyed correlation values for one supervision touch this controller read.
+
+        ``tool_call_correlation_ids`` equal the ``tool_call_correlation_id`` of
+        the touched calls' tool events, in ``tool_call_ids`` order; the model
+        and round values equal those on the session's model and tool events.
+        Without a configured alias keyring the result is empty.
+        """
+
+        return self.__reads.supervision_correlation_ids(event)
 
     async def sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         """List the sessions this controller may read; others are absent, never errors."""

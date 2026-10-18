@@ -247,10 +247,11 @@ def test_retirement_cannot_discard_pending_timer_publication(
     from cayu.tasks.memory import InMemoryTaskStore
 
     async def scenario():
-        async with stores(backend, tmp_path, request, [datetime.now(UTC)]) as (store, reopen):
+        now = datetime.now(UTC)
+        async with stores(backend, tmp_path, request, [now]) as (store, reopen):
             waits = ExternalEventWaits(store=store, access_policy=AdministrationPolicy())
             correlation = await waits.reserve_correlation(
-                reservation(deadline=datetime.now(UTC) - timedelta(seconds=1)), context=CONTEXT
+                reservation(deadline=now - timedelta(seconds=1)), context=CONTEXT
             )
             registered = registration(correlation)
             await waits.register(registered, context=CONTEXT)

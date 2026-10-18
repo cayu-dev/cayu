@@ -48,9 +48,9 @@ from cayu.server.auth import AuthConfigurationError
 from cayu.server.contracts import (
     ApiEventRecord,
     ApiSessionDetail,
+    ApiSupervisionEvent,
     ListSessionsResponse,
     SupervisionEventsRequest,
-    SupervisionEventsResponse,
 )
 from cayu.server.routes import (
     _BoundedPrivateJsonBodyRoute,
@@ -62,6 +62,7 @@ from cayu.server.routes import (
     _serialize_supervision_event,
     _supervision_event_query_from_request,
 )
+from cayu.sessions._correlation import CORRELATION_FIELDS
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.forks import ForkRequestConflict
@@ -323,6 +324,30 @@ class ForkControllerSessionEventsResponse(ForkControllerEventsResponse):
     session_id: str
 
 
+class ForkControllerSupervisionEvent(ApiSupervisionEvent):
+    """One supervision touch plus keyed correlation values that join its events.
+
+    ``tool_call_correlation_ids`` follow the touched calls in order and equal
+    their tool events' ``tool_call_correlation_id``. The other values equal the
+    same-named fields on the session's tool and model events. None of them is
+    resolution authority. Without a configured alias keyring the four fields
+    are absent from the response.
+    """
+
+    tool_call_correlation_ids: list[str] = Field(default_factory=list)
+    tool_round_correlation_id: str | None = None
+    model_step_correlation_id: str | None = None
+    model_attempt_correlation_id: str | None = None
+
+
+class ForkControllerSupervisionEventsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[ForkControllerSupervisionEvent]
+    next_cursor: str
+    has_more: StrictBool
+
+
 class _BoundedEventQueryRoute(_BoundedPrivateJsonBodyRoute):
     """Bound controller event queries before FastAPI parses their filters."""
 
@@ -364,8 +389,27 @@ async def _read(operation: Awaitable[Any]) -> Any:
         ) from None
 
 
+def _controller_event(
+    app: CayuApp, handle: ForkControllerAccess, record: EventRecord
+) -> dict[str, Any]:
+    """Serialize like the control plane, then publish only derived correlation values.
+
+    Every correlation field is dropped first, including the control plane's own
+    ``tool_call_correlation_id``, which a host without a keyring derives from a
+    process-local key; only keyed values are added back.
+    """
+
+    serialized = _serialize_event_record(app, record)
+    payload = serialized["payload"]
+    for field in CORRELATION_FIELDS:
+        payload.pop(field, None)
+    payload.update(handle.event_correlation_ids(record))
+    return serialized
+
+
 def _event_page(
     app: CayuApp,
+    handle: ForkControllerAccess,
     page: tuple[list[EventRecord], bool],
     *,
     order_by: EventOrder,
@@ -376,7 +420,7 @@ def _event_page(
     records, has_more = page
     cursor = after_sequence if order_by is EventOrder.SEQUENCE_ASC else before_sequence
     payload = {
-        "events": [_serialize_event_record(app, record) for record in records],
+        "events": [_controller_event(app, handle, record) for record in records],
         "order_by": order_by,
         "next_sequence": records[-1].sequence if records else cursor,
         "has_more": has_more,
@@ -518,6 +562,7 @@ def create_fork_controller_router(
             "session_id": app.project_session_id_for_exposure(loaded.id),
             **_event_page(
                 app,
+                handle,
                 page,
                 order_by=order_by,
                 after_sequence=after_sequence,
@@ -543,6 +588,7 @@ def create_fork_controller_router(
         page = await _read(queried())
         return _event_page(
             app,
+            handle,
             page,
             order_by=body.order_by,
             after_sequence=body.after_sequence,
@@ -567,22 +613,33 @@ def create_fork_controller_router(
             )
 
         page, anchors = await _read(paged())
-        return SupervisionEventsResponse.model_validate(
+        events = [
             {
-                "events": [
-                    _serialize_supervision_event(app, event, anchors[event.sequence])
-                    for event in page.events
-                ],
-                "next_cursor": page.next_cursor,
-                "has_more": page.has_more,
+                **_serialize_supervision_event(app, event, anchors[event.sequence]),
+                **handle.supervision_correlation_ids(event),
             }
+            for event in page.events
+        ]
+        response = ForkControllerSupervisionEventsResponse.model_validate(
+            {"events": events, "next_cursor": page.next_cursor, "has_more": page.has_more}
         )
+        # The store bounds the whole private page; correlation values add bytes,
+        # so the whole published page, envelope included, is bounded again in
+        # the exact form the route returns.
+        if not json_utf8_size_within_limit(
+            response.model_dump(mode="json", exclude_unset=True), body.max_bytes
+        ):
+            raise _too_large()
+        return response
 
     router.add_api_route(
         "/supervision-events/query",
         query_supervision_events,
         methods=["POST"],
-        response_model=SupervisionEventsResponse,
+        response_model=ForkControllerSupervisionEventsResponse,
+        # The serializer sets every control-plane field, so only correlation
+        # fields a keyless host withholds are left unset and omitted.
+        response_model_exclude_unset=True,
         route_class_override=_BoundedSupervisionEventsRoute,
     )
 
@@ -754,6 +811,8 @@ __all__ = [
     "ForkControllerEventQueryRequest",
     "ForkControllerEventsResponse",
     "ForkControllerSessionEventsResponse",
+    "ForkControllerSupervisionEvent",
+    "ForkControllerSupervisionEventsResponse",
     "create_fork_controller_router",
     "environment_fork_controller_router",
     "fork_controller_from_environment",

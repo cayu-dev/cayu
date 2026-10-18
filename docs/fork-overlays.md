@@ -322,6 +322,75 @@ controller read with `NotImplementedError` (501 over HTTP).
   linkage are the same public values the control plane publishes. The routes
   do not mount the control plane.
 
+### Correlation ids
+
+Public linkage aliases such as `cayu_event_12:tool_call_id` name one record, so
+they cannot pair a tool call's start with its terminal. Controller reads add
+correlation ids that can:
+
+| Event | Correlation fields in `payload` |
+| --- | --- |
+| `tool.call.started` | `tool_call_correlation_id`, `tool_round_correlation_id`, and the proposing attempt's `model_step_correlation_id` and `model_attempt_correlation_id` |
+| `tool.call.completed`, `.failed`, `.blocked`, `.approval_denied`, `.approval_expired` | `tool_call_correlation_id`, `tool_round_correlation_id` |
+| `model.started`, `model.completed`, `model.error` | `model_step_correlation_id`, `model_attempt_correlation_id`; a completion that proposed tools also has `tool_round_correlation_id` |
+| `model.auxiliary.attempt_started`, `model.auxiliary.attempt_settled` | `auxiliary_operation_correlation_id`, `model_step_correlation_id`, `model_attempt_correlation_id` |
+
+Supervision records from `POST /fork-controller/supervision-events/query` also
+carry `tool_call_correlation_ids`, `tool_round_correlation_id`,
+`model_step_correlation_id` and `model_attempt_correlation_id`, which are null
+or empty when the touch has no such linkage.
+
+A ledger joins records with these values:
+
+- Every `tool.call.started` has exactly one terminal with the same
+  `tool_call_correlation_id`.
+- Every `model.started` has exactly one `model.completed` or `model.error` with
+  the same `model_attempt_correlation_id`. A retried step keeps its
+  `model_step_correlation_id` and gets a new attempt value.
+- Auxiliary attempts pair on `auxiliary_operation_correlation_id` plus
+  `attempt`.
+- A supervision record's `tool_call_correlation_ids` follow the touched calls
+  in order and equal those calls' `tool_call_correlation_id`. Its round, step
+  and attempt values equal the same fields on the session's tool and model
+  events.
+
+The rest of each record is the control plane's projection. `purpose` (for
+example `context_compaction`), `usage_metrics`, `timestamp` and `sequence`
+survive. So do the auxiliary attempt's `auxiliary_inference.purpose`,
+`auxiliary_outcome` and `usage_metrics`, and a
+`session.execution_profile.decided` event's `decision` and
+`candidate_profile.fingerprint`. The private tool call, round, model step,
+model attempt and auxiliary operation ids never appear in controller-read
+output.
+
+SDK reads return the store's own records. `event_correlation_ids(record)` and
+`supervision_correlation_ids(event)` on `ForkControllerAccess` return the same
+values the HTTP routes add.
+
+Each value is an HMAC of the session id and the private id under the host's
+public authority alias keyring. Each kind has its own field name inside the
+value, so values of different kinds never match. The values are the same on
+every read and after a restart with the same key material. Rotating the active
+key changes them, so a reader that joins records rebuilds its joins after a
+rotation instead of mixing values from both keys.
+
+- Correlation ids carry no authority. No session, interaction, approval, input
+  or linkage resolver accepts one, and approval and user-input resolution
+  refuse them.
+- Only derived values are published. A payload field with one of these names
+  that the host did not derive is dropped.
+- `max_bytes` bounds each published page with its correlation values. A larger
+  event or supervision page returns 413.
+- Correlation values need a configured alias keyring. Without one they could
+  only come from a process-local key that changes on restart, so a SQLite or
+  PostgreSQL store with no keyring publishes none: controller reads still
+  work, the correlation fields above are absent from every event and
+  supervision record, and `event_correlation_ids` and
+  `supervision_correlation_ids` return empty dicts. That includes the
+  `tool_call_correlation_id` the control plane derives from its process-local
+  key. An in-memory store always has a random key for as long as its data
+  lives, so its reads carry the fields.
+
 ### Bearer-token authentication
 
 `ForkControllerBearerAuth` is a ready-made `authenticate` callback that maps
