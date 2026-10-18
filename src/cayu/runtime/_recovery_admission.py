@@ -92,9 +92,9 @@ from cayu.tools.exposure import (
 )
 
 
-def _completed_tool_round_model_step(step: int | None, *, max_steps: int) -> int:
+def _completed_tool_round_model_step(step: int | None, *, max_steps: int | None) -> int:
     """Retain consumed allowance from the authenticated pending round."""
-    if type(step) is not int or not 1 <= step <= max_steps:
+    if type(step) is not int or step < 1 or (max_steps is not None and step > max_steps):
         raise RuntimeError("Tool-round continuation has no valid consumed model-step evidence.")
     return step
 
@@ -118,7 +118,7 @@ def _continued_tool_exposure_profile_id(
 class _RecoveryInvocationSemantics:
     """Exact provider-dispatch semantics reconstructed for one continuation."""
 
-    max_steps: int
+    max_steps: int | None
     limits: RunLimits
     budget_limits: tuple[BudgetLimit, ...]
     retry_policy: RetryPolicy
@@ -326,6 +326,7 @@ class RecoveryAdmission:
         before_mutation: RecoveryMutationHook | None = None,
         before_resume: RecoveryExecutionAdmissionHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
@@ -494,6 +495,9 @@ class RecoveryAdmission:
             if transition_failure is None:
                 raise RuntimeError("Continuation recovery transition completed without a session.")
             raise transition_failure
+
+        if on_admitted is not None:
+            on_admitted(session)
 
         # The transition activated this epoch only in the child task's copied
         # context. The caller owns all subsequent writes and cleanup.

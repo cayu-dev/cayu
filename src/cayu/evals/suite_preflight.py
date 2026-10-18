@@ -128,10 +128,13 @@ def compile_authored_suite_run_exposure(
             raise ValueError("Suite trial policy exceeds a selected execution profile.")
 
     candidate_trials = len(selected_ids) * policy.trial_count
-    maximum_candidate_model_steps = sum(
-        len(launch.case_ids) * policy.trial_count * launch.execution_profile.ceilings.max_steps
-        for launch in launches
-    )
+    maximum_candidate_model_steps: int | None = 0
+    for launch in launches:
+        maximum = launch.execution_profile.ceilings.max_steps
+        if maximum is None:
+            maximum_candidate_model_steps = None
+            break
+        maximum_candidate_model_steps += len(launch.case_ids) * policy.trial_count * maximum
     # Runtime token limits stop subsequent work after observed usage reaches the
     # configured threshold. A single provider completion can legitimately cross
     # that threshold, so those limits are not a pre-dispatch maximum exposure.

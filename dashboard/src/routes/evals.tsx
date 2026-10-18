@@ -653,7 +653,7 @@ function EvalExecutionProfileSummary({
           />
           <ProfileFact
             label="Execution ceilings"
-            value={`${profile.ceilings.max_timeout_seconds}s timeout · ${profile.ceilings.max_steps} steps · ${profile.ceilings.max_compiled_input_chars.toLocaleString()} compiled chars`}
+            value={`${profile.ceilings.max_timeout_seconds}s timeout · ${profile.ceilings.max_steps == null ? "no step cap" : `${profile.ceilings.max_steps} steps`} · ${profile.ceilings.max_compiled_input_chars.toLocaleString()} compiled chars`}
           />
           <ProfileFact
             label="Evidence"
@@ -3783,7 +3783,7 @@ function AcceptedExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV
     <div className="mb-4 grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
       <RunFact
         label="Accepted candidate maximum"
-        value={`${formatCount(exposure.candidate_trials)} trials · ${formatCount(exposure.maximum_candidate_model_steps)} model steps · ${exposure.maximum_candidate_total_tokens == null ? "token ceiling unavailable" : `${formatCount(exposure.maximum_candidate_total_tokens)} tokens`}`}
+        value={`${formatCount(exposure.candidate_trials)} trials · ${exposure.maximum_candidate_model_steps == null ? "no model-step cap" : `${formatCount(exposure.maximum_candidate_model_steps)} model steps`} · ${exposure.maximum_candidate_total_tokens == null ? "token ceiling unavailable" : `${formatCount(exposure.maximum_candidate_total_tokens)} tokens`}`}
       />
       <RunFact
         label="Accepted judge work"

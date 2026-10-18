@@ -450,10 +450,12 @@ def _decode_incomplete_recovery_cursor(
     return status, session_cursor
 
 
-def _require_recovery_max_steps(value: int | None) -> int:
-    if value is None:
+def _require_recovery_max_steps(
+    pending: pending_rounds.PendingToolRound | PendingUserInput | PendingToolApproval,
+) -> int | None:
+    if pending.max_steps is None and pending.max_steps_unbounded is not True:
         raise ValueError("Recovery requires recorded invocation max_steps.")
-    return value
+    return pending.max_steps
 
 
 class IncompleteSessionRecovery:
@@ -2169,7 +2171,7 @@ class IncompleteSessionRecovery:
                             session=claim.session,
                             pending_round=post_action_round,
                             invocation_semantics=_RecoveryInvocationSemantics(
-                                max_steps=_require_recovery_max_steps(post_action_round.max_steps),
+                                max_steps=_require_recovery_max_steps(post_action_round),
                                 limits=post_action_round.limits,
                                 budget_limits=post_action_round.budget_limits,
                                 retry_policy=self._effective_retry_policy(

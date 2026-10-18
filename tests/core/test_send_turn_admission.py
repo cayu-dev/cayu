@@ -169,9 +169,9 @@ def test_turn_rejects_session_changes_after_abandoned_recovery(
                 elif boundary == "recovery_events":
                     resume = app._session_engine.resume
 
-                    async def race_resume(preparation):
+                    async def race_resume(preparation, **kwargs):
                         await compete()
-                        async for event in resume(preparation):
+                        async for event in resume(preparation, **kwargs):
                             yield event
 
                     monkeypatch.setattr(app._session_engine, "resume", race_resume)

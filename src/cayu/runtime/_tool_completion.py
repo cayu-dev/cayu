@@ -45,7 +45,7 @@ async def load_recorded_tool_completion_policy(
     checkpoint: dict[str, Any] | None | _CheckpointState = _CheckpointState.NOT_LOADED,
     *,
     execution_profile: ExecutionProfileIdentity,
-    max_steps: int,
+    max_steps: int | None,
     limits: RunLimits,
     retry_policy: RetryPolicy,
     context: ModelCompletionRecoveryContext | None = None,

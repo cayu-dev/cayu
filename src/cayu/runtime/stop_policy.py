@@ -30,6 +30,7 @@ class StopLimit(StrEnum):
     MODEL_STEPS = "model_steps"
     ELAPSED_SECONDS = "elapsed_seconds"
     ESTIMATED_COST = "estimated_cost"
+    EXECUTION_DEADLINE = "execution_deadline"
 
 
 class StopDecision(BaseModel):
@@ -156,3 +157,48 @@ def first_reached_limit(
                 message=f"Run limit reached: {limit.value} {actual} {comparator} {maximum}.",
             )
     return None
+
+
+def approaching_run_limit(
+    *,
+    limits: RunLimits,
+    usage: SessionUsageSummary,
+    elapsed_seconds: int,
+) -> StopDecision | None:
+    """Select a finish boundary without modifying any hard-limit authority."""
+    if limits.on_limit != "finish":
+        return None
+    checks = (
+        (StopLimit.INPUT_TOKENS, limits.max_input_tokens, usage.usage.input_tokens),
+        (StopLimit.OUTPUT_TOKENS, limits.max_output_tokens, usage.usage.output_tokens),
+        (StopLimit.TOTAL_TOKENS, limits.max_total_tokens, usage.usage.total_tokens),
+        (StopLimit.TOOL_CALLS, limits.max_tool_calls, usage.tool_calls),
+    )
+    for limit, maximum, actual in checks:
+        if maximum is not None and actual * 10 >= maximum * 9:
+            return StopDecision(
+                limit=limit,
+                maximum=maximum,
+                actual=actual,
+                message=f"Finishing before the {limit.value} limit.",
+            )
+    maximum = limits.max_elapsed_seconds
+    if maximum is not None and maximum - elapsed_seconds <= limits.finish_reserve_seconds:
+        return StopDecision(
+            limit=StopLimit.ELAPSED_SECONDS,
+            maximum=maximum,
+            actual=elapsed_seconds,
+            message="Finishing before the elapsed-time limit.",
+        )
+    return None
+
+
+def approaching_cost_limit(*, maximum: Decimal, actual: Decimal) -> StopDecision | None:
+    if actual * 10 < maximum * 9:
+        return None
+    return StopDecision(
+        limit=StopLimit.ESTIMATED_COST,
+        maximum=maximum,
+        actual=actual,
+        message="Finishing before the estimated-cost limit.",
+    )

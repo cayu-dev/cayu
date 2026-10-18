@@ -33,6 +33,15 @@ class RunLimits(BaseModel):
     max_tool_calls: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
     max_elapsed_seconds: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
     scope: Literal["session", "run"] = "run"
+    on_limit: Literal["interrupt", "finish"] = Field(
+        default="interrupt", exclude_if=lambda value: value == "interrupt"
+    )
+    finish_reserve_seconds: StrictInt = Field(
+        default=30,
+        ge=1,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value == 30,
+    )
 
 
 def copy_run_limits(limits: RunLimits | None) -> RunLimits:
@@ -47,6 +56,8 @@ def copy_run_limits(limits: RunLimits | None) -> RunLimits:
         max_tool_calls=limits.max_tool_calls,
         max_elapsed_seconds=limits.max_elapsed_seconds,
         scope=limits.scope,
+        on_limit=limits.on_limit,
+        finish_reserve_seconds=limits.finish_reserve_seconds,
     )
 
 

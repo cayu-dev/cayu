@@ -58,6 +58,7 @@ from cayu.runtime._memory_evidence import (
 from cayu.runtime._model_execution_selection import ModelFailoverAttempt
 from cayu.runtime._run_limits import BudgetStepReservation
 from cayu.runtime.model_steps import AssistantStepResult
+from cayu.runtime.stop_policy import StopDecision
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_tool_round as pending_rounds
@@ -151,11 +152,12 @@ class ModelCompletionRecoveryContext(BaseModel):
     thinking: ThinkingConfig | None = None
     # A missing field can be a persisted schema-v1 payload, so changing this
     # default would rewrite historical run semantics during recovery.
-    max_steps: StrictInt = Field(
+    max_steps: StrictInt | None = Field(
         default=_MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
         ge=1,
         le=MAX_STEPS,
     )
+    finish_limit: StopDecision | None = Field(default=None, exclude_if=lambda value: value is None)
     limits: RunLimits = Field(default_factory=RunLimits)
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] = ()
@@ -335,6 +337,9 @@ def _copy_assistant_step_result(result: AssistantStepResult) -> AssistantStepRes
         has_user_visible_content=result.has_user_visible_content,
         provider_state_count=result.provider_state_count,
         thinking_count=result.thinking_count,
+        finish_limit=None
+        if result.finish_limit is None
+        else result.finish_limit.model_copy(deep=True),
     )
 
 

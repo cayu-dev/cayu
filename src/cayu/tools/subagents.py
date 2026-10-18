@@ -263,7 +263,7 @@ class SubagentSpec(BaseModel):
     context_mode: SubagentContextMode = SubagentContextMode.TASK_ONLY
     mode: SubagentExecutionMode = SubagentExecutionMode.FOREGROUND
     environment_name: str | None = None
-    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     result_max_chars: StrictInt = Field(
         default=DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
         ge=1,

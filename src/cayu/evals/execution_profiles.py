@@ -232,7 +232,7 @@ class EvalExecutionResourceCeilingsV1(BaseModel):
         ge=1,
         le=CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
     )
-    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(ge=1, le=MAX_STEPS)
     run_limits: RunLimits
 
     @field_validator("run_limits", mode="before")

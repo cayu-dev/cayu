@@ -200,7 +200,7 @@ class WorkAttemptTurnExecution(Protocol):
         invocation_context: InvocationContext,
         messages: list[Message],
         messages_to_append: list[Message],
-        max_steps: int,
+        max_steps: int | None,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,

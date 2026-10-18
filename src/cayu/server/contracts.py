@@ -1116,7 +1116,7 @@ class EvalTargetCatalogEntry(ApiBaseModel):
     max_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     max_timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
-    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(ge=1, le=MAX_STEPS)
     cost_budget_available: StrictBool
     cost_budget_currencies: tuple[StrictStr, ...] = Field(max_length=32)
     judge_profiles: tuple[JudgeProfileIdentityV1, ...] = Field(default=(), max_length=32)

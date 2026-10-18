@@ -1986,6 +1986,7 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         tool_name="reader",
         arguments={"path": "README.md"},
         agent_name="assistant",
+        max_steps_unbounded=True,
         # Set so the optional key is present and its collision handling exercised.
         workspace_id_explicit=True,
         publish_arguments=True,
@@ -2005,6 +2006,7 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         question="Continue?",
         arguments={"path": "README.md"},
         agent_name="assistant",
+        max_steps_unbounded=True,
         execution_profile_fingerprint="e" * 64,
         tool_calls=[pending_call],
     )

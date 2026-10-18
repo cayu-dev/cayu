@@ -863,7 +863,10 @@ class ProviderDispositionRecovery:
                 reset_budgets=False,
                 now=self._clock(),
             )
-        if pending.source_step > recovery_context.max_steps:
+        if (
+            recovery_context.max_steps is not None
+            and pending.source_step > recovery_context.max_steps
+        ):
             raise ProviderOperationEvidenceError(
                 "Provider-operation fallback step exceeds its durable run limit."
             )

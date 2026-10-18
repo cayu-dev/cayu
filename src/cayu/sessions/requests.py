@@ -281,7 +281,7 @@ class RunRequest(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     invocation_origin: InvocationOriginClaim | None = None
-    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -519,7 +519,7 @@ class ResumeRequest(BaseModel):
     tool_grants: tuple[TargetedToolGrant, ...] = ()
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None

@@ -46,6 +46,7 @@ class ActiveSessionRun(Generic[UsageTrackerT]):
     task_id: str | None
     task_started: bool
     task_finished: bool
+    structured_output_pending: bool = False
     turn_registered_agent: runtime_records.RegisteredAgentState | None = None
     turn_environment_name: str | None = None
     turn_started_at: float | None = None

@@ -1391,12 +1391,16 @@ def profiled_session_identity(
     agent_name: str,
     provider_name: str,
     model: str,
+    task_id: str,
     invocation_loop_policies: tuple[LoopPolicy, ...] = (),
 ) -> SessionIdentity:
     # Mirror the runtime-owned identity for this manually seeded resume fixture.
     runtime_version = version("cayu")
     runtime_build_provenance = current_runtime_build_provenance()
     registered_agent = app._agents[agent_name]
+    run_request = app._with_application_run_defaults(
+        RunRequest(agent_name=agent_name, task_id=task_id, messages=[])
+    )
     engine = app._session_engine
     invocation_loop_policy_identities = tuple(
         policy.execution_profile_identity for policy in invocation_loop_policies
@@ -1429,8 +1433,8 @@ def profiled_session_identity(
             ),
             registered_provider=app._provider_registry.registrations.get(provider_name),
             finalization=execution_profile_admission.model_finalization_material(
-                max_steps=app.config.run.max_steps,
-                limits=app.config.run.copy_limits(),
+                max_steps=run_request.max_steps,
+                limits=run_request.limits,
                 retry_policy=app.config.run.retry_policy,
             ),
         ),
@@ -2166,6 +2170,7 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
             agent_name=first_service.agent_name,
             provider_name=provider.name,
             model="scripted-model",
+            task_id=product_task.id,
             invocation_loop_policies=invocation_loop_policies,
         )
         tool_capability_ceiling = ToolCapabilityCeiling(

@@ -124,7 +124,7 @@ class BeforeStopContext:
         step_result: AssistantStepResult,
         classification: StepClassification,
         step: int,
-        max_steps: int,
+        max_steps: int | None,
         metadata: dict[str, Any],
         messages: Sequence[Message] = (),
         continuation_message_indices: Iterable[int] = (),
@@ -160,7 +160,7 @@ class BeforeStopContext:
         return self._step
 
     @property
-    def max_steps(self) -> int:
+    def max_steps(self) -> int | None:
         return self._max_steps
 
     @property

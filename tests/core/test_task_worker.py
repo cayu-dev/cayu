@@ -32,7 +32,6 @@ from cayu.approvals.tools import (
     ToolApprovalRequest,
 )
 from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
-from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message
@@ -4673,7 +4672,7 @@ def test_expired_attached_session_is_recovered_handed_off_and_resumed() -> None:
                 ),
             ),
             identity=profiled_session_identity(
-                max_steps=DEFAULT_MAX_STEPS,
+                max_steps=None,
                 provider_name=provider.name,
                 model="scripted-model",
                 agent_name="worker-agent",
@@ -8036,7 +8035,7 @@ def test_resume_rechecks_worker_authority_after_session_admission() -> None:
                 ),
             ),
             identity=profiled_session_identity(
-                max_steps=DEFAULT_MAX_STEPS,
+                max_steps=None,
                 provider_name=provider.name,
                 model="scripted-model",
                 agent_name="worker-agent",
@@ -8245,7 +8244,7 @@ def test_session_engine_keeps_legacy_custom_store_direct_resume_compatible() -> 
                 ),
             ),
             identity=profiled_session_identity(
-                max_steps=DEFAULT_MAX_STEPS,
+                max_steps=None,
                 provider_name=provider.name,
                 model="scripted-model",
             ),
@@ -8316,7 +8315,7 @@ def test_resume_completes_the_running_task_already_attached_to_the_session(
                 ),
             ),
             identity=profiled_session_identity(
-                max_steps=DEFAULT_MAX_STEPS,
+                max_steps=None,
                 provider_name=provider.name,
                 model="scripted-model",
             ),

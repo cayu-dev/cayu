@@ -1518,6 +1518,7 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
                 ),
             ),
             identity=profiled_session_identity(
+                max_steps=None,
                 provider_name=provider.name,
                 model="scripted-model",
                 invocation_loop_policies=(
@@ -3598,5 +3599,38 @@ def test_product_deadline_during_setup_settles_task_and_redelivery(monkeypatch, 
         assert provider.requests == []
         assert (await service.execute_work(operation.work_id)).status == "failed"
         assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_product_service_retains_public_step_default_for_task_runs(monkeypatch):
+    service, store, _ = _build_service()
+    captured = []
+    original = service.cayu_app.run
+
+    def capture(request):
+        captured.append(service.cayu_app._with_application_run_defaults(request).max_steps)
+        return original(request)
+
+    monkeypatch.setattr(service.cayu_app, "run", capture)
+
+    async def scenario():
+        try:
+            reservation = await store.reserve(
+                tenant_id="tenant-a",
+                subject_id="test-subject",
+                idempotency_key="step-default",
+                request_fingerprint=_product_request_fingerprint("bounded work"),
+                public_id="op_step_default",
+                work_id="work_step_default",
+                session_id="session_step_default",
+                task_id="task_step_default",
+                request_text="bounded work",
+            )
+            operation = await service.execute_work(reservation.operation.work_id)
+            assert operation.status == "completed"
+            assert captured == [DEFAULT_MAX_STEPS]
+        finally:
+            await service.cayu_app.aclose()
 
     asyncio.run(scenario())

@@ -7,6 +7,7 @@ import json
 import threading
 import traceback
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from cayu._exception_groups import iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.billing import BillingIdentity
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelRequest, ModelStreamEvent
@@ -1321,9 +1323,13 @@ def test_cayu_app_preserves_caller_cancellation_across_billing_task_group_failur
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("expired", [False, True])
 def test_provider_cancellation_publication_failure_remains_repairable(
     monkeypatch: pytest.MonkeyPatch,
+    expired: bool,
 ) -> None:
+    from cayu.deadlines import _TIMERS
+
     class BillingCleanupFailureProvider(FakeProvider):
         def __init__(self) -> None:
             super().__init__([])
@@ -1335,6 +1341,7 @@ def test_provider_cancellation_publication_failure_remains_repairable(
             request: ModelRequest,
         ) -> BillingIdentity | None:
             del request
+            self.deadline_timers = tuple(timer for timer, _ in _TIMERS.get())
 
             async def child() -> None:
                 await self.release_cleanup.wait()
@@ -1372,26 +1379,49 @@ def test_provider_cancellation_publication_failure_remains_repairable(
                     agent_name="assistant",
                     session_id=session_id,
                     messages=[Message.text("user", "hello")],
+                    execution_deadline=ExecutionDeadline.after(3600)
+                    if expired
+                    else ExecutionDeadline(),
                 ),
             )
         )
         await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
-        task.cancel("caller cancelled billing")
+        if expired:
+            expired_wall = datetime.now(UTC) + timedelta(seconds=3601)
+
+            class ExpiredClock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return expired_wall
+
+            monkeypatch.setattr("cayu.deadlines.datetime", ExpiredClock)
+            for timer in provider.deadline_timers:
+                if timer.when() is not None:
+                    timer.reschedule(asyncio.get_running_loop().time())
+            await asyncio.sleep(0)
+        else:
+            task.cancel("caller cancelled billing")
         provider.release_cleanup.set()
-        with pytest.raises(asyncio.CancelledError) as raised:
+        with pytest.raises(
+            ExecutionDeadlineExceeded if expired else asyncio.CancelledError
+        ) as raised:
             await task
 
-        assert str(raised.value) == "caller cancelled billing"
-        assert type(raised.value.__cause__) is RuntimeError
-        assert str(raised.value.__cause__) == (
-            "Session interruption finalization failed after provider cancellation."
-        )
+        if not expired:
+            assert str(raised.value) == "caller cancelled billing"
+            assert type(raised.value.__cause__) is RuntimeError
+            assert str(raised.value.__cause__) == (
+                "Session interruption finalization failed after provider cancellation."
+            )
         session = await app.session_store.load(session_id)
         assert session is not None
         assert session.status is SessionStatus.INTERRUPTED
         checkpoint = await app.session_store.load_checkpoint(session_id)
         assert checkpoint is not None
         pending = checkpoint["pending_session_interrupt"]
+        assert pending["interruption_type"] == (
+            "limit_reached" if expired else "runtime_interrupted"
+        )
         assert pending["provider_cancellation_failures"] == [
             {
                 "phase": "billing_identity_for_request",
@@ -1413,7 +1443,13 @@ def test_provider_cancellation_publication_failure_remains_repairable(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
-        assert any(event.type == EventType.SESSION_INTERRUPTED for event in recovered.events)
+        interrupted = next(
+            event for event in recovered.events if event.type is EventType.SESSION_INTERRUPTED
+        )
+        assert interrupted.payload["interruption_type"] == pending["interruption_type"]
+        if expired:
+            assert interrupted.payload["limit"] == "execution_deadline"
+            assert interrupted.payload["failure_evidence"]["classification"] == "deadline"
         repaired_checkpoint = await app.session_store.load_checkpoint(session_id)
         assert repaired_checkpoint is not None
         assert "pending_session_interrupt" not in repaired_checkpoint

@@ -43,6 +43,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_LIMIT_REACHED,
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -91,6 +92,7 @@ def _provider_cancellation_interrupt_payload(
         raise ValueError("Provider cancellation interruption diagnostics cannot be empty.")
     interruption_type = payload.get("interruption_type")
     if type(interruption_type) is not str or interruption_type not in (
+        _INTERRUPTION_TYPE_LIMIT_REACHED,
         _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
         _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     ):

@@ -11,6 +11,7 @@ import pytest
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.context.structured_output import StructuredOutputSpec
 from cayu.deadlines import (
     ExecutionDeadline,
     ExecutionDeadlineExceeded,
@@ -376,18 +377,19 @@ def test_inflight_model_cancellation_waits_for_settlement():
     async def run():
         app, _ = _app(provider=BlockingProvider([]))
         events = []
-        with pytest.raises(ExecutionDeadlineExceeded) as failure:
-            async for event in app.run(
-                RunRequest(
-                    agent_name="worker",
-                    messages=[Message.text("user", "go")],
-                    execution_deadline=ExecutionDeadline.after(3),
-                )
-            ):
-                events.append(event)
+        async for event in app.run(
+            RunRequest(
+                agent_name="worker",
+                messages=[Message.text("user", "go")],
+                execution_deadline=ExecutionDeadline.after(3),
+            )
+        ):
+            events.append(event)
         assert settled == [True]
-        assert failure.value.diagnostics["remaining_seconds"] == 0
-        assert failure.value.diagnostics["denied_stage"]
+        terminal = next(event for event in events if event.type is EventType.SESSION_INTERRUPTED)
+        assert terminal.payload["reason"] == "limit_reached"
+        assert terminal.payload["limit"] == "execution_deadline"
+        assert terminal.payload["execution_deadline"]["remaining_seconds"] == 0
         session_id = events[0].session_id
         stored = await app.session_store.load(session_id)
         assert stored.status != SessionStatus.COMPLETED
@@ -404,6 +406,91 @@ def test_observed_wall_expiry_stays_expired_after_clock_rollback(clock):
     assert boundary.expired
     clock.wall -= timedelta(seconds=11)
     assert boundary.expired
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("delivery", ["advance", "close"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_expiry_after_resume_admission_finalizes_before_delivery_returns(
+    clock, tmp_path, store_kind, delivery, structured
+):
+    async def scenario():
+        store = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "resume-admission.sqlite3")
+        )
+        output = StructuredOutputSpec(
+            strategy="native",
+            json_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        )
+        app, provider = _app(
+            store=store,
+            provider=ScriptedModelProvider(
+                [[ModelStreamEvent.text_delta('{"answer": 42}'), ModelStreamEvent.completed({})]],
+                supports_native_structured_output=True,
+            ),
+        )
+        try:
+            initial = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="worker",
+                        session_id="resume-admission",
+                        messages=[Message.text("user", "First")],
+                        structured_output=output if structured else None,
+                        execution_deadline=ExecutionDeadline.after(3600),
+                    )
+                )
+            ]
+            assert initial[-1].type is EventType.SESSION_COMPLETED
+            previous = await store.load("resume-admission")
+            stream = app.resume(
+                ResumeRequest(
+                    session_id="resume-admission",
+                    messages=[Message.text("user", "Next")],
+                    structured_output=output if structured else None,
+                )
+            )
+            admitted = await anext(stream)
+            assert admitted.type is EventType.INTERACTION_STARTED
+            admitted_session = await store.load("resume-admission")
+            assert admitted_session.run_epoch == previous.run_epoch + 1
+            clock.wall += timedelta(seconds=3601)
+            clock.mono += 3601
+            if delivery == "advance":
+                remaining = [event async for event in stream]
+                assert remaining[-1].type is EventType.SESSION_INTERRUPTED
+                assert remaining[-1].payload["limit"] == "execution_deadline"
+                assert remaining[-1].payload["structured_output_pending"] is structured
+            else:
+                await stream.aclose()
+            current = await store.load("resume-admission")
+            assert current.status is SessionStatus.INTERRUPTED
+            assert current.run_epoch >= admitted_session.run_epoch
+            assert len(provider.requests) == 1
+            terminals = [
+                event
+                for event in await store.load_events("resume-admission")
+                if event.type is EventType.SESSION_INTERRUPTED
+            ]
+            assert len(terminals) == 1
+            assert terminals[0].payload["interruption_type"] == (
+                "limit_reached" if delivery == "advance" else "runtime_interrupted"
+            )
+            assert (
+                terminals[0].payload["failure_evidence"]["run_epoch"] == admitted_session.run_epoch
+            )
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_no_new_tools_or_models_when_wall_expiry_is_observed(clock):
@@ -529,16 +616,14 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
         boundary = ExecutionDeadline.after(3600)
         events = []
         if entrypoint == "run":
-            with pytest.raises(TimeoutError) as failure:
-                async for event in app.run(
-                    RunRequest(
-                        agent_name="worker",
-                        messages=[Message.text("user", "go")],
-                        execution_deadline=boundary,
-                    )
-                ):
-                    events.append(event)
-            timeout = failure.value
+            async for event in app.run(
+                RunRequest(
+                    agent_name="worker",
+                    messages=[Message.text("user", "go")],
+                    execution_deadline=boundary,
+                )
+            ):
+                events.append(event)
             session_id = events[0].session_id
         else:
             with pytest.raises(StepError) as step_failure:
@@ -549,8 +634,6 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
                     prompt="go",
                     run_options=StepRunOptions(execution_deadline=boundary),
                 )
-            timeout = step_failure.value.__cause__
-            assert isinstance(timeout, TimeoutError)
             assert step_failure.value.evidence.classification == "deadline"
             assert step_failure.value.evidence.deadline_phase == "in_flight"
             session_id = step_failure.value.session_id
@@ -578,8 +661,12 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
             f"call-{index}" for index in range(tool_count)
         }
         assert not any(e.type == EventType.TOOL_CALL_COMPLETED for e in persisted)
-        assert timeout.execution_deadline["remaining_seconds"] == 0.0
-        assert isinstance(timeout.__cause__, asyncio.CancelledError)
+        terminal = next(e for e in persisted if e.type is EventType.SESSION_INTERRUPTED)
+        assert terminal.payload["reason"] == "limit_reached"
+        assert terminal.payload["limit"] == "execution_deadline"
+        assert terminal.payload["execution_deadline"]["remaining_seconds"] == 0.0
+        assert terminal.payload["failure_evidence"]["classification"] == "deadline"
+        assert terminal.payload["failure_evidence"]["deadline_phase"] == "in_flight"
         await loop.shutdown_asyncgens()
         await asyncio.sleep(0)
         assert loop_errors == []
@@ -1045,8 +1132,7 @@ def test_task_deadline_releases_ownership_after_cancellation_drains(
                     == 1
                 )
             else:
-                with pytest.raises(TimeoutError):
-                    await asyncio.wait_for(handler(app, task), 15)
+                await asyncio.wait_for(handler(app, task), 15)
             final = await store.load_task(task.id)
             assert entered == [blocked]
             assert settled == [blocked]

@@ -141,6 +141,7 @@ def _durable_assistant_step_result(
     text_content = assistant_text_content(assistant_message)
     return AssistantStepResult(
         session_id=copied.session_id,
+        finish_limit=copied.finish_limit,
         step=copied.step,
         model_step_id=copied.model_step_id,
         model_attempt_id=copied.model_attempt_id,

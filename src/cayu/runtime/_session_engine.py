@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -232,6 +234,7 @@ from cayu.execution_profiles import (
 from cayu.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
+    ToolRoundIdentity,
     new_model_step_identity,
 )
 from cayu.messages import (
@@ -335,6 +338,7 @@ from cayu.runtime._run_limit_accounting import (
     capture_run_limit_accounting_context,
     restore_run_limit_accounting_context,
 )
+from cayu.runtime._run_limit_stream import admitted_continuation_deadline_outcome
 from cayu.runtime._run_limits import (
     BudgetStepReservation,
     LimitEvaluation,
@@ -1571,6 +1575,7 @@ class SessionEngine:
         participant_permit_commitment: str | None = None,
         execution_to_wait: _ExecutionToWait | _ExternalExecutionToWait | None = None,
         producer_output: _ProducerExecution | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(pause_after_initial_transcript) is not bool:
             raise TypeError("pause_after_initial_transcript must be a bool.")
@@ -2070,6 +2075,8 @@ class SessionEngine:
             invocation_context = prepared_invocation_context.with_admitted_session(session)
         if invocation_context is None:
             raise AssertionError("Invocation admission produced no frozen context.")
+        if on_admitted is not None:
+            on_admitted(session)
         _activate_session_interaction(session.id, interaction_id)
         targeted_tool_projection = resolve_targeted_tool_projection(
             registered_agent.targeted_tool_mode,
@@ -2086,6 +2093,7 @@ class SessionEngine:
                 task_started=False,
                 task_finished=False,
             )
+            active_factory_run.structured_output_pending = request.structured_output is not None
         # The run fence belongs to this pre-run setup until control is handed to
         # _run_session. Every earlier exit must revoke it, including cancellation
         # and failures while recording the original setup failure.
@@ -2345,6 +2353,7 @@ class SessionEngine:
                             registered_environment=registered_environment,
                             execution_profile=execution_profile,
                             invocation_context=invocation_context,
+                            active_run=active_factory_run,
                         ),
                     ),
                     (
@@ -3277,7 +3286,7 @@ class SessionEngine:
         environment_name: str | None,
         messages: list[Message],
         step: int,
-        max_steps: int,
+        max_steps: int | None,
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
@@ -3352,7 +3361,7 @@ class SessionEngine:
             is declaration.get("deliver_queued_session_messages")
         )
         while True:
-            if step >= max_steps and not can_reject_only:
+            if (max_steps is not None and step >= max_steps) and not can_reject_only:
                 # Ordinary unconditioned SDK steering does not require the new
                 # lifecycle capability. Preserve its queue and existing limit stop.
                 break
@@ -3367,7 +3376,7 @@ class SessionEngine:
                 invocation_context=invocation_context,
                 predecessor_settlement_event=predecessor_settlement_event,
                 before_successor_admission=admit_successor,
-                reject_only=step >= max_steps,
+                reject_only=(max_steps is not None and step >= max_steps),
             )
             events.extend(drained_events)
             if len(messages) != message_count:
@@ -3528,7 +3537,7 @@ class SessionEngine:
                     "complete", captured.result.session, [], invocation_context, marker
                 )
             except SessionQueuedMessagesPending:
-                if step >= max_steps:
+                if max_steps is not None and step >= max_steps:
                     break
                 continue
             except (SessionRunFenced, SessionStatusConflict):
@@ -3750,7 +3759,12 @@ class SessionEngine:
             in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
         )
 
-    async def resume(self, preparation: _ResumePreparation) -> AsyncGenerator[Event, None]:
+    async def resume(
+        self,
+        preparation: _ResumePreparation,
+        *,
+        on_admitted: Callable[[Session], None] | None = None,
+    ) -> AsyncGenerator[Event, None]:
         """Execute a prepared continuation after abandoned-owner recovery settles."""
         request = preparation.request
         task_id = preparation.task_id
@@ -3934,7 +3948,7 @@ class SessionEngine:
             )
 
         def current_resume_profile(
-            max_steps: int,
+            max_steps: int | None,
             candidate_provider: runtime_records.RegisteredProvider,
             candidate_model: str,
             runtime_identity: SessionRuntimeIdentity | None = None,
@@ -4464,7 +4478,7 @@ class SessionEngine:
             )
 
             def ordinary_resume_profile(
-                max_steps: int,
+                max_steps: int | None,
                 candidate_provider: runtime_records.RegisteredProvider,
                 model: str | None = None,
             ) -> ExecutionProfileIdentity:
@@ -5194,6 +5208,8 @@ class SessionEngine:
                 _deactivate_session_interaction(loaded_session.id)
             raise
         invocation_context = prepared_invocation_context.with_admitted_session(session)
+        if on_admitted is not None:
+            on_admitted(session)
         if task_id is not None and required_task_session_instance_id is not None:
             try:
                 await self._session_tasks.require_linked_continuation_task_authority(
@@ -5216,6 +5232,7 @@ class SessionEngine:
                                     registered_environment=registered_environment,
                                     execution_profile=invocation_profile,
                                     invocation_context=invocation_context,
+                                    structured_output_pending=request.structured_output is not None,
                                     run_terminal_hooks=False,
                                 ),
                             ),
@@ -5412,23 +5429,24 @@ class SessionEngine:
                     "Session transcript contains a workload secret in execution authority "
                     "and cannot be resumed."
                 ) from None
-        except asyncio.CancelledError as cancellation:
+        except (asyncio.CancelledError, GeneratorExit) as abandonment:
             try:
                 await self._recovery_ownership.run_cleanup_steps(
-                    authoritative_failure=cancellation,
+                    authoritative_failure=abandonment,
                     steps=(
                         (
-                            "cancelled resume setup finalization",
+                            "abandoned resume setup finalization",
                             lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                 session.id,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
                                 execution_profile=invocation_profile,
                                 invocation_context=invocation_context,
+                                structured_output_pending=request.structured_output is not None,
                             ),
                         ),
                         (
-                            "cancelled resume run-fence release",
+                            "abandoned resume run-fence release",
                             lambda: (
                                 self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                     session_id=session.id,
@@ -5701,6 +5719,7 @@ class SessionEngine:
             ) from None
         stream = self._continue_admitted_run(request)
         stream = await self._resource_session_stream.restore(stream, request.session.id)
+        stream = admitted_continuation_deadline_outcome(stream, self.session_store, request.session)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -5785,7 +5804,7 @@ class SessionEngine:
         admitted_checkpoint: dict[str, Any] | None | _CheckpointState = _CheckpointState.NOT_LOADED,
         messages: list[Message],
         messages_to_append: list[Message],
-        max_steps: int,
+        max_steps: int | None,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
@@ -6027,7 +6046,7 @@ class SessionEngine:
         invocation_context: InvocationContext,
         messages: list[Message],
         messages_to_append: list[Message],
-        max_steps: int,
+        max_steps: int | None,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
@@ -6157,13 +6176,15 @@ class SessionEngine:
             )
         if completed_tool_round_model_step is not None and (
             type(completed_tool_round_model_step) is not int
-            or not 1 <= completed_tool_round_model_step <= max_steps
+            or completed_tool_round_model_step < 1
+            or (max_steps is not None and completed_tool_round_model_step > max_steps)
             or initial_model_step_identity is not None
         ):
             raise ValueError("Completed tool-round step conflicts with continuation bounds.")
         if initial_model_step_number is not None and (
             type(initial_model_step_number) is not int
-            or not 1 <= initial_model_step_number <= max_steps
+            or initial_model_step_number < 1
+            or (max_steps is not None and initial_model_step_number > max_steps)
         ):
             raise ValueError("initial_model_step_number is outside this run's step bounds.")
         if (
@@ -6469,6 +6490,7 @@ class SessionEngine:
                     turn_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                 )
+                active_run.structured_output_pending = structured_output is not None
                 await self._session_control.execution_presence.ensure(
                     outcome_state.session, task_id=task_id
                 )
@@ -6629,6 +6651,55 @@ class SessionEngine:
                         raise RuntimeError(
                             "Recovered governed model completion is a non-turn outcome."
                         )
+            finish_decision: StopDecision | None = (
+                None if recovered_assistant_step is None else recovered_assistant_step.finish_limit
+            )
+
+            if (
+                recovered_assistant_step is None
+                and not messages_to_append
+                and model_boundary.completed_stage is not None
+            ):
+                retained_finish_context = model_completion_recovery_context_from_stage(
+                    model_boundary.completed_stage
+                )
+                if retained_finish_context is not None:
+                    finish_decision = retained_finish_context.finish_limit
+
+            async def finish_interruption(
+                *,
+                pending: bool,
+                tool_calls: list[runtime_records.ToolCallRequest] | None = None,
+                tool_round_identity: ToolRoundIdentity | None = None,
+            ) -> AsyncGenerator[Event, None]:
+                if finish_decision is None:
+                    raise RuntimeError("Finish-up lost its recorded limit.")
+                usage = await self._run_limit_controller.session_usage_summary(
+                    outcome_state.session.id
+                )
+                async for event in self._session_finalization.stop_session_for_limit_reached(
+                    session=outcome_state.session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    decision=finish_decision,
+                    usage_summary=usage,
+                    cost_summary=None,
+                    messages=messages,
+                    tool_calls=tool_calls or [],
+                    completed_tool_outcomes=[],
+                    tool_round_identity=tool_round_identity,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    reconcile_transition_cancellation=True,
+                    structured_output_pending=pending,
+                    finish_up=True,
+                ):
+                    yield event
+
             if model_boundary.state == "promoted" and model_boundary.completion_event is not None:
                 yield copy_event(model_boundary.completion_event)
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
@@ -6993,6 +7064,7 @@ class SessionEngine:
                 execution_profile=execution_profile,
                 tail_message_count=recovery_tail_message_count,
                 admit_replay=admit_replay,
+                finish_up=finish_decision is not None,
                 expected_transcript_cursor=recovery_expected_transcript_cursor,
             ):
                 if event.type in {
@@ -7019,6 +7091,7 @@ class SessionEngine:
             elif (
                 recovered_structured_outcome is not None
                 and recovered_structured_outcome.type == EventType.STRUCTURED_OUTPUT_FAILED
+                and finish_decision is None
             ):
                 recovered_attempt = recovered_structured_outcome.payload.get("attempt")
                 raise RuntimeError(
@@ -7042,6 +7115,12 @@ class SessionEngine:
                     outcome_state.session.id,
                     messages_to_append,
                 )
+            if (
+                active_run is not None
+                and recovered_structured_outcome is not None
+                and recovered_structured_outcome.type is EventType.STRUCTURED_OUTPUT_VALIDATED
+            ):
+                active_run.structured_output_pending = False
             for evaluation in replay_limit_evaluations:
                 async for event in self._session_finalization.apply_limit_evaluation(
                     evaluation=evaluation,
@@ -7075,6 +7154,21 @@ class SessionEngine:
                 and tool_completion_result != tool_completion_replay
             ):
                 raise RuntimeError("Final-tool recovery lost its exact durable completion basis.")
+            if (
+                finish_decision is not None
+                and recovered_assistant_step is None
+                and not messages_to_append
+            ):
+                pending = (
+                    recovered_structured_outcome is None
+                    or recovered_structured_outcome.type
+                    is not EventType.STRUCTURED_OUTPUT_VALIDATED
+                )
+                if active_run is not None:
+                    active_run.structured_output_pending = pending
+                async for event in finish_interruption(pending=pending):
+                    yield event
+                return
             skip_model_steps = False
             if (
                 (
@@ -7248,6 +7342,7 @@ class SessionEngine:
                         execution_profile_fingerprint=execution_profile_fingerprint,
                         budget_reservations=budget_reservation_contexts,
                         max_steps=max_steps,
+                        finish_limit=finish_decision,
                         limits=limits,
                         retry_policy=retry_policy,
                         tool_completion=tool_completion,
@@ -7260,6 +7355,7 @@ class SessionEngine:
                     structured_output=structured_output,
                     thinking=effective_thinking,
                     max_steps=max_steps,
+                    finish_limit=finish_decision,
                     limits=limits,
                     run_limit_accounting=run_limit_accounting,
                     budget_limits=budget_limits,
@@ -7480,6 +7576,8 @@ class SessionEngine:
                     raise RuntimeError("Queued handoff lost live invocation authority.")
                 if rebound is invocation_context:
                     return
+                if active_run is not None:
+                    active_run.structured_output_pending = structured_output is not None
                 model_step_run.rebind_queued_interaction(rebound)
                 tool_round_runner.rebind_queued_interaction(rebound)
                 invocation_context = rebound
@@ -7520,7 +7618,14 @@ class SessionEngine:
                 await self._session_finalization.stop_at_requested_tool_round_boundary(
                     outcome_state.session
                 )
-            model_steps = () if skip_model_steps else range(first_model_step, max_steps + 1)
+
+            model_steps = (
+                ()
+                if skip_model_steps
+                else itertools.count(first_model_step)
+                if max_steps is None
+                else range(first_model_step, max_steps + 1)
+            )
             # A resumed round can have consumed the final allowed step already.
             # The empty-loop limit path must report that consumed step, not an
             # uninitialized loop variable or a newly granted model request.
@@ -7625,6 +7730,27 @@ class SessionEngine:
                         yield event
                     if limit_evaluation.decision is not None:
                         return
+                    if structured_output is not None and limits.on_limit == "finish":
+                        finish_decision = limit_evaluation.finish or budget_evaluation.finish
+                        if max_steps is not None and step >= max_steps:
+                            finish_decision = StopDecision(
+                                limit=StopLimit.MODEL_STEPS,
+                                maximum=max_steps,
+                                actual=step,
+                                message="Finishing in the final allowed model step.",
+                            )
+                        remaining = current_execution_deadline().remaining_seconds()
+                        if (
+                            finish_decision is None
+                            and remaining is not None
+                            and remaining <= limits.finish_reserve_seconds
+                        ):
+                            finish_decision = StopDecision(
+                                limit=StopLimit.EXECUTION_DEADLINE,
+                                maximum=limits.finish_reserve_seconds,
+                                actual=Decimal(str(remaining)),
+                                message="Finishing within the remaining execution deadline.",
+                            )
                     request_variant = (
                         RequestVariant.STRUCTURED_OUTPUT_REPAIR
                         if structured_output_retries
@@ -7636,6 +7762,7 @@ class SessionEngine:
                         source_transcript_cursor=source_transcript_cursor,
                         model_step_identity=model_step_identity,
                         request_variant=request_variant,
+                        finish_up=finish_decision is not None,
                     )
                     try:
                         async for event, flow_outcome in model_step_events:
@@ -7774,54 +7901,77 @@ class SessionEngine:
                     and (replayed_step is None or model_boundary.state == "promoted")
                 ):
                     messages.append(assistant_message)
+                if finish_decision is not None and _user_tool_call_count(tool_calls):
+                    async for event in finish_interruption(
+                        pending=True, tool_calls=tool_calls, tool_round_identity=tool_round_identity
+                    ):
+                        yield event
+                    return
                 limit_evaluation = await limit_gate.evaluate_limits(
                     pending_tool_calls=_user_tool_call_count(tool_calls),
                     execution_identity=completed_model_attempt_identity,
                 )
-                async for event in self._session_finalization.apply_limit_evaluation(
-                    evaluation=limit_evaluation,
-                    session=outcome_state.session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                    messages=messages,
-                    tool_calls=tool_calls,
-                    tool_round_identity=tool_round_identity,
-                    run_started_at=run_started_at,
-                    turn_usage_tracker=turn_usage_tracker,
-                    active_run=active_run,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                ):
-                    yield event
-                if limit_evaluation.decision is not None:
-                    return
-
+                if finish_decision is not None:
+                    for event in limit_evaluation.events:
+                        yield event
+                    finish_decision = limit_evaluation.decision or finish_decision
+                else:
+                    async for event in self._session_finalization.apply_limit_evaluation(
+                        evaluation=limit_evaluation,
+                        session=outcome_state.session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        tool_round_identity=tool_round_identity,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    ):
+                        yield event
+                    if limit_evaluation.decision is not None:
+                        return
                 budget_evaluation = await limit_gate.evaluate_budget(
                     budget_policy,
                     execution_identity=completed_model_attempt_identity,
                 )
-                async for event in self._session_finalization.apply_budget_evaluation(
-                    evaluation=budget_evaluation,
-                    session=outcome_state.session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                    messages=messages,
-                    tool_calls=tool_calls,
-                    tool_round_identity=tool_round_identity,
-                    run_started_at=run_started_at,
-                    turn_usage_tracker=turn_usage_tracker,
-                    active_run=active_run,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                ):
-                    yield event
-                if budget_evaluation.check is not None:
-                    return
-
-                if not tool_calls and completion_requests_follow_up(
-                    assistant_step_result.completion
+                if finish_decision is not None:
+                    for event in budget_evaluation.events:
+                        yield event
+                    if budget_evaluation.check is not None:
+                        check = budget_evaluation.check
+                        finish_decision = StopDecision(
+                            limit=StopLimit.ESTIMATED_COST,
+                            maximum=check.maximum,
+                            actual=check.actual,
+                            message=check.message,
+                        )
+                else:
+                    async for event in self._session_finalization.apply_budget_evaluation(
+                        evaluation=budget_evaluation,
+                        session=outcome_state.session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        tool_round_identity=tool_round_identity,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    ):
+                        yield event
+                    if budget_evaluation.check is not None:
+                        return
+                if (
+                    finish_decision is None
+                    and not tool_calls
+                    and completion_requests_follow_up(assistant_step_result.completion)
                 ):
                     continue
 
@@ -7855,7 +8005,8 @@ class SessionEngine:
                             spec=structured_output,
                             step=step,
                             attempt=structured_output_retries + 1,
-                            retry_allowed=step < max_steps,
+                            retry_allowed=finish_decision is None
+                            and (max_steps is None or step < max_steps),
                             execution_profile=execution_profile,
                             redactor=self._secret_redactor,
                             tool_redactor=self._tool_round_executor._secret_redactor,
@@ -7870,6 +8021,8 @@ class SessionEngine:
                     validation = structured_publication.validation
                     cancellation = structured_publication.cancellation
                     close_new_pending_round_on_interrupt = False
+                    if validation.valid and active_run is not None:
+                        active_run.structured_output_pending = False
                     if cancellation is not None:
                         raise cancellation
                     await self._session_control.raise_if_interrupted(outcome_state.session.id)
@@ -7884,6 +8037,10 @@ class SessionEngine:
                             outcome_state.session.id,
                             validation.output,
                         )
+                        if finish_decision is not None:
+                            async for event in finish_interruption(pending=False):
+                                yield event
+                            return
                         if isinstance(execution_to_wait, _ExternalExecutionToWait):
                             async for event in park_external_completion():
                                 yield event
@@ -7948,12 +8105,16 @@ class SessionEngine:
                                 return
                             continue
                         break
+                    if finish_decision is not None:
+                        async for event in finish_interruption(pending=True):
+                            yield event
+                        return
                     if structured_output_retries >= structured_output.max_retries:
                         raise RuntimeError(
                             "Structured output validation failed after "
                             f"{structured_output_retries + 1} attempt(s)."
                         )
-                    if step >= max_steps:
+                    if max_steps is not None and step >= max_steps:
                         raise RuntimeError(
                             "Structured output validation failed after "
                             f"{structured_output_retries + 1} attempt(s): "
@@ -7997,7 +8158,7 @@ class SessionEngine:
                                     outcome_state.session.id,
                                     validation.output,
                                 )
-                                yield await emit_structured_event(
+                                validated_event = await emit_structured_event(
                                     event_with_execution_profile_authority(
                                         _structured_output_event(
                                             event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -8014,6 +8175,13 @@ class SessionEngine:
                                         execution_profile,
                                     )
                                 )
+                                if active_run is not None:
+                                    active_run.structured_output_pending = False
+                                yield validated_event
+                                if finish_decision is not None:
+                                    async for event in finish_interruption(pending=False):
+                                        yield event
+                                    return
                                 if isinstance(execution_to_wait, _ExternalExecutionToWait):
                                     async for event in park_external_completion():
                                         yield event
@@ -8101,12 +8269,16 @@ class SessionEngine:
                                 execution_profile,
                             )
                         )
+                        if finish_decision is not None:
+                            async for event in finish_interruption(pending=True):
+                                yield event
+                            return
                         if structured_output_retries >= structured_output.max_retries:
                             raise RuntimeError(
                                 "Structured output validation failed after "
                                 f"{structured_output_retries + 1} attempt(s)."
                             )
-                        if step >= max_steps:
+                        if max_steps is not None and step >= max_steps:
                             raise RuntimeError(
                                 "Structured output validation failed after "
                                 f"{structured_output_retries + 1} attempt(s): "
@@ -8186,7 +8358,7 @@ class SessionEngine:
                         )
                     if before_stop_decision is not None:
                         if before_stop_decision.action == BeforeStopAction.CONTINUE:
-                            if step >= max_steps:
+                            if max_steps is not None and step >= max_steps:
                                 async for event in self._stop_session_for_model_step_limit(
                                     session=outcome_state.session,
                                     registered_agent=registered_agent,
@@ -8930,7 +9102,18 @@ class SessionEngine:
                 if propagated_failure is not abandonment:
                     raise propagated_failure from None
                 raise
-            try:
+
+            async def finalize_closed_session() -> None:
+                deadline_expired = expired_execution_deadline() is not None
+                if deadline_expired and invocation_context.work_attempt is not None:
+                    if self.task_store is None:
+                        raise RuntimeError("Governed deadline stop requires its task store.")
+                    await record_work_attempt_execution_stop(
+                        self.task_store,
+                        admission=invocation_context.work_attempt.admission,
+                        reason="elapsed_limit",
+                        redactor=self._secret_redactor,
+                    )
                 await self._session_finalization.finalize_abandoned_session_run(
                     RecoveryAbandonedSessionRequest(
                         session=outcome_state.session,
@@ -8943,6 +9126,23 @@ class SessionEngine:
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
                     )
+                )
+                if deadline_expired and invocation_context.work_attempt is None:
+                    outcome_state.task_finished = (
+                        await self._session_tasks.fail_task_for_execution_deadline(
+                            task_id=task_id,
+                            task_worker_id=task_worker_id,
+                            task_handoff_id=task_handoff_id,
+                            session=outcome_state.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                        )
+                    ) or outcome_state.task_finished
+
+            try:
+                await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=abandonment,
+                    steps=(("closed session finalization", finalize_closed_session),),
                 )
             except Exception as finalization_failure:
                 _raise_primary_with_secondary_failure(
@@ -9141,13 +9341,15 @@ class SessionEngine:
         environment_name: str | None,
         messages: list[Message],
         step: int,
-        max_steps: int,
+        max_steps: int | None,
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if max_steps is None:
+            raise RuntimeError("An unlimited invocation cannot exhaust model steps.")
         usage_summary = await self._run_limit_controller.session_usage_summary(session.id)
         decision = StopDecision(
             limit=StopLimit.MODEL_STEPS,
@@ -9214,7 +9416,7 @@ class SessionEngine:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         step_result: AssistantStepResult,
         step: int,
-        max_steps: int,
+        max_steps: int | None,
         request_metadata: dict[str, Any],
         request_loop_policies: tuple[LoopPolicy, ...],
         invocation_context: InvocationContext | None = None,

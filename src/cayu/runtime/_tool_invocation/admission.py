@@ -1329,6 +1329,7 @@ class ToolInvocationAdmission:
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
             max_steps=max_steps,
+            max_steps_unbounded=True if max_steps is None else None,
             limits=copy_run_limits(limits) if limits is not None else None,
             run_limit_accounting=pause_run_limit_accounting_context(
                 pending_round.run_limit_accounting, now=self._clock()

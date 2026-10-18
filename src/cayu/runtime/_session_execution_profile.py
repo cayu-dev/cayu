@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from cayu._validation import (
     copy_json_value,
@@ -87,7 +87,7 @@ def _execution_profile_identity(
     causal_budget_id: str | None = None,
     structured_output: StructuredOutputSpec | None = None,
     thinking: ThinkingConfig | None = None,
-    max_steps: int | None = None,
+    max_steps: int | None,
     limits: RunLimits | None = None,
     retry_policy: RetryPolicy | None = None,
     finalization_material: dict[str, Any] | None = None,
@@ -103,8 +103,6 @@ def _execution_profile_identity(
         material = tool_completion.model_dump(mode="json")
         if redactor.redact_json(material) != material:
             raise ValueError("tool_completion names must be free of workload secrets.")
-    if finalization_material is None and max_steps is None:
-        raise ValueError("Execution profile requires resolved invocation max_steps.")
     runtime_identity = (
         SessionRuntimeIdentity(
             runtime_name="cayu",
@@ -178,7 +176,7 @@ def _execution_profile_identity(
         structured_output=_execution_profile_structured_output(structured_output),
         finalization=(
             execution_profile_admission.model_finalization_material(
-                max_steps=cast("int", max_steps),
+                max_steps=max_steps,
                 limits=copy_run_limits(limits),
                 retry_policy=copy_retry_policy(retry_policy),
                 tool_completion=tool_completion,

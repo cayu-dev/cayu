@@ -543,11 +543,20 @@ class PendingToolApproval(BaseModel):
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
+    max_steps_unbounded: Literal[True] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     limits: RunLimits | None = None
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_step_limit_authority(self):
+        if self.max_steps_unbounded is True and self.max_steps is not None:
+            raise ValueError("Unlimited-step authority cannot also carry a step cap.")
+        return self
 
     @field_validator("expires_at")
     @classmethod
@@ -1027,6 +1036,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         structured_output=copy_structured_output_spec(approval.structured_output),
         thinking=approval.thinking,
         max_steps=approval.max_steps,
+        max_steps_unbounded=approval.max_steps_unbounded,
         limits=copy_run_limits(approval.limits) if approval.limits is not None else None,
         run_limit_accounting=approval.run_limit_accounting,
         budget_limits=(

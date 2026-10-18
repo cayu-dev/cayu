@@ -950,6 +950,7 @@ class PendingToolRoundRecovery:
         expected_transcript_cursor: int | None = None,
         admit_replay: Callable[[ModelAttemptIdentity], Awaitable[bool]] | None = None,
         elect_replay: bool = False,
+        finish_up: bool = False,
     ) -> AsyncGenerator[Event, None]:
         """Repair one durable pending round strictly from recorded evidence.
 
@@ -1136,7 +1137,7 @@ class PendingToolRoundRecovery:
                 registered_environment=registered_environment,
                 messages=messages,
                 pending_round=pending_round,
-                retry_allowed=session.status == SessionStatus.RUNNING,
+                retry_allowed=session.status == SessionStatus.RUNNING and not finish_up,
                 expected_transcript_cursor=expected_transcript_cursor,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,

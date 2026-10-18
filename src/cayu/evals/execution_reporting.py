@@ -279,7 +279,7 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
         exposure_html = (
             "<p>Accepted maximum work: "
             f"{exposure.candidate_trials} candidate trial(s), "
-            f"{exposure.maximum_candidate_model_steps} candidate model step(s), "
+            f"{exposure.maximum_candidate_model_steps if exposure.maximum_candidate_model_steps is not None else 'unlimited'} candidate model step(s), "
             f"{_optional_maximum(exposure.maximum_candidate_total_tokens)} candidate token(s); "
             f"{exposure.judge_evaluations} judge evaluation(s), concurrency "
             f"{exposure.max_concurrency}, "

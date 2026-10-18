@@ -27,6 +27,15 @@ older claimants do not understand key exclusion.
   Recovery settles the recorded outcome without running sibling tools or another
   model step, and the task remains failed.
 
+Upgrade: Admitted runs that expire their execution deadline now end normally with
+`session.interrupted`, `reason="limit_reached"`, and `limit="execution_deadline"`.
+Read the terminal event instead of catching the expiry exception. Pre-admission
+expiry still raises `ExecutionDeadlineExceeded`. Task-backed runs have no implicit
+step cap; set `max_steps=64` explicitly to retain that bound. Applications can use
+`send_turn` to create or continue a conversation and await one result. Services
+whose task workers can be stopped mid-handler can settle the stranded tasks with
+`reconcile_abandoned_task_cancellation`.
+
 - Stop agent snapshot materializations from being reused across authority
   scopes. Two scopes that register the same snapshot content share a root, so a
   request with another scope's candidate and trial ids used to receive that
@@ -65,14 +74,16 @@ service credentials stay outside the guest. Existing native agents are unchanged
   and tasks, with usage, after-step budgets, deadlines, native approval/MCP
   bridges and joined process cleanup. See [external agents](external-agents.md).
 
-Upgrade: Existing streaming applications continue unchanged. Applications can use
-`send_turn` to create or continue a conversation and await one result. Services
-whose task workers can be stopped mid-handler can settle the stranded tasks with
-`reconcile_abandoned_task_cancellation`.
-
-- Raise `ExecutionDeadlineExceeded` with deadline diagnostics when a deadline
-  expires during a stream, matching expiry between steps. Cleanup still joins
-  before the exception escapes, and unrelated timeout errors keep their identity.
+- Make `max_steps=None` an explicit unlimited allowance and omit implicit step
+  caps for task-backed SDK runs. HTTP runs and product services retain the
+  configured application step cap (64 by default). Add `RunLimits(on_limit="finish")` to reserve one
+  structured-answer step near a time, cost, token, tool-call, or step limit;
+  ordinary tools are withdrawn and existing deadlines and budgets remain in force.
+  Limit interruptions report whether structured output is still pending. See
+  [Run limits and finishing](runtime-contracts.md#run-limits-and-finishing).
+- Normalize admitted execution-deadline expiry to the same terminal limit event.
+  Cleanup still joins before the iterator ends; lower-level deadline utilities
+  raise `ExecutionDeadlineExceeded`, and unrelated timeout errors keep their identity.
   A deadline a tool opens for its own work still fails only that tool call.
 - Add `send_turn` and `TurnRequest` for applications that create or continue a
   conversation and await one result. Creation races and session replacement
@@ -159,6 +170,10 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
 
 - Storage schema revision 124 requires all writers to understand restartable
   task policy and concurrency keys. Migrate with older processes stopped.
+- Task-backed runs no longer inherit the framework's 64-step cap. Explicit
+  request and application caps remain effective; `None` means unlimited.
+- Deadline expiry after run admission ends the iterator normally with a limit
+  interruption. Pre-admission expiry and deadline scopes still raise.
 
 ## v0.11.4
 

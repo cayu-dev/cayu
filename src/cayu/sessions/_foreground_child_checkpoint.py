@@ -165,7 +165,10 @@ class ForegroundParentContinuation(BaseModel):
             or self.request.tool_grants
             or self.request.tool_capability_ceiling is not None
             or self.request.loop_policies
-            or self.completed_model_step > self.request.max_steps
+            or (
+                self.request.max_steps is not None
+                and self.completed_model_step > self.request.max_steps
+            )
             or (
                 has_run_limit_accounting_authority(self.request.limits, self.request.budget_limits)
                 and self.run_limit_accounting is None
@@ -360,7 +363,11 @@ def gate_close_continuation(checkpoint, *, pending, publication_id, metadata):
     pending = post_action_continuation_round_from_checkpoint(checkpoint)
     if pending is None:
         raise SessionRunFenced("Gate closure lost its original round.")
-    if pending.max_steps is None or pending.limits is None or pending.budget_limits is None:
+    if (
+        (pending.max_steps is None and pending.max_steps_unbounded is not True)
+        or pending.limits is None
+        or pending.budget_limits is None
+    ):
         raise SessionRunFenced("Gate closure lacks original execution semantics.")
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     completed_model_step = pending.model_step if pending_input is None else pending_input.model_step

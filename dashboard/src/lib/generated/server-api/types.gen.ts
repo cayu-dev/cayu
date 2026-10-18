@@ -6161,7 +6161,7 @@ export type EvalExecutionResourceCeilingsV1 = {
     /**
      * Max Steps
      */
-    max_steps: number;
+    max_steps: number | null;
     /**
      * Max Timeout Seconds
      */
@@ -8318,7 +8318,7 @@ export type EvalSuiteRunExposureV1 = {
     /**
      * Maximum Candidate Model Steps
      */
-    maximum_candidate_model_steps: number;
+    maximum_candidate_model_steps: number | null;
     /**
      * Maximum Candidate Total Tokens
      */
@@ -8564,7 +8564,7 @@ export type EvalTargetCatalogEntry = {
     /**
      * Max Steps
      */
-    max_steps: number;
+    max_steps: number | null;
     /**
      * Max Timeout Seconds
      */
@@ -15242,7 +15242,7 @@ export type ResumeBody = {
     /**
      * Max Steps
      */
-    max_steps?: number;
+    max_steps?: number | null;
     profile_adoption?: ExecutionProfileAdoptionBody | null;
     /**
      * Prompt
@@ -15370,7 +15370,7 @@ export type RunBody = {
     /**
      * Max Steps
      */
-    max_steps?: number;
+    max_steps?: number | null;
     /**
      * Prompt
      */
@@ -15420,6 +15420,10 @@ export type RunInputSpec = {
  */
 export type RunLimits = {
     /**
+     * Finish Reserve Seconds
+     */
+    finish_reserve_seconds?: number;
+    /**
      * Max Elapsed Seconds
      */
     max_elapsed_seconds?: number | null;
@@ -15439,6 +15443,10 @@ export type RunLimits = {
      * Max Total Tokens
      */
     max_total_tokens?: number | null;
+    /**
+     * On Limit
+     */
+    on_limit?: 'interrupt' | 'finish';
     /**
      * Scope
      */
@@ -15892,7 +15900,7 @@ export type ScenarioLaunchBindingV2 = {
     /**
      * Max Steps
      */
-    max_steps: number;
+    max_steps: number | null;
     operator_run_limits?: RunLimits | null;
     /**
      * Revision
@@ -21643,6 +21651,10 @@ export type CreateEvalRunApiEvalsRunsPostData = {
         expected_execution_profile_revision: string;
         limits?: {
             /**
+             * Finish Reserve Seconds
+             */
+            finish_reserve_seconds?: number;
+            /**
              * Max Elapsed Seconds
              */
             max_elapsed_seconds?: number | null;
@@ -21662,6 +21674,10 @@ export type CreateEvalRunApiEvalsRunsPostData = {
              * Max Total Tokens
              */
             max_total_tokens?: number | null;
+            /**
+             * On Limit
+             */
+            on_limit?: 'interrupt' | 'finish';
             /**
              * Scope
              */

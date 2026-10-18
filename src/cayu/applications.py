@@ -352,6 +352,10 @@ from cayu.resource_access import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime._application_run_defaults import (
+    _RunConfigurationRequest,
+    with_application_run_defaults,
+)
 from cayu.runtime._assistant_model_publication import AssistantModelPublication
 from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
 from cayu.runtime._browser_control_runtime import BrowserControlRuntime
@@ -434,6 +438,11 @@ from cayu.runtime._recovery_admission import RecoveryAdmission
 from cayu.runtime._recovery_coordinator import RecoveryCoordinator
 from cayu.runtime._recovery_ownership import RecoveryOwnership
 from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
+from cayu.runtime._run_limit_stream import (
+    DeadlineOutcomeAdmission,
+    continuation_deadline_outcome,
+    deadline_outcome_stream,
+)
 from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
@@ -664,6 +673,7 @@ from cayu.sessions.requests import (
     RunRequest,
     copy_fork_session_request,
     copy_resume_request,
+    run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
@@ -781,14 +791,6 @@ RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
 
 _WorkerStepResult = TypeVar("_WorkerStepResult")
-
-_RunConfigurationRequest = TypeVar(
-    "_RunConfigurationRequest",
-    RunRequest,
-    ResumeRequest,
-    DispatchRequest,
-)
-
 
 if TYPE_CHECKING:
     from cayu.collaboration._contracts import OperationRef
@@ -6795,27 +6797,11 @@ class CayuApp:
         return copy_cayu_config(self._config)
 
     def _with_application_run_defaults(
-        self,
-        request: _RunConfigurationRequest,
+        self, request: _RunConfigurationRequest, session: Session | None = None
     ) -> _RunConfigurationRequest:
-        """Resolve omitted run controls once before admission or dispatch."""
-
-        updates: dict[str, object] = {}
-        fields_set = request.model_fields_set
-        if "max_steps" not in fields_set:
-            updates["max_steps"] = self._config.run.max_steps
-        if "limits" not in fields_set:
-            updates["limits"] = self._config.run.copy_limits()
-        if not updates:
-            return request
-        # Loop policies and other request collaborators can hold runtime
-        # objects that are intentionally not deepcopy-safe. The resolved
-        # configuration values above are already detached copies. Preserve the
-        # caller's explicit-field set so durable continuation can distinguish
-        # an inherited value from an explicit override.
-        resolved = request.model_copy(update=updates)
-        object.__setattr__(resolved, "__pydantic_fields_set__", set(fields_set))
-        return resolved
+        return with_application_run_defaults(
+            request, self._config, self._config_sources["run.max_steps"], session
+        )
 
     @_admitted_entrance
     @runtime_stream_entrance
@@ -7002,6 +6988,10 @@ class CayuApp:
         )
         boundary.require_admission("child_run" if parent is not None else "run")
         request = request.model_copy(update={"execution_deadline": boundary})
+        if request.session_id is None:
+            request = run_request_with_runtime_generated_authority(
+                request.model_copy(update={"session_id": str(uuid4())}), "session_id"
+            )
         from cayu.resource_access import current_binding, current_execution_labels, guard_stream
 
         binding = (
@@ -7014,7 +7004,6 @@ class CayuApp:
         if binding is not None:
             request = request.model_copy(
                 update={
-                    "session_id": request.session_id or str(uuid4()),
                     "labels": request.labels
                     or (
                         dict(parent.labels)
@@ -7025,6 +7014,7 @@ class CayuApp:
                     ),
                 }
             )
+        admission = DeadlineOutcomeAdmission()
         stream = self._session_engine.run(
             request=request,
             expected_execution_profile=expected_execution_profile,
@@ -7038,6 +7028,7 @@ class CayuApp:
             participant_permit_commitment=participant_permit_commitment,
             execution_to_wait=execution_to_wait,
             producer_output=producer_output,
+            on_admitted=admission.observe,
         )
         if binding is not None:
             stream = guard_stream(
@@ -7048,11 +7039,14 @@ class CayuApp:
                 store=self.session_store,
                 session_id=request.session_id,
             )
+        session_id = request.session_id
         del request
-        if boundary.expires_at is not None:
-            stream = deadline_stream(stream, boundary)
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
+        assert session_id is not None
+        outcome_stream = deadline_outcome_stream(
+            stream, boundary, session_id=session_id, store=self.session_store, admission=admission
+        )
+        async with _close_delegated_event_stream(outcome_stream) as owned_outcome:
+            async for item in owned_outcome:
                 yield item
 
     async def _require_participant_execution(
@@ -7116,21 +7110,24 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
-        request = self._with_application_run_defaults(request)
-        request = _validate_resume_request(request)
         stored = await self.session_store.load(request.session_id)
         require_native_session(stored, "resume")
+        request = self._with_application_run_defaults(request, stored)
+        request = _validate_resume_request(request)
         boundary = resumed_execution_deadline(
             stored.execution_deadline if stored is not None else ExecutionDeadline()
         )
         boundary.require_admission("resume")
+        admission = DeadlineOutcomeAdmission()
         stream = self._session_recovery.resume(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
             continuation_handoff=continuation_handoff,
             participant_context=participant_context,
             execution_to_wait=execution_to_wait,
+            on_admitted=admission.observe,
         )
+        session_id = request.session_id
         del request
         from cayu.resource_access import current_binding
 
@@ -7151,10 +7148,11 @@ class CayuApp:
                 store=self.session_store,
                 session_id=stored.id,
             )
-        if boundary.expires_at is not None:
-            stream = deadline_stream(stream, boundary)
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
+        outcome_stream = deadline_outcome_stream(
+            stream, boundary, session_id=session_id, store=self.session_store, admission=admission
+        )
+        async with _close_delegated_event_stream(outcome_stream) as owned_outcome:
+            async for item in owned_outcome:
                 yield item
 
     @_admitted_entrance
@@ -8016,7 +8014,6 @@ class CayuApp:
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
             raise TypeError("Runtime dispatch requires a DispatchRequest.")
-        request = self._with_application_run_defaults(request)
         request = copy_dispatch_request(request)
         if request.task_id is not None and self.task_store is None:
             raise RuntimeError("task_store is required when DispatchRequest.task_id is set.")
@@ -8026,6 +8023,7 @@ class CayuApp:
         # the worker that owns execution.
         private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
         stored = await self.session_store.load(private_session_id)
+        request = self._with_application_run_defaults(request, stored)
         if stored is not None:
             resumed_execution_deadline(stored.execution_deadline).require_admission("dispatch")
         (
@@ -8145,9 +8143,11 @@ class CayuApp:
     async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
-        request = self._with_application_run_defaults(request)
         session_id, store_resolved_session_id = await self._resolve_public_session_authority(
             request.session_id
+        )
+        request = self._with_application_run_defaults(
+            request, await self.session_store.load(session_id)
         )
         request = request.model_copy(update={"session_id": session_id}, deep=True)
         stream = self._dispatch_inline_private(
@@ -8997,26 +8997,6 @@ class CayuApp:
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
 
-    async def _prepare_continuation_recovery_authority(
-        self,
-        *,
-        session_id: str,
-        task_worker_id: str | None,
-        task_handoff_id: str | None,
-        allow_terminal_failure_replay: bool = False,
-        allow_deadline_settlement: bool = False,
-        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
-    ) -> tuple[str | None, str | None, tuple[Event, ...] | None]:
-        return await self._session_tasks.prepare_continuation_recovery_authority(
-            require_ordinary_execution=self._require_ordinary_recovery_execution,
-            session_id=session_id,
-            task_worker_id=task_worker_id,
-            task_handoff_id=task_handoff_id,
-            allow_terminal_failure_replay=allow_terminal_failure_replay,
-            allow_deadline_settlement=allow_deadline_settlement,
-            approval_failure_identity=approval_failure_identity,
-        )
-
     async def _require_continuation_recovery_execution(
         self,
         *,
@@ -9102,7 +9082,8 @@ class CayuApp:
             task_id,
             task_session_instance_id,
             replay_events,
-        ) = await self._prepare_continuation_recovery_authority(
+        ) = await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=response.session_id,
             task_worker_id=response.task_worker_id,
             task_handoff_id=response.task_handoff_id,
@@ -9119,7 +9100,9 @@ class CayuApp:
         session_id = response.session_id
         task_worker_id = response.task_worker_id
         task_handoff_id = response.task_handoff_id
+        admission = DeadlineOutcomeAdmission()
         stream = self._recovery_coordinator.resolve_user_input(
+            on_admitted=admission.observe,
             response=response,
             participant_context=participant_context,
             before_mutation=lambda: self._require_continuation_recovery_execution(
@@ -9145,6 +9128,9 @@ class CayuApp:
         )
         del response
         stream = await self._resource_session_stream.restore(stream, session_id)
+        stream = continuation_deadline_outcome(
+            stream, self.session_store, session, admission=admission
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -9210,7 +9196,8 @@ class CayuApp:
             task_id,
             task_session_instance_id,
             replay_events,
-        ) = await self._prepare_continuation_recovery_authority(
+        ) = await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
@@ -9321,7 +9308,8 @@ class CayuApp:
             task_id,
             task_session_instance_id,
             replay_events,
-        ) = await self._prepare_continuation_recovery_authority(
+        ) = await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
@@ -9422,7 +9410,8 @@ class CayuApp:
             task_id,
             task_session_instance_id,
             replay_events,
-        ) = await self._prepare_continuation_recovery_authority(
+        ) = await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
@@ -9443,7 +9432,9 @@ class CayuApp:
         session_id = request.session_id
         task_worker_id = request.task_worker_id
         task_handoff_id = request.task_handoff_id
+        admission = DeadlineOutcomeAdmission()
         stream = self._recovery_coordinator.resolve_tool_approval(
+            on_admitted=admission.observe,
             request=request,
             participant_context=participant_context,
             task_id=task_id,
@@ -9472,6 +9463,9 @@ class CayuApp:
         )
         del request
         stream = await self._resource_session_stream.restore(stream, session_id)
+        stream = continuation_deadline_outcome(
+            stream, self.session_store, session, admission=admission
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -9534,7 +9528,8 @@ class CayuApp:
             task_id,
             task_session_instance_id,
             replay_events,
-        ) = await self._prepare_continuation_recovery_authority(
+        ) = await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
@@ -9794,7 +9789,8 @@ class CayuApp:
             task_id,
             task_session_instance_id,
             replay_events,
-        ) = await self._prepare_continuation_recovery_authority(
+        ) = await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,

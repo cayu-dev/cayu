@@ -1251,7 +1251,9 @@ class SessionRecovery:
             self.session_store,
             wait.parent_effect.session_id,
         )
-        if pending is None or pending.max_steps is None:
+        if pending is None or (
+            pending.max_steps is None and pending.max_steps_unbounded is not True
+        ):
             raise RuntimeError("Foreground continuation lacks its original pending round.")
         if pending.tool_round_id != wait.parent_effect.tool_round_id:
             raise RuntimeError("Foreground continuation conflicts with its original tool round.")
@@ -1323,6 +1325,7 @@ class SessionRecovery:
         continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
     ) -> AsyncGenerator[Event, None]:
         preparation = await self._engine.prepare_resume(
             request=request,
@@ -1359,7 +1362,7 @@ class SessionRecovery:
         )
         for event in recovery_events:
             yield event
-        stream = self._engine.resume(preparation)
+        stream = self._engine.resume(preparation, on_admitted=on_admitted)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -1372,6 +1375,7 @@ class SessionRecovery:
         continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_resume_request(
             request,
@@ -1434,6 +1438,7 @@ class SessionRecovery:
             start_task_on_enter=False,
             continuation_handoff=continuation_handoff,
             execution_to_wait=execution_to_wait,
+            on_admitted=on_admitted,
         )
         session_id = request.session_id
         del request

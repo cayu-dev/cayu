@@ -528,7 +528,10 @@ def _build_tool_round_publication_request(
             copied_source_checkpoint[FOREGROUND_CHILD_TERMINAL_KEY]
         )
         if (
-            copied_pending_round.max_steps is None
+            (
+                copied_pending_round.max_steps is None
+                and copied_pending_round.max_steps_unbounded is not True
+            )
             or copied_pending_round.limits is None
             or copied_pending_round.budget_limits is None
             or copied_pending_round.model_step is None

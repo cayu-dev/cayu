@@ -60,7 +60,7 @@ class RunDefaults(BaseModel):
 
     model_config = _CONFIG_MODEL
 
-    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
     thinking: ThinkingConfig | None = None

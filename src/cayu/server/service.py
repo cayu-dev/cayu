@@ -1095,6 +1095,7 @@ class CayuService:
                         messages=[Message.text("user", operation.request_text)],
                         session_id=operation.session_id,
                         task_id=operation.task_id,
+                        max_steps=self.cayu_app.config.run.max_steps,
                         execution_deadline=ExecutionDeadline.after(
                             self.execution_timeout_s, source="product_service"
                         ),
@@ -1143,6 +1144,13 @@ async def _settle_product_run_outcome(
     recovery_status: ProductRecoveryStatus | None,
 ) -> ProductOperation:
     if outcome_status is SessionStatus.INTERRUPTED:
+        terminal = await _reconcile_terminal_product_work(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+        )
+        if terminal is not None:
+            return terminal
         await _record_product_recovery_status(
             service=service,
             operation=operation,

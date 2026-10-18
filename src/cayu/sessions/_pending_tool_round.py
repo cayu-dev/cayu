@@ -90,6 +90,9 @@ class PendingToolRound(BaseModel):
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
+    max_steps_unbounded: Literal[True] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     limits: RunLimits | None = None
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -116,6 +119,12 @@ class PendingToolRound(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     structured_output_validation: StructuredOutputValidation | None = None
+
+    @model_validator(mode="after")
+    def validate_step_limit_authority(self):
+        if self.max_steps_unbounded is True and self.max_steps is not None:
+            raise ValueError("Unlimited-step authority cannot also carry a step cap.")
+        return self
 
     @field_validator("agent_name")
     @classmethod

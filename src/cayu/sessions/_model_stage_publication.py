@@ -382,7 +382,7 @@ def _validate_assistant_model_completion_publication(
     }
     marker_keys = set(marker)
     if not required_marker_keys <= marker_keys or not marker_keys <= (
-        required_marker_keys | {"assistant_publication", "tool_exposure"}
+        required_marker_keys | {"assistant_publication", "tool_exposure", "max_steps_unbounded"}
     ):
         raise ValueError("The model-step pending tool-round marker has invalid fields.")
     raw_run_limit_accounting = marker.get("run_limit_accounting")

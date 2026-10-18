@@ -579,6 +579,7 @@ def resumed_event(
         agent_name=agent_name,
         environment_name=environment_name,
         payload={
+            "run_epoch": session.run_epoch,
             "model_step_id": approval.model_step_id,
             "model_attempt_id": approval.model_attempt_id,
             "tool_round_id": approval.tool_round_id,

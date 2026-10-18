@@ -445,7 +445,7 @@ class EvalSuiteRunExposureV1(_PortablePolicyModel):
     candidate_trials: StrictInt = Field(ge=1, le=100_000)
     judge_evaluations: StrictInt = Field(ge=0, le=6_400_000)
     max_concurrency: StrictInt = Field(ge=1, le=EVAL_SUITE_MAX_CONCURRENCY)
-    maximum_candidate_model_steps: StrictInt = Field(ge=1)
+    maximum_candidate_model_steps: StrictInt | None = Field(ge=1)
     maximum_candidate_total_tokens: StrictInt | None = Field(default=None, ge=1)
     maximum_judge_input_tokens: StrictInt | None = Field(default=None, ge=0)
     maximum_judge_output_tokens: StrictInt | None = Field(default=None, ge=0)
@@ -510,7 +510,10 @@ class EvalSuiteRunExposureV1(_PortablePolicyModel):
     def validate_contract(self) -> EvalSuiteRunExposureV1:
         if self.candidate_cost.state == "not_applicable":
             raise ValueError("Candidate work requires a maximum-cost exposure state.")
-        if self.maximum_candidate_model_steps < self.candidate_trials:
+        if (
+            self.maximum_candidate_model_steps is not None
+            and self.maximum_candidate_model_steps < self.candidate_trials
+        ):
             raise ValueError("Candidate model-step exposure is smaller than candidate trials.")
         judge_token_maxima = (
             self.maximum_judge_input_tokens,

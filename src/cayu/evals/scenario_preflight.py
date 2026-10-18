@@ -280,7 +280,7 @@ class ScenarioLaunchBindingV2(_ScenarioPreflightModel):
     trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
-    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(ge=1, le=MAX_STEPS)
     target_limits: RunLimits
     operator_run_limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
@@ -531,7 +531,11 @@ async def preflight_eval_scenario(
         selected.trials > target.limits.max_trials
         or selected.max_concurrency > target.limits.max_concurrency
         or selected.timeout_seconds > target.limits.max_timeout_seconds
-        or (selected.max_steps is not None and selected.max_steps > target.request_base.max_steps)
+        or (
+            selected.max_steps is not None
+            and target.request_base.max_steps is not None
+            and selected.max_steps > target.request_base.max_steps
+        )
         or _requested_limits_broaden(target.request_base.limits, selected.limits)
     ):
         diagnostics.append(_diagnostic(ScenarioLaunchDiagnosticCode.EXECUTION_LIMIT_EXCEEDED))

@@ -1340,6 +1340,7 @@ class SessionCompaction:
 
         def current_compaction_profile_candidate() -> ExecutionProfileIdentity:
             candidate = _session_execution_profile._execution_profile_identity(
+                max_steps=None,
                 registered_agent=registered_agent,
                 provider_name=loaded_session.provider_name,
                 registered_provider=registered_provider,

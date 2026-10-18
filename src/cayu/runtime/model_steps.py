@@ -11,6 +11,7 @@ from cayu.execution_units import (
 from cayu.messages import Message, MessageRole, ProviderStatePart, TextPart, ThinkingPart
 from cayu.providers import ModelCompletion, ModelFinishReason
 from cayu.runtime._runtime_records import ToolCallRequest
+from cayu.runtime.stop_policy import StopDecision
 
 
 class StepClassificationType(StrEnum):
@@ -37,6 +38,7 @@ class AssistantStepResult:
     has_user_visible_content: bool
     provider_state_count: int
     thinking_count: int = 0
+    finish_limit: StopDecision | None = None
 
     def __post_init__(self) -> None:
         ModelAttemptIdentity(

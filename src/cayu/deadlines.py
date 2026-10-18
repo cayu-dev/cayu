@@ -238,9 +238,24 @@ async def deadline_stream(
         while True:
             async with execution_deadline_scope(deadline):
                 try:
+                    if current_execution_deadline().expired:
+                        # Let the owned timer deliver before advancing a
+                        # producer that may yield without suspending.
+                        await asyncio.sleep(0)
+                        current_execution_deadline().require_admission("execution")
                     item = await anext(iterator)
+                    if current_execution_deadline().expired:
+                        await asyncio.sleep(0)
+                        current_execution_deadline().require_admission("execution_completion")
                 except StopAsyncIteration:
                     return
+                except BaseException:
+                    # Producer cleanup classifies an owned deadline while its
+                    # timer is still live, including expiry between phases.
+                    close = getattr(iterator, "aclose", None)
+                    if close is not None:
+                        await close()
+                    raise
             yield item
     finally:
         close = getattr(iterator, "aclose", None)

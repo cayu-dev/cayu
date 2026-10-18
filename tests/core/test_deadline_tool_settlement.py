@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.core.test_run_limit_finish import spec as structured_spec
 from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_task_reconciliation import (
     _TaskSessionStore,
@@ -39,7 +40,7 @@ from cayu.tools.user_input import UserInputTool
 
 
 @pytest.mark.store_semantics
-@pytest.mark.parametrize("expiry", ["run", "before_recovery", "during_recovery"])
+@pytest.mark.parametrize("expiry", ["run", "before_recovery", "during_recovery", "continuation"])
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("worker", [None, "worker"])
 @pytest.mark.parametrize(
@@ -52,9 +53,34 @@ from cayu.tools.user_input import UserInputTool
     ],
 )
 def test_deadline_failure_retains_exact_settlement_authority(
-    backend, worker, gate, manual_attempt, tmp_path, expiry
+    backend, worker, gate, manual_attempt, tmp_path, expiry, monkeypatch, structured=False
 ):
+    import cayu.deadlines as deadline_module
+
     async def scenario():
+        advance = timedelta()
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(tz) + advance
+
+        monkeypatch.setattr(deadline_module, "datetime", Clock)
+
+        async def expire_active_timer():
+            nonlocal advance
+            # Trigger the real owned timer at the phase under test. Setup and
+            # store latency must not expire a different phase first.
+            advance = timedelta(seconds=601)
+            timers = [
+                timer
+                for timer, selected in deadline_module._TIMERS.get()
+                if selected.expires_at == boundary.expires_at and timer.when() is not None
+            ]
+            assert timers
+            timers[-1].reschedule(asyncio.get_running_loop().time())
+            await asyncio.Event().wait()
+
         store = (
             _TaskSessionStore()
             if backend == "memory"
@@ -72,14 +98,15 @@ def test_deadline_failure_retains_exact_settlement_authority(
                 calls.append(ctx.idempotency_key)
                 if expiry != "run":
                     raise ConnectionError("external acknowledgement lost")
-                await asyncio.Event().wait()
+                await expire_active_timer()
                 return ToolResult(content="unreachable")
 
         class Reconciler:
             async def reconcile(self, *, context, receipt):
+                nonlocal advance
                 lookups.append(context.idempotency_key)
                 if expiry == "during_recovery":
-                    await asyncio.sleep((boundary.remaining_seconds() or 0) + 0.02)
+                    advance = timedelta(seconds=601)
                 return ToolEffectReconciliationResult(
                     outcome="completed",
                     observation="sent",
@@ -107,7 +134,16 @@ def test_deadline_failure_retains_exact_settlement_authority(
                     arguments={"question": "Proceed?"},
                 ),
             )
-        provider = _SequencedProvider([response])
+
+        class Provider(_SequencedProvider):
+            async def stream(self, request):
+                if expiry == "continuation" and self.requests:
+                    self.requests.append(request)
+                    await expire_active_timer()
+                async for event in super().stream(request):
+                    yield event
+
+        provider = Provider([response])
         app = CayuApp(session_store=store, task_store=tasks, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(
@@ -127,11 +163,12 @@ def test_deadline_failure_retains_exact_settlement_authority(
                 task = await tasks.claim_task(worker, lease_seconds=30)
             events = []
             input_response = None
-            boundary = ExecutionDeadline.after(3)
+            boundary = ExecutionDeadline.after(600)
             try:
                 async for event in app.run(
                     RunRequest(
                         session_id="deadline-settlement",
+                        structured_output=structured_spec("tool") if structured else None,
                         agent_name="agent",
                         task_id=task.id,
                         task_worker_id=worker,
@@ -182,7 +219,7 @@ def test_deadline_failure_retains_exact_settlement_authority(
             else:
                 assert failed.status is TaskStatus.RUNNING
                 if expiry == "before_recovery":
-                    await asyncio.sleep((boundary.remaining_seconds() or 0) + 0.02)
+                    advance = timedelta(seconds=601)
             session = await store.load("deadline-settlement")
             assert session.status is SessionStatus.INTERRUPTED
             started = next(
@@ -246,14 +283,19 @@ def test_deadline_failure_retains_exact_settlement_authority(
             settled = [event async for event in entrance(action)]
             assert any(event.type is EventType.TOOL_CALL_COMPLETED for event in settled)
             assert settled[-1].type is EventType.SESSION_INTERRUPTED
-            assert settled[-1].payload["deadline_settlement_only"] is True
+            if expiry == "continuation":
+                assert settled[-1].payload["limit"] == "execution_deadline"
+            else:
+                assert settled[-1].payload["deadline_settlement_only"] is True
+            assert settled[-1].payload["structured_output_pending"] is structured
             current_task = await tasks.load_task(task.id)
             assert current_task.status is TaskStatus.FAILED
             assert current_task.error["error"] == "ExecutionDeadlineExceeded"
             if expiry == "run":
                 assert current_task == failed
             assert (await store.load(session.id)).status is SessionStatus.INTERRUPTED
-            assert len(calls) == len(provider.requests) == 1
+            expected_requests = 2 if expiry == "continuation" else 1
+            assert len(calls) == 1 and len(provider.requests) == expected_requests
             assert lookups == calls
             with pytest.raises((TaskClaimLost, ExecutionDeadlineExceeded)):
                 _ = [
@@ -266,8 +308,21 @@ def test_deadline_failure_retains_exact_settlement_authority(
                         )
                     )
                 ]
-            assert len(provider.requests) == 1
+            assert len(provider.requests) == expected_requests
         finally:
             await app.aclose()
 
     asyncio.run(scenario())
+
+
+def test_expired_structured_task_receipt_retains_pending_output_status(tmp_path, monkeypatch):
+    test_deadline_failure_retains_exact_settlement_authority(
+        "memory",
+        None,
+        "ordinary",
+        False,
+        tmp_path,
+        "before_recovery",
+        monkeypatch,
+        structured=True,
+    )

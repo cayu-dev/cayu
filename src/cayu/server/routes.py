@@ -1808,7 +1808,7 @@ class RunBody(_BoundedControlPlanePromptBody):
     failover: ModelFailoverPolicy | None = None
     causal_budget_id: NonBlankString | None = None
     labels: dict[str, str] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -1851,7 +1851,7 @@ class ResumeBody(_BoundedControlPlanePromptBody):
     prompt: NonBlankString
     profile_adoption: ExecutionProfileAdoptionBody | None = None
     failover: ModelFailoverPolicy | None = None
-    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -5592,11 +5592,14 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             tool_completion=body.tool_completion,
+            max_steps=(
+                body.max_steps
+                if "max_steps" in body.model_fields_set
+                else cayu_app.config.run.max_steps
+            ),
             metadata=trace_metadata,
         )
         run_default_overrides: dict[str, object] = {}
-        if "max_steps" in body.model_fields_set:
-            run_default_overrides["max_steps"] = body.max_steps
         if "limits" in body.model_fields_set:
             run_default_overrides["limits"] = body.limits
         if "thinking" in body.model_fields_set:

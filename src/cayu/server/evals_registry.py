@@ -106,6 +106,8 @@ def _narrow_run_limits(current: RunLimits, requested: RunLimits | None) -> RunLi
         # measure the same initial invocation. The persisted operator ceilings
         # deliberately use run scope and cannot broaden a target base limit.
         scope="run",
+        on_limit=current.on_limit,
+        finish_reserve_seconds=current.finish_reserve_seconds,
     )
 
 
@@ -201,11 +203,7 @@ def target_for_eval_invocation(
     request = request.model_copy(
         update={
             "environment_name": scenario_environment or request.environment_name,
-            "max_steps": (
-                request.max_steps
-                if invocation.max_steps is None
-                else min(request.max_steps, invocation.max_steps)
-            ),
+            "max_steps": _narrow_optional_limit(request.max_steps, invocation.max_steps),
             "limits": _narrow_run_limits(request.limits, invocation.limits),
             "budget_limits": budget_limits,
         }

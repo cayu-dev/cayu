@@ -8948,8 +8948,7 @@ def test_deadline_failed_task_allows_provider_failure_settlement_only(
             if worker_owned:
                 await run_task_worker(app, store, handler, worker_id="original", max_tasks=1)
             else:
-                with pytest.raises(TimeoutError):
-                    await handler(app, task)
+                await handler(app, task)
             failed = await store.load_task(task.id)
             assert failed.status is TaskStatus.FAILED
             assert failed.error["error"] == "ExecutionDeadlineExceeded"

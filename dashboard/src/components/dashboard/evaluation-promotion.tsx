@@ -858,7 +858,7 @@ function FreshExecutionEditor({
             label="Max model steps per trial"
             id="promotion-max-steps"
             value={draft.maxSteps}
-            maximum={target?.max_steps}
+            maximum={target?.max_steps ?? undefined}
             optional
             onChange={(value) => update("maxSteps", value)}
           />
@@ -981,7 +981,7 @@ function validateFreshExecution(
     const maxSteps = optionalFreshExecutionInteger(
       draft.maxSteps,
       "Max model steps per trial",
-      target.max_steps,
+      target.max_steps ?? MAX_SAFE_RUNTIME_LIMIT,
     )
     const maxTotalTokens = optionalFreshExecutionInteger(
       draft.maxTotalTokens,

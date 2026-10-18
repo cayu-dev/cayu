@@ -2350,9 +2350,9 @@ def _require_browser_acceptance_execution_limits(plan: BrowserAcceptancePlanV1) 
             raise ValueError("Browser acceptance tool limits exceed the manifest ceilings.")
         request = eval_case.request
         run_limits = request.limits
-        maximum_model_steps += request.max_steps * plan.manifest.trial_count
-        if request.max_steps > limits.max_model_steps:
+        if request.max_steps is None or request.max_steps > limits.max_model_steps:
             raise ValueError("Browser acceptance request exceeds the model-step ceiling.")
+        maximum_model_steps += request.max_steps * plan.manifest.trial_count
         if (
             run_limits.max_tool_calls is None
             or run_limits.max_tool_calls > limits.max_browser_operations

@@ -143,15 +143,15 @@ class ExecutionProfileContinuationPlan:
 
 def model_finalization_material(
     *,
-    max_steps: int,
+    max_steps: int | None,
     limits: RunLimits,
     retry_policy: RetryPolicy,
     tool_completion: ToolCompletionPolicy | None = None,
 ) -> dict[str, Any]:
     """Return the versioned structural identity for model-loop finalization."""
 
-    if type(max_steps) is not int:
-        raise TypeError("max_steps must be an integer.")
+    if max_steps is not None and type(max_steps) is not int:
+        raise TypeError("max_steps must be an integer or None.")
     if type(limits) is not RunLimits:
         raise TypeError("limits must be a RunLimits instance.")
     if type(retry_policy) is not RetryPolicy:

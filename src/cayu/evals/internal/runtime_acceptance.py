@@ -627,7 +627,7 @@ def _request(
     session_slug: str,
     prompt: str,
     *,
-    max_steps: int,
+    max_steps: int | None,
     budget_limits: tuple[BudgetLimit, ...] = (),
 ) -> RunRequest:
     return RunRequest(

@@ -43,6 +43,8 @@ class EffectiveRunLimits(BaseModel):
     max_tool_calls: StrictInt | None = None
     max_elapsed_seconds: StrictInt | None = None
     scope: Literal["session", "run"] = "run"
+    on_limit: Literal["interrupt", "finish"] = "interrupt"
+    finish_reserve_seconds: StrictInt = 30
 
 
 class EffectiveRunConfiguration(BaseModel):
@@ -55,7 +57,7 @@ class EffectiveRunConfiguration(BaseModel):
 
     model_config = _INSPECTION_MODEL
 
-    max_steps: EffectiveConfigurationField[StrictInt]
+    max_steps: EffectiveConfigurationField[StrictInt | None]
     limits: EffectiveConfigurationField[EffectiveRunLimits]
     retry_policy: EffectiveConfigurationField[RetryPolicy]
     thinking: EffectiveConfigurationField[ThinkingConfig | None]

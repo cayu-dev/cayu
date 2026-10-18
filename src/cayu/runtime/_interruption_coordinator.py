@@ -53,6 +53,7 @@ from cayu.runtime._session_control import (
 )
 from cayu.sessions._invocation_scope import _deactivate_session_run_fence
 from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_LIMIT_REACHED,
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     interruption_request_id_from_payload,
@@ -1329,6 +1330,7 @@ class BackgroundInterruptionCoordinator:
                 raise ValueError("Provider cancellation diagnostics cannot be empty.")
             interruption_type = payload.get("interruption_type")
             if type(interruption_type) is not str or interruption_type not in (
+                _INTERRUPTION_TYPE_LIMIT_REACHED,
                 _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
                 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
             ):

@@ -2449,7 +2449,10 @@ def _prepare_external_private_memory_ablation_validated(
             raise ValueError("Trial timeout differs from the immutable suite timeout.")
         if request.timeout_seconds > copied_authorization.maximum_timeout_seconds:
             raise ValueError("Trial timeout exceeds the authorized ceiling.")
-        if request.run_request.max_steps > copied_authorization.maximum_model_steps:
+        if (
+            request.run_request.max_steps is None
+            or request.run_request.max_steps > copied_authorization.maximum_model_steps
+        ):
             raise ValueError("Trial model-step limit exceeds the authorized ceiling.")
         if (
             copied_authorization.maximum_total_tokens_per_trial is not None

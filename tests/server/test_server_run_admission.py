@@ -638,7 +638,7 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
         list(response.iter_lines())
 
     assert captured == [DEFAULT_MAX_STEPS, 7]
-    assert captured_explicitness == [False, True]
+    assert captured_explicitness == [True, True]
     assert captured_targets == [
         None,
         ModelTarget(provider_name="fake", model="request-model"),

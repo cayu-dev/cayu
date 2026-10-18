@@ -7,7 +7,7 @@ import hmac
 from collections.abc import Callable
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, cast
+from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_value
 from cayu.approvals.tools import ResolutionActor
@@ -592,8 +592,6 @@ class ExecutionProfileContinuation:
         additional_profile_fingerprints: tuple[str, ...] = (),
         tool_completion: ToolCompletionPolicy | None = None,
     ) -> tuple[execution_profile_admission.ExecutionProfileContinuationPlan, Any]:
-        if invocation_semantics_available and max_steps is None:
-            raise ValueError("Recovery requires recorded invocation max_steps.")
         active_model_completion = await self._session_store.load_active_model_completion_stage(
             session.id
         )
@@ -651,7 +649,7 @@ class ExecutionProfileContinuation:
                 session,
                 checkpoint,
                 execution_profile=recorded_profile.profile,
-                max_steps=cast("int", max_steps),
+                max_steps=max_steps,
                 limits=copy_run_limits(limits),
                 retry_policy=copy_retry_policy(retry_policy),
                 context=model_completion_context,
@@ -705,7 +703,7 @@ class ExecutionProfileContinuation:
             structured_output=_execution_profile_structured_output(structured_output),
             finalization=(
                 execution_profile_admission.model_finalization_material(
-                    max_steps=cast("int", max_steps),
+                    max_steps=max_steps,
                     limits=copy_run_limits(limits),
                     retry_policy=copy_retry_policy(retry_policy),
                     tool_completion=tool_completion,

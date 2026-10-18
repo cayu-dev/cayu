@@ -429,6 +429,7 @@ def checkpoint_with_pending_tool_round(
     structured_output: StructuredOutputSpec | None = None,
     thinking: ThinkingConfig | None = None,
     max_steps: int | None = None,
+    max_steps_unbounded: bool = False,
     limits: RunLimits | None = None,
     run_limit_accounting: RunLimitAccountingContext | None = None,
     budget_limits: tuple[BudgetLimit, ...] | None = None,
@@ -529,6 +530,7 @@ def checkpoint_with_pending_tool_round(
         structured_output=copy_structured_output_spec(structured_output),
         thinking=thinking,
         max_steps=max_steps,
+        max_steps_unbounded=True if max_steps_unbounded else None,
         limits=copy_run_limits(limits) if limits is not None else None,
         run_limit_accounting=run_limit_accounting,
         budget_limits=(

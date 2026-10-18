@@ -101,6 +101,7 @@ def planned_tool_round_from_pending_approval(
         structured_output=approval.structured_output,
         thinking=approval.thinking,
         max_steps=approval.max_steps,
+        max_steps_unbounded=approval.max_steps_unbounded,
         limits=approval.limits,
         run_limit_accounting=approval.run_limit_accounting,
         budget_limits=approval.budget_limits,

@@ -49,7 +49,7 @@ export function scenarioLaunchSettingsContract(
   const timeoutSeconds = Number(settings.timeoutSeconds)
   const maxSteps = optionalPositiveInteger(
     settings.maxSteps,
-    Math.min(target.max_steps, MAX_SAFE_SCENARIO_RUNTIME_LIMIT),
+    Math.min(target.max_steps ?? MAX_SAFE_SCENARIO_RUNTIME_LIMIT, MAX_SAFE_SCENARIO_RUNTIME_LIMIT),
   )
   const maxTotalTokens = optionalPositiveInteger(
     settings.maxTotalTokens,

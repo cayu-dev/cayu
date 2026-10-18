@@ -1207,6 +1207,21 @@ class ModelStepExecutor:
             if tool_exposure is None
             else _require_frozen_tool_exposure(tool_exposure)
         )
+        finishing = resolved_tool_exposure.profile_id == _LIMIT_FINISH_TOOL_EXPOSURE_PROFILE_ID
+        if finishing:
+            context_messages = _finish_request_messages(context_messages)
+            context_messages.append(
+                Message.text(
+                    "system",
+                    "Runtime limit approaching. This is your final model step. "
+                    "Ordinary tools are withdrawn. Return the requested structured answer "
+                    "now using only the information already available. State any uncertainty "
+                    "in the answer. The original deadline and budgets still apply.",
+                )
+            )
+            targeted_tool_projection_kind = None
+            tool_discovery_projection_kind = None
+            tool_discovery_native_tool_names = ()
         model_tools, callable_tool_names = _dispatched_model_tools(
             registered_agent=registered_agent,
             tool_exposure=resolved_tool_exposure,
@@ -1237,7 +1252,7 @@ class ModelStepExecutor:
         if registered_agent.tool_discovery_mode is None:
             if tool_discovery_projection_kind is not None:
                 raise RuntimeError("A discovery projection requires configured tool discovery.")
-        elif tool_discovery_projection_kind is None:
+        elif tool_discovery_projection_kind is None and not finishing:
             raise RuntimeError("Configured tool discovery requires a resolved projection.")
         discovery_native_tool_names = tuple(
             () if tool_discovery_native_tool_names is None else tool_discovery_native_tool_names
@@ -1328,6 +1343,13 @@ class ModelStepExecutor:
         )
         if type(provider_options) is not dict:
             raise AssertionError("Agent provider options copied as a non-object.")
+        if finishing:
+            # The final request owns its remaining output mechanism. A forced
+            # ordinary tool (or a blanket prohibition) must not survive withdrawal.
+            for protocol_options in provider_options.values():
+                if type(protocol_options) is dict:
+                    protocol_options.pop("tool_choice", None)
+                    protocol_options.pop("function_call", None)
         agent_metadata = deepcopy(registered_agent.spec.metadata)
         environment_metadata = (
             deepcopy(registered_environment.spec.metadata)
@@ -1458,7 +1480,7 @@ class ModelStepExecutor:
             model=effective_model,
             messages=redacted_messages,
             tools=redacted_tools,
-            hosted_tools=registered_agent.hosted_tools,
+            hosted_tools=() if finishing else registered_agent.hosted_tools,
             targeted_tool_projection=redacted_targeted_tool_projection,
             tool_discovery_projection=(
                 ToolDiscoveryProjectionRequest(loaded_tools=discovery_native_tools)
@@ -2429,6 +2451,9 @@ class ModelStepExecutor:
         await self._session_control.raise_if_interrupted(session_id)
 
 
+_LIMIT_FINISH_TOOL_EXPOSURE_PROFILE_ID = "cayu:limit-finish:v1"
+
+
 @dataclass(frozen=True)
 class _TargetedToolModelProjection:
     """Request-local rendering and evidence from one authenticated grant read."""
@@ -2884,6 +2909,7 @@ class ModelStepRun:
         source_transcript_cursor: int,
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
+        finish_up: bool = False,
     ) -> AsyncGenerator[tuple[Event | None, ModelStepFlowOutcome | None], None]:
         task = asyncio.current_task()
         cancellation_baseline = 0 if task is None else task.cancelling()
@@ -2897,6 +2923,7 @@ class ModelStepRun:
                 model_step_identity=model_step_identity,
                 request_variant=request_variant,
                 fallback=fallback,
+                finish_up=finish_up,
             )
             exhausted: _ModelFailoverCandidateExhausted | None = None
             try:
@@ -3072,6 +3099,7 @@ class ModelStepRun:
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant,
         fallback: ModelFailoverTransition | None,
+        finish_up: bool = False,
     ) -> AsyncGenerator[tuple[Event | None, ModelStepFlowOutcome | None], None]:
         if self._registered_environment is not None:
             if self._invocation_context is None or self._execution_profile is None:
@@ -3095,7 +3123,20 @@ class ModelStepRun:
             step=step,
             transcript_cursor=source_transcript_cursor,
         )
-        targeted_projection = await self._targeted_tool_projections()
+        targeted_projection_kind = None if finish_up else self._targeted_tool_projection_kind
+        discovery_projection_kind = None if finish_up else self._tool_discovery_projection_kind
+        if finish_up:
+            messages = _finish_request_messages(messages)
+            tool_exposure = ResolvedToolExposure(
+                profile_id=_LIMIT_FINISH_TOOL_EXPOSURE_PROFILE_ID,
+                catalogue_revision=self._registered_agent.tool_catalogue.revision,
+                tools=(),
+                registered_count=len(self._registered_agent.tool_capabilities),
+                ceiling_count=len(self._tool_capability_ceiling.tool_names),
+            )
+        targeted_projection = (
+            _TargetedToolModelProjection() if finish_up else await self._targeted_tool_projections()
+        )
         targeted_tool_gateway = targeted_projection.gateway
         targeted_tool_native = targeted_projection.native
         targeted_tool_native_grant_ids = targeted_projection.native_grant_ids
@@ -3114,8 +3155,12 @@ class ModelStepRun:
             )
         ):
             messages = [*messages, targeted_tool_native_marker]
-        discovery_native_grant_ids = await self._native_tool_discovery_grant_ids(
-            tool_exposure=tool_exposure,
+        discovery_native_grant_ids = (
+            {}
+            if finish_up
+            else await self._native_tool_discovery_grant_ids(
+                tool_exposure=tool_exposure,
+            )
         )
         # One provider-visible function name can bind to only one frozen grant.
         # A deliberately issued targeted grant takes precedence for its interaction;
@@ -3207,17 +3252,17 @@ class ModelStepRun:
                     thinking=self._thinking,
                     step=step,
                     tool_exposure=tool_exposure,
-                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
+                    targeted_tool_projection_kind=targeted_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=targeted_tool_native,
-                    tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+                    tool_discovery_projection_kind=discovery_projection_kind,
                     tool_discovery_native_tool_names=discovery_native_tool_names,
                     tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
                     tool_exposure=tool_exposure,
-                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
+                    targeted_tool_projection_kind=targeted_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=targeted_tool_native,
                     tool_discovery_native_tool_names=discovery_native_tool_names,
@@ -3225,7 +3270,7 @@ class ModelStepRun:
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
                     tool_exposure=tool_exposure,
-                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
+                    targeted_tool_projection_kind=targeted_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=targeted_tool_native,
                     tool_discovery_native_tool_names=discovery_native_tool_names,
@@ -3362,10 +3407,10 @@ class ModelStepRun:
             thinking=self._thinking,
             step=step,
             tool_exposure=tool_exposure,
-            targeted_tool_projection_kind=self._targeted_tool_projection_kind,
+            targeted_tool_projection_kind=targeted_projection_kind,
             targeted_tool_gateway=targeted_tool_gateway,
             targeted_tool_native=targeted_tool_native,
-            tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+            tool_discovery_projection_kind=discovery_projection_kind,
             tool_discovery_native_tool_names=discovery_native_tool_names,
             model_execution_selection=self._model_execution_selection,
             tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
@@ -3437,7 +3482,14 @@ class ModelStepRun:
         fallback: ModelFailoverTransition | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
-        if targeted_tool_grants is None and self._targeted_tool_grants is not None:
+        if (
+            targeted_tool_grants is None
+            and self._targeted_tool_grants is not None
+            and (
+                tool_exposure is None
+                or tool_exposure.profile_id != _LIMIT_FINISH_TOOL_EXPOSURE_PROFILE_ID
+            )
+        ):
             if self._model_execution_selection is not None:
                 raise RuntimeError("Selected request lost its targeted grant footprint.")
             targeted_tool_grants = self._targeted_tool_grants
@@ -5184,6 +5236,14 @@ def _dispatched_model_tools(
     Dispatch and context-pressure estimation share this so both see the same tools.
     """
 
+    if tool_exposure.profile_id == _LIMIT_FINISH_TOOL_EXPOSURE_PROFILE_ID:
+        tools = _model_request_tools(
+            tool_exposure=tool_exposure,
+            structured_output=structured_output,
+            targeted_tool_projection=None,
+            tool_discovery_mode=None,
+        )
+        return tools, [cast("str", tool["name"]) for tool in tools]
     if registered_agent.tool_exposure_mode is not ToolExposureMode.STABLE_CATALOGUE:
         return (
             _model_request_tools(
@@ -5522,6 +5582,20 @@ def _tool_capability_ceiling_exposure(
         registered_count=len(capabilities),
         ceiling_count=len(selected),
     )
+
+
+def _finish_request_messages(messages: list[Message]) -> list[Message]:
+    """Withdraw native tool state while retaining same-provider signed thinking."""
+
+    projected = []
+    for message in messages:
+        if message.role is not MessageRole.ASSISTANT:
+            projected.append(detach_message(message))
+            continue
+        parts = tuple(part for part in message.content if type(part) is not ProviderStatePart)
+        if parts:
+            projected.append(Message(role=message.role, content=parts))
+    return projected
 
 
 def _model_request_messages(
@@ -6363,6 +6437,7 @@ def reconstruct_assistant_step_result(
     if assistant_message is not None:
         assistant_message = detach_message(assistant_message)
     text_content = assistant_text_content(assistant_message)
+    recovery_context = model_completion_recovery_context_from_stage(stage)
     result = AssistantStepResult(
         session_id=session_id,
         step=step,
@@ -6376,6 +6451,7 @@ def reconstruct_assistant_step_result(
         has_user_visible_content=bool(text_content.strip()),
         provider_state_count=provider_state_count(assistant_message),
         thinking_count=thinking_count(assistant_message),
+        finish_limit=None if recovery_context is None else recovery_context.finish_limit,
     )
     if classify_assistant_step(result).type.value != classification:
         raise ValueError("Recovered model result conflicts with its durable classification.")

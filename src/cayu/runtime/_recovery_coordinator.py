@@ -19,7 +19,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import cayu.sessions.pending_actions as pending_actions
@@ -243,6 +243,10 @@ from cayu.runtime._recovery_requests import (
     RecoveryTerminalEventRequest,
 )
 from cayu.runtime._run_limit_accounting import restore_run_limit_accounting_context
+from cayu.runtime._run_limit_stream import (
+    ContinuationDeadlineStart,
+    admitted_continuation_deadline_outcome,
+)
 from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
@@ -1028,7 +1032,9 @@ class RecoveryCoordinator:
                 foreground_gate=replay,
             )
         with self._session_control.active_control_ownership(parent.id):
-            async with _close_delegated_event_stream(stream) as owned:
+            async with _close_delegated_event_stream(
+                cast("AsyncGenerator[Event, None]", stream)
+            ) as owned:
                 async for _ in owned:
                     pass
         return True
@@ -1165,19 +1171,27 @@ class RecoveryCoordinator:
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
+        from cayu.runtime._run_limit_stream import settled_continuation_deadline_outcome
+
         with self._session_control.active_control_ownership(response.session_id):
-            async with _close_delegated_event_stream(
-                self._resolve_user_input_owned(
-                    response,
-                    participant_context=participant_context,
-                    before_mutation=before_mutation,
-                    after_admission=after_admission,
-                    effect_reconciliation=effect_reconciliation,
-                )
-            ) as stream:
+            owned = self._resolve_user_input_owned(
+                response,
+                participant_context=participant_context,
+                before_mutation=before_mutation,
+                after_admission=after_admission,
+                on_admitted=on_admitted,
+                effect_reconciliation=effect_reconciliation,
+            )
+            execution = (
+                settled_continuation_deadline_outcome(owned, self._session_store)
+                if effect_reconciliation is not None
+                else cast("AsyncGenerator[Event, None]", owned)
+            )
+            async with _close_delegated_event_stream(execution) as stream:
                 async for event in stream:
                     yield event
 
@@ -1187,10 +1201,11 @@ class RecoveryCoordinator:
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         foreground_gate: GateReplay | None = None,
         participant_context: CollaborationAccessContext | None = None,
-    ) -> AsyncGenerator[Event, None]:
+    ) -> AsyncGenerator[Event | ContinuationDeadlineStart, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
         The answer becomes the ``ask_user`` tool result; any other tool calls in the same
@@ -1430,10 +1445,9 @@ class RecoveryCoordinator:
             before_mutation=before_mutation,
             before_resume=admit_exact_user_input_execution,
             after_admission=after_admission,
+            on_admitted=on_admitted,
             invocation_context=invocation_context,
         )
-        if resumed_event is not None:
-            yield resumed_event
         if claimed_intent is None:
             raise RuntimeError("User-input answer claim completed without durable intent.")
         invocation_context = invocation_context.with_rebound_session(
@@ -1463,6 +1477,8 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
+            if resumed_event is not None:
+                yield resumed_event
             async for event in continuation_stream:
                 yield event
         except BaseException as exc:
@@ -1884,6 +1900,7 @@ class RecoveryCoordinator:
         task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         with self._session_control.active_control_ownership(request.session_id):
@@ -1894,6 +1911,7 @@ class RecoveryCoordinator:
                     task_id=task_id,
                     before_mutation=before_mutation,
                     after_admission=after_admission,
+                    on_admitted=on_admitted,
                 )
             ) as stream:
                 async for event in stream:
@@ -1906,6 +1924,7 @@ class RecoveryCoordinator:
         task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        on_admitted: Callable[[Session], None] | None = None,
         foreground_gate: GateReplay | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
@@ -2244,6 +2263,7 @@ class RecoveryCoordinator:
                 execution_profile_snapshot=execution_profile_snapshot,
                 before_mutation=before_mutation,
                 after_admission=after_admission,
+                on_admitted=on_admitted,
                 invocation_context=invocation_context,
             )
         except (InvocationLifecycleCommandConflict, SessionRunFenced) as claim_conflict:
@@ -2267,8 +2287,6 @@ class RecoveryCoordinator:
             raise RuntimeError("Tool approval claim completed without approval state.")
         if task_id != pending_approval.task_id:
             raise RuntimeError("Tool approval changed its attached task identity.")
-        if resumed_event is not None:
-            yield resumed_event
         invocation_context = invocation_context.with_rebound_session(
             session,
             active_profile=execution_profile_snapshot.model_copy(
@@ -2293,6 +2311,8 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
+            if resumed_event is not None:
+                yield resumed_event
             async for event in continuation_stream:
                 yield event
         except BaseException as exc:
@@ -3540,7 +3560,7 @@ class RecoveryCoordinator:
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         foreground_gate: GateReplay | None = None,
         participant_context: CollaborationAccessContext | None = None,
-    ) -> AsyncGenerator[Event, None]:
+    ) -> AsyncGenerator[Event | ContinuationDeadlineStart, None]:
         await self._require_participant_execution(session, participant_context)
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -3737,6 +3757,8 @@ class RecoveryCoordinator:
                         async for event in settlement_stream:
                             yield event
                     return
+            if effect_reconciliation is not None:
+                yield ContinuationDeadlineStart(session)
                 resume_events = await self._session_store.load_events(session.id)
             if emit_resume_event:
                 yield await self._event_writer.emit(
@@ -3748,6 +3770,7 @@ class RecoveryCoordinator:
                                 agent_name=registered_agent.spec.name,
                                 environment_name=environment.name,
                                 payload={
+                                    "run_epoch": session.run_epoch,
                                     **tool_round_identity.payload(),
                                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                                     "input_id": pending.input_id,
@@ -6144,6 +6167,7 @@ class RecoveryCoordinator:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment.name,
                         payload={
+                            "run_epoch": session.run_epoch,
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                             "input_id": pending.input_id,
@@ -6333,7 +6357,7 @@ class RecoveryCoordinator:
             from cayu.runtime._foreground_gate_continuation import gate_input_response_from_recovery
 
             response = gate_input_response_from_recovery(request)
-            continuation_stream = self.continue_user_input_resolution(
+            raw_continuation = self.continue_user_input_resolution(
                 response=response,
                 participant_context=participant_context,
                 session=session,
@@ -6348,6 +6372,11 @@ class RecoveryCoordinator:
                 budget_policy=budget_policy,
                 invocation_context=environment.invocation_context,
                 emit_resume_event=False,
+            )
+            continuation_stream = admitted_continuation_deadline_outcome(
+                cast("AsyncGenerator[Event, None]", raw_continuation),
+                self._session_store,
+                session,
             )
             async for event in continuation_stream:
                 yield event
@@ -6818,6 +6847,11 @@ class RecoveryCoordinator:
                 enforce_expiry=False,
                 claimed_resolution_intent=claimed_resolution_intent,
                 recovery_closure_only=True,
+            )
+            continuation_stream = admitted_continuation_deadline_outcome(
+                continuation_stream,
+                self._session_store,
+                session,
             )
             async for event in continuation_stream:
                 yield event
@@ -8111,6 +8145,7 @@ class RecoveryCoordinator:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload={
+                            "run_epoch": session.run_epoch,
                             "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                             **pending_rounds.pending_tool_round_identity(pending_round).payload(),
                             "tool_call_id": pending_tool_call.tool_call_id,
@@ -8659,6 +8694,11 @@ class RecoveryCoordinator:
                         "reason": "limit_reached",
                         "limit": "execution_deadline",
                         "deadline_settlement_only": True,
+                        "structured_output_pending": (
+                            await self._session_finalization._structured_output_pending_for_limit(
+                                session, None
+                            )
+                        ),
                         "execution_deadline": session.execution_deadline.inspection(),
                         "failure_evidence": FailureEvidence(
                             classification="deadline",
@@ -9323,8 +9363,12 @@ def _effective_tool_round_invocation_semantics(
     effective_retry_policy: EffectiveRetryPolicy,
 ) -> _RecoveryInvocationSemantics:
     if type(request) is ToolEffectReconciliationRequest:
-        recorded_max_steps = _require_recovery_max_steps(pending_round.max_steps)
-        if request.max_steps is not None and request.max_steps > recorded_max_steps:
+        recorded_max_steps = _require_recovery_max_steps(pending_round)
+        if (
+            request.max_steps is not None
+            and recorded_max_steps is not None
+            and request.max_steps > recorded_max_steps
+        ):
             raise ValueError("Receipt continuation cannot increase the recorded step limit.")
         return _RecoveryInvocationSemantics(
             max_steps=recorded_max_steps if request.max_steps is None else request.max_steps,
@@ -9338,13 +9382,9 @@ def _effective_tool_round_invocation_semantics(
         raise TypeError("Tool-round recovery requires a ToolRoundRecoveryRequest.")
     if type(pending_round) is not pending_rounds.PendingToolRound:
         raise TypeError("Pending tool round must be a PendingToolRound.")
-    _require_recovery_max_steps(pending_round.max_steps)
+    recorded_max_steps = _require_recovery_max_steps(pending_round)
     return _RecoveryInvocationSemantics(
-        max_steps=(
-            request.max_steps
-            if request.max_steps is not None
-            else _require_recovery_max_steps(pending_round.max_steps)
-        ),
+        max_steps=request.max_steps if request.max_steps is not None else recorded_max_steps,
         limits=copy_run_limits(
             request.limits if request.limits is not None else pending_round.limits or RunLimits()
         ),
@@ -9365,11 +9405,11 @@ def _effective_user_input_max_steps(
     *,
     max_steps: int | None,
     pending: PendingUserInput,
-) -> int:
+) -> int | None:
     # Restore recorded invocation settings; profile admission validates overrides.
     if type(pending) is not PendingUserInput:
         raise TypeError("Pending user input must be a PendingUserInput.")
-    recorded = _require_recovery_max_steps(pending.max_steps)
+    recorded = _require_recovery_max_steps(pending)
     return recorded if max_steps is None else max_steps
 
 
@@ -9477,11 +9517,11 @@ def _effective_approval_max_steps(
     *,
     max_steps: int | None,
     pending_approval: PendingToolApproval,
-) -> int:
+) -> int | None:
     # Restore recorded invocation settings; profile admission validates overrides.
     if type(pending_approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
-    recorded = _require_recovery_max_steps(pending_approval.max_steps)
+    recorded = _require_recovery_max_steps(pending_approval)
     return recorded if max_steps is None else max_steps
 
 
@@ -9671,7 +9711,7 @@ def recorded_pending_invocation_semantics(
     )
     if pending_round is not None:
         return _RecoveryInvocationSemantics(
-            max_steps=_require_recovery_max_steps(pending_round.max_steps),
+            max_steps=_require_recovery_max_steps(pending_round),
             limits=copy_run_limits(pending_round.limits or RunLimits()),
             budget_limits=copy_request_budget_limits(pending_round.budget_limits or ()),
             retry_policy=effective_retry_policy(pending_round.retry_policy),

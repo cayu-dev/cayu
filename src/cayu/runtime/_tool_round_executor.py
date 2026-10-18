@@ -284,7 +284,7 @@ class ToolRoundExecutor:
         task_id: str | None,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
-        max_steps: int,
+        max_steps: int | None,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
@@ -541,6 +541,7 @@ class ToolRoundExecutor:
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
             max_steps=max_steps,
+            max_steps_unbounded=True if max_steps is None else None,
             limits=copy_run_limits(limits) if limits is not None else None,
             run_limit_accounting=pause_run_limit_accounting_context(
                 pending_round.run_limit_accounting, now=self._clock()
@@ -1155,7 +1156,7 @@ class ToolRoundRun:
         task_id: str | None,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
-        max_steps: int,
+        max_steps: int | None,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,

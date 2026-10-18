@@ -1585,8 +1585,11 @@ function RunExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) 
       <div>
         <span className="text-muted-foreground">Candidate work</span>
         <div className="font-medium">
-          {exposure.candidate_trials.toLocaleString()} trials · up to{" "}
-          {exposure.maximum_candidate_model_steps.toLocaleString()} model steps ·{" "}
+          {exposure.candidate_trials.toLocaleString()} trials ·{" "}
+          {exposure.maximum_candidate_model_steps == null
+            ? "no model-step cap"
+            : `up to ${exposure.maximum_candidate_model_steps.toLocaleString()} model steps`}{" "}
+          ·{" "}
           {exposure.maximum_candidate_total_tokens == null
             ? "token ceiling unavailable"
             : `${exposure.maximum_candidate_total_tokens.toLocaleString()} tokens`}

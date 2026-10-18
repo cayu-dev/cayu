@@ -119,6 +119,8 @@ from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.stop_policy import (
     StopDecision,
     StopLimit,
+    approaching_cost_limit,
+    approaching_run_limit,
     auxiliary_token_admission,
     first_reached_limit,
 )
@@ -1197,12 +1199,14 @@ class LimitEvaluation:
     usage_summary: SessionUsageSummary
     cost_summary: SessionCostTotals | None
     events: tuple[Event, ...] = ()
+    finish: StopDecision | None = None
 
 
 @dataclass(frozen=True)
 class BudgetEvaluation:
     check: BudgetCheck | None
     events: tuple[Event, ...] = ()
+    finish: StopDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -2267,6 +2271,9 @@ class RunLimitController:
                 cost_summary=None,
             )
 
+        finish = approaching_run_limit(
+            limits=limits, usage=usage_for_limits, elapsed_seconds=elapsed_seconds
+        )
         expected_run_budgets = {
             _effective_budget_limit_id(limit): limit
             for limit in budget_limits
@@ -2328,6 +2335,15 @@ class RunLimitController:
                 pricing_provider_name=pricing_provider_name,
                 model=model,
             )
+            if (
+                finish is None
+                and limits.on_limit == "finish"
+                and budget_limit.action == "interrupt"
+            ):
+                actual_cost = _budget_actual_cost(budget_limit, cost_summary, budget_baseline)
+                finish = approaching_cost_limit(
+                    maximum=budget_limit.max_estimated_cost, actual=actual_cost
+                )
             if budget_outcome is None:
                 continue
             if budget_limit.action == "notify":
@@ -2358,6 +2374,7 @@ class RunLimitController:
             usage_summary=usage_summary,
             cost_summary=cost_summary,
             events=tuple(emitted_events),
+            finish=finish,
         )
 
     async def evaluate_policy_budgets(
@@ -2387,6 +2404,7 @@ class RunLimitController:
         if not limits:
             return BudgetEvaluation(check=None)
         emitted_events: list[Event] = []
+        finish: StopDecision | None = None
         effective_provider_name = pricing_provider_name or session.provider_name
         effective_model = model or session.model
         additional_events = [
@@ -2438,6 +2456,10 @@ class RunLimitController:
                         )
                     )
                 )
+            if finish is None and limit.action == "interrupt":
+                finish = approaching_cost_limit(
+                    maximum=limit.max_estimated_cost, actual=summary.total_cost
+                )
             if not check.limit_reached:
                 continue
             if limit.action == "notify":
@@ -2454,7 +2476,7 @@ class RunLimitController:
                     )
                 continue
             return BudgetEvaluation(check=check, events=tuple(emitted_events))
-        return BudgetEvaluation(check=None, events=tuple(emitted_events))
+        return BudgetEvaluation(check=None, events=tuple(emitted_events), finish=finish)
 
     async def _budget_notify_already_emitted(
         self,
@@ -5601,6 +5623,16 @@ def _budget_notify_already_emitted_in_invocation(
     )
 
 
+def _budget_actual_cost(
+    limit: BudgetLimit,
+    cost_summary: SessionCostTotals,
+    cost_baseline: SessionCostTotals | None,
+) -> Decimal:
+    if limit.scope == "run" and cost_baseline is not None:
+        return max(cost_summary.total_cost - cost_baseline.total_cost, Decimal("0"))
+    return cost_summary.total_cost
+
+
 def _first_budget_limit_outcome(
     *,
     session: Session,
@@ -5624,14 +5656,10 @@ def _first_budget_limit_outcome(
     }:
         raise TypeError("cost_baseline must be SessionCostTotals.")
 
-    actual_cost = cost_summary.total_cost
+    actual_cost = _budget_actual_cost(limit, cost_summary, cost_baseline)
     unpriced_model_steps = cost_summary.unpriced_model_steps
     unpriced_auxiliary_attempts = cost_summary.unpriced_auxiliary_attempts
     if limit.scope == "run" and cost_baseline is not None:
-        actual_cost = max(
-            cost_summary.total_cost - cost_baseline.total_cost,
-            Decimal("0"),
-        )
         unpriced_model_steps = max(
             unpriced_model_steps - cost_baseline.unpriced_model_steps,
             0,

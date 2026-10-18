@@ -41,14 +41,20 @@ for examples and the distinction between wildcard exports and explicit imports.
 ## Application Runtime Configuration
 
 `CayuConfig` is the immutable application tuning API. `CayuApp()` uses a
-64-step model budget. Explicit `max_steps` accepts strict positive integers up to
-`2**53 - 1` (9,007,199,254,740,991), the largest safe integer for exact JSON
-interchange with JavaScript API clients. This is a representation bound, not a
-work allowance. Configuration, workflow roles, CLI/server admission, and durable
-recovery share this bound. Unlimited model steps are not supported: `None` on
-continuation options means omitted/inherit, not unlimited. Cancellation, execution
-deadlines, and explicit token/tool limits still apply independently. Configure
-alternatives directly in Python:
+64-step model budget for interactive runs. Task-backed runs omit the step cap
+unless the request or application explicitly configures one. `max_steps=None`
+on a run, resume, application default, or workflow role means no step cap. A finite
+cap must be a strict positive integer up to `2**53 - 1` (9,007,199,254,740,991),
+the largest safe integer for exact JSON interchange with JavaScript API clients.
+Configuration, CLI/server admission, and durable recovery share this bound.
+Omitted continuation options inherit recorded authority; the approval and
+user-input resolution APIs also use `max_steps=None` to mean inherit. Legacy
+pending checkpoints with no recorded cap cannot grant unlimited execution.
+Before the first completed model step, ordinary resume uses the application's
+default for the session's creation source. Attaching a task to an existing
+interactive or forked session does not change that session's default cap.
+See [Run limits and finishing](#run-limits-and-finishing) for time and money bounds.
+Configure alternatives directly in Python:
 
 ```python
 from cayu import CayuApp, CayuConfig
@@ -10169,6 +10175,55 @@ rounding, regional pricing, provider-side discounts, or account-specific terms
 can differ from a caller's pricing table. Cost stop policies should build on
 this primitive only after the app has supplied pricing appropriate for its
 deployment.
+
+## Run limits and finishing
+
+Use `execution_deadline` for a wall-clock bound and `budget_limits` for an
+estimated-cost bound. Add count limits only when the application needs them.
+
+| Setting | Default and meaning |
+| --- | --- |
+| `execution_deadline` | Unbounded unless supplied; cancels in-flight work when its absolute deadline expires. Continuations inherit it, including time spent waiting for a person. |
+| `budget_limits` | No request budget; estimates cost from recorded usage and the selected price book. Existing policy budgets and reservations still apply. |
+| `max_steps` | 64 for interactive SDK runs; no cap for task-backed SDK runs unless explicitly configured. HTTP runs and product services use the application cap (64 by default). `None` disables it. |
+| `limits.max_tool_calls` | `None`, meaning no call-count cap. |
+| `limits.max_input_tokens`, `max_output_tokens`, `max_total_tokens` | `None`; evaluated from observed model usage. |
+| `limits.max_elapsed_seconds` | `None`; a cooperative check between operations. Run scope counts active invocation time and excludes recorded human waits; session scope counts wall time since creation. Use a deadline to interrupt a stalled operation. |
+
+A limit stop emits `session.interrupted` with `reason="limit_reached"`, `limit`
+naming the bound, and `structured_output_pending` saying whether a requested
+answer remains unavailable. The admitted run iterator ends normally. Deadline
+cleanup still waits for owned work and records uncertain external outcomes;
+pre-admission expiry and the lower-level deadline utilities still raise
+`ExecutionDeadlineExceeded`. Operator cancellation remains cancellation.
+
+For structured-output runs, opt in to one final answer step:
+
+```python
+RunRequest(
+    agent_name="researcher",
+    messages=[Message.text("user", "Investigate and report the evidence.")],
+    max_steps=None,
+    execution_deadline=ExecutionDeadline.after(600),
+    structured_output=answer_spec,
+    limits=RunLimits(on_limit="finish", finish_reserve_seconds=30),
+)
+```
+
+At a model boundary, Cayu reserves the last finite step, or starts finishing when
+observed token/call/cost use reaches 90% of a limit or remaining time reaches
+`finish_reserve_seconds`. It persists a final-answer instruction and withdraws
+ordinary tools and tool discovery, retaining only the structured-output submit
+mechanism. A valid answer is published before the limit interruption, with
+`structured_output_pending=false` and `finish_up=true`. An invalid answer ends
+with `structured_output_pending=true`; it gets no repair or research step.
+
+Finishing is best effort within the original authority. A long in-flight call
+can consume all remaining time or budget before the next model boundary. Cayu
+never extends a deadline or budget, dispatches after a hard gate denies admission,
+or guarantees a valid answer. Token and estimated-cost use can cross a limit in
+one admitted model call; a valid answer already returned by that final call is
+retained. Configure enough time reserve for the expected answer latency.
 
 `RunLimits` provides hard token/tool/time stop controls for runtime calls.
 `BudgetLimit` provides estimated-cost stop controls backed by an explicitly selected

@@ -48,7 +48,7 @@ class WorkAttemptRunSemantics(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     schema_version: Literal[1] = 1
-    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
+    max_steps: StrictInt | None = Field(ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = ()
     causal_budget_id: str | None = None

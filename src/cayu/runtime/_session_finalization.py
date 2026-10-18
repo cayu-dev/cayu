@@ -3520,6 +3520,25 @@ class SessionFinalization:
         ):
             yield event
 
+    async def _structured_output_pending_for_limit(
+        self,
+        session: Session,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None,
+    ) -> bool:
+        if active_run is not None:
+            return active_run.structured_output_pending
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        pending = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
+        if pending is not None:
+            return pending.structured_output is not None
+        pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint, current_run_epoch=session.run_epoch
+        )
+        if pending_input is not None:
+            return pending_input.structured_output is not None
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
+        return pending_round is not None and pending_round.structured_output is not None
+
     async def stop_session_for_limit_reached(
         self,
         *,
@@ -3544,6 +3563,8 @@ class SessionFinalization:
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None = None,
         reconcile_transition_cancellation: bool,
+        structured_output_pending: bool | None = None,
+        finish_up: bool = False,
     ) -> AsyncGenerator[Event, None]:
         if type(reconcile_transition_cancellation) is not bool:
             raise TypeError("reconcile_transition_cancellation must be a bool.")
@@ -3577,6 +3598,13 @@ class SessionFinalization:
             usage_summary=usage_summary,
             cost_summary=cost_summary,
         )
+        limit_payload["structured_output_pending"] = (
+            structured_output_pending
+            if structured_output_pending is not None
+            else await self._structured_output_pending_for_limit(session, active_run)
+        )
+        if finish_up:
+            limit_payload["finish_up"] = True
         yield await self._event_writer.emit(
             Event(
                 type=EventType.SESSION_LIMIT_REACHED,
@@ -4881,6 +4909,19 @@ class SessionFinalization:
         if deadline.expires_at is not None:
             payload["execution_deadline"] = deadline.inspection()
         expired_boundary = request.native_admission_deadline or expired_execution_deadline()
+        if expired_boundary is not None:
+            payload.update(
+                reason="limit_reached",
+                limit="execution_deadline",
+                interruption_type=_INTERRUPTION_TYPE_LIMIT_REACHED,
+                structured_output_pending=(
+                    request.structured_output_pending
+                    if request.structured_output_pending is not None
+                    else await self._structured_output_pending_for_limit(
+                        request.session, request.active_run
+                    )
+                ),
+            )
         payload["failure_evidence"] = FailureEvidence(
             classification="deadline" if expired_boundary is not None else "interruption",
             deadline=expired_boundary,
@@ -5208,6 +5249,8 @@ class SessionFinalization:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         run_terminal_hooks: bool = True,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        structured_output_pending: bool | None = None,
     ) -> None:
         """Idempotently finalize a live session when setup-time streaming is abandoned."""
         try:
@@ -5269,6 +5312,8 @@ class SessionFinalization:
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
                     run_terminal_hooks=run_terminal_hooks,
+                    active_run=active_run,
+                    structured_output_pending=structured_output_pending,
                 )
             )
         except InteractionLifecyclePublicationRejected:

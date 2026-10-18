@@ -230,6 +230,7 @@ def _assistant_step_result_with_published_targeted_authority(
         has_user_visible_content=live.has_user_visible_content,
         provider_state_count=live.provider_state_count,
         thinking_count=live.thinking_count,
+        finish_limit=live.finish_limit,
     )
 
 

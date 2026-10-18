@@ -1050,6 +1050,7 @@ def _validated_provider_cancellation_event_failures(
         if type(interruption_type) is not str or interruption_type not in (
             "operator_requested",
             "runtime_interrupted",
+            "limit_reached",
         ):
             raise ValueError("Provider cancellation interruption type is invalid.")
         request_id = payload.get("interruption_request_id")
