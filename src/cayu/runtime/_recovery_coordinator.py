@@ -8460,15 +8460,19 @@ class RecoveryCoordinator:
                     invocation_context.profile,
                 )
             )
-            terminal_result = tool_execution.with_approved_arguments_notice(
-                ToolResult(
-                    content=receipt.message,
-                    structured=receipt.structured,
-                    artifacts=receipt.artifacts,
-                    is_error=receipt.outcome == "failed",
+            # The receipt check expects the notice before the whole message, so
+            # it is added even when the message already starts with one.
+            terminal_result = ToolResult(
+                content=(
+                    tool_execution.receipt_approved_arguments_notice_content(
+                        receipt.message, redactor=receipt_redactor
+                    )
+                    if approved_with_changes
+                    else receipt.message
                 ),
-                approved=approved_with_changes,
-                redactor=receipt_redactor,
+                structured=receipt.structured,
+                artifacts=receipt.artifacts,
+                is_error=receipt.outcome == "failed",
             )
             event = Event(
                 type=EventType.TOOL_CALL_FAILED

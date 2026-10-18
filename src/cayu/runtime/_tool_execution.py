@@ -1152,6 +1152,23 @@ def approved_arguments_notice_content(content: str, *, redactor: Any = None) -> 
     return notice if not content else f"{notice}\n\n{content}"
 
 
+def receipt_approved_arguments_notice_content(message: str, *, redactor: Any = None) -> str:
+    """Begin a receipt message with the notice, even if it already starts with one.
+
+    A receipt message is external evidence, so the runtime never infers from its
+    text that the notice is already there. The terminal is always the notice
+    followed by the whole message, which is the one shape
+    ``content_carries_approved_arguments_notice`` accepts.
+    """
+
+    notice = (
+        APPROVED_ARGUMENTS_NOTICE
+        if redactor is None
+        else redactor.redact_text(APPROVED_ARGUMENTS_NOTICE)
+    )
+    return notice if not message else f"{notice}\n\n{message}"
+
+
 def _is_approved_arguments_notice_projection(text: str) -> bool:
     """Whether ``text`` is the notice, or the notice with registered secrets redacted."""
 

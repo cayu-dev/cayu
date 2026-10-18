@@ -28,6 +28,7 @@ from cayu.runtime._tool_execution import (
     APPROVED_ARGUMENTS_NOTICE,
     approved_arguments_notice_content,
     content_carries_approved_arguments_notice,
+    receipt_approved_arguments_notice_content,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import (
@@ -88,8 +89,14 @@ class _ApprovalPolicy(ToolPolicy):
         )
 
 
-def _app(tool: Tool, *, store=None, policy=None, dynamic=False, reconcilers=None) -> CayuApp:
-    app = CayuApp(session_store=store or InMemorySessionStore(), enable_logging=False)
+def _app(
+    tool: Tool, *, store=None, policy=None, dynamic=False, reconcilers=None, secret_redactor=None
+) -> CayuApp:
+    app = CayuApp(
+        session_store=store or InMemorySessionStore(),
+        enable_logging=False,
+        secret_redactor=secret_redactor,
+    )
     app.register_provider(
         ScriptedModelProvider(
             [
@@ -240,8 +247,21 @@ def test_a_failing_edited_call_carries_the_marker_and_notice(effect):
     assert result.content.startswith(APPROVED_ARGUMENTS_NOTICE)
 
 
-def test_receipt_recovery_of_an_edited_call_keeps_the_marker_and_notice():
+_RECEIPT_MESSAGE = "Delivery confirmed."
+
+
+@pytest.mark.parametrize(
+    "message",
+    [_RECEIPT_MESSAGE, f"{APPROVED_ARGUMENTS_NOTICE}\n\n{_RECEIPT_MESSAGE}"],
+    ids=["plain", "already-noticed"],
+)
+@pytest.mark.parametrize("secret", [None, "person"], ids=["no-secret", "notice-secret"])
+def test_receipt_recovery_of_an_edited_call_keeps_the_marker_and_notice(message, secret):
+    # A receipt message that already starts with the notice still gets its own
+    # notice, so the strict receipt check accepts the settled terminal. The
+    # secret "person" overlaps the notice, so the notice is published redacted.
     now = datetime.now(UTC)
+    redactor = SecretRedactor() if secret is None else SecretRedactor(secret)
 
     class _LostAcknowledgementTool(_SendTool):
         def __init__(self) -> None:
@@ -273,7 +293,7 @@ def test_receipt_recovery_of_an_edited_call_keeps_the_marker_and_notice():
                     tool_name=context.tool_name,
                     idempotency_key=context.idempotency_key,
                     outcome="completed",
-                    message="Delivery confirmed.",
+                    message=message,
                     source="reconciler",
                     observed_at=now,
                 ),
@@ -282,6 +302,7 @@ def test_receipt_recovery_of_an_edited_call_keeps_the_marker_and_notice():
     tool = _LostAcknowledgementTool()
     app = _app(
         tool,
+        secret_redactor=redactor,
         reconcilers={
             "send": ToolEffectReconciliationRegistration(
                 reconciler=_Reconciler(),
@@ -307,13 +328,14 @@ def test_receipt_recovery_of_an_edited_call_keeps_the_marker_and_notice():
 
     terminal, result = asyncio.run(scenario())
 
+    notice = redactor.redact_text(APPROVED_ARGUMENTS_NOTICE)
+    published_message = redactor.redact_text(message)
+    assert (notice == APPROVED_ARGUMENTS_NOTICE) is (secret is None)
     assert tool.calls == [{"to": "finance"}]
     assert terminal.payload["effect_reconciled"] is True
     assert terminal.payload["approved_with_changes"] is True
-    assert terminal.payload["result"]["content"] == (
-        f"{APPROVED_ARGUMENTS_NOTICE}\n\nDelivery confirmed."
-    )
-    assert result.content.startswith(APPROVED_ARGUMENTS_NOTICE)
+    assert terminal.payload["result"]["content"] == f"{notice}\n\n{published_message}"
+    assert result.content == f"{notice}\n\n{published_message}"
 
 
 def test_approving_with_the_proposed_arguments_is_a_plain_approval():
@@ -346,6 +368,9 @@ def test_a_receipt_terminal_is_recognized_with_a_redacted_notice():
     for redacting in (None, redactor):
         content = approved_arguments_notice_content(original, redactor=redacting)
         assert content_carries_approved_arguments_notice(content, original=original)
+        for message in (original, content, ""):
+            noticed = receipt_approved_arguments_notice_content(message, redactor=redacting)
+            assert content_carries_approved_arguments_notice(noticed, original=message)
     assert not content_carries_approved_arguments_notice(original, original=original)
     assert not content_carries_approved_arguments_notice(
         f"Something else.\n\n{original}", original=original
