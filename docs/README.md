@@ -34,6 +34,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Common-root budget bindings](common-root-budgets.md)
 - [Docker coding toolchains](docker-coding-toolchains.md)
 - [Environment factories](environment-factories.md)
+- [External vendor harnesses](external-agents.md)
 - [Execution capabilities: Docker and Lambda MicroVM](execution-capabilities.md)
 - [Execution snapshots: managed process and workspace restoration](execution-snapshots.md)
 - [Session fork overlays: outside controllers with their own instructions, tools and memory](fork-overlays.md)

@@ -782,7 +782,8 @@ def test_close_stop_failure_keeps_runner_open(monkeypatch):
     assert r._closed is False
 
 
-def test_create_bind_mount_mode(monkeypatch, tmp_path):
+@pytest.mark.parametrize("read_only", [False, True])
+def test_create_bind_mount_mode(monkeypatch, tmp_path, read_only):
     issued = []
 
     async def fake_run_subprocess(command, **kwargs):
@@ -798,6 +799,7 @@ def test_create_bind_mount_mode(monkeypatch, tmp_path):
             docker_path="/usr/bin/docker",
             image="debian:stable-slim",
             mount_path=host_ws,
+            mount_read_only=read_only,
             setup_commands=("apt-get install -y whois",),
         )
     )
@@ -812,7 +814,7 @@ def test_create_bind_mount_mode(monkeypatch, tmp_path):
         "--name",
         "a1",
         "--mount",
-        f"type=bind,source={host_ws},target={host_ws}",
+        f"type=bind,source={host_ws},target={host_ws}" + (",readonly" if read_only else ""),
         "debian:stable-slim",
         "sleep",
         "infinity",

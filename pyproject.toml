@@ -53,6 +53,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+claude-agent-sdk = ["claude-agent-sdk==0.2.168"]
+codex = ["openai-codex==0.163.0"]
 dev = [
   # Exercises the bounded Brotli decoder in egress; not a runtime dependency.
   "brotli>=1.2,<2",
@@ -180,7 +182,7 @@ all-runtime-extras = [
   "server-settings",
   "vertex",
 ]
-excluded-from-all = { browser = "Dashboard and browser verification tooling is opt-in." }
+excluded-from-all = { browser = "Dashboard and browser verification tooling is opt-in.", claude-agent-sdk = "External-agent vendor SDKs and bundled CLI binaries are explicit opt-ins.", codex = "External-agent vendor SDKs and bundled CLI binaries are explicit opt-ins." }
 non-runtime-extras = { dev = "Contributor test and development tools are not runtime extras." }
 
 [project.urls]

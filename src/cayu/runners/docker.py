@@ -1928,6 +1928,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         image: str = DEFAULT_DOCKER_IMAGE,
         runtime: str | None = None,
         mount_path: str | None = None,
+        mount_read_only: bool = False,
         default_cwd: str | None = None,
         close_action: DockerCloseAction = "remove",
         setup_commands: tuple[str, ...] = (),
@@ -1958,6 +1959,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
+        ``mount_read_only=True`` makes that host bind mount read-only.
         With ``mount_path`` the host dir is bind-mounted at the same absolute path
         (convenience; pair with ``LocalWorkspace``). Without it, an in-container
         ``default_cwd`` is created (hardened; pair with ``RunnerWorkspace``, which
@@ -2050,6 +2052,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         runtime = _validate_runtime(runtime)
         if mount_path is not None:
             mount_path = _validate_mount_path(mount_path)
+        if type(mount_read_only) is not bool:
+            raise TypeError("mount_read_only must be a bool.")
+        if mount_read_only and mount_path is None:
+            raise ValueError("mount_read_only requires mount_path.")
         _validate_close_action(close_action)
         if type(replace) is not bool:
             raise TypeError("replace must be a bool.")
@@ -2145,7 +2151,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             for host_entry in extra_hosts:
                 run_argv += ["--add-host", require_clean_nonblank(host_entry, "extra_hosts")]
             if mount_path is not None:
-                run_argv += ["--mount", f"type=bind,source={mount_path},target={mount_path}"]
+                run_argv += [
+                    "--mount",
+                    f"type=bind,source={mount_path},target={mount_path}"
+                    + (",readonly" if mount_read_only else ""),
+                ]
             if ca_mount is not None:
                 ca_host, ca_guest = _validate_ca_mount(ca_mount)
                 run_argv += [

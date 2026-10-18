@@ -1155,6 +1155,8 @@ class IncompleteSessionRecovery:
             retained_invocation_context = context
 
         try:
+            if session.runtime_name == "external_agent":
+                raise ValueError("External sessions require recover_external_agent_run.")
             if before_recovery is not None:
                 await before_recovery(session.id)
             try:
@@ -1241,6 +1243,9 @@ class IncompleteSessionRecovery:
     ) -> IncompleteSessionRecoveryResult:
         from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
 
+        if session.runtime_name == "external_agent":
+            del session
+            raise ValueError("External sessions require recover_external_agent_run.")
         require_abandoned_execution_matches(session)
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_durable_metadata(metadata)

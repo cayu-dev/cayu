@@ -621,6 +621,10 @@ class PriceBook(BaseModel):
             billing_identity.provider_name if billing_identity is not None else provider_name
         )
         pricing_model = billing_identity.resource_id if billing_identity is not None else model
+        if pricing_provider_name == "cayu-tool-dispatch" and pricing_model == "tool-dispatch":
+            # This runtime-owned identity dispatches native tools without a model
+            # request. Its zero charge is independent of commercial price books.
+            return _PriceBookMatch(_external_tool_dispatch_price(), "tool-dispatch", "exact")
         mapped = False
         if billing_identity is not None:
             mapping = next(
@@ -867,6 +871,17 @@ def dump_price_book(price_book: PriceBook) -> str:
 def load_price_book(path: str | Path) -> PriceBook:
     """Load a price book from a JSON file written by ``dump_price_book``."""
     return PriceBook.model_validate_json(Path(path).read_text())
+
+
+def _external_tool_dispatch_price() -> ModelPrice:
+    """Native control input has no upstream model usage or charge."""
+    return ModelPrice.fixed(
+        provider_name="cayu-tool-dispatch",
+        model="tool-dispatch",
+        input_per_million=Decimal(0),
+        output_per_million=Decimal(0),
+        match="exact",
+    )
 
 
 def default_price_book() -> PriceBook:

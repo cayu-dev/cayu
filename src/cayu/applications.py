@@ -298,6 +298,7 @@ from cayu.events import (
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.external_agents._session_control import require_native_session
 from cayu.fork_controllers import (
     ForkController,
     ForkControllerAccess,
@@ -662,7 +663,6 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
     copy_fork_session_request,
-    copy_interrupt_session_request,
     copy_resume_request,
 )
 from cayu.sessions.store import SessionStore
@@ -6136,6 +6136,7 @@ class CayuApp:
         policy: ExecutionSnapshotPolicy | None = None,
     ) -> ExecutionSnapshotRecord:
         """Capture an idle session's managed workload without rewinding its history."""
+        require_native_session(await self.session_store.load(session_id), "capture")
         registered = self.get_environment(environment_name)
         if registered.binding_generation_id != expected_generation:
             raise ExecutionSnapshotError("Expected capture binding generation changed.")
@@ -7118,6 +7119,7 @@ class CayuApp:
         request = self._with_application_run_defaults(request)
         request = _validate_resume_request(request)
         stored = await self.session_store.load(request.session_id)
+        require_native_session(stored, "resume")
         boundary = resumed_execution_deadline(
             stored.execution_deadline if stored is not None else ExecutionDeadline()
         )
@@ -7611,22 +7613,15 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
-    async def _interrupt_session_private(
+    def _interrupt_session_private(
         self,
         request: InterruptSessionRequest,
         *,
         store_resolved_session_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
-        if type(request) is not InterruptSessionRequest:
-            raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
-        request = copy_interrupt_session_request(request)
-        stream = self._session_interruption.interrupt_session(
-            request=request,
-            store_resolved_session_id=store_resolved_session_id,
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
+        from cayu.external_agents._session_control import interrupt
+
+        return interrupt(self, request, store_resolved_session_id=store_resolved_session_id)
 
     @_admitted_entrance
     @execution_owned_by("recovery")
@@ -8708,6 +8703,7 @@ class CayuApp:
                 source_session_id,
                 store_resolved_source_session_id,
             ) = await self._resolve_public_session_authority(request.source_session_id)
+            require_native_session(await self.session_store.load(source_session_id), "fork")
             expected_source = request.expected_source
             if expected_source is not None:
                 (

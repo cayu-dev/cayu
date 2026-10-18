@@ -121,12 +121,14 @@ _FORBIDDEN_KEYS = frozenset(
 )
 _OPTIONAL_DISTRIBUTIONS = (
     "boto3",
+    "claude-agent-sdk",
     "cryptography",
     "e2b",
     "fastapi",
     "google-auth",
     "ipython",
     "microsandbox",
+    "openai-codex",
     "opentelemetry-api",
     "opentelemetry-sdk",
     "pillow",

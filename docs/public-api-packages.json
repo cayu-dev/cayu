@@ -11,6 +11,7 @@
   "cayu.evals",
   "cayu.extensions.egress",
   "cayu.extensions.runners",
+  "cayu.external_agents",
   "cayu.mcp",
   "cayu.memory",
   "cayu.observability",

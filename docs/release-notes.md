@@ -48,6 +48,14 @@ older claimants do not understand key exclusion.
   Operator cancellation and lost ownership never become automatic retries.
   Custom workers can use `requeue_restartable_task` after proving quiescence.
 
+Upgrade: Install `cayu[claude-agent-sdk]` or `cayu[codex]` only when running a
+vendor harness. Configure a private model gateway and a whole-process sandbox;
+service credentials stay outside the guest. Existing native agents are unchanged.
+
+- Add optional external-agent adapters that record vendor runs as Cayu sessions
+  and tasks, with usage, after-step budgets, deadlines, native approval/MCP
+  bridges and joined process cleanup. See [external agents](external-agents.md).
+
 Upgrade: Existing streaming applications continue unchanged. Applications can use
 `send_turn` to create or continue a conversation and await one result. Services
 whose task workers can be stopped mid-handler can settle the stranded tasks with
