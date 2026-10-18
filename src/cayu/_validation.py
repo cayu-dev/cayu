@@ -169,6 +169,8 @@ _DURABLE_ERROR_MESSAGES = {
 _JSON_SHORT_ESCAPES = ('"', "\\", "\b", "\f", "\n", "\r", "\t")
 _JSON_OTHER_CONTROL_RE = re.compile(r"[\x00-\x07\x0b\x0e-\x1f]")
 _NONPORTABLE_STRING_RE = re.compile(r"[\x00\ud800-\udfff]")
+_JSON_ESCAPED_OR_NONPORTABLE_RE = re.compile(r'[\x00-\x1f"\\\ud800-\udfff]')
+_DURABLE_STRING_CHUNK_CHARS = 4096
 _ASCII_ESCAPED_BMP_RE = re.compile(r"[\x7f-\uffff]")
 _ASTRAL_RE = re.compile(r"[\U00010000-\U0010ffff]")
 
@@ -863,6 +865,10 @@ class JsonUtf8SizeCounter:
         return False
 
 
+_DURABLE_JSON_CONTAINER_TYPES = frozenset({dict, FrozenJsonDict, FrozenJsonList})
+_DURABLE_JSON_OBJECT_TYPES = frozenset({dict, FrozenJsonDict})
+
+
 @dataclass(slots=True)
 class _BoundedDurableJsonFrame:
     value_id: int
@@ -938,7 +944,12 @@ def _walk_bounded_durable_json(
     active_container_ids: set[int] = set()
     frames: list[_BoundedDurableJsonFrame] = []
     current = value
-    current_path = "$"
+    # Most nodes are valid scalars whose path is never reported. Format a
+    # child path only when an error or a nested container frame needs it.
+    current_path: str | None = "$"
+    pending_parent_path = "$"
+    pending_index = 0
+    pending_object = False
     result: Any = None
     value = None
     # Nested authority envelopes repeat short field names and exact immutable
@@ -947,32 +958,59 @@ def _walk_bounded_durable_json(
     # count and retained text length are bounded independently of input size.
     string_sizes: dict[str, int] = {}
 
+    def path_now() -> str:
+        nonlocal current_path
+        if current_path is None:
+            current_path = _durable_child_path(
+                pending_parent_path,
+                pending_index,
+                object_value=pending_object,
+            )
+        return current_path
+
+    def string_path(is_key: bool) -> str:
+        return f"{path_now()}/key" if is_key else path_now()
+
+    def too_large(path: str) -> DurableValueError:
+        return DurableValueError(
+            "json_value_too_large",
+            field_name,
+            path=path,
+            limit=max_bytes,
+            observed_lower_bound=max_bytes - remaining,
+        )
+
     def consume(count: int, path: str) -> None:
         nonlocal remaining
         remaining -= count
         if remaining < 0:
-            raise DurableValueError(
-                "json_value_too_large",
-                field_name,
-                path=path,
-                limit=max_bytes,
-                observed_lower_bound=max_bytes - remaining,
-            )
+            raise too_large(path)
 
-    def consume_string(text: str, path: str) -> None:
-        consume(2, path)
+    def consume_string(text: str, is_key: bool) -> None:
+        nonlocal remaining
+        remaining -= 2
+        if remaining < 0:
+            raise too_large(string_path(is_key))
         before = remaining
-        cached_size = string_sizes.get(text) if len(text) <= 256 else None
-        if cached_size is not None and cached_size <= remaining:
-            consume(cached_size, path)
-            return
+        short = len(text) <= 256
+        if short:
+            cached_size = string_sizes.get(text)
+            if cached_size is not None and cached_size <= remaining:
+                remaining -= cached_size
+                return
         # Bound temporary allocation and avoid Python work per character for
         # ordinary text. Special characters retain the ordered scalar checks
         # below, so a later invalid scalar cannot hide an exhausted byte bound.
-        for offset in range(0, len(text), 4096):
-            chunk = text[offset : offset + 4096]
-            if re.search(r'[\x00-\x1f"\\\ud800-\udfff]', chunk) is None:
-                consume(len(chunk.encode("utf-8")), path)
+        for offset in range(0, len(text), _DURABLE_STRING_CHUNK_CHARS):
+            chunk = (
+                text
+                if len(text) <= _DURABLE_STRING_CHUNK_CHARS
+                else text[offset : offset + _DURABLE_STRING_CHUNK_CHARS]
+            )
+            if _JSON_ESCAPED_OR_NONPORTABLE_RE.search(chunk) is None:
+                remaining -= len(chunk) if chunk.isascii() else len(chunk.encode("utf-8"))
+                if remaining < 0:
+                    raise too_large(string_path(is_key))
                 continue
             # Ordinary escapes (newlines, quotes) are sized in C. Only a chunk
             # holding a rejected character or crossing the byte bound takes the
@@ -980,12 +1018,12 @@ def _walk_bounded_durable_json(
             if _NONPORTABLE_STRING_RE.search(chunk) is None:
                 size = _json_string_body_size(chunk)
                 if size <= remaining:
-                    consume(size, path)
+                    remaining -= size
                     continue
-            consume_special_string(chunk, path)
+            consume_special_string(chunk, string_path(is_key))
         # A crossing string always takes the original ordered path, preserving
         # the error location, first invalid scalar and observed lower bound.
-        if len(text) <= 256 and len(string_sizes) < 128:
+        if short and len(string_sizes) < 128:
             string_sizes[text] = before - remaining
 
     def consume_special_string(text: str, path: str) -> None:
@@ -1020,34 +1058,40 @@ def _walk_bounded_durable_json(
                 raise DurableValueError(
                     "too_many_json_nodes",
                     field_name,
-                    path=current_path,
+                    path=path_now(),
                     limit=max_nodes,
                     observed_lower_bound=node_count,
                 )
 
+            current_type = type(current)
             if current is None:
-                consume(4, current_path)
-            elif type(current) is bool:
-                consume(4 if current else 5, current_path)
-            elif type(current) is str or (
-                allow_models and isinstance(current, Enum) and type(current.value) is str
-            ):
-                text = current.value if allow_models and isinstance(current, Enum) else current
-                consume_string(text, current_path)
-            elif type(current) is int:
+                remaining -= 4
+                if remaining < 0:
+                    raise too_large(path_now())
+            elif current_type is bool:
+                remaining -= 4 if current else 5
+                if remaining < 0:
+                    raise too_large(path_now())
+            elif current_type is str:
+                consume_string(current, False)
+            elif allow_models and isinstance(current, Enum) and type(current.value) is str:
+                consume_string(current.value, False)
+            elif current_type is int:
                 if not MIN_DURABLE_JSON_INTEGER <= current <= MAX_DURABLE_JSON_INTEGER:
                     raise DurableValueError(
                         "integer_out_of_range",
                         field_name,
-                        path=current_path,
+                        path=path_now(),
                     )
-                consume(len(str(current)), current_path)
-            elif type(current) is float:
+                remaining -= len(str(current))
+                if remaining < 0:
+                    raise too_large(path_now())
+            elif current_type is float:
                 if not isfinite(current):
                     raise DurableValueError(
                         "non_finite_number",
                         field_name,
-                        path=current_path,
+                        path=path_now(),
                     )
                 if current.is_integer() and not (
                     MIN_DURABLE_JSON_INTEGER <= current <= MAX_DURABLE_JSON_INTEGER
@@ -1055,7 +1099,7 @@ def _walk_bounded_durable_json(
                     raise DurableValueError(
                         "integral_float_out_of_range",
                         field_name,
-                        path=current_path,
+                        path=path_now(),
                     )
                 copied = int(current) if current.is_integer() else current
                 rendered = (
@@ -1063,24 +1107,20 @@ def _walk_bounded_durable_json(
                     if canonical_numbers
                     else json.dumps(copied)
                 )
-                consume(len(rendered), current_path)
+                consume(len(rendered), path_now())
             elif (
                 (
-                    type(current) is list
+                    current_type is list
                     or (allow_tuples and isinstance(current, tuple))
                     or (allow_models and isinstance(current, BaseModel))
                 )
                 and (allow_tuples or not isinstance(current, tuple))
-            ) or type(current) in {
-                dict,
-                FrozenJsonDict,
-                FrozenJsonList,
-            }:
+            ) or current_type in _DURABLE_JSON_CONTAINER_TYPES:
                 if len(frames) >= max_nesting:
                     raise DurableValueError(
                         "nesting_too_deep",
                         field_name,
-                        path=current_path,
+                        path=path_now(),
                         limit=max_nesting,
                         observed_lower_bound=len(frames) + 1,
                     )
@@ -1089,15 +1129,15 @@ def _walk_bounded_durable_json(
                     raise DurableValueError(
                         "circular_reference",
                         field_name,
-                        path=current_path,
+                        path=path_now(),
                     )
-                consume(2, current_path)
+                consume(2, path_now())
                 is_model = allow_models and isinstance(current, BaseModel)
-                is_object = is_model or type(current) in {dict, FrozenJsonDict}
+                is_object = is_model or current_type in _DURABLE_JSON_OBJECT_TYPES
                 copied = ({} if is_object else []) if detach else None
                 if is_model:
                     model_items = []
-                    for name, field in type(current).model_fields.items():
+                    for name, field in current_type.model_fields.items():
                         field_value = getattr(current, name)
                         exclude_if = getattr(field, "exclude_if", None)
                         if field.exclude is True or (
@@ -1115,7 +1155,7 @@ def _walk_bounded_durable_json(
                         value_id=value_id,
                         items=items,
                         is_object=is_object,
-                        path=current_path,
+                        path=path_now(),
                         copied=copied,
                     )
                 )
@@ -1123,7 +1163,7 @@ def _walk_bounded_durable_json(
                 raise DurableValueError(
                     "invalid_json_type",
                     field_name,
-                    path=current_path,
+                    path=path_now(),
                 )
 
             if detach:
@@ -1142,7 +1182,9 @@ def _walk_bounded_durable_json(
                     frames.pop()
                     continue
                 if frame.item_count:
-                    consume(1, frame.path)
+                    remaining -= 1
+                    if remaining < 0:
+                        raise too_large(frame.path)
                 item_index = frame.item_count
                 frame.item_count += 1
                 entry_limit = max_object_entries if frame.is_object else max_array_entries
@@ -1154,25 +1196,25 @@ def _walk_bounded_durable_json(
                         limit=entry_limit,
                         observed_lower_bound=frame.item_count,
                     )
-                child_path = _durable_child_path(
-                    frame.path,
-                    item_index,
-                    object_value=frame.is_object,
-                )
+                pending_parent_path = frame.path
+                pending_index = item_index
+                pending_object = frame.is_object
+                current_path = None
                 if frame.is_object:
                     key, current = entry
                     if type(key) is not str:
                         raise DurableValueError(
                             "invalid_json_key",
                             field_name,
-                            path=f"{child_path}/key",
+                            path=f"{path_now()}/key",
                         )
-                    consume_string(key, f"{child_path}/key")
-                    consume(1, child_path)
+                    consume_string(key, True)
+                    remaining -= 1
+                    if remaining < 0:
+                        raise too_large(path_now())
                     frame.key = key
                 else:
                     current = entry
-                current_path = child_path
                 break
             else:
                 break

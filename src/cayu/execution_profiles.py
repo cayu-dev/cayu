@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from enum import StrEnum
+from functools import lru_cache
 from hashlib import sha256
 from typing import Any, Literal, cast
 
@@ -1568,6 +1569,37 @@ def _profile_fingerprint(
     *,
     schema_version: int,
     runtime_build_provenance: RuntimeBuildProvenance | None = None,
+) -> str:
+    # Components and provenance are frozen models whose JSON dump is a function
+    # of their field values, so equal inputs always hash to equal material.
+    # Validators still compare every stored fingerprint with this result.
+    if type(components) is tuple:
+        return _cached_profile_fingerprint(components, schema_version, runtime_build_provenance)
+    return _compute_profile_fingerprint(
+        components,
+        schema_version=schema_version,
+        runtime_build_provenance=runtime_build_provenance,
+    )
+
+
+@lru_cache(maxsize=512, typed=True)
+def _cached_profile_fingerprint(
+    components: tuple[ExecutionProfileComponentIdentity, ...],
+    schema_version: int,
+    runtime_build_provenance: RuntimeBuildProvenance | None,
+) -> str:
+    return _compute_profile_fingerprint(
+        components,
+        schema_version=schema_version,
+        runtime_build_provenance=runtime_build_provenance,
+    )
+
+
+def _compute_profile_fingerprint(
+    components: tuple[ExecutionProfileComponentIdentity, ...],
+    *,
+    schema_version: int,
+    runtime_build_provenance: RuntimeBuildProvenance | None,
 ) -> str:
     material: dict[str, Any] = {
         "schema_version": schema_version,

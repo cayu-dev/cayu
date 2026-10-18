@@ -79,14 +79,15 @@ def test_repeated_json_strings_preserve_exact_failure_evidence(suffix):
 def test_repeated_json_string_sizing_is_local_and_bounded(monkeypatch):
     from cayu import _validation
 
-    search = _validation.re.search
+    pattern = _validation._JSON_ESCAPED_OR_NONPORTABLE_RE
     scanned = []
 
-    def record(pattern, text, *args, **kwargs):
-        scanned.append(text)
-        return search(pattern, text, *args, **kwargs)
+    class RecordingPattern:
+        def search(self, text, *args, **kwargs):
+            scanned.append(text)
+            return pattern.search(text, *args, **kwargs)
 
-    monkeypatch.setattr(_validation.re, "search", record)
+    monkeypatch.setattr(_validation, "_JSON_ESCAPED_OR_NONPORTABLE_RE", RecordingPattern())
     for _ in range(2):
         scanned.clear()
         inspect_bounded_durable_json(["repeat"] * 20, "record", max_bytes=1024, max_nodes=100)

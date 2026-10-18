@@ -78,6 +78,9 @@ def _validate_bounded_text(value: str, field_name: str, max_bytes: int) -> str:
     return value
 
 
+# A pure function of four validated scalars. Every model validation still
+# compares its stored fingerprint with this value; only the hashing is reused.
+@lru_cache(maxsize=256, typed=True)
 def _runtime_build_fingerprint(
     *,
     origin: RuntimeBuildProvenanceOrigin,

@@ -25,8 +25,26 @@ from cayu.vaults.redaction import SecretRedactor
 ValueT = TypeVar("ValueT", bound=ContractValue)
 
 
+# Both annotation helpers are pure functions of trusted, immutable schema
+# annotations. Unhashable annotations fall back to the direct computation.
+_LITERAL_CONTROLS: dict[object, tuple[object, ...] | None] = {}
+_STRUCTURAL_ANNOTATIONS: dict[object, object] = {}
+
+
 def _literal_controls(annotation: object) -> tuple[object, ...] | None:
     """Only closed literal/None unions are controls; a text branch is not."""
+    try:
+        return _LITERAL_CONTROLS[annotation]
+    except KeyError:
+        controls = _compute_literal_controls(annotation)
+        if len(_LITERAL_CONTROLS) < 4096:
+            _LITERAL_CONTROLS[annotation] = controls
+        return controls
+    except TypeError:
+        return _compute_literal_controls(annotation)
+
+
+def _compute_literal_controls(annotation: object) -> tuple[object, ...] | None:
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin is Annotated:
@@ -48,6 +66,18 @@ def _literal_controls(annotation: object) -> tuple[object, ...] | None:
 
 def _structural_annotation(annotation: object) -> object:
     """Unwrap metadata and a single nullable branch, never choose a text union."""
+    try:
+        return _STRUCTURAL_ANNOTATIONS[annotation]
+    except KeyError:
+        structural = _compute_structural_annotation(annotation)
+        if len(_STRUCTURAL_ANNOTATIONS) < 4096:
+            _STRUCTURAL_ANNOTATIONS[annotation] = structural
+        return structural
+    except TypeError:
+        return _compute_structural_annotation(annotation)
+
+
+def _compute_structural_annotation(annotation: object) -> object:
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin is Annotated:
