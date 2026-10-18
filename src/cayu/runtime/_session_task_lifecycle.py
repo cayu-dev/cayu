@@ -461,6 +461,104 @@ class SessionTaskLifecycle:
             session_invocation=session_invocation,
         )
 
+    async def fail_task_for_execution_deadline(
+        self,
+        *,
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_lease_expires_at: datetime | None = None,
+        task_handoff_id: str | None,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> bool:
+        """Settle an owned ordinary task after deadline cancellation has drained.
+
+        Exact latest lifecycle evidence covers setup as well as dispatched work.
+        The interrupted session remains available for external-effect recovery.
+        """
+        from cayu.sessions.event_queries import EventOrder, EventQuery
+        from cayu.sessions.terminal_evidence import TERMINAL_EVIDENCE_EVENT_TYPES
+
+        if task_id is None or self.task_store is None:
+            return False
+        task = await self.task_store.load_task(task_id)
+        current = await self.session_store.load(session.id)
+        if (
+            task is None
+            or current is None
+            or current.instance_id != session.instance_id
+            or current.status is not SessionStatus.INTERRUPTED
+            or task.status not in {TaskStatus.PENDING, TaskStatus.CLAIMED, TaskStatus.RUNNING}
+            or task.worker_id != task_worker_id
+            or task.session_id not in {None, session.id}
+            or task.session_instance_id not in {None, session.instance_id}
+            or task.retry_series is not None
+            or task.work_contract is not None
+        ):
+            return False
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=TERMINAL_EVIDENCE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records:
+            return False
+        terminal = records[0].event
+        evidence = terminal.payload.get("failure_evidence")
+        if (
+            terminal.type != EventType.SESSION_INTERRUPTED
+            or type(evidence) is not dict
+            or evidence.get("classification") != "deadline"
+            or evidence.get("session_id") != session.id
+            or evidence.get("run_epoch") != session.run_epoch
+        ):
+            return False
+        from cayu.runtime._task_lease_authority import managed_task_lease_mutation
+
+        async with managed_task_lease_mutation(
+            task_id=task.id,
+            worker_id=task_worker_id,
+            handoff_id=task_handoff_id,
+            presented_lease_expires_at=task_lease_expires_at,
+        ) as exact_lease:
+            failed = await self._session_finalization.fail_task(
+                task_id=task.id,
+                task_worker_id=task_worker_id,
+                task_lease_expires_at=exact_lease,
+                task_handoff_id=task_handoff_id,
+                session=session,
+                error=self._secret_redactor.redact_json(
+                    {
+                        "error": "ExecutionDeadlineExceeded",
+                        "message": "Execution deadline expired; task timed out.",
+                        "failure_evidence": evidence,
+                        "execution_deadline": terminal.payload.get("execution_deadline"),
+                        "deadline_failure": {
+                            "session_id": session.id,
+                            "session_instance_id": session.instance_id,
+                            "run_epoch": session.run_epoch,
+                            "terminal_event_id": terminal.id,
+                            "task_started": task.started_at is not None,
+                            "task_handoff_id": task_handoff_id,
+                        },
+                    }
+                ),
+            )
+        await self._event_writer.emit(
+            _task_event(
+                event_type=EventType.TASK_FAILED,
+                task=failed,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+        )
+        return True
+
     async def fail_task_for_run_setup_error(
         self,
         *,
@@ -1249,6 +1347,20 @@ class SessionTaskLifecycle:
             redactor=self._secret_redactor,
             authority_kind="task continuation authority",
         )
+        if allow_terminal_failure_replay:
+            from cayu.runtime._deadline_task_failure import load_deadline_task_failure
+
+            deadline_failure = await load_deadline_task_failure(
+                self.task_store,
+                self.session_store,
+                task_id=task_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+            )
+            if deadline_failure is not None:
+                return
         if task_worker_id is None:
             if expected_runtime_task_terminalization_request_sha256 is not None:
                 if await self._runtime_task_failure_decision_receipt_is_durable(

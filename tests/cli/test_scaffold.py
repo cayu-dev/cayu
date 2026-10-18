@@ -1853,6 +1853,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     settings_source = (project / "configuration/settings.py").read_text(encoding="utf-8")
     storage_source = (project / "configuration/storage.py").read_text(encoding="utf-8")
     assert "create_agent_service(" in service_source
+    assert "execution_timeout_s=600" in service_source
     assert "product_operations=True" in service_source
     assert "from product_store" not in service_source
     assert "product_operations=build_product" in storage_source

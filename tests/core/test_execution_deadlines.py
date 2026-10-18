@@ -887,3 +887,123 @@ def test_consumed_cancellation_cannot_report_successful_execution():
         assert raised.value.diagnostics["remaining_seconds"] == 0
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("worker_owned", [False, True])
+@pytest.mark.parametrize("blocked", ["provider", "tool", "session_started"])
+@pytest.mark.parametrize("sqlite", [False, True])
+def test_task_deadline_releases_ownership_after_cancellation_drains(
+    worker_owned,
+    blocked,
+    sqlite,
+    sqlite_resources,
+    monkeypatch,
+):
+    from cayu import Tool, ToolEffect, ToolResult, ToolSpec
+    from cayu.storage import SQLiteTaskStore
+    from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, run_task_worker
+
+    async def scenario():
+        async with sqlite_resources as resources:
+            store = (
+                resources.own(SQLiteTaskStore(resources.path())) if sqlite else InMemoryTaskStore()
+            )
+            entered, settled = [], []
+
+            class StalledProvider(ScriptedModelProvider):
+                async def stream(self, request):
+                    entered.append("provider")
+                    try:
+                        await asyncio.Event().wait()
+                        yield ModelStreamEvent.completed()
+                    finally:
+                        await asyncio.sleep(0)
+                        settled.append("provider")
+
+            class StalledTool(Tool):
+                spec = ToolSpec(name="wait", effect=ToolEffect.NONE)
+
+                async def run(self, ctx, arguments):
+                    entered.append("tool")
+                    try:
+                        await asyncio.Event().wait()
+                        return ToolResult(content="unreachable")
+                    finally:
+                        await asyncio.sleep(0)
+                        settled.append("tool")
+
+            provider = (
+                StalledProvider([])
+                if blocked == "provider"
+                else ScriptedModelProvider(
+                    [
+                        ModelStreamEvent.tool_call(id="wait", name="wait", arguments={}),
+                        ModelStreamEvent.completed(),
+                    ]
+                )
+            )
+            app = CayuApp(task_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="worker", model="scripted"), tools=[StalledTool()])
+            if blocked == "session_started":
+                emit = app._event_writer.emit
+
+                async def stall_after_session_started(event):
+                    recorded = await emit(event)
+                    if event.type is EventType.SESSION_STARTED:
+                        entered.append("session_started")
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            settled.append("session_started")
+                    return recorded
+
+                monkeypatch.setattr(app._event_writer, "emit", stall_after_session_started)
+            task = await store.create_task(TaskCreate(type="deadline-test"))
+
+            async def handler(app, task, worker_id=None):
+                async for _ in app.run(
+                    RunRequest(
+                        agent_name="worker",
+                        session_id="timed-out-task",
+                        messages=[Message.text("user", "go")],
+                        task_id=task.id,
+                        task_worker_id=worker_id,
+                        task_lease_expires_at=task.lease_expires_at,
+                        execution_deadline=ExecutionDeadline.after(5),
+                    )
+                ):
+                    pass
+
+            if worker_owned:
+                assert (
+                    await asyncio.wait_for(
+                        run_task_worker(
+                            app,
+                            store,
+                            handler,
+                            worker_id="deadline-worker",
+                            max_tasks=1,
+                        ),
+                        15,
+                    )
+                    == 1
+                )
+            else:
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(handler(app, task), 15)
+            final = await store.load_task(task.id)
+            assert entered == [blocked]
+            assert settled == [blocked]
+            assert final.status is TaskStatus.FAILED
+            assert final.worker_id is None and final.lease_expires_at is None
+            assert final.error["error"] == "ExecutionDeadlineExceeded"
+            assert final.error["failure_evidence"]["classification"] == "deadline"
+            assert final.error["failure_evidence"]["settlement"] == "unknown"
+            records = await app.session_store.load_events("timed-out-task")
+            terminal = next(
+                event for event in reversed(records) if event.type is EventType.SESSION_INTERRUPTED
+            )
+            assert final.error["deadline_failure"]["terminal_event_id"] == terminal.id
+
+    asyncio.run(scenario())

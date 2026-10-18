@@ -364,6 +364,7 @@ def runtime_task_failure_terminalization_request(
     *,
     task_id: str,
     task_worker_id: str,
+    task_lease_expires_at: datetime | None = None,
     task_handoff_id: str | None,
     session_id: str,
     error: dict[str, Any],
@@ -373,6 +374,7 @@ def runtime_task_failure_terminalization_request(
     return TaskTerminalizationRequest(
         task_id=task_id,
         worker_id=task_worker_id,
+        lease_expires_at=task_lease_expires_at,
         handoff_id=task_handoff_id,
         kind=TaskTerminalKind.FAILED,
         error=error,

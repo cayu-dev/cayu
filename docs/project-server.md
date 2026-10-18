@@ -308,6 +308,21 @@ Maintained product creation accepts at most 1 MiB of encoded JSON and rejects
 duplicate object keys before FastAPI validation. Product responses are marked
 `Cache-Control: private, no-store`.
 
+The generated service sets `execution_timeout_s=600` on `create_agent_service`.
+Choose a duration for the slowest expected job, including model and tool waits;
+set it to `None` only to deliberately allow unbounded execution. The framework
+constructor defaults to `None`, so existing applications keep their configured
+behavior. The timer starts when a new product operation begins running, and its
+stored finish-by deadline survives recovery. Queue wait is excluded.
+
+A deadline stops execution and fails the attached ordinary task with
+`ExecutionDeadlineExceeded` after cancellation drains. The dashboard shows the
+expiry beside the session and labels its outcome **timed out**. A session can
+remain interrupted with accounting or external-operation recovery evidence;
+that evidence is retained even though the job and product operation failed.
+Expiry does not prove that a remote effect never happened. Inspect the retained
+recovery state before retrying work with external side effects.
+
 The built-in listener uses HTTP. A production public service must run behind a
 trusted TLS-terminating ingress or reverse proxy with the backend listener
 restricted to that trusted network. Expose only HTTPS to customers and

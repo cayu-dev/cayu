@@ -400,6 +400,7 @@ def _build_service(
     control_plane_path="/cayu",
     execution_profile_policy=None,
     project_context=None,
+    execution_timeout_s=None,
 ):
     provider = provider or ScriptedModelProvider(
         [
@@ -448,6 +449,7 @@ def _build_service(
         product_api_path=product_api_path,
         control_plane_path=control_plane_path,
         project_context=project_context,
+        execution_timeout_s=execution_timeout_s,
     )
     return service, product_store, provider
 
@@ -3492,5 +3494,109 @@ def test_execution_stops_before_a_blocked_heartbeat_can_outlive_its_lease(
             )
 
         assert store.by_work_id["work_heartbeat_timeout"].status == "failed"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("duration", [0, 1])
+def test_product_execution_deadline_fails_task_and_operation_without_redispatch(duration):
+    settled = []
+
+    class StalledProvider(ScriptedModelProvider):
+        async def stream(self, request):
+            self.requests.append(request)
+            try:
+                await asyncio.Event().wait()
+                yield ModelStreamEvent.completed()
+            finally:
+                settled.append(True)
+
+    async def scenario():
+        provider = StalledProvider([])
+        service, store, _ = _build_service(provider, execution_timeout_s=duration)
+        assert service.execution_timeout_s == duration
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            subject_id="test-subject",
+            idempotency_key="deadline",
+            request_fingerprint=_product_request_fingerprint("bounded work"),
+            public_id="op_deadline",
+            work_id="work_deadline",
+            session_id="session_deadline",
+            task_id="task_deadline",
+            request_text="bounded work",
+        )
+        operation = await asyncio.wait_for(service.execute_work(reservation.operation.work_id), 10)
+        assert operation.status == "failed"
+        task = await service.cayu_app.task_store.load_task(operation.task_id)
+        assert task.status is TaskStatus.FAILED
+        assert task.error["error"] == "ExecutionDeadlineExceeded"
+        assert task.worker_id is None
+        assert settled == ([] if duration == 0 else [True])
+        # Durable redelivery recognizes the completed failure without spending again.
+        assert (await service.execute_work(operation.work_id)).status == "failed"
+        assert len(provider.requests) == (0 if duration == 0 else 1)
+        state = await service.cayu_app.session_store.load(operation.session_id)
+        if duration == 0:
+            assert state is None
+        else:
+            assert state.execution_deadline.expires_at is not None
+            assert state.status is SessionStatus.INTERRUPTED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("duration", [-1, float("inf"), float("nan"), True])
+def test_product_execution_deadline_rejects_invalid_durations(duration):
+    with pytest.raises(ValueError, match="Deadline duration"):
+        _build_service(execution_timeout_s=duration)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        EventType.INTERACTION_STARTED,
+        EventType.TASK_STARTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
+    ],
+)
+def test_product_deadline_during_setup_settles_task_and_redelivery(monkeypatch, phase):
+    from cayu.runtime._event_writer import RuntimeEventWriter
+
+    async def scenario():
+        provider = ScriptedModelProvider([])
+        service, store, _ = _build_service(provider, execution_timeout_s=2)
+        entered = False
+        original = RuntimeEventWriter._deliver_persisted_side_effect_claim
+
+        async def block_setup(writer, claim, *args, **kwargs):
+            nonlocal entered
+            result = await original(writer, claim, *args, **kwargs)
+            if writer is service.cayu_app._event_writer and not entered and result[0].type == phase:
+                entered = True
+                await asyncio.Event().wait()
+            return result
+
+        monkeypatch.setattr(RuntimeEventWriter, "_deliver_persisted_side_effect_claim", block_setup)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            subject_id="test-subject",
+            idempotency_key="setup-deadline",
+            request_fingerprint=_product_request_fingerprint("bounded setup"),
+            public_id="op_setup",
+            work_id="work_setup",
+            session_id="session_setup",
+            task_id="task_setup",
+            request_text="bounded setup",
+        )
+        operation = await asyncio.wait_for(service.execute_work(reservation.operation.work_id), 15)
+        assert entered, "The test must reach its selected setup boundary."
+        assert operation.status == "failed"
+        task = await service.cayu_app.task_store.load_task(operation.task_id)
+        assert task.status is TaskStatus.FAILED
+        assert task.error["error"] == "ExecutionDeadlineExceeded"
+        assert provider.requests == []
+        assert (await service.execute_work(operation.work_id)).status == "failed"
+        assert provider.requests == []
 
     asyncio.run(scenario())

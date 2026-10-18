@@ -8895,3 +8895,102 @@ def test_competing_offline_recovery_workers_converge_on_one_completion() -> None
         assert len(await store.load_transcript("competing-offline-recovery")) == 2
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("worker_owned", [False, True])
+def test_deadline_failed_task_allows_provider_failure_settlement_only(
+    task_store_kind, worker_owned, tmp_path
+):
+    from cayu.deadlines import ExecutionDeadline
+    from cayu.tasks import run_task_worker
+
+    class PendingAdapter(_BudgetedOfflineOperationAdapter):
+        async def start(self, request):
+            self.start_calls += 1
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def scenario():
+        store = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "deadline-provider.db")
+        )
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        provider.adapter = PendingAdapter()
+        ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+        app = CayuApp(
+            task_store=store,
+            budget_policy=_budget_policy(provider.name),
+            budget_ledger=ledger,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker", model="fake-model"))
+        task = await store.create_task(TaskCreate(type="job"))
+
+        async def handler(app, task, worker_id=None):
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="worker",
+                    session_id="deadline-provider",
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
+                    messages=[Message.text("user", "start")],
+                    execution_deadline=ExecutionDeadline.after(5),
+                )
+            ):
+                pass
+
+        try:
+            if worker_owned:
+                await run_task_worker(app, store, handler, worker_id="original", max_tasks=1)
+            else:
+                with pytest.raises(TimeoutError):
+                    await handler(app, task)
+            failed = await store.load_task(task.id)
+            assert failed.status is TaskStatus.FAILED
+            assert failed.error["error"] == "ExecutionDeadlineExceeded"
+            session = await app.session_store.load("deadline-provider")
+            stage = await app.session_store.load_active_model_completion_stage(session.id)
+            assert stage is not None and stage.stage.reservation_ids
+            [reservation_id] = stage.stage.reservation_ids
+            request = ProviderOperationResolutionRequest(
+                session_id=session.id,
+                stage_id=stage.stage.stage_id,
+                expected_run_epoch=session.run_epoch,
+                task_worker_id="original" if worker_owned else None,
+                action=ProviderOperationResolutionAction.FAIL,
+                reason="settle the expired run without replacement work",
+            )
+            with pytest.raises(TaskClaimLost):
+                _ = [
+                    e
+                    async for e in app.resolve_provider_operation(
+                        request.model_copy(
+                            update={"action": ProviderOperationResolutionAction.FALLBACK_RETRY}
+                        )
+                    )
+                ]
+            events = [e async for e in app.resolve_provider_operation(request)]
+            assert events[-1].type is EventType.SESSION_FAILED
+            assert provider.adapter.start_calls == 1
+            assert await store.load_task(task.id) == failed
+            assert (await ledger.load_reservation(reservation_id)).status == "reconciled"
+            replay = [e async for e in app.resolve_provider_operation(request)]
+            assert [e.type for e in replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
+            if worker_owned:
+                with pytest.raises(TaskClaimLost):
+                    _ = [
+                        e
+                        async for e in app.resolve_provider_operation(
+                            request.model_copy(update={"task_worker_id": "foreign"})
+                        )
+                    ]
+        finally:
+            if task_store_kind == "sqlite":
+                await store.close()
+
+    asyncio.run(scenario())

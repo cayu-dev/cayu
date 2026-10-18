@@ -2319,6 +2319,18 @@ class SessionEngine:
                 ):
                     yield event
                 return
+
+            async def settle_pre_run_deadline_task() -> None:
+                await self._session_tasks.fail_task_for_execution_deadline(
+                    task_id=request.task_id,
+                    task_worker_id=request.task_worker_id,
+                    task_lease_expires_at=request.task_lease_expires_at,
+                    task_handoff_id=None,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+
             await self._recovery_ownership.run_cleanup_steps(
                 authoritative_failure=cancellation,
                 steps=(
@@ -2332,6 +2344,10 @@ class SessionEngine:
                             execution_profile=execution_profile,
                             invocation_context=invocation_context,
                         ),
+                    ),
+                    (
+                        "cancelled pre-run task deadline finalization",
+                        settle_pre_run_deadline_task,
                     ),
                 ),
             )
@@ -2742,6 +2758,35 @@ class SessionEngine:
                         "Session interruption transition failed after provider billing cancellation"
                     ) from None
             raise billing_identity_cancellation_group
+
+        if (
+            expired_execution_deadline() is not None
+            and invocation_context.work_attempt is None
+            and (propagated_cancellation is not None or propagated_cancellation_group is not None)
+        ):
+
+            async def settle_expired_task() -> None:
+                await self._session_finalization.finalize_abandoned_session_by_id(
+                    session.id,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                )
+                await self._session_tasks.fail_task_for_execution_deadline(
+                    task_id=request.task_id,
+                    task_worker_id=request.task_worker_id,
+                    task_lease_expires_at=request.task_lease_expires_at,
+                    task_handoff_id=None,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+
+            await self._recovery_ownership.run_cleanup_steps(
+                authoritative_failure=propagated_cancellation or propagated_cancellation_group,
+                steps=(("expired task finalization after stream cleanup", settle_expired_task),),
+            )
 
         if propagated_cancellation is not None:
             if self._session_control.is_interruption_request_active(
@@ -8802,6 +8847,17 @@ class SessionEngine:
                         )
                     )
                 )
+                if deadline_expired and invocation_context.work_attempt is None:
+                    outcome_state.task_finished = (
+                        await self._session_tasks.fail_task_for_execution_deadline(
+                            task_id=task_id,
+                            task_worker_id=task_worker_id,
+                            task_handoff_id=task_handoff_id,
+                            session=outcome_state.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                        )
+                    ) or outcome_state.task_finished
 
             cancellation_cleanup_steps = (
                 (

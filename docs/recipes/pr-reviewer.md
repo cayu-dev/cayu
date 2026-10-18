@@ -90,6 +90,8 @@ async def handle_pr_review_task(app, task, worker_id):
                   "base_ref": task.input["base_ref"]},
         messages=[Message.text("user", f"Review pull request #{pr} in {owner}/{repo}.")],
         limits=RunLimits(max_tool_calls=20, max_elapsed_seconds=600),
+        # Choose a wall-clock cap for the expected review size, including waits.
+        execution_deadline=ExecutionDeadline.after(600, source="pr_review"),
     )
     async for event in app.run(request):
         ...
@@ -104,13 +106,19 @@ await run_task_worker(
 )
 ```
 
+Import `ExecutionDeadline` from `cayu.deadlines`. The ten-minute expiry cancels
+stalled provider/tool awaits as well as stopping new work. Choose a value for
+your expected review size; `ExecutionDeadline.after(None)` deliberately leaves
+execution unbounded. A stored deadline continues across recovery and resume.
+
 Two things worth calling out:
 
 - **`metadata` fans out to everything downstream.** The environment factory reads
   it to know which repo to check out; the tools read it (via `ctx.metadata`) to
   know which PR to fetch and comment on. It is the single source of PR identity.
 - **`RunLimits` are your blast-radius cap** — a QA agent runs shell, so bound its
-  tool calls and wall-clock. (Limits are enforced per run; see
+  tool calls and elapsed work. `execution_deadline` supplies the active finish-by
+  timer. (Limits are enforced per run; see
   [runtime-contracts](../runtime-contracts.md).)
 
 ## 3. A fresh review workspace per PR

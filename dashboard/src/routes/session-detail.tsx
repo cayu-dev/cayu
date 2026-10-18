@@ -98,7 +98,7 @@ import {
   optionalString,
   summarizeFailureEvent,
 } from "../lib/session-debug"
-import { sessionExecutionLabel } from "../lib/session-execution"
+import { sessionDeadlineState, sessionExecutionLabel } from "../lib/session-execution"
 import {
   CoalescedAsyncRunner,
   durationDetail,
@@ -2797,9 +2797,15 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const tokenInput = summary?.usage.usage?.input_tokens
   const tokenOutput = summary?.usage.usage?.output_tokens
   const tokenTotal = summary === undefined ? null : totalTokens(summary)
-  const outcomeReason = summaryIsCurrent
-    ? summary.outcome.reason || summary.session.status
-    : session.status
+  const deadlineState = sessionDeadlineState(
+    session.metadata,
+    summaryIsCurrent ? summary.outcome.terminal_event : null,
+  )
+  const outcomeReason = deadlineState.timedOut
+    ? "timed out"
+    : summaryIsCurrent
+      ? summary.outcome.reason || summary.session.status
+      : session.status
   const latestEvent = summary?.events.latest_event
   const eventCounts = summaryIsCurrent ? sortedEventCounts(summary) : []
   const totalEvents = summaryIsCurrent ? summary.events.total_events : undefined
@@ -2808,8 +2814,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     (transcriptFiltersActive
       ? transcript.length
       : (summary?.transcript.total_messages ?? transcript.length))
-  const statusDetail =
-    summaryIsCurrent && summary.outcome.retry ? "retry recorded" : "current lifecycle state"
+  const statusDetail = deadlineState.timedOut
+    ? "Execution deadline expired; recovery evidence remains available"
+    : summaryIsCurrent && summary.outcome.retry
+      ? "retry recorded"
+      : "current lifecycle state"
   const summaryUnavailableDetail = summaryQuery.isError ? "summary unavailable" : "loading summary"
   const summarySnapshotDetail = summaryIsCurrent ? "" : " · snapshot"
   const createdAtMs = timestampMs(session.created_at)
@@ -2973,7 +2982,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         </Link>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant={statusVariant(session.status)}>{session.status}</Badge>
+            <Badge variant={deadlineState.timedOut ? "destructive" : statusVariant(session.status)}>
+              {deadlineState.timedOut ? "timed out" : session.status}
+            </Badge>
             {state?.execution && (
               <Badge
                 variant={state.execution.state === "owner_lost" ? "destructive" : "outline"}
@@ -2990,6 +3001,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           </h1>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
             <span>Created {formatDateTime(session.created_at)}</span>
+            {deadlineState.expiresAt && (
+              <span>Deadline {formatDateTime(deadlineState.expiresAt)}</span>
+            )}
             {session.provider_name && <Badge variant="outline">{session.provider_name}</Badge>}
             {session.model && <Badge variant="outline">{session.model}</Badge>}
             <Badge

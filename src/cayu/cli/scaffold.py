@@ -1270,6 +1270,9 @@ def build_service(
         product_access=selected_product_access,
         operator_access=selected_operator_access,
         product_store=stores.product_store,
+        # Choose a cap for the slowest expected job, including provider/tool waits.
+        # Set None only when deliberately allowing unbounded execution.
+        execution_timeout_s=600,
     )
 '''
 

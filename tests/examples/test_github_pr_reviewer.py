@@ -236,6 +236,7 @@ def test_pr_review_session_identity_includes_head_sha() -> None:
     request = captured["request"]
     assert request.session_id == "pr-review-acme-app-7-abcdef123456"
     assert request.metadata["head_sha"] == "abcdef1234567890"
+    assert 590 < request.execution_deadline.remaining_seconds() <= 600
     assert "abcdef123456" in request.messages[0].content[0].text
 
 

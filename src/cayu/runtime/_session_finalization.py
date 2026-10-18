@@ -3295,18 +3295,34 @@ class SessionFinalization:
         *,
         task_id: str,
         task_worker_id: str | None,
+        task_lease_expires_at: datetime | None = None,
         task_handoff_id: str | None,
         session: Session,
         error: dict[str, Any],
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        if error == provider_operation_task_failure_payload(session_id=session.id):
+            from cayu.runtime._deadline_task_failure import load_deadline_task_failure
+
+            deadline_failure = await load_deadline_task_failure(
+                self.task_store,
+                self.session_store,
+                task_id=task_id,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+            )
+            if deadline_failure is not None:
+                return deadline_failure
         if task_worker_id is not None:
             return await _terminalize_claimed_task(
                 self.task_store,
                 runtime_task_failure_terminalization_request(
                     task_id=task_id,
                     task_worker_id=task_worker_id,
+                    task_lease_expires_at=task_lease_expires_at,
                     task_handoff_id=task_handoff_id,
                     session_id=session.id,
                     error=error,

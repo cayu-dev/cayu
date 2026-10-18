@@ -47,7 +47,9 @@ from cayu._validation import (
 )
 from cayu.applications import CayuApp
 from cayu.budgets.usage import is_conversational_model_completion_payload
+from cayu.deadlines import ExecutionDeadline
 from cayu.events import Event, EventType
+from cayu.failure_evidence import exception_evidence
 from cayu.messages import Message
 from cayu.project_control_plane import ProjectControlPlaneContext
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -79,7 +81,11 @@ from cayu.sessions.invocation import (
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ResumeRequest, RunRequest
-from cayu.sessions.terminal_evidence import TerminalSessionEvidence, TerminalSessionEvidenceError
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_EVIDENCE_EVENT_TYPES,
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+)
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.records import Task, TaskStatus
 from cayu.vaults import (
@@ -862,6 +868,7 @@ class CayuService:
         "_asgi_app",
         "_assembly_token",
         "_cayu_app",
+        "_execution_timeout_s",
         "_manifest",
         "_product_store",
         "_project_control_plane_context",
@@ -877,6 +884,7 @@ class CayuService:
         manifest: PublicServiceManifest,
         product_store: ProductOperationStore,
         agent_name: str,
+        execution_timeout_s: float | None = None,
         project_control_plane_context: ProjectControlPlaneContext | None = None,
         _assembly_token: object | None = None,
     ) -> None:
@@ -887,6 +895,7 @@ class CayuService:
         self._manifest = manifest
         self._product_store = product_store
         self._agent_name = agent_name
+        self._execution_timeout_s = execution_timeout_s
         self._project_control_plane_context = project_control_plane_context
         self._assembly_token = _assembly_token
         self._route_signature: tuple[object, ...] | None = None
@@ -911,6 +920,11 @@ class CayuService:
     @property
     def agent_name(self) -> str:
         return self._agent_name
+
+    @property
+    def execution_timeout_s(self) -> float | None:
+        """Configured finish-by duration for each new product operation."""
+        return self._execution_timeout_s
 
     @property
     def project_control_plane_context_attached(self) -> bool:
@@ -1081,6 +1095,9 @@ class CayuService:
                         messages=[Message.text("user", operation.request_text)],
                         session_id=operation.session_id,
                         task_id=operation.task_id,
+                        execution_deadline=ExecutionDeadline.after(
+                            self.execution_timeout_s, source="product_service"
+                        ),
                         loop_policies=(receipt_policy,),
                     ),
                     receipt_policy=receipt_policy,
@@ -1166,6 +1183,31 @@ async def _reconcile_uncertain_product_stream(
     """Settle only exact terminal evidence after the runtime stream becomes uncertain."""
 
     try:
+        deadline_failure = exception_evidence(observation_failure)
+        if deadline_failure.classification == "deadline":
+            task_store = service.cayu_app.task_store
+            if task_store is None:
+                raise RuntimeError("task_store is required to settle an expired product job.")
+            task = await task_store.load_task(operation.task_id)
+            if (
+                task is not None
+                and _validated_product_task(
+                    task, operation=operation, agent_name=service.agent_name
+                ).status
+                is TaskStatus.PENDING
+                and await service.cayu_app.session_store.load_state(operation.session_id) is None
+            ):
+                await task_store.fail_task(
+                    task.id,
+                    service.cayu_app.redact_json(
+                        {
+                            "error": "ExecutionDeadlineExceeded",
+                            "message": "Execution deadline expired before the task started.",
+                            "failure_evidence": deadline_failure.model_dump(mode="json"),
+                            "deadline_failure_before_run": True,
+                        }
+                    ),
+                )
         reconciled = await _reconcile_terminal_product_work(
             service=service,
             operation=operation,
@@ -1935,6 +1977,26 @@ async def _reconcile_terminal_product_work(
         agent_name=service.agent_name,
     )
     state = await service.cayu_app.session_store.load_state(operation.session_id)
+    error = task.error or {}
+    if task.status is TaskStatus.FAILED and (
+        (
+            state is None
+            and error.get("deadline_failure_before_run") is True
+            and error.get("error") == "ExecutionDeadlineExceeded"
+        )
+        or (
+            state is not None
+            and state.status is SessionStatus.INTERRUPTED
+            and await _product_deadline_failure_is_current(service, operation, task)
+        )
+    ):
+        return await _finish_product_operation_resisting_cancellation(
+            service.product_store,
+            operation=operation,
+            claim_id=claim_id,
+            status="failed",
+            result=None,
+        )
     if state is None:
         return None
     if not getattr(
@@ -1987,6 +2049,54 @@ async def _reconcile_terminal_product_work(
         claim_id=claim_id,
         status=receipt.publication_status,
         result=(receipt.result if receipt.publication_status == "completed" else None),
+    )
+
+
+async def _product_deadline_failure_is_current(
+    service: CayuService, operation: ProductOperation, task: Task
+) -> bool:
+    """Verify the exact interrupted run retained by Runtime's timeout failure."""
+    marker = (task.error or {}).get("deadline_failure")
+    if type(marker) is not dict:
+        return False
+    session = await service.cayu_app.session_store.load(operation.session_id)
+    if (
+        session is None
+        or session.status is not SessionStatus.INTERRUPTED
+        or session.agent_name != service.agent_name
+        or (
+            task.session_instance_id != session.instance_id
+            and not (task.session_instance_id is None and marker.get("task_started") is False)
+        )
+        or marker.get("session_id") != session.id
+        or marker.get("session_instance_id") != session.instance_id
+        or type(marker.get("run_epoch")) is not int
+        or marker["run_epoch"] > session.run_epoch
+        or type(marker.get("terminal_event_id")) is not str
+    ):
+        return False
+    records = await service.cayu_app.session_store.query_events(
+        EventQuery(
+            session_id=session.id,
+            event_types=TERMINAL_EVIDENCE_EVENT_TYPES,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    if len(records) != 1:
+        return False
+    event = records[0].event
+    evidence = event.payload.get("failure_evidence")
+    return (
+        event.id == marker["terminal_event_id"]
+        and event.type is EventType.SESSION_INTERRUPTED
+        and event.session_id == session.id
+        and event.agent_name == service.agent_name
+        and type(evidence) is dict
+        and evidence.get("classification") == "deadline"
+        and evidence.get("session_id") == session.id
+        and evidence.get("run_epoch") == marker["run_epoch"]
+        and evidence == (task.error or {}).get("failure_evidence")
     )
 
 
@@ -2494,16 +2604,23 @@ def create_agent_service(
     product_access: ProductAccess,
     operator_access: OperatorAccess,
     product_store: ProductOperationStore,
+    execution_timeout_s: float | None = None,
     product_api_path: str = "/api",
     control_plane_path: str = "/cayu",
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evals: EvalsConfig | None = None,
     project_context: ProjectControlPlaneContext | None = None,
 ) -> CayuService:
-    """Assemble the maintained product API and separately protected control plane."""
+    """Assemble the maintained product API and separately protected control plane.
+
+    ``execution_timeout_s`` bounds each new operation's runtime execution; ``None``
+    leaves it unbounded. Durable session deadlines remain in force across recovery.
+    Queue wait before execution is not charged against this duration.
+    """
 
     if not isinstance(app, CayuApp):
         raise TypeError("create_agent_service requires a CayuApp.")
+    ExecutionDeadline.after(execution_timeout_s, source="product_service")
     if project_context is not None and type(project_context) is not ProjectControlPlaneContext:
         raise TypeError("project_context must be a framework-owned ProjectControlPlaneContext.")
     agent_name = require_durable_clean_nonblank(agent_name, "agent_name")
@@ -2569,6 +2686,7 @@ def create_agent_service(
         manifest=manifest,
         product_store=product_store,
         agent_name=agent_name,
+        execution_timeout_s=execution_timeout_s,
         project_control_plane_context=project_context,
         _assembly_token=_SERVICE_ASSEMBLY_TOKEN,
     )

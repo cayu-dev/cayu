@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from cayu import CayuApp, Message, RunRequest
 from cayu.budgets import RunLimits
+from cayu.deadlines import ExecutionDeadline
 from cayu.sessions import InvocationOriginClaim, TaskExecutionSource
 from cayu.storage import SQLiteTaskStore
 from cayu.tasks import (
@@ -76,6 +77,8 @@ async def _handle_pr_review_task(app: CayuApp, task: Task, worker_id: str) -> No
             )
         ],
         limits=RunLimits(max_tool_calls=20, max_elapsed_seconds=600),
+        # Bound provider/tool waits too; choose a cap for the expected review size.
+        execution_deadline=ExecutionDeadline.after(600, source="pr_review"),
     )
     async for event in app.run(request):
         print(event.type, event.tool_name or "-", str(event.payload)[:160])
