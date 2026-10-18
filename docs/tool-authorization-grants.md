@@ -185,8 +185,12 @@ reuses the runtime's exactly-once approval resolution, so the protected call
 cannot run twice.
 
 `prepare(approval, grant)` does steps 1 to 3 and returns the staged grant and
-the exact `approval_request` to submit through any resolution path; call
-`reconcile` afterward.
+the exact `approval_request` to submit with `app.resolve_tool_approval` in the
+same process; call `reconcile` afterward. The public resolution entrances refuse
+`cayu:authorization_grant` metadata unless it is the marker the service issued
+on that request object, so a client cannot claim a grant it did not create.
+Neither `prepare` nor `approve_and_grant` accepts an approval with changed
+arguments.
 
 ## Listing, expiry, and revocation
 

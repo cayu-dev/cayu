@@ -1871,11 +1871,11 @@ class ResumeBody(_BoundedControlPlanePromptBody):
         return self
 
 
-def _copy_control_plane_metadata(value: Any) -> dict[str, Any]:
-    copied = copy_durable_json_object(value, "metadata")
+def _copy_control_plane_metadata(value: Any, field_name: str = "metadata") -> dict[str, Any]:
+    copied = copy_durable_json_object(value, field_name)
     if not json_utf8_size_within_limit(copied, MAX_CONTROL_PLANE_METADATA_BYTES):
         raise ValueError(
-            "metadata exceeds the maximum encoded size of "
+            f"{field_name} exceeds the maximum encoded size of "
             f"{MAX_CONTROL_PLANE_METADATA_BYTES} bytes."
         )
 
@@ -1885,13 +1885,13 @@ def _copy_control_plane_metadata(value: Any) -> dict[str, Any]:
         container, depth = pending.pop()
         if depth > MAX_CONTROL_PLANE_METADATA_NESTING:
             raise ValueError(
-                "metadata exceeds the maximum nesting depth of "
+                f"{field_name} exceeds the maximum nesting depth of "
                 f"{MAX_CONTROL_PLANE_METADATA_NESTING}."
             )
         member_count += len(container)
         if member_count > MAX_CONTROL_PLANE_METADATA_MEMBERS:
             raise ValueError(
-                "metadata exceeds the maximum aggregate member count of "
+                f"{field_name} exceeds the maximum aggregate member count of "
                 f"{MAX_CONTROL_PLANE_METADATA_MEMBERS}."
             )
         values = container.values() if type(container) is dict else container
@@ -2065,6 +2065,13 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
     tool_round_id: NonBlankString
     tool_call_id: NonBlankString
     decision: ToolApprovalDecision
+    arguments: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Replacement arguments for the gating call, approved with changes; "
+            "requires decision=approve."
+        ),
+    )
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
@@ -2081,6 +2088,19 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
         if value is None:
             return None
         return copy_request_budget_limits(value)
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def copy_arguments(cls, value: Any) -> dict[str, Any] | None:
+        return None if value is None else _copy_control_plane_metadata(value, "arguments")
+
+    @model_validator(mode="after")
+    def validate_approved_arguments(self) -> ToolApprovalBody:
+        if self.arguments is not None and self.decision is not ToolApprovalDecision.APPROVE:
+            raise ValueError("Approved arguments require decision=approve.")
+        if self.arguments is not None and self.review_reference is not None:
+            raise ValueError("Approval cannot change the arguments of a human-reviewed proposal.")
+        return self
 
     @model_validator(mode="after")
     def validate_task_handoff_authority(self) -> ToolApprovalBody:
@@ -2492,6 +2512,11 @@ def _serialize_supervision_event(
         "attention_state": event.attention_state,
         "approval_revision": (
             None if event.approval_revision is None else event.approval_revision.model_dump()
+        ),
+        "arguments_revision": (
+            None
+            if event.arguments_revision is None
+            else event.arguments_revision.model_dump(mode="json")
         ),
         "authorization_grant_id": event.authorization_grant_id,
         "authorization_grant_role": (
@@ -6133,6 +6158,7 @@ def create_router(
                 field_name="tool_call_id",
             ),
             decision=body.decision,
+            arguments=body.arguments,
             reason=body.reason,
             metadata=body.metadata,
             resolved_by=_request_resolution_actor(auth_context, body.resolved_by),

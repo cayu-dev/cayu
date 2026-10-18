@@ -1695,6 +1695,8 @@ class PendingToolRoundRecovery:
 
         A missing result permits ordinary unknown-outcome synthesis only after
         external-effect fences have passed. This operation never dispatches a tool.
+        ``tool_call`` carries the model's arguments: a round with a pending
+        approval, and so with approved arguments, never reaches round recovery.
         """
         expected_idempotency_key = tool_execution.tool_idempotency_key(
             session_id=session.id,

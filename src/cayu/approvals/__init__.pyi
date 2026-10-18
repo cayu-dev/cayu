@@ -144,6 +144,7 @@ from cayu.approvals.review import HumanReviewView as HumanReviewView
 from cayu.approvals.revisions import (
     APPROVAL_REVISION_METADATA_KEY as APPROVAL_REVISION_METADATA_KEY,
 )
+from cayu.approvals.revisions import ApprovalArgumentsRevision as ApprovalArgumentsRevision
 from cayu.approvals.revisions import ApprovalRevision as ApprovalRevision
 from cayu.approvals.revisions import approval_revision_metadata as approval_revision_metadata
 from cayu.approvals.tools import PendingToolApproval as PendingToolApproval
@@ -152,6 +153,7 @@ from cayu.approvals.tools import PendingToolCallApproval as PendingToolCallAppro
 from cayu.approvals.tools import (
     PendingToolCallApprovalEventView as PendingToolCallApprovalEventView,
 )
+from cayu.approvals.tools import ToolApprovalArgumentsRefused as ToolApprovalArgumentsRefused
 from cayu.approvals.tools import ToolApprovalDecision as ToolApprovalDecision
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome as ToolApprovalRecoveryOutcome
 from cayu.approvals.tools import ToolApprovalRecoveryRequest as ToolApprovalRecoveryRequest

@@ -279,7 +279,12 @@ class ToolInvocation:
         ) = None,
         rejoin_targeted_invocation: bool = False,
         tool_invocation_observer: Callable[[str], None] | None = None,
+        approved_arguments: dict[str, Any] | None = None,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
+        if approved_arguments is not None and (
+            check_policy or approval_id is None or _targeted_tool_invocation_payload(tool_call)
+        ):
+            raise RuntimeError("Approved arguments run only for an approved, untargeted call.")
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
@@ -560,6 +565,29 @@ class ToolInvocation:
                 yield terminal
             return
         model_arguments = copy_json_value(tool_call.arguments, "tool_call.arguments")
+        # A person's approved arguments replace the model's for execution only;
+        # terminal ``arguments`` and the transcript keep what the model asked.
+        execution_tool_call = (
+            tool_call
+            if approved_arguments is None
+            else replace(
+                tool_call,
+                arguments=copy_json_value(approved_arguments, "approved_arguments"),
+            )
+        )
+        # Every terminal this call publishes carries the marker, so the terminal
+        # choke point restores the notice whichever path produced it.
+        approved_marker = (
+            {}
+            if approved_arguments is None
+            else {tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD: True}
+        )
+        # Detached before dispatch: a tool may mutate the dict it receives.
+        approved_arguments_payload = (
+            {}
+            if approved_arguments is None
+            else {"approved_arguments": deepcopy(execution_tool_call.arguments)}
+        )
         invocation_redactor = _redactor_for_tool_calls(
             self._secret_redactor,
             registered_agent=registered_agent,
@@ -590,7 +618,9 @@ class ToolInvocation:
             approval_id=approval_id,
             pause_id=input_id,
         )
-        argument_error = _registered_tool_argument_error(registered_tool, tool_call.arguments)
+        argument_error = _registered_tool_argument_error(
+            registered_tool, execution_tool_call.arguments
+        )
         if emit_started and argument_error is None:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
@@ -649,6 +679,7 @@ class ToolInvocation:
             if input_id is not None:
                 payload["input_id"] = input_id
             async for event in self.terminals.publish_result(
+                approved_arguments_notice=approved_arguments is not None,
                 event=Event(
                     type=EventType.TOOL_CALL_FAILED,
                     session_id=session.id,
@@ -725,6 +756,7 @@ class ToolInvocation:
                 if input_id is not None:
                     payload["input_id"] = input_id
                 async for event in self.terminals.publish_result(
+                    approved_arguments_notice=approved_arguments is not None,
                     event=Event(
                         type=EventType.TOOL_CALL_BLOCKED,
                         session_id=session.id,
@@ -794,7 +826,9 @@ class ToolInvocation:
             tool_name=tool_call.name,
             payload={"tool_call_id": tool_call.id, **identity_payload},
         )
-        before_resolution = _BeforeToolCallResolution(arguments=deepcopy(tool_call.arguments))
+        before_resolution = _BeforeToolCallResolution(
+            arguments=deepcopy(execution_tool_call.arguments)
+        )
         quarantine_pre_execution_publication = (
             policy_output_secret_resolution_scope != "static"
             or not registered_tool.publish_arguments
@@ -815,15 +849,20 @@ class ToolInvocation:
         ):
             yield hook_event, None
         effective_tool_call = (
-            tool_call
-            if before_resolution.arguments == tool_call.arguments
-            else replace(tool_call, arguments=before_resolution.arguments)
+            execution_tool_call
+            if before_resolution.arguments == execution_tool_call.arguments
+            else replace(execution_tool_call, arguments=before_resolution.arguments)
         )
-        effective_arguments_payload = (
-            {"effective_arguments": effective_tool_call.arguments}
-            if effective_tool_call is not tool_call
-            else {}
-        )
+        # ``effective_arguments`` records hook changes only; a person's edit is
+        # ``approved_arguments``.
+        effective_arguments_payload = {
+            **approved_arguments_payload,
+            **(
+                {"effective_arguments": deepcopy(effective_tool_call.arguments)}
+                if effective_tool_call is not execution_tool_call
+                else {}
+            ),
+        }
         if before_resolution.block_reason is not None:
             publication_snapshot = await publication.static_scope()
             block_reason = (
@@ -832,6 +871,7 @@ class ToolInvocation:
                 else "Tool call blocked by a before_tool_call hook."
             )
             async for event in self.terminals.emit_result(
+                approved_arguments_notice=approved_arguments is not None,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -866,6 +906,7 @@ class ToolInvocation:
                 else _private_argument_short_circuit_result(before_resolution.short_circuit_result)
             )
             async for event in self.terminals.emit_result(
+                approved_arguments_notice=approved_arguments is not None,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -896,7 +937,7 @@ class ToolInvocation:
                 yield event
             return
 
-        if effective_tool_call is not tool_call:
+        if effective_tool_call is not execution_tool_call:
             reauthorization = await self.admission.authorize(
                 session=session,
                 registered_agent=registered_agent,
@@ -944,6 +985,7 @@ class ToolInvocation:
                         "hook modifications do not support."
                     )
                 async for event in self.terminals.emit_result(
+                    approved_arguments_notice=approved_arguments is not None,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -1606,6 +1648,14 @@ class ToolInvocation:
                 execution_started=True,
                 artifacts=artifacts,
             )
+            # The notice joins the interrupted result before its event is built
+            # and staged, so the staged and published bytes are identical.
+            interrupted_outcome = replace(
+                interrupted_outcome,
+                result=tool_execution.with_approved_arguments_notice(
+                    interrupted_outcome.result, approved=approved_arguments is not None
+                ),
+            )
             interrupted_event = _interrupted_tool_call_event(
                 session=session,
                 registered_agent=registered_agent,
@@ -1626,6 +1676,7 @@ class ToolInvocation:
                 )
                 interrupted_payload = {
                     **interrupted_event.payload,
+                    **approved_marker,
                     **projection.payload_fields(),
                     tool_argument_publication.ARGUMENTS_EXACT_FIELD: (
                         tool_argument_publication.argument_projection_is_exact(
@@ -1634,9 +1685,12 @@ class ToolInvocation:
                         )
                     ),
                 }
-                if projection.state == "finalized" and effective_arguments_payload:
-                    interrupted_payload["effective_arguments"] = snapshot.redactor.redact_json(
-                        effective_tool_call.arguments
+                if projection.state == "finalized":
+                    interrupted_payload.update(
+                        {
+                            key: snapshot.redactor.redact_json(value)
+                            for key, value in effective_arguments_payload.items()
+                        }
                     )
                 interrupted_event = interrupted_event.model_copy(
                     update={"payload": interrupted_payload}
@@ -1723,6 +1777,7 @@ class ToolInvocation:
                         run_epoch=session.run_epoch,
                         execution_profile=execution_profile,
                         tool_round_identity=tool_round_identity,
+                        approved_with_changes=approved_arguments is not None,
                     )
                 except asyncio.CancelledError as cancellation:
                     secondary = exception_cause(cancellation)
@@ -1822,7 +1877,11 @@ class ToolInvocation:
 
         result_event: Event | None = None
         try:
-            result = execution_outcome.result
+            # The notice joins the result before redaction, size bounding and
+            # staging, so every later representation carries the same bytes.
+            result = tool_execution.with_approved_arguments_notice(
+                execution_outcome.result, approved=approved_arguments is not None
+            )
             redactor = invocation_secret_scope.redactor
             output_redactor = redactor
             if workspace_window_id is not None:
@@ -1943,6 +2002,7 @@ class ToolInvocation:
                         )
                     ),
                     "result": result.model_dump(),
+                    **approved_marker,
                     **effective_arguments_payload,
                     **execution_outcome.terminal_payload_fields(),
                     **workspace_capture_payload,
@@ -2096,6 +2156,7 @@ class ToolInvocation:
                 terminal_recorded = False
                 async for event in _iterate_post_tool_events(
                     self.terminals.emit_result(
+                        approved_arguments_notice=approved_arguments is not None,
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -2213,6 +2274,7 @@ class ToolInvocation:
             try:
                 async for event in _iterate_post_tool_events(
                     self.terminals.publish_result(
+                        approved_arguments_notice=approved_arguments is not None,
                         event=result_event,
                         session=session,
                         registered_agent=registered_agent,

@@ -55,6 +55,7 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectTerminal,
     is_command_policy_refusal_terminal,
 )
+from cayu.runtime._tool_execution import APPROVED_ARGUMENTS_NOTICE_MAX_BYTES
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._assistant_tool_round_publication import validate_tool_exposure_terminal_event
 from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
@@ -925,30 +926,30 @@ def _prepare_tool_result_event(
     ):
         raise ValueError("Terminal tool event has an invalid argument publication state.")
     argument_projection: tool_argument_publication.ToolArgumentProjection | None = None
-    effective_arguments: dict[str, Any] | None = None
+    executed_arguments: dict[str, dict[str, Any]] = {}
     if argument_state is not None:
         argument_projection = tool_argument_publication.terminal_argument_projection(
             event.payload,
             legacy_arguments={},
         )
-        raw_effective_arguments = event.payload.get("effective_arguments")
-        if raw_effective_arguments is not None:
-            if argument_projection.state == "unavailable":
-                raw_effective_arguments = None
-            elif type(raw_effective_arguments) is not dict:
-                raise TypeError("Terminal effective_arguments must be an object.")
-            else:
-                projected_effective_arguments = redactor.redact_json(raw_effective_arguments)
-                if type(projected_effective_arguments) is not dict:
-                    raise AssertionError("Effective argument projection returned a non-object.")
-                effective_arguments = projected_effective_arguments
+        for field_name in tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS:
+            raw_arguments = event.payload.get(field_name)
+            if raw_arguments is None or argument_projection.state == "unavailable":
+                continue
+            if type(raw_arguments) is not dict:
+                raise TypeError(f"Terminal {field_name} must be an object.")
+            projected_arguments = redactor.redact_json(raw_arguments)
+            if type(projected_arguments) is not dict:
+                raise AssertionError("Executed argument projection returned a non-object.")
+            executed_arguments[field_name] = projected_arguments
         payload_without_argument_projection = dict(event.payload)
         payload_without_argument_projection.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
         payload_without_argument_projection.pop(
             tool_argument_publication.ARGUMENTS_STATE_FIELD,
             None,
         )
-        payload_without_argument_projection.pop("effective_arguments", None)
+        for field_name in tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS:
+            payload_without_argument_projection.pop(field_name, None)
         event = event.model_copy(update={"payload": payload_without_argument_projection})
     result = ToolResult(
         content=result.content,
@@ -990,8 +991,7 @@ def _prepare_tool_result_event(
     if argument_projection is not None:
         payload = dict(event.payload)
         payload.update(argument_projection.payload_fields())
-        if effective_arguments is not None:
-            payload["effective_arguments"] = effective_arguments
+        payload.update(executed_arguments)
         event = event.model_copy(update={"payload": payload})
     event, result = _bound_policy_denial_event(event=event, result=result)
     return _validate_and_synchronize_tool_result_event(event=event, result=result)
@@ -1220,14 +1220,18 @@ def _staged_terminal_argument_projections(
         legacy_arguments={},
     )
     effective_arguments = event.payload.get("effective_arguments")
+    approved_arguments = event.payload.get("approved_arguments")
     if projection.state == "unavailable":
-        if effective_arguments is not None:
-            raise ValueError("Unavailable staged arguments cannot carry effective arguments.")
+        if effective_arguments is not None or approved_arguments is not None:
+            raise ValueError("Unavailable staged arguments cannot carry executed arguments.")
         return projection, projection
+    # Hooks observe what ran: hook changes, else a person's approved arguments.
+    if effective_arguments is None:
+        effective_arguments = approved_arguments
     if effective_arguments is None:
         return projection, projection
     if type(effective_arguments) is not dict:
-        raise TypeError("Staged effective arguments must be an object.")
+        raise TypeError("Staged executed arguments must be an object.")
     return (
         projection,
         tool_argument_publication.ToolArgumentProjection(
@@ -1309,8 +1313,13 @@ async def _tool_terminal_payload_limits(
     *,
     publication_governor: ToolTerminalPublicationGovernor,
     runtime_hooks: Iterable[runtime_records.RegisteredRuntimeHook] = (),
+    approved_arguments: Mapping[str, dict[str, Any]] | None = None,
 ) -> dict[str, int | None]:
-    """Resolve frozen registration-time terminal bounds for round admission."""
+    """Resolve frozen registration-time terminal bounds for round admission.
+
+    A call a person approved with changed arguments also publishes them and
+    begins its result with the runtime notice, so both are reserved.
+    """
 
     has_argument_modifying_hook = any(
         _runtime_hook_supports_phase(
@@ -1334,10 +1343,17 @@ async def _tool_terminal_payload_limits(
             limits[tool_call.id] = None
             continue
         argument_bytes = 0
+        approved = None if approved_arguments is None else approved_arguments.get(tool_call.id)
         if registered_tool.publish_arguments:
-            argument_bytes = await publication_governor.run_cpu(
-                (TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1 if tool_call.arguments else 0),
-                lambda tool_call=tool_call: _durable_payload_utf8_size(tool_call.arguments),
+            published = (
+                [tool_call.arguments] if approved is None else [tool_call.arguments, approved]
             )
+            for arguments in published:
+                argument_bytes += await publication_governor.run_cpu(
+                    (TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1 if arguments else 0),
+                    lambda arguments=arguments: _durable_payload_utf8_size(arguments),
+                )
+        if approved is not None:
+            argument_bytes += APPROVED_ARGUMENTS_NOTICE_MAX_BYTES
         limits[tool_call.id] = result_limit + argument_bytes
     return limits

@@ -148,7 +148,8 @@ class InvocationProjection:
         call["requested_arguments"] = arguments if available else None
         exact = payload.get("arguments_exact")
         call["arguments_exact"] = exact if available and type(exact) is bool else None
-        effective = payload.get("effective_arguments", arguments)
+        # What ran: hook changes, else a person's approved arguments.
+        effective = payload.get("effective_arguments", payload.get("approved_arguments", arguments))
         call["effective_arguments"] = (
             effective if available and isinstance(effective, dict) else None
         )

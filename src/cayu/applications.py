@@ -47,6 +47,7 @@ from cayu.approvals.tools import (
     PendingToolApproval,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    copy_public_tool_approval_request,
     copy_tool_approval_recovery_request,
     copy_tool_approval_request,
 )
@@ -9193,14 +9194,13 @@ class CayuApp:
         *,
         context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
-        if type(request) is not ToolApprovalRequest:
-            raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
+        request = copy_public_tool_approval_request(request)
         session_id = await self._resolve_public_session_id(request.session_id)
         await self._recovery_coordinator.require_human_review_resolution_authority(
             session_id,
             request.review_reference,
         )
-        request = copy_tool_approval_request(request).model_copy(
+        request = request.model_copy(
             update={
                 "session_id": session_id,
                 "approval_id": await self._resolve_public_action_linkage(

@@ -1603,6 +1603,10 @@ export type ApiSupervisionEvent = {
      */
     approval_revision?: ApprovalRevision | null;
     /**
+     * Runtime evidence of an approval with changed arguments: salted digests of both versions and the schema-declared top-level fields that changed.
+     */
+    arguments_revision?: ApprovalArgumentsRevision | null;
+    /**
      * Attention Id
      *
      * Human-attention identity of the request this touch settled; the same value pending-action reads report as attention_id. Never resolution authority.
@@ -2382,6 +2386,36 @@ export type ApplicationDefaultsManifest = {
      * Provider
      */
     provider: string | null;
+};
+
+/**
+ * ApprovalArgumentsRevision
+ *
+ * Runtime evidence that a person approved a call with changed arguments.
+ *
+ * ``changed_fields`` names only top-level properties the tool's schema
+ * declares; it never carries argument values. The digests identify the
+ * proposed and approved versions with HMAC-SHA256 under the session store's
+ * public-authority alias key ``digest_key_id``, so they cannot be confirmed
+ * by guessing; all three are ``None`` when the store has no alias keyring.
+ */
+export type ApprovalArgumentsRevision = {
+    /**
+     * Approved Arguments Digest
+     */
+    approved_arguments_digest?: string | null;
+    /**
+     * Changed Fields
+     */
+    changed_fields?: Array<string>;
+    /**
+     * Digest Key Id
+     */
+    digest_key_id?: string | null;
+    /**
+     * Proposed Arguments Digest
+     */
+    proposed_arguments_digest?: string | null;
 };
 
 /**
@@ -18107,6 +18141,14 @@ export type ToolApprovalBody = {
      * Approval Id
      */
     approval_id: string;
+    /**
+     * Arguments
+     *
+     * Replacement arguments for the gating call, approved with changes; requires decision=approve.
+     */
+    arguments?: {
+        [key: string]: unknown;
+    } | null;
     /**
      * Budget Limits
      */

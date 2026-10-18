@@ -1150,7 +1150,14 @@ class ToolInvocationAdmission:
         request_metadata: dict[str, Any],
         taint_labels: Iterable[str] | None = None,
         tool_round_id: str | None = None,
+        recorded_scope: PendingToolApproval | None = None,
     ) -> ToolPolicyResult:
+        """Authorize one call; ``recorded_scope`` replays a pause's own environment scope.
+
+        A paused call's live environment may be an unallocated placeholder, so
+        re-authorizing it uses the environment and workspace its pause recorded.
+        """
+
         registered_tool = registered_agent.executable_tool(tool_call.name)
         error = _registered_tool_argument_error(registered_tool, tool_call.arguments)
         if error is not None:
@@ -1174,9 +1181,21 @@ class ToolInvocationAdmission:
                 tool_round_id=tool_round_id,
                 tool_effect=_tool_effect(registered_agent, tool_call),
                 arguments=tool_call.arguments,
-                environment_name=_environment_name(registered_environment),
-                workspace_id=_workspace_id(registered_environment),
-                workspace_id_explicit=_workspace_id_explicit(registered_environment),
+                environment_name=(
+                    _environment_name(registered_environment)
+                    if recorded_scope is None
+                    else recorded_scope.environment_name
+                ),
+                workspace_id=(
+                    _workspace_id(registered_environment)
+                    if recorded_scope is None
+                    else recorded_scope.workspace_id
+                ),
+                workspace_id_explicit=(
+                    _workspace_id_explicit(registered_environment)
+                    if recorded_scope is None
+                    else recorded_scope.workspace_id_explicit
+                ),
                 metadata=policy_metadata,
             )
         )
@@ -1285,6 +1304,7 @@ class ToolInvocationAdmission:
             agent_name=registered_agent.spec.name,
             environment_name=_environment_name(registered_environment),
             workspace_id=_workspace_id(registered_environment),
+            workspace_id_explicit=_workspace_id_explicit(registered_environment),
             task_id=task_id,
             execution_profile_fingerprint=pending_round.execution_profile_fingerprint,
             publish_arguments=_tool_round_publishes_arguments(

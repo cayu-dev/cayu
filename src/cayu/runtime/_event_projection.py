@@ -1317,12 +1317,14 @@ def _quarantine_pre_execution_tool_arguments(
         value.pop("targeted_tool_rejection", None)
         value.pop("arguments", None)
         value.pop("effective_arguments", None)
+        value.pop("approved_arguments", None)
         if had_private_arguments or had_quarantine_marker:
             value["arguments_state"] = "quarantined"
 
     if event.type == EventType.TOOL_CALL_STARTED:
         payload.pop("arguments", None)
         payload.pop("effective_arguments", None)
+        payload.pop("approved_arguments", None)
         payload["arguments_state"] = "quarantined"
         return
     if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
@@ -1366,14 +1368,21 @@ def _validate_new_terminal_tool_argument_projection(
     if state == "finalized":
         if type(payload.get(tool_argument_publication.ARGUMENTS_FIELD)) is not dict:
             raise ValueError("Finalized terminal arguments must be an object.")
-        effective_arguments = payload.get("effective_arguments")
-        if effective_arguments is not None and type(effective_arguments) is not dict:
-            raise TypeError("Terminal effective_arguments must be an object.")
+        for field_name in tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS:
+            executed = payload.get(field_name)
+            if executed is not None and type(executed) is not dict:
+                raise TypeError(f"Terminal {field_name} must be an object.")
         return
     if state == "unavailable":
         if arguments_exact is True:
             raise ValueError("Unavailable terminal arguments cannot be exact.")
-        if tool_argument_publication.ARGUMENTS_FIELD in payload or "effective_arguments" in payload:
+        if any(
+            field_name in payload
+            for field_name in (
+                tool_argument_publication.ARGUMENTS_FIELD,
+                *tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS,
+            )
+        ):
             raise ValueError("Unavailable terminal arguments cannot carry argument objects.")
         return
     raise ValueError("Terminal tool event has an invalid argument publication state.")
@@ -1396,22 +1405,28 @@ def _fail_closed_public_terminal_tool_argument_projection(
     valid = False
     if state == "finalized":
         arguments = original.get(tool_argument_publication.ARGUMENTS_FIELD)
-        effective_arguments = original.get("effective_arguments")
         valid = (
             type(arguments) is dict
             and (arguments_exact is None or type(arguments_exact) is bool)
-            and (effective_arguments is None or type(effective_arguments) is dict)
+            and all(
+                original.get(field_name) is None or type(original.get(field_name)) is dict
+                for field_name in tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS
+            )
         )
     elif state == "unavailable":
         valid = (
             tool_argument_publication.ARGUMENTS_FIELD not in original
-            and "effective_arguments" not in original
+            and all(
+                field_name not in original
+                for field_name in tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS
+            )
             and (arguments_exact is None or arguments_exact is False)
         )
     if valid:
         return
     payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
-    payload.pop("effective_arguments", None)
+    for field_name in tool_argument_publication.EXECUTED_ARGUMENTS_FIELDS:
+        payload.pop(field_name, None)
     payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "unavailable"
     payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
 

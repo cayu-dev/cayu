@@ -8,6 +8,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictInt,
     field_validator,
@@ -17,8 +18,10 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._command_diagnostics import CommandDenialCode
 from cayu._validation import (
+    copy_durable_json_object,
     copy_durable_json_value,
     copy_durable_metadata,
+    json_utf8_size_within_limit,
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
@@ -31,6 +34,10 @@ from cayu.approvals.actors import ResolutionActorSource as ResolutionActorSource
 from cayu.approvals.actors import copy_resolution_actor as copy_resolution_actor
 from cayu.approvals.actors import expiry_resolution_actor as expiry_resolution_actor
 from cayu.approvals.actors import resolution_actor_payload as resolution_actor_payload
+from cayu.approvals.authorization_grants import (
+    TOOL_AUTHORIZATION_GRANT_METADATA_KEY,
+    TOOL_AUTHORIZATION_GRANT_OFFER_METADATA_KEY,
+)
 from cayu.approvals.review import HumanReviewReference
 from cayu.approvals.revisions import validate_approval_revision_metadata
 from cayu.budgets._run_limit_accounting import (
@@ -66,6 +73,18 @@ class ToolApprovalRecoveryOutcome(StrEnum):
     FAILED = "failed"
 
 
+# Approved arguments share the HTTP control-plane bound for caller-supplied JSON.
+MAX_APPROVED_TOOL_ARGUMENTS_BYTES = 64 * 1024
+
+
+class ToolApprovalArgumentsRefused(ValueError):
+    """Changed arguments were refused before the approval was claimed.
+
+    The approval stays pending and no tool ran; resolve it again with an
+    accepted edit, without arguments, or with a denial.
+    """
+
+
 class ToolApprovalRequest(BaseModel):
     """Caller decision for a pending tool approval.
 
@@ -91,6 +110,10 @@ class ToolApprovalRequest(BaseModel):
     tool_round_id: str
     tool_call_id: str
     decision: ToolApprovalDecision
+    # Replacement arguments for the gating call only, approved with changes.
+    arguments: dict[str, Any] | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
@@ -104,11 +127,29 @@ class ToolApprovalRequest(BaseModel):
         default_factory=tuple,
         exclude=True,
     )
+    # The grant marker the grant service issued on this exact request object.
+    # In-process provenance only: a serialized or rebuilt request never has it.
+    _issued_authorization_grant: dict[str, Any] | None = PrivateAttr(default=None)
 
     @field_validator("session_id", "approval_id", "tool_round_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def copy_arguments(cls, value: Any) -> dict[str, Any] | None:
+        return copy_approved_tool_arguments(value)
+
+    @model_validator(mode="after")
+    def validate_approved_arguments(self) -> ToolApprovalRequest:
+        if self.arguments is not None and self.decision is not ToolApprovalDecision.APPROVE:
+            raise ValueError("Approved arguments require decision=approve.")
+        if self.arguments is not None and self.review_reference is not None:
+            # The reviewed content binding names the model's proposal; an edit
+            # would execute content the review never covered.
+            raise ValueError("Approval cannot change the arguments of a human-reviewed proposal.")
+        return self
 
     @field_validator("task_worker_id", "task_handoff_id")
     @classmethod
@@ -481,6 +522,8 @@ class PendingToolApproval(BaseModel):
     agent_name: str
     environment_name: str | None = None
     workspace_id: str | None = None
+    # Whether the application named the workspace, as pause-time policy saw it.
+    workspace_id_explicit: StrictBool = Field(default=False, exclude_if=lambda value: not value)
     task_id: str | None = None
     execution_profile_fingerprint: str | None = Field(
         default=None,
@@ -676,6 +719,7 @@ class PendingToolApprovalEventView(BaseModel):
     agent_name: str
     environment_name: str | None = None
     workspace_id: str | None = None
+    workspace_id_explicit: StrictBool = Field(default=False, exclude_if=lambda value: not value)
     task_id: str | None = None
     execution_profile_fingerprint: str | None = Field(
         default=None,
@@ -875,6 +919,47 @@ def _copy_approval_resume_fields(
     }
 
 
+def copy_approved_tool_arguments(value: Any) -> dict[str, Any] | None:
+    """Copy approved arguments as one bounded durable JSON object."""
+
+    if value is None:
+        return None
+    copied = copy_durable_json_object(value, "arguments")
+    if not json_utf8_size_within_limit(copied, MAX_APPROVED_TOOL_ARGUMENTS_BYTES):
+        raise ValueError(
+            "arguments exceed the maximum encoded size of "
+            f"{MAX_APPROVED_TOOL_ARGUMENTS_BYTES} bytes."
+        )
+    return copied
+
+
+def copy_public_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
+    """Copy a caller's resolution, refusing grant metadata only the grant service sets.
+
+    ``cayu:authorization_grant`` is accepted only as the exact marker the grant
+    service issued on this request object; ``cayu:authorization_grant_offer``
+    belongs to policy results and is never accepted on a resolution.
+    """
+
+    copied = copy_tool_approval_request(request)
+    if copied.arguments is not None and TOOL_AUTHORIZATION_GRANT_METADATA_KEY in copied.metadata:
+        # A grant generalizes the call that was approved, never arguments the
+        # person rejected by changing them.
+        raise ToolApprovalArgumentsRefused(
+            "An approval that creates an authorization grant cannot change the call's arguments."
+        )
+    issued = request._issued_authorization_grant
+    if TOOL_AUTHORIZATION_GRANT_OFFER_METADATA_KEY in copied.metadata or (
+        TOOL_AUTHORIZATION_GRANT_METADATA_KEY in copied.metadata
+        and (issued is None or copied.metadata[TOOL_AUTHORIZATION_GRANT_METADATA_KEY] != issued)
+    ):
+        raise ValueError(
+            "Authorization grant metadata is reserved for the grant service; use "
+            "ToolAuthorizationGrantService.approve_and_grant to approve and grant."
+        )
+    return copied
+
+
 def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
     if type(request) is not ToolApprovalRequest:
         raise TypeError("Tool approval resolution requires a ToolApprovalRequest.")
@@ -889,6 +974,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         tool_round_id=request.tool_round_id,
         tool_call_id=request.tool_call_id,
         decision=request.decision,
+        arguments=copy_approved_tool_arguments(request.arguments),
         **_copy_approval_resume_fields(request),
     )
 
@@ -930,6 +1016,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         agent_name=approval.agent_name,
         environment_name=approval.environment_name,
         workspace_id=approval.workspace_id,
+        workspace_id_explicit=approval.workspace_id_explicit,
         task_id=approval.task_id,
         execution_profile_fingerprint=approval.execution_profile_fingerprint,
         publish_arguments=approval.publish_arguments,

@@ -26,6 +26,7 @@ _FIELD_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", flags=re.ASCII)
 _BASE64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z", flags=re.ASCII)
 _HMAC_CONTEXT = b"cayu.public-authority-alias"
 _KEY_FINGERPRINT_CONTEXT = b"cayu.public-authority-alias.key-fingerprint.v1"
+_EVIDENCE_DIGEST_CONTEXT = b"cayu:public-evidence-digest:v1\x00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +190,24 @@ class PublicAuthorityAliasCodec:
             )
             for key_id in ordered_key_ids
         )
+
+    def evidence_digest(self, payload: bytes, *, context: str) -> tuple[str, str]:
+        """Return ``(active key id, keyed digest)`` for content-free public evidence.
+
+        The digest is HMAC-SHA256 under a key derived from the active alias key
+        and ``context``, so published evidence cannot be confirmed by guessing
+        its input offline, and it never equals an alias.
+        """
+
+        if type(payload) is not bytes:
+            raise TypeError("payload must be bytes.")
+        context = _require_field_name(context)
+        key_id = self.keyring.active_key_id
+        key = self.keyring._key_bytes(key_id)
+        if key is None:  # pragma: no cover - the keyring validates its active key
+            raise RuntimeError("The active alias key is missing.")
+        derived = hmac.digest(key, _EVIDENCE_DIGEST_CONTEXT + context.encode("ascii"), "sha256")
+        return key_id, hmac.digest(derived, payload, "sha256").hex()
 
     def key_fingerprint(self, key_id: str) -> str:
         """Return a non-secret stable fingerprint for deployment validation."""

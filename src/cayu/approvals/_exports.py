@@ -5,6 +5,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.approvals.revisions",
         "APPROVAL_REVISION_METADATA_KEY",
     ),
+    "ApprovalArgumentsRevision": ("cayu.approvals.revisions", "ApprovalArgumentsRevision"),
     "ApprovalRevision": ("cayu.approvals.revisions", "ApprovalRevision"),
     "approval_revision_metadata": ("cayu.approvals.revisions", "approval_revision_metadata"),
     "AllowedActorsGrantAuthority": (
@@ -78,6 +79,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "TOOL_MANDATORY_APPROVAL_METADATA_KEY",
     ),
     "TieredApprovalPolicy": ("cayu.approvals.business", "TieredApprovalPolicy"),
+    "ToolApprovalArgumentsRefused": ("cayu.approvals.tools", "ToolApprovalArgumentsRefused"),
     "ToolApprovalDecision": ("cayu.approvals.tools", "ToolApprovalDecision"),
     "ToolApprovalRecoveryOutcome": ("cayu.approvals.tools", "ToolApprovalRecoveryOutcome"),
     "ToolApprovalRecoveryRequest": ("cayu.approvals.tools", "ToolApprovalRecoveryRequest"),
@@ -206,6 +208,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 
 PUBLIC_NAMES = [
     "APPROVAL_REVISION_METADATA_KEY",
+    "ApprovalArgumentsRevision",
     "ApprovalRevision",
     "approval_revision_metadata",
     "AllowedActorsGrantAuthority",
@@ -243,6 +246,7 @@ PUBLIC_NAMES = [
     "TOOL_AUTHORIZATION_GRANT_OFFER_METADATA_KEY",
     "TOOL_MANDATORY_APPROVAL_METADATA_KEY",
     "TieredApprovalPolicy",
+    "ToolApprovalArgumentsRefused",
     "ToolApprovalDecision",
     "ToolApprovalRecoveryOutcome",
     "ToolApprovalRecoveryRequest",

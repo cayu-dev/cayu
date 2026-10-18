@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -99,6 +99,7 @@ class PausedToolRound:
         secret_redactor: SecretRedactor,
         secret_resolution_scope: Literal["static", "dynamic", "unknown"],
         pause: ApprovalRoundPause | UserInputRoundPause,
+        approved_arguments: Mapping[str, dict[str, Any]] | None = None,
     ) -> PausedToolRound:
         defer_terminals = (len(tool_calls) > 1 and secret_resolution_scope != "static") or any(
             registered is not None
@@ -134,6 +135,7 @@ class PausedToolRound:
                         if invocation_context is None
                         else invocation_context.runtime_hooks
                     ),
+                    approved_arguments=approved_arguments,
                 )
                 if defer_terminals
                 else None
@@ -206,6 +208,7 @@ class PausedToolRound:
         model_step: int | None,
         taint_labels: frozenset[str] | None,
         policy_result: ToolPolicyResult | None = None,
+        approved_arguments: dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         return self.round.timed_continuation_dispatch(
             self.invocation.execute(
@@ -243,6 +246,7 @@ class PausedToolRound:
                 input_id=self.pause.input_id
                 if isinstance(self.pause, UserInputRoundPause)
                 else None,
+                approved_arguments=approved_arguments,
             )
         )
 

@@ -966,7 +966,10 @@ def _project_tool_arguments(
         return _unavailable_tool_value(
             "unavailable" if arguments_state in {None, "unavailable"} else "malformed"
         )
-    arguments = terminal.payload.get("effective_arguments", terminal.payload.get("arguments"))
+    arguments = terminal.payload.get(
+        "effective_arguments",
+        terminal.payload.get("approved_arguments", terminal.payload.get("arguments")),
+    )
     if type(arguments) is not dict:
         return _unavailable_tool_value("malformed")
     return _project_tool_json_value(arguments, app=app)

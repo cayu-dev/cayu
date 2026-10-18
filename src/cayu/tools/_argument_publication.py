@@ -18,6 +18,8 @@ from cayu.vaults.redaction import SecretRedactor
 
 ARGUMENTS_STATE_FIELD = "arguments_state"
 ARGUMENTS_FIELD = "arguments"
+# Terminal fields for the arguments that ran, published only beside ``arguments``.
+EXECUTED_ARGUMENTS_FIELDS = ("approved_arguments", "effective_arguments")
 ARGUMENTS_EXACT_FIELD = "arguments_exact"
 ArgumentPublicationState = Literal["quarantined", "finalized", "unavailable"]
 TERMINAL_ARGUMENT_STATES = frozenset({"finalized", "unavailable"})

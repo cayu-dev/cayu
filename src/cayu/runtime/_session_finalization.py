@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, NoReturn, TypeVar
 from uuid import uuid4
@@ -112,6 +112,7 @@ from cayu.providers._credential_boundary import (
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
@@ -3924,6 +3925,29 @@ class SessionFinalization:
             decision=decision,
             tool_round_identity=tool_round_identity,
         )
+        # A gating call a person approved with changes is told so even when a
+        # run limit skips it, before redaction like any other result content.
+        edited_call_id = (
+            pending_approval_to_clear.tool_call_id
+            if approval_support.approved_arguments_for_call(
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(
+                    await self.session_store.load_checkpoint(session.id),
+                    redactor=self._secret_redactor,
+                ),
+                pending_approval_to_clear.tool_call_id,
+            )
+            is not None
+            else None
+        )
+        skipped_outcomes = [
+            replace(
+                outcome,
+                result=tool_execution.with_approved_arguments_notice(
+                    outcome.result, approved=outcome.call.id == edited_call_id
+                ),
+            )
+            for outcome in skipped_outcomes
+        ]
         completed_tool_outcomes = tool_results.redact_tool_call_outcomes(
             completed_tool_outcomes,
             self._secret_redactor,
@@ -3960,6 +3984,7 @@ class SessionFinalization:
                     tool_round_identity=tool_round_identity,
                     execution_profile=execution_profile,
                     approval_id=pending_approval_to_clear.approval_id,
+                    approved_with_changes=skipped_outcome.call.id == edited_call_id,
                 )
             )
         skipped_outcomes = [

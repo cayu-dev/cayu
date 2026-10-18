@@ -10,6 +10,8 @@ from typing import Any
 from cayu._clock import utc_clock
 from cayu._validation import copy_durable_metadata, require_clean_nonblank
 from cayu.approvals.authorization_grants import (
+    APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY,
+    MANDATORY_CONTROL_OFFER_REASON,
     TOOL_APPROVAL_GATE_METADATA_KEY,
     TOOL_AUTHORIZATION_GRANT_MAX_BOUNDARY_LABELS,
     TOOL_AUTHORIZATION_GRANT_MAX_LIST,
@@ -266,9 +268,15 @@ class ToolAuthorizationGrantPolicy(ToolPolicy):
                     }
                 )
             )
-            return self._with_offer(required, grantable=False, reason="mandatory_control")
+            return self._with_offer(
+                required, grantable=False, reason=MANDATORY_CONTROL_OFFER_REASON
+            )
         if base.decision is not ToolPolicyDecision.REQUIRE_APPROVAL:
             return base
+        if request.metadata.get(APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY) is True:
+            # A person already approved this call; re-checking their changed
+            # arguments must not record a grant use or draw a sample.
+            return self._with_offer(base, grantable=False, reason="approved_arguments")
         matcher_kind = self._grantable.get(request.tool_name)
         if matcher_kind is None:
             return base

@@ -144,6 +144,10 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._approval_support import _pending_approval_and_round_for_atomic_claim
+from cayu.runtime._approved_tool_arguments import (
+    admit_approved_tool_arguments,
+    arguments_revision_payload,
+)
 from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._continuation_environment import ContinuationEnvironment
 from cayu.runtime._continuation_task_failure import (
@@ -1923,13 +1927,23 @@ class RecoveryCoordinator:
             else foreground_gate.resolution_digest
         )
         can_create_resolution_intent = True
+        candidate_decision = request.decision
+        candidate_requested_at: datetime | None = None
         try:
             candidate_events = await self._session_store.load_events(loaded_session.id)
+            candidate_requested_at = next(
+                (
+                    event.timestamp
+                    for event in candidate_events
+                    if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+                    and event.payload.get("approval_id") == candidate_approval.approval_id
+                ),
+                None,
+            )
             candidate_history = approval_support.approval_resolution_history(
                 events=candidate_events,
                 approval=candidate_approval,
             )
-            candidate_decision = request.decision
             if (
                 approval_support.pending_approval_expired(
                     candidate_approval,
@@ -1984,6 +1998,24 @@ class RecoveryCoordinator:
         registered_provider = invocation_context.registered_provider
         registered_environment = invocation_context.registered_environment
         budget_policy_snapshot = invocation_context.budget_policy
+        # An exact retry reuses the arguments its claimed intent pinned, and an
+        # expired approval is denied, so neither re-authorizes an edit.
+        approved_arguments = (
+            await admit_approved_tool_arguments(
+                request,
+                approval=candidate_approval,
+                request_metadata=candidate_round.request_metadata,
+                requested_at=candidate_requested_at,
+                clock=self._clock,
+                session=loaded_session,
+                invocation_context=invocation_context,
+                admission=self._tool_invocation.admission,
+                redactor=self._secret_redactor,
+                can_create_resolution_intent=can_create_resolution_intent,
+            )
+            if candidate_intent is None and candidate_decision is ToolApprovalDecision.APPROVE
+            else None
+        )
         pending_approval: PendingToolApproval | None = None
         pending_round: pending_rounds.PendingToolRound | None = None
         claimed_intent: pending_approval_reader.ApprovalResolutionIntent | None = None
@@ -2064,6 +2096,7 @@ class RecoveryCoordinator:
                     )
                 ),
                 runtime_session=_current_session,
+                approved_arguments=approved_arguments,
             )
             claimed_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 claimed_checkpoint,
@@ -4676,6 +4709,16 @@ class RecoveryCoordinator:
                 secret_resolution_scope=pause_secret_resolution_scope,
                 secret_redactor=self._secret_redactor,
                 pause=ApprovalRoundPause(pending_approval.approval_id),
+                approved_arguments={
+                    call.id: approved
+                    for call in round_tool_calls
+                    if (
+                        approved := approval_support.approved_arguments_for_call(
+                            claimed_resolution_intent, call.id
+                        )
+                    )
+                    is not None
+                },
             )
             round_owner = paused_round.round
             await round_owner.admit()
@@ -4800,6 +4843,9 @@ class RecoveryCoordinator:
                         tool_round_identity=tool_round_identity,
                         reason=request.reason,
                         metadata=request.metadata,
+                        approved_arguments=approval_support.approved_arguments_for_call(
+                            claimed_resolution_intent, tool_call.id
+                        ),
                         resolved_by_payload=resolved_by_payload,
                         durable_events=approval_events,
                     )
@@ -4886,6 +4932,9 @@ class RecoveryCoordinator:
 
                 async for event, outcome in paused_round.execute(
                     tool_call=tool_call,
+                    approved_arguments=approval_support.approved_arguments_for_call(
+                        claimed_resolution_intent, tool_call.id
+                    ),
                     request_metadata=request.metadata,
                     budget_limits=pending_approval.budget_limits or (),
                     auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
@@ -5583,6 +5632,7 @@ class RecoveryCoordinator:
         metadata: dict[str, Any],
         resolved_by_payload: dict[str, Any] | None,
         durable_events: list[Event],
+        approved_arguments: dict[str, Any] | None = None,
     ) -> Event:
         existing = [
             event
@@ -5631,6 +5681,31 @@ class RecoveryCoordinator:
                                 redactor=self._secret_redactor,
                             ),
                             **_approval_revision_field(metadata),
+                            **(
+                                {}
+                                if approved_arguments is None
+                                else {
+                                    "arguments_revision": arguments_revision_payload(
+                                        session_id=session.id,
+                                        tool_call_id=tool_call.id,
+                                        proposed=tool_call.arguments,
+                                        approved=approved_arguments,
+                                        digest_codec=(
+                                            self._session_store.public_authority_alias_codec
+                                        ),
+                                        schema=(
+                                            None
+                                            if (
+                                                registered_tool := registered_agent.executable_tool(
+                                                    tool_call.name
+                                                )
+                                            )
+                                            is None
+                                            else registered_tool.schema
+                                        ),
+                                    )
+                                }
+                            ),
                             "resolved_by": resolved_by_payload,
                         },
                     ),
@@ -6149,6 +6224,12 @@ class RecoveryCoordinator:
             registered_environment=registered_environment,
             invocation_context=invocation_context,
         )
+        recovered_with_changes = (
+            approval_support.approved_arguments_for_call(
+                claimed_resolution_intent, pending_tool_call.tool_call_id
+            )
+            is not None
+        )
         try:
             if type(request) is ToolApprovalRecoveryRequest:
                 await ToolEffectStateOwner(self._session_store).require_unverified_recovery_allowed(
@@ -6156,13 +6237,16 @@ class RecoveryCoordinator:
                     tool_round_id=pending_approval.tool_round_id,
                     tool_call_id=pending_tool_call.tool_call_id,
                 )
-                recovered_result = approval_support.recovered_tool_result(
-                    request=request,
-                )
+                recovered_result = approval_support.recovered_tool_result(request=request)
                 recovery_secret_resolution_scope = pending_approval.secret_resolution_scope
-                public_recovered_result = _public_manual_recovery_result(
-                    recovered_result,
-                    secret_resolution_scope=recovery_secret_resolution_scope,
+                # The scope projection may replace the whole operator result, so
+                # the content-free notice is applied after it.
+                public_recovered_result = tool_execution.with_approved_arguments_notice(
+                    _public_manual_recovery_result(
+                        recovered_result,
+                        secret_resolution_scope=recovery_secret_resolution_scope,
+                    ),
+                    approved=recovered_with_changes,
                 )
                 event_type = (
                     EventType.TOOL_CALL_FAILED
@@ -6240,6 +6324,7 @@ class RecoveryCoordinator:
                     source_run_epoch=loaded_session.run_epoch,
                     session=session,
                     invocation_context=environment.invocation_context,
+                    approved_with_changes=recovered_with_changes,
                 )
                 async with contextlib.aclosing(settlement_stream) as owned_settlement:
                     async for item in owned_settlement:
@@ -6291,6 +6376,11 @@ class RecoveryCoordinator:
                                     approval_id=pending_approval.approval_id,
                                 ),
                                 "manual_recovery": True,
+                                **(
+                                    {tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD: True}
+                                    if recovered_with_changes
+                                    else {}
+                                ),
                                 **tool_argument_publication.unavailable_argument_projection().payload_fields(),
                                 **_public_resolution_audit_fields(
                                     secret_resolution_scope=recovery_secret_resolution_scope,
@@ -8200,8 +8290,14 @@ class RecoveryCoordinator:
         source_run_epoch: int,
         session: Session,
         invocation_context: InvocationContext,
+        approved_with_changes: bool = False,
     ) -> AsyncGenerator[Event | _ReconciledToolEffectReplay | _ToolEffectObservationReplay, None]:
-        """Select evidence under an existing recovery claim; never own continuation."""
+        """Select evidence under an existing recovery claim; never own continuation.
+
+        ``approved_with_changes`` marks a gating call a person approved with
+        changed arguments: its receipt terminal begins with the notice and
+        carries the marker, before it is persisted and its result digested.
+        """
         invocation_context._validate()
         invocation_context.with_admitted_session(session)
         owner = ToolEffectStateOwner(self._session_store)
@@ -8275,21 +8371,22 @@ class RecoveryCoordinator:
             registered=registered_tool.effect_reconciler,
         )
         record = admitted
+        receipt_redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=[
+                runtime_records.ToolCallRequest(
+                    id=record.intent.tool_call_id,
+                    name=record.intent.tool_name,
+                    arguments={},
+                    arguments_state="unavailable",
+                )
+            ],
+        )
         result = project_accepted_reconciliation(
             accepted,
             registered=registered_tool.effect_reconciler,
-            redactor=_redactor_for_tool_calls(
-                self._secret_redactor,
-                registered_agent=registered_agent,
-                tool_calls=[
-                    runtime_records.ToolCallRequest(
-                        id=record.intent.tool_call_id,
-                        name=record.intent.tool_name,
-                        arguments={},
-                        arguments_state="unavailable",
-                    )
-                ],
-            ),
+            redactor=receipt_redactor,
         )
         identity = {
             name: getattr(record.intent, name)
@@ -8363,11 +8460,15 @@ class RecoveryCoordinator:
                     invocation_context.profile,
                 )
             )
-            terminal_result = ToolResult(
-                content=receipt.message,
-                structured=receipt.structured,
-                artifacts=receipt.artifacts,
-                is_error=receipt.outcome == "failed",
+            terminal_result = tool_execution.with_approved_arguments_notice(
+                ToolResult(
+                    content=receipt.message,
+                    structured=receipt.structured,
+                    artifacts=receipt.artifacts,
+                    is_error=receipt.outcome == "failed",
+                ),
+                approved=approved_with_changes,
+                redactor=receipt_redactor,
             )
             event = Event(
                 type=EventType.TOOL_CALL_FAILED
@@ -8385,6 +8486,11 @@ class RecoveryCoordinator:
                     "reconciliation_state": "reconciled",
                     "receipt_id": receipt.receipt_id,
                     "receipt_evidence": receipt_evidence,
+                    **(
+                        {tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD: True}
+                        if approved_with_changes
+                        else {}
+                    ),
                     "result": terminal_result.model_dump(mode="json"),
                 },
             )

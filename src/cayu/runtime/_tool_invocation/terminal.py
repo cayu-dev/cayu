@@ -69,10 +69,12 @@ from cayu.tools.base import (
 from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+    ToolResultProjection,
     ToolResultProjectionPolicy,
     ToolResultProjectionRequest,
     _last_reconciliation_candidate,
     projection_failure,
+    reestimate_tool_result_projection_tokens,
     safe_projection_failure_type,
     validate_tool_result_projection,
 )
@@ -96,18 +98,80 @@ from .hooks import ToolInvocationHooks, _project_tool_call_for_hook
 _TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS = 30.0
 
 
+def _approved_with_changes(event: Event) -> bool:
+    return event.payload.get(tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD) is True
+
+
+def _with_approved_arguments_notice(
+    event: Event, result: ToolResult, *, redactor: SecretRedactor | None = None
+) -> tuple[Event, ToolResult]:
+    """Begin newly produced content of an edited call with the notice.
+
+    Called only where content was just produced or replaced (the first
+    publication, a hook replacement, a projection, a bounded failure), never on
+    staged or finalized evidence. ``redactor`` projects the notice when the
+    content it joins has already been redacted.
+    """
+
+    if not _approved_with_changes(event):
+        return event, result
+    noticed = tool_execution.with_approved_arguments_notice(
+        result, approved=True, redactor=redactor
+    )
+    stored = event.payload.get("result")
+    if type(stored) is not dict:
+        raise RuntimeError("Terminal lost its tool result before the approval notice.")
+    if noticed is result and stored.get("content") == result.content:
+        return event, result
+    payload = {**event.payload, "result": {**stored, "content": noticed.content}}
+    return event.model_copy(update={"payload": payload}), noticed
+
+
+def _projection_with_approved_arguments_notice(
+    projection: ToolResultProjection, *, redactor: SecretRedactor
+) -> ToolResultProjection:
+    """Begin projected content with the notice and recompute its accounting.
+
+    The policy's preview keeps exactly its own bytes; the runtime notice has
+    its own allowance and the result stays within the projection safety bound,
+    which ``ToolResultProjection`` re-validates.
+    """
+
+    noticed = tool_execution.with_approved_arguments_notice(
+        projection.result, approved=True, redactor=redactor
+    )
+    if noticed is projection.result:
+        return projection
+    estimate, method = reestimate_tool_result_projection_tokens(
+        noticed.content, token_estimation_method=projection.record.token_estimation_method
+    )
+    record = projection.record.model_copy(
+        update={
+            "projected_bytes": len(noticed.content.encode("utf-8")),
+            "projected_token_estimate": estimate,
+            "token_estimation_method": method,
+        }
+    )
+    return ToolResultProjection(result=noticed, record=record)
+
+
 def _bounded_tool_failure_event(
     event: Event, failure: tool_execution.ToolExecutionOutcome
-) -> Event:
+) -> tuple[Event, ToolResult]:
+    """Replace a terminal with its bounded failure; an edited call keeps its notice."""
+
+    result = tool_execution.with_approved_arguments_notice(
+        failure.result, approved=_approved_with_changes(event)
+    )
     payload = dict(event.payload)
     payload.pop("tool_result_projection", None)
-    payload["result"] = failure.result.model_dump(mode="json")
+    payload["result"] = result.model_dump(mode="json")
     payload.update(failure.terminal_payload_fields())
     failed = event.model_copy(update={"type": EventType.TOOL_CALL_FAILED, "payload": payload})
     try:
         copied = copy_event(failed)
         validate_event_envelope(copied)
-        return copied
+        return copied, result
     except Exception as exc:
         limit_error = extract_durable_value_error(exc)
         if limit_error is None or limit_error.dimension is None:
@@ -115,12 +179,13 @@ def _bounded_tool_failure_event(
     # The effect intent retains argument authority. This terminal projection is
     # explicitly unavailable, never a truncated or different invocation.
     payload.pop("effective_arguments", None)
+    payload.pop("approved_arguments", None)
     payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
     payload.update(tool_argument_publication.unavailable_argument_projection().payload_fields())
     payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
     copied = copy_event(failed.model_copy(update={"payload": payload}))
     validate_event_envelope(copied)
-    return copied
+    return copied, result
 
 
 def _consume_projection_task_outcome(task: asyncio.Task[Any]) -> None:
@@ -199,6 +264,7 @@ class ToolTerminalPublisher:
         run_epoch: int,
         execution_profile: ExecutionProfileIdentity | None,
         tool_round_identity: ToolRoundIdentity,
+        approved_with_changes: bool = False,
     ) -> None:
         """Publish the pre-dispatch refusal with its failed external-effect state."""
 
@@ -229,6 +295,11 @@ class ToolTerminalPublisher:
                         else {}
                     ),
                     **({"input_id": intent.pause_id} if intent.pause_id is not None else {}),
+                    **(
+                        {tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD: True}
+                        if approved_with_changes
+                        else {}
+                    ),
                     "result": ToolResult(
                         content="Tool was not invoked because execution admission was refused.",
                         is_error=True,
@@ -236,6 +307,9 @@ class ToolTerminalPublisher:
                 },
             ),
             execution_profile,
+        )
+        event, _ = _with_approved_arguments_notice(
+            event, tool_results.tool_result_from_payload(event.payload["result"])
         )
         event = self._event_writer.prepare(
             _event_with_tool_round_authority(
@@ -267,7 +341,11 @@ class ToolTerminalPublisher:
         return self.governor.snapshot()
 
     async def emit(self, event: Event, *, emitter: TerminalEventEmitter | None = None) -> Event:
-        """Deliver one terminal through its selected persistence boundary."""
+        """Deliver one terminal through its selected persistence boundary.
+
+        Never rewrites the event: an edited call's notice entered its content
+        before redaction and staging, so staged and durable bytes are identical.
+        """
 
         if emitter is not None:
             return await emitter(event)
@@ -316,6 +394,7 @@ class ToolTerminalPublisher:
         argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
         deferred_terminal_stager: DeferredTerminalStager | None = None,
         publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
+        approved_arguments_notice: bool = False,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         payload: dict[str, Any] = {
             "tool_call_id": tool_call.id,
@@ -350,6 +429,7 @@ class ToolTerminalPublisher:
             allow_modification=allow_modification,
             deferred_terminal_stager=deferred_terminal_stager,
             publication_snapshot=publication_snapshot,
+            approved_arguments_notice=approved_arguments_notice,
         ):
             yield event
 
@@ -409,8 +489,8 @@ class ToolTerminalPublisher:
             result=result,
             redactor=redactor,
         )
-        failed = _bounded_tool_failure_event(event, failure)
-        return failed, failure.result, failure, cancellation, 0
+        failed, failed_result = _bounded_tool_failure_event(event, failure)
+        return failed, failed_result, failure, cancellation, 0
 
     async def _enforce_terminal_result_payload_limit(
         self,
@@ -429,6 +509,9 @@ class ToolTerminalPublisher:
         ).max_terminal_payload_bytes
         if maximum_bytes is None:
             return event, result, False
+        if event.payload.get(tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD) is True:
+            # The runtime's notice is not tool output and has its own allowance.
+            maximum_bytes += tool_execution.approved_arguments_notice_bytes(redactor)
         observed_bytes = await self.governor.run_cpu(
             _terminal_publication_work_estimate(event),
             lambda: _durable_payload_utf8_size(result.model_dump(mode="json")),
@@ -442,7 +525,9 @@ class ToolTerminalPublisher:
             observed_bytes=observed_bytes,
             redactor=redactor,
         )
-        failure_result = failure.result
+        failure_result = tool_execution.with_approved_arguments_notice(
+            failure.result, approved=_approved_with_changes(event)
+        )
         failure_payload = dict(event.payload)
         for field_name in tool_terminal_controls.runtime_terminal_controls(failure_payload):
             failure_payload.pop(field_name, None)
@@ -495,6 +580,7 @@ class ToolTerminalPublisher:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         executed_runtime_tool: object | None = None,
+        approved_arguments_notice: bool = False,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -519,6 +605,19 @@ class ToolTerminalPublisher:
         if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
             raise ValueError("Deferred terminal projection recording requires observational hooks.")
 
+        if approved_arguments_notice and not _approved_with_changes(event):
+            # Every terminal of a call a person changed tells the model so. The
+            # notice joins the content here, before redaction and staging; the
+            # marker records that it did, so no later step adds it again.
+            event = event.model_copy(
+                update={
+                    "payload": {
+                        **event.payload,
+                        tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD: True,
+                    }
+                }
+            )
+            event, result = _with_approved_arguments_notice(event, result)
         registered_tool = registered_agent.executable_tool(tool_call.name)
         quarantine_hook_output = (
             registered_tool is not None and not registered_tool.publish_arguments
@@ -553,6 +652,7 @@ class ToolTerminalPublisher:
         event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
         if resolved_argument_projection.state == "unavailable":
             event_payload.pop("effective_arguments", None)
+            event_payload.pop("approved_arguments", None)
             event_payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
         event_payload.update(resolved_argument_projection.payload_fields())
         event = event.model_copy(update={"payload": event_payload})
@@ -828,6 +928,13 @@ class ToolTerminalPublisher:
             if modified is not None:
                 final_result = modified
         if final_result is not result:
+            # A hook's replacement is new content; the notice joins it before
+            # the replacement is redacted.
+            final_result = tool_execution.with_approved_arguments_notice(
+                final_result,
+                approved=_approved_with_changes(event),
+                redactor=resolved_output_redactor,
+            )
             payload = dict(event.payload)
             payload["result"] = final_result.model_dump()
             event = event.model_copy(update={"payload": payload})
@@ -943,7 +1050,8 @@ class ToolTerminalPublisher:
                     result=result,
                     redactor=redactor,
                 )
-                return _bounded_tool_failure_event(event, failure), failure.result, failure, None, 0
+                failed, failed_result = _bounded_tool_failure_event(event, failure)
+                return failed, failed_result, failure, None, 0
             return event, result, None, None, 0
         if event.payload.get("terminal_outcome") == "invalid_tool_output" and event.payload.get(
             "durable_value_error_code"
@@ -1027,6 +1135,29 @@ class ToolTerminalPublisher:
                         settlement_observer.snapshot()
                     ),
                 )
+        if _approved_with_changes(event) and projection.result.content != result.content:
+            # Replaced content (an externalization marker) gets the notice
+            # here, before the record's byte and token accounting is fixed, so
+            # the record describes the exact published content.
+            try:
+                projection = _projection_with_approved_arguments_notice(
+                    projection, redactor=redactor
+                )
+            except ValueError:
+                # Only a policy filling the projection safety bound leaves no
+                # room for the notice; fail the projection closed, as for any
+                # projection the runtime cannot accept.
+                projection = _projection_with_approved_arguments_notice(
+                    projection_failure(
+                        policy=policy,
+                        request=request,
+                        failure_type="approval_notice_exceeds_projection_bound",
+                        # Keep the validated settlement: it names the operation
+                        # and artifact an uncertain write must be reconciled with.
+                        artifact_write_settlement=projection.record.artifact_write_settlement,
+                    ),
+                    redactor=redactor,
+                )
         payload = dict(event.payload)
         payload["result"] = projection.result.model_dump()
         payload["tool_result_projection"] = projection.record.model_dump(
@@ -1054,10 +1185,10 @@ class ToolTerminalPublisher:
                 redactor=redactor,
                 projection_evidence=projection.record.model_dump(mode="json", exclude_none=True),
             )
-            failed_event = _bounded_tool_failure_event(event, failure)
+            failed_event, failed_result = _bounded_tool_failure_event(event, failure)
             return (
                 failed_event,
-                failure.result,
+                failed_result,
                 failure,
                 outcome.cancellation,
                 outcome.cancellation_requests_consumed,

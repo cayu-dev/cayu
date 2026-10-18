@@ -25,7 +25,7 @@ from pydantic import ValidationError
 from cayu._validation import canonical_durable_json_bytes, json_utf8_size_within_limit
 from cayu.approvals.actors import ResolutionActor
 from cayu.approvals.authorization_grants import TOOL_AUTHORIZATION_GRANT_METADATA_KEY
-from cayu.approvals.revisions import ApprovalRevision
+from cayu.approvals.revisions import ApprovalArgumentsRevision, ApprovalRevision
 from cayu.budgets.usage import UsageMetrics
 from cayu.events import Event, EventType
 from cayu.execution_profiles import ExecutionProfileDecisionKind
@@ -426,16 +426,10 @@ async def _classify(
 ) -> SupervisionEvent | None:
     event_type = record.event.type
     if event_type == EventType.TOOL_CALL_APPROVED:
-        # An edit is an approval whose application declared a different
-        # approved revision than the proposal; the runtime cannot infer one.
-        revision = _approval_revision(record.event.payload)
+        # The record decides between approve and edit from the whole approval.
         return await _approval_record(
             record,
-            kind=(
-                SupervisionEventKind.EDIT
-                if revision is not None and revision.edited
-                else SupervisionEventKind.APPROVE
-            ),
+            kind=SupervisionEventKind.APPROVE,
             outcome=SupervisionEventOutcome.APPROVED,
             counts=lambda payload: True,
             session=session,
@@ -528,7 +522,27 @@ async def _approval_record(
     tool_call_ids = _distinct(_text(peer.event.payload, "tool_call_id") for peer in peers) or (
         _distinct([_text(payload, "tool_call_id")])
     )
-    approved = kind in {SupervisionEventKind.APPROVE, SupervisionEventKind.EDIT}
+    approved = kind is SupervisionEventKind.APPROVE
+    # Runtime evidence of changed arguments sits on the gating call's own
+    # approval event, which need not be the first in the round; an
+    # application's declared revision is a separate, weaker input.
+    arguments_revision = (
+        next(
+            (
+                revision
+                for peer in peers
+                if (revision := _arguments_revision(peer.event.payload)) is not None
+            ),
+            None,
+        )
+        if approved
+        else None
+    )
+    declared_revision = _approval_revision(payload) if approved else None
+    if arguments_revision is not None or (
+        declared_revision is not None and declared_revision.edited
+    ):
+        kind = SupervisionEventKind.EDIT
     grant_id, grant_role = _authorization_grant(request, payload if approved else None)
     return await _record(
         record,
@@ -547,14 +561,26 @@ async def _approval_record(
         requested_at=request.event.timestamp if request is not None else None,
         release_position=request.sequence if request is not None else None,
         attention_state=_APPROVAL_ATTENTION_STATES[kind],
-        approval_revision=_approval_revision(payload) if approved else None,
+        approval_revision=declared_revision,
+        arguments_revision=arguments_revision,
         authorization_grant_id=grant_id,
         authorization_grant_role=grant_role,
         content=(
             SupervisionEventContent(
                 tool_arguments=await _published_arguments(
                     evidence, session.id, approval_id=approval_id, after=window_start
-                )
+                ),
+                approved_arguments=(
+                    await _published_arguments(
+                        evidence,
+                        session.id,
+                        approval_id=approval_id,
+                        after=window_start,
+                        field="approved_arguments",
+                    )
+                    if arguments_revision is not None
+                    else None
+                ),
             )
             if content
             else None
@@ -869,6 +895,7 @@ async def _record(
     attention_kind: PendingActionKind | None = None,
     attention_state: SupervisionAttentionState | None = None,
     approval_revision: ApprovalRevision | None = None,
+    arguments_revision: ApprovalArgumentsRevision | None = None,
     authorization_grant_id: str | None = None,
     authorization_grant_role: SupervisionGrantRole | None = None,
     content: SupervisionEventContent | None = None,
@@ -931,6 +958,7 @@ async def _record(
         attention_id=attention_id,
         attention_state=attention_state if attention_id is not None else None,
         approval_revision=approval_revision,
+        arguments_revision=arguments_revision,
         authorization_grant_id=authorization_grant_id,
         authorization_grant_role=authorization_grant_role,
         requested_at=requested_at,
@@ -1000,7 +1028,12 @@ async def _usage(
 
 
 async def _published_arguments(
-    evidence: _SessionEvidence, session_id: str, *, approval_id: str, after: int
+    evidence: _SessionEvidence,
+    session_id: str,
+    *,
+    approval_id: str,
+    after: int,
+    field: str = "arguments",
 ) -> dict[str, Any] | None:
     terminals = await evidence.all_after(
         session_id,
@@ -1008,11 +1041,11 @@ async def _published_arguments(
         after,
         lambda event: (
             _text(event.payload, "approval_id") == approval_id
-            and type(event.payload.get("arguments")) is dict
+            and type(event.payload.get(field)) is dict
         ),
     )
     published = {
-        call_id: terminal.event.payload["arguments"]
+        call_id: terminal.event.payload[field]
         for terminal in terminals
         if (call_id := _text(terminal.event.payload, "tool_call_id")) is not None
     }
@@ -1090,6 +1123,22 @@ def _approval_revision(payload: dict[str, Any]) -> ApprovalRevision | None:
         return None
     try:
         return ApprovalRevision.model_validate(value)
+    except ValidationError:
+        return None
+
+
+def _arguments_revision(payload: dict[str, Any]) -> ApprovalArgumentsRevision | None:
+    """Read the runtime's own evidence that a person changed the call's arguments.
+
+    It is a runtime-owned event field, never metadata, so it survives every
+    secret scope and metadata bound.
+    """
+
+    value = _object(payload, "arguments_revision")
+    if value is None:
+        return None
+    try:
+        return ApprovalArgumentsRevision.model_validate(value)
     except ValidationError:
         return None
 

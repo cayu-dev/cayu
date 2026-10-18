@@ -18,6 +18,7 @@ from cayu.environments.bindings import DeterministicWorkspaceBinding
 from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.runtime._tool_execution import APPROVED_ARGUMENTS_NOTICE
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.memory import InMemorySessionStore
@@ -43,7 +44,9 @@ from cayu.workspaces.observation_recovery import workspace_observations_from_che
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("pause", ["ordinary", "approval", "user_input", "gateway", "workspace"])
+@pytest.mark.parametrize(
+    "pause", ["ordinary", "approval", "approval_edit", "user_input", "gateway", "workspace"]
+)
 def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_path):
     async def scenario():
         committed = asyncio.Event()
@@ -170,7 +173,7 @@ def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_pat
                 AgentSpec(name="agent", model="test"),
                 tools=[External(), UserInputTool()] if pause == "user_input" else [External()],
                 tool_policy=AlwaysRequireApprovalToolPolicy(tools=["external"])
-                if pause == "approval"
+                if pause in {"approval", "approval_edit"}
                 else None,
                 **(
                     {
@@ -226,7 +229,7 @@ def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_pat
                         session_id="prepared", input_id=awaiting.payload["input_id"], answer="yes"
                     )
                     _ = [e async for e in app.resolve_user_input(input_response)]
-                elif pause == "approval":
+                elif pause in {"approval", "approval_edit"}:
                     approval = next(
                         e for e in events if e.type.value == "tool.call.approval_requested"
                     )
@@ -236,6 +239,7 @@ def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_pat
                         tool_round_id=approval.payload["tool_round_id"],
                         tool_call_id=approval.payload["tool_call_id"],
                         decision=ToolApprovalDecision.APPROVE,
+                        arguments={"value": "edited"} if pause == "approval_edit" else None,
                     )
                     _ = [e async for e in app.resolve_tool_approval(approval_request)]
 
@@ -351,6 +355,13 @@ def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_pat
             ]
             assert len(terminals) == 1 and terminals[0].id == selected["terminal"]["event_id"]
             assert terminals[0].payload["result"]["structured"]["executed"] is False
+            if pause == "approval_edit":
+                # Even a call that never ran tells the model a person changed it.
+                assert terminals[0].payload["approved_with_changes"] is True
+                assert (
+                    terminals[0].payload["result"]["content"].startswith(APPROVED_ARGUMENTS_NOTICE)
+                )
+                assert model_results[0].content.startswith(APPROVED_ARGUMENTS_NOTICE)
             # Diagnostic redaction must not erase the boolean non-dispatch proof
             # or expose the private arguments in the recovered terminal.
             assert "private argument" not in str(terminals[0].payload)

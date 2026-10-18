@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError, model_validator
 
 APPROVAL_REVISION_METADATA_KEY = "cayu:approval_revision"
 # Opaque digest tokens such as lowercase SHA-256 hex or ``sha256:<hex>``. The
@@ -36,6 +36,35 @@ class ApprovalRevision(BaseModel):
         """Whether the person approved a different version than the agent proposed."""
 
         return self.approved_digest != self.proposed_digest
+
+
+class ApprovalArgumentsRevision(BaseModel):
+    """Runtime evidence that a person approved a call with changed arguments.
+
+    ``changed_fields`` names only top-level properties the tool's schema
+    declares; it never carries argument values. The digests identify the
+    proposed and approved versions with HMAC-SHA256 under the session store's
+    public-authority alias key ``digest_key_id``, so they cannot be confirmed
+    by guessing; all three are ``None`` when the store has no alias keyring.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    changed_fields: tuple[StrictStr, ...] = Field(default=(), max_length=64)
+    proposed_arguments_digest: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    approved_arguments_digest: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    digest_key_id: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_digests(self) -> ApprovalArgumentsRevision:
+        present = {
+            self.proposed_arguments_digest is not None,
+            self.approved_arguments_digest is not None,
+            self.digest_key_id is not None,
+        }
+        if len(present) != 1:
+            raise ValueError("Argument digests and their key id are published together.")
+        return self
 
 
 def approval_revision_metadata(

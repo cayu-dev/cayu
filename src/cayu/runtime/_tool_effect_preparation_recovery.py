@@ -13,12 +13,19 @@ from cayu.execution_profiles import (
     event_with_execution_profile_authority,
 )
 from cayu.execution_units import ToolRoundIdentity
-from cayu.runtime._approval_support import tool_call_request_from_pending
+from cayu.runtime._approval_support import (
+    approved_arguments_for_call,
+    tool_call_request_from_pending,
+)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_effect_state import (
     ToolEffectRecord,
     ToolEffectStateOwner,
     ToolEffectTerminal,
+)
+from cayu.runtime._tool_execution import (
+    APPROVED_ARGUMENTS_TERMINAL_FIELD,
+    with_approved_arguments_notice,
 )
 from cayu.runtime._tool_invocation.context import (
     _event_with_targeted_tool_invocation_authority,
@@ -26,6 +33,7 @@ from cayu.runtime._tool_invocation.context import (
 )
 from cayu.runtime._tool_round_staging import _event_with_tool_round_authority
 from cayu.runtime.tool_effects import ToolEffectConflict
+from cayu.sessions._pending_approval_reader import approval_resolution_intent_from_checkpoint
 from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
@@ -60,6 +68,12 @@ async def settle_prepared_tool_effects(
     """Use the same exact CAS as dispatch; leave pause/round consumption to its owner."""
     owner = ToolEffectStateOwner(store)
     events: list[Event] = []
+    # The model learns a person changed the gating call even when it never ran.
+    resolution_intent = (
+        approval_resolution_intent_from_checkpoint(await store.load_checkpoint(session.id))
+        if isinstance(pending, PendingToolApproval)
+        else None
+    )
     identity = ToolRoundIdentity(
         model_step_id=pending.model_step_id,
         model_attempt_id=pending.model_attempt_id,
@@ -111,14 +125,23 @@ async def settle_prepared_tool_effects(
                 **({"approval_id": intent.approval_id} if intent.approval_id else {}),
                 **({"input_id": intent.pause_id} if intent.pause_id else {}),
                 "recovered": True,
-                "result": ToolResult(
-                    content="Tool was not invoked before interrupted preparation was recovered.",
-                    is_error=True,
-                    structured={
-                        "recovery_reason": "tool_effect_not_dispatched",
-                        "executed": False,
-                        "outcome_unknown": False,
-                    },
+                **(
+                    {APPROVED_ARGUMENTS_TERMINAL_FIELD: True}
+                    if approved_arguments_for_call(resolution_intent, call.tool_call_id) is not None
+                    else {}
+                ),
+                "result": with_approved_arguments_notice(
+                    ToolResult(
+                        content="Tool was not invoked before interrupted preparation was recovered.",
+                        is_error=True,
+                        structured={
+                            "recovery_reason": "tool_effect_not_dispatched",
+                            "executed": False,
+                            "outcome_unknown": False,
+                        },
+                    ),
+                    approved=approved_arguments_for_call(resolution_intent, call.tool_call_id)
+                    is not None,
                 ).model_dump(mode="json"),
             },
         )

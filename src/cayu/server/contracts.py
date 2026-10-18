@@ -29,7 +29,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.approvals.actors import ResolutionActorSource
-from cayu.approvals.revisions import ApprovalRevision
+from cayu.approvals.revisions import ApprovalArgumentsRevision, ApprovalRevision
 from cayu.budgets.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -795,6 +795,13 @@ class ApiSupervisionEvent(ApiBaseModel):
     approval_revision: ApprovalRevision | None = Field(
         default=None,
         description="Application-declared proposed and approved revision digests.",
+    )
+    arguments_revision: ApprovalArgumentsRevision | None = Field(
+        default=None,
+        description=(
+            "Runtime evidence of an approval with changed arguments: salted digests of "
+            "both versions and the schema-declared top-level fields that changed."
+        ),
     )
     authorization_grant_id: str | None = None
     authorization_grant_role: SupervisionGrantRole | None = None

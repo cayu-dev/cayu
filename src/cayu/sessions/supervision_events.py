@@ -31,7 +31,7 @@ from pydantic import (
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
-from cayu.approvals.revisions import ApprovalRevision
+from cayu.approvals.revisions import ApprovalArgumentsRevision, ApprovalRevision
 from cayu.budgets.usage import UsageMetrics
 from cayu.releases import validate_release_id
 from cayu.sessions.queries import SessionAggregateFilter
@@ -182,12 +182,15 @@ class SupervisionEventContent(BaseModel):
 
     Each field holds only what the runtime already published durably; content
     the runtime withheld at publication stays ``None``. ``tool_arguments`` maps
-    a tool-call id to the arguments its terminal event published.
+    a tool-call id to the arguments its terminal event published, which are the
+    model's; ``approved_arguments`` maps the call a person changed to the
+    arguments it ran with, under the same publication rule.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     tool_arguments: dict[StrictStr, Any] | None = None
+    approved_arguments: dict[StrictStr, Any] | None = None
     question: StrictStr | None = None
     options: tuple[StrictStr, ...] | None = None
     answer: Any = None
@@ -202,6 +205,9 @@ class SupervisionEvent(BaseModel):
     ``attention_state`` is that request's settled state when the shared
     settlement rule decides it, and ``None`` otherwise. ``approval_revision`` is
     the application's content-free declaration of the approved version.
+    ``arguments_revision`` is the runtime's own content-free evidence that a
+    person approved the call with changed arguments; either one makes the touch
+    an ``edit``.
     ``authorization_grant_id`` names the tool authorization grant that sent the
     call to sampled review or that this approval created, per
     ``authorization_grant_role``. ``release_id`` and ``release_snapshot_root``
@@ -241,6 +247,7 @@ class SupervisionEvent(BaseModel):
     attention_id: StrictStr | None = Field(default=None, pattern=r"^attention_[0-9a-f]{64}$")
     attention_state: SupervisionAttentionState | None = None
     approval_revision: ApprovalRevision | None = None
+    arguments_revision: ApprovalArgumentsRevision | None = None
     authorization_grant_id: StrictStr | None = None
     authorization_grant_role: SupervisionGrantRole | None = None
     requested_at: datetime | None = None

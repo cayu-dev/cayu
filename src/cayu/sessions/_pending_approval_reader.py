@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_durable_json_value, require_durable_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+)
 from cayu.approvals.tools import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -207,6 +212,39 @@ def effective_tool_policy_evidence(
     return ToolPolicyEvidence.UNREGISTERED
 
 
+def approved_arguments_sha256(arguments: dict[str, Any]) -> str:
+    """Bind approved arguments by their canonical durable JSON bytes."""
+
+    return sha256(canonical_durable_json_bytes(arguments, "approved_arguments")).hexdigest()
+
+
+class ApprovedToolArguments(BaseModel):
+    """Changed arguments accepted for the gating call before it was claimed.
+
+    Admission re-authorized them at request time; resume runs them under the
+    approval's own decision and never re-runs policy, so no policy result is kept.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    arguments: dict[str, Any] = Field(repr=False)
+    arguments_sha256: str
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def copy_arguments(cls, value: Any) -> dict[str, Any]:
+        copied = copy_durable_json_value(value, "approved_arguments")
+        if type(copied) is not dict:
+            raise ValueError("approved_arguments must be an object.")
+        return copied
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> ApprovedToolArguments:
+        if self.arguments_sha256 != approved_arguments_sha256(self.arguments):
+            raise ValueError("approved_arguments_sha256 does not match approved_arguments.")
+        return self
+
+
 class ApprovalResolutionIntent(BaseModel):
     """Immutable resolution authority retained with one pending approval."""
 
@@ -226,6 +264,10 @@ class ApprovalResolutionIntent(BaseModel):
     # publication coverage advances. Legacy/unreviewed claims do not acquire
     # this authority retroactively.
     reviewed_approval_digest: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # Written in the same claim as the decision, before any dispatch.
+    approved_arguments: ApprovedToolArguments | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -258,6 +300,11 @@ class ApprovalResolutionIntent(BaseModel):
 
     @model_validator(mode="after")
     def validate_execution_identity(self) -> ApprovalResolutionIntent:
+        if (
+            self.approved_arguments is not None
+            and self.decision is not ToolApprovalDecision.APPROVE
+        ):
+            raise ValueError("Approved arguments require an approval decision.")
         ToolRoundIdentity(
             tool_round_id=self.tool_round_id,
             model_step_id=self.model_step_id,

@@ -1192,6 +1192,8 @@ class DurableToolRound:
                 or pending_tool_call.tool_call_id in staged_call_ids
             ):
                 continue
+            # The model's arguments: round recovery is unreachable while an
+            # approval, and so any approved arguments, is pending.
             tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
             if (
                 pending_approval_reader.effective_tool_policy_evidence(pending_tool_call)
@@ -2022,6 +2024,7 @@ def _limit_reached_tool_call_event(
     tool_round_identity: ToolRoundIdentity,
     execution_profile: ExecutionProfileIdentity | None,
     approval_id: str | None = None,
+    approved_with_changes: bool = False,
 ) -> Event:
     identity = copy_tool_round_identity(tool_round_identity)
     payload = {
@@ -2040,6 +2043,8 @@ def _limit_reached_tool_call_event(
     }
     if approval_id is not None:
         payload["approval_id"] = approval_id
+    if approved_with_changes:
+        payload[tool_execution.APPROVED_ARGUMENTS_TERMINAL_FIELD] = True
     return event_with_execution_profile_authority(
         Event(
             type=EventType.TOOL_CALL_FAILED,

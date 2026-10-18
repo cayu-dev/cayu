@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -50,7 +51,7 @@ from cayu.tools._runner import (
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.tools.isolated import ProcessIsolatedTool
 from cayu.tools.policy import ToolPolicyResult
-from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.runtime._invocation_secrets import InvocationPublicationSnapshot
@@ -1117,3 +1118,107 @@ def validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
         command_denial_code=result.command_denial_code,
         approval_expires_in_seconds=result.approval_expires_in_seconds,
     )
+
+
+# Runtime-owned, content-free terminal field: the call ran with arguments a
+# person changed, so its final result must begin with the notice.
+APPROVED_ARGUMENTS_TERMINAL_FIELD = "approved_with_changes"
+APPROVED_ARGUMENTS_NOTICE = (
+    "A person changed this call's arguments before approving it; "
+    "the call used their arguments, not the ones you proposed."
+)
+
+
+def approved_arguments_notice_content(content: str, *, redactor: Any = None) -> str:
+    """Begin content with the runtime notice, once, in the redactor's projection.
+
+    The notice is ordinary result content: it enters before redaction and is
+    redacted like any other text, so a registered secret is never published
+    even inside it. Producers call this only on content that does not carry the
+    notice yet; publication recognizes an edited call by its terminal marker,
+    never by this prefix.
+    """
+
+    notice = (
+        APPROVED_ARGUMENTS_NOTICE
+        if redactor is None
+        else redactor.redact_text(APPROVED_ARGUMENTS_NOTICE)
+    )
+    if content.startswith(APPROVED_ARGUMENTS_NOTICE) or content.startswith(notice):
+        return content
+    return notice if not content else f"{notice}\n\n{content}"
+
+
+def _is_approved_arguments_notice_projection(text: str) -> bool:
+    """Whether ``text`` is the notice, or the notice with registered secrets redacted."""
+
+    if text == APPROVED_ARGUMENTS_NOTICE:
+        return True
+    fragments = text.split(REDACTED_SECRET)
+    if len(fragments) < 2:
+        return False
+    position = 0
+    for index, fragment in enumerate(fragments):
+        if index == 0:
+            if not APPROVED_ARGUMENTS_NOTICE.startswith(fragment):
+                return False
+            position = len(fragment)
+            continue
+        if index == len(fragments) - 1:
+            return len(APPROVED_ARGUMENTS_NOTICE) - len(fragment) >= position and (
+                APPROVED_ARGUMENTS_NOTICE.endswith(fragment)
+            )
+        found = APPROVED_ARGUMENTS_NOTICE.find(fragment, position + 1) if fragment else position
+        if found < 0:
+            return False
+        position = found + len(fragment)
+    return True
+
+
+def content_carries_approved_arguments_notice(content: str, *, original: str) -> bool:
+    """Whether ``content`` is ``original`` begun with the (possibly redacted) notice.
+
+    Checks a published terminal against evidence that predates the notice,
+    such as a validated receipt's message, without the publishing redactor.
+    """
+
+    if original:
+        suffix = f"\n\n{original}"
+        if not content.endswith(suffix):
+            return False
+        notice = content[: -len(suffix)]
+    else:
+        notice = content
+    return _is_approved_arguments_notice_projection(notice)
+
+
+def with_approved_arguments_notice(
+    result: ToolResult, *, approved: bool, redactor: Any = None
+) -> ToolResult:
+    """Begin a result with the runtime notice that a person changed the call."""
+
+    if not approved:
+        return result
+    content = approved_arguments_notice_content(result.content, redactor=redactor)
+    return result if content == result.content else result.model_copy(update={"content": content})
+
+
+def approved_arguments_notice_bytes(redactor: Any = None) -> int:
+    """Encoded JSON bytes the (redacted) notice and its separator add to a result."""
+
+    notice = (
+        APPROVED_ARGUMENTS_NOTICE
+        if redactor is None
+        else redactor.redact_text(APPROVED_ARGUMENTS_NOTICE)
+    )
+    return max(
+        len(json.dumps(f"{text}\n\n", ensure_ascii=False).encode()) - 2
+        for text in (APPROVED_ARGUMENTS_NOTICE, notice)
+    )
+
+
+# Upper bound for reservations made before the publishing redactor is known:
+# redaction could at worst replace every notice character with its marker.
+APPROVED_ARGUMENTS_NOTICE_MAX_BYTES = (
+    len(json.dumps(REDACTED_SECRET * len(APPROVED_ARGUMENTS_NOTICE) + "\n\n").encode()) - 2
+)

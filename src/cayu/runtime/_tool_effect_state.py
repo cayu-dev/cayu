@@ -37,6 +37,10 @@ from cayu._validation import (
 from cayu.events import Event, EventType, copy_event
 from cayu.failure_evidence import FailureEvidence
 from cayu.runtime._phase_timing import timed_phase
+from cayu.runtime._tool_execution import (
+    APPROVED_ARGUMENTS_TERMINAL_FIELD,
+    content_carries_approved_arguments_notice,
+)
 from cayu.runtime.tool_effects import (
     TOOL_EFFECT_RECEIPT_MAX_BYTES,
     TOOL_EFFECT_RECEIPT_MAX_NODES,
@@ -1128,8 +1132,16 @@ def _validate_selected_terminal(
         if terminal.receipt is not None:
             receipt = terminal.receipt
             result = event.payload["result"]
+            content = result.get("content")
+            # An edited gating call's receipt terminal begins with the notice.
+            content_matches = (
+                type(content) is str
+                and content_carries_approved_arguments_notice(content, original=receipt.message)
+                if event.payload.get(APPROVED_ARGUMENTS_TERMINAL_FIELD) is True
+                else content == receipt.message
+            )
             if (
-                result.get("content") != receipt.message
+                not content_matches
                 or result.get("structured") != receipt.structured
                 or result.get("is_error") is not (receipt.outcome == "failed")
                 or result.get("artifacts") != receipt.artifacts

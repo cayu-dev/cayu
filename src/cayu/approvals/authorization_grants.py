@@ -46,6 +46,11 @@ TOOL_AUTHORIZATION_GRANT_SCHEMA_VERSION = 1
 TOOL_APPROVAL_GATE_METADATA_KEY = APPROVAL_GATE_METADATA_KEY
 #: Policy metadata marking a mandatory control. Grants never apply to it.
 TOOL_MANDATORY_APPROVAL_METADATA_KEY = "cayu:mandatory_approval"
+# Marks the read-only re-authorization of arguments a person changed before
+# approving: a grant policy never selects, uses or samples a grant for it.
+APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY = "cayu:approved_arguments_reauthorization"
+# The non-grantable offer reason a grant policy records for a mandatory control.
+MANDATORY_CONTROL_OFFER_REASON = "mandatory_control"
 #: Evidence on a policy result authorized (or sampled) by a grant, and the
 #: marker on the approval request that created a grant.
 TOOL_AUTHORIZATION_GRANT_METADATA_KEY = "cayu:authorization_grant"

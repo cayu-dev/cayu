@@ -42,6 +42,7 @@ from cayu.approvals.authorization_grants import (
 )
 from cayu.approvals.tools import (
     PendingToolApproval,
+    ToolApprovalArgumentsRefused,
     ToolApprovalDecision,
     ToolApprovalRequest,
     copy_tool_approval_request,
@@ -191,6 +192,12 @@ class ToolAuthorizationGrantService:
             )
         if TOOL_AUTHORIZATION_GRANT_METADATA_KEY in approval.metadata:
             raise ValueError(f"metadata[{TOOL_AUTHORIZATION_GRANT_METADATA_KEY!r}] is reserved.")
+        if approval.arguments is not None:
+            # A grant generalizes the call that was approved; it must never be
+            # created from arguments the person rejected by changing them.
+            raise ToolApprovalArgumentsRefused(
+                "A grant cannot be created with an approval that changes the call's arguments."
+            )
         approval = await self._private_request(approval)
         grant_id = tool_authorization_grant_id(
             session_id=approval.session_id, approval_id=approval.approval_id
@@ -638,7 +645,12 @@ def _approval_request_with_marker(
             },
         }
     )
-    return copy_tool_approval_request(approval).model_copy(update={"metadata": metadata})
+    request = copy_tool_approval_request(approval).model_copy(update={"metadata": metadata})
+    # Only this exact marker passes the public resolution entrance.
+    request._issued_authorization_grant = copy_durable_metadata(
+        metadata[TOOL_AUTHORIZATION_GRANT_METADATA_KEY]
+    )
+    return request
 
 
 def _resolution_request_digest(request: ToolApprovalRequest) -> str:

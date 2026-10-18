@@ -144,6 +144,7 @@ def approval_resolution_intent_for(
     resolution_request_digest: str | None,
     reviewed_approval_digest: str | None = None,
     pause_resolved_at: datetime | None = None,
+    approved_arguments: pending_approval_reader.ApprovedToolArguments | None = None,
 ) -> pending_approval_reader.ApprovalResolutionIntent:
     if type(approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
@@ -159,7 +160,23 @@ def approval_resolution_intent_for(
         resolution_request_digest=resolution_request_digest,
         reviewed_approval_digest=reviewed_approval_digest,
         pause_resolved_at=pause_resolved_at,
+        approved_arguments=approved_arguments,
     )
+
+
+def approved_arguments_for_call(
+    intent: pending_approval_reader.ApprovalResolutionIntent | None,
+    tool_call_id: str,
+) -> dict[str, Any] | None:
+    """Return the arguments a person approved for this call, if they changed it.
+
+    Only the gating call can carry changed arguments; every sibling keeps the
+    model's arguments.
+    """
+
+    if intent is None or intent.approved_arguments is None or tool_call_id != intent.tool_call_id:
+        return None
+    return copy_durable_json_value(intent.approved_arguments.arguments, "approved_arguments")
 
 
 def approval_resolution_request_digest(request: ToolApprovalRequest) -> str:
@@ -170,9 +187,11 @@ def approval_resolution_request_digest(request: ToolApprovalRequest) -> str:
     return runtime_publication_checkpoint_value_digest(
         request.model_dump(
             mode="json",
+            # Absent approved arguments are excluded, so earlier digests hold.
             include={
                 "review_reference",
                 "decision",
+                "arguments",
                 "reason",
                 "metadata",
                 "resolved_by",
@@ -196,6 +215,7 @@ def require_resolution_intent_matches_approval(
             if intent.reviewed_approval_digest is None
             else runtime_publication_checkpoint_value_digest(approval.model_dump(mode="json"))
         ),
+        approved_arguments=intent.approved_arguments,
     )
     if intent != expected:
         raise RuntimeError("Approval resolution intent conflicts with its pending approval.")
@@ -211,6 +231,7 @@ def checkpoint_with_approval_resolution_intent(
     runtime_session: Session | None = None,
     reviewed_approval_digest: str | None = None,
     pause_resolved_at: datetime | None = None,
+    approved_arguments: pending_approval_reader.ApprovedToolArguments | None = None,
 ) -> dict[str, Any]:
     """Set or validate one immutable decision inside an approval claim."""
 
@@ -226,6 +247,7 @@ def checkpoint_with_approval_resolution_intent(
         resolution_request_digest=resolution_request_digest,
         reviewed_approval_digest=reviewed_approval_digest,
         pause_resolved_at=pause_resolved_at,
+        approved_arguments=approved_arguments,
     )
     current = pending_approval_reader.approval_resolution_intent_from_checkpoint(
         copied, redactor=redactor
@@ -242,6 +264,8 @@ def checkpoint_with_approval_resolution_intent(
             )
         if current.reviewed_approval_digest != reviewed_approval_digest:
             raise RuntimeError("Tool approval cannot replace its accepted content binding.")
+        if current.approved_arguments != approved_arguments:
+            raise RuntimeError("Tool approval cannot replace its approved arguments.")
         expected = current
     copied[pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY] = expected.model_dump(
         mode="json"

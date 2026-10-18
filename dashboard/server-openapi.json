@@ -3185,6 +3185,17 @@
             ],
             "description": "Application-declared proposed and approved revision digests."
           },
+          "arguments_revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalArgumentsRevision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runtime evidence of an approval with changed arguments: salted digests of both versions and the schema-declared top-level fields that changed."
+          },
           "attention_id": {
             "anyOf": [
               {
@@ -4867,6 +4878,58 @@
           "environment"
         ],
         "title": "ApplicationDefaultsManifest",
+        "type": "object"
+      },
+      "ApprovalArgumentsRevision": {
+        "additionalProperties": false,
+        "description": "Runtime evidence that a person approved a call with changed arguments.\n\n``changed_fields`` names only top-level properties the tool's schema\ndeclares; it never carries argument values. The digests identify the\nproposed and approved versions with HMAC-SHA256 under the session store's\npublic-authority alias key ``digest_key_id``, so they cannot be confirmed\nby guessing; all three are ``None`` when the store has no alias keyring.",
+        "properties": {
+          "approved_arguments_digest": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approved Arguments Digest"
+          },
+          "changed_fields": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Changed Fields",
+            "type": "array"
+          },
+          "digest_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest Key Id"
+          },
+          "proposed_arguments_digest": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proposed Arguments Digest"
+          }
+        },
+        "title": "ApprovalArgumentsRevision",
         "type": "object"
       },
       "ApprovalRevision": {
@@ -35680,6 +35743,19 @@
             "minLength": 1,
             "title": "Approval Id",
             "type": "string"
+          },
+          "arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replacement arguments for the gating call, approved with changes; requires decision=approve.",
+            "title": "Arguments"
           },
           "budget_limits": {
             "anyOf": [
