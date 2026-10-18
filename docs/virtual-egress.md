@@ -106,8 +106,9 @@ lookup runs in an owned helper process, so expiry terminates and reaps the
 resolver before returning the timeout. Application-injected HTTPX transports
 or destination resolvers carry no inferred cancellation authority and remain
 capacity-counted until natural completion. Responses are buffered so the broker
-can scrub credentials before the guest sees them. The broker rejects any
-returned response above its configured limit:
+can scrub credentials before the guest sees them (event streams are scrubbed
+chunk by chunk instead; see [Streamed responses](#streamed-responses)). The
+broker rejects any returned response above its configured limit:
 `TransparentEgressBroker(upstream_max_response_bytes=...)` defaults to 256 MiB
 and accepts up to the 2 GiB hard ceiling, and
 `upstream_total_timeout_s` (default 600 seconds, at most one hour) bounds each
@@ -159,6 +160,46 @@ by construction: the container joins an `--internal`
 Docker network with no route to the internet, so the only reachable egress is a
 dual-homed sidecar that forwards to the in-process broker. This network control
 does not turn the container into a secure sandbox boundary.
+
+### Streamed responses
+
+Server-sent events (`text/event-stream`) and newline-delimited JSON
+(`application/x-ndjson`) responses are forwarded through the proxy server as
+they arrive instead of being buffered, so a long streamed model call keeps
+delivering events to the guest and does not hit the client's idle deadline.
+The request goes through the same credential, policy and authority checks
+before dispatch; a denied request never reaches the upstream. The response head
+gets the same header and `Set-Cookie` checks and scrubbing as a buffered
+response, and any response those checks would refuse, or any encoded,
+`HEAD`, `204`, `205` or `304` response, is buffered instead so it keeps its
+specific denial. Each chunk is scrubbed before it is forwarded; only bytes that
+could begin a secret split across two chunks are held back until the next chunk
+shows whether they do. The response byte limit applies to the bytes received
+and to the bytes forwarded, and at most 256 KiB of scrubbed bytes wait for a
+slow client before the broker pauses reading, so a streamed response holds only
+that window against the buffer budget. The reservation lasts until the proxy has
+taken every queued chunk, even after the upstream has finished. The total upstream deadline still
+bounds the whole stream.
+
+The proxy writes a streamed body with chunked transfer encoding (HTTP/1.1
+requests only; HTTP/1.0 requests stay buffered). When the byte limit or buffer
+budget is exceeded, authority is revoked, or the upstream fails part-way, the
+proxy closes the connection without the terminal chunk, so the client reports
+an incomplete body rather than accepting a truncated one. The broker records
+one decision per streamed request after the body ends: allowed when it
+completed, or a denial with the usual error code (`oversized_response`,
+`timeout`, `upstream_capacity_exhausted`, `client_disconnected` and so on) when
+it stopped. A stream cancelled part-way, because the client disconnected or the
+proxy shut down or timed out, is recorded as a denial with `client_disconnected`,
+`proxy_shutting_down` or `proxy_broker_timeout`. A client that disconnects cancels the upstream call; an upstream
+that cannot be cancelled stops at its next chunk.
+Calls to `handle_request` itself always return a buffered response.
+
+A custom upstream can stream through the same seam: when
+`EgressUpstreamLimits.response_stream` is set, it offers the response head to
+`EgressResponseStream.start`, and if that returns `True` it passes each body
+chunk to `write` and returns the head with an empty body. Upstreams that ignore
+`response_stream` keep the buffered behavior.
 
 ## API shape
 

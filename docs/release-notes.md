@@ -7,6 +7,15 @@ this build. Schema revision 124 preserves restartable task policy, provisional r
 fences, and durable concurrency keys across every task claimant. All task stores must be migrated;
 older claimants do not understand key exclusion.
 
+- Stream server-sent events and newline-delimited JSON responses through the
+  egress proxy as they arrive instead of buffering the whole body, so a long
+  streamed model call through virtual egress no longer hits the client's
+  300-second idle deadline. Policy checks, credential substitution, secret
+  scrubbing, the response byte limit and the buffer budget all still apply, per
+  chunk; a stream stopped part-way closes the connection without the terminal
+  chunk. Custom upstreams can stream through `EgressUpstreamLimits.response_stream`
+  ([streamed responses](virtual-egress.md#streamed-responses)).
+
 - Add optional task concurrency keys. Workers skip jobs whose key already has
   a live lease, allowing unrelated work to run without occupying waiting slots.
   Retry and continuation claims preserve the same exclusion.

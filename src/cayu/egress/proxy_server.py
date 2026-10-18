@@ -34,6 +34,7 @@ from cayu.egress.broker import (
     EgressResponseBuffer,
     TransparentEgressBroker,
     _ConnectDestinationAdmission,
+    _ResponseStreamChannel,
 )
 from cayu.egress.destinations import normalize_egress_hostname
 
@@ -639,7 +640,7 @@ class TransparentEgressProxyServer:
             request_line, headers = _read_head(tls, stop=self._stop)
             if not request_line:
                 return
-            method, path, _ = _parse_request_line(request_line)
+            method, path, version = _parse_request_line(request_line)
             body = _read_body(tls, headers, stop=self._stop)
             split = urlsplit(path)
             captured = CapturedRequest(
@@ -652,7 +653,20 @@ class TransparentEgressProxyServer:
                 headers=headers,
                 body=body,
             )
-            response, response_buffers = self._call_broker(captured, client=tls)
+            # Chunked framing lets a truncated stream be told apart from a
+            # complete one, so only HTTP/1.1 responses that carry a body stream.
+            response_stream = (
+                _ResponseStreamChannel(self._loop)
+                if version == "HTTP/1.1" and method.upper() != "HEAD"
+                else None
+            )
+            response, response_buffers = self._call_broker(
+                captured,
+                client=tls,
+                response_stream=response_stream,
+            )
+            if response is None:
+                return
             try:
                 response_head = _serialize_response_head(response)
                 _send_all(tls, response_head, stop=self._stop)
@@ -777,32 +791,60 @@ class TransparentEgressProxyServer:
         request: CapturedRequest,
         *,
         client: ssl.SSLSocket,
-    ) -> tuple[CapturedResponse, tuple[EgressResponseBuffer, ...]]:
-        future, claim = _submit_broker_request(self._broker, request, self._loop)
+        response_stream: _ResponseStreamChannel | None = None,
+    ) -> tuple[CapturedResponse | None, tuple[EgressResponseBuffer, ...]]:
+        """Return the buffered response, or ``None`` after relaying a streamed one."""
+
+        future, claim = _submit_broker_request(
+            self._broker,
+            request,
+            self._loop,
+            response_stream=response_stream,
+        )
+        if response_stream is not None:
+            future.add_done_callback(lambda _future: response_stream.wake())
         # Poll so a concurrent close() (which sets _stop) aborts the wait quickly
         # instead of blocking the whole shutdown until the response deadline.
         response_timeout_s = max(
             _BROKER_TIMEOUT_S,
             getattr(self._broker, "upstream_total_timeout_s", 0.0) + _BROKER_RESPONSE_MARGIN_S,
         )
-        waited = 0.0
-        while waited < response_timeout_s:
+        deadline = time.monotonic() + response_timeout_s
+        while time.monotonic() < deadline:
             if self._stop.is_set():
-                _abandon_broker_request(future, claim)
+                _abandon_broker_request(
+                    future, claim, response_stream, reason="proxy_shutting_down"
+                )
                 raise RuntimeError("Egress proxy is shutting down.")
             if _client_disconnected(client):
-                _abandon_broker_request(future, claim)
+                _abandon_broker_request(future, claim, response_stream)
                 raise _ProxyProtocolError(
                     "client_disconnected",
                     "Client disconnected before the broker response was available.",
                 )
+            if response_stream is not None and response_stream.started:
+                self._relay_response_stream(
+                    client,
+                    response_stream,
+                    future=future,
+                    claim=claim,
+                    deadline=deadline,
+                )
+                return None, ()
             try:
+                if response_stream is not None:
+                    if not future.done():
+                        response_stream.wait(0.25)
+                        continue
+                    if response_stream.started:
+                        # The broker started and finished the stream after the
+                        # check above; relay it instead of the bare head.
+                        continue
                 try:
                     # Waiting for completion separately keeps an exception raised
                     # by the broker (including TimeoutError) distinct from a poll.
                     future.exception(timeout=0.25)
                 except TimeoutError:
-                    waited += 0.25
                     continue
                 response = future.result()
                 return response, claim.take()
@@ -811,9 +853,67 @@ class TransparentEgressProxyServer:
                     self._broker._record_proxy_failure, "proxy_broker_failed"
                 )
                 raise
-        _abandon_broker_request(future, claim)
+        _abandon_broker_request(future, claim, response_stream, reason="proxy_broker_timeout")
         self._loop.call_soon_threadsafe(self._broker._record_proxy_failure, "proxy_broker_timeout")
         raise TimeoutError("Broker did not respond within the timeout.")
+
+    def _relay_response_stream(
+        self,
+        client: ssl.SSLSocket,
+        response_stream: _ResponseStreamChannel,
+        *,
+        future: Future[CapturedResponse],
+        claim: _BrokerResponseClaim,
+        deadline: float,
+    ) -> None:
+        """Write a streamed response to the client chunk by chunk as it arrives.
+
+        A complete body ends with the terminal chunk. A body the broker stopped
+        (byte limit, revoked authority, upstream failure) ends with the
+        connection closing before that chunk, which HTTP clients report as an
+        incomplete response.
+        """
+
+        abandon_reason = "client_disconnected"
+        try:
+            while True:
+                if self._stop.is_set():
+                    abandon_reason = "proxy_shutting_down"
+                    raise RuntimeError("Egress proxy is shutting down.")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    abandon_reason = "proxy_broker_timeout"
+                    self._loop.call_soon_threadsafe(
+                        self._broker._record_proxy_failure, "proxy_broker_timeout"
+                    )
+                    raise TimeoutError("Broker did not finish the streamed response in time.")
+                item = response_stream.get(min(0.25, remaining))
+                if item is None:
+                    if _client_disconnected(client):
+                        raise _ProxyProtocolError(
+                            "client_disconnected",
+                            "Client disconnected during the streamed response.",
+                        )
+                    continue
+                kind, payload = item
+                if kind == "head":
+                    assert isinstance(payload, CapturedResponse)
+                    _send_all(
+                        client, _serialize_response_head(payload, chunked=True), stop=self._stop
+                    )
+                elif kind == "data":
+                    assert isinstance(payload, bytes)
+                    frame = b"".join((b"%x\r\n" % len(payload), payload, b"\r\n"))
+                    _send_all(client, frame, stop=self._stop)
+                elif kind == "end":
+                    _send_all(client, b"0\r\n\r\n", stop=self._stop)
+                    return
+                else:
+                    return
+        finally:
+            # The broker finished (or is stopped here); either way the queued
+            # chunks' reservation is released once nothing is left to write.
+            _abandon_broker_request(future, claim, response_stream, reason=abandon_reason)
 
 
 def _release_response_buffers(response_buffers: tuple[EgressResponseBuffer, ...]) -> None:
@@ -861,11 +961,19 @@ def _submit_broker_request(
     broker: TransparentEgressBroker,
     request: CapturedRequest,
     loop: asyncio.AbstractEventLoop,
+    *,
+    response_stream: _ResponseStreamChannel | None = None,
 ) -> tuple[Future[CapturedResponse], _BrokerResponseClaim]:
     claim = _BrokerResponseClaim()
 
     async def handle() -> CapturedResponse:
-        response, buffers = await broker._handle_request_holding_buffer(request)
+        if response_stream is None:
+            response, buffers = await broker._handle_request_holding_buffer(request)
+        else:
+            response, buffers = await broker._handle_request_holding_buffer(
+                request,
+                response_stream=response_stream,
+            )
         # No await follows, so cancellation cannot separate the offer from the result.
         claim.offer(buffers)
         return response
@@ -873,9 +981,17 @@ def _submit_broker_request(
     return asyncio.run_coroutine_threadsafe(handle(), loop), claim
 
 
-def _abandon_broker_request(future: Future[CapturedResponse], claim: _BrokerResponseClaim) -> None:
+def _abandon_broker_request(
+    future: Future[CapturedResponse],
+    claim: _BrokerResponseClaim,
+    response_stream: _ResponseStreamChannel | None = None,
+    *,
+    reason: str = "client_disconnected",
+) -> None:
     """Cancel a broker call; reservations of a result that exists are released."""
 
+    if response_stream is not None:
+        response_stream.abandon(reason)
     claim.abandon()
     future.cancel()
 
@@ -1140,7 +1256,7 @@ def _content_length(headers: dict[str, str]) -> int | None:
     return None
 
 
-def _serialize_response_head(response: CapturedResponse) -> bytes:
+def _serialize_response_head(response: CapturedResponse, *, chunked: bool = False) -> bytes:
     from cayu.egress.broker import _validated_set_cookie_headers
 
     cookies = _validated_set_cookie_headers(response.set_cookie_headers)
@@ -1149,8 +1265,15 @@ def _serialize_response_head(response: CapturedResponse) -> bytes:
     except ValueError:
         reason = "Unknown Status"
     lines = [f"HTTP/1.1 {response.status_code} {reason}"]
-    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
-    headers["Content-Length"] = str(len(response.body))
+    headers = {
+        k: v
+        for k, v in response.headers.items()
+        if k.lower() not in {"content-length", "transfer-encoding", "connection"}
+    }
+    if chunked:
+        headers["Transfer-Encoding"] = "chunked"
+    else:
+        headers["Content-Length"] = str(len(response.body))
     headers["Connection"] = "close"
     for key, value in headers.items():
         lines.append(f"{key}: {value}")

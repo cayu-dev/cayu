@@ -7,6 +7,7 @@ import json
 import math
 import ssl
 import threading
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
@@ -80,6 +81,12 @@ MAX_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 3600.0
 # concurrent large downloads fail clearly instead of exhausting host memory.
 DEFAULT_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES = 1024 * 1024 * 1024
 MAX_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024 * 1024
+# Incremental response bodies (server-sent events, newline-delimited JSON) are
+# forwarded as they arrive instead of being buffered, so a long streamed model
+# call reaches the client before the upstream finishes. At most this many
+# scrubbed bytes wait between the upstream and a slower client.
+_STREAMED_RESPONSE_MEDIA_TYPES = frozenset({"text/event-stream", "application/x-ndjson"})
+_RESPONSE_STREAM_WINDOW_BYTES = 256 * 1024
 
 # Headers that must not be forwarded verbatim between hops.
 _HOP_BY_HOP = frozenset(
@@ -251,17 +258,26 @@ class EgressUpstreamLimits:
     ``response_buffer``, when present, is this operation's share of the
     broker-wide buffer budget: an upstream calls ``reserve_to`` with the bytes
     it holds for the response so far, and stops reading if that raises.
+
+    ``response_stream``, when present, lets the upstream hand an incremental
+    body to the broker chunk by chunk instead of buffering it; see
+    :class:`EgressResponseStream`. Upstreams that ignore it keep working.
     """
 
     max_response_bytes: int
     total_timeout_s: float
     response_buffer: EgressResponseBuffer | None = None
+    response_stream: EgressResponseStream | None = None
 
     def __post_init__(self) -> None:
         if self.response_buffer is not None and not isinstance(
             self.response_buffer, EgressResponseBuffer
         ):
             raise TypeError("response_buffer must be an EgressResponseBuffer.")
+        if self.response_stream is not None and not isinstance(
+            self.response_stream, EgressResponseStream
+        ):
+            raise TypeError("response_stream must be an EgressResponseStream.")
         object.__setattr__(
             self,
             "max_response_bytes",
@@ -567,6 +583,375 @@ class EgressResponseBuffer:
 _RESPONSE_BUFFER_HANDOFF: contextvars.ContextVar[list[EgressResponseBuffer] | None] = (
     contextvars.ContextVar("cayu_egress_response_buffer_handoff", default=None)
 )
+# The proxy server's channel for a response the broker forwards incrementally.
+_RESPONSE_STREAM_CHANNEL: contextvars.ContextVar[_ResponseStreamChannel | None] = (
+    contextvars.ContextVar("cayu_egress_response_stream_channel", default=None)
+)
+
+
+class _ResponseStreamStoppedError(RuntimeError):
+    """A streamed response stopped because authority ended or its client left."""
+
+    def __init__(self, reason: Literal["authority_revoked", "client_disconnected"]) -> None:
+        super().__init__("The streamed egress response was stopped.")
+        self.reason = reason
+
+
+class _ResponseStreamChannel:
+    """Bounded hand-off of one streamed response from the broker loop to a proxy worker.
+
+    The broker side runs on the event loop and waits for space without blocking
+    it. The worker side runs on a proxy thread and polls with a timeout so it
+    still observes shutdown and client disconnects. Items are ``("head",
+    CapturedResponse)``, then ``("data", bytes)`` chunks, then ``("end", None)``
+    for a complete body or ``("abort", None)`` for a truncated one.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        max_pending_bytes: int = _RESPONSE_STREAM_WINDOW_BYTES,
+    ) -> None:
+        self._loop = loop
+        self._max_pending_bytes = max_pending_bytes
+        self._condition = threading.Condition()
+        self._items: deque[tuple[str, object]] = deque()
+        self._pending_bytes = 0
+        self._claimed = False
+        self._started = False
+        self._closed = False
+        self._abandoned = False
+        self._abandon_reason: str | None = None
+        self._reservation: EgressResponseBuffer | None = None
+        self._space = asyncio.Event()
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    @property
+    def pending_bytes(self) -> int:
+        return self._pending_bytes
+
+    @property
+    def abandon_reason(self) -> str | None:
+        """Why the worker abandoned the stream, or None while it is still relaying."""
+
+        return self._abandon_reason
+
+    def release_when_drained(self, reservation: EgressResponseBuffer) -> None:
+        """Hold a response's buffer reservation until the worker has taken every chunk.
+
+        Queued chunks are still in memory after the broker finishes, so the
+        reservation covering them is released only once the worker has taken
+        the final marker or abandoned the stream.
+        """
+
+        with self._condition:
+            if not (self._abandoned or (self._closed and not self._items)):
+                self._reservation = reservation
+                return
+        reservation.release()
+
+    def claim(self) -> bool:
+        """Give the channel to one forwarded response; later claims are refused."""
+
+        with self._condition:
+            if self._claimed or self._abandoned:
+                return False
+            self._claimed = True
+            return True
+
+    def put_head(self, head: CapturedResponse) -> None:
+        with self._condition:
+            if self._abandoned:
+                raise _ResponseStreamStoppedError("client_disconnected")
+            self._started = True
+            self._items.append(("head", head))
+            self._condition.notify_all()
+
+    async def put_data(self, data: bytes) -> None:
+        while True:
+            with self._condition:
+                if self._abandoned:
+                    raise _ResponseStreamStoppedError("client_disconnected")
+                if (
+                    self._pending_bytes == 0
+                    or self._pending_bytes + len(data) <= self._max_pending_bytes
+                ):
+                    self._items.append(("data", data))
+                    self._pending_bytes += len(data)
+                    self._condition.notify_all()
+                    return
+                # Cleared under the lock, so a worker that frees space after
+                # this check schedules a set() that runs after this wait starts.
+                self._space.clear()
+            await self._space.wait()
+
+    def close(self, *, complete: bool) -> None:
+        with self._condition:
+            if self._closed or not self._started:
+                return
+            self._closed = True
+            self._items.append(("end" if complete else "abort", None))
+            self._condition.notify_all()
+
+    def wait(self, timeout: float) -> None:
+        """Wait on the worker thread until an item arrives, a wake, or the timeout."""
+
+        with self._condition:
+            if not self._items:
+                self._condition.wait(timeout)
+
+    def wake(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def get(self, timeout: float) -> tuple[str, object] | None:
+        with self._condition:
+            if not self._items:
+                self._condition.wait(timeout)
+            if not self._items:
+                return None
+            kind, payload = self._items.popleft()
+            reservation = None
+            if kind == "data":
+                assert isinstance(payload, bytes)
+                self._pending_bytes -= len(payload)
+            elif kind in {"end", "abort"}:
+                reservation, self._reservation = self._reservation, None
+        if reservation is not None:
+            reservation.release()
+        self._signal_space()
+        return kind, payload
+
+    def abandon(self, reason: str = "client_disconnected") -> None:
+        """Drop queued data; the broker side then stops at its next write."""
+
+        with self._condition:
+            if not self._abandoned:
+                self._abandoned = True
+                self._abandon_reason = reason
+            self._items.clear()
+            self._pending_bytes = 0
+            reservation, self._reservation = self._reservation, None
+            self._condition.notify_all()
+        if reservation is not None:
+            reservation.release()
+        self._signal_space()
+
+    def _signal_space(self) -> None:
+        with contextlib.suppress(RuntimeError):  # the loop is closed
+            self._loop.call_soon_threadsafe(self._space.set)
+
+
+class EgressResponseStream:
+    """Hands an incremental upstream response body to the broker as it arrives.
+
+    The broker passes one in ``EgressUpstreamLimits.response_stream`` when its
+    caller can forward a body incrementally (the proxy server can). Once the
+    response head is known, the upstream offers it to :meth:`start` with an
+    empty body. If ``start`` returns ``True`` the broker has accepted the
+    response for streaming: the upstream passes each body chunk, in order, to
+    :meth:`write` and, after the last one, returns the same head (still with an
+    empty body) from its operation. If it returns ``False`` the upstream reads
+    the body into its returned ``CapturedResponse`` as usual.
+
+    The broker accepts only identity-encoded ``text/event-stream`` and
+    ``application/x-ndjson`` bodies, and only after the same authority, header
+    and cookie checks a buffered response gets. It scrubs resolved secrets from
+    every chunk (holding back only bytes that could begin a secret split across
+    chunks) and applies the response byte limit to the bytes received and
+    forwarded. ``write`` raises when that limit or the response buffer budget is
+    exceeded, when authority ends, or when the client goes away; the upstream
+    must then stop reading and let the error propagate. Await both methods on
+    the broker's event loop.
+    """
+
+    __slots__ = (
+        "_accept",
+        "_channel",
+        "_ensure_authority",
+        "_failure",
+        "_forwarded_bytes",
+        "_head",
+        "_max_body_bytes",
+        "_received_bytes",
+        "_response_buffer",
+        "_secrets",
+        "_state",
+        "_tail",
+    )
+    _accept: Callable[[CapturedResponse], CapturedResponse | None]
+    _channel: _ResponseStreamChannel
+    _ensure_authority: Callable[[], None] | None
+    _failure: Exception | None
+    _forwarded_bytes: int
+    _head: CapturedResponse | None
+    _max_body_bytes: int
+    _received_bytes: int
+    _response_buffer: EgressResponseBuffer | None
+    _secrets: tuple[bytes, ...]
+    _state: str
+    _tail: bytes
+
+    def __init__(self) -> None:
+        raise TypeError("EgressResponseStream instances are created by the broker.")
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        channel: _ResponseStreamChannel,
+        accept: Callable[[CapturedResponse], CapturedResponse | None],
+        secrets: tuple[str, ...],
+        max_body_bytes: int,
+        response_buffer: EgressResponseBuffer | None,
+        ensure_authority: Callable[[], None] | None,
+    ) -> EgressResponseStream:
+        stream = cls.__new__(cls)
+        stream._channel = channel
+        stream._accept = accept
+        stream._secrets = tuple(secret.encode() for secret in secrets if secret)
+        stream._max_body_bytes = max_body_bytes
+        stream._response_buffer = response_buffer
+        stream._ensure_authority = ensure_authority
+        stream._state = "new"
+        stream._head = None
+        stream._tail = b""
+        stream._received_bytes = 0
+        stream._forwarded_bytes = 0
+        stream._failure = None
+        return stream
+
+    @property
+    def started(self) -> bool:
+        """Whether the broker accepted the response and forwarded its head."""
+
+        return self._head is not None
+
+    @property
+    def finished(self) -> bool:
+        """Whether the whole body was forwarded and its decision recorded."""
+
+        return self._state == "finished"
+
+    async def start(self, head: CapturedResponse) -> bool:
+        """Offer the response head; ``True`` means deliver the body through ``write``."""
+
+        if type(head) is not CapturedResponse:
+            raise TypeError("head must be a CapturedResponse instance.")
+        if self._state != "new":
+            raise RuntimeError("An egress response stream can be started only once.")
+        accepted = self._accept(head)
+        if accepted is None:
+            self._state = "declined"
+            return False
+        try:
+            self._channel.put_head(accepted)
+        except BaseException as error:
+            self._fail(error)
+            raise
+        self._head = accepted
+        self._state = "streaming"
+        return True
+
+    async def write(self, chunk: bytes) -> None:
+        """Forward the next body chunk once there is room for it."""
+
+        if self._state != "streaming":
+            if self._failure is not None:
+                raise self._failure
+            raise RuntimeError("The egress response stream is not accepting body chunks.")
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("chunk must be bytes.")
+        data = bytes(chunk)
+        if not data:
+            return
+        try:
+            if self._ensure_authority is not None:
+                try:
+                    self._ensure_authority()
+                except VirtualCredentialError:
+                    raise _ResponseStreamStoppedError("authority_revoked") from None
+            self._received_bytes += len(data)
+            if self._received_bytes > self._max_body_bytes:
+                raise _UpstreamResponseTooLargeError(
+                    "Streamed upstream response exceeded the configured byte limit."
+                )
+            await self._forward(self._redact(data))
+        except BaseException as error:
+            self._fail(error)
+            raise
+
+    def _fail(self, error: BaseException) -> None:
+        self._state = "stopped"
+        if isinstance(error, Exception):
+            self._failure = error
+
+    def _redact(self, data: bytes) -> bytes:
+        if not self._secrets:
+            return data
+        window = self._tail + data
+        replacement = REDACTED_SECRET.encode()
+        for secret in self._secrets:
+            window = window.replace(secret, replacement)
+        # Hold back only the longest suffix that could still grow into a secret.
+        # Any secret starting earlier is complete in the window and replaced.
+        hold = 0
+        longest = max(len(secret) for secret in self._secrets) - 1
+        for size in range(min(longest, len(window)), 0, -1):
+            suffix = window[-size:]
+            if any(secret.startswith(suffix) for secret in self._secrets):
+                hold = size
+                break
+        if hold:
+            window, self._tail = window[:-hold], window[-hold:]
+        else:
+            self._tail = b""
+        return window
+
+    async def _forward(self, data: bytes) -> None:
+        if not data:
+            return
+        self._forwarded_bytes += len(data)
+        if self._forwarded_bytes > self._max_body_bytes:
+            raise _UpstreamResponseTooLargeError(
+                "Redacted streamed response exceeded the configured byte limit."
+            )
+        if self._response_buffer is not None:
+            # Covers the chunks waiting for the client, this chunk, and the
+            # held-back tail. The reservation only grows, so it tracks the peak.
+            self._response_buffer.reserve_to(
+                self._channel.pending_bytes + len(data) + len(self._tail)
+            )
+        await self._channel.put_data(data)
+
+    async def _flush(self) -> None:
+        # Broker-internal: forward the held-back tail after the last chunk.
+        if self._state != "streaming":
+            if self._failure is not None:
+                raise self._failure
+            raise RuntimeError("The egress response stream is not streaming.")
+        tail, self._tail = self._tail, b""
+        try:
+            await self._forward(tail)
+        except BaseException as error:
+            self._fail(error)
+            raise
+
+    def _complete(self) -> None:
+        self._state = "finished"
+        self._channel.close(complete=True)
+
+    def _stop(self) -> None:
+        # Broker-internal: truncate a started stream that will not complete.
+        if self._state == "finished":
+            return
+        if self._state in {"new", "streaming"}:
+            self._state = "stopped"
+        self._channel.close(complete=False)
 
 
 _UpstreamFailureCode = Literal[
@@ -700,6 +1085,7 @@ class HttpxUpstream:
             max_response_bytes=min(self._max_response_bytes, limits.max_response_bytes),
             total_timeout_s=min(self._timeout_s, limits.total_timeout_s),
             response_buffer=limits.response_buffer,
+            response_stream=limits.response_stream,
         )
         return EgressUpstreamOperation(
             lambda: self._send(request, limits=effective_limits),
@@ -884,6 +1270,34 @@ class HttpxUpstream:
                         raise _UpstreamResponseTooLargeError(
                             "Upstream response exceeded the configured byte limit."
                         )
+            head = CapturedResponse(
+                status_code=response.status_code,
+                headers=_identity_response_headers(
+                    {key: value for key, value in response.headers.items() if key != "set-cookie"}
+                ),
+                set_cookie_headers=tuple(
+                    value.decode("latin-1")
+                    for key, value in response.headers.raw
+                    if key.lower() == b"set-cookie"
+                ),
+            )
+            response_stream = limits.response_stream
+            if (
+                response_stream is not None
+                and decoder is None
+                and await response_stream.start(head)
+            ):
+                # The broker scrubs and forwards each chunk as it arrives;
+                # the same received-byte limit still stops the read.
+                received = 0
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received > limits.max_response_bytes:
+                        raise _UpstreamResponseTooLargeError(
+                            "Upstream response exceeded the configured byte limit."
+                        )
+                    await response_stream.write(chunk)
+                return head
             body = bytearray()
             reserve = None if limits.response_buffer is None else limits.response_buffer.reserve_to
             try:
@@ -916,18 +1330,7 @@ class HttpxUpstream:
                 raise _UpstreamContentDecodingError(
                     "Upstream response content encoding is invalid."
                 ) from exc
-            return CapturedResponse(
-                status_code=response.status_code,
-                headers=_identity_response_headers(
-                    {key: value for key, value in response.headers.items() if key != "set-cookie"}
-                ),
-                set_cookie_headers=tuple(
-                    value.decode("latin-1")
-                    for key, value in response.headers.raw
-                    if key.lower() == b"set-cookie"
-                ),
-                body=bytes(body),
-            )
+            return head.model_copy(update={"body": bytes(body)})
 
     async def _target(self, request: CapturedRequest) -> _ResolvedUpstreamTarget:
         route = self._routes.get(request.host)
@@ -1283,15 +1686,20 @@ class TransparentEgressBroker:
     async def _handle_request_holding_buffer(
         self,
         request: CapturedRequest,
+        *,
+        response_stream: _ResponseStreamChannel | None = None,
     ) -> tuple[CapturedResponse, tuple[EgressResponseBuffer, ...]]:
         """Handle one request, returning its buffer reservations to the caller.
 
         The caller must release every returned reservation once it has written or
         dropped the response body. Any failure or cancellation here releases them.
+        With ``response_stream``, an eligible response is delivered through that
+        channel as it arrives; the returned response is then only its head.
         """
 
         handoff: list[EgressResponseBuffer] = []
         token = _RESPONSE_BUFFER_HANDOFF.set(handoff)
+        stream_token = _RESPONSE_STREAM_CHANNEL.set(response_stream)
         try:
             response = await self.handle_request(request)
         except BaseException:
@@ -1299,6 +1707,7 @@ class TransparentEgressBroker:
                 response_buffer.release()
             raise
         finally:
+            _RESPONSE_STREAM_CHANNEL.reset(stream_token)
             _RESPONSE_BUFFER_HANDOFF.reset(token)
         return response, tuple(handoff)
 
@@ -1723,6 +2132,29 @@ class TransparentEgressBroker:
         # handed on; cancellation and every denial release it here.
         response_buffer = EgressResponseBuffer(self._response_buffer_budget)
         handoff = _RESPONSE_BUFFER_HANDOFF.get()
+        channel = _RESPONSE_STREAM_CHANNEL.get()
+        response_stream: EgressResponseStream | None = None
+        if channel is not None and channel.claim():
+            _, response_limit = self._response_limits(authorization)
+
+            def accept(head: CapturedResponse) -> CapturedResponse | None:
+                return self._streamable_response_head(
+                    request,
+                    head,
+                    authorization=authorization,
+                    ensure_authority=ensure_authority,
+                    response_buffer=response_buffer,
+                    response_limit=response_limit,
+                )
+
+            response_stream = EgressResponseStream._create(
+                channel=channel,
+                accept=accept,
+                secrets=authorization.secrets,
+                max_body_bytes=response_limit,
+                response_buffer=response_buffer,
+                ensure_authority=ensure_authority,
+            )
         try:
             response = await self._forward_authorized_buffered(
                 request=request,
@@ -1730,10 +2162,33 @@ class TransparentEgressBroker:
                 authorization=authorization,
                 ensure_authority=ensure_authority,
                 response_buffer=response_buffer,
+                response_stream=response_stream,
             )
         except BaseException:
-            response_buffer.release()
+            if response_stream is not None and response_stream.started:
+                if not response_stream.finished:
+                    # The upstream already received the request and its
+                    # credential and the guest already received part of the
+                    # body, so a cancelled stream still leaves its decision.
+                    self._record_cancelled_stream(request, authorization, channel)
+                response_stream._stop()
+                assert channel is not None
+                channel.release_when_drained(response_buffer)
+            else:
+                response_buffer.release()
+                if response_stream is not None:
+                    response_stream._stop()
             raise
+        if response_stream is not None:
+            # A started stream that did not complete ends truncated, so the
+            # client cannot mistake a partial body for a whole one.
+            response_stream._stop()
+            if response_stream.started:
+                # Chunks may still be queued for a slow client; the channel
+                # keeps their reservation until the worker has taken them.
+                assert channel is not None
+                channel.release_when_drained(response_buffer)
+                return response
         if handoff is None:
             response_buffer.release()
         else:
@@ -1752,6 +2207,7 @@ class TransparentEgressBroker:
         authorization: _ForwardingAuthorization,
         ensure_authority: Callable[[], None] | None,
         response_buffer: EgressResponseBuffer,
+        response_stream: EgressResponseStream | None = None,
     ) -> CapturedResponse:
         if ensure_authority is not None:
             try:
@@ -1771,19 +2227,13 @@ class TransparentEgressBroker:
                     }
                 }
             )
-        effective_response_limit = (
-            min(
-                self._upstream_max_response_bytes,
-                self._browser_max_response_bytes,
-            )
-            if authorization.require_identity_encoding
-            else self._upstream_max_response_bytes
-        )
+        effective_response_limit, response_limit = self._response_limits(authorization)
         try:
             response = await self._run_upstream_operation(
                 upstream_request,
                 max_response_bytes=effective_response_limit,
                 response_buffer=response_buffer,
+                response_stream=response_stream,
             )
             # A custom upstream may not reserve while reading; hold what it returned.
             response_buffer.reserve_to(len(response.body))
@@ -1877,6 +2327,8 @@ class TransparentEgressBroker:
                 authorization_kind=authorization.authorization_kind,
                 error_code="fetch_failed",
             )
+        except _ResponseStreamStoppedError as stopped:
+            return self._stopped_response_stream(request, authorization, stopped)
         except Exception as error:
             return self._deny(
                 request,
@@ -1886,6 +2338,14 @@ class TransparentEgressBroker:
                 "Upstream request failed.",
                 authorization_kind=authorization.authorization_kind,
                 error_code=_upstream_failure_code(error),
+            )
+        if response_stream is not None and response_stream.started:
+            return await self._complete_response_stream(
+                request=request,
+                response=response,
+                authorization=authorization,
+                ensure_authority=ensure_authority,
+                response_stream=response_stream,
             )
         if ensure_authority is not None:
             try:
@@ -1927,11 +2387,6 @@ class TransparentEgressBroker:
                 authorization_kind=authorization.authorization_kind,
                 error_code="oversized_response",
             )
-        response_limit = (
-            self._browser_max_response_bytes
-            if authorization.require_identity_encoding
-            else effective_response_limit
-        )
         try:
             scrubbed_response = _scrub_response(
                 response,
@@ -1984,12 +2439,189 @@ class TransparentEgressBroker:
         )
         return scrubbed_response
 
+    def _response_limits(self, authorization: _ForwardingAuthorization) -> tuple[int, int]:
+        """Return the upstream read limit and the limit on the body handed on."""
+
+        if authorization.require_identity_encoding:
+            return (
+                min(self._upstream_max_response_bytes, self._browser_max_response_bytes),
+                self._browser_max_response_bytes,
+            )
+        return self._upstream_max_response_bytes, self._upstream_max_response_bytes
+
+    def _streamable_response_head(
+        self,
+        request: CapturedRequest,
+        head: CapturedResponse,
+        *,
+        authorization: _ForwardingAuthorization,
+        ensure_authority: Callable[[], None] | None,
+        response_buffer: EgressResponseBuffer,
+        response_limit: int,
+    ) -> CapturedResponse | None:
+        """Return the scrubbed head of a response to stream, or None to buffer it.
+
+        Anything the buffered path would refuse is declined here, so that path
+        still produces its specific denial instead of a truncated stream.
+        """
+
+        if (
+            request.method == "HEAD"
+            or head.body
+            or head.status_code < 200
+            or head.status_code in {204, 205, 304}
+        ):
+            return None
+        content_type = _header_get(head.headers, "content-type") or ""
+        if content_type.split(";", 1)[0].strip().lower() not in _STREAMED_RESPONSE_MEDIA_TYPES:
+            return None
+        content_encoding = _header_get(head.headers, "content-encoding")
+        if content_encoding is not None and content_encoding.strip().lower() != "identity":
+            return None
+        if ensure_authority is not None:
+            try:
+                ensure_authority()
+            except VirtualCredentialError:
+                return None
+        try:
+            scrubbed = _scrub_response(
+                head,
+                secrets=authorization.secrets,
+                max_body_bytes=response_limit,
+                response_buffer=response_buffer,
+            )
+        except (
+            _UpstreamBufferBudgetError,
+            _UpstreamCookieHeadersError,
+            _UpstreamResponseTooLargeError,
+        ):
+            return None
+        return scrubbed.model_copy(update={"headers": _identity_response_headers(scrubbed.headers)})
+
+    async def _complete_response_stream(
+        self,
+        *,
+        request: CapturedRequest,
+        response: CapturedResponse,
+        authorization: _ForwardingAuthorization,
+        ensure_authority: Callable[[], None] | None,
+        response_stream: EgressResponseStream,
+    ) -> CapturedResponse:
+        """Finish a streamed body and record its decision, or report why it stopped."""
+
+        if response.body:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream returned a body for a response it streamed.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="upstream_failed",
+            )
+        if ensure_authority is not None:
+            try:
+                ensure_authority()
+            except VirtualCredentialError:
+                return self._authority_revoked(request, authorization)
+        try:
+            await response_stream._flush()
+        except _ResponseStreamStoppedError as stopped:
+            return self._stopped_response_stream(request, authorization, stopped)
+        except _UpstreamBufferBudgetError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                503,
+                "Egress response buffer budget is exhausted; retry when other downloads finish.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="upstream_capacity_exhausted",
+            )
+        except _UpstreamResponseTooLargeError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream response exceeded the configured byte limit.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="oversized_response",
+            )
+        except Exception:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream request failed.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="upstream_failed",
+            )
+        head = response_stream._head
+        assert head is not None
+        self._record(
+            EgressDecision(
+                allowed=True,
+                status_code=head.status_code,
+                destination=request.host,
+                method=request.method,
+                path=request.path,
+                grant_id=authorization.grant_id,
+                policy_name=authorization.policy_name,
+                reason=None,
+                authorization_kind=authorization.authorization_kind,
+            )
+        )
+        # No await follows: the end marker and the recorded decision cannot be
+        # separated by cancellation.
+        response_stream._complete()
+        return head
+
+    def _record_cancelled_stream(
+        self,
+        request: CapturedRequest,
+        authorization: _ForwardingAuthorization,
+        channel: _ResponseStreamChannel | None,
+    ) -> None:
+        error_code = (channel.abandon_reason if channel is not None else None) or (
+            "request_cancelled"
+        )
+        self._deny(
+            request,
+            authorization.grant_id,
+            authorization.policy_name,
+            504 if error_code == "proxy_broker_timeout" else 502,
+            "The streamed response was cancelled before it completed.",
+            authorization_kind=authorization.authorization_kind,
+            error_code=error_code,
+        )
+
+    def _stopped_response_stream(
+        self,
+        request: CapturedRequest,
+        authorization: _ForwardingAuthorization,
+        stopped: _ResponseStreamStoppedError,
+    ) -> CapturedResponse:
+        if stopped.reason == "authority_revoked":
+            return self._authority_revoked(request, authorization)
+        return self._deny(
+            request,
+            authorization.grant_id,
+            authorization.policy_name,
+            502,
+            "Client disconnected during the streamed response.",
+            authorization_kind=authorization.authorization_kind,
+            error_code="client_disconnected",
+        )
+
     async def _run_upstream_operation(
         self,
         request: CapturedRequest,
         *,
         max_response_bytes: int,
         response_buffer: EgressResponseBuffer | None = None,
+        response_stream: EgressResponseStream | None = None,
     ) -> CapturedResponse:
         token = self._reserve_upstream_operation()
         if token is None:
@@ -2006,6 +2638,7 @@ class TransparentEgressBroker:
                     max_response_bytes=max_response_bytes,
                     total_timeout_s=self._upstream_total_timeout_s,
                     response_buffer=response_buffer,
+                    response_stream=response_stream,
                 ),
             )
             if not isinstance(operation, EgressUpstreamOperation):

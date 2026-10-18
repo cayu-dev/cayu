@@ -33,6 +33,7 @@ from cayu.egress.broker import CapturedResponse as CapturedResponse
 from cayu.egress.broker import EgressDecision as EgressDecision
 from cayu.egress.broker import EgressResponseBuffer as EgressResponseBuffer
 from cayu.egress.broker import EgressResponseBufferBudget as EgressResponseBufferBudget
+from cayu.egress.broker import EgressResponseStream as EgressResponseStream
 from cayu.egress.broker import EgressUpstream as EgressUpstream
 from cayu.egress.broker import EgressUpstreamLimits as EgressUpstreamLimits
 from cayu.egress.broker import EgressUpstreamOperation as EgressUpstreamOperation
