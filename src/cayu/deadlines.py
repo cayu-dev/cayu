@@ -19,7 +19,7 @@ EXECUTION_DEADLINE_METADATA_KEY = "cayu:execution_deadline"
 
 
 class ExecutionDeadlineExceeded(TimeoutError):
-    """New application work was denied; this does not attest external settlement."""
+    """Execution reached its deadline; this does not attest external settlement."""
 
     def __init__(self, deadline: ExecutionDeadline, stage: str) -> None:
         self.diagnostics = {**deadline.inspection(), "denied_stage": stage}
@@ -178,6 +178,7 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
     already_owned = _OWNER.get() is task and selected.expires_at == parent.expires_at
     owner_token = _OWNER.set(task)
     timer: asyncio.Timeout | None = None
+    timeout_cancellation: asyncio.CancelledError | None = None
     try:
         async with asyncio.timeout(
             None if already_owned else selected.remaining_seconds()
@@ -185,6 +186,10 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
             timer_token = _TIMERS.set((*_TIMERS.get(), (timer, selected)))
             try:
                 yield timer
+            except asyncio.CancelledError as cancellation:
+                if timer.expired():
+                    timeout_cancellation = cancellation
+                raise
             finally:
                 _TIMERS.reset(timer_token)
             # Cooperative extension code may consume cancellation, or return
@@ -192,15 +197,25 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
             # after the authoritative boundary has been observed expired.
             selected.require_admission("execution_completion")
     except BaseException as exc:
+        failure = exc
         if timer is not None and timer.expired():
-            # Keep the original exception/cause, including secondary cleanup
-            # failures. Expiry evidence does not claim effects have stopped.
-            exc.__dict__["execution_deadline"] = selected.inspection()
+            # Only asyncio.timeout's translation of our escaping cancellation
+            # becomes the public deadline exception. An application/provider
+            # timeout or secondary cleanup failure keeps its original identity.
+            if (
+                type(exc) is TimeoutError
+                and timeout_cancellation is not None
+                and exc.__cause__ is timeout_cancellation
+            ):
+                failure = ExecutionDeadlineExceeded(selected, "execution")
+            failure.__dict__["execution_deadline"] = selected.inspection()
             if task is not None and task.cancelling() == 0:
                 # asyncio.timeout has consumed its own cancellation request.
                 # Keep this process-local authority on the escaping exception;
                 # public/serialized deadline observations are not stop authority.
-                exc.__dict__["_cayu_deadline_expiry_task"] = task
+                failure.__dict__["_cayu_deadline_expiry_task"] = task
+        if failure is not exc:
+            raise failure from timeout_cancellation
         raise
     finally:
         _OWNER.reset(owner_token)

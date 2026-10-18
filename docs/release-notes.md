@@ -16,6 +16,9 @@ Upgrade: Existing streaming applications continue unchanged. Applications can us
 whose task workers can be stopped mid-handler can settle the stranded tasks with
 `reconcile_abandoned_task_cancellation`.
 
+- Raise `ExecutionDeadlineExceeded` with deadline diagnostics when a deadline
+  expires during a stream, matching expiry between steps. Cleanup still joins
+  before the exception escapes, and unrelated timeout errors keep their identity.
 - Add `send_turn` and `TurnRequest` for applications that create or continue a
   conversation and await one result. Creation races and session replacement
   retain native admission checks. `RunOutcome` now reports invocation usage,

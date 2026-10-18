@@ -12560,8 +12560,10 @@ trustworthy UTC clocks; no process-local timestamp can correct arbitrary host cl
 Known expiry denies new workflow steps, child runs, model attempts, tools, compaction,
 and continuation dispatch. `ExecutionDeadlineExceeded` carries safe `diagnostics`,
 including the denied stage. In-flight expiry cancels through existing Runtime ownership
-and raises `TimeoutError`; an owned timeout adds an `execution_deadline` inspection to
-the exception without replacing its cleanup causes. Session/workflow start events record
+and raises the same `ExecutionDeadlineExceeded` subtype of `TimeoutError` after cleanup.
+It retains the cancellation cause and carries both safe `diagnostics` and an
+`execution_deadline` inspection. Independent provider/application timeouts and secondary
+cleanup failures retain their original exception identity. Session/workflow start events record
 the effective boundary, and abandoned-session interruption evidence retains a deadline
 inspection alongside existing receipts and failures. These are observations of expiry,
 not proof that all external effects have stopped.

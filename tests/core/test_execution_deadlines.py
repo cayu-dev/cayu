@@ -376,7 +376,7 @@ def test_inflight_model_cancellation_waits_for_settlement():
     async def run():
         app, _ = _app(provider=BlockingProvider([]))
         events = []
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ExecutionDeadlineExceeded) as failure:
             async for event in app.run(
                 RunRequest(
                     agent_name="worker",
@@ -386,6 +386,8 @@ def test_inflight_model_cancellation_waits_for_settlement():
             ):
                 events.append(event)
         assert settled == [True]
+        assert failure.value.diagnostics["remaining_seconds"] == 0
+        assert failure.value.diagnostics["denied_stage"]
         session_id = events[0].session_id
         stored = await app.session_store.load(session_id)
         assert stored.status != SessionStatus.COMPLETED
@@ -885,6 +887,59 @@ def test_consumed_cancellation_cannot_report_successful_execution():
                     await asyncio.Event().wait()
         assert raised.value.diagnostics["denied_stage"] == "execution_completion"
         assert raised.value.diagnostics["remaining_seconds"] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_owned_deadline_timeout_has_typed_diagnostics_after_cleanup(streamed):
+    from cayu.deadlines import _deadline_expired_in_task, deadline_stream
+
+    async def run():
+        boundary = ExecutionDeadline.after(0.01, source="test", scope="case")
+        joined = False
+
+        async def producer():
+            nonlocal joined
+            try:
+                await asyncio.Event().wait()
+                yield "unreachable"
+            finally:
+                await asyncio.sleep(0)
+                joined = True
+
+        with pytest.raises(ExecutionDeadlineExceeded) as raised:
+            if streamed:
+                async for _ in deadline_stream(producer(), boundary):
+                    pass
+            else:
+                async with execution_deadline_scope(boundary):
+                    async for _ in producer():
+                        pass
+        assert joined
+        assert raised.value.diagnostics["source"] == "test"
+        assert raised.value.diagnostics["scope"] == "case"
+        assert raised.value.diagnostics["remaining_seconds"] == 0
+        assert raised.value.__dict__["execution_deadline"] == boundary.inspection()
+        assert _deadline_expired_in_task(raised.value, asyncio.current_task())
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("during_cleanup", [False, True])
+def test_deadline_scope_preserves_independent_timeout_errors(during_cleanup):
+    async def run():
+        failure = TimeoutError("application cleanup timed out")
+        with pytest.raises(TimeoutError) as raised:
+            async with execution_deadline_scope(ExecutionDeadline.after(0.01)):
+                if during_cleanup:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        raise failure from None
+                raise failure
+        assert raised.value is failure
+        assert type(raised.value) is TimeoutError
 
     asyncio.run(run())
 
