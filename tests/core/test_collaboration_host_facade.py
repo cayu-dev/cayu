@@ -90,12 +90,12 @@ def test_failed_source_does_not_starve_another_participant():
 
         app = FailingSource()
         host = CollaborationHost(app, registration("bad", "good"))
-        await host.service_once()
-        # A short observation may end between sources. Continue the same owned
-        # pass before starting another one; never restart on observation timeout.
-        while host.inspect().servicing_pending:
-            await host.service_once()
-        assert app.calls == ["bad", "good"]
+        # A bounded pass can finish between sources. The durable source cursor
+        # must let subsequent passes visit the healthy participant.
+        async with asyncio.timeout(5):
+            while "good" not in app.calls or host.inspect().servicing_pending:
+                await host.service_once()
+        assert app.calls[:2] == ["bad", "good"]
         assert host.inspect().source_failures == 1
         await host.aclose()
 

@@ -34,6 +34,12 @@ from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 
+async def _wait_for_marker(path: Path) -> None:
+    async with asyncio.timeout(20):
+        while not path.exists():
+            await asyncio.sleep(0.01)
+
+
 async def _child(root: Path, mode: str, fault: str) -> None:
     def call(operation: str) -> None:
         with (root / "calls.jsonl").open("a") as stream:
@@ -151,8 +157,6 @@ async def _child(root: Path, mode: str, fault: str) -> None:
                 raise asyncio.CancelledError("fixture cleanup cancelled")
             if mode == "cleanup_timeout":
                 await asyncio.sleep(60)
-            if mode.startswith("concurrent_"):
-                await asyncio.sleep(1)
             path = root / (allocation.intent.allocation_id + ".resource")
             if path.exists():
                 if json.loads(path.read_text()) != allocation.intent.to_payload():
@@ -195,6 +199,17 @@ async def _child(root: Path, mode: str, fault: str) -> None:
         Factory(),
         default=True,
     )
+    if mode == "concurrent_two":
+        validate = app._execution_profile_continuation.validate
+
+        async def after_competing_recovery(**kwargs):
+            (root / "second_recovery_inspecting").touch()
+            await _wait_for_marker(root / "first_recovery_finished")
+            return await validate(**kwargs)
+
+        app._execution_profile_continuation.validate = after_competing_recovery
+    elif mode == "concurrent_one":
+        await _wait_for_marker(root / "second_recovery_inspecting")
     try:
         if mode == "run":
             async for _ in app.run(
@@ -221,6 +236,8 @@ async def _child(root: Path, mode: str, fault: str) -> None:
                 )
             )
             (root / (mode + ".json")).write_text(result.model_dump_json())
+            if mode == "concurrent_one":
+                (root / "first_recovery_finished").touch()
         checkpoint = await store.load_checkpoint("abandoned")
         (root / "checkpoint.json").write_text(json.dumps(checkpoint))
         events = await store.load_events("abandoned")

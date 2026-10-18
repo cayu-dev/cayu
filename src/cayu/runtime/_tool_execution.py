@@ -704,9 +704,12 @@ async def _run_tool(
             failure_code=exc.code,
             redactor=active_redactor,
         )
-    except ExecutionDeadlineExceeded:
-        raise
     except TimeoutError as exc:
+        if isinstance(exc, ExecutionDeadlineExceeded) and current_execution_deadline().expired:
+            # The run's boundary owns cancellation of the whole invocation.
+            # A tighter scope owned by the tool has already restored that
+            # parent boundary and must retain its normal tool diagnostic.
+            raise
         ctx._discard_policy_denials_for(tool)
         if timer is not None and timer.expired():
             return _tool_timeout_outcome(

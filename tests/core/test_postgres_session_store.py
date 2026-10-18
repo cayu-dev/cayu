@@ -245,6 +245,7 @@ def _new_store(dsn: str):
 
 def test_postgres_detach_closure_conformance(postgres_dsn: str) -> None:
     async def run():
+        await _truncate(postgres_dsn)
         store = _new_store(postgres_dsn)
         competitor = _new_store(postgres_dsn)
         try:

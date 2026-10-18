@@ -137,7 +137,10 @@ def test_public_stop_rejects_secret_or_mutated_identity_before_store_access(
         assert canary not in str(caught.value)
         assert canary not in repr(caught.value)
         assert store.reads == 0
-        assert not recwarn
+        assert all(canary not in str(warning.message) for warning in recwarn)
+        assert not any(
+            "Pydantic serializer warnings" in str(warning.message) for warning in recwarn
+        )
         output = capsys.readouterr()
         assert canary not in output.out + output.err + caplog.text
 

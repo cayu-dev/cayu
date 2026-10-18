@@ -1916,6 +1916,25 @@ class IncompleteSessionRecovery:
                     # to the profile that started it; the next turn adopts the new runtime.
                     assert active_invocation_profile is not None
                     execution_profile_snapshot = active_invocation_profile
+                except RuntimeError:
+                    current = await self._session_store.load(session.id)
+                    if current is None or (
+                        current.instance_id,
+                        current.run_epoch,
+                        current.status,
+                    ) == (session.instance_id, session.run_epoch, session.status):
+                        raise
+                    # Profile inspection precedes the atomic recovery claim. A
+                    # competing owner may close the interaction between those
+                    # reads; the stale observer has no mutation authority.
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=current.status,
+                        actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                        events=(),
+                        message="Session recovery authority changed during profile inspection.",
+                    )
             if pending_completion_finalization is not None:
                 expected_terminal_status = (
                     SessionStatus.INTERRUPTED

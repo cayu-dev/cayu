@@ -293,8 +293,10 @@ def test_successful_visual_disarm_preserves_signal_through_popup_cleanup(
 
         daemon.close = close
 
+        timeout = asyncio.timeout(None)
+
         async def execute():
-            async with asyncio.timeout(0.02 if signal == "deadline" else None):
+            async with timeout:
                 return await daemon.execute(request)
 
         task = asyncio.create_task(execute())
@@ -302,6 +304,8 @@ def test_successful_visual_disarm_preserves_signal_through_popup_cleanup(
         if signal == "cancel":
             task.cancel()
         else:
+            # Start expiry only after the disarm owner is known to be blocked.
+            timeout.reschedule(asyncio.get_running_loop().time())
             # Observe actual timeout delivery while the disarm owner is blocked.
             async with asyncio.timeout(1):
                 while not task.cancelling():

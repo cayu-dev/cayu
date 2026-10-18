@@ -92,7 +92,7 @@ def test_native_tool_deadline_diagnostic_redacts_public_and_durable_evidence(
                 assert evidence.classification == "deadline"
                 assert evidence.deadline is not None
                 assert evidence.deadline.source == evidence.deadline.scope == "redacted"
-                assert evidence.exception_types == ("TimeoutError", "CancelledError")
+                assert evidence.exception_types == ("ExecutionDeadlineExceeded", "CancelledError")
                 assert evidence.settlement == "unknown"
             assert events[-1].type == (
                 EventType.SESSION_INTERRUPTED

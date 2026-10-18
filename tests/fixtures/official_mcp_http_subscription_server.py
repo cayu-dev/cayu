@@ -55,9 +55,11 @@ def main() -> None:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         sock.listen(128)
-        args.ready_path.write_text(
+        temporary_ready = args.ready_path.with_suffix(".tmp")
+        temporary_ready.write_text(
             f"http://127.0.0.1:{sock.getsockname()[1]}/mcp", encoding="utf-8"
         )
+        temporary_ready.replace(args.ready_path)
         uvicorn.Server(uvicorn.Config(app, log_level="error")).run(sockets=[sock])
 
 

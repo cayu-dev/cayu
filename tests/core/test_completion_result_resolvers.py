@@ -1639,8 +1639,22 @@ def test_foreground_application_renews_publication_ownership(
 
     async def scenario() -> None:
         task_store = BlockingApplicationStore()
+        store_now = datetime.now(UTC)
+        session_store = InMemorySessionStore(ownership_clock=lambda: store_now)
+        renewed = asyncio.Event()
+        original_renew = resolver_coordinator_module._PublicationLeaseHeartbeat.renew
+
+        async def observe_renewal(heartbeat):
+            result = await original_renew(heartbeat)
+            renewed.set()
+            return result
+
+        monkeypatch.setattr(
+            resolver_coordinator_module._PublicationLeaseHeartbeat, "renew", observe_renewal
+        )
         app, session_store, _task_store, decision_id = await _prepared_app_with_stores(
             task_store=task_store,
+            session_store=session_store,
         )
         app.register_completion_result_resolver(
             _contract().result_resolver,
@@ -1649,8 +1663,14 @@ def test_foreground_application_renews_publication_ownership(
         operation = asyncio.create_task(
             app.resolve_completion_result(_resolution_request(decision_id))
         )
-        await task_store.application_started.wait()
-        await asyncio.sleep(0.12)
+        await asyncio.wait_for(task_store.application_started.wait(), 10)
+        # Advance through the original lease using store time, and wait for a
+        # real heartbeat renewal between the two steps. Scheduler latency does
+        # not need to fit inside a 50 ms lease to prove durable renewal.
+        store_now += timedelta(seconds=40)
+        renewed.clear()
+        await asyncio.wait_for(renewed.wait(), 10)
+        store_now += timedelta(seconds=40)
 
         with pytest.raises(
             ValueError,
@@ -1664,7 +1684,7 @@ def test_foreground_application_renews_publication_ownership(
     monkeypatch.setattr(
         resolver_coordinator_module,
         "_PUBLICATION_OWNER_LEASE_SECONDS",
-        0.05,
+        60,
     )
     monkeypatch.setattr(
         resolver_coordinator_module,

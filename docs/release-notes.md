@@ -6,6 +6,9 @@ Upgrade: Stop all older writers and run `cayu storage migrate` before starting
 this build. Schema revision 122 preserves restartable task policy and requires
 exact worker claims for their session attachments.
 
+- Skip stale recovery observers when another recovery owner closes the active
+  interaction during execution profile inspection.
+
 - Add opt-in restartable queue jobs. On worker shutdown, cancellation cleanup
   finishes under the renewed lease before the same task returns to pending.
   Operator cancellation and lost ownership never become automatic retries.
