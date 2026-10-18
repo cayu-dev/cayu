@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Upgrade: Stop all older writers and run `cayu storage migrate` before starting
+this build. Schema revision 122 preserves restartable task policy and requires
+exact worker claims for their session attachments.
+
+- Add opt-in restartable queue jobs. On worker shutdown, cancellation cleanup
+  finishes under the renewed lease before the same task returns to pending.
+  Operator cancellation and lost ownership never become automatic retries.
+  Custom workers can use `requeue_restartable_task` after proving quiescence.
+
 Upgrade: Existing streaming applications continue unchanged. Applications can use
 `send_turn` to create or continue a conversation and await one result. Services
 whose task workers can be stopped mid-handler can settle the stranded tasks with
@@ -59,7 +68,8 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
 
 ### Breaking changes
 
-None.
+- Storage schema revision 122 requires all writers to understand restartable
+  task policy. Migrate with older processes stopped.
 
 ## v0.11.4
 

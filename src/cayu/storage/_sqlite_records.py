@@ -144,6 +144,8 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
             else json_dumps(task.work_contract.model_dump(mode="json", warnings=False))
         ),
         None if task.schedule is None else json_dumps(task.schedule.model_dump(mode="json")),
+        int(task.restartable),
+        task.restart_count,
     )
 
 
@@ -153,6 +155,8 @@ def task_from_row(row: sqlite3.Row) -> Task:
     result_json = row["result_json"]
     error_json = row["error_json"]
     return Task(
+        restartable=bool(row["restartable"]),
+        restart_count=row["restart_count"],
         graph_id=row["graph_id"],
         prerequisite_task_ids=tuple(json.loads(row["prerequisite_task_ids_json"])),
         id=row["id"],

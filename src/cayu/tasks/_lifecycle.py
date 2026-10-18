@@ -27,6 +27,8 @@ from cayu.tasks.terminalization import (
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
+    if task.restartable and next_status is TaskStatus.RUNNING:
+        raise TaskClaimLost("Restartable tasks must attach through an exact worker claim.")
     if (
         task.schedule is not None
         and task.schedule.admitted_at is None

@@ -1093,7 +1093,7 @@ class PostgresVerifiedWorkMixin:
                 worker_id = %s, lease_expires_at = %s,
                 status_reason = %s, status_payload = %s, result = %s, error = %s,
                 updated_at = %s, started_at = %s, completed_at = %s, retry_series = %s,
-                work_contract = %s, available_at = %s, schedule = %s
+                work_contract = %s, available_at = %s, schedule = %s, restart_count = %s
             WHERE id = %s
             """,
             (
@@ -1119,6 +1119,7 @@ class PostgresVerifiedWorkMixin:
                 None
                 if task.schedule is None
                 else json.dumps(task.schedule.model_dump(mode="json")),
+                task.restart_count,
                 task.id,
             ),
         )
@@ -1219,11 +1220,34 @@ class PostgresVerifiedWorkMixin:
             return pg_support.task_from_row(row)
 
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
+        await self._admit_ordinary_session(session_id, cleanup_only=False)
+
+    async def require_unretired_task_session(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = %s", (session_id,)
+            )
+            if await cur.fetchone() is not None:
+                raise TaskClaimLost("A retired task session cannot execute again.")
+
+    async def admit_ordinary_session_cleanup(self, session_id: str) -> None:
+        await self._admit_ordinary_session(session_id, cleanup_only=True)
+
+    async def _admit_ordinary_session(self, session_id: str, *, cleanup_only: bool) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
 
         async def operation(conn: Any, cur: Any) -> None:
             del conn
+            if not cleanup_only:
+                await cur.execute(
+                    "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise TaskClaimLost("A retired task session cannot execute again.")
             await self._ensure_session_authority(cur, session_id, "ordinary")
 
         await self._run_verified_work_mutation(operation)

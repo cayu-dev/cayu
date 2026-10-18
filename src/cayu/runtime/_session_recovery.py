@@ -665,6 +665,7 @@ class SessionRecovery:
                 ) = await self._engine.verifier_aware_task_execution_outcome(
                     None,
                     session_id=request.session_id,
+                    cleanup_only=True,
                 )
                 if admission_failure is not None:
                     raise_task_store_operation_failure(admission_failure)
@@ -877,6 +878,7 @@ class SessionRecovery:
             ) = await self._engine.verifier_aware_task_execution_outcome(
                 None,
                 session_id=session_id,
+                cleanup_only=True,
             )
             if admission_failure is not None:
                 raise_task_store_operation_failure(admission_failure)

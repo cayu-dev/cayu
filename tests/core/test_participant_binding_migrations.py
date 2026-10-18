@@ -99,6 +99,10 @@ def test_historical_sqlite_upgrade_continues_session(
     seed_store = asyncio.run(seed_data())
     with closing(sqlite3.connect(seed)) as connection:
         seeded = _rows(connection)
+        seeded_columns = {
+            table: [row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')]
+            for table in seeded
+        }
 
     db = tmp_path / "historical.sqlite"
     with monkeypatch.context() as historical:
@@ -140,8 +144,13 @@ def test_historical_sqlite_upgrade_continues_session(
                 if table not in existing_tables or not rows:
                     continue
                 connection.execute(f'DELETE FROM "{table}"')
+                columns = [row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')]
+                source_indices = [seeded_columns[table].index(column) for column in columns]
+                column_sql = ",".join(f'"{column}"' for column in columns)
+                placeholders = ",".join("?" for _ in columns)
                 connection.executemany(
-                    f'INSERT INTO "{table}" VALUES ({",".join("?" for _ in rows[0])})', rows
+                    f'INSERT INTO "{table}" ({column_sql}) VALUES ({placeholders})',
+                    [tuple(row[index] for index in source_indices) for row in rows],
                 )
             connection.execute("CREATE TABLE product_records (id TEXT PRIMARY KEY, payload TEXT)")
             connection.execute(
@@ -152,6 +161,10 @@ def test_historical_sqlite_upgrade_continues_session(
             connection.commit()
     with closing(sqlite3.connect(db)) as connection:
         before = _rows(connection)
+        before_columns = {
+            table: [row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')]
+            for table in before
+        }
     backup = tmp_path / "retained.backup.sqlite"
     assert (
         main(
@@ -178,7 +191,10 @@ def test_historical_sqlite_upgrade_continues_session(
         assert _rows(connection) == before
     with closing(sqlite3.connect(db)) as connection:
         after = _rows(connection)
-        assert all(after[table] == rows for table, rows in before.items())
+        # Additive migrations may append columns; every historical value must survive.
+        for table, rows in before.items():
+            column_sql = ",".join(f'"{column}"' for column in before_columns[table])
+            assert connection.execute(f'SELECT {column_sql} FROM "{table}"').fetchall() == rows
         validate_sqlite_participant_bindings(connection)
     # Repeated public migration is a no-op, with its own retained backup/receipt.
     assert main(["storage", "migrate", "--sqlite", str(db)]) == 0

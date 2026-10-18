@@ -1558,6 +1558,9 @@ async def _create_then_rewind_agent_snapshot_revision(postgres_dsn: str) -> None
         await creator.close()
     async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
         await conn.execute("DROP TABLE " + ", ".join(AGENT_SNAPSHOT_TABLES))
+        await conn.execute("DROP TABLE cayu_retired_task_sessions")
+        await conn.execute("ALTER TABLE cayu_tasks DROP COLUMN restartable")
+        await conn.execute("ALTER TABLE cayu_tasks DROP COLUMN restart_count")
         await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 120")
         await conn.commit()
 
@@ -1572,7 +1575,7 @@ def test_revision_120_adds_agent_snapshot_tables_without_raising_the_floor(
 
     async def runner() -> None:
         await _create_then_rewind_agent_snapshot_revision(postgres_dsn)
-        # A revision-119 database still serves every older store.
+        # The session store still reads revision 119; task writers need the later floor.
         session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
             await session_store.ensure_schema()

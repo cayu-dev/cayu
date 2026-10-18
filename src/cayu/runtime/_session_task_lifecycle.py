@@ -1289,6 +1289,11 @@ class SessionTaskLifecycle:
                 raise TaskClaimLost(
                     "Continuation worker authority has no running task attached to the session."
                 )
+            # Recheck after observing no live attachment: restart atomically
+            # detaches the task and retires its previous session. An admission
+            # read made before that transaction must not turn the old run into
+            # independent work when this attachment lookup happens afterward.
+            await self.task_store.require_unretired_task_session(session_id)
             return None, None
         task = tasks[0]
         if task.session_instance_id is None:

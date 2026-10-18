@@ -21,6 +21,7 @@ async def verifier_aware_task_execution_outcome(
     session_id: str | None = None,
     admit_session: bool = True,
     allow_missing_task: bool = False,
+    cleanup_only: bool = False,
 ) -> tuple[bool, BaseException | None]:
     if task_store is None:
         # Preserve the established run lifecycle: a missing TaskStore is
@@ -109,12 +110,23 @@ async def verifier_aware_task_execution_outcome(
         requires_completion_decision = task is not None
         del task
         return requires_completion_decision, None
+    # Validate the concrete mutation, not TaskStore's compatibility delegate.
+    # Existing stores prove their execution-admission method's quiescence.
+    admission_method = (
+        "admit_ordinary_session_cleanup"
+        if cleanup_only
+        and type(task_store).admit_ordinary_session_cleanup
+        is not TaskStore.admit_ordinary_session_cleanup
+        else "admit_ordinary_session_execution"
+    )
     admission_outcome = await capture_task_store_operation(
-        lambda: task_store.admit_ordinary_session_execution(session_id),
-        operation_name="Ordinary session execution admission",
+        lambda: getattr(task_store, admission_method)(session_id),
+        operation_name="Ordinary session cleanup admission"
+        if cleanup_only
+        else "Ordinary session execution admission",
         redactor=redactor,
         mutation_store=task_store,
-        mutation_method_name="admit_ordinary_session_execution",
+        mutation_method_name=admission_method,
     )
     if type(admission_outcome.failure) is TaskCompletionDecisionRequired:
         return True, None

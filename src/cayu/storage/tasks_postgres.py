@@ -234,7 +234,7 @@ from cayu.tasks.topology import (
     decode_task_topology_cursor,
 )
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 117
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 122
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -244,7 +244,8 @@ _TASK_RETURNING_COLUMNS = (
     "task.available_at, task.worker_id, task.lease_expires_at, task.interrupted_handoff_id, "
     "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
     "task.created_at, task.updated_at, task.started_at, task.completed_at, task.invocation, "
-    "task.retry_series, task.work_contract, task.schedule, task.graph_id, task.prerequisite_task_ids"
+    "task.retry_series, task.work_contract, task.schedule, task.graph_id, task.prerequisite_task_ids, "
+    "task.restartable, task.restart_count"
 )
 
 
@@ -1103,7 +1104,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 )
                 """,
                 pg_support.task_insert_values(task),
@@ -3337,7 +3338,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s
                             )
                             """,
                             pg_support.task_insert_values(successor),
@@ -4478,6 +4479,37 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 updated = pg_support.task_from_row(row)
             await conn.commit()
             return updated.model_copy(deep=True)
+
+    async def restart_task(
+        self, task_id: str, worker_id: str, *, lease_expires_at: datetime
+    ) -> Task:
+        from cayu.tasks.restart import _restarted_task
+
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn:
+            async with conn.cursor() as cur:
+                task = await self._load_task_locked(cur, task_id)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost("Admitted work attempts cannot restart.")
+                updated = _restarted_task(
+                    task, worker_id, expected_lease, now=await self._database_now(cur)
+                )
+                if task.session_id is not None:
+                    await cur.execute(
+                        "INSERT INTO cayu_retired_task_sessions (session_id, task_id) VALUES (%s, %s)",
+                        (task.session_id, task.id),
+                    )
+                await self._update_task_snapshot(cur, updated)
+                await self._record_task_transition(cur, task, updated)
+            await conn.commit()
+        return updated.model_copy(deep=True)
 
     async def release_task(
         self,

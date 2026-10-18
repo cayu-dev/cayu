@@ -427,13 +427,31 @@ class TaskStore(ABC):
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
         """Atomically admit a session to the ordinary, non-verifier runtime.
 
-        Supporting stores must reject admission while a contracted task binding
-        retains authority over the session and must durably prevent later contract
-        attachment to an admitted session. Task terminalization alone is not a
+        Supporting stores must reject sessions retired by restart_task and
+        sessions still owned by a contracted task binding. Admission must durably
+        prevent later contract attachment. Task terminalization alone is not a
         release; only the lifecycle settlement that retires the contract binding
         is. Repeated admission of the same session is idempotent.
         """
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def require_unretired_task_session(self, session_id: str) -> None:
+        """Read-only retirement fence before a detached session continuation.
+
+        Stores implementing restart_task must reject its retired sessions here.
+        The default is for stores whose restart_task remains unsupported.
+        """
+        if type(self).restart_task is not TaskStore.restart_task:
+            raise NotImplementedError("Restartable stores require a retired-session fence.")
+
+    async def admit_ordinary_session_cleanup(self, session_id: str) -> None:
+        """Admit cleanup without permitting provider or tool execution.
+
+        Supporting stores may clean retired sessions while retaining the same
+        contracted-session authority fence as ordinary execution. The default
+        delegates to execution admission, so custom stores remain fail-closed.
+        """
+        await self.admit_ordinary_session_execution(session_id)
 
     async def hold_claimed_work_contract_task(
         self,
@@ -1299,6 +1317,22 @@ class TaskStore(ABC):
         Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
         the live claim.
         """
+
+    async def restart_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Atomically requeue an opted-in task after its handler is quiescent.
+
+        The caller must stop and join its handler before invoking this method.
+        Require an exact live worker lease; reject pending cancellation and
+        special task lifecycles. Clear the previous session attachment and
+        increment ``restart_count`` while preserving task identity and input.
+        """
+        raise NotImplementedError("This task store does not support restartable jobs.")
 
     @abstractmethod
     async def release_task(

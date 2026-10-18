@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictFloat,
     StrictInt,
     field_validator,
@@ -340,6 +341,8 @@ class Task(BaseModel):
 
     id: str = Field(default_factory=lambda: str(uuid4()))
     type: str
+    restartable: StrictBool = False
+    restart_count: StrictInt = Field(default=0, ge=0)
     title: str | None = None
     description: str | None = None
     status: TaskStatus = TaskStatus.PENDING
@@ -367,6 +370,24 @@ class Task(BaseModel):
     schedule: TaskScheduleState | None = None
     retry_series: TaskRetrySeriesSnapshot | None = None
     work_contract: WorkContractRef | None = Field(default=None, frozen=True)
+
+    @model_validator(mode="after")
+    def validate_restart_policy(self) -> Task:
+        if self.restart_count and not self.restartable:
+            raise ValueError("A restart count requires restartable task policy.")
+        if self.restartable and any(
+            value is not None
+            for value in (
+                self.graph_id,
+                self.parent_task_id,
+                self.schedule,
+                self.retry_series,
+                self.work_contract,
+                self.invocation.root_session_id,
+            )
+        ):
+            raise ValueError("Restartable tasks must be ordinary root queue jobs.")
+        return self
 
     @model_validator(mode="after")
     def validate_graph_membership(self) -> Task:
@@ -545,6 +566,8 @@ def copy_task(task: Task) -> Task:
         _preflight_bounded_task_payloads(task)
     return Task(
         id=task.id,
+        restartable=task.restartable,
+        restart_count=task.restart_count,
         type=task.type,
         title=task.title,
         description=task.description,

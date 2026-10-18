@@ -238,6 +238,7 @@ from cayu.tasks.records import TaskRetrySeriesDisposition as TaskRetrySeriesDisp
 from cayu.tasks.records import TaskRetrySeriesSnapshot as TaskRetrySeriesSnapshot
 from cayu.tasks.records import TaskSessionClosureClaim as TaskSessionClosureClaim
 from cayu.tasks.records import TaskStatus as TaskStatus
+from cayu.tasks.restart import requeue_restartable_task as requeue_restartable_task
 from cayu.tasks.retry import TaskRetryAttemptDisposition as TaskRetryAttemptDisposition
 from cayu.tasks.retry import TaskRetryAttemptReport as TaskRetryAttemptReport
 from cayu.tasks.retry import TaskRetryEvent as TaskRetryEvent

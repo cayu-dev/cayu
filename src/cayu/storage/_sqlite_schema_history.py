@@ -670,6 +670,10 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    122: """CREATE TABLE IF NOT EXISTS cayu_retired_task_sessions (
+        session_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL
+    );""",
     108: """
         CREATE TABLE IF NOT EXISTS cayu_context_selection_exclusions (
             selection_key TEXT PRIMARY KEY,
@@ -4316,6 +4320,10 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    121: (
+        ("cayu_tasks", "restartable", "INTEGER NOT NULL DEFAULT 0 CHECK (restartable IN (0, 1))"),
+        ("cayu_tasks", "restart_count", "INTEGER NOT NULL DEFAULT 0 CHECK (restart_count >= 0)"),
+    ),
     101: (("cayu_budget_bindings", "allowance", "INTEGER"),),
     96: (
         ("cayu_task_groups", "barrier_status", "TEXT NOT NULL DEFAULT 'not_requested'"),

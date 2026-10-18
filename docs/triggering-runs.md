@@ -222,3 +222,38 @@ Stripe hook), your app terminates the HTTP request and enqueues a `Task`, then a
 including non-ASCII or invalid hexadecimal signatures. It raises
 `WebhookSignatureError` only for invalid verifier configuration or caller inputs,
 such as an unsupported algorithm, invalid secret, or non-bytes request body.
+
+### Restartable queue jobs
+
+Set `TaskCreate(restartable=True, ...)` only for an ordinary root queue job that
+can safely repeat from its beginning. External writes need application-level
+idempotency keys or another way to tolerate repetition. The handler must join
+all subprocesses and other work during cancellation; returning while detached
+work can still act is not a safe restart boundary.
+
+```python
+await app.create_task(TaskCreate(type="index_repository", restartable=True,
+                               input={"repository": "example"}))
+```
+
+When its worker coroutine is cancelled during shutdown, `run_task_worker`
+cancels the handler, keeps renewing its lease while the handler cleans up, and
+waits for it to finish before atomically returning the task to `pending`. The
+next worker claims the same task ID and input with an incremented
+`task.restart_count`. Its previous session remains available for inspection and is durably fenced against resuming;
+the next handler must create a fresh session, using the default `RunRequest`
+session ID or an ID that includes `restart_count`. Restartable tasks attach only
+through an exact worker claim, so an old session cannot start them without one.
+Connect SIGTERM to cancellation of the worker coroutine in your service.
+Setting the worker's `stop` event continues to drain active handlers normally.
+
+An operator cancellation always wins over shutdown requeueing. Lost ownership
+also prevents a restart. Non-restartable tasks keep their existing cancellation
+behavior. Retry series, schedules, graph/group members, work contracts, and
+pre-attached or child tasks do not accept this flag. A crash or SIGKILL cannot
+prove handler quiescence and does not automatically restart a started job.
+
+Custom workers can use `requeue_restartable_task(task_store, task, worker_id)`
+after stopping and fully joining the handler themselves. Keep the lease renewed
+until that point and pass its current snapshot. This standalone helper neither
+cancels work nor treats an expired lease as proof of quiescence.

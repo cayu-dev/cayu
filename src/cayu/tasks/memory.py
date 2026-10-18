@@ -455,6 +455,7 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
         self._tasks: dict[str, Task] = {}
+        self._retired_task_sessions: set[str] = set()
         self._task_groups: dict[str, TaskGroupSnapshot] = {}
         self._task_group_by_graph: dict[str, str] = {}
         self._task_group_events: dict[str, list[TaskGroupEvent]] = {}
@@ -587,8 +588,22 @@ class InMemoryTaskStore(TaskStore):
             return None if task is None else task.model_copy(deep=True)
 
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
+        await self._admit_ordinary_session(session_id, cleanup_only=False)
+
+    async def require_unretired_task_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if session_id in self._retired_task_sessions:
+                raise TaskClaimLost("A retired task session cannot execute again.")
+
+    async def admit_ordinary_session_cleanup(self, session_id: str) -> None:
+        await self._admit_ordinary_session(session_id, cleanup_only=True)
+
+    async def _admit_ordinary_session(self, session_id: str, *, cleanup_only: bool) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if not cleanup_only and session_id in self._retired_task_sessions:
+                raise TaskClaimLost("A retired task session cannot execute again.")
             contracted_task = self._active_work_contract_task_for_session(session_id)
             requires_completion_decision = contracted_task is not None
             del contracted_task
@@ -4004,6 +4019,24 @@ class InMemoryTaskStore(TaskStore):
                     "updated_at": now,
                 }
             )
+            self._store_task(updated)
+            return updated.model_copy(deep=True)
+
+    async def restart_task(
+        self, task_id: str, worker_id: str, *, lease_expires_at: datetime
+    ) -> Task:
+        from cayu.tasks.restart import _restarted_task
+
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        async with self._lock:
+            task = self._require_task(task_id)
+            if task_id in self._latest_admission_id_by_task:
+                raise WorkAttemptExecutionClaimLost("Admitted work attempts cannot restart.")
+            updated = _restarted_task(task, worker_id, expected_lease, now=self._ownership_clock())
+            if task.session_id is not None:
+                self._retired_task_sessions.add(task.session_id)
             self._store_task(updated)
             return updated.model_copy(deep=True)
 

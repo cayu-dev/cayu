@@ -1,6 +1,7 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "requeue_restartable_task": ("cayu.tasks.restart", "requeue_restartable_task"),
     "TaskGroupInvocationSettlementPending": (
         "cayu.runtime._task_group_invocation",
         "TaskGroupInvocationSettlementPending",
@@ -339,6 +340,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "requeue_restartable_task",
     "TaskGroupCreate",
     "TaskGroupQuiescencePolicy",
     "TaskGroupQuiescenceStatus",

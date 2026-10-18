@@ -1544,6 +1544,7 @@ class SessionEngine:
         session_id: str | None = None,
         admit_session: bool = True,
         allow_missing_task: bool = False,
+        cleanup_only: bool = False,
     ) -> tuple[bool, BaseException | None]:
         return await verifier_aware_task_execution_outcome(
             task_id,
@@ -1552,6 +1553,7 @@ class SessionEngine:
             session_id=session_id,
             admit_session=admit_session,
             allow_missing_task=allow_missing_task,
+            cleanup_only=cleanup_only,
         )
 
     async def run(

@@ -531,6 +531,10 @@ REVISIONS: tuple[Revision, ...] = (
     # are new tables that older binaries never read or write. The PostgreSQL
     # snapshot store requires them; SQLite snapshot stores keep their own tables.
     Revision(revision=120, kind=RevisionKind.ADDITIVE, compatible_from=115),
+    # Writers must preserve restart policy and claim-only reattachment authority.
+    Revision(revision=121, kind=RevisionKind.BREAKING, compatible_from=121),
+    # Retired sessions must remain fenced after a restart detaches their task.
+    Revision(revision=122, kind=RevisionKind.BREAKING, compatible_from=122),
 )
 
 #: The revision an empty database is initialized to.

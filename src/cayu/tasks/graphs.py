@@ -72,6 +72,8 @@ class TaskGraphNode(BaseModel):
         if type(value) is not TaskCreate:
             raise ValueError("Graph nodes require task creation requests.")
         copied = copy_task_create(value)
+        if copied.restartable:
+            raise ValueError("Restartable tasks cannot be members of task graphs or groups.")
         if copied.task_id is None:
             raise ValueError("Graph nodes require explicit task identities.")
         graph_identifier(copied.task_id)

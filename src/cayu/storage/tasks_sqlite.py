@@ -355,7 +355,7 @@ from cayu.tasks.work_receipts import (
 _T = TypeVar("_T")
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 117
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 122
 
 
 @model_store_surface("tasks")
@@ -1243,7 +1243,7 @@ class SQLiteTaskStore(TaskStore):
                 worker_id = ?, lease_expires_at = ?,
                 status_reason = ?, status_payload_json = ?, result_json = ?, error_json = ?,
                 updated_at = ?, started_at = ?, completed_at = ?, retry_series_json = ?,
-                work_contract_json = ?, available_at = ?, schedule_json = ?
+                work_contract_json = ?, available_at = ?, schedule_json = ?, restart_count = ?
             WHERE id = ?
             """,
             (
@@ -1273,6 +1273,7 @@ class SQLiteTaskStore(TaskStore):
                 None
                 if task.schedule is None
                 else sqlite_records.json_dumps(task.schedule.model_dump(mode="json")),
+                task.restart_count,
                 task.id,
             ),
         )
@@ -1344,9 +1345,34 @@ class SQLiteTaskStore(TaskStore):
             return sqlite_records.task_from_row(row)
 
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
+        await self._admit_ordinary_session(session_id, cleanup_only=False)
+
+    async def require_unretired_task_session(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = ?", (session_id,)
+                ).fetchone()
+                is not None
+            ):
+                raise TaskClaimLost("A retired task session cannot execute again.")
+
+    async def admit_ordinary_session_cleanup(self, session_id: str) -> None:
+        await self._admit_ordinary_session(session_id, cleanup_only=True)
+
+    async def _admit_ordinary_session(self, session_id: str, *, cleanup_only: bool) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             with self._verified_transaction_unlocked():
+                if not cleanup_only and (
+                    self._connection.execute(
+                        "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise TaskClaimLost("A retired task session cannot execute again.")
                 self._ensure_session_execution_authority_unlocked(session_id, "ordinary")
 
     async def hold_claimed_work_contract_task(
@@ -3896,9 +3922,9 @@ class SQLiteTaskStore(TaskStore):
                     invocation_json,
                     retry_series_json,
                     work_contract_json,
-                    schedule_json
+                    schedule_json, restartable, restart_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_records.task_to_row_values(task),
             )
@@ -5594,8 +5620,8 @@ class SQLiteTaskStore(TaskStore):
                             status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
-                            work_contract_json, schedule_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            work_contract_json, schedule_json, restartable, restart_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_records.task_to_row_values(successor),
                     )
@@ -6453,6 +6479,32 @@ class SQLiteTaskStore(TaskStore):
                     )
                     self._raise_task_active_lease_error(task_id, worker_id, now=now)
                 updated = self._require_task_unlocked(task_id)
+                return updated.model_copy(deep=True)
+
+    async def restart_task(
+        self, task_id: str, worker_id: str, *, lease_expires_at: datetime
+    ) -> Task:
+        from cayu.tasks.restart import _restarted_task
+
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                task = self._require_task_unlocked(task_id)
+                self._raise_if_governed_work_attempt_admission(
+                    task_id, "Admitted work attempts cannot restart."
+                )
+                updated = _restarted_task(
+                    task, worker_id, expected_lease, now=self._ownership_clock()
+                )
+                if task.session_id is not None:
+                    self._connection.execute(
+                        "INSERT INTO cayu_retired_task_sessions (session_id, task_id) VALUES (?, ?)",
+                        (task.session_id, task.id),
+                    )
+                self._update_task_snapshot_unlocked(updated)
+                self._record_task_transition_unlocked(task, updated)
                 return updated.model_copy(deep=True)
 
     async def release_task(

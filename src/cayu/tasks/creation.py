@@ -7,7 +7,15 @@ from decimal import Decimal
 from typing import Any, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import copy_durable_json_object, copy_durable_metadata, revalidate_model_input
@@ -110,11 +118,27 @@ class TaskCreate(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     retry_policy: TaskRetryPolicy | None = None
+    restartable: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
     work_contract: WorkContractRef | None = None
     invocation_origin: InvocationOriginClaim | None = None
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
     _runtime_session_binding: SessionInvocationBinding | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def validate_restartable(self) -> TaskCreate:
+        if self.restartable and any(
+            value is not None
+            for value in (
+                self.session_id,
+                self.parent_task_id,
+                self.retry_policy,
+                self.work_contract,
+                self.schedule_policy,
+            )
+        ):
+            raise ValueError("Restartable tasks must be ordinary unattached root queue jobs.")
+        return self
 
     @field_validator("schedule_policy", mode="before")
     @classmethod
@@ -217,6 +241,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         _preflight_bounded_task_payloads(request, ("input", "metadata"))
     copied = TaskCreate(
         task_id=request.task_id,
+        restartable=request.restartable,
         type=request.type,
         title=request.title,
         description=request.description,
@@ -581,6 +606,7 @@ def _task_from_create(
         title=request.title,
         description=request.description,
         status=TaskStatus.PENDING,
+        restartable=request.restartable,
         session_id=request.session_id,
         session_instance_id=(
             None

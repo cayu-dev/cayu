@@ -141,6 +141,7 @@ from cayu.tasks.handoff import (
 )
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import (
+    _TERMINAL_TASK_STATUSES,
     Task,
     TaskClaimLost,
     TaskRetrySeriesDisposition,
@@ -1706,6 +1707,18 @@ async def _await_task_handler(
             raise AssertionError(
                 "Task retry cancellation handling returned unexpectedly."
             ) from None
+        if task.restartable and owner_task.cancelling() > cancellation_baseline:
+            await _restart_task_handler_after_shutdown(
+                task_store,
+                task,
+                worker_id,
+                handler_task,
+                heartbeat_task,
+                stop_heartbeat,
+                lease_authority=lease_authority,
+                owner_cancellation=owner_cancellation,
+            )
+            raise owner_cancellation from exception_cause(owner_cancellation)
         await _drain_ordinary_task_handler_under_cancellation_fence(
             task_store,
             task,
@@ -1719,6 +1732,79 @@ async def _await_task_handler(
             owner_cancellation=owner_cancellation,
         )
         raise owner_cancellation from exception_cause(owner_cancellation)
+
+
+async def _restart_task_handler_after_shutdown(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    handler_task: asyncio.Future[Any],
+    heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
+    stop_heartbeat: asyncio.Event,
+    *,
+    lease_authority: _TaskLeaseAuthority,
+    owner_cancellation: asyncio.CancelledError,
+) -> None:
+    async def settle() -> None:
+        stop_heartbeat.set()
+        await heartbeat_task
+        async with lease_authority.lock:
+            current = await task_store.load_task(task.id)
+            if current is None:
+                raise TaskClaimLost("Restartable task disappeared during shutdown.")
+            if current.status in _TERMINAL_TASK_STATUSES:
+                return
+            if not _task_cancellation_requested(current):
+                try:
+                    await task_store.restart_task(
+                        task.id, worker_id, lease_expires_at=lease_authority.lease_expires_at
+                    )
+                    return
+                except TaskTerminalizationConflict:
+                    current = await task_store.load_task(task.id)
+                    if (
+                        current is None
+                        or not _task_cancellation_requested(current)
+                        or current.worker_id != worker_id
+                        or current.lease_expires_at != lease_authority.lease_expires_at
+                    ):
+                        raise
+            await _settle_ordinary_task_cancellation_after_quiescence(
+                task_store, task.id, worker_id
+            )
+
+    async def cleanup() -> None:
+        # Lease renewal continues until cancellation cleanup has fully joined.
+        # A handler suppressing cancellation retains ownership until it returns.
+        handler_task.cancel()
+        handler_failure: BaseException | None = None
+        try:
+            await handler_task
+        except asyncio.CancelledError:
+            pass
+        except BaseException as error:
+            handler_failure = error
+        try:
+            await settle()
+        except BaseException as settlement_failure:
+            if handler_failure is not None:
+                _attach_task_worker_secondary_failure(
+                    settlement_failure, handler_failure, label="Restartable handler cleanup failure"
+                )
+            raise
+        if handler_failure is not None:
+            raise handler_failure
+
+    outcome = await await_shielded_task_outcome(
+        asyncio.create_task(cleanup()), cancellation=owner_cancellation
+    )
+    if outcome.error is not None:
+        _attach_task_worker_secondary_failure(
+            owner_cancellation, outcome.error, label="Restartable task shutdown failure"
+        )
+    restore_task_cancellation_requests(
+        outcome.cancellation_requests_consumed, cancellation=owner_cancellation
+    )
 
 
 async def _raise_task_retry_owner_cancellation(
