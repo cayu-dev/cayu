@@ -210,6 +210,17 @@ async def _child(root: Path, mode: str, fault: str) -> None:
         app._execution_profile_continuation.validate = after_competing_recovery
     elif mode == "concurrent_one":
         await _wait_for_marker(root / "second_recovery_inspecting")
+    elif mode in {"concurrent_validation", "validation_failure"}:
+        validate = app._execution_profile_continuation.validate
+
+        async def validate_after_competitor(**kwargs):
+            if mode == "validation_failure":
+                raise RuntimeError("fixture profile validation failed")
+            winner = await asyncio.to_thread(_process, root, "validation_winner")
+            assert winner.returncode == 0, winner.stderr
+            return await validate(**kwargs)
+
+        app._execution_profile_continuation.validate = validate_after_competitor
     try:
         if mode == "run":
             async for _ in app.run(
@@ -407,6 +418,38 @@ def test_concurrent_recovery_uses_one_claim_and_preserves_other_allocations(tmp_
     assert list(tmp_path.glob("*.resource")) == [foreign]
     assert foreign.read_text() == "owned by another session"
     assert (tmp_path / "calls.jsonl").read_text().count('"create"') == 1
+
+
+def test_recovery_skips_a_snapshot_settled_during_profile_validation(tmp_path: Path):
+    assert _process(tmp_path, "run").returncode == 73
+    foreign = tmp_path / "foreign.resource"
+    foreign.write_text("owned by another session")
+
+    result = _recover(tmp_path, "concurrent_validation")
+
+    assert result["actions"] == ["skipped_active"]
+    assert result["status"] == "interrupted"
+    winner = json.loads((tmp_path / "validation_winner.json").read_text())
+    assert "reaped_allocation" in winner["actions"]
+    assert list(tmp_path.glob("*.resource")) == [foreign]
+    assert foreign.read_text() == "owned by another session"
+    calls = (tmp_path / "calls.jsonl").read_text()
+    assert calls.count('"create"') == calls.count('"reap"') == 1
+    events = json.loads((tmp_path / "events.json").read_text())
+    assert sum(event["type"] == "session.interrupted" for event in events) == 1
+    assert not any(event["type"] == "model.requested" for event in events)
+
+
+def test_recovery_preserves_validation_failure_without_a_competing_owner(tmp_path: Path):
+    assert _process(tmp_path, "run").returncode == 73
+
+    failed = _process(tmp_path, "validation_failure")
+
+    assert failed.returncode != 0
+    assert "fixture profile validation failed" in failed.stderr
+    assert list(tmp_path.glob("*.resource"))
+    assert '"reap"' not in (tmp_path / "calls.jsonl").read_text()
+    assert "reaped_allocation" in _recover(tmp_path)["actions"]
 
 
 def test_valid_continuation_reconnects_exact_published_allocation(tmp_path: Path):

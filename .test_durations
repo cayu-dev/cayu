@@ -49011,5 +49011,7 @@
     "tests/runtime/test_runtime_supervision_attention.py::test_grant_linkage_and_usage_cost_are_read_from_recorded_events": 0.01,
     "tests/runtime/test_runtime_supervision_attention.py::test_round_recovery_names_its_manual_recovery_request": 1.27,
     "tests/runtime/test_runtime_supervision_attention.py::test_user_input_recovery_names_the_manual_recovery_request": 3.794,
-    "tests/server/test_server_supervision_events.py::test_attention_identity_and_declared_edit_cross_http_without_content": 2.028
+    "tests/server/test_server_supervision_events.py::test_attention_identity_and_declared_edit_cross_http_without_content": 2.028,
+    "tests/core/test_abandoned_environment_allocations.py::test_recovery_preserves_validation_failure_without_a_competing_owner": 14.405,
+    "tests/core/test_abandoned_environment_allocations.py::test_recovery_skips_a_snapshot_settled_during_profile_validation": 19.196
 }

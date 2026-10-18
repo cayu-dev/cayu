@@ -2355,21 +2355,35 @@ async def test_sse_parser_propagates_real_task_cancellation() -> None:
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                deadline_controller=_deadline_controller(1.0),
+                deadline_controller=ProviderStreamDeadlineController(ProviderStreamDeadlines()),
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
             )
         ]
 
     task = asyncio.create_task(consume())
-    await read_started.wait()
-    task.cancel()
+    started = asyncio.create_task(read_started.wait())
+    try:
+        # Surface an early consumer failure instead of waiting forever for a
+        # read that was cancelled before its generator could start.
+        done, _ = await asyncio.wait(
+            (task, started), timeout=5, return_when=asyncio.FIRST_COMPLETED
+        )
+        if task in done:
+            await task
+        assert started in done, "SSE source read did not start"
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert task.cancelling() == 1
-    assert task.cancelled()
-    assert source_finalized.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelling() == 1
+        assert task.cancelled()
+        assert source_finalized.is_set()
+    finally:
+        for pending in (task, started):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(task, started, return_exceptions=True)
 
 
 @pytest.mark.anyio
