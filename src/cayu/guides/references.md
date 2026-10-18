@@ -146,7 +146,11 @@ when behavior changes. Undeclared custom guards remain process-local.
 An `Environment` groups a workspace, runner, artifact store, vault, credential
 proxy, knowledge store, and MCP servers. Register a static environment or an
 `EnvironmentFactory`; choose a default explicitly. Local workspaces and runners
-are development conveniences, not isolation boundaries.
+are development conveniences, not isolation boundaries. Start with Docker for
+local development and Lambda MicroVM for cloud sandboxing. Docker shares the
+host kernel and does not satisfy `ExecutionRequirements.untrusted()`. See the
+[execution path and host table](https://github.com/cayu-dev/cayu/blob/main/docs/execution-capabilities.md#choose-a-sandbox-and-restrict-network-access)
+for Docker runners/coding environments, cloud sandboxes and network restrictions.
 
 ## artifacts
 
@@ -159,7 +163,13 @@ identity in durable state, and test with a temporary local artifact store.
 Resolve secrets through a `Vault`/`SecretRef`, and put outbound authority in
 credential proxies and `HttpEgressPolicy`. Do not place secret values in source,
 prompts, manifests, diagnostics, tool results, or generated plans. Virtual
-credentials keep provider credentials out of the tool process.
+credentials keep provider credentials out of the tool process. Install
+`cayu[egress]` for Docker or `cayu[aws,egress]` for Lambda MicroVM, and select
+an enforcing adapter to
+restrict network access, including credentialless package-index destinations.
+The [virtual-egress guide](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md)
+shows `VirtualEgressEnvironmentFactory` and deny-by-default policy. The Docker
+coding environment disables networking when no such access is needed.
 
 ## mcp
 

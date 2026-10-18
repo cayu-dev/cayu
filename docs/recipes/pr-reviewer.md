@@ -148,8 +148,13 @@ class PRReviewWorkspaceFactory(EnvironmentFactory):
   separate QA agent with a checkout, branch the *same* factory on
   `request.agent_name` — it is a per-session field — returning `NoWorkspaceBinding`
   for one and a `GitRepositoryBinding` for the other.
-- **Go cloud:** swap `LocalRunner`/`LocalWorkspace` for `E2BRunner`/`E2BWorkspace`
-  (`cayu[e2b]`) for real isolation instead of the trusted local-dev runner.
+- **Sandbox the checkout and QA:** use Docker (`DockerRunner` or
+  `DockerCodingEnvironmentFactory`) for local development, then run the service
+  in a cloud container with Lambda MicroVM for tool execution. Follow the
+  [canonical execution path](../execution-capabilities.md#choose-a-sandbox-and-restrict-network-access)
+  for the shared-kernel caveat, host compatibility and `cayu[egress]` network
+  restrictions. The local snippet above is only for trusted fixtures; a QA
+  command allowlist does not make code from a pull request safe to execute.
 
 ## 4. GitHub egress: two options
 

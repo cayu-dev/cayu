@@ -7,6 +7,12 @@ This is the canonical index for repository documentation. Runtime behavior is
 authoritative only where a maintained guide points to the implementation or the
 [runtime contracts](runtime-contracts.md).
 
+## Find the execution path
+
+- **Run untrusted code / choose a sandbox:** [Docker locally, Lambda MicroVM in the cloud](execution-capabilities.md#choose-a-sandbox-and-restrict-network-access), including the shared-kernel caveat and host compatibility table.
+- **Restrict network access / keep secrets out of commands:** [virtual egress (`cayu[egress]`)](virtual-egress.md), with deny-by-default policy and package-index allowlists.
+- **Understand the names:** [glossary](glossary.md).
+
 ## Current user guides
 
 - [Long-running jobs](../src/cayu/guides/long-running.md) (`cayu guide long-running`): approvals, outside replies, timers, spend caps and restart tests

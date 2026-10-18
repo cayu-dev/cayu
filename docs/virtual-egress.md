@@ -8,6 +8,8 @@ secret — not in env, files, `/proc`, logs, or on the wire. Isolation strength
 still comes from the explicitly selected runner: ordinary Docker containers are
 not a secure sandbox boundary.
 
+Choose the backend using the [canonical execution path and host table](execution-capabilities.md#choose-a-sandbox-and-restrict-network-access): Docker locally, Lambda MicroVM in the cloud.
+
 ## Why not just `secret_env`?
 
 `secret_env` (mode `raw_env`) resolves a vault secret and injects the **raw
@@ -211,7 +213,9 @@ proof and its compatibility boundary.
 Install the TLS/Docker pieces with the optional extra:
 
 ```
-pip install 'cayu[egress]'   # adds cryptography
+pip install 'cayu[egress]'   # Docker; adds cryptography
+# For Lambda MicroVM, include the AWS SDK too:
+# pip install 'cayu[aws,egress]'
 ```
 
 ### Trusting a broker CA for Cayu provider calls
@@ -612,10 +616,8 @@ adapter. Omitted and unsupported selections fail before grants, proxies,
 runners, or workspaces are created. `runner_kind="docker"` selects ordinary
 Docker container execution and is intended for trusted development, CI,
 conformance, and packaging. It is never an implicit fallback for untrusted code.
-Microsandbox is Cayu's primary local runner for untrusted code; if that microVM
-runtime is unavailable, setup fails rather than falling back to Docker. E2B and
-Microsandbox use registered `SandboxEgressAdapter` implementations that both
-prepare the proxy and create the matching network-restricted runner. Remote/raw
+E2B and Microsandbox integrations use registered `SandboxEgressAdapter`
+implementations that both prepare the proxy and create the matching network-restricted runner. Remote/raw
 proxy exposures have an additional credentialless requirement described below.
 
 ### Managed runner and workspace composition

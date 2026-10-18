@@ -14,11 +14,60 @@ that proves it.
 `VirtualEgressEnvironmentFactory`, or a `LambdaMicroVMRunner` composed directly,
 with the first-party sidecar image.
 
+## Choose a sandbox and restrict network access
+
+The canonical path is to build locally with Docker, then deploy the Cayu service
+in a cloud container and run its tools in a cloud sandbox, starting with Lambda
+MicroVM. The service owns the agent loop and model credentials; the runner owns
+the workspace commands. A cloud service container does not itself give those
+commands a separate sandbox.
+
+- **Local development, laptops and plain VMs:** start with `DockerRunner`, or
+  [`DockerCodingEnvironmentFactory`](docker-coding-toolchains.md) for a fresh
+  coding workspace and admitted toolchain. Docker needs a daemon, not nested
+  virtualization. It shares the Docker host's kernel, so a container escape can
+  compromise that host. Use only code whose risk you accept on that host.
+- **Run untrusted code with a stronger boundary:** compose
+  `VirtualEgressEnvironmentFactory` with `LambdaMicroVMEgressAdapter` in a cloud
+  sandbox, using `metadata_isolation="required"`. That adapter supplies the
+  security evidence required by `ExecutionRequirements.untrusted()`. See the
+  [Lambda MicroVM setup](virtual-egress.md#runner-support). A directly composed
+  `LambdaMicroVMRunner`, including the
+  [bare-runner example](../examples/aws/environments/lambda_microvm.py), does not
+  supply those security claims or deny-by-default networking and is refused for
+  untrusted execution too.
+  Docker does not satisfy `ExecutionRequirements.untrusted()`; do not remove that
+  requirement just to make admission pass for hostile workloads.
+- **Restrict network access:** the Docker coding factory disables networking.
+  When tools need selected destinations, install `cayu[egress]` for Docker or
+  `cayu[aws,egress]` for Lambda MicroVM, then compose
+  `VirtualEgressEnvironmentFactory` with `DockerEgressAdapter` locally or
+  `LambdaMicroVMEgressAdapter` in the cloud. Configure `HttpEgressPolicy` and
+  [credentialless approved destinations](virtual-egress.md#credentialless-approved-destinations-for-coding-agents)
+  for package indexes. [Virtual egress](virtual-egress.md) enforces the network
+  path and keeps real credentials in the host broker. An allowlist in a prompt
+  or a command policy does not restrict outbound connections from executed code.
+
+### Which host can run it?
+
+| Cayu service host | Docker runner / coding factory | Lambda MicroVM runner |
+| --- | --- | --- |
+| Laptop | Yes, with a local Docker daemon (Docker Desktop uses a Linux VM). | Remote AWS allocation; requires AWS access and the configured network path. |
+| Plain Linux VM | Yes, with Docker installed; no KVM requirement. | Remote AWS allocation; no nested virtualization on the service host. |
+| VM with nested virtualization | Yes; nested virtualization adds no isolation to ordinary Docker. | Same remote AWS allocation. |
+| ECS on EC2 | Requires explicitly provisioned Docker daemon access and compatible workspace paths. Keep daemon authority in the trusted service. | Remote AWS allocation with IAM and VPC/egress-connector setup. |
+| ECS on Fargate | No local Docker daemon or privileged Docker-in-Docker path. | Preferred cloud composition: service on Fargate, tool execution in Lambda MicroVM. |
+
+For virtual egress, the MicroVM must reach the service's private broker through
+its configured egress connector; AWS API connectivity alone is insufficient.
+Fargate's host and privilege restrictions are described in
+[AWS's Fargate security considerations](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-security-considerations.html).
+
 ## Isolation and admission
 
 | Capability | Docker | Lambda MicroVM |
 | --- | --- | --- |
-| Untrusted-code isolation | No. A container is not a secure sandbox boundary; admission of `ExecutionRequirements.untrusted()` refuses it (`docker_untrusted_isolation_unsupported`). | Yes. Firecracker MicroVM per session. |
+| Untrusted-code isolation | No. A container is not a secure sandbox boundary; admission of `ExecutionRequirements.untrusted()` refuses it (`docker_untrusted_isolation_unsupported`). | Yes through `VirtualEgressEnvironmentFactory` + `LambdaMicroVMEgressAdapter` in required metadata-isolation mode. A bare `LambdaMicroVMRunner` does not claim these capabilities. |
 | Credential non-possession (virtual egress) | Yes with Docker virtual egress, through the per-session broker. The Docker coding environment has no network at all (`docker_network_disabled`). | Yes, through the private proxy in the control-plane task. |
 | Deny-by-default network with metadata denial | Yes (egress adapter preflight). | Yes in `metadata_isolation="required"` mode, verified by preflight before agent code runs (`aws-lambda-microvm-metadata-isolation-live`). |
 | Unprivileged agent commands | Container user as configured. | Yes: UID/GID 1000, no capabilities, `no_new_privs`, no AWS credentials, verified by a guest probe on every create and reconnect. |

@@ -4,7 +4,9 @@ A cloud PR-review agent composed end-to-end on cayu: it is triggered by a pull
 request, checks the queued PR head SHA out into a fresh review workspace, QAs the
 change by running the project's tests, and posts one review comment back —
 durably, on a worker pool. The bundled runnable version uses the trusted local
-runner; swap in E2B or another sandbox runner for isolation.
+runner for trusted fixtures. Use Docker locally and Lambda MicroVM in the cloud;
+see the [execution path](../../docs/execution-capabilities.md#choose-a-sandbox-and-restrict-network-access)
+for isolation and network restrictions.
 
 This is the worked example behind [`docs/recipes/pr-reviewer.md`](../../docs/recipes/pr-reviewer.md).
 Read that recipe for the narrative; this directory is the runnable code.
@@ -90,8 +92,10 @@ Credential and tool policy remain independent authorization boundaries.
 
 ## Making it genuinely cloud
 
-Swap `LocalRunner`/`LocalWorkspace` in `PRReviewWorkspaceFactory` for
-`E2BRunner`/`E2BWorkspace` (the `cayu[e2b]` extra) to run the checkout and QA
-commands in an isolated cloud sandbox instead of the trusted local-dev runner,
-and back the app with `PostgresSessionStore`/`PostgresTaskStore` for multi-worker
-durability.
+Build locally with Docker, accepting its shared-kernel boundary. Deploy the
+service in a cloud container and execute checkout/QA commands in Lambda MicroVM;
+use `cayu[egress]` for Docker or `cayu[aws,egress]` for Lambda MicroVM when those
+commands need approved network destinations. Follow
+the [sandbox and network guide](../../docs/execution-capabilities.md#choose-a-sandbox-and-restrict-network-access)
+for runner/workspace composition and host requirements. Back the app with
+`PostgresSessionStore`/`PostgresTaskStore` for multi-worker durability.

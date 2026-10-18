@@ -54,6 +54,11 @@ disambiguates them so a name never sends you down the wrong path.
   run of an agent in an environment; a `SessionStore` (in-memory / SQLite /
   Postgres) persists sessions, events, and transcripts.
 
+## Sandboxing and network access
+
+- **Sandbox / run untrusted code.** Start with the [execution path and host table](execution-capabilities.md#choose-a-sandbox-and-restrict-network-access): Docker for local development, Lambda MicroVM for cloud isolation. Docker shares its host kernel and does not satisfy Cayu's untrusted-code admission requirement.
+- **Restrict network access / virtual egress.** [`cayu[egress]`](virtual-egress.md) supplies an enforcing runner adapter, deny-by-default outbound policy, and a broker that substitutes real secrets outside the sandbox. Docker's coding factory disables networking; use virtual egress when commands need approved destinations.
+
 ## A few load-bearing terms
 
 - **Knowledge vs memory.** Knowledge is durable canonical semantic material
