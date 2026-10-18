@@ -3,7 +3,9 @@
 ## Unreleased
 
 Upgrade: Existing streaming applications continue unchanged. Applications can use
-`send_turn` to create or continue a conversation and await one result.
+`send_turn` to create or continue a conversation and await one result. Services
+whose task workers can be stopped mid-handler can settle the stranded tasks with
+`reconcile_abandoned_task_cancellation`.
 
 - Add `send_turn` and `TurnRequest` for applications that create or continue a
   conversation and await one result. Creation races and session replacement
@@ -27,6 +29,15 @@ Upgrade: Existing streaming applications continue unchanged. Applications can us
   `cayu serve` labels Evals results with the same Release id, and an invalid
   `CAYU_RELEASE_ID` now fails application construction. See
   [release identity](runtime-contracts.md#release-identity).
+
+- Add `reconcile_abandoned_task_cancellation` for an ordinary task whose worker
+  process died while its cancellation was draining. Such a task stayed `claimed`
+  with a pending cancellation that no worker reclaims; the helper builds the exact
+  quiescent owner-lost reconciliation from the application's validator and evidence
+  identity. The `run_task_worker` documentation now says that reclamation returns
+  only unstarted tasks to `pending`, and that cancelling the worker waits for the
+  running handler instead of interrupting it. See
+  [When a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
 ### Breaking changes
 

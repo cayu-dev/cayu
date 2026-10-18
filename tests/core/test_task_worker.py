@@ -1804,6 +1804,82 @@ def test_owner_lost_cancellation_reconciliation_uses_store_owned_time() -> None:
     asyncio.run(scenario())
 
 
+def _abandoned_task_store(backend: str, tmp_path: Path, now: dict[str, datetime]) -> TaskStore:
+    if backend == "memory":
+        return InMemoryTaskStore(ownership_clock=lambda: now["value"])
+    return SQLiteTaskStore(tmp_path / "tasks.db", ownership_clock=lambda: now["value"])
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_abandoned_task_cancellation_settles_with_application_evidence(
+    backend: str, tmp_path: Path
+) -> None:
+    from cayu.tasks import reconcile_abandoned_task_cancellation
+    from cayu.tasks.cancellation import TaskCancellationReconciliationConflict
+
+    async def scenario() -> None:
+        now = {"value": datetime(2026, 1, 1, tzinfo=UTC)}
+        store = _abandoned_task_store(backend, tmp_path, now)
+        created = await store.create_task(TaskCreate(task_id="abandoned", type="job"))
+        claimed = await store.claim_task("dead-worker", TaskQuery(type="job"), lease_seconds=5)
+        assert claimed is not None
+        # What cancelling run_task_worker records before it waits for the handler;
+        # the process then dies, so its worker never settles the fence.
+        fenced = await store.cancel_task(created.id, {"code": "worker_cancelled"})
+        assert fenced.status_reason == "cancellation_requested"
+        assert fenced.lease_expires_at is not None
+        evidence = {
+            "validator_id": "service.restart-recovery",
+            "validator_version": "1",
+            "evidence_id": "process-exit:4242",
+        }
+
+        # While the lease is live the owner may still be draining: refused.
+        with pytest.raises(TaskCancellationReconciliationConflict):
+            await reconcile_abandoned_task_cancellation(store, created.id, **evidence)
+
+        now["value"] = fenced.lease_expires_at + timedelta(seconds=1)
+        # Lease expiry alone neither reclaims nor re-claims the fenced task.
+        assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+        assert await store.claim_task("next-worker", TaskQuery(type="job")) is None
+
+        settled = await reconcile_abandoned_task_cancellation(store, created.id, **evidence)
+        assert settled.status is TaskStatus.CANCELLED
+        assert settled.worker_id is None and settled.lease_expires_at is None
+        assert settled.status_payload is not None
+        reconciliation = settled.status_payload["cancellation_reconciliation"]
+        assert reconciliation["reconciliation_requested_at"] is not None
+        loaded = await store.load_task(created.id)
+        assert loaded == settled
+        # Settling again is a no-op that returns the terminal task.
+        assert await reconcile_abandoned_task_cancellation(store, created.id, **evidence) == settled
+
+    asyncio.run(scenario())
+
+
+def test_abandoned_task_cancellation_requires_a_pending_cancellation() -> None:
+    from cayu.tasks import reconcile_abandoned_task_cancellation
+
+    async def scenario() -> None:
+        store = InMemoryTaskStore()
+        queued = await store.create_task(TaskCreate(task_id="queued", type="job"))
+        evidence = {"validator_id": "v", "validator_version": "1", "evidence_id": "e"}
+        with pytest.raises(TaskTerminalizationConflict, match="pending cancellation"):
+            await reconcile_abandoned_task_cancellation(store, queued.id, **evidence)
+        claimed = await store.claim_task("live-worker", TaskQuery(type="job"), lease_seconds=60)
+        assert claimed is not None
+        with pytest.raises(TaskTerminalizationConflict, match="pending cancellation"):
+            await reconcile_abandoned_task_cancellation(store, claimed.id, **evidence)
+        with pytest.raises(TaskTerminalizationConflict, match="lost its task"):
+            await reconcile_abandoned_task_cancellation(store, "missing", **evidence)
+        with pytest.raises(ValueError):
+            await reconcile_abandoned_task_cancellation(
+                store, claimed.id, validator_id=" ", validator_version="1", evidence_id="e"
+            )
+
+    asyncio.run(scenario())
+
+
 def test_owner_lost_retry_reconciliation_uses_store_owned_time() -> None:
     class CapturingTaskStore(InMemoryTaskStore):
         reconciliation_requested_at: datetime | None = None
@@ -8343,3 +8419,24 @@ def test_resume_rejects_multiple_running_tasks_attached_to_the_same_session(
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
     assert provider.requests == []
+
+
+def test_abandoned_task_cancellation_names_the_retry_reconciliation_boundary() -> None:
+    from cayu.tasks import reconcile_abandoned_task_cancellation
+
+    async def scenario() -> None:
+        store = InMemoryTaskStore()
+        task = await store.create_task(
+            TaskCreate(type="job", retry_policy=TaskRetryPolicy(max_attempts=2))
+        )
+        claimed = await store.claim_task("worker", lease_seconds=5)
+        assert claimed is not None
+        fenced = await store.cancel_task(task.id, {"code": "worker_cancelled"})
+        assert fenced.status_reason == "retry_cancellation_requested"
+        with pytest.raises(TaskTerminalizationConflict, match="reconcile_task_retry_cancellation"):
+            await reconcile_abandoned_task_cancellation(
+                store, task.id, validator_id="v", validator_version="1", evidence_id="exit"
+            )
+        assert (await store.load_task(task.id)) == fenced
+
+    asyncio.run(scenario())

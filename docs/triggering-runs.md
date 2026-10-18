@@ -137,7 +137,8 @@ await run_task_worker(app, task_store, handle, worker_id="worker-1",
 The loop owns claim → heartbeat → handle → reclaim-expired-leases, and keeps
 going if one task's handler raises or returns without terminalizing its task (it
 marks that task failed). Pass a `stop: asyncio.Event` for graceful shutdown and
-`max_tasks=N` to bound it.
+`max_tasks=N` to bound it. `stop` ends claiming; handlers that are already
+running finish.
 
 The handler passes the claim snapshot it received. The worker loop privately
 serializes later heartbeat generations with session attachment and terminal
@@ -160,6 +161,44 @@ ineligible for fresh-task claim/reclaim while an approval, user-input response,
 operator resume, or recovery process continues the session. Returning `None`
 preserves the original terminal-or-fail behavior; do not return the handoff
 outcome merely to abandon unfinished work.
+
+### When a worker dies mid-task
+
+Reclaiming expired leases returns a task to `pending` only when its handler never
+started. A started task can have done part of its work, so Cayu never gives it to
+another worker: reclamation fences it as a cancellation request instead. Cancelling
+the `run_task_worker(...)` coroutine records the same fence and then waits for the
+running handler to finish; it does not interrupt the handler. The worker settles
+the fence once the handler returns.
+
+If the process exits before that, for example because a service manager stopped
+it while a long handler was running, an ordinary (non-retry) task stays `claimed`
+with `status_reason == "cancellation_requested"`. No worker claims or reclaims it
+again. Retry-series tasks use `retry_cancellation_requested` and require
+`TaskStore.reconcile_task_retry_cancellation` with retry-specific evidence; the
+helper below does not settle them.
+Once the application knows the original worker can no longer act and its handler
+left nothing half-done, settle it:
+
+```python
+from cayu.tasks import reconcile_abandoned_task_cancellation
+
+await reconcile_abandoned_task_cancellation(
+    task_store,
+    task.id,
+    validator_id="my-service.restart-recovery",
+    validator_version="1",
+    evidence_id=f"process-exit:{previous_pid}",
+)
+```
+
+The task becomes `cancelled` with that evidence recorded; create a new task if the
+work should run again. The store refuses while the original lease is live, but
+lease expiry does not prove that the handler stopped: a cancellation-fenced handler
+may still be draining after expiry. The application must independently establish
+quiescence before calling this helper. This helper does not support session-attached
+tasks. Interrupted-handoff recovery covers attached tasks without pending
+cancellation; cancellation-fenced attached tasks require separate reconciliation.
 
 ## What does *not* trigger a run
 

@@ -248,6 +248,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.tasks.handoff",
         "new_interrupted_task_continuation_handoff_id",
     ),
+    "reconcile_abandoned_task_cancellation": (
+        "cayu.tasks.worker",
+        "reconcile_abandoned_task_cancellation",
+    ),
     "run_task_worker": ("cayu.tasks.worker", "run_task_worker"),
     "settle_task_retry_attempt_with_retry": (
         "cayu.tasks._terminalization",
@@ -498,6 +502,7 @@ PUBLIC_NAMES = [
     "fail_managed_task",
     "interrupted_task_handoff_request",
     "new_interrupted_task_continuation_handoff_id",
+    "reconcile_abandoned_task_cancellation",
     "run_task_worker",
     "settle_task_retry_attempt_with_retry",
     "task_create_with_execution_source",

@@ -265,6 +265,99 @@ async def fail_managed_task(
         )
 
 
+async def reconcile_abandoned_task_cancellation(
+    task_store: TaskStore,
+    task_id: str,
+    *,
+    validator_id: str,
+    validator_version: str,
+    evidence_id: str,
+    reconciled_by: ResolutionActor | None = None,
+) -> Task:
+    """Settle an ordinary task whose worker died while its cancellation was draining.
+
+    Cayu never hands a started task to another worker after its lease expires:
+    expired-claim reclamation fences it as a cancellation request instead, and
+    cancelling ``run_task_worker`` records the same fence and waits for the handler
+    to finish. The owning worker settles the fence once its handler is quiescent.
+    If that process died first, the task stays claimed with ``status_reason``
+    ``"cancellation_requested"`` until the application attests quiescence.
+
+    Call this once the application knows the original worker can no longer act
+    (for example, its process exited or its host restarted) and the handler left
+    no partial external effect it would need to finish. ``validator_id`` and
+    ``validator_version`` name the application check that made that judgement and
+    ``evidence_id`` identifies the fact it relied on. The store still refuses while
+    the original lease is live, but lease expiry does not prove that the handler
+    stopped. Independently establish quiescence before calling this helper;
+    a cancellation-fenced handler can still run after its lease expires.
+    Session-attached tasks are not supported. Interrupted-handoff recovery covers
+    attached tasks without pending cancellation; fenced attachments need separate
+    reconciliation.
+
+    Returns the cancelled task; a task this already settled is returned unchanged.
+    """
+
+    for name, value in (
+        ("validator_id", validator_id),
+        ("validator_version", validator_version),
+        ("evidence_id", evidence_id),
+    ):
+        require_clean_nonblank(value, name)
+    current = await task_store.load_task(task_id)
+    if current is None:
+        raise TaskTerminalizationConflict("Abandoned task cancellation lost its task.")
+    if current.status is TaskStatus.CANCELLED:
+        return current
+    if current.session_id is not None:
+        raise TaskTerminalizationConflict(
+            "Session-attached tasks are not supported; interrupted-handoff recovery "
+            "only covers tasks without a pending cancellation."
+        )
+    if current.retry_series is not None:
+        raise TaskTerminalizationConflict(
+            "Retry-series cancellations require TaskStore.reconcile_task_retry_cancellation; "
+            "reconcile_abandoned_task_cancellation only settles ordinary tasks."
+        )
+    worker_id = current.worker_id
+    terminalization = (
+        _task_cancellation_terminalization_request(current, worker_id=worker_id)
+        if worker_id is not None
+        else None
+    )
+    if worker_id is None or terminalization is None:
+        raise TaskTerminalizationConflict(
+            "Only a claimed task with a pending cancellation can be reconciled as abandoned."
+        )
+    evidence_sha256 = sha256(
+        canonical_durable_json_bytes(
+            {
+                "schema": "cayu.abandoned-task-cancellation.v1",
+                "task_id": current.id,
+                "worker_id": worker_id,
+                "cancellation_idempotency_key": terminalization.idempotency_key,
+                "validator_id": validator_id,
+                "validator_version": validator_version,
+                "evidence_id": evidence_id,
+            },
+            "abandoned_task_cancellation",
+        )
+    ).hexdigest()
+    request = _owner_lost_cancellation_request(
+        current,
+        worker_id,
+        cancellation_idempotency_key=terminalization.idempotency_key,
+        reconciliation_idempotency_key=f"abandoned-task-cancellation:v1:{evidence_sha256}",
+        reconciled_by=reconciled_by
+        or ResolutionActor(subject=validator_id, source=ResolutionActorSource.SYSTEM),
+        validator_id=validator_id,
+        validator_version=validator_version,
+        evidence_id=evidence_id,
+        evidence_sha256=evidence_sha256,
+    )
+    return (await task_store.reconcile_task_cancellation(request)).task
+
+
 class _TaskRetryElapsed(Exception):
     """The durable retry-series deadline elapsed while its handler was active."""
 
@@ -362,7 +455,12 @@ async def run_task_worker(
     - ``minimum_idle_delay_s`` / ``maximum_idle_delay_s`` bound adaptive polling.
     - ``idle_backoff_multiplier`` and ``idle_jitter_ratio`` control empty-claim
       backoff without changing the dispatch-latency bound.
-    - ``reclaim`` periodically returns expired leases from dead workers to pending.
+    - ``reclaim`` periodically returns expired claims from dead workers to pending
+      when their handler never started. A started task whose owner is gone is
+      fenced as a cancellation request instead of being repeated, and stays
+      claimed until it is settled; see ``reconcile_abandoned_task_cancellation``
+      for ordinary tasks and ``TaskStore.reconcile_task_retry_cancellation`` for
+      retry series.
     - ``reclaim_every_s`` controls that cadence independently of task claims.
     - ``recover_interrupted_handoffs`` owns bounded recovery of expired attached
       task workers. Elect one such scanner for each shared task store.
@@ -378,7 +476,11 @@ async def run_task_worker(
       progress. A continuation claimed at that bound fails the task instead of
       running the handler, unless the session has a pending action. ``None``
       disables the bound; repeated unproductive continuations still back off.
-    - ``stop`` is an ``asyncio.Event`` for graceful shutdown.
+    - ``stop`` is an ``asyncio.Event`` for graceful shutdown: no new claims, and
+      handlers already running finish. Cancelling this coroutine instead fences
+      each running task as a cancellation request and still waits for its handler;
+      if the process exits first, the task needs
+      ``reconcile_abandoned_task_cancellation``.
     - ``max_tasks`` bounds the loop (useful for tests and one-shot drains).
     """
     if lease_seconds <= 0:
@@ -2147,16 +2249,6 @@ async def _settle_ordinary_task_cancellation_after_quiescence(
     )
     if terminalization is None:  # pragma: no cover - guarded above
         raise AssertionError("Task cancellation request disappeared during reconciliation.")
-    execution_profile_fingerprint = current.metadata.get("execution_profile_fingerprint")
-    effect_fingerprint = current.metadata.get("effect_fingerprint")
-    for name, value in (
-        ("execution_profile_fingerprint", execution_profile_fingerprint),
-        ("effect_fingerprint", effect_fingerprint),
-    ):
-        if value is not None and type(value) is not str:
-            raise TaskTerminalizationConflict(
-                f"Task cancellation reconciliation has invalid {name} authority."
-            )
     evidence_identity = canonical_durable_json_bytes(
         {
             "schema": "cayu.task-worker-quiescence.v1",
@@ -2167,6 +2259,49 @@ async def _settle_ordinary_task_cancellation_after_quiescence(
         "task_worker_quiescence",
     )
     evidence_sha256 = sha256(evidence_identity).hexdigest()
+    request = _owner_lost_cancellation_request(
+        current,
+        worker_id,
+        cancellation_idempotency_key=terminalization.idempotency_key,
+        reconciliation_idempotency_key=f"task-worker-quiescence:v1:{evidence_sha256}",
+        reconciled_by=ResolutionActor(
+            subject="cayu:task-worker-quiescence",
+            source=ResolutionActorSource.SYSTEM,
+        ),
+        validator_id="cayu.task-worker",
+        validator_version="1",
+        evidence_id=f"task-worker-quiescence:{evidence_sha256}",
+        evidence_sha256=evidence_sha256,
+    )
+    await task_store.reconcile_task_cancellation(request)
+
+
+def _owner_lost_cancellation_request(
+    current: Task,
+    worker_id: str,
+    *,
+    cancellation_idempotency_key: str,
+    reconciliation_idempotency_key: str,
+    reconciled_by: ResolutionActor,
+    validator_id: str,
+    validator_version: str,
+    evidence_id: str,
+    evidence_sha256: str,
+) -> TaskCancellationReconciliationRequest:
+    """Build the exact owner-lost reconciliation for a cancellation-fenced ordinary task."""
+
+    if current.lease_expires_at is None:
+        raise TaskTerminalizationConflict("Task cancellation reconciliation lost its lease.")
+    execution_profile_fingerprint = current.metadata.get("execution_profile_fingerprint")
+    effect_fingerprint = current.metadata.get("effect_fingerprint")
+    for name, value in (
+        ("execution_profile_fingerprint", execution_profile_fingerprint),
+        ("effect_fingerprint", effect_fingerprint),
+    ):
+        if value is not None and type(value) is not str:
+            raise TaskTerminalizationConflict(
+                f"Task cancellation reconciliation has invalid {name} authority."
+            )
     cancellation_payload = current.status_payload
     if (
         type(cancellation_payload) is not dict
@@ -2189,23 +2324,20 @@ async def _settle_ordinary_task_cancellation_after_quiescence(
         cancellation_requested_at,
         current.lease_expires_at,
     )
-    request = TaskCancellationReconciliationRequest(
+    return TaskCancellationReconciliationRequest(
         task_id=current.id,
         original_worker_id=worker_id,
         original_lease_expires_at=current.lease_expires_at,
         cancellation_requested_at=cancellation_requested_at,
-        cancellation_idempotency_key=terminalization.idempotency_key,
-        reconciliation_idempotency_key=(f"task-worker-quiescence:v1:{evidence_sha256}"),
+        cancellation_idempotency_key=cancellation_idempotency_key,
+        reconciliation_idempotency_key=reconciliation_idempotency_key,
         reconciliation_requested_at=quiescence_validated_at,
-        reconciled_by=ResolutionActor(
-            subject="cayu:task-worker-quiescence",
-            source=ResolutionActorSource.SYSTEM,
-        ),
+        reconciled_by=reconciled_by,
         evidence=TaskCancellationReconciliationEvidence(
             outcome=TaskCancellationReconciliationOutcome.QUIESCENT,
-            validator_id="cayu.task-worker",
-            validator_version="1",
-            evidence_id=f"task-worker-quiescence:{evidence_sha256}",
+            validator_id=validator_id,
+            validator_version=validator_version,
+            evidence_id=evidence_id,
             evidence_sha256=evidence_sha256,
             validated_at=quiescence_validated_at,
             execution_profile_fingerprint=execution_profile_fingerprint,
@@ -2214,7 +2346,6 @@ async def _settle_ordinary_task_cancellation_after_quiescence(
         expected_execution_profile_fingerprint=execution_profile_fingerprint,
         expected_effect_fingerprint=effect_fingerprint,
     )
-    await task_store.reconcile_task_cancellation(request)
 
 
 async def _settle_retry_task_cancellation_after_quiescence(

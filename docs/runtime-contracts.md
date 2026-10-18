@@ -7600,7 +7600,12 @@ reclamation excludes a cancellation-requested task because lease expiry proves
 only owner loss, not handler quiescence or external-effect settlement.
 
 `reconcile_task_cancellation(...)` is the durable operator/application boundary
-for an ordinary cancellation whose owner was lost. It accepts a
+for an ordinary cancellation whose owner was lost.
+`reconcile_abandoned_task_cancellation(task_store, task_id, validator_id=...,
+validator_version=..., evidence_id=...)` builds the exact `quiescent` request from
+the fenced task, the same way the task worker settles its own quiescent drain, so
+an application that knows the worker process is gone attests only its validator
+and evidence identity. It accepts a
 `TaskCancellationReconciliationRequest` only for the exact ordinary task,
 original worker, final lease expiry, cancellation-request event timestamp,
 deterministic cancellation terminalization key, and expected

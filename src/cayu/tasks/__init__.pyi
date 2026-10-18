@@ -283,4 +283,7 @@ from cayu.tasks.work_receipts import (
 from cayu.tasks.worker import TaskHandlerOutcome as TaskHandlerOutcome
 from cayu.tasks.worker import complete_managed_task as complete_managed_task
 from cayu.tasks.worker import fail_managed_task as fail_managed_task
+from cayu.tasks.worker import (
+    reconcile_abandoned_task_cancellation as reconcile_abandoned_task_cancellation,
+)
 from cayu.tasks.worker import run_task_worker as run_task_worker
