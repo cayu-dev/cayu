@@ -28,6 +28,7 @@ from cayu.runtime._event_projection import (
     prepare_budget_settlement_event_template,
     prepare_new_runtime_event,
     project_persisted_runtime_event,
+    public_event_envelope_alias,
 )
 from cayu.runtime._phase_timing import RuntimeTimingRecorder, observe_timing_event, phase_scope
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
@@ -57,7 +58,18 @@ _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
 _MAX_AGGREGATED_FAILURES = 16
 _MAX_EXCEPTION_NOTES = 16
 _PERSISTED_SIDE_EFFECT_RECOVERY_CLAIM_TIMEOUT_SECONDS = 1.0
+_RECOVERY_TIMEOUT_MEMORY_TTL_SECONDS = 3600.0
+_RECOVERY_TIMEOUT_MEMORY_LIMIT = 4096
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _SideEffectRecoverySummary:
+    recovered: int = 0
+    pending: int = 0
+    skipped: int = 0
+    claim_timeouts: int = 0
+    needs_attention: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +135,8 @@ class RuntimeEventWriter:
         self._prepared_event_owner = object()
         self._continue_foreground_parent = continue_foreground_parent
         self._release_identity = release_identity
+        # At most one bounded batch of identities; no event payloads or errors.
+        self._recovery_claim_timeouts: dict[tuple[str, str], float] = {}
         self.timing = RuntimeTimingRecorder(
             config=runtime_timing,
             sinks=(
@@ -417,7 +431,14 @@ class RuntimeEventWriter:
             limit=limit,
         )
         recovered: list[Event] = []
+        summaries: dict[str, _SideEffectRecoverySummary] = {}
+        now = asyncio.get_running_loop().time()
+        for identity, timed_out_at in tuple(self._recovery_claim_timeouts.items()):
+            if now - timed_out_at >= _RECOVERY_TIMEOUT_MEMORY_TTL_SECONDS:
+                self._recovery_claim_timeouts.pop(identity, None)
         for candidate in candidates:
+            identity = (candidate.session_id, candidate.event_id)
+            summary = summaries.setdefault(candidate.session_id, _SideEffectRecoverySummary())
             try:
                 async with asyncio.timeout(_PERSISTED_SIDE_EFFECT_RECOVERY_CLAIM_TIMEOUT_SECONDS):
                     claim = await self._session_store.claim_persisted_event_side_effect(
@@ -425,18 +446,24 @@ class RuntimeEventWriter:
                         event_id=candidate.event_id,
                     )
             except TimeoutError:
-                logger.warning(
-                    "Persisted event side-effect recovery claim timed out: "
-                    "session_id=%s event_id=%s",
-                    candidate.session_id,
-                    candidate.event_id,
-                )
+                summary.pending += 1
+                summary.claim_timeouts += 1
+                summary.needs_attention |= identity in self._recovery_claim_timeouts
+                self._recovery_claim_timeouts.pop(identity, None)
+                self._recovery_claim_timeouts[identity] = asyncio.get_running_loop().time()
+                while len(self._recovery_claim_timeouts) > _RECOVERY_TIMEOUT_MEMORY_LIMIT:
+                    self._recovery_claim_timeouts.pop(next(iter(self._recovery_claim_timeouts)))
                 continue
             if claim is None:
+                # Another worker may have claimed or delivered this candidate.
+                summary.skipped += 1
                 continue
+            self._recovery_claim_timeouts.pop(identity, None)
             try:
                 _, delivered = await self._deliver_persisted_side_effect_claim(claim)
             except Exception as exc:
+                summary.pending += 1
+                summary.needs_attention = True
                 public = project_persisted_runtime_event(
                     claim.event,
                     sequence=claim.event_sequence,
@@ -453,6 +480,7 @@ class RuntimeEventWriter:
                 )
                 continue
             if delivered:
+                summary.recovered += 1
                 recovered.append(
                     project_persisted_runtime_event(
                         claim.event,
@@ -461,6 +489,29 @@ class RuntimeEventWriter:
                         public_authority_alias_codec=self._public_authority_alias_codec,
                     )
                 )
+            else:
+                summary.pending += 1
+                summary.needs_attention |= candidate.status is PersistedEventSideEffectStatus.FAILED
+        for session_id, summary in summaries.items():
+            public_session_id = session_id
+            if self._secret_redactor.redact_text(session_id) != session_id:
+                assert self._public_authority_alias_codec is not None
+                public_session_id = public_event_envelope_alias(
+                    session_id,
+                    field_name="session_id",
+                    codec=self._public_authority_alias_codec,
+                )
+            logger.log(
+                logging.WARNING if summary.needs_attention else logging.INFO,
+                "Persisted event side-effect recovery batch: "
+                "session_id=%s recovered=%d pending=%d skipped=%d claim_timeouts=%d%s",
+                public_session_id.encode("unicode_escape").decode("ascii"),
+                summary.recovered,
+                summary.pending,
+                summary.skipped,
+                summary.claim_timeouts,
+                "; inspect event-side-effect health" if summary.needs_attention else "",
+            )
         return recovered
 
     async def _deliver_persisted_side_effect_claim(

@@ -29,6 +29,29 @@ return HTTP 400; invalid parameter types return 422; unavailable stores return
 503 with `event_side_effect_store_unavailable`. Standalone routers have no owned
 recovery task and return a null `recovery_loop`.
 
+## Restart recovery messages
+
+Normal recovery logs one info-level `Persisted event side-effect recovery batch`
+summary per session in each bounded sweep, instead of a warning for every event
+whose claim times out. `recovered` counts acknowledged deliveries, `pending`
+counts candidates this sweep could not finish (including `claim_timeouts`), and
+`skipped` counts candidates another worker may have claimed or delivered. These
+are batch observations, not the session's total backlog. No message is emitted
+for an empty sweep.
+
+A claim timeout leaves the durable record available for a later recovery sweep;
+it does not mean the original model or tool operation must run again. A timeout
+for the same event again on this process, a recovery exception,
+or a previously failed delivery that still cannot finish raises the summary to
+warning level. Successful claims clear the process-local timeout observation;
+smaller or skipped sweeps do not. This diagnostic memory expires after one hour,
+retains the 4096 most recent timeout identities, and clears on process restart.
+Delivery and dead-letter errors keep their
+existing diagnostics. If warnings persist or the backlog does not drain, inspect
+`app.get_persisted_event_side_effect_health()` or the protected health route and
+follow the runbook below; durable ages and attempts remain authoritative across
+process restarts.
+
 ## Reading the snapshot
 
 All ages and lease classifications use the same timezone-aware UTC `observed_at`.

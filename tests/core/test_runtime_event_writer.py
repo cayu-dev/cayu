@@ -1734,3 +1734,157 @@ def test_recovery_limit_counts_claimable_events_not_live_leases() -> None:
 
     assert [event.type for event in recovered] == ["custom.pending"]
     assert [event.id for event in sink_events] == [recovered[0].id]
+
+
+def test_recovery_summarizes_each_session_and_warns_on_repeated_claim_timeouts(caplog) -> None:
+    class ContendedStore(InMemorySessionStore):
+        blocked = True
+
+        async def claim_persisted_event_side_effect(self, **kwargs):
+            if self.blocked:
+                raise TimeoutError("private claim error must not be logged")
+            return await super().claim_persisted_event_side_effect(**kwargs)
+
+    async def scenario() -> None:
+        store = ContendedStore()
+        for session_id in ("recovery-one", "recovery-two"):
+            await store.create(
+                RunRequest(session_id=session_id, agent_name="test", messages=[]),
+                identity=SessionIdentity(provider_name="fake", model="fake"),
+            )
+            await store.append_events(
+                session_id,
+                [Event(type="custom.recovery", session_id=session_id) for _ in range(3)],
+            )
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[]
+        )
+        assert await writer.recover_persisted_side_effects() == []
+        records = list(caplog.records)
+        assert len(records) == 2
+        assert all(r.levelno == logging.INFO for r in records)
+        assert all("recovered=0 pending=3 skipped=0 claim_timeouts=3" in r.message for r in records)
+        caplog.clear()
+        assert await writer.recover_persisted_side_effects() == []
+        assert len(caplog.records) == 2
+        assert all(r.levelno == logging.WARNING for r in caplog.records)
+        assert all("inspect event-side-effect health" in r.message for r in caplog.records)
+        assert "private claim error" not in caplog.text
+        caplog.clear()
+        store.blocked = False
+        assert len(await writer.recover_persisted_side_effects()) == 6
+        assert len(caplog.records) == 2
+        assert all(r.levelno == logging.INFO for r in caplog.records)
+        assert all("recovered=3 pending=0" in r.message for r in caplog.records)
+        caplog.clear()
+        assert await writer.recover_persisted_side_effects() == []
+        assert caplog.records == []
+
+    with caplog.at_level(logging.INFO, logger="cayu.runtime._event_writer"):
+        asyncio.run(scenario())
+
+
+def test_recovery_summary_does_not_expose_private_session_or_event_identity(caplog) -> None:
+    secret = "recovery-log-secret"
+
+    class ContendedStore(InMemorySessionStore):
+        async def claim_persisted_event_side_effect(self, **kwargs):
+            raise TimeoutError(secret)
+
+    async def scenario() -> None:
+        store = ContendedStore()
+        session_id = f"session-{secret}"
+        await store.create(
+            RunRequest(session_id=session_id, agent_name="test", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake"),
+        )
+        await store.append_event(
+            session_id, Event(id=f"event-{secret}", type="custom.recovery", session_id=session_id)
+        )
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        await writer.recover_persisted_side_effects()
+        await writer.recover_persisted_side_effects()
+
+    with caplog.at_level(logging.INFO, logger="cayu.runtime._event_writer"):
+        asyncio.run(scenario())
+    assert len(caplog.records) == 2
+    assert secret not in caplog.text
+    assert "pending=1" in caplog.text
+
+
+def test_recovery_summary_warns_when_a_failed_delivery_still_cannot_finish(monkeypatch, caplog):
+    monkeypatch.setattr(event_writer_module, "_PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS", 0)
+
+    async def scenario() -> None:
+        store = await _session_store("repeated-sink-failure")
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[_FailingSink()]
+        )
+        await writer.emit(Event(type="custom.failure", session_id="repeated-sink-failure"))
+        caplog.clear()
+        assert await writer.recover_persisted_side_effects() == []
+
+    with caplog.at_level(logging.INFO, logger="cayu.runtime._event_writer"):
+        asyncio.run(scenario())
+    summaries = [r for r in caplog.records if "recovery batch" in r.message]
+    assert len(summaries) == 1
+    assert summaries[0].levelno == logging.WARNING
+    assert "recovered=0 pending=1" in summaries[0].message
+
+
+def test_recovery_timeout_warning_survives_smaller_and_skipped_sweeps(caplog):
+    class ContendedStore(InMemorySessionStore):
+        async def claim_persisted_event_side_effect(self, *, session_id, event_id):
+            if event_id == "contended":
+                raise TimeoutError
+            return None
+
+    async def scenario():
+        store = ContendedStore()
+        await store.create(
+            RunRequest(session_id="partial-sweep", agent_name="test", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake"),
+        )
+        await store.append_events(
+            "partial-sweep",
+            [
+                Event(id=event_id, type="custom.pending", session_id="partial-sweep")
+                for event_id in ("claimed-elsewhere", "contended")
+            ],
+        )
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[]
+        )
+        await writer.recover_persisted_side_effects(limit=1000)
+        assert caplog.records[-1].levelno == logging.INFO
+        await writer.recover_persisted_side_effects(limit=1)
+        assert caplog.records[-1].levelno == logging.INFO
+        await writer.recover_persisted_side_effects(limit=1000)
+        assert caplog.records[-1].levelno == logging.WARNING
+        assert "claim_timeouts=1" in caplog.records[-1].message
+
+    with caplog.at_level(logging.INFO, logger="cayu.runtime._event_writer"):
+        asyncio.run(scenario())
+
+
+def test_recovery_summary_escapes_control_characters(caplog):
+    async def scenario():
+        session_id = "recovery\nWARNING:forged\r\t\x1b"
+        store = await _session_store(session_id)
+        await store.append_event(session_id, Event(type="custom.pending", session_id=session_id))
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[]
+        )
+        assert len(await writer.recover_persisted_side_effects()) == 1
+
+    with caplog.at_level(logging.INFO, logger="cayu.runtime._event_writer"):
+        asyncio.run(scenario())
+    assert len(caplog.records) == 1
+    message = caplog.records[0].message
+    assert not any(character in message for character in "\n\r\t\x1b")
+    assert r"recovery\nWARNING:forged\r\t\x1b" in message
