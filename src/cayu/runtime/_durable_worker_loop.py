@@ -495,6 +495,12 @@ class DurableWorkerPollerGroup:
             if self._preferred_token is None and token in self._tokens:
                 self._preferred_token = token
 
+    def _defer_step(self, token: int) -> None:
+        with self._lock:
+            self._busy_tokens.add(token)
+            if self._preferred_token == token:
+                self._preferred_token = self._successor_token(token)
+
     def _reset(
         self,
         token: int,
@@ -510,7 +516,7 @@ class DurableWorkerPollerGroup:
                 return
             policy = self._required_policy()
             self._next_empty_delay_s = policy.minimum_idle_delay_s
-            if prefer_token and self._active_token is None:
+            if prefer_token and self._active_token is None and token not in self._busy_tokens:
                 self._preferred_token = token
             self._next_poll_at = (
                 now
@@ -523,10 +529,12 @@ class DurableWorkerPollerGroup:
                 )
             )
 
-    def _deadline(self, token: int, *, now: float, forced: bool) -> float:
+    def _deadline(self, token: int, *, now: float, forced: bool, deferred: bool) -> float:
         _validate_worker_clock(now)
         with self._lock:
             policy = self._required_policy()
+            if deferred:
+                return now + policy.minimum_idle_delay_s
             if forced and self._active_token is None:
                 return now
             if self._active_token is not None or (
@@ -603,6 +611,7 @@ class DurableWorkerPoller:
         self._random_source = random_source
         self._forced = False
         self._closed = False
+        self._deferred = False
         self._last_attempted = False
         self._last_claimed = False
         self._pending_hint = False
@@ -632,9 +641,15 @@ class DurableWorkerPoller:
         return self._group._reserve_claim_query_index(query_count)
 
     def begin_step(self) -> None:
+        self._deferred = False
         self._group._begin_step(self._token)
         self._last_attempted = False
         self._last_claimed = False
+
+    def defer_step(self) -> None:
+        """Yield polling eligibility until this worker can accept another claim."""
+        self._deferred = True
+        self._group._defer_step(self._token)
 
     async def claim(
         self,
@@ -760,7 +775,9 @@ class DurableWorkerPoller:
 
     def next_wake_at(self) -> float:
         now = self._clock()
-        return self._group._deadline(self._token, now=now, forced=self._forced)
+        return self._group._deadline(
+            self._token, now=now, forced=self._forced, deferred=self._deferred
+        )
 
     def metrics_snapshot(self) -> DurableWorkerMetricsSnapshot:
         return self._group.metrics.snapshot()

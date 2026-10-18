@@ -128,11 +128,20 @@ async def handle(app, task, worker_id):
             outcome = TaskHandlerOutcome.SESSION_INTERRUPTED
     return outcome
 
-# Run N of these across processes; the task store's lease + FOR UPDATE SKIP LOCKED
-# claiming (Postgres) keeps workers from colliding.
+# Four independently heartbeated tasks in one process. More processes can
+# share the store; its atomic claims keep them from taking the same task.
 await run_task_worker(app, task_store, handle, worker_id="worker-1",
-                      query=TaskQuery(type="review_pr"))
+                      query=TaskQuery(type="review_pr"), concurrency=4)
 ```
+
+`concurrency` defaults to one. `max_tasks`, when set, is a total for the whole
+call, not a per-slot quota; recovered continuations and contracted-task parking
+also count. One handler failing does not cancel its peers. Each active handler
+retains its own lease, and one slot runs the shared recovery/reclaim scans.
+Setting `stop` stops new claims and lets all active handlers finish. Cancelling
+the worker applies the same cancellation-fence and quiescent-settlement rules to
+every slot as to one worker; ordinary handlers may continue draining. An
+infrastructure exception stops and drains all slots before propagating.
 
 The loop owns claim → heartbeat → handle → reclaim-expired-leases, and keeps
 going if one task's handler raises or returns without terminalizing its task (it

@@ -109,6 +109,7 @@ from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
+from cayu.tasks._group_maintenance import TaskGroupMaintenance
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks._terminalization import (
     _terminalize_claimed_task,
@@ -413,6 +414,29 @@ class _TaskRetryHandlerUnsettled(RuntimeError):
     """A handler remained live after its durable retry authority was lost."""
 
 
+@dataclass(slots=True)
+class _TaskWorkerBudget:
+    """Event-loop-local reservations keep concurrent claims within max_tasks."""
+
+    remaining: int
+    reserved: int = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining == 0 and self.reserved == 0
+
+    def reserve(self) -> bool:
+        if self.remaining == 0:
+            return False
+        self.remaining -= 1
+        self.reserved += 1
+        return True
+
+    def settle(self, handled: int) -> None:
+        self.remaining += 1 - handled
+        self.reserved -= 1
+
+
 async def run_task_worker(
     app: CayuApp,
     task_store: TaskStore,
@@ -438,6 +462,7 @@ async def run_task_worker(
     ),
     stop: asyncio.Event | None = None,
     max_tasks: int | None = None,
+    concurrency: int = 1,
 ) -> int:
     """Claim and handle durable tasks until stopped; return the number handled.
 
@@ -481,8 +506,16 @@ async def run_task_worker(
       each running task as a cancellation request and still waits for its handler;
       if the process exits first, the task needs
       ``reconcile_abandoned_task_cancellation``.
-    - ``max_tasks`` bounds the loop (useful for tests and one-shot drains).
+    - ``max_tasks`` bounds the total handled across all slots, including recovered
+      continuations and contracted-task parking (useful for one-shot drains).
+    - ``concurrency`` is the positive number of independently heartbeated handler
+      slots; it defaults to one. Handler failures are isolated. Setting ``stop``
+      stops new claims and drains active handlers; cancelling this coroutine
+      applies the existing cancellation/settlement rules to every active slot.
+      Infrastructure errors stop and drain the group before propagating.
     """
+    if type(concurrency) is not int or concurrency < 1:
+        raise ValueError("concurrency must be a positive int.")
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
     validate_worker_interval(poll_interval_s, "poll_interval_s")
@@ -514,8 +547,8 @@ async def run_task_worker(
         or max_unproductive_interrupted_handoffs < 1
     ):
         raise ValueError("max_unproductive_interrupted_handoffs must be a positive int or None.")
-    if max_tasks is not None and max_tasks < 0:
-        raise ValueError("max_tasks must be non-negative.")
+    if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 0):
+        raise ValueError("max_tasks must be non-negative (an int or None).")
     worker_id = require_clean_nonblank(worker_id, "worker_id")
     if app.redact_json(worker_id) != worker_id:
         raise ValueError(
@@ -577,295 +610,370 @@ async def run_task_worker(
             "cancellation-quiescent continuation claim."
         )
 
-    expired_handoff_after: tuple[datetime, str] | None = None
-    continuation_after: tuple[datetime, str] | None = None
-    continuation_scan_scanned = 0
-    continuation_scan_rejected = 0
-    continuation_scan_filtered = 0
-    next_interrupted_handoff_recovery_at = 0.0
-    next_interrupted_continuation_scan_at = 0.0
-    subscribe_to_poller = getattr(task_store, "_durable_worker_poller", None)
-    if callable(subscribe_to_poller):
-        poller = subscribe_to_poller((query,), demand_policy, clock=monotonic)
-    else:
-        poller = DurableWorkerPollerGroup().subscribe(demand_policy, clock=monotonic)
-    if metrics is not None:
-        poller.set_metrics(metrics)
-    reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
-    from cayu.tasks._group_maintenance import TaskGroupMaintenance
-
+    budget = _TaskWorkerBudget(max_tasks) if concurrency > 1 and max_tasks is not None else None
     group_maintenance = TaskGroupMaintenance.for_store(task_store)
+    infrastructure_stop = asyncio.Event()
+    slot_stop = infrastructure_stop if concurrency > 1 else stop
 
-    async def reclaim_expired_tasks() -> bool:
-        if materialized_work_contract_queue_supported:
-            reclaim_outcome = await capture_task_store_operation(
-                lambda: task_store.reclaim_expired(query=query),
-                operation_name="Expired task-claim reclamation",
-                redactor=app._secret_redactor,
-                mutation_store=task_store,
-                mutation_method_name="reclaim_expired",
-            )
-            if reclaim_outcome.failure is not None:
-                failure = reclaim_outcome.failure
-                del reclaim_outcome
-                raise_task_store_operation_failure(failure)
-            reclaimed = reclaim_outcome.result
-            del reclaim_outcome
-            return bool(reclaimed)
+    def slot_should_stop() -> bool:
+        return infrastructure_stop.is_set() or _worker_should_stop(app, stop)
+
+    async def run_slot(*, owns_maintenance: bool) -> int:
+        expired_handoff_after: tuple[datetime, str] | None = None
+        continuation_after: tuple[datetime, str] | None = None
+        continuation_scan_scanned = 0
+        continuation_scan_rejected = 0
+        continuation_scan_filtered = 0
+        next_interrupted_handoff_recovery_at = 0.0
+        next_interrupted_continuation_scan_at = 0.0
+        subscribe_to_poller = getattr(task_store, "_durable_worker_poller", None)
+        if callable(subscribe_to_poller):
+            poller = subscribe_to_poller((query,), demand_policy, clock=monotonic)
         else:
-            return bool(await task_store.reclaim_expired(query=query))
+            poller = DurableWorkerPollerGroup().subscribe(demand_policy, clock=monotonic)
+        if metrics is not None:
+            poller.set_metrics(metrics)
+        reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
 
-    async def run_step(_now: float, handled: int) -> DurableWorkerStep:
-        nonlocal expired_handoff_after
-        nonlocal continuation_after
-        nonlocal continuation_scan_scanned
-        nonlocal continuation_scan_rejected
-        nonlocal continuation_scan_filtered
-        nonlocal next_interrupted_handoff_recovery_at
-        nonlocal next_interrupted_continuation_scan_at
-
-        loop = asyncio.get_running_loop()
-        meaningful_activity = False
-        if (
-            recover_interrupted_handoffs
-            and interrupted_handoff_supported
-            and loop.time() >= next_interrupted_handoff_recovery_at
-        ):
-            poller.metrics.maintenance(recovery=True)
-            recovery_page = await _recover_expired_interrupted_task_handoffs(
-                app,
-                task_store,
-                after=expired_handoff_after,
-                limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
-                stop=stop,
-            )
-            if recovery_page.recovered:
-                meaningful_activity = True
-                next_interrupted_continuation_scan_at = 0.0
-            if recovery_page.exhausted:
-                expired_handoff_after = None
-                next_interrupted_handoff_recovery_at = (
-                    loop.time() + interrupted_handoff_recovery_every_s
-                )
-            else:
-                expired_handoff_after = recovery_page.next_after
-                next_interrupted_handoff_recovery_at = 0.0
-            if _worker_should_stop(app, stop):
-                return DurableWorkerStep(stop=True, activity=meaningful_activity)
-        continuation_activity = False
-        handled_this_step = 0
-        if (
-            recovered_interrupted_task_handler is not None
-            and loop.time() >= next_interrupted_continuation_scan_at
-        ):
-            continuation_page = await _run_recovered_interrupted_task_handler(
-                app,
-                task_store,
-                recovered_interrupted_task_handler,
-                worker_id=worker_id,
-                lease_seconds=lease_seconds,
-                query=query,
-                after=continuation_after,
-                max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
-                stop=stop,
-            )
-            continuation_scan_scanned += continuation_page.scanned_candidates
-            continuation_scan_rejected += continuation_page.rejected_candidates
-            continuation_scan_filtered += continuation_page.filtered_candidates
-            continuation_activity = continuation_page.task is not None
-            meaningful_activity = meaningful_activity or continuation_activity
-            if continuation_page.exhausted:
-                if continuation_scan_rejected:
-                    logger.warning(
-                        "Interrupted-task continuation scan rejected invalid authority: "
-                        "rejected_candidates=%d filtered_candidates=%d "
-                        "scanned_candidates=%d",
-                        continuation_scan_rejected,
-                        continuation_scan_filtered,
-                        continuation_scan_scanned,
-                    )
-                continuation_after = None
-                continuation_scan_scanned = 0
-                continuation_scan_rejected = 0
-                continuation_scan_filtered = 0
-                next_interrupted_continuation_scan_at = loop.time() + continuation_poll_interval_s
-            else:
-                continuation_after = continuation_page.next_after
-                next_interrupted_continuation_scan_at = 0.0
-            if continuation_activity:
-                handled_this_step += 1
-                if (
-                    max_tasks is not None and handled + handled_this_step >= max_tasks
-                ) or _worker_should_stop(app, stop):
-                    return DurableWorkerStep(
-                        handled=handled_this_step,
-                        stop=True,
-                        activity=True,
-                    )
-        if _worker_should_stop(app, stop):
-            return DurableWorkerStep(
-                handled=handled_this_step,
-                stop=True,
-                activity=meaningful_activity,
-            )
-        if reclaim:
-            reclaim_ran, reclaimed = await reclaim_cadence.run_if_due(
-                reclaim_expired_tasks,
-                now=loop.time(),
-                clock=loop.time,
-            )
-            if reclaim_ran:
-                poller.metrics.maintenance(reclaim=True)
-            meaningful_activity = meaningful_activity or bool(reclaimed)
-
-        async def prepare_claim() -> None:
-            # Maintenance is a database poll too. Only the admitted worker may
-            # scan; otherwise an idle cohort fans out before claim admission.
-            await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
-
-        async def claim_next_task() -> Task | None:
+        async def reclaim_expired_tasks() -> bool:
             if materialized_work_contract_queue_supported:
-                claim_outcome = await capture_task_store_operation(
-                    lambda: task_store.claim_task(
-                        worker_id,
-                        query,
-                        lease_seconds=lease_seconds,
-                    ),
-                    operation_name="Task claim",
+                reclaim_outcome = await capture_task_store_operation(
+                    lambda: task_store.reclaim_expired(query=query),
+                    operation_name="Expired task-claim reclamation",
                     redactor=app._secret_redactor,
                     mutation_store=task_store,
-                    mutation_method_name="claim_task",
+                    mutation_method_name="reclaim_expired",
                 )
-                if claim_outcome.failure is not None:
-                    failure = claim_outcome.failure
-                    del claim_outcome
+                if reclaim_outcome.failure is not None:
+                    failure = reclaim_outcome.failure
+                    del reclaim_outcome
                     raise_task_store_operation_failure(failure)
-                task = claim_outcome.result
-                del claim_outcome
-                return task
-            return await task_store.claim_task(
-                worker_id,
-                query,
-                lease_seconds=lease_seconds,
-            )
+                reclaimed = reclaim_outcome.result
+                del reclaim_outcome
+                return bool(reclaimed)
+            else:
+                return bool(await task_store.reclaim_expired(query=query))
 
-        claim = await poller.claim(
-            claim_next_task,
-            before_claim=prepare_claim,
-            maximum_active_s=lease_seconds,
-        )
-        task = claim.value
-        # The poller's wrapper aliases the task. Drop it before fallible task
-        # handling so detached failures cannot retain a second task reference.
-        del claim
-        if task is None:
-            if continuation_activity and continuation_after is not None:
+        async def run_step(_now: float, handled: int) -> DurableWorkerStep:
+            nonlocal expired_handoff_after
+            nonlocal continuation_after
+            nonlocal continuation_scan_scanned
+            nonlocal continuation_scan_rejected
+            nonlocal continuation_scan_filtered
+            nonlocal next_interrupted_handoff_recovery_at
+            nonlocal next_interrupted_continuation_scan_at
+
+            loop = asyncio.get_running_loop()
+            meaningful_activity = False
+            if (
+                owns_maintenance
+                and recover_interrupted_handoffs
+                and interrupted_handoff_supported
+                and loop.time() >= next_interrupted_handoff_recovery_at
+            ):
+                poller.metrics.maintenance(recovery=True)
+                recovery_page = await _recover_expired_interrupted_task_handoffs(
+                    app,
+                    task_store,
+                    after=expired_handoff_after,
+                    limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
+                    stop=slot_stop,
+                )
+                if recovery_page.recovered:
+                    meaningful_activity = True
+                    next_interrupted_continuation_scan_at = 0.0
+                if recovery_page.exhausted:
+                    expired_handoff_after = None
+                    next_interrupted_handoff_recovery_at = (
+                        loop.time() + interrupted_handoff_recovery_every_s
+                    )
+                else:
+                    expired_handoff_after = recovery_page.next_after
+                    next_interrupted_handoff_recovery_at = 0.0
+                if slot_should_stop():
+                    return DurableWorkerStep(stop=True, activity=meaningful_activity)
+            continuation_activity = False
+            handled_this_step = 0
+            if (
+                recovered_interrupted_task_handler is not None
+                and loop.time() >= next_interrupted_continuation_scan_at
+            ):
+                continuation_page = await _run_recovered_interrupted_task_handler(
+                    app,
+                    task_store,
+                    recovered_interrupted_task_handler,
+                    worker_id=worker_id,
+                    lease_seconds=lease_seconds,
+                    query=query,
+                    after=continuation_after,
+                    max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
+                    stop=slot_stop,
+                )
+                continuation_scan_scanned += continuation_page.scanned_candidates
+                continuation_scan_rejected += continuation_page.rejected_candidates
+                continuation_scan_filtered += continuation_page.filtered_candidates
+                continuation_activity = continuation_page.task is not None
+                meaningful_activity = meaningful_activity or continuation_activity
+                if continuation_page.exhausted:
+                    if continuation_scan_rejected:
+                        logger.warning(
+                            "Interrupted-task continuation scan rejected invalid authority: "
+                            "rejected_candidates=%d filtered_candidates=%d "
+                            "scanned_candidates=%d",
+                            continuation_scan_rejected,
+                            continuation_scan_filtered,
+                            continuation_scan_scanned,
+                        )
+                    continuation_after = None
+                    continuation_scan_scanned = 0
+                    continuation_scan_rejected = 0
+                    continuation_scan_filtered = 0
+                    next_interrupted_continuation_scan_at = (
+                        loop.time() + continuation_poll_interval_s
+                    )
+                else:
+                    continuation_after = continuation_page.next_after
+                    next_interrupted_continuation_scan_at = 0.0
+                if continuation_activity:
+                    handled_this_step += 1
+                    should_stop = (
+                        max_tasks is not None and handled + handled_this_step >= max_tasks
+                    ) or slot_should_stop()
+                    if should_stop or budget is not None:
+                        # A shared reservation authorizes only one handled task.
+                        return DurableWorkerStep(
+                            handled=handled_this_step,
+                            stop=should_stop,
+                            continue_immediately=not should_stop,
+                            activity=True,
+                        )
+            if slot_should_stop():
                 return DurableWorkerStep(
                     handled=handled_this_step,
+                    stop=True,
+                    activity=meaningful_activity,
+                )
+            if owns_maintenance and reclaim:
+                reclaim_ran, reclaimed = await reclaim_cadence.run_if_due(
+                    reclaim_expired_tasks,
+                    now=loop.time(),
+                    clock=loop.time,
+                )
+                if reclaim_ran:
+                    poller.metrics.maintenance(reclaim=True)
+                meaningful_activity = meaningful_activity or bool(reclaimed)
+
+            async def prepare_claim() -> None:
+                # Maintenance is a database poll too. Only the admitted worker may
+                # scan; otherwise an idle cohort fans out before claim admission.
+                await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
+
+            async def claim_next_task() -> Task | None:
+                if materialized_work_contract_queue_supported:
+                    claim_outcome = await capture_task_store_operation(
+                        lambda: task_store.claim_task(
+                            worker_id,
+                            query,
+                            lease_seconds=lease_seconds,
+                        ),
+                        operation_name="Task claim",
+                        redactor=app._secret_redactor,
+                        mutation_store=task_store,
+                        mutation_method_name="claim_task",
+                    )
+                    if claim_outcome.failure is not None:
+                        failure = claim_outcome.failure
+                        del claim_outcome
+                        raise_task_store_operation_failure(failure)
+                    task = claim_outcome.result
+                    del claim_outcome
+                    return task
+                return await task_store.claim_task(
+                    worker_id,
+                    query,
+                    lease_seconds=lease_seconds,
+                )
+
+            claim = await poller.claim(
+                claim_next_task,
+                before_claim=prepare_claim,
+                maximum_active_s=lease_seconds,
+            )
+            task = claim.value
+            # The poller's wrapper aliases the task. Drop it before fallible task
+            # handling so detached failures cannot retain a second task reference.
+            del claim
+            if task is None:
+                if continuation_activity and continuation_after is not None:
+                    return DurableWorkerStep(
+                        handled=handled_this_step,
+                        continue_immediately=True,
+                        activity=True,
+                    )
+                wake_deadlines: list[float] = []
+                # Only the cohort's admitted poller inspects durable deadlines. An
+                # idle handler denied a poll turn must not create another DB poll.
+                schedule_deadline = (
+                    await next_schedule_wake_at(task_store, (query,))
+                    if poller.last_attempted
+                    else None
+                )
+                if recovered_interrupted_task_handler is not None and continuation_after is None:
+                    wake_deadlines.append(next_interrupted_continuation_scan_at)
+                if (
+                    owns_maintenance
+                    and recover_interrupted_handoffs
+                    and interrupted_handoff_supported
+                    and expired_handoff_after is None
+                ):
+                    wake_deadlines.append(next_interrupted_handoff_recovery_at)
+                if owns_maintenance and reclaim and reclaim_cadence.next_run_at is not None:
+                    wake_deadlines.append(reclaim_cadence.next_run_at)
+                return DurableWorkerStep(
+                    handled=handled_this_step,
+                    idle=True,
+                    next_wake_at=min(wake_deadlines) if wake_deadlines else None,
+                    next_claim_at=schedule_deadline,
+                    activity=meaningful_activity,
+                )
+            record_task_admission_to_claim_latency(
+                poller.metrics,
+                admitted_at=task.created_at,
+                claimed_at=datetime.now(UTC),
+            )
+            task = copy_task(task)
+            if task.work_contract is not None:
+                task_id = task.id
+                contract = task.work_contract
+                lease_expires_at = task.lease_expires_at
+                if lease_expires_at is None:  # pragma: no cover - claim contract
+                    raise TaskClaimLost("Contracted task claim has no worker lease.")
+                parking_outcome = await capture_task_store_operation(
+                    lambda task_id=task_id, contract=contract, lease_expires_at=lease_expires_at: (
+                        task_store.hold_claimed_work_contract_task(
+                            task_id,
+                            worker_id=worker_id,
+                            lease_expires_at=lease_expires_at,
+                            contract=contract,
+                        )
+                    ),
+                    operation_name="Contracted task parking",
+                    redactor=app._secret_redactor,
+                    mutation_store=task_store,
+                    mutation_method_name="hold_claimed_work_contract_task",
+                )
+                if parking_outcome.failure is not None:
+                    failure = parking_outcome.failure
+                    del contract, lease_expires_at, parking_outcome, task, task_id
+                    raise_task_store_operation_failure(failure)
+                del contract, parking_outcome, task_id
+                return DurableWorkerStep(
+                    handled=handled_this_step + 1,
                     continue_immediately=True,
                     activity=True,
                 )
-            wake_deadlines: list[float] = []
-            # Only the cohort's admitted poller inspects durable deadlines. An
-            # idle handler denied a poll turn must not create another DB poll.
-            schedule_deadline = (
-                await next_schedule_wake_at(task_store, (query,)) if poller.last_attempted else None
-            )
-            if recovered_interrupted_task_handler is not None and continuation_after is None:
-                wake_deadlines.append(next_interrupted_continuation_scan_at)
-            if (
-                recover_interrupted_handoffs
-                and interrupted_handoff_supported
-                and expired_handoff_after is None
-            ):
-                wake_deadlines.append(next_interrupted_handoff_recovery_at)
-            if reclaim and reclaim_cadence.next_run_at is not None:
-                wake_deadlines.append(reclaim_cadence.next_run_at)
-            return DurableWorkerStep(
-                handled=handled_this_step,
-                idle=True,
-                next_wake_at=min(wake_deadlines) if wake_deadlines else None,
-                next_claim_at=schedule_deadline,
-                activity=meaningful_activity,
-            )
-        record_task_admission_to_claim_latency(
-            poller.metrics,
-            admitted_at=task.created_at,
-            claimed_at=datetime.now(UTC),
-        )
-        task = copy_task(task)
-        if task.work_contract is not None:
-            task_id = task.id
-            contract = task.work_contract
-            lease_expires_at = task.lease_expires_at
-            if lease_expires_at is None:  # pragma: no cover - claim contract
-                raise TaskClaimLost("Contracted task claim has no worker lease.")
-            parking_outcome = await capture_task_store_operation(
-                lambda task_id=task_id, contract=contract, lease_expires_at=lease_expires_at: (
-                    task_store.hold_claimed_work_contract_task(
-                        task_id,
-                        worker_id=worker_id,
-                        lease_expires_at=lease_expires_at,
-                        contract=contract,
-                    )
-                ),
-                operation_name="Contracted task parking",
-                redactor=app._secret_redactor,
-                mutation_store=task_store,
-                mutation_method_name="hold_claimed_work_contract_task",
-            )
-            if parking_outcome.failure is not None:
-                failure = parking_outcome.failure
-                del contract, lease_expires_at, parking_outcome, task, task_id
-                raise_task_store_operation_failure(failure)
-            del contract, parking_outcome, task_id
+            poller.metrics.handler_started()
+            try:
+                await _handle_with_heartbeat(
+                    app, task_store, task, handler, worker_id, lease_seconds
+                )
+            finally:
+                poller.metrics.handler_finished()
+            next_interrupted_continuation_scan_at = 0.0
             return DurableWorkerStep(
                 handled=handled_this_step + 1,
                 continue_immediately=True,
                 activity=True,
             )
-        poller.metrics.handler_started()
+
+        subscribe_to_admissions = getattr(task_store, "_task_admission_wakeup", None)
+        admission_wakeup = None
         try:
-            await _handle_with_heartbeat(app, task_store, task, handler, worker_id, lease_seconds)
+            admission_wakeup = (
+                None
+                if not callable(subscribe_to_admissions)
+                else await subscribe_to_admissions((query,))
+            )
+
+            async def counted_step(now: float, handled: int) -> DurableWorkerStep:
+                # Checked before any maintenance: a closing app's stores may already
+                # be closed. A step already running is waited for by shutdown.
+                if slot_should_stop():
+                    return DurableWorkerStep(stop=True)
+                if budget is not None and not budget.reserve():
+                    poller.defer_step()
+                    return DurableWorkerStep(stop=budget.exhausted, idle=not budget.exhausted)
+                completed = 0
+                try:
+                    result = await app._run_worker_step(lambda: run_step(now, handled))
+                    completed = result.handled
+                    return result
+                finally:
+                    if budget is not None:
+                        budget.settle(completed)
+
+            return await run_durable_worker_loop(
+                counted_step,
+                poll_interval_s=poll_interval_s,
+                stop=slot_stop,
+                max_handled=max_tasks if budget is None else None,
+                wait=(
+                    _wait_or_stop if admission_wakeup is None else admission_wakeup.wait_for_worker
+                ),
+                demand_policy=demand_policy,
+                poller=poller,
+                metrics=metrics if metrics is not None else poller.metrics,
+            )
         finally:
-            poller.metrics.handler_finished()
-        next_interrupted_continuation_scan_at = 0.0
-        return DurableWorkerStep(
-            handled=handled_this_step + 1,
-            continue_immediately=True,
-            activity=True,
-        )
+            if admission_wakeup is not None:
+                admission_wakeup.close()
+            poller.close()
 
-    subscribe_to_admissions = getattr(task_store, "_task_admission_wakeup", None)
-    admission_wakeup = None
+    if concurrency == 1:
+        return await run_slot(owns_maintenance=True)
+    failures: list[Exception] = []
+
+    async def drain_slot(*, owns_maintenance: bool) -> int:
+        try:
+            return await run_slot(owns_maintenance=owns_maintenance)
+        except asyncio.CancelledError:
+            infrastructure_stop.set()
+            raise
+        except Exception as exc:
+            infrastructure_stop.set()
+            failures.append(exc)
+            return 0
+
+    async def forward_stop() -> None:
+        assert stop is not None
+        await stop.wait()
+        infrastructure_stop.set()
+
     try:
-        admission_wakeup = (
-            None
-            if not callable(subscribe_to_admissions)
-            else await subscribe_to_admissions((query,))
-        )
-
-        async def counted_step(now: float, handled: int) -> DurableWorkerStep:
-            # Checked before any maintenance: a closing app's stores may already
-            # be closed. A step already running is waited for by shutdown.
-            if _worker_should_stop(app, stop):
-                return DurableWorkerStep(stop=True)
-            return await app._run_worker_step(lambda: run_step(now, handled))
-
-        return await run_durable_worker_loop(
-            counted_step,
-            poll_interval_s=poll_interval_s,
-            stop=stop,
-            max_handled=max_tasks,
-            wait=(_wait_or_stop if admission_wakeup is None else admission_wakeup.wait_for_worker),
-            demand_policy=demand_policy,
-            poller=poller,
-            metrics=metrics if metrics is not None else poller.metrics,
-        )
-    finally:
-        if admission_wakeup is not None:
-            admission_wakeup.close()
-        poller.close()
+        async with asyncio.TaskGroup() as group:
+            stop_watcher = group.create_task(forward_stop()) if stop is not None else None
+            slots = [
+                group.create_task(drain_slot(owns_maintenance=index == 0))
+                for index in range(
+                    min(concurrency, max_tasks) if max_tasks is not None else concurrency
+                )
+            ]
+            try:
+                await asyncio.wait(slots)
+            finally:
+                if stop_watcher is not None:
+                    stop_watcher.cancel()
+    except BaseException as failure:
+        for recorded in failures:
+            _attach_task_worker_secondary_failure(
+                failure, recorded, label="Task-worker slot failures during shutdown"
+            )
+        raise
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise ExceptionGroup("Task-worker slot failures", failures)
+    return sum(slot.result() for slot in slots)
 
 
 async def _handle_with_heartbeat(
