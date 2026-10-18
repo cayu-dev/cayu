@@ -249,7 +249,9 @@ Setting the worker's `stop` event continues to drain active handlers normally.
 
 An operator cancellation always wins over shutdown requeueing. Lost ownership
 also prevents a restart. Non-restartable tasks keep their existing cancellation
-behavior. Retry series, schedules, graph/group members, work contracts, and
+behavior, and so does a restartable task that the worker is running as the
+continuation of an interrupted session: shutdown cancels it rather than
+requeueing it. Retry series, schedules, graph/group members, work contracts, and
 pre-attached or child tasks do not accept this flag. A crash or SIGKILL cannot
 prove handler quiescence and does not automatically restart a started job.
 

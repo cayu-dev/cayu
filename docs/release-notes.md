@@ -9,6 +9,11 @@ exact worker claims for their session attachments.
 - Skip stale recovery observers when another recovery owner closes the active
   interaction during execution profile inspection.
 
+- Cancel a restartable task on worker shutdown when it is running as the
+  continuation of an interrupted session. Shutdown previously tried to requeue
+  it, was refused, and left it running under the stopped worker until its lease
+  expired.
+
 - Add opt-in restartable queue jobs. On worker shutdown, cancellation cleanup
   finishes under the renewed lease before the same task returns to pending.
   Operator cancellation and lost ownership never become automatic retries.

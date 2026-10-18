@@ -270,3 +270,59 @@ def test_a_refusal_from_another_closed_app_is_an_ordinary_failure() -> None:
         assert app.lifecycle_state == "open"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("restartable", [False, True])
+def test_shutdown_settles_a_restartable_continuation_like_any_continuation(
+    restartable: bool,
+) -> None:
+    from tests.core.test_task_worker import _seed_receipt_backed_continuation
+
+    from cayu.tasks.cancellation import _task_cancellation_requested
+    from cayu.tasks.queries import TaskQuery
+
+    async def scenario() -> None:
+        store = InMemoryTaskStore()
+        app = _app(store)
+        running = asyncio.Event()
+
+        async def fresh(*_args) -> None:
+            raise AssertionError("no fresh task is queued")
+
+        async def continuation(_app: CayuApp, task, _worker_id: str) -> None:
+            # Like a cooperative runtime handler, stop once cancellation is requested.
+            running.set()
+            while not _task_cancellation_requested(await store.load_task(task.id)):
+                await asyncio.sleep(0.01)
+
+        await _seed_receipt_backed_continuation(
+            app, store, task_id="t1", session_id="s1", restartable=restartable
+        )
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                fresh,
+                worker_id="w",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                recovered_interrupted_task_handler=continuation,
+                max_tasks=1,
+            )
+        )
+        await asyncio.wait_for(running.wait(), 10)
+        claimed = await store.load_task("t1")
+        assert claimed is not None and claimed.interrupted_handoff_id is not None
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(worker, 10)
+        task = await store.load_task("t1")
+        # A continuation cannot be requeued as a fresh attempt. Shutdown must
+        # still settle it instead of leaving it running under the stopped worker.
+        assert task is not None
+        assert task.status is TaskStatus.CANCELLED, (task.status, task.status_reason)
+        assert task.worker_id is None and task.restart_count == 0
+
+    asyncio.run(scenario())

@@ -1707,7 +1707,13 @@ async def _await_task_handler(
             raise AssertionError(
                 "Task retry cancellation handling returned unexpectedly."
             ) from None
-        if task.restartable and owner_task.cancelling() > cancellation_baseline:
+        # Only a fresh root attempt can be requeued. A continuation of an
+        # interrupted session keeps its handoff and settles like any other.
+        if (
+            task.restartable
+            and task.interrupted_handoff_id is None
+            and owner_task.cancelling() > cancellation_baseline
+        ):
             await _restart_task_handler_after_shutdown(
                 task_store,
                 task,

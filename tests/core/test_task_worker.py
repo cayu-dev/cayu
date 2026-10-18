@@ -145,8 +145,11 @@ async def _seed_interrupted_worker_handoff(
     *,
     task_id: str,
     session_id: str,
+    restartable: bool = False,
 ) -> None:
-    created = await task_store.create_task(TaskCreate(task_id=task_id, type="job"))
+    created = await task_store.create_task(
+        TaskCreate(task_id=task_id, type="job", restartable=restartable)
+    )
     await app.session_store.create(
         run_request_with_task_invocation(
             RunRequest(
@@ -175,12 +178,14 @@ async def _seed_receipt_backed_continuation(
     *,
     task_id: str,
     session_id: str,
+    restartable: bool = False,
 ) -> None:
     await _seed_interrupted_worker_handoff(
         app,
         task_store,
         task_id=task_id,
         session_id=session_id,
+        restartable=restartable,
     )
     worker_id = f"prior-{task_id}"
     claimed = await task_store.claim_task(worker_id, TaskQuery(type="job"))
