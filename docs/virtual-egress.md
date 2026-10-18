@@ -1682,6 +1682,57 @@ Qualification without external websites:
 CAYU_RUN_PUBLIC_WEB_ACCEPTANCE=1 uv run pytest tests/egress/test_public_web_docker.py
 ```
 
+### Credentialless open internet for isolated sandboxes
+
+Some workloads, such as a coding sandbox that installs packages from public
+registries and clones from GitHub, need the public internet rather than a host
+list, and hold nothing worth exfiltrating. Admit that explicitly with
+`OpenInternetEgressPolicy` and `open_internet_policy`:
+
+```python
+from cayu.egress import (
+    VIRTUAL_EGRESS_EVENT_TYPES,
+    OpenInternetEgressPolicy,
+    VirtualEgressEnvironmentFactory,
+)
+
+builder = VirtualEgressEnvironmentFactory(
+    policies={"internet-v1": OpenInternetEgressPolicy(name="internet-v1")},
+    open_internet_policy="internet-v1",
+    adapter=adapter,
+    event_emitter=app.scoped_event_emitter(event_types=VIRTUAL_EGRESS_EVENT_TYPES),
+)
+```
+
+`SandboxCodingEnvironmentFactory` takes the same two arguments and requires
+`event_emitter` with them.
+
+It shares the public-research admission rules above and differs only in what a
+request may do:
+
+- Any canonical FQDN over HTTPS port 443 is admitted, with every method. The
+  workload's headers and body are forwarded unchanged (no fixed replacement
+  headers), so `pip`, `npm`, `git` over HTTPS and API clients work.
+- No credential exists in the environment: it cannot be combined with
+  credentials, a secret resolver, approved destinations, public research or any
+  other policy, and no request enters credential resolution.
+- IP literals, other ports, plain HTTP and ambiguous authorities are refused.
+  Every resolved address must be public; private, loopback, link-local and
+  metadata answers (including DNS rebinding) fail before an upstream
+  connection, and the transport connects to the checked address with the
+  original TLS hostname. Routing/transport overrides and alternate upstreams
+  are refused. Redirects are not followed upstream.
+- Every request produces an ordinary `egress.request.authorized` or
+  `egress.request.denied` event with `authorization_kind="credentialless"`
+  and the policy name. Response-size, concurrency and time limits apply as
+  usual (256 MiB per response by default).
+
+The durable egress authority records `kind="open_internet"` with no concrete
+bindings. Reconnect, renewal, revocation and comparison behave as for public
+research: the policy name, generation and policy version are part of the
+fingerprint, reconnect requires that exact authority, and any change is
+`incomparable`.
+
 The fixture uses the real broker and pinned browser. Test-owned synthetic DNS answers
 exercise production IP validation before routing admitted public addresses to a local
 fixture server. No production route override is enabled.

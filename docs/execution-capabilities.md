@@ -11,7 +11,8 @@ that proves it.
 "Docker" below covers both the Docker coding environment
 (`DockerCodingEnvironmentFactory`) and Docker virtual egress
 (`DockerEgressAdapter`). "Lambda" means `LambdaMicroVMEgressAdapter` behind
-`VirtualEgressEnvironmentFactory`, or a `LambdaMicroVMRunner` composed directly,
+`VirtualEgressEnvironmentFactory` (or its coding preset,
+`SandboxCodingEnvironmentFactory`), or a `LambdaMicroVMRunner` composed directly,
 with the first-party sidecar image.
 
 ## Choose a sandbox and restrict network access

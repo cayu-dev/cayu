@@ -300,6 +300,126 @@ Notes:
   `workspace_factory=MicrosandboxWorkspace` produces a first-party workspace
   in the enforced microVM without exposing the raw `MicrosandboxRunner`.
 
+### Coding in a cloud sandbox
+
+`SandboxCodingEnvironmentFactory` (in `cayu.egress`) is the cloud counterpart of
+`DockerCodingEnvironmentFactory`: each session gets its own sandbox, a durable
+`source_workspace` (a `LocalWorkspace` outside the sandbox) is copied in before
+the first tool call, file, search, check and command tools run inside the
+sandbox, and changes are copied back according to `sync_back` (`on_success` by
+default). The sandbox filesystem is reconstructible execution state; the source
+stays canonical.
+
+- `.git`, `.cayu` and `.runtime` never cross in either direction. The sandbox
+  gets the working tree, not the host's repository, so it can't write git
+  config or hooks into the host checkout. Git commands inside the sandbox see
+  no repository unless the workload creates one.
+- The sandbox copy also excludes whatever the source workspace excludes (for
+  example `excluded_directory_names=("__pycache__",)`) and
+  `sandbox_excluded_directory_names`.
+- Copy-back is revision-aware: if a source file changes outside the sandbox
+  after copy-in, the session's finalization fails with a
+  `SyncBindingSourceConflictError` instead of overwriting that change.
+
+The provider is chosen only by the adapter, so callers don't change when a
+different cloud's sandbox is used. AWS Lambda MicroVM is the first
+implementation:
+
+```python
+from cayu.egress import (
+    ApprovedEgressDestination,
+    HttpEgressPolicy,
+    SandboxCodingEnvironmentFactory,
+    SandboxWorkspaceTransferLimits,
+)
+from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
+from cayu.egress.proxy_exposure import VpcTaskProxyExposure
+from cayu.workspaces import LocalWorkspace
+
+factory = SandboxCodingEnvironmentFactory(
+    adapter=LambdaMicroVMEgressAdapter(
+        region_name="us-east-1",
+        egress_network_connector_arn=egress_connector_arn,
+        exposure=VpcTaskProxyExposure(task_private_ip),
+        runner_options={"default_cwd": "/workspace/project"},
+    ),
+    image=microvm_image_arn,
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    policies={
+        "pypi": HttpEgressPolicy(
+            name="pypi",
+            allowed_hosts=["pypi.org"],
+            allowed_endpoints=[("GET", "/simple/")],
+        )
+    },
+    approved_destinations=[
+        ApprovedEgressDestination(destination="pypi.org", policy_name="pypi")
+    ],
+    transfer_limits=SandboxWorkspaceTransferLimits(max_total_bytes=256 * 1024 * 1024),
+)
+```
+
+The factory is a preset over `VirtualEgressEnvironmentFactory`, `SyncBinding`
+and `RunnerWorkspace`, and each stays usable on its own. Tools are admitted
+through the adapter's live executable evidence, so a tool whose executables are
+missing from the image is refused before the model sees it. Commands and checks
+run in the runner's default working directory, which is where the source is
+copied. One source workspace belongs to one active session at a time.
+
+#### Network access
+
+All sandbox traffic goes through the adapter's egress proxy, which terminates
+TLS and, with `event_emitter` wired, records an `egress.request.authorized` or
+`egress.request.denied` event for every request. Pick one explicit mode; there
+is no default and no network-free mode:
+
+- **Allowlist**, shown above: `approved_destinations` (credentialless) and
+  `credentials` (virtual credentials) name the hosts the work may reach, each
+  under its policy. Everything else is denied.
+- **Open internet**: name an `OpenInternetEgressPolicy` with
+  `open_internet_policy`. Any public HTTPS host is reachable, with every method
+  and the sandbox's own headers and body forwarded unchanged, so package
+  installs from public registries and `git clone`/`fetch` over HTTPS work
+  without listing hosts.
+- **Public research** (`public_web_policy`): bodyless GET/HEAD to any public
+  host with fixed headers; see
+  [Virtual egress](virtual-egress.md#credentialless-public-web-research).
+
+```python
+from cayu.egress import (
+    VIRTUAL_EGRESS_EVENT_TYPES,
+    OpenInternetEgressPolicy,
+    SandboxCodingEnvironmentFactory,
+)
+
+factory = SandboxCodingEnvironmentFactory(
+    adapter=adapter,  # the same LambdaMicroVMEgressAdapter as above
+    image=microvm_image_arn,
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    policies={"internet": OpenInternetEgressPolicy(name="internet")},
+    open_internet_policy="internet",
+    event_emitter=app.scoped_event_emitter(event_types=VIRTUAL_EGRESS_EVENT_TYPES),
+)
+```
+
+Open internet is for sandboxes that hold nothing worth stealing. The factory
+refuses it together with credentials, a secret resolver, approved destinations
+or any other policy, so the sandbox never receives a credential and the broker
+never resolves one. It also requires `event_emitter`, so every request is on
+the session's event stream. The proxy still refuses IP literals, ports other than 443,
+plain HTTP, and any hostname that resolves to a private, loopback, link-local or
+metadata address (each connection is pinned to the checked public address).
+Each response is buffered under the broker's response-size limit (256 MiB by
+default). Tools must use the proxy and CA the adapter sets (`HTTPS_PROXY`,
+`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`); git over SSH and
+other non-HTTPS protocols are not available. See
+[Virtual egress](virtual-egress.md#credentialless-open-internet-for-isolated-sandboxes).
+
+Not yet available on the cloud factory: Docker toolchain profiles
+(`DockerCodingToolchainProfile` is Docker-typed and refused elsewhere),
+immutable inputs, a guest git baseline (Docker's `git_baseline`), and a
+network-free sandbox.
+
 ### Per-child workspaces for subagents
 
 A `SubagentTool` child runs in its parent's environment by default. Set

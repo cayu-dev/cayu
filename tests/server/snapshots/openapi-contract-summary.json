@@ -6214,7 +6214,8 @@
             "http",
             "browser",
             "opaque",
-            "public_web"
+            "public_web",
+            "open_internet"
           ],
           "title": "Kind",
           "type": "string"

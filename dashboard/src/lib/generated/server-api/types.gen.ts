@@ -5003,7 +5003,7 @@ export type EgressAuthorityPolicyIdentity = {
     /**
      * Kind
      */
-    kind: 'http' | 'browser' | 'opaque' | 'public_web';
+    kind: 'http' | 'browser' | 'opaque' | 'public_web' | 'open_internet';
     /**
      * Name
      */

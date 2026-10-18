@@ -541,6 +541,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         credentials: Sequence[VirtualCredentialSpec] = (),
         approved_destinations: Sequence[ApprovedEgressDestination] = (),
         public_web_policy: str | None = None,
+        open_internet_policy: str | None = None,
         resolver: SecretResolver | None = None,
         image: str = DEFAULT_SANDBOX_IMAGE,
         setup_commands: Sequence[str] = (),
@@ -565,14 +566,31 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         egress_authority_scope: str = "session",
         egress_policy_version: str | None = None,
     ) -> None:
-        from cayu.egress.policy import PublicWebEgressPolicy
+        from cayu.egress.policy import OpenInternetEgressPolicy, PublicWebEgressPolicy
 
+        if public_web_policy is not None and open_internet_policy is not None:
+            raise ValueError("Pass either public_web_policy or open_internet_policy, not both.")
         self._public_web_policy = public_web_policy
+        self._open_internet_policy = open_internet_policy
+        # Public research and open internet egress both admit any public hostname
+        # through one credentialless policy and share its durable reconnect rules.
+        self._any_public_host_policy = public_web_policy or open_internet_policy
         if public_web_policy is not None:
             if type(policies.get(public_web_policy)) is not PublicWebEgressPolicy:
                 raise ValueError("public_web_policy must name a PublicWebEgressPolicy.")
+        elif any(type(policy) is PublicWebEgressPolicy for policy in policies.values()):
+            raise ValueError("PublicWebEgressPolicy requires explicit public_web_policy admission.")
+        if open_internet_policy is not None:
+            if type(policies.get(open_internet_policy)) is not OpenInternetEgressPolicy:
+                raise ValueError("open_internet_policy must name an OpenInternetEgressPolicy.")
+        elif any(type(policy) is OpenInternetEgressPolicy for policy in policies.values()):
+            raise ValueError(
+                "OpenInternetEgressPolicy requires explicit open_internet_policy admission."
+            )
+        if self._any_public_host_policy is not None:
+            mode = "Public research" if public_web_policy is not None else "Open internet egress"
             if credentials or resolver is not None or approved_destinations or len(policies) != 1:
-                raise ValueError("Public research requires a separate credentialless environment.")
+                raise ValueError(f"{mode} requires a separate credentialless environment.")
             if upstream is not None:
                 from cayu.egress.broker import HttpxUpstream
 
@@ -581,15 +599,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     or upstream._routes
                     or upstream._transport is not None
                 ):
-                    raise ValueError(
-                        "Public research cannot override upstream routing or transport."
-                    )
-        elif any(type(policy) is PublicWebEgressPolicy for policy in policies.values()):
-            raise ValueError("PublicWebEgressPolicy requires explicit public_web_policy admission.")
-        if not credentials and not approved_destinations and public_web_policy is None:
+                    raise ValueError(f"{mode} cannot override upstream routing or transport.")
+        if not credentials and not approved_destinations and self._any_public_host_policy is None:
             raise ValueError(
                 "VirtualEgressEnvironmentFactory requires at least one credential or "
-                "approved destination."
+                "approved destination, or a public_web_policy or open_internet_policy."
             )
         if credentials and resolver is None:
             raise ValueError("Virtual-egress credentials require a secret resolver.")
@@ -885,6 +899,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             policies=self._policies,
             approved_destinations=self._approved_destinations,
             public_web_policy=self._public_web_policy,
+            open_internet_policy=self._open_internet_policy,
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
@@ -896,7 +911,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         target_egress_destinations = _ordered_destinations(
             grants,
             self._approved_destinations,
-            self._public_web_policy,
+            self._any_public_host_policy,
         )
         target_redactor = SecretRedactor(tuple(grant.presented_value for grant in grants))
         if persisted.state is not EgressAuthorityTransitionState.AUTHORIZED:
@@ -932,7 +947,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     ) -> None:
         # Called only after sealing the adapter-verified active handoff. Retain
         # the exact result/allocation while advancing its reconnect authority.
-        if self._public_web_policy is not None:
+        if self._any_public_host_policy is not None:
             factory_result.reconnect_metadata["public_web_authority_fingerprint"] = (
                 self._egress_authority_identity.fingerprint
             )
@@ -996,7 +1011,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         broker = managed_runner._authority_revoker._broker
         revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
         destinations = _ordered_destinations(
-            grants, self._approved_destinations, self._public_web_policy
+            grants, self._approved_destinations, self._any_public_host_policy
         )
         await managed_runner._renew_egress_authority(
             authority=expected_authority,
@@ -1258,7 +1273,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
             expected_public_authority = (
                 self._egress_authority_identity.fingerprint
-                if self._public_web_policy is not None
+                if self._any_public_host_policy is not None
                 else None
             )
             if stored_public_authority != expected_public_authority:
@@ -1304,6 +1319,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             policies=self._policies,
             approved_destinations=self._approved_destinations,
             public_web_policy=self._public_web_policy,
+            open_internet_policy=self._open_internet_policy,
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
@@ -1363,7 +1379,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 egress_destinations=_ordered_destinations(
                     grants,
                     self._approved_destinations,
-                    self._public_web_policy,
+                    self._any_public_host_policy,
                 ),
                 session_id=request.session_id,
                 environment_name=request.environment_name,
@@ -1423,7 +1439,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 supported=adapter.supports_reconnect,
                 allocation_fingerprint=stable_environment_fingerprint,
             )
-            if self._public_web_policy is not None:
+            if self._any_public_host_policy is not None:
                 reconnect_metadata["public_web_authority_fingerprint"] = (
                     self._egress_authority_identity.fingerprint
                 )
@@ -5384,11 +5400,11 @@ def _duplicate_env_names(credentials: Sequence[VirtualCredentialSpec]) -> tuple[
 def _ordered_destinations(
     grants: Sequence[VirtualCredentialGrant],
     approved_destinations: Sequence[ApprovedEgressDestination],
-    public_web_policy: str | None = None,
+    any_public_host_policy: str | None = None,
 ) -> tuple[str, ...]:
     # This reserved name is only the adapter TLS/CONNECT probe. It is never
-    # resolved or contacted upstream and does not represent the research scope.
-    if public_web_policy is not None:
+    # resolved or contacted upstream and does not represent the public-host scope.
+    if any_public_host_policy is not None:
         return ("public-web-preflight.invalid",)
     return tuple(
         dict.fromkeys(

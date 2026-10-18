@@ -54,6 +54,7 @@ from cayu.egress.policy import (
     BrowserEgressPolicy,
     EgressPolicy,
     EgressRequest,
+    OpenInternetEgressPolicy,
     PublicWebEgressPolicy,
 )
 from cayu.vaults import (
@@ -1475,6 +1476,7 @@ class TransparentEgressBroker:
         policies: Mapping[str, EgressPolicy],
         approved_destinations: Sequence[ApprovedEgressDestination] = (),
         public_web_policy: str | None = None,
+        open_internet_policy: str | None = None,
         upstream: EgressUpstream | None = None,
         audit: Callable[[EgressDecision], None] | None = None,
         require_test_mode_credentials: bool = True,
@@ -1498,24 +1500,37 @@ class TransparentEgressBroker:
         self._resolver = resolver
         self._policies = dict(policies)
         self._approved_destinations = _approved_destination_map(approved_destinations)
+        if public_web_policy is not None and open_internet_policy is not None:
+            raise ValueError("Pass either public_web_policy or open_internet_policy, not both.")
         self._public_web_policy = public_web_policy
+        # Public research and open internet egress both admit any public hostname
+        # through one credentialless policy; only the policy's semantics differ.
+        self._any_public_host_policy = public_web_policy or open_internet_policy
         if public_web_policy is not None:
             if type(policies.get(public_web_policy)) is not PublicWebEgressPolicy:
                 raise ValueError("public_web_policy must name a PublicWebEgressPolicy.")
+        elif any(type(policy) is PublicWebEgressPolicy for policy in policies.values()):
+            raise ValueError("PublicWebEgressPolicy requires explicit public_web_policy admission.")
+        if open_internet_policy is not None:
+            if type(policies.get(open_internet_policy)) is not OpenInternetEgressPolicy:
+                raise ValueError("open_internet_policy must name an OpenInternetEgressPolicy.")
+        elif any(type(policy) is OpenInternetEgressPolicy for policy in policies.values()):
+            raise ValueError(
+                "OpenInternetEgressPolicy requires explicit open_internet_policy admission."
+            )
+        if self._any_public_host_policy is not None:
+            mode = "Public research" if public_web_policy is not None else "Open internet egress"
             if (
                 resolver is not None
                 or approved_destinations
                 or registry.active_grants()
                 or len(policies) != 1
             ):
-                raise ValueError("Public research requires a separate credentialless broker.")
+                raise ValueError(f"{mode} requires a separate credentialless broker.")
             if upstream is not None and type(upstream) is not HttpxUpstream:
-                raise ValueError("Public research requires the checked, pinned HttpxUpstream.")
+                raise ValueError(f"{mode} requires the checked, pinned HttpxUpstream.")
             if upstream is not None and (upstream._routes or upstream._transport is not None):
-                raise ValueError("Public research cannot override upstream routing or transport.")
-
-        elif any(type(policy) is PublicWebEgressPolicy for policy in policies.values()):
-            raise ValueError("PublicWebEgressPolicy requires explicit public_web_policy admission.")
+                raise ValueError(f"{mode} cannot override upstream routing or transport.")
         self._credentialless_authority_active = True
         self._credentialless_active_requests = 0
         self._credentialless_idle = asyncio.Event()
@@ -1587,7 +1602,7 @@ class TransparentEgressBroker:
     def has_credentialless_destinations(self) -> bool:
         """Whether the broker requires an isolated, independently authenticated transport."""
 
-        return bool(self._approved_destinations) or self._public_web_policy is not None
+        return bool(self._approved_destinations) or self._any_public_host_policy is not None
 
     async def authorize_connect_destination(self, *, host: str, port: int) -> bool:
         """Return positive coarse authority before the proxy mints a leaf certificate.
@@ -1663,7 +1678,7 @@ class TransparentEgressBroker:
             normalized_host = normalize_egress_hostname(host, field_name="CONNECT host")
         except (TypeError, ValueError):
             return None
-        if self._credentialless_authority_active and self._public_web_policy is not None:
+        if self._credentialless_authority_active and self._any_public_host_policy is not None:
             return (
                 normalized_host if PublicWebEgressPolicy.admits_hostname(normalized_host) else None
             )
@@ -1715,7 +1730,7 @@ class TransparentEgressBroker:
         if type(request) is not CapturedRequest:
             raise TypeError("request must be a CapturedRequest instance.")
         request = CapturedRequest(**request.model_dump(mode="python", warnings=False))
-        if self._public_web_policy is not None:
+        if self._any_public_host_policy is not None:
             # Never let a discovered host enter credential resolution, even if
             # a workload presents a virtual credential or an origin cookie.
             return await self._handle_credentialless(request)
@@ -1863,7 +1878,7 @@ class TransparentEgressBroker:
     ) -> ApprovedEgressDestination | None:
         if not self._credentialless_authority_active:
             return None
-        if self._public_web_policy is not None:
+        if self._any_public_host_policy is not None:
             if (
                 request.protocol != "https"
                 or request.port != 443
@@ -1872,7 +1887,7 @@ class TransparentEgressBroker:
                 return None
             return ApprovedEgressDestination(
                 destination=request.host,
-                policy_name=self._public_web_policy,
+                policy_name=self._any_public_host_policy,
             )
         return self._approved_destinations.get(
             (request.host, request.protocol, request.port),

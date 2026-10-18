@@ -394,3 +394,30 @@ class PublicWebEgressPolicy(EgressPolicy):
         if request.method not in {"GET", "HEAD"} or request.body:
             return _deny("Public research permits only bodyless GET/HEAD.", policy=self.name)
         return ProxyAuthorizationResult(allowed=True, metadata={"policy": self.name})
+
+
+class OpenInternetEgressPolicy(EgressPolicy):
+    """Application-owned, credentialless HTTPS access to any public host.
+
+    For isolated sandboxes that need package registries, source hosts and other
+    public services without a declared host list. Every method is admitted and
+    the caller's headers and body are forwarded unchanged, so installs, HTTPS git
+    fetches and API calls work. Nothing is minted or resolved: the environment
+    that admits this policy holds no credentials, approved destinations or other
+    policies. The broker still terminates every connection, refuses IP literals
+    and private, loopback, link-local and metadata addresses, and records an
+    egress decision for every request. This policy has fixed semantics; changing
+    its name changes durable authority.
+    """
+
+    def __init__(self, *, name: str) -> None:
+        self._name = require_clean_nonblank(name, "name")
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def authorize(self, request: EgressRequest) -> ProxyAuthorizationResult:
+        if not PublicWebEgressPolicy.admits_hostname(request.host):
+            return _deny("Open internet egress requires an unambiguous FQDN.", policy=self.name)
+        return ProxyAuthorizationResult(allowed=True, metadata={"policy": self.name})
