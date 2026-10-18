@@ -434,13 +434,16 @@ class ChatCompletionsProvider(ModelProvider):
     name = "openai_chat"
     usage_dialect = UsageDialect.OPENAI
 
+    def output_token_option_path(self) -> tuple[str, ...]:
+        return (self.name, "max_completion_tokens")
+
     def prepare_auxiliary_request(
         self, request: ModelRequest, *, max_output_tokens: int
     ) -> ModelRequest:
         return self._prepare_auxiliary_request(
             request,
             max_output_tokens=max_output_tokens,
-            output_option_path=(self.name, "max_completion_tokens"),
+            output_option_path=self.output_token_option_path(),
         )
 
     @property

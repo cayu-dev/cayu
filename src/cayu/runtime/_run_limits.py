@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._exception_groups import add_exception_note_safely, exception_cause
 from cayu._exception_state import exception_state, set_exception_state
+from cayu._fork_controller_errors import ForkControllerDenied
 from cayu._task_wait import (
     await_shielded_task_outcome,
     unexpected_child_cancellation_error,
@@ -128,6 +130,7 @@ from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.fork_overlays import resolve_fork_lineage, resolve_fork_lineage_async
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.store import SessionStore
 from cayu.tools.inference import InferenceLimits
@@ -1392,6 +1395,10 @@ class BudgetReservationIdentityGuard:
         await self._budget_ledger.claim_reservation_identity(**claim)
 
 
+_UNRESOLVED_FORK_LINEAGE = object()
+_FORK_LINEAGE_OWNER_CACHE_SIZE = 4096
+
+
 class RunLimitController:
     """Evaluate run limits and own durable budget-accounting lifecycle."""
 
@@ -1405,8 +1412,15 @@ class RunLimitController:
         clock: Callable[[], datetime],
         budget_binding_receiver: BudgetBindingReceiver | None = None,
         common_root_budget_binding_enabled: bool = False,
+        fork_caps: Callable[[str | None, str, str], tuple[_EffectiveBudgetLimit, ...]]
+        | None = None,
     ) -> None:
         self._session_store = session_store
+        # The gate and per-fork cap for a session's lineage owner, id and instance id.
+        self._fork_lineage_budget_limits = fork_caps
+        # Lineage owners of unmarked sessions, settled through their parents, by
+        # session id and instance id, so each incarnation walks its parents once.
+        self._fork_lineage_owners: OrderedDict[tuple[str, str], str | None] = OrderedDict()
         self._budget_store = budget_store
         self._budget_ledger = budget_ledger
         self._event_writer = event_writer
@@ -1419,6 +1433,85 @@ class RunLimitController:
         )
         self._global_settlement_recovery_lock = asyncio.Lock()
         self._global_settlement_recovery_after: BudgetSettlementCursor | None = None
+
+    async def fork_lineage_budget_limits(
+        self, session: Session
+    ) -> tuple[_EffectiveBudgetLimit, ...]:
+        """Host limits for a session in a fork controller's lineage; raises when it may not run.
+
+        They are app-owned like policy limits but session-scoped, so they are
+        evaluated with the policy limits before every model step and operation,
+        and kept out of execution-profile identity: the host can change a cap
+        without making existing forks fail profile checks. A session without a
+        lineage marker settles its owner through its parents; a malformed or
+        unsettled lineage fails closed.
+        """
+
+        if self._fork_lineage_budget_limits is None:
+            return ()
+        try:
+            owner = self._own_row_fork_lineage_owner(session)
+            if owner is _UNRESOLVED_FORK_LINEAGE:
+                key = (session.id, session.instance_id)
+                owner = self._fork_lineage_owners.get(key, _UNRESOLVED_FORK_LINEAGE)
+                if owner is _UNRESOLVED_FORK_LINEAGE:
+                    lineage = await resolve_fork_lineage_async(session, self._session_store.load)
+                    owner = lineage.owner()
+                    self._remember_fork_lineage_owner(key, owner)
+        except ValueError:
+            raise ForkControllerDenied(
+                "The session's fork lineage cannot be resolved; it cannot run."
+            ) from None
+        return self._fork_lineage_budget_limits(
+            cast("str | None", owner), session.id, session.instance_id
+        )
+
+    def known_fork_lineage_budget_limits(
+        self, session: Session
+    ) -> tuple[_EffectiveBudgetLimit, ...]:
+        """The limits ``fork_lineage_budget_limits`` admitted for this session, without I/O.
+
+        For synchronous configuration such as provider pricing selection. It
+        never refuses: the asynchronous check before each step does.
+        """
+
+        if self._fork_lineage_budget_limits is None:
+            return ()
+        try:
+            owner = self._own_row_fork_lineage_owner(session)
+            if owner is _UNRESOLVED_FORK_LINEAGE:
+                owner = self._fork_lineage_owners.get(
+                    (session.id, session.instance_id), _UNRESOLVED_FORK_LINEAGE
+                )
+            if owner is _UNRESOLVED_FORK_LINEAGE:
+                return ()
+            return self._fork_lineage_budget_limits(
+                cast("str | None", owner), session.id, session.instance_id
+            )
+        except (ValueError, ForkControllerDenied):
+            return ()
+
+    @staticmethod
+    def _own_row_fork_lineage_owner(session: Session) -> object:
+        """The owner a session's own row settles, or ``_UNRESOLVED_FORK_LINEAGE``.
+
+        A row with an overlay record, a lineage marker, or no parent at all is
+        never read from the cache, so a new session that reuses a deleted
+        session's id is judged by its own durable metadata.
+        """
+
+        lineage = resolve_fork_lineage(session, None)
+        if not lineage.settled:
+            return _UNRESOLVED_FORK_LINEAGE
+        return lineage.owner()
+
+    def _remember_fork_lineage_owner(self, key: tuple[str, str], owner: str | None) -> None:
+        # Keyed by the session incarnation: a session recreated under a deleted
+        # session's id has a new instance id and walks its own parents again.
+        self._fork_lineage_owners[key] = owner
+        self._fork_lineage_owners.move_to_end(key)
+        while len(self._fork_lineage_owners) > _FORK_LINEAGE_OWNER_CACHE_SIZE:
+            self._fork_lineage_owners.popitem(last=False)
 
     async def _verify_retained_budget_binding(self, binding: BudgetBinding) -> None:
         """Cleanup-only read through the original frozen runtime ledger.
@@ -2392,10 +2485,13 @@ class RunLimitController:
         execution_profile_fingerprint: str | None = None,
         usage_tracker: SessionUsageTracker | None = None,
     ) -> BudgetEvaluation:
-        limits = budget_limits_for_session(
-            policy=budget_policy,
-            agent_name=agent_name,
-            causal_budget_id=session.causal_budget_id,
+        limits = (
+            *budget_limits_for_session(
+                policy=budget_policy,
+                agent_name=agent_name,
+                causal_budget_id=session.causal_budget_id,
+            ),
+            *await self.fork_lineage_budget_limits(session),
         )
         if usage_tracker is not None:
             await usage_tracker.retain_cost_scopes(
@@ -2575,7 +2671,7 @@ class RunLimitController:
         ):
             raise ValueError("Budget binding conflicts with the model dispatch identity.")
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-        limits = self.provider_reservation_limits(
+        limits = await self.provider_reservation_limits(
             session=session,
             agent_name=agent_name,
             budget_policy=budget_policy,
@@ -2888,7 +2984,7 @@ class RunLimitController:
             )
         return BudgetReservationSetup(tuple(reservations), None, tuple(emitted_events), None)
 
-    def provider_reservation_limits(
+    async def provider_reservation_limits(
         self,
         *,
         session: Session,
@@ -2898,7 +2994,7 @@ class RunLimitController:
     ) -> tuple[_EffectiveBudgetLimit, ...]:
         return tuple(
             limit
-            for limit in self.provider_budget_limits(
+            for limit in await self.provider_budget_limits(
                 session=session,
                 agent_name=agent_name,
                 budget_policy=budget_policy,
@@ -2907,7 +3003,7 @@ class RunLimitController:
             if limit.reservation is not None
         )
 
-    def provider_budget_limits(
+    async def provider_budget_limits(
         self,
         *,
         session: Session,
@@ -2926,6 +3022,7 @@ class RunLimitController:
                 agent_name=agent_name,
                 causal_budget_id=session.causal_budget_id,
             ),
+            *await self.fork_lineage_budget_limits(session),
             *effective_request_limits,
         )
 

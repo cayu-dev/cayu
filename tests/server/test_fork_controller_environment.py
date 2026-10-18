@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 
 import pytest
 from fastapi import FastAPI
@@ -110,12 +111,57 @@ def test_variables_build_the_controller_with_safe_defaults() -> None:
             CAYU_FORK_CONTROLLER_MODE="observe",
             CAYU_FORK_CONTROLLER_HOST_TOOLS="post_journal",
             CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS="true",
+            CAYU_FORK_CONTROLLER_FORK_BUDGET_USD="2.50",
+            CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS="200000",
+            CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS="16000",
         )
     )
     assert explicit is not None
     assert explicit.controller.agents == (AGENT, "unenrolled")
     assert explicit.controller.host_tools == ("post_journal",)
     assert explicit.controller.allow_model_runs is True
+    cap = explicit.controller.fork_budget_limit
+    assert cap is not None and cap.max_estimated_cost == Decimal("2.50")
+    assert cap.reservation is not None
+    assert (cap.reservation.max_input_tokens, cap.reservation.max_output_tokens) == (
+        200_000,
+        16_000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        # Model runs never start without a cap.
+        ({"CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS": "true"}, "requires fork_budget_limit"),
+        (
+            {
+                "CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS": "true",
+                "CAYU_FORK_CONTROLLER_FORK_BUDGET_USD": "2",
+            },
+            "needs all of",
+        ),
+        (
+            {
+                "CAYU_FORK_CONTROLLER_FORK_BUDGET_USD": "2",
+                "CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS": "-1",
+                "CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS": "16",
+            },
+            "whole number of tokens",
+        ),
+        (
+            {
+                "CAYU_FORK_CONTROLLER_FORK_BUDGET_USD": "lots",
+                "CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS": "100",
+                "CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS": "16",
+            },
+            "per-fork cap is invalid",
+        ),
+    ],
+)
+def test_model_runs_from_the_environment_need_a_complete_cap(overrides, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        fork_controller_from_environment(_environment(**overrides))
 
 
 @pytest.mark.parametrize(
@@ -199,6 +245,7 @@ def test_mount_cayu_serves_the_environment_controller_with_its_own_bearer(enviro
             "host_tools": ["post_journal"],
             "served_tools": [],
             "allow_model_runs": False,
+            "fork_budget_limit": None,
         }
     assert client.get(path, headers=_bearer(OPERATOR)).status_code == 401
     assert client.get(path, headers=_bearer("x" * 48)).status_code == 401

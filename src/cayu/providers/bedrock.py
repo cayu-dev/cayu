@@ -360,13 +360,16 @@ class BedrockProvider(ModelProvider):
     billing_provider_name = "bedrock"
     usage_dialect = UsageDialect.ANTHROPIC
 
+    def output_token_option_path(self) -> tuple[str, ...]:
+        return ("bedrock", "inferenceConfig", "maxTokens")
+
     def prepare_auxiliary_request(
         self, request: ModelRequest, *, max_output_tokens: int
     ) -> ModelRequest:
         return self._prepare_auxiliary_request(
             request,
             max_output_tokens=max_output_tokens,
-            output_option_path=("bedrock", "inferenceConfig", "maxTokens"),
+            output_option_path=self.output_token_option_path(),
         )
 
     @property

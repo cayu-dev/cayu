@@ -112,6 +112,7 @@ from cayu._exception_groups import (
     iter_exception_tree,
 )
 from cayu._exception_state import pop_exception_state
+from cayu._fork_controller_errors import ForkControllerDenied
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
@@ -3712,6 +3713,9 @@ class SessionEngine:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
         await self._require_participant_execution(loaded_session, participant_context)
+        # Every continuation of a fork controller's lineage, whoever starts it,
+        # needs that controller's current permission to run models.
+        await self._run_limit_controller.fork_lineage_budget_limits(loaded_session)
         # Refuse a stale conditional resume before recovery or admission mutates.
         _require_expected_resume_run_epoch(loaded_session, request)
         if (
@@ -6378,6 +6382,12 @@ class SessionEngine:
             agent_name=registered_agent.spec.name,
             causal_budget_id=outcome_state.session.causal_budget_id,
         )
+        # Settle this session's fork lineage once, so each model step can apply
+        # its limits without reading parents again. A refusal is left to the
+        # first model step, which fails the session cleanly; raising here,
+        # before the run's protected block, would leave it running.
+        with contextlib.suppress(ForkControllerDenied):
+            await self._run_limit_controller.fork_lineage_budget_limits(outcome_state.session)
         hosted_search_budget_limits = (
             *budget_limits,
             *budget_limits_for_session(

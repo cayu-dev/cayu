@@ -530,7 +530,7 @@ class AuxiliaryInferenceOwner:
             raise ValueError("Auxiliary reservation conflicts with the active invocation.")
         request_limits = copy_inference_limits(request_limits)
         identity = copy_model_attempt_identity(identity)
-        budget_limits = self._run_limit_controller.provider_budget_limits(
+        budget_limits = await self._run_limit_controller.provider_budget_limits(
             session=session,
             agent_name=binding.agent_name,
             budget_policy=invocation.budget_policy,

@@ -33,6 +33,7 @@ from cayu._validation import (
 )
 from cayu.applications import CayuApp
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.budgets.base import BudgetLimit, BudgetReservation
 from cayu.events import EventType
 from cayu.fork_controllers import (
     FORK_CONTROLLER_READ_DEFAULT_BYTES,
@@ -652,6 +653,18 @@ FORK_CONTROLLER_TOKEN_SHA256_VARIABLE = "CAYU_FORK_CONTROLLER_TOKEN_SHA256"
 FORK_CONTROLLER_MODE_VARIABLE = "CAYU_FORK_CONTROLLER_MODE"
 FORK_CONTROLLER_HOST_TOOLS_VARIABLE = "CAYU_FORK_CONTROLLER_HOST_TOOLS"
 FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE = "CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS"
+FORK_CONTROLLER_FORK_BUDGET_USD_VARIABLE = "CAYU_FORK_CONTROLLER_FORK_BUDGET_USD"
+FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS_VARIABLE = (
+    "CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS"
+)
+FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS_VARIABLE = (
+    "CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS"
+)
+_FORK_BUDGET_VARIABLES = (
+    FORK_CONTROLLER_FORK_BUDGET_USD_VARIABLE,
+    FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS_VARIABLE,
+    FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS_VARIABLE,
+)
 #: The variables ``fork_controller_from_environment`` reads, all reserved for it.
 FORK_CONTROLLER_ENVIRONMENT_VARIABLES = (
     FORK_CONTROLLER_NAME_VARIABLE,
@@ -660,6 +673,7 @@ FORK_CONTROLLER_ENVIRONMENT_VARIABLES = (
     FORK_CONTROLLER_MODE_VARIABLE,
     FORK_CONTROLLER_HOST_TOOLS_VARIABLE,
     FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE,
+    *_FORK_BUDGET_VARIABLES,
 )
 #: A controller enrolled from the environment acts as ``fork-controller:<name>``.
 ENVIRONMENT_FORK_CONTROLLER_SUBJECT_PREFIX = "fork-controller:"
@@ -687,6 +701,32 @@ def _environment_names(raw: str, variable: str, *, allow_empty: bool) -> tuple[s
     return names
 
 
+def _environment_fork_budget_limit(configured: Mapping[str, str]) -> BudgetLimit | None:
+    """Build the per-fork cap from its three variables, or nothing when none is set."""
+
+    present = [name for name in _FORK_BUDGET_VARIABLES if name in configured]
+    if not present:
+        return None
+    if len(present) != len(_FORK_BUDGET_VARIABLES):
+        raise ValueError("The per-fork cap needs all of " + ", ".join(_FORK_BUDGET_VARIABLES) + ".")
+    tokens: list[int] = []
+    for variable in (
+        FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS_VARIABLE,
+        FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS_VARIABLE,
+    ):
+        raw = configured[variable].strip()
+        if not raw.isdigit():
+            raise ValueError(f"{variable} must be a whole number of tokens.")
+        tokens.append(int(raw))
+    try:
+        return BudgetLimit.usd(
+            configured[FORK_CONTROLLER_FORK_BUDGET_USD_VARIABLE].strip(),
+            reservation=BudgetReservation(max_input_tokens=tokens[0], max_output_tokens=tokens[1]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"The per-fork cap is invalid: {exc}") from None
+
+
 def fork_controller_from_environment(
     environ: Mapping[str, str] | None = None,
 ) -> EnvironmentForkController | None:
@@ -697,7 +737,10 @@ def fork_controller_from_environment(
     ``CAYU_FORK_CONTROLLER_TOKEN_SHA256`` (comma-separated lowercase hex
     SHA-256 digests of the bearer tokens) are required. ``_MODE`` (``observe``),
     ``_HOST_TOOLS`` (comma-separated, default none) and ``_ALLOW_MODEL_RUNS``
-    (``true`` or ``false``, default ``false``) are optional. The controller acts
+    (``true`` or ``false``, default ``false``) are optional. ``_ALLOW_MODEL_RUNS=true``
+    needs the per-fork cap: ``_FORK_BUDGET_USD`` and the reservation's
+    ``_FORK_RESERVATION_INPUT_TOKENS`` and ``_FORK_RESERVATION_OUTPUT_TOKENS``,
+    priced with Cayu's bundled price book. The controller acts
     as subject ``fork-controller:<name>``. Any malformed or partial
     configuration raises, and errors never include digests. ``environ``
     replaces ``os.environ``.
@@ -742,6 +785,7 @@ def fork_controller_from_environment(
             host_tools=host_tools,
             mode=ForkControllerMode(mode),
             allow_model_runs=allow_model_runs == "true",
+            fork_budget_limit=_environment_fork_budget_limit(configured),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"The CAYU_FORK_CONTROLLER_* enrollment is invalid: {exc}") from None
@@ -801,6 +845,9 @@ __all__ = [
     "FORK_CONTROLLER_AGENTS_VARIABLE",
     "FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE",
     "FORK_CONTROLLER_ENVIRONMENT_VARIABLES",
+    "FORK_CONTROLLER_FORK_BUDGET_USD_VARIABLE",
+    "FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS_VARIABLE",
+    "FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS_VARIABLE",
     "FORK_CONTROLLER_HOST_TOOLS_VARIABLE",
     "FORK_CONTROLLER_MODE_VARIABLE",
     "FORK_CONTROLLER_NAME_VARIABLE",

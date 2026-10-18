@@ -175,6 +175,7 @@ from cayu.providers.base import (
 from cayu.providers.deadlines import (
     ProviderStreamDeadlineAdmission,
 )
+from cayu.providers.hosted import HostedToolCapabilityError
 from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationMode,
@@ -198,6 +199,7 @@ from cayu.runtime._environment_exposure import (
     require_environment_exposed,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._fork_cap_requests import bound_fork_cap_request
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._live_model_attempt import (
     LiveModelAttempt,
@@ -1538,6 +1540,13 @@ class ModelStepExecutor:
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         if type(prior_provider_effect_observed) is not bool:
             raise TypeError("Prior model effect observation must be a boolean.")
+        # Every attempt, including recovery and failover attempts, stays inside a
+        # capped fork's reservation: output clamped, oversized input refused.
+        model_request = bound_fork_cap_request(
+            model_request,
+            provider,
+            await self._run_limit_controller.fork_lineage_budget_limits(session),
+        )
         provider_effect_observed = prior_provider_effect_observed
         if context_overflow is not None:
             if (
@@ -2668,12 +2677,24 @@ class ModelStepRun:
             raise ValueError(
                 "Targeted grant footprint conflicts with the resolved provider projection."
             )
+        fork_lineage_limits = self._executor._run_limit_controller.known_fork_lineage_budget_limits(
+            self._session
+        )
+        if fork_lineage_limits and self._registered_agent.hosted_tools:
+            # A fork controller's cap is a strict budget, and provider-hosted
+            # tools have no hard per-response ceiling. Refusing inside the model
+            # step fails the session cleanly before any provider request.
+            raise HostedToolCapabilityError(
+                "A fork controller's per-fork cap cannot admit provider-hosted tools, which "
+                "have no hard per-response ceiling. Use an agent without hosted tools."
+            )
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
                 agent_name=self._registered_agent.spec.name,
                 causal_budget_id=self._session.causal_budget_id,
             ),
+            *fork_lineage_limits,
             *self._request_budget_limits,
         )
         self._deferred_contextual_price = any(
@@ -3482,6 +3503,12 @@ class ModelStepRun:
         fallback: ModelFailoverTransition | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        # Bound the request before the step reserves against a fork's cap.
+        model_request = bound_fork_cap_request(
+            model_request,
+            self._request_provider,
+            await self._executor._run_limit_controller.fork_lineage_budget_limits(self._session),
+        )
         if (
             targeted_tool_grants is None
             and self._targeted_tool_grants is not None

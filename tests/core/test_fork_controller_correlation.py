@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
+from decimal import Decimal
 from typing import Any
 
 from tests.core.session_store_conformance.support import (
@@ -17,7 +18,11 @@ from tests.core.session_store_conformance.support import (
     session_store_case,
 )
 from tests.core.test_fork_controller_reads import _controller_server
-from tests.core.test_session_fork_overlays import _controller_toolset, _http
+from tests.core.test_session_fork_overlays import (
+    _controller_toolset,
+    _http,
+    durable_budget_ledger,
+)
 from tests.runtime.runtime_supervision_support import (
     WINDOW_END,
     WINDOW_START,
@@ -30,6 +35,8 @@ from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
+from cayu.budgets import BudgetLimit, BudgetReservation
+from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.evals import ScriptedModelProvider
 from cayu.events import EventType
@@ -145,8 +152,29 @@ class _Script:
         return [ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed(_usage())]
 
 
+# The fork runs a model step, so the host enrolls Compass with a per-fork cap
+# priced for the scripted provider.
+FORK_CAP = BudgetLimit.usd(
+    100,
+    pricing=PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="scripted",
+                model="fake-model",
+                match="exact",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        ),
+    ),
+    reservation=BudgetReservation(max_input_tokens=100_000, max_output_tokens=1000),
+)
+
+
 def _app(store) -> CayuApp:
-    app = CayuApp(session_store=store, enable_logging=False)
+    app = CayuApp(
+        session_store=store, enable_logging=False, budget_ledger=durable_budget_ledger(store)
+    )
     provider = ScriptedModelProvider(response_factory=_Script())
     app.register_provider(provider, default=True)
     app.register_agent(
@@ -165,6 +193,7 @@ def _app(store) -> CayuApp:
             agents=(AGENT,),
             mcp_toolsets=(toolset,),
             allow_model_runs=True,
+            fork_budget_limit=FORK_CAP,
         )
     )
     return app

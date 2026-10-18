@@ -10,9 +10,10 @@ text and ordinary fork requests never introduce controller tools or authority.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import aclosing
 from dataclasses import KW_ONLY, dataclass
+from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,12 @@ from cayu._fork_controller_reads import (
 )
 from cayu._validation import require_durable_clean_nonblank
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.budgets.base import (
+    BudgetLimit,
+    _copy_budget_limit,
+    _effective_budget_limits,
+    _EffectiveBudgetLimit,
+)
 from cayu.mcp.tools import McpToolset
 from cayu.sessions._fork_controller_bounds import fork_lineage_admits
 from cayu.sessions.event_queries import EventOrder, EventQuery
@@ -114,6 +121,8 @@ class ForkController:
     mode; only ``observe`` exists. ``allow_model_runs`` is False by default:
     the controller may create forks but not run them, so a fork with an
     ``initial_invocation`` and every resume are refused before any work starts.
+    Turning it on requires ``fork_budget_limit``, the host's spend cap for each
+    session in the controller's fork lineage; see ``fork_lineage_budget_limits``.
     """
 
     name: str
@@ -125,11 +134,22 @@ class ForkController:
     mcp_toolsets: tuple[McpToolset, ...] = ()
     mode: ForkControllerMode = ForkControllerMode.OBSERVE
     allow_model_runs: bool = False
+    fork_budget_limit: BudgetLimit | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", validate_fork_controller_name(self.name, "name"))
         if type(self.allow_model_runs) is not bool:
             raise TypeError("allow_model_runs must be a bool.")
+        if self.fork_budget_limit is not None:
+            object.__setattr__(
+                self, "fork_budget_limit", _validated_fork_budget_limit(self.fork_budget_limit)
+            )
+        if self.allow_model_runs and self.fork_budget_limit is None:
+            raise ValueError(
+                "allow_model_runs=True requires fork_budget_limit, the host's spend cap "
+                "for each fork, such as BudgetLimit.usd(5, reservation=BudgetReservation("
+                "max_input_tokens=200_000, max_output_tokens=16_000))."
+            )
         object.__setattr__(
             self,
             "subjects",
@@ -184,6 +204,45 @@ class ForkController:
         return tuple(sorted(tool.name for toolset in self.mcp_toolsets for tool in toolset.tools))
 
 
+def _validated_fork_budget_limit(value: object) -> BudgetLimit:
+    """Copy a per-fork cap, refusing anything that would not bound a fork's spend."""
+
+    if type(value) is not BudgetLimit:
+        raise TypeError("fork_budget_limit must be a BudgetLimit.")
+    limit = _copy_budget_limit(value)
+    if limit.scope != "session":
+        raise ValueError(
+            "fork_budget_limit must have scope='session'; it caps each fork session, "
+            "as BudgetLimit.usd(amount) does by default."
+        )
+    if limit.action != "interrupt":
+        raise ValueError("fork_budget_limit must use action='interrupt' to stop a fork.")
+    if limit.allow_unpriced:
+        raise ValueError(
+            "fork_budget_limit cannot allow unpriced models; their spend would not count."
+        )
+    if limit.window.kind != "all_time":
+        raise ValueError("fork_budget_limit must count a fork's whole life (an all_time window).")
+    if limit.reservation is None:
+        # Without a reservation, a dispatch that ends without usage evidence (a
+        # stream the caller abandons, a lost response) would cost nothing, so a
+        # controller could spend past the cap by abandoning its own requests.
+        raise ValueError(
+            "fork_budget_limit needs a reservation: the most tokens one model step may "
+            "use, charged until the step's real usage is known."
+        )
+    return limit
+
+
+class ForkBudgetLimitView(BaseModel):
+    """The per-fork cap as a controller sees it: the amount, never the price book."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_estimated_cost: Decimal
+    currency: str
+
+
 class ForkControllerEnrollment(BaseModel):
     """What one authenticated controller subject is allowed to do.
 
@@ -200,6 +259,7 @@ class ForkControllerEnrollment(BaseModel):
     host_tools: tuple[str, ...]
     served_tools: tuple[str, ...]
     allow_model_runs: bool
+    fork_budget_limit: ForkBudgetLimitView | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -266,6 +326,14 @@ class ForkControllerAccess:
             host_tools=controller.host_tools,
             served_tools=controller.served_tool_names,
             allow_model_runs=controller.allow_model_runs,
+            fork_budget_limit=(
+                None
+                if controller.fork_budget_limit is None
+                else ForkBudgetLimitView(
+                    max_estimated_cost=controller.fork_budget_limit.max_estimated_cost,
+                    currency=controller.fork_budget_limit.currency,
+                )
+            ),
         )
 
     async def fork(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
@@ -551,6 +619,64 @@ def require_fork_controller_model_runs(controller: ForkController) -> None:
         raise ForkControllerDenied("The host has not allowed this controller to run its forks.")
 
 
+FORK_CONTROLLER_BUDGET_NAMESPACE_PREFIX = "fork_controller:"
+
+
+def fork_controller_budget_limits(
+    controller: ForkController, session_id: str, instance_id: str
+) -> tuple[_EffectiveBudgetLimit, ...]:
+    """Return the controller's cap for one session, with that session's own ledger identity.
+
+    The budget ledger counts reservations by limit identity, so the identity
+    names the controller, the currency and the session incarnation (its id and
+    instance id): each fork's
+    reservations count only against its own cap, and a host's own limit with
+    the same definition never shares a ledger entry or budget events with it.
+    The identity does not depend on the amount, price book or reservation, so
+    a host that changes the cap keeps charging the fork's earlier reservations,
+    and a new session that reuses a deleted session's id starts a fresh entry.
+    """
+
+    limit = controller.fork_budget_limit
+    if limit is None:
+        return ()
+    session_id = require_durable_clean_nonblank(session_id, "session_id")
+    instance_id = require_durable_clean_nonblank(instance_id, "instance_id")
+    return _effective_budget_limits(
+        (limit,),
+        identity_namespace=(
+            f"{FORK_CONTROLLER_BUDGET_NAMESPACE_PREFIX}{controller.name}"
+            f":currency:{limit.currency}:session:{session_id}:instance:{instance_id}"
+        ),
+    )
+
+
+def fork_lineage_budget_limits(
+    owner: str | None,
+    session_id: str,
+    instance_id: str,
+    controllers: Mapping[str, ForkController],
+) -> tuple[_EffectiveBudgetLimit, ...]:
+    """Budget limits the host adds to every model step of a session with this lineage owner.
+
+    ``owner`` is the controller that owns the session's fork lineage (its fork,
+    or anything created under the fork), or ``None`` outside any controller's
+    lineage, which gets no limits. A controller's lineage runs only while that
+    controller is enrolled with ``allow_model_runs``, and then under its
+    per-fork cap. The runtime applies this before each model step, whatever
+    started the run, so a host resume, a dispatch, a recovery or a subagent
+    under the fork is gated and capped exactly like the controller's own resume.
+    """
+
+    if owner is None:
+        return ()
+    controller = controllers.get(owner)
+    if controller is None:
+        raise ForkControllerDenied("The host has not allowed this controller to run its forks.")
+    require_fork_controller_model_runs(controller)
+    return fork_controller_budget_limits(controller, session_id, instance_id)
+
+
 def require_fork_controller_hosted_tools(
     controller: ForkController,
     registered_agent: RegisteredAgentState,
@@ -625,6 +751,7 @@ __all__ = [
     "FORK_CONTROLLER_EVENT_QUERY_FIELDS",
     "FORK_CONTROLLER_READ_DEFAULT_BYTES",
     "FORK_CONTROLLER_READ_MAX_BYTES",
+    "ForkBudgetLimitView",
     "ForkController",
     "ForkControllerAccess",
     "ForkControllerDenied",

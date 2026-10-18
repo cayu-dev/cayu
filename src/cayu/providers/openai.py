@@ -1202,13 +1202,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
 
+    def output_token_option_path(self) -> tuple[str, ...]:
+        return ("openai", "max_output_tokens")
+
     def prepare_auxiliary_request(
         self, request: ModelRequest, *, max_output_tokens: int
     ) -> ModelRequest:
         return self._prepare_auxiliary_request(
             request,
             max_output_tokens=max_output_tokens,
-            output_option_path=("openai", "max_output_tokens"),
+            output_option_path=self.output_token_option_path(),
         )
 
     @property

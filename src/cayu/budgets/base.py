@@ -3234,13 +3234,36 @@ def copy_request_budget_limits(
             f"budget_limits cannot contain more than {MAX_REQUEST_BUDGET_LIMITS} limits."
         )
     for limit in copied:
-        if limit.reservation is not None and limit.scope in ("session", "run"):
+        if (
+            limit.reservation is not None
+            and limit.scope in ("session", "run")
+            and not _is_fork_controller_session_cap(limit)
+        ):
             raise ValueError(
                 "Request budget limits must not use reservations for "
                 f"{limit.scope!r} scope; reservations require a shared "
                 "budget scope (app, agent, or causal)."
             )
     return copied
+
+
+def _is_fork_controller_session_cap(limit: BudgetLimit) -> bool:
+    """Whether a limit is a host's per-fork cap, the one session limit that reserves.
+
+    Only the runtime builds it, with an identity namespaced to one controller and
+    one session, so its ledger entry counts that session's reservations alone.
+    Callers' request limits are plain ``BudgetLimit`` values and never match.
+    """
+
+    return (
+        type(limit) is _EffectiveBudgetLimit
+        and limit.scope == "session"
+        and _is_fork_controller_session_cap_namespace(limit.identity_namespace)
+    )
+
+
+def _is_fork_controller_session_cap_namespace(namespace: str) -> bool:
+    return namespace.startswith("fork_controller:") and ":session:" in namespace
 
 
 def budget_limits_for_session(
@@ -3689,6 +3712,11 @@ def _budget_limit_id_from_material(
     definition_occurrences: int,
     occurrence: int,
 ) -> str:
+    if _is_fork_controller_session_cap_namespace(namespace):
+        # A host's per-fork cap keeps one ledger identity for its session while
+        # the host changes the amount, price book or reservation, so charges
+        # for unfinished requests still count against the new cap.
+        definition_digest = "fork-controller-cap"
     identity_material = canonical_durable_json_bytes(
         {
             "namespace": namespace,

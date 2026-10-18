@@ -17,11 +17,15 @@ Every part of an overlay is optional, and the parts are independent:
 Budget, stop conditions and the expected result shape are not new overlay
 fields. Use the fork's `initial_invocation` or a later `ResumeRequest`:
 `budget_limits`, `max_steps`, `limits` and `structured_output`. They are part
-of the fork request identity when sent as `initial_invocation`.
+of the fork request identity when sent as `initial_invocation`. These are the
+controller's own limits; the host's per-fork cap (see
+[Running forks](#running-forks)) applies on top of them and the controller
+cannot change it.
 
 ## Enrolling a controller
 
 ```python
+from cayu.budgets import BudgetLimit, BudgetReservation
 from cayu.fork_controllers import ForkController
 from cayu.mcp import connect_mcp_toolset
 
@@ -40,6 +44,9 @@ app.enroll_fork_controller(
         host_tools=("lookup_ledger",),
         mcp_toolsets=(compass_tools,),
         allow_model_runs=True,
+        fork_budget_limit=BudgetLimit.usd(
+            2, reservation=BudgetReservation(max_input_tokens=200_000, max_output_tokens=16_000)
+        ),
     )
 )
 ```
@@ -61,7 +68,8 @@ Everything after `agents` is keyword-only.
   so its tools run on the controller's side, and may not use `secret_env` or
   `secret_headers`, so no host secret is resolved for it.
 - `allow_model_runs` is False by default: the controller can create forks,
-  but not run them. See [Running forks](#running-forks).
+  but not run them. Turning it on requires `fork_budget_limit`, the host's
+  spend cap for each fork. See [Running forks](#running-forks).
 
 When a controller serves tools, enrollment registers one extra body per agent,
 named `<agent>@fork-controller:<controller>`. It is the host agent's exact
@@ -86,7 +94,10 @@ controller's own bearer token, never the operator login.
 | `CAYU_FORK_CONTROLLER_TOKEN_SHA256` | Required. Comma-separated lowercase hex SHA-256 digests of its bearer tokens. Give two during rotation. |
 | `CAYU_FORK_CONTROLLER_MODE` | Optional. Only `observe`. |
 | `CAYU_FORK_CONTROLLER_HOST_TOOLS` | Optional. Comma-separated host-tool allowance; the default is none. |
-| `CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS` | Optional. `true` or `false`; the default is `false`. |
+| `CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS` | Optional. `true` or `false`; the default is `false`. `true` needs the three cap variables below. |
+| `CAYU_FORK_CONTROLLER_FORK_BUDGET_USD` | The per-fork cap in US dollars, priced with Cayu's bundled price book. See [Running forks](#running-forks). |
+| `CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS` | The cap's reservation: the most input tokens one model step may use. |
+| `CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS` | The cap's reservation: the most output tokens one model step may use. |
 
 ```bash
 token=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
@@ -105,7 +116,9 @@ curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/fork-controller
   characters.
 - Malformed configuration stops the server from starting: a missing required
   variable, any of these variables set without a name, an empty list entry, a
-  repeated or malformed digest, an unknown mode or `ALLOW_MODEL_RUNS` value, an
+  repeated or malformed digest, an unknown mode or `ALLOW_MODEL_RUNS` value,
+  `ALLOW_MODEL_RUNS=true` without all three cap variables, a malformed cap, a
+  durable session store without a durable budget ledger when model runs are on, an
   unregistered agent, an unknown host tool, or a name or subject already
   enrolled differently in code. Errors never include digests.
 - Mounting the same app twice reuses the one enrollment.
@@ -160,7 +173,9 @@ invocation then runs through the host's ordinary durable dispatch.
 `controller.enrollment()` returns a frozen `ForkControllerEnrollment`: the
 controller name, the authenticated subject, `mode`, the enrolled `agents`,
 `host_tools`, `served_tools` (the names of the tools the controller
-serves) and `allow_model_runs`. It describes only the caller's own enrollment. Other controllers,
+serves), `allow_model_runs` and `fork_budget_limit` (the cap's
+`max_estimated_cost` and `currency`, without the price book, or `None`). It
+describes only the caller's own enrollment. Other controllers,
 other subjects of the same controller and agents outside the enrollment never
 appear.
 
@@ -180,9 +195,65 @@ profile, or a source that changed after its exact snapshot returns 409.
 ### Running forks
 
 A fork runs the host's model, and possibly the controller's tools, at the
-host's expense. Until a per-fork spend cap exists, running a controller's
-forks is the host's explicit choice: `ForkController(allow_model_runs=True)`.
-With the default, `False`:
+host's expense. Running a controller's forks is the host's explicit choice,
+and it always comes with a hard spend cap:
+
+```python
+ForkController(
+    name="compass",
+    subjects=("svc:compass",),
+    agents=("finance-monthend",),
+    allow_model_runs=True,
+    # At most 2 USD per fork; each model step holds up to this many tokens'
+    # cost until its real usage is known.
+    fork_budget_limit=BudgetLimit.usd(
+        2, reservation=BudgetReservation(max_input_tokens=200_000, max_output_tokens=16_000)
+    ),
+)
+```
+
+`allow_model_runs=True` without `fork_budget_limit` fails at construction, so
+model runs are never unbounded. The cap is an ordinary session-scoped
+`BudgetLimit`, so it can use the bundled price book or the host's own
+(`pricing=my_prices`). It must keep the defaults that make it a hard cap:
+`scope="session"`, `action="interrupt"`, an all-time window and
+`allow_unpriced=False`. A model the price book does not price, or a completion
+without usage, stops the fork instead of running uncounted.
+
+It also needs a `reservation`: the most tokens one model step may use. Before
+each model step, compaction or auxiliary call, the budget ledger reserves that
+step's worst-case cost against the fork's cap and refuses the step when the
+reservation would not fit. The reservation is settled to the real cost when
+usage arrives. A step that ends without usage, such as a stream the controller
+abandons, stays charged at its reservation, so dropping requests cannot spend
+past the cap. Choose a reservation the cap holds a few times over: one larger
+than the cap stops every fork before its first step.
+
+The runtime also holds every request of a capped fork inside the reservation,
+so no single step can cost more than it reserved:
+
+- Output is capped at the reservation's `max_output_tokens` through the
+  provider adapter's own output-token option
+  (`ModelProvider.output_token_option_path()`); a lower cap the request already
+  sets is kept. The bundled adapters declare it. A provider that declares none
+  cannot run a capped fork: the step fails before any request.
+- Input is bounded by the request's serialized size in bytes, which is at least
+  its token count for text. A request larger than the reservation's
+  `max_input_tokens` fails before dispatch, as does one with files or other
+  non-text input that bytes cannot bound. Reserve input for the fork's whole
+  context, measured in bytes.
+- A provider-backed compactor's requests are checked the same way but are not
+  rewritten, so a capped fork's compactor must set its own output cap within
+  the reservation, for example `ModelCompactor(options={"anthropic":
+  {"max_tokens": 4000}})`. An auxiliary call must
+also fit in it (`InferenceLimits.max_input_tokens` and `max_output_tokens` at
+most the reservation's). Reservations must outlive a restart as long as the
+sessions do, so with a durable session store, enrolling a controller with
+`allow_model_runs=True` fails unless the app has a durable `budget_ledger`
+(`SQLiteBudgetLedger` or `PostgresBudgetLedger`). An in-memory session store
+can keep the default in-memory ledger.
+
+With the default, `allow_model_runs=False`:
 
 - `controller.fork(...)` with an `initial_invocation` is refused with
   `ForkControllerDenied` (403 over HTTP);
@@ -190,10 +261,51 @@ With the default, `False`:
 
 The refusal comes before any child is created or dispatched, so no model,
 hosted tool or controller-served MCP tool is called. A fork without an
-`initial_invocation` is still created. The setting is read from the current
-enrollment on every request, so a host that restarts with
-`allow_model_runs=False` stops its controller from resuming forks created
-earlier.
+`initial_invocation` is still created.
+
+#### How the cap and the gate are enforced
+
+The host enforces both through Cayu's budget machinery, for every session in
+the controller's [fork lineage](#fork-lineage): the controller's forks and
+every session created under them, such as a subagent. It does not matter what
+starts the run:
+
+- the controller's own `fork(initial_invocation=...)` and `resume(...)`;
+- the host's `app.resume(...)`, `app.dispatch(...)` and `app.dispatch_inline(...)`;
+- a new run the host starts under a fork, a subagent, or a recovery.
+
+Before each model step, compaction or auxiliary model call, the runtime looks
+up the controller the session's lineage names in the current enrollment. If
+that controller is not enrolled, or does not allow model runs, the step is
+refused with `ForkControllerDenied`: resumes and dispatches are refused before
+any work, and a new run under the fork fails before its first model request.
+Otherwise the cap is evaluated with the app's other budget limits, against
+the session's durable cost events and its ledger reservations. A fork that
+reaches its cap stops with `budget.limit_reached` before the next model step;
+the step that crosses the cap finishes. Every later resume stops at once.
+
+- The cap counts each session in the lineage on its own: a subagent under a
+  fork has its own cap, with its own ledger entry. That entry's identity
+  names the controller, the currency and the session's id and instance id, so
+  a new fork that reuses a deleted fork's id starts fresh, but not the amount, price
+  book or reservation, so a host that changes the cap keeps charging the
+  fork's earlier reservations against the new one. Budget inspection reports
+  such a session's cost as `partial`, since its checks name two different caps. There is no per-controller total yet; app and causal
+  budgets still apply to forks as usual.
+- The controller's own `budget_limits` can only tighten what a fork may spend.
+- Spend is read from durable events, and the cap and the gate from the current
+  enrollment. A host that restarts with a lower cap, or with
+  `allow_model_runs=False`, stops forks created earlier.
+- The cap is not part of a fork's execution profile, so changing it never makes
+  an existing fork fail profile checks.
+- Provider-hosted tools such as OpenAI web search have no hard per-response
+  ceiling, so a cap cannot bound them. A controller allowed to run models
+  cannot name a hosted tool type in `host_tools`; enrollment fails. A
+  hosted-tool agent the host runs under a fork fails at its first model step.
+- A session without a lineage marker, such as one written before markers
+  existed, settles its owner through its parents (see
+  [Sessions without a marker](#sessions-without-a-marker)). One whose lineage
+  does not settle cannot run.
 
 ## Reading sessions and events
 
@@ -500,7 +612,9 @@ use. The controller's `tool_capability_ceiling` can only narrow that further.
   can fork, replay or resume a fork of an agent registered with a hosted tool
   only when `host_tools` names that tool's type (for example
   `"openai_web_search"`). Otherwise the request is denied before any child or
-  model request. Enrollment rejects a hosted type no enrolled agent registers.
+  model request. Enrollment rejects a hosted type no enrolled agent registers,
+  and any hosted type when the controller may run models, since the per-fork
+  cap cannot bound hosted tools.
 - Every replay of an existing fork and every resume through the controller
   entrance checks the child's durable ceiling against the current allowance.
   If the host has since removed a tool from `host_tools` that the child's

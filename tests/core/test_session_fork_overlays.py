@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ import pytest
 
 from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.budgets import BudgetLimit, BudgetReservation
+from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.events import Event
 from cayu.execution_profiles import (
@@ -19,7 +22,7 @@ from cayu.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.fork_controllers import ForkController, ForkControllerDenied
+from cayu.fork_controllers import ForkBudgetLimitView, ForkController, ForkControllerDenied
 from cayu.knowledge.records import KnowledgeStatus
 from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.mcp import (
@@ -70,6 +73,60 @@ MEMORY = ForkOverlayMemoryItem(
     content="August closed with a 2% accrual variance.",
     source="compass:findings",
 )
+# Every scripted completion reports usage priced by this book, so a host's
+# per-fork cap can count it: one completion costs 0.15 USD, exactly what a
+# fixture cap reserves per step.
+FAKE_PRICES = PriceBook(
+    prices=(
+        ModelPrice.fixed(
+            provider_name="fake",
+            model="fake-model",
+            match="exact",
+            input_per_million=Decimal("2"),
+            output_per_million=Decimal("100"),
+        ),
+    ),
+)
+USAGE = {"input_tokens": 50_000, "output_tokens": 500, "total_tokens": 50_500}
+
+
+def durable_budget_ledger(store) -> Any:
+    """The budget ledger a host pairs with ``store`` when its controllers run models.
+
+    A durable store needs a durable ledger, shared by every app a scenario
+    restarts on it; an in-memory store keeps the app's default ledger.
+    """
+
+    from cayu.storage.budget_ledger import SQLiteBudgetLedger
+    from cayu.storage.budget_postgres import PostgresBudgetLedger
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    if isinstance(store, InMemorySessionStore):
+        return None
+    ledger = getattr(store, "_fork_test_budget_ledger", None)
+    if ledger is None:
+        if isinstance(store, SQLiteSessionStore):
+            ledger = SQLiteBudgetLedger(store.path.with_name(store.path.name + ".budget"))
+        elif isinstance(store, PostgresSessionStore):
+            ledger = PostgresBudgetLedger(store._conninfo, schema_mode=SchemaMode.CREATE)
+        else:
+            raise TypeError(f"No durable budget ledger for {type(store).__name__}.")
+        store._fork_test_budget_ledger = ledger
+    return ledger
+
+
+def fork_budget_limit(amount: str = "100") -> BudgetLimit:
+    """A per-fork cap the scenarios that run forks never reach unless they mean to.
+
+    Each model step reserves what one scripted completion costs, 0.15 USD.
+    """
+
+    return BudgetLimit.usd(
+        amount,
+        pricing=FAKE_PRICES,
+        reservation=BudgetReservation(max_input_tokens=50_000, max_output_tokens=500),
+    )
 
 
 class ScriptedProvider(ModelProvider):
@@ -91,6 +148,9 @@ class ScriptedProvider(ModelProvider):
         self.requests.append(request)
         for event in self.batches[len(self.requests) - 1]:
             yield event
+
+    def output_token_option_path(self) -> tuple[str, ...]:
+        return ("fake", "max_output_tokens")
 
 
 class ControllerMcpSession(McpSession):
@@ -209,14 +269,14 @@ def _controller_toolset(
 def _completed(text: str) -> list[ModelStreamEvent]:
     return [
         ModelStreamEvent.text_delta(text),
-        ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ModelStreamEvent.completed({"finish_reason": "stop", "usage": USAGE}),
     ]
 
 
 def _calls(name: str, arguments: dict[str, Any], call_id: str = "call-1") -> list[ModelStreamEvent]:
     return [
         ModelStreamEvent.tool_call(id=call_id, name=name, arguments=arguments),
-        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ModelStreamEvent.completed({"finish_reason": "tool_calls", "usage": USAGE}),
     ]
 
 
@@ -233,8 +293,11 @@ def _host_app(
     hosted_tools: tuple[Any, ...] = (),
     environment: Environment | None = None,
     allow_model_runs: bool = True,
+    budget_limit: BudgetLimit | None = None,
     **app_options: Any,
 ) -> tuple[CayuApp, PostJournal]:
+    if enroll and allow_model_runs and "budget_ledger" not in app_options:
+        app_options["budget_ledger"] = durable_budget_ledger(store)
     app = CayuApp(session_store=store, enable_logging=False, **app_options)
     app.register_provider(provider, default=True)
     if environment is not None:
@@ -258,6 +321,7 @@ def _host_app(
                 mcp_toolsets=() if toolset is None else (toolset,),
                 # These scenarios run their forks; the gate's default is tested on its own.
                 allow_model_runs=allow_model_runs,
+                fork_budget_limit=(fork_budget_limit() if budget_limit is None else budget_limit),
                 **allowance,
             )
         )
@@ -660,6 +724,7 @@ def test_host_policies_govern_overlay_forks_and_tools() -> None:
                 agents=(HOST_AGENT,),
                 mcp_toolsets=(toolset,),
                 allow_model_runs=True,
+                fork_budget_limit=fork_budget_limit(),
             )
         )
         await _run_trunk(app)
@@ -716,6 +781,7 @@ def test_host_tool_policy_sees_the_host_agent_name() -> None:
                 agents=(HOST_AGENT,),
                 mcp_toolsets=(toolset,),
                 allow_model_runs=True,
+                fork_budget_limit=fork_budget_limit(),
             )
         )
         await _run_trunk(app)
@@ -873,7 +939,9 @@ def test_restart_reproduces_the_overlay_fork_without_duplicates(tmp_path: Path) 
             ScriptedProvider([_completed("never")]),
             enroll=False,
         )
-        with pytest.raises(KeyError, match="Agent not registered"):
+        # A host resume is gated like the controller's own: without the
+        # enrollment, nothing may run the fork.
+        with pytest.raises(ForkControllerDenied, match="not allowed this controller"):
             await _drain(
                 unenrolled.resume(
                     ResumeRequest(session_id="compass-child", messages=[Message.text("user", "go")])
@@ -1985,6 +2053,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
                 host_tools=("post_journal",),
                 mcp_toolsets=(toolset,),
                 allow_model_runs=True,
+                fork_budget_limit=fork_budget_limit(),
             )
         )
         app.enroll_fork_controller(
@@ -2020,6 +2089,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         host_tools=("post_journal",),
         served_tools=(LOOKUP, "mcp__compass__search"),
         allow_model_runs=True,
+        fork_budget_limit=ForkBudgetLimitView(max_estimated_cost=Decimal("100"), currency="USD"),
     )
     with pytest.raises(ValueError):
         sdk.__setattr__("subject", "svc:other")
@@ -2036,6 +2106,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         "served_tools": [],
         # The default enrollment creates forks but never runs them.
         "allow_model_runs": False,
+        "fork_budget_limit": None,
     }
     assert unknown.status_code == 403
     assert anonymous.status_code == 401
@@ -2351,13 +2422,16 @@ def test_hosted_tools_need_the_host_tool_allowance(tmp_path: Path, allowed: bool
             source_session_id="trunk", session_id="compass-child", overlay=_overlay(tools=())
         )
 
-    async def process(host_tools: tuple[str, ...], batches):
+    async def process(host_tools: tuple[str, ...], batches, *, runs: bool = False):
         provider = HostedSearchProvider(batches)
         app, _journal = _host_app(
             SQLiteSessionStore(database),
             provider,
             hosted_tools=(OpenAIWebSearch(),),
             host_tools=host_tools,
+            # A per-fork cap cannot bound hosted search, so a controller allowed
+            # web search may not run models.
+            allow_model_runs=runs,
         )
         return app, provider
 
@@ -2375,12 +2449,6 @@ def test_hosted_tools_need_the_host_tool_allowance(tmp_path: Path, allowed: bool
             json=instructions_only().model_dump(mode="json"),
         )
         outcome["http_status"] = http.status_code
-        if allowed:
-            await _drain(
-                controller.resume(
-                    ResumeRequest(session_id="compass-child", messages=[Message.text("user", "go")])
-                )
-            )
         outcome["requests"] = provider.requests
         outcome["child"] = await app.session_store.load("compass-child")
         return outcome
@@ -2397,8 +2465,9 @@ def test_hosted_tools_need_the_host_tool_allowance(tmp_path: Path, allowed: bool
     assert [tool.type for tool in outcome["requests"][-1].hosted_tools] == ["openai_web_search"]
 
     async def narrowed():
-        # The host withdraws web search: the existing fork's replay and resume fail closed.
-        app, provider = await process((), [])
+        # The host withdraws web search: the existing fork's replay and resume fail
+        # closed, even though the controller may now run models.
+        app, provider = await process((), [], runs=True)
         controller = app.fork_controller_access(SUBJECT)
         replay = await _forbidden(controller.fork(instructions_only()))
         resume = await _forbidden(
@@ -2410,8 +2479,20 @@ def test_hosted_tools_need_the_host_tool_allowance(tmp_path: Path, allowed: bool
 
     replay, resume, requests = asyncio.run(narrowed())
     assert isinstance(replay, ForkControllerDenied)
-    assert isinstance(resume, ForkControllerDenied)
+    assert isinstance(resume, ForkControllerDenied) and "hosted tool" in str(resume)
     assert requests == []
+
+
+def test_a_controller_that_runs_models_cannot_hold_hosted_tools() -> None:
+    from cayu.providers.hosted import OpenAIWebSearch
+
+    with pytest.raises(ValueError, match="cannot be allowed provider-hosted tools"):
+        _host_app(
+            InMemorySessionStore(),
+            HostedSearchProvider([]),
+            hosted_tools=(OpenAIWebSearch(),),
+            host_tools=("openai_web_search",),
+        )
 
 
 def test_a_hosted_tool_no_enrolled_agent_has_fails_enrollment() -> None:

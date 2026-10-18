@@ -20,6 +20,9 @@ from cayu.sessions.memory import InMemorySessionStore
 class FakeProvider(ModelProvider):
     name = "fake"
 
+    def output_token_option_path(self) -> tuple[str, ...]:
+        return ("fake", "max_output_tokens")
+
     def __init__(
         self,
         events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],

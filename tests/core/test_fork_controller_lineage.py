@@ -38,7 +38,12 @@ from tests.core.test_fork_controller_reads import (
     _notes,
     _world,
 )
-from tests.core.test_session_fork_overlays import _http
+from tests.core.test_session_fork_overlays import (
+    USAGE,
+    _http,
+    durable_budget_ledger,
+    fork_budget_limit,
+)
 from tests.runtime.runtime_provider_support import FakeProvider
 from tests.runtime.runtime_session_support import (
     _pending_tool_approval_from_public_event,
@@ -56,7 +61,11 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision
 from cayu.events import EventType
-from cayu.fork_controllers import ForkController, ForkControllerDenied
+from cayu.fork_controllers import (
+    ForkController,
+    ForkControllerDenied,
+    fork_controller_budget_limits,
+)
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions import ForkSessionRequest, ResumeRequest
@@ -568,7 +577,7 @@ def test_a_subagent_of_a_controller_fork_joins_its_lineage(session_store_case):
                 [
                     [
                         ModelStreamEvent.text_delta("host done"),
-                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                        ModelStreamEvent.completed({"finish_reason": "stop", "usage": USAGE}),
                     ],
                     [
                         ModelStreamEvent.tool_call(
@@ -576,19 +585,23 @@ def test_a_subagent_of_a_controller_fork_joins_its_lineage(session_store_case):
                             name="subagent",
                             arguments={"agent": "helper", "task": "investigate the denial"},
                         ),
-                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls", "usage": USAGE}),
                     ],
                     [
                         ModelStreamEvent.text_delta("investigated"),
-                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                        ModelStreamEvent.completed({"finish_reason": "stop", "usage": USAGE}),
                     ],
                     [
                         ModelStreamEvent.text_delta("fork done"),
-                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                        ModelStreamEvent.completed({"finish_reason": "stop", "usage": USAGE}),
                     ],
                 ]
             )
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                budget_ledger=durable_budget_ledger(store),
+            )
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name=AGENT, model="fake-model"),
@@ -610,6 +623,7 @@ def test_a_subagent_of_a_controller_fork_joins_its_lineage(session_store_case):
                         agents=(AGENT, "helper"),
                         host_tools=("subagent",),
                         allow_model_runs=True,
+                        fork_budget_limit=fork_budget_limit(),
                     )
                 )
             await collect_events(
@@ -638,6 +652,17 @@ def test_a_subagent_of_a_controller_fork_joins_its_lineage(session_store_case):
                 await store.list_sessions(SessionQuery(parent_session_id=OTHER_CONTROLLER_FORK))
             ).sessions
             compass = app.fork_controller_access(COMPASS_SUBJECT)
+            # The subagent runs under the auditor's per-fork cap, like the fork itself.
+            [auditor_cap] = fork_controller_budget_limits(
+                app._agent_registry.fork_controller(AUDITOR), child.id, child.instance_id
+            )
+            checked = {
+                record.event.payload["budget_limit_id"]
+                for record in await store.query_events(
+                    EventQuery(session_id=child.id, event_type=EventType.BUDGET_CHECKED)
+                )
+            }
+            assert checked == {auditor_cap.budget_limit_id}
             return (
                 child,
                 await _denied(compass.session(child.id)),

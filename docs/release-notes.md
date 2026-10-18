@@ -134,6 +134,18 @@ service credentials stay outside the guest. Existing native agents are unchanged
   `<api path>/fork-controller`, so an app needs no controller code. Malformed
   configuration stops the server from starting. See
   [enrolling from the environment](fork-overlays.md#enrolling-from-the-environment).
+- Cap what a fork controller's forks spend. `ForkController(allow_model_runs=True)`
+  now requires `fork_budget_limit`, a session-scoped `BudgetLimit` with a
+  reservation, which the budget ledger enforces before every model step,
+  compaction and auxiliary call of every session in the controller's fork
+  lineage, whoever starts the run. Each such request is held inside the
+  reservation: output is capped through the adapter's
+  `ModelProvider.output_token_option_path()`, and input larger than the
+  reservation is refused before dispatch. With a durable session store, the app needs
+  a durable budget ledger. From the environment, set
+  `CAYU_FORK_CONTROLLER_FORK_BUDGET_USD` and the two
+  `CAYU_FORK_CONTROLLER_FORK_RESERVATION_*_TOKENS` variables. See
+  [running forks](fork-overlays.md#running-forks).
 
 - `CayuApp.abandon_session(session_id)` ends a session that stopped on an
   unknown external tool outcome and that the application will never continue,

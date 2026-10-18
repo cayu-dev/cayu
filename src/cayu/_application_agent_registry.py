@@ -18,11 +18,12 @@ from cayu._application_registration import (
 )
 from cayu._validation import require_clean_nonblank
 from cayu.agents import AgentSpec
+from cayu.budgets.base import BudgetLedger, InMemoryBudgetLedger, _EffectiveBudgetLimit
 from cayu.configuration import CayuConfigSource
 from cayu.context.base import ContextPolicy, DefaultContextPolicy
 from cayu.context.thinking import ThinkingConfig
 from cayu.environments.admission import ExecutionRequirements
-from cayu.fork_controllers import ForkController
+from cayu.fork_controllers import ForkController, fork_lineage_budget_limits
 from cayu.mcp.tools import (
     McpToolAdapter,
     McpToolset,
@@ -70,6 +71,21 @@ from cayu.tools.exposure import (
 from cayu.tools.policy import AllowAllToolPolicy, ToolPolicy
 from cayu.tools.targeted_projection import TargetedToolMode, copy_targeted_tool_mode
 from cayu.vaults.redaction import SecretRedactor
+
+
+def _session_store_survives_restart(store: SessionStore) -> bool:
+    """Whether a session store keeps sessions after its process ends.
+
+    The in-memory store and SQLite's ``:memory:`` database do not; every other
+    store, including third-party ones, is treated as durable.
+    """
+
+    from cayu.sessions.memory import InMemorySessionStore
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    if isinstance(store, InMemorySessionStore):
+        return False
+    return not (isinstance(store, SQLiteSessionStore) and str(store.path) == ":memory:")
 
 
 class ApplicationAgentRegistry:
@@ -703,7 +719,15 @@ class ApplicationAgentRegistry:
         except KeyError:
             raise KeyError(f"Fork controller not enrolled: {name}") from None
 
-    def enroll_fork_controller(self, controller: ForkController) -> None:
+    def fork_lineage_budget_limits(
+        self, owner: str | None, session_id: str, instance_id: str
+    ) -> tuple[_EffectiveBudgetLimit, ...]:
+        """Gate and cap model steps of a session whose fork lineage ``owner`` owns."""
+        return fork_lineage_budget_limits(owner, session_id, instance_id, self._fork_controllers)
+
+    def enroll_fork_controller(
+        self, controller: ForkController, *, budget_ledger: BudgetLedger | None = None
+    ) -> None:
         """Enroll one outside controller and register its tool-carrying bodies.
 
         Each named host agent must already be registered. When the controller
@@ -714,6 +738,19 @@ class ApplicationAgentRegistry:
 
         if type(controller) is not ForkController:
             raise TypeError("controller must be a ForkController.")
+        if (
+            controller.allow_model_runs
+            and type(budget_ledger) is InMemoryBudgetLedger
+            and _session_store_survives_restart(self._session_store)
+        ):
+            # Each fork's cap reserves through the ledger. Sessions that outlive
+            # a process with reservations that do not would fail on their next
+            # step after a restart, so refuse the configuration up front.
+            raise ValueError(
+                "A fork controller with allow_model_runs=True needs a durable budget ledger "
+                "for its per-fork caps: pass CayuApp(budget_ledger=SQLiteBudgetLedger(...)) "
+                "or PostgresBudgetLedger(...) alongside a durable session store."
+            )
         if controller.name in self._fork_controllers:
             raise ValueError(f"Fork controller already enrolled: {controller.name}")
         enrolled_subjects = {
@@ -733,9 +770,10 @@ class ApplicationAgentRegistry:
         )
         if any(base.fork_controller_name is not None for base in enrolled_bases):
             raise ValueError("A fork-controller body cannot be enrolled again.")
-        enrolled_host_tools = {name for base in enrolled_bases for name in base.tools} | {
-            tool.type for base in enrolled_bases for tool in base.hosted_tools
-        }
+        hosted_types = {tool.type for base in enrolled_bases for tool in base.hosted_tools}
+        enrolled_host_tools = {
+            name for base in enrolled_bases for name in base.tools
+        } | hosted_types
         unknown_host_tools = [
             name for name in controller.host_tools if name not in enrolled_host_tools
         ]
@@ -743,6 +781,13 @@ class ApplicationAgentRegistry:
             raise ValueError(
                 "host_tools names tools that no enrolled agent registers: "
                 + ", ".join(unknown_host_tools)
+            )
+        if controller.allow_model_runs and hosted_types.intersection(controller.host_tools):
+            # The per-fork cap is a strict budget, and provider-hosted tools have
+            # no hard per-response ceiling, so such a fork could never run.
+            raise ValueError(
+                "A controller allowed to run models cannot be allowed provider-hosted tools; "
+                "the per-fork cap cannot bound their spend."
             )
         bodies: dict[str, runtime_records.RegisteredAgentState] = {}
         for agent_name, base in zip(controller.agents, enrolled_bases, strict=True):

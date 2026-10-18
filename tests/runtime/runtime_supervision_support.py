@@ -70,24 +70,40 @@ def two_call_provider() -> FakeProvider:
     )
 
 
-def approval_app(store, *, sessions: int, policy=None, resource_access_policy=None) -> CayuApp:
-    """One app whose provider scripts a pause and a continuation per session, in order."""
+def approval_app(
+    store,
+    *,
+    sessions: int,
+    policy=None,
+    resource_access_policy=None,
+    usage=None,
+    budget_ledger=None,
+) -> CayuApp:
+    """One app whose provider scripts a pause and a continuation per session, in order.
 
+    ``usage``, when given, is reported by every completion so cost budgets can count it.
+    """
+
+    reported = {} if usage is None else {"usage": usage}
     turns = []
     for _ in range(sessions):
         turns.append(
             [
                 ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
-                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls", **reported}),
             ]
         )
         turns.append(
             [
                 ModelStreamEvent.text_delta("done"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ModelStreamEvent.completed({"finish_reason": "stop", **reported}),
             ]
         )
-    app = CayuApp(session_store=store, resource_access_policy=resource_access_policy)
+    app = CayuApp(
+        session_store=store,
+        resource_access_policy=resource_access_policy,
+        budget_ledger=budget_ledger,
+    )
     app.register_provider(FakeProvider(turns), default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),

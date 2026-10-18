@@ -1357,6 +1357,7 @@ class CayuApp:
             clock=self._clock,
             budget_binding_receiver=self.budget_binding_receiver,
             common_root_budget_binding_enabled=self.enable_common_root_budget_binding,
+            fork_caps=lambda *key: self._agent_registry.fork_lineage_budget_limits(*key),
         )
         self._agent_registry = ApplicationAgentRegistry(
             session_store=self.session_store,
@@ -6005,7 +6006,7 @@ class CayuApp:
 
     def enroll_fork_controller(self, controller: ForkController) -> None:
         """Let one outside controller fork the named agents with its own overlay."""
-        self._agent_registry.enroll_fork_controller(controller)
+        self._agent_registry.enroll_fork_controller(controller, budget_ledger=self.budget_ledger)
 
     def fork_controller_access(self, subject: str) -> ForkControllerAccess:
         """Return the overlay entrance for a subject the host already authenticated."""
@@ -8025,6 +8026,7 @@ class CayuApp:
         stored = await self.session_store.load(private_session_id)
         request = self._with_application_run_defaults(request, stored)
         if stored is not None:
+            await self._run_limit_controller.fork_lineage_budget_limits(stored)
             resumed_execution_deadline(stored.execution_deadline).require_admission("dispatch")
         (
             contract_rejected,

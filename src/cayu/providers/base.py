@@ -1448,6 +1448,17 @@ class ModelProvider(ABC):
     before running when the resolved provider does not set this.
     """
 
+    def output_token_option_path(self) -> tuple[str, ...] | None:
+        """Where this adapter reads a request's output-token cap in ``options``.
+
+        A fork controller's per-fork cap clamps the value at this path on every
+        model request it admits. ``None``, the default, means the adapter cannot
+        cap output, so a capped fork cannot run on it. Transparent wrappers
+        delegate this hook.
+        """
+
+        return None
+
     def prepare_auxiliary_request(
         self, request: ModelRequest, *, max_output_tokens: int
     ) -> ModelRequest:

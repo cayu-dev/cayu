@@ -7,6 +7,7 @@ database, so enrolling a controller that runs models needs no ledger code.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,8 +33,8 @@ from cayu.storage.application import open_application_stores
 AGENT = "finance-monthend"
 TOKEN = "compass-" + "a" * 40
 
-# The per-fork cap variables are read once cayu-tech/cayu#2554 lands; until
-# then they are ignored, and ALLOW_MODEL_RUNS=true enrolls without a cap.
+# Model runs from the environment need the per-fork cap variables, and a
+# durable session store needs a durable ledger for the cap's reservations.
 MODEL_RUNS_ENVIRONMENT = {
     "CAYU_FORK_CONTROLLER_NAME": "compass",
     "CAYU_FORK_CONTROLLER_AGENTS": AGENT,
@@ -120,7 +121,26 @@ def test_create_server_enrolls_model_runs_on_the_stores_durable_ledger(
         fastapi_options={"lifespan": _closing(stores)},
     )
     with TestClient(server) as client:
-        assert _enrollment(client, "/api/fork-controller/enrollment")["allow_model_runs"]
+        enrollment = _enrollment(client, "/api/fork-controller/enrollment")
+    assert enrollment["allow_model_runs"]
+    assert enrollment["fork_budget_limit"] == {"max_estimated_cost": "2", "currency": "USD"}
+
+
+def test_env_model_runs_without_the_stores_ledger_stop_the_server(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with open_application_stores(
+            None, sqlite_path=tmp_path / "cayu.db", budget_ledger=False
+        ) as stores:
+            app = _app(stores)
+            with pytest.raises(ValueError, match="needs a durable budget ledger"):
+                create_server(
+                    app,
+                    config=ServerConfig.protected(
+                        _operator, dashboard=DashboardConfig(enabled=False)
+                    ),
+                )
+
+    asyncio.run(scenario())
 
 
 def test_mount_cayu_enrolls_model_runs_on_the_stores_durable_ledger(

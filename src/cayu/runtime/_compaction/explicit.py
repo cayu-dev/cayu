@@ -127,6 +127,7 @@ from cayu.runtime._durable_tool_round import _environment_name
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
 )
+from cayu.runtime._fork_cap_requests import require_fork_cap_request
 from cayu.runtime._model_execution_selection import _session_agent_spec
 from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
@@ -1218,10 +1219,13 @@ class SessionCompaction:
             ) from None
         checkpoint_before_claim = await reconcile_after_admission()
         compaction_budget_policy = copy_budget_policy(self._get_budget_policy())
-        candidate_app_policy_budget_limits = budget_limits_for_session(
-            policy=compaction_budget_policy,
-            agent_name=registered_agent.spec.name,
-            causal_budget_id=loaded_session.causal_budget_id,
+        candidate_app_policy_budget_limits = (
+            *budget_limits_for_session(
+                policy=compaction_budget_policy,
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=loaded_session.causal_budget_id,
+            ),
+            *await self._run_limit_controller.fork_lineage_budget_limits(loaded_session),
         )
         candidate_request_budget_limits = request_budget_limits_for_session(
             limits=request.budget_limits,
@@ -2401,6 +2405,11 @@ class SessionCompaction:
             ) -> tuple[str, dict[str, Any]]:
                 model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
                 validate_live_compaction_semantics()
+                require_fork_cap_request(
+                    model_request,
+                    provider,
+                    await self._run_limit_controller.fork_lineage_budget_limits(loaded_session),
+                )
                 actual_pricing_provider_name = _require_application_compaction_event_text(
                     actual_pricing_provider_name,
                     "compactor_provider_name",

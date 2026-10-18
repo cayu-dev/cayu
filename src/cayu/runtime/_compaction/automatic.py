@@ -97,6 +97,7 @@ from cayu.runtime import _context_events
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._compaction import identity as _compaction_identity
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._fork_cap_requests import require_fork_cap_request
 from cayu.runtime._live_model_attempt import (
     _deadline_with_runtime_recovery_authority,
     _model_request_fingerprint,
@@ -2270,7 +2271,7 @@ class AutomaticCompactionRun:
         if type(lifecycle) is not _AutomaticCompactionLifecycle:
             raise TypeError("lifecycle must be an _AutomaticCompactionLifecycle.")
         controller = self._owner._run_limit_controller
-        all_limits = controller.provider_budget_limits(
+        all_limits = await controller.provider_budget_limits(
             session=self._session,
             agent_name=self._registered_agent.spec.name,
             budget_policy=self._budget_policy,
@@ -2507,6 +2508,11 @@ class AutomaticCompactionRun:
 
             del actual_model, actual_usage_dialect
             await self._refresh_live_model_semantics()
+            require_fork_cap_request(
+                model_request,
+                provider,
+                await self._owner._run_limit_controller.fork_lineage_budget_limits(self._session),
+            )
             model_attempt_identity = compaction_identity_ledger.begin_dispatch(
                 new_model_step_identity().new_attempt()
             )
@@ -2714,6 +2720,11 @@ class AutomaticCompactionRun:
         ) -> tuple[str, dict[str, Any]]:
             del actual_usage_dialect
             await self._refresh_live_model_semantics()
+            require_fork_cap_request(
+                model_request,
+                provider,
+                await self._owner._run_limit_controller.fork_lineage_budget_limits(self._session),
+            )
             actual_pricing_provider_name = require_durable_clean_nonblank(
                 actual_pricing_provider_name,
                 "compactor_provider_name",

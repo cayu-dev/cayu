@@ -302,13 +302,16 @@ class VertexProvider(ModelProvider):
     name = "vertex"
     usage_dialect = UsageDialect.ANTHROPIC
 
+    def output_token_option_path(self) -> tuple[str, ...]:
+        return ("anthropic", "max_tokens")
+
     def prepare_auxiliary_request(
         self, request: ModelRequest, *, max_output_tokens: int
     ) -> ModelRequest:
         return self._prepare_auxiliary_request(
             request,
             max_output_tokens=max_output_tokens,
-            output_option_path=("anthropic", "max_tokens"),
+            output_option_path=self.output_token_option_path(),
         )
 
     @property

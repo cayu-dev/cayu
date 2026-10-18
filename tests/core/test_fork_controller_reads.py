@@ -12,7 +12,13 @@ from tests.core.session_store_conformance.support import (
     conformance_postgres_dsn,
     session_store_case,
 )
-from tests.core.test_session_fork_overlays import _controller_toolset, _http
+from tests.core.test_session_fork_overlays import (
+    USAGE,
+    _controller_toolset,
+    _http,
+    durable_budget_ledger,
+    fork_budget_limit,
+)
 from tests.runtime.runtime_session_support import (
     _pending_tool_approval_from_public_event,
     collect_events,
@@ -71,7 +77,9 @@ def _app(
     compass_agents: tuple[str, ...] = (AGENT, OTHER_AGENT),
     sessions: int = 2,
 ) -> CayuApp:
-    app = approval_app(store, sessions=sessions)
+    app = approval_app(
+        store, sessions=sessions, usage=USAGE, budget_ledger=durable_budget_ledger(store)
+    )
     app.register_agent(
         AgentSpec(name=OTHER_AGENT, model="fake-model"),
         tools=[SideEffectTool()],
@@ -84,10 +92,20 @@ def _app(
             subjects=(COMPASS_SUBJECT,),
             agents=compass_agents,
             mcp_toolsets=(toolset,),
+            # The host runs sessions under these controllers' forks, which only
+            # an enrollment that allows model runs, under a cap, permits.
+            allow_model_runs=True,
+            fork_budget_limit=fork_budget_limit(),
         )
     )
     app.enroll_fork_controller(
-        ForkController(name=AUDITOR, subjects=(AUDITOR_SUBJECT,), agents=(AGENT,))
+        ForkController(
+            name=AUDITOR,
+            subjects=(AUDITOR_SUBJECT,),
+            agents=(AGENT,),
+            allow_model_runs=True,
+            fork_budget_limit=fork_budget_limit(),
+        )
     )
     return app
 
