@@ -657,16 +657,52 @@ class ExecutionAdmissionError(RuntimeError):
 
     def __init__(self, decision: ExecutionAdmissionDecision) -> None:
         self.decision = decision
-        requirements = ", ".join(
-            (
-                refusal.capability
-                if refusal.capability is not None
-                else f"executable:{refusal.executable}"
-            )
+        reasons: list[str] = []
+        seen: set[str] = set()
+        tool_requirements = {
+            (item.tool_name, item.requirement.name): item.requirement
+            for item in decision.requirements.tool_requirements
+        }
+        for refusal in decision.refusals:
+            if refusal.tool_name is not None and refusal.requirement_name is not None:
+                reason = f"{refusal.tool_name} requires {refusal.requirement_name}"
+                requirement = tool_requirements.get((refusal.tool_name, refusal.requirement_name))
+                if requirement is not None:
+                    alternatives = " or ".join(
+                        f"executable {item.executable}"
+                        if isinstance(item, ToolExecutableRequirement)
+                        else f"runner capability {item.capability}"
+                        for item in requirement.alternatives
+                    )
+                    reason += f" ({alternatives})"
+                if refusal.capability is not None:
+                    reason += f": runner capability {refusal.capability}"
+                elif refusal.executable is not None:
+                    reason += f": executable {refusal.executable}"
+            elif refusal.capability is not None:
+                reason = refusal.capability
+            elif refusal.executable is not None:
+                reason = f"executable:{refusal.executable}"
+            else:
+                reason = "admission evidence"
+            reason += f" [{refusal.code}]"
+            if reason not in seen:
+                seen.add(reason)
+                reasons.append(reason)
+        if decision.evidence is None and all(
+            refusal.code == "missing_capability" and refusal.observed_state == "missing"
             for refusal in decision.refusals
-            if refusal.capability is not None or refusal.executable is not None
-        )
-        detail = f": {requirements}" if requirements else ""
+        ):
+            reasons.append(
+                "no admission evidence was supplied"
+                + (
+                    "; factories must implement EnvironmentFactory.execution_admission_candidate"
+                    "; static environments must supply Runner.execution_admission_candidate_for"
+                    if decision.stage == "pre_create"
+                    else ""
+                )
+            )
+        detail = f": {'; '.join(reasons)}" if reasons else ""
         super().__init__(
             f"Execution candidate {decision.candidate!r} was refused during "
             f"{decision.stage}{detail}."

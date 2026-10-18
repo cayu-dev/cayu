@@ -7,16 +7,19 @@ import pytest
 from cayu.environments.admission import (
     EXECUTION_CAPABILITY_EVIDENCE_SCHEMA,
     ExecutionAdmissionDecision,
+    ExecutionAdmissionError,
     ExecutionAdmissionRefusal,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionEvidenceOverride,
     ExecutionExecutableEvidence,
     ExecutionRequirements,
+    ExecutionToolRequirement,
     ExecutionToolRequirementEvidence,
     evaluate_execution_admission,
 )
 from cayu.runners.local import LocalRunner
+from cayu.tools.search import SearchTextTool
 
 
 def test_untrusted_requirements_cover_every_execution_security_dimension() -> None:
@@ -443,3 +446,79 @@ def test_required_executable_needs_fresh_exact_final_environment_evidence() -> N
     assert pre_exposure.refusals[0].code == "insufficient_evidence"
     assert pre_exposure.refusals[0].executable == "git"
     assert stale.refusals[0].code == "stale_evidence"
+
+
+@pytest.mark.parametrize("evidence", [None, {"not": "valid evidence"}])
+def test_admission_error_names_tool_requirements_and_distinguishes_absent_evidence(evidence):
+    tool = SearchTextTool()
+    requirements = ExecutionRequirements.trusted(
+        tool_requirements=tuple(
+            ExecutionToolRequirement(tool_name=tool.spec.name, requirement=requirement)
+            for requirement in tool.spec.execution_requirements
+        )
+    )
+    decision = evaluate_execution_admission(
+        candidate="checkout", requirements=requirements, evidence=evidence, stage="pre_create"
+    )
+    with pytest.raises(ExecutionAdmissionError) as caught:
+        decision.require_admitted()
+    message = str(caught.value)
+    assert "'checkout' was refused during pre_create" in message
+    assert "search_text requires workspace_text_search" in message
+    assert "runner capability workspace_text_search_v1" in message
+    assert "executable rg" in message
+    assert ("no admission evidence was supplied" in message) is (evidence is None)
+    assert ("EnvironmentFactory.execution_admission_candidate" in message) is (evidence is None)
+    assert ("Runner.execution_admission_candidate_for" in message) is (evidence is None)
+    assert ("malformed_evidence" in message) is (evidence is not None)
+    assert caught.value.decision is decision
+
+
+def test_admission_error_preserves_non_tool_reasons():
+    decision = evaluate_execution_admission(
+        candidate="checkout",
+        requirements=ExecutionRequirements.trusted(required_executables=("git",)),
+        evidence=None,
+    )
+    assert "executable:git [missing_capability]" in str(ExecutionAdmissionError(decision))
+    malformed = ExecutionAdmissionDecision(
+        status="refused",
+        stage="pre_create",
+        candidate="checkout",
+        requirements=ExecutionRequirements.trusted(),
+        refusals=(ExecutionAdmissionRefusal(code="malformed_evidence"),),
+    )
+    assert "admission evidence [malformed_evidence]" in str(ExecutionAdmissionError(malformed))
+    assert "no admission evidence" not in str(ExecutionAdmissionError(malformed))
+
+
+def test_admission_error_associates_each_tool_alternative_with_its_refusal():
+    tool = SearchTextTool()
+    requirement = tool.spec.execution_requirements[0]
+    decision = ExecutionAdmissionDecision(
+        status="refused",
+        stage="pre_exposure",
+        candidate="checkout",
+        requirements=ExecutionRequirements.trusted(
+            tool_requirements=(
+                ExecutionToolRequirement(tool_name=tool.spec.name, requirement=requirement),
+            ),
+        ),
+        refusals=(
+            ExecutionAdmissionRefusal(
+                code="unsupported_capability",
+                tool_name=tool.spec.name,
+                requirement_name=requirement.name,
+                capability="workspace_text_search_v1",
+            ),
+            ExecutionAdmissionRefusal(
+                code="stale_evidence",
+                tool_name=tool.spec.name,
+                requirement_name=requirement.name,
+                executable="rg",
+            ),
+        ),
+    )
+    message = str(ExecutionAdmissionError(decision))
+    assert ": runner capability workspace_text_search_v1 [unsupported_capability]" in message
+    assert ": executable rg [stale_evidence]" in message

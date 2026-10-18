@@ -504,6 +504,39 @@ admission claim therefore continue to work for trusted agents whose admitted
 tools have no external execution requirements. Agent and tool requirements both
 fail closed when the integration provides no corresponding evidence.
 
+For a trusted agent whose tools need local execution evidence, use a prepared
+checkout with a known path. Unlike the allocating example above, this factory
+requires the directory to exist before `app.run`; it does not depend on a
+caller knowing runtime-generated session or child IDs:
+
+```python
+class PreparedLocalFactory(EnvironmentFactory):
+    def __init__(self, root):
+        self._root = root.resolve(strict=True)
+
+    def execution_admission_candidate(self, request):
+        return LocalRunner(self._root).execution_admission_candidate_for(
+            request.execution_requirements
+        )
+
+    async def create(self, request):
+        return EnvironmentFactoryResult(
+            environment=Environment(
+                EnvironmentSpec(name=request.environment_name),
+                workspace=LocalWorkspace(self._root),
+                runner=LocalRunner(self._root),
+                binding=NativeBinding(),
+            )
+        )
+```
+
+The hook forwards evidence for the same existing root as the final runner.
+Pre-create admission must not create directories or start workloads. A refusal
+names the tool, its requirement, and each refused capability or executable;
+absent evidence points to `EnvironmentFactory.execution_admission_candidate` for
+factories or `Runner.execution_admission_candidate_for` for static environments.
+A shared prepared checkout does not provide per-session filesystem isolation.
+
 A custom integration supplies evidence at two boundaries. The factory hook
 describes the candidate before allocation; the runner hook describes the exact
 live candidate that will execute commands:
