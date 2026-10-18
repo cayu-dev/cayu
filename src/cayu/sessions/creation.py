@@ -27,6 +27,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     execution_profile_session_metadata,
 )
+from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, fork_lineage_for_child
 from cayu.sessions.forks import FORK_EXECUTION_PROFILE_METADATA_KEY
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -146,6 +147,13 @@ def session_metadata_for_creation(
         raise ValueError(
             "Session metadata contains runtime-owned tool-capability-ceiling authority."
         )
+    if FORK_LINEAGE_METADATA_KEY in copied:
+        raise ValueError("Session metadata contains runtime-owned fork-lineage authority.")
+    # Preserve both forked and known unforked lineage at the create boundary,
+    # so later parent deletion or detachment cannot change the child's status.
+    lineage = None if parent_session is None else fork_lineage_for_child(parent_session)
+    if lineage is not None:
+        copied[FORK_LINEAGE_METADATA_KEY] = lineage
     if tool_capability_ceiling is not None and identity.execution_profile is None:
         raise ValueError("A tool capability ceiling requires a durable session execution profile.")
     if identity.execution_profile is not None:

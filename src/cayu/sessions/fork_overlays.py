@@ -11,7 +11,8 @@ executables come from the host's enrollment of the controller.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,11 +24,20 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.messages import Message, MessageRole
+from cayu.sessions.invocation import SessionExecutionSource
 
 if TYPE_CHECKING:
     from cayu.sessions.records import Session
 
 FORK_OVERLAY_METADATA_KEY = "cayu:fork_overlay"
+# Runtime-owned marker on every fork and its descendants, and on ordinary
+# children whose unforked lineage is known. It records the owning controller
+# and fork status at creation, so both survive parent deletion. Older sessions
+# have no marker; their lineage is derived from their parents instead.
+FORK_LINEAGE_METADATA_KEY = "cayu:fork_lineage"
+# How many parents a lineage walk follows before it gives up on a session.
+FORK_LINEAGE_MAX_DEPTH = 256
+_MISSING = object()
 FORK_OVERLAY_SCHEMA_VERSION = 1
 FORK_OVERLAY_CONTROLLER_MAX_CHARS = 128
 FORK_OVERLAY_INSTRUCTIONS_MAX_CHARS = 32_000
@@ -241,6 +251,207 @@ def fork_overlay_record_from_metadata(metadata: Mapping[str, Any]) -> ForkOverla
         raise ValueError("Fork overlay metadata is malformed; the fork fails closed.") from None
 
 
+def _fork_lineage_marker(controller: str | None, *, forked: bool = True) -> dict[str, Any]:
+    return {"controller": controller, "forked": forked}
+
+
+def fork_lineage_marker_from_metadata(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Load the exact durable lineage marker or fail closed when it is malformed."""
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("session metadata must be a mapping.")
+    raw = metadata.get(FORK_LINEAGE_METADATA_KEY)
+    if raw is None:
+        return None
+    controller = raw.get("controller", _MISSING) if isinstance(raw, Mapping) else _MISSING
+    if (
+        not isinstance(raw, Mapping)
+        or type(raw.get("forked")) is not bool
+        or not (controller is None or type(controller) is str)
+        or (raw.get("forked") is False and controller is not None)
+    ):
+        raise ValueError("Fork lineage metadata is malformed; the session fails closed.")
+    return _fork_lineage_marker(controller, forked=raw["forked"])
+
+
+def fork_lineage_owner(metadata: Mapping[str, Any]) -> str | None:
+    """Name the controller that owns a session's fork lineage, or nothing.
+
+    A controller fork is owned by its overlay's controller; any other session in
+    a forked lineage inherits the owner its marker recorded at creation. Raises
+    on a malformed record or marker, so callers fail closed.
+    """
+
+    record = fork_overlay_record_from_metadata(metadata)
+    if record is not None:
+        return record.overlay.controller
+    marker = fork_lineage_marker_from_metadata(metadata)
+    return None if marker is None else marker["controller"]
+
+
+def fork_lineage_for_child(parent: Session) -> dict[str, Any] | None:
+    """Return the lineage marker a session created under this parent must carry.
+
+    Preserve known ordinary lineages too: deleting or detaching the parent must
+    not turn an unforked child into an unresolved, unreadable session. An older
+    parent whose own row cannot settle its lineage still requires a parent walk.
+    """
+
+    lineage = resolve_fork_lineage(parent, None)
+    if not lineage.settled:
+        return None
+    return _fork_lineage_marker(lineage.owner(), forked=lineage.forked)
+
+
+def session_metadata_in_fork_lineage(metadata: Mapping[str, Any]) -> bool:
+    """Whether a session's own metadata places it in a fork lineage.
+
+    False does not mean unforked: a session written before lineage markers
+    existed carries neither entry, so ``resolve_fork_lineage`` settles it.
+    """
+
+    if metadata.get(FORK_OVERLAY_METADATA_KEY) is not None:
+        return True
+    raw = metadata.get(FORK_LINEAGE_METADATA_KEY)
+    if raw is None:
+        return False
+    # Malformed markers fail closed, including a false marker naming an owner.
+    return not (
+        isinstance(raw, Mapping)
+        and raw.get("forked") is False
+        and "controller" in raw
+        and raw["controller"] is None
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ForkLineage:
+    """Where one session's fork lineage is settled.
+
+    ``terminal`` is the nearest session, the session itself or an ancestor,
+    that carries an overlay record or a lineage marker, or else the unforked
+    root its parents lead to. It is ``None`` when the parents do not settle the
+    lineage: an ancestor was deleted or cannot be read, or the chain is deeper
+    than ``FORK_LINEAGE_MAX_DEPTH``. Every reader treats an unsettled lineage
+    as forked and owned by an unknown controller. ``through_fork`` records a
+    fork passed on the way to an unforked root, which only sessions written
+    before lineage markers existed can have.
+    """
+
+    terminal: Session | None
+    through_fork: bool = False
+
+    @property
+    def settled(self) -> bool:
+        return self.terminal is not None
+
+    @property
+    def forked(self) -> bool:
+        terminal = self.terminal
+        return (
+            terminal is None
+            or self.through_fork
+            or session_metadata_in_fork_lineage(terminal.metadata)
+        )
+
+    def owner(self) -> str | None:
+        """Name the lineage's owning controller; raises when no reader can know it."""
+
+        terminal = self.terminal
+        if terminal is None:
+            raise ValueError("The session's fork lineage cannot be resolved; it fails closed.")
+        return fork_lineage_owner(terminal.metadata)
+
+
+def _lineage_step(session: Session) -> ForkLineage | str | None:
+    """Settle one session's lineage from its own row, or name the parent to read next."""
+
+    if (
+        session.metadata.get(FORK_OVERLAY_METADATA_KEY) is not None
+        or session.metadata.get(FORK_LINEAGE_METADATA_KEY) is not None
+    ):
+        return ForkLineage(session)
+    if session.parent_session_id is not None:
+        return session.parent_session_id
+    # Only a true root names itself as its tree's root. A session whose parent
+    # was deleted lost the link to whatever lineage that parent was in.
+    if session.invocation.root_session_id == session.id:
+        return ForkLineage(session)
+    return None
+
+
+def _is_fork(session: Session) -> bool:
+    return session.invocation.source is SessionExecutionSource.FORK
+
+
+def _lineage_walk(session: Session) -> Generator[str, Session | None, ForkLineage]:
+    """Yield each parent id the walk needs and receive that parent, or ``None``."""
+
+    through_fork = False
+    current = session
+    for _depth in range(FORK_LINEAGE_MAX_DEPTH + 1):
+        step = _lineage_step(current)
+        if step is None:
+            return ForkLineage(None)
+        if isinstance(step, ForkLineage):
+            return ForkLineage(step.terminal, through_fork)
+        through_fork = through_fork or _is_fork(current)
+        parent = yield step
+        if parent is None:
+            return ForkLineage(None)
+        current = parent
+    return ForkLineage(None)
+
+
+def resolve_fork_lineage(
+    session: Session, parent_of: Callable[[str], Session | None] | None
+) -> ForkLineage:
+    """Settle a session's fork lineage, reading parents through ``parent_of``.
+
+    Without ``parent_of`` only the session's own row is used, so a session
+    that needs its parents stays unsettled. Stores evaluate the same walk in
+    SQL.
+    """
+
+    walk = _lineage_walk(session)
+    try:
+        parent_id = next(walk)
+        while True:
+            parent_id = walk.send(None if parent_of is None else parent_of(parent_id))
+    except StopIteration as done:
+        return done.value
+
+
+async def resolve_fork_lineage_async(
+    session: Session, parent_of: Callable[[str], Awaitable[Session | None]]
+) -> ForkLineage:
+    """``resolve_fork_lineage`` for a parent loader that awaits."""
+
+    walk = _lineage_walk(session)
+    try:
+        parent_id = next(walk)
+        while True:
+            parent_id = walk.send(await parent_of(parent_id))
+    except StopIteration as done:
+        return done.value
+
+
+def fork_lineage_for_fork(
+    source_lineage: ForkLineage, *, controller: str | None
+) -> dict[str, Any] | None:
+    """Return the lineage marker of a new fork: its overlay's controller, else the source's.
+
+    A host fork of a source whose lineage is unsettled gets no marker, so its
+    readers derive the same unsettled lineage through its parent.
+    """
+
+    if controller is not None:
+        return _fork_lineage_marker(controller)
+    if not source_lineage.settled:
+        return None
+    return _fork_lineage_marker(source_lineage.owner())
+
+
 def fork_overlay_granted_tool_names(session: Session) -> frozenset[str]:
     """Return controller tools a fork's durable overlay adds beyond its source ceiling.
 
@@ -291,18 +502,28 @@ def fork_overlay_context_message(record: ForkOverlayRecord | None) -> Message | 
 
 __all__ = [
     "FORK_CONTROLLER_AGENT_SEPARATOR",
+    "FORK_LINEAGE_MAX_DEPTH",
+    "FORK_LINEAGE_METADATA_KEY",
     "FORK_OVERLAY_CONTEXT_MAX_CHARS",
     "FORK_OVERLAY_INSTRUCTIONS_MAX_CHARS",
     "FORK_OVERLAY_MAX_MEMORY_ITEMS",
     "FORK_OVERLAY_MAX_TOOL_GRANTS",
     "FORK_OVERLAY_MEMORY_CONTENT_MAX_CHARS",
     "FORK_OVERLAY_METADATA_KEY",
+    "ForkLineage",
     "ForkOverlay",
     "ForkOverlayMemoryItem",
     "ForkOverlayRecord",
     "ForkOverlayToolGrant",
     "fork_controller_agent_name",
+    "fork_lineage_for_child",
+    "fork_lineage_for_fork",
+    "fork_lineage_marker_from_metadata",
+    "fork_lineage_owner",
     "fork_overlay_context_message",
     "fork_overlay_fingerprint",
     "fork_overlay_record_from_metadata",
+    "resolve_fork_lineage",
+    "resolve_fork_lineage_async",
+    "session_metadata_in_fork_lineage",
 ]

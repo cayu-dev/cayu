@@ -286,7 +286,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds, _SessionAccessBounds
     from cayu.sessions._context_view_source import (
         CompletedTurnSnapshot,
         ContextViewPublicationSource,
@@ -398,7 +398,7 @@ class InMemorySessionStore(
         return await memory_read(self, bounds, session_id, kind, offset, limit, max_bytes)
 
     async def _access_list_sessions(
-        self, bounds: _SessionAccessBounds, query: SessionQuery
+        self, bounds: SessionReadBounds, query: SessionQuery
     ) -> SessionListResult:
         return await memory_session_queries.list_sessions(
             self._read_session_query_state,
@@ -412,10 +412,15 @@ class InMemorySessionStore(
     ) -> Session:
         return await self.update_labels(session_id, labels, _access_bounds=bounds)
 
-    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+    async def _access_load_session(self, bounds: SessionReadBounds, session_id: str) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
+        from cayu.sessions._access_rules import require_session_read
+
         async with self._lock:
-            return bounds.require_read(self._sessions.get(session_id)).model_copy(deep=True)
+            sessions = self._sessions
+            return require_session_read(bounds, sessions.get(session_id), sessions.get).model_copy(
+                deep=True
+            )
 
     peer_content_version: ClassVar[int | None] = 1
 
@@ -733,6 +738,7 @@ class InMemorySessionStore(
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
     supports_supervision_events: ClassVar[bool] = True
+    supports_fork_controller_reads: ClassVar[bool] = True
     child_session_notification_version: ClassVar[int | None] = 1
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_targeted_tool_grants: ClassVar[bool] = True

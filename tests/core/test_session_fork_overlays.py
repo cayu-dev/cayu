@@ -232,6 +232,7 @@ def _host_app(
     extra_agents: tuple[str, ...] = (),
     hosted_tools: tuple[Any, ...] = (),
     environment: Environment | None = None,
+    allow_model_runs: bool = True,
     **app_options: Any,
 ) -> tuple[CayuApp, PostJournal]:
     app = CayuApp(session_store=store, enable_logging=False, **app_options)
@@ -255,6 +256,8 @@ def _host_app(
                 subjects=(SUBJECT,),
                 agents=enrolled_agents,
                 mcp_toolsets=() if toolset is None else (toolset,),
+                # These scenarios run their forks; the gate's default is tested on its own.
+                allow_model_runs=allow_model_runs,
                 **allowance,
             )
         )
@@ -656,6 +659,7 @@ def test_host_policies_govern_overlay_forks_and_tools() -> None:
                 subjects=(SUBJECT,),
                 agents=(HOST_AGENT,),
                 mcp_toolsets=(toolset,),
+                allow_model_runs=True,
             )
         )
         await _run_trunk(app)
@@ -711,6 +715,7 @@ def test_host_tool_policy_sees_the_host_agent_name() -> None:
                 subjects=(SUBJECT,),
                 agents=(HOST_AGENT,),
                 mcp_toolsets=(toolset,),
+                allow_model_runs=True,
             )
         )
         await _run_trunk(app)
@@ -1928,7 +1933,8 @@ def test_observe_mode_controller_has_no_trunk_write_path() -> None:
     assert all(isinstance(error, ForkControllerDenied) for error in to_trunk.values())
     assert http_resume.status_code == 403
     assert controller_server.calls == [("lookup", {"q": "accruals"})]
-    # The whole controller surface: no message, steering or approval entrance exists.
+    # The whole controller surface: no message, steering or approval entrance
+    # exists; everything beyond fork and resume only reads.
     assert {name for name in vars(ForkControllerAccess) if not name.startswith("_")} == {
         "controller_name",
         "subject",
@@ -1936,12 +1942,22 @@ def test_observe_mode_controller_has_no_trunk_write_path() -> None:
         "fork",
         "resume",
         "snapshot_source",
+        "sessions",
+        "session",
+        "events",
+        "query_events",
+        "supervision_events",
     }
     assert routes == {
         ("GET", "/fork-controller/enrollment"),
         ("GET", "/fork-controller/sources/{session_id}/snapshot"),
         ("POST", "/fork-controller/fork"),
         ("POST", "/fork-controller/resume"),
+        ("GET", "/fork-controller/sessions"),
+        ("GET", "/fork-controller/sessions/{session_id}"),
+        ("GET", "/fork-controller/sessions/{session_id}/events"),
+        ("POST", "/fork-controller/events/query"),
+        ("POST", "/fork-controller/supervision-events/query"),
     }
 
 
@@ -1966,6 +1982,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
                 agents=(HOST_AGENT,),
                 host_tools=("post_journal",),
                 mcp_toolsets=(toolset,),
+                allow_model_runs=True,
             )
         )
         app.enroll_fork_controller(
@@ -2000,6 +2017,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         agents=(HOST_AGENT,),
         host_tools=("post_journal",),
         served_tools=(LOOKUP, "mcp__compass__search"),
+        allow_model_runs=True,
     )
     with pytest.raises(ValueError):
         sdk.__setattr__("subject", "svc:other")
@@ -2014,6 +2032,8 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         "agents": ["payroll"],
         "host_tools": ["post_journal"],
         "served_tools": [],
+        # The default enrollment creates forks but never runs them.
+        "allow_model_runs": False,
     }
     assert unknown.status_code == 403
     assert anonymous.status_code == 401

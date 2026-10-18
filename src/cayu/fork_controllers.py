@@ -18,15 +18,27 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
+from cayu._fork_controller_errors import ForkControllerDenied
+from cayu._fork_controller_reads import (
+    FORK_CONTROLLER_EVENT_QUERY_FIELDS,
+    FORK_CONTROLLER_READ_DEFAULT_BYTES,
+    FORK_CONTROLLER_READ_MAX_BYTES,
+    ForkControllerReads,
+)
 from cayu._validation import require_durable_clean_nonblank
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
 from cayu.mcp.tools import McpToolset
+from cayu.sessions._fork_controller_bounds import fork_lineage_admits
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.fork_overlays import (
     ForkOverlay,
     fork_controller_agent_name,
     fork_overlay_record_from_metadata,
+    resolve_fork_lineage_async,
     validate_fork_controller_name,
 )
+from cayu.sessions.queries import SessionListResult, SessionQuery
+from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
 from cayu.tools.exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     ToolCapabilityCeiling,
@@ -39,15 +51,12 @@ if TYPE_CHECKING:
     from cayu.execution_profiles import ExecutionProfileAdoptionIntent
     from cayu.runtime._runtime_records import RegisteredAgentState
     from cayu.sessions.forks import ForkSourceSnapshot
+    from cayu.sessions.records import EventRecord, Session
     from cayu.sessions.requests import ForkSessionRequest, ResumeRequest
 
 _FORK_CONTROLLER_MAX_SUBJECTS = 64
 _FORK_CONTROLLER_MAX_AGENTS = 256
 _VERIFIED_FORK_CONTROLLER_TOKEN = object()
-
-
-class ForkControllerDenied(PermissionError):
-    """The caller is not an enrolled controller, or the target is outside its enrollment."""
 
 
 class ForkControllerMode(StrEnum):
@@ -98,7 +107,9 @@ class ForkController:
     optional controller-served tools; they must use a remote URL transport and
     may not resolve host secrets, so a call carries only model arguments to the
     controller and never host credentials. ``mode`` is the declared operating
-    mode; only ``observe`` exists.
+    mode; only ``observe`` exists. ``allow_model_runs`` is False by default:
+    the controller may create forks but not run them, so a fork with an
+    ``initial_invocation`` and every resume are refused before any work starts.
     """
 
     name: str
@@ -109,9 +120,12 @@ class ForkController:
     host_tools: tuple[str, ...] = ()
     mcp_toolsets: tuple[McpToolset, ...] = ()
     mode: ForkControllerMode = ForkControllerMode.OBSERVE
+    allow_model_runs: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", validate_fork_controller_name(self.name, "name"))
+        if type(self.allow_model_runs) is not bool:
+            raise TypeError("allow_model_runs must be a bool.")
         object.__setattr__(
             self,
             "subjects",
@@ -181,6 +195,7 @@ class ForkControllerEnrollment(BaseModel):
     agents: tuple[str, ...]
     host_tools: tuple[str, ...]
     served_tools: tuple[str, ...]
+    allow_model_runs: bool
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -225,6 +240,7 @@ class ForkControllerAccess:
     def __init__(self, app: CayuApp, verified: VerifiedForkController) -> None:
         self.__app = app
         self.__verified = require_verified_fork_controller(verified)
+        self.__reads = ForkControllerReads(app, self.__verified.controller)
 
     @property
     def controller_name(self) -> str:
@@ -245,6 +261,7 @@ class ForkControllerAccess:
             agents=controller.agents,
             host_tools=controller.host_tools,
             served_tools=controller.served_tool_names,
+            allow_model_runs=controller.allow_model_runs,
         )
 
     async def fork(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
@@ -258,6 +275,8 @@ class ForkControllerAccess:
             raise ValueError("Controller forks require an overlay.")
         if request.overlay.controller != self.controller_name:
             raise ForkControllerDenied("The overlay names a different controller.")
+        if request.initial_invocation is not None:
+            require_fork_controller_model_runs(self.__verified.controller)
         if request.session_id is not None:
             # A named destination that exists must be this controller's own fork;
             # otherwise a conflict would reveal that a host session id exists.
@@ -312,11 +331,88 @@ class ForkControllerAccess:
             not in {fork_controller_agent_name(agent, self.controller_name) for agent in enrolled}
         ):
             raise ForkControllerDenied("The source is not an agent this controller may fork.")
-        record = fork_overlay_record_from_metadata(source.metadata)
-        if record is not None and record.overlay.controller != self.controller_name:
-            # Another controller's fork is private to it, even without its own body.
+        lineage = await resolve_fork_lineage_async(source, self.__app.session_store.load)
+        if not fork_lineage_admits(lineage, self.controller_name):
+            # Another controller's fork, and every session created under it, is
+            # private to that controller even without its own body.
             raise ForkControllerDenied("The source is not an agent this controller may fork.")
         return await self.__app.snapshot_fork_source(source_session_id)
+
+    async def sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        """List the sessions this controller may read; others are absent, never errors."""
+
+        return await self.__reads.sessions(query)
+
+    async def session(self, session_id: str) -> Session:
+        """Load one readable session; absent, foreign and other-controller ids are denied alike."""
+
+        return await self.__reads.session(session_id)
+
+    async def events(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int | None = None,
+        before_sequence: int | None = None,
+        order_by: EventOrder = EventOrder.SEQUENCE_ASC,
+        limit: int = 100,
+        max_bytes: int = FORK_CONTROLLER_READ_DEFAULT_BYTES,
+    ) -> list[EventRecord]:
+        """Page one readable session's durable events in sequence order."""
+
+        session = await self.session(session_id)
+        return await self.query_events(
+            EventQuery(
+                session_id=session.id,
+                after_sequence=after_sequence,
+                before_sequence=before_sequence,
+                order_by=order_by,
+                limit=limit,
+            ),
+            max_bytes=max_bytes,
+        )
+
+    async def query_events(
+        self,
+        query: EventQuery,
+        *,
+        exclude_forked_sessions: bool = False,
+        max_bytes: int = FORK_CONTROLLER_READ_DEFAULT_BYTES,
+    ) -> list[EventRecord]:
+        """Query events across readable sessions; ``since`` may be omitted.
+
+        Sessions this controller may not read are filtered out by the store, so
+        foreign ``session_ids`` simply match nothing. A query that is not for
+        exactly one session reads in ascending sequence order only and starts
+        after ``after_sequence``, 0 when omitted, so continuing from the last
+        returned sequence never skips an event committed late with a lower one.
+        ``exclude_forked_sessions`` drops every session in a forked lineage: a
+        fork, including this controller's own, and every session created under
+        one. Raises ``EventQueryResultTooLarge`` when the matching records
+        exceed ``max_bytes``.
+        """
+
+        return await self.__reads.query_events(
+            query, exclude_forked_sessions=exclude_forked_sessions, max_bytes=max_bytes
+        )
+
+    async def _query_event_page(
+        self, query: EventQuery, *, exclude_forked_sessions: bool, max_bytes: int
+    ) -> tuple[list[EventRecord], bool]:
+        return await self.__reads.query_event_page(
+            query, exclude_forked_sessions=exclude_forked_sessions, max_bytes=max_bytes
+        )
+
+    async def supervision_events(self, query: SupervisionEventQuery) -> SupervisionEventPage:
+        """Page settled supervision touches on readable sessions; never includes content."""
+
+        page, _anchors = await self._supervision_page_with_anchors(query)
+        return page
+
+    async def _supervision_page_with_anchors(
+        self, query: SupervisionEventQuery
+    ) -> tuple[SupervisionEventPage, dict[int, EventRecord]]:
+        return await self.__reads.supervision_page_with_anchors(query)
 
     async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
         """Continue a fork this controller created; its overlay stays exactly as admitted."""
@@ -325,6 +421,8 @@ class ForkControllerAccess:
 
         if type(request) is not ResumeRequest:
             raise TypeError("Controller resumes require ResumeRequest.")
+        # Every resume runs the model, so the gate refuses it before any lookup.
+        require_fork_controller_model_runs(self.__verified.controller)
         private_id = await self.__app._resolve_public_session_id(request.session_id)
         session = await self.__app.session_store.load(private_id)
         record = None if session is None else fork_overlay_record_from_metadata(session.metadata)
@@ -413,6 +511,17 @@ def require_fork_controller_host_tools(
     require_fork_controller_hosted_tools(controller, registered_agent)
 
 
+def require_fork_controller_model_runs(controller: ForkController) -> None:
+    """Fail closed unless the host enrolled the controller with ``allow_model_runs``.
+
+    Runs before any child is created or dispatched, so a refused request never
+    reaches a model, a hosted tool or a controller-served MCP tool.
+    """
+
+    if not controller.allow_model_runs:
+        raise ForkControllerDenied("The host has not allowed this controller to run its forks.")
+
+
 def require_fork_controller_hosted_tools(
     controller: ForkController,
     registered_agent: RegisteredAgentState,
@@ -484,6 +593,9 @@ def fork_overlay_tool_capability_ceiling(
 
 
 __all__ = [
+    "FORK_CONTROLLER_EVENT_QUERY_FIELDS",
+    "FORK_CONTROLLER_READ_DEFAULT_BYTES",
+    "FORK_CONTROLLER_READ_MAX_BYTES",
     "ForkController",
     "ForkControllerAccess",
     "ForkControllerDenied",

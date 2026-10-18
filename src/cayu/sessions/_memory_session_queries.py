@@ -91,7 +91,7 @@ from cayu.sessions.topology import (
 from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 
 if TYPE_CHECKING:
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds
 
 
 class MemorySessionQueryState(NamedTuple):
@@ -623,8 +623,10 @@ async def list_sessions(
     query: SessionQuery | None,
     *,
     pending_interruption_cascade_only: bool,
-    access_bounds: _SessionAccessBounds | None = None,
+    access_bounds: SessionReadBounds | None = None,
 ) -> SessionListResult:
+    from cayu.sessions._access_rules import session_read_admitted
+
     query = copy_session_query(query)
     async with read() as state:
         inactive_before = (
@@ -660,7 +662,10 @@ async def list_sessions(
             else [
                 session
                 for session in candidates
-                if (access_bounds is None or access_bounds.matches(session.labels))
+                if (
+                    access_bounds is None
+                    or session_read_admitted(access_bounds, session, state.sessions.get)
+                )
                 and session_query_rules._session_matches(session, base_query)
                 and _session_matches_debug_state(
                     session,

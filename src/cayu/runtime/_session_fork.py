@@ -62,6 +62,7 @@ from cayu.fork_controllers import (
     fork_overlay_tool_capability_ceiling,
     require_fork_controller_host_tools,
     require_fork_controller_hosted_tools,
+    require_fork_controller_model_runs,
     require_requested_fork_controller_host_tools,
     require_verified_fork_controller,
 )
@@ -135,9 +136,11 @@ from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.fork_overlays import (
+    FORK_LINEAGE_METADATA_KEY,
     FORK_OVERLAY_METADATA_KEY,
     ForkOverlayRecord,
-    fork_overlay_record_from_metadata,
+    fork_lineage_for_fork,
+    resolve_fork_lineage_async,
 )
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
@@ -917,6 +920,8 @@ class SessionFork:
             verified_controller = require_verified_fork_controller(fork_controller)
             if overlay.controller != verified_controller.controller.name:
                 raise ForkControllerDenied("The overlay names a different controller.")
+            if request.initial_invocation is not None:
+                require_fork_controller_model_runs(verified_controller.controller)
             require_requested_fork_controller_host_tools(
                 verified_controller.controller,
                 request.tool_capability_ceiling,
@@ -1239,13 +1244,18 @@ class SessionFork:
                 f"{source_session.agent_name}"
             ) from exc
         # An overlay fork belongs to its controller whether or not it carries that
-        # controller's body; its durable overlay record names the owner too.
-        source_overlay_record = fork_overlay_record_from_metadata(source_session.metadata)
+        # controller's body; its durable overlay record names the owner too, and
+        # every session created under it inherits that owner in its lineage marker.
+        # A source without a marker, such as one written before markers existed,
+        # takes its owner from the parents that settle its lineage.
+        source_lineage = await resolve_fork_lineage_async(source_session, self.session_store.load)
+        if overlay is not None and not source_lineage.settled:
+            raise ForkControllerDenied("The source is not an agent this controller may fork.")
         source_owners = {
             owner
             for owner in (
                 source_registered_agent.fork_controller_name,
-                None if source_overlay_record is None else source_overlay_record.overlay.controller,
+                source_lineage.owner() if source_lineage.settled else None,
             )
             if owner is not None
         }
@@ -1914,12 +1924,17 @@ class SessionFork:
             fork_metadata,
             effective_tool_capability_ceiling,
         )
+        fork_owner: str | None = None
         if overlay is not None and verified_controller is not None:
+            fork_owner = overlay.controller
             fork_metadata[FORK_OVERLAY_METADATA_KEY] = ForkOverlayRecord(
                 overlay=overlay,
                 fingerprint=overlay.fingerprint,
                 controller_subject=verified_controller.subject,
             ).model_dump(mode="json")
+        fork_lineage = fork_lineage_for_fork(source_lineage, controller=fork_owner)
+        if fork_lineage is not None:
+            fork_metadata[FORK_LINEAGE_METADATA_KEY] = fork_lineage
         prompt_workflow.attach_receipt(
             fork_metadata,
             source_session=source_session,

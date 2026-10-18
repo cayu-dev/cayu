@@ -88,7 +88,7 @@ from cayu.storage import _session_store_sql as session_store_sql
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds
 
 
 PostgresConnection = Callable[[], AbstractAsyncContextManager[Any]]
@@ -1264,7 +1264,7 @@ async def list_sessions(
     query: SessionQuery | None,
     *,
     pending_interruption_cascade_only: bool,
-    access_bounds: _SessionAccessBounds | None = None,
+    access_bounds: SessionReadBounds | None = None,
 ) -> SessionListResult:
     query = copy_session_query(query)
     session_source_sql = (

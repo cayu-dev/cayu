@@ -23,7 +23,8 @@ from cayu.sessions.records import SessionStatus
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 if TYPE_CHECKING:
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds
+    from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ def build_event_query_sql(
     clauses: list[str] = []
     params: list[object] = []
     from cayu.sessions._access_rules import _query_bounds
+    from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
 
     access_bounds = _query_bounds.get()
     if access_bounds is not None:
@@ -152,6 +154,19 @@ def build_event_query_sql(
             + "))"
         )
         params.extend(clause.params)
+        if type(access_bounds) is _ForkControllerReadBounds and access_bounds.exclude_forked:
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM cayu_events AS fork_marker "
+                "WHERE fork_marker.session_id = cayu_events.session_id "
+                f"AND fork_marker.event_type = {dialect.placeholder})"
+            )
+            params.append(str(EventType.SESSION_FORKED))
+            clauses.append(
+                "EXISTS (SELECT 1 FROM cayu_sessions WHERE "
+                "cayu_sessions.id = cayu_events.session_id AND "
+                + fork_lineage_unforked_sql(dialect)
+                + ")"
+            )
 
     if query.after_sequence is not None:
         clauses.append(f"cayu_events.sequence > {dialect.placeholder}")
@@ -316,6 +331,9 @@ def build_session_query_sql(
         column="causal_budget_id",
         value=query.causal_budget_id,
     )
+    if query.created_after is not None:
+        clauses.append(f"created_at > {dialect.placeholder}")
+        params.append(dialect.datetime_param(query.created_after))
     if query.last_activity_before is not None:
         clauses.append(f"last_activity_at <= {dialect.placeholder}")
         params.append(dialect.datetime_param(query.last_activity_before))
@@ -502,10 +520,247 @@ def _label_in_clause(dialect: SessionStoreSqlDialect, *, value_count: int) -> st
         """
 
 
+def _json_type(dialect: SessionStoreSqlDialect, column: str, *keys: str) -> str:
+    """SQL naming the JSON type at ``keys`` inside ``column``; NULL when absent."""
+
+    if dialect.contains_style == "sqlite_nocase_like":
+        return f"json_type({column}, '$." + ".".join(f'"{key}"' for key in keys) + "')"
+    return f"jsonb_typeof({column}" + "".join(f" -> '{key}'" for key in keys) + ")"
+
+
+def _json_text(dialect: SessionStoreSqlDialect, column: str, *keys: str) -> str:
+    """SQL reading the scalar at ``keys`` inside ``column`` as text."""
+
+    if dialect.contains_style == "sqlite_nocase_like":
+        return f"json_extract({column}, '$." + ".".join(f'"{key}"' for key in keys) + "')"
+    return f"({column} #>> '{{" + ",".join(keys) + "}')"
+
+
+def _present(kind: str) -> str:
+    # Mirrors the Python ``metadata.get(key) is not None``: JSON null is absent.
+    return f"({kind} IS NOT NULL AND {kind} <> 'null')"
+
+
+def _carries_fork_lineage(dialect: SessionStoreSqlDialect, metadata: str) -> str:
+    """True for a row carrying an overlay record or a lineage marker.
+
+    Such a row settles the parent walk, even when its marker says unforked.
+    """
+
+    from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, FORK_OVERLAY_METADATA_KEY
+
+    return (
+        "("
+        + " OR ".join(
+            _present(_json_type(dialect, metadata, key))
+            for key in (FORK_OVERLAY_METADATA_KEY, FORK_LINEAGE_METADATA_KEY)
+        )
+        + ")"
+    )
+
+
+def _fork_lineage_entries_admit(dialect: SessionStoreSqlDialect, metadata: str) -> str:
+    """Compile ``fork_controller_lineage_admits`` for one row; binds the controller twice."""
+
+    from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, FORK_OVERLAY_METADATA_KEY
+
+    sqlite = dialect.contains_style == "sqlite_nocase_like"
+    string = "'text'" if sqlite else "'string'"
+    record = _json_type(dialect, metadata, FORK_OVERLAY_METADATA_KEY)
+    named = (FORK_OVERLAY_METADATA_KEY, "overlay", "controller")
+    marker = _json_type(dialect, metadata, FORK_LINEAGE_METADATA_KEY)
+    forked = (FORK_LINEAGE_METADATA_KEY, "forked")
+    owner = (FORK_LINEAGE_METADATA_KEY, "controller")
+    forked_true = (
+        f"{_json_type(dialect, metadata, *forked)} = 'true'"
+        if sqlite
+        else f"{_json_type(dialect, metadata, *forked)} = 'boolean' AND "
+        f"{_json_text(dialect, metadata, *forked)} = 'true'"
+    )
+    forked_boolean = (
+        f"{_json_type(dialect, metadata, *forked)} IN ('true', 'false')"
+        if sqlite
+        else f"{_json_type(dialect, metadata, *forked)} = 'boolean'"
+    )
+    record_admits = (
+        f"({record} IS NULL OR {record} = 'null' OR "
+        f"({_json_type(dialect, metadata, *named)} = {string} AND "
+        f"{_json_text(dialect, metadata, *named)} = {dialect.placeholder}))"
+    )
+    marker_admits = (
+        f"({marker} IS NULL OR {marker} = 'null' OR "
+        f"({marker} = 'object' AND {forked_boolean} AND "
+        f"({_json_type(dialect, metadata, *owner)} = 'null' OR "
+        f"({forked_true} AND {_json_type(dialect, metadata, *owner)} = {string} AND "
+        f"{_json_text(dialect, metadata, *owner)} = {dialect.placeholder}))))"
+    )
+    return f"{record_admits} AND {marker_admits}"
+
+
+def _fork_chain(dialect: SessionStoreSqlDialect, select: str) -> str:
+    """Prefix ``select`` with ``fork_chain``: the row and its parents up to the one settling it.
+
+    The walk starts at the enclosing query's ``cayu_sessions`` row and climbs
+    ``parent_session_id`` while the current row carries neither an overlay
+    record nor a lineage marker, as ``resolve_fork_lineage`` does. A deleted
+    parent or a chain deeper than ``FORK_LINEAGE_MAX_DEPTH`` ends the walk on a
+    row that settles nothing.
+    """
+
+    from cayu.sessions.fork_overlays import FORK_LINEAGE_MAX_DEPTH
+
+    sqlite = dialect.contains_style == "sqlite_nocase_like"
+    metadata, invocation = (
+        ("metadata_json", "invocation_json") if sqlite else ("metadata", "invocation")
+    )
+    return (
+        "WITH RECURSIVE fork_chain(id, parent_session_id, metadata, invocation, depth) AS ("
+        "SELECT cayu_sessions.id, cayu_sessions.parent_session_id, "
+        f"cayu_sessions.{metadata}, cayu_sessions.{invocation}, 0 "
+        "UNION ALL SELECT fork_parent.id, fork_parent.parent_session_id, "
+        f"fork_parent.{metadata}, fork_parent.{invocation}, fork_chain.depth + 1 "
+        "FROM fork_chain JOIN cayu_sessions AS fork_parent "
+        "ON fork_parent.id = fork_chain.parent_session_id "
+        f"WHERE fork_chain.depth < {int(FORK_LINEAGE_MAX_DEPTH)} AND NOT "
+        + _carries_fork_lineage(dialect, "fork_chain.metadata")
+        + ") "
+        + select
+    )
+
+
+def _row_metadata(dialect: SessionStoreSqlDialect) -> str:
+    return (
+        "cayu_sessions.metadata_json"
+        if dialect.contains_style == "sqlite_nocase_like"
+        else "cayu_sessions.metadata"
+    )
+
+
+def _unforked_terminal(
+    dialect: SessionStoreSqlDialect, row: str, *, metadata: str | None = None
+) -> str:
+    """A known unforked marker or root that settles the walk."""
+
+    from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, FORK_OVERLAY_METADATA_KEY
+
+    if metadata is None:
+        metadata, invocation = f"{row}.metadata", f"{row}.invocation"
+    else:
+        invocation = (
+            f"{row}.invocation_json"
+            if dialect.contains_style == "sqlite_nocase_like"
+            else f"{row}.invocation"
+        )
+    root = (
+        f"({row}.parent_session_id IS NULL AND "
+        + _json_text(dialect, invocation, "root_session_id")
+        + f" = {row}.id AND NOT "
+        + _carries_fork_lineage(dialect, metadata)
+        + ")"
+    )
+    forked = (FORK_LINEAGE_METADATA_KEY, "forked")
+    forked_false = (
+        f"{_json_type(dialect, metadata, *forked)} = 'false'"
+        if dialect.contains_style == "sqlite_nocase_like"
+        else f"{_json_type(dialect, metadata, *forked)} = 'boolean' AND "
+        f"{_json_text(dialect, metadata, *forked)} = 'false'"
+    )
+    marker = (
+        f"({_json_type(dialect, metadata, FORK_LINEAGE_METADATA_KEY)} = 'object' AND "
+        f"{forked_false} AND "
+        f"{_json_type(dialect, metadata, FORK_LINEAGE_METADATA_KEY, 'controller')} = 'null' "
+        f"AND NOT {_present(_json_type(dialect, metadata, FORK_OVERLAY_METADATA_KEY))})"
+    )
+    return f"({root} OR {marker})"
+
+
+def fork_lineage_unforked_sql(dialect: SessionStoreSqlDialect) -> str:
+    """True for a ``cayu_sessions`` row outside every fork lineage.
+
+    Mirrors ``ForkLineage.forked`` being false: the walk settles on an unforked
+    marker or root and passes no fork on the way. A row that settles itself skips the walk.
+    """
+
+    from cayu.sessions.invocation import SessionExecutionSource
+
+    is_fork = (
+        _json_text(dialect, "passed.invocation", "source")
+        + f" = '{SessionExecutionSource.FORK.value}'"
+    )
+    walk = (
+        "EXISTS ("
+        + _fork_chain(
+            dialect,
+            "SELECT 1 FROM fork_chain WHERE "
+            + _unforked_terminal(dialect, "fork_chain")
+            + f" AND NOT EXISTS (SELECT 1 FROM fork_chain AS passed WHERE {is_fork})",
+        )
+        + ")"
+    )
+    return (
+        "("
+        + _unforked_terminal(dialect, "cayu_sessions", metadata=_row_metadata(dialect))
+        + " OR (NOT "
+        + _carries_fork_lineage(dialect, _row_metadata(dialect))
+        + f" AND cayu_sessions.parent_session_id IS NOT NULL AND {walk}))"
+    )
+
+
+def fork_controller_read_clause(
+    bounds: _ForkControllerReadBounds, *, dialect: SessionStoreSqlDialect
+) -> SqlClause:
+    """Compile one controller's read limit exactly as ``_ForkControllerReadBounds.admits``.
+
+    The lineage part walks the row's parents to the session that settles it,
+    so a session written before lineage markers existed is judged by the fork
+    it descends from.
+    """
+
+    def settles_and_admits(metadata: str, root: str) -> str:
+        return (
+            "(("
+            + _carries_fork_lineage(dialect, metadata)
+            + " AND "
+            + _fork_lineage_entries_admit(dialect, metadata)
+            + f") OR {root})"
+        )
+
+    metadata = _row_metadata(dialect)
+    walk = (
+        "EXISTS ("
+        + _fork_chain(
+            dialect,
+            "SELECT 1 FROM fork_chain WHERE "
+            + settles_and_admits("fork_chain.metadata", _unforked_terminal(dialect, "fork_chain")),
+        )
+        + ")"
+    )
+    # A row with its own record or marker, or a true root, settles itself;
+    # only the other rows need the walk, whose answer for them is the same.
+    sql = (
+        f"cayu_sessions.agent_name IN ({dialect.placeholders(len(bounds.agent_names))}) AND ("
+        + settles_and_admits(
+            metadata, _unforked_terminal(dialect, "cayu_sessions", metadata=metadata)
+        )
+        + " OR (NOT "
+        + _carries_fork_lineage(dialect, metadata)
+        + f" AND cayu_sessions.parent_session_id IS NOT NULL AND {walk}))"
+    )
+    controller = bounds.controller
+    return SqlClause(sql, (*bounds.agent_names, controller, controller, controller, controller))
+
+
 def session_access_clause(
-    bounds: _SessionAccessBounds, *, dialect: SessionStoreSqlDialect
+    bounds: SessionReadBounds, *, dialect: SessionStoreSqlDialect
 ) -> SqlClause:
     """Compile admitted AND current authority; alternatives stay inside each scope."""
+    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
+
+    if type(bounds) is _ForkControllerReadBounds:
+        return fork_controller_read_clause(bounds, dialect=dialect)
+    if type(bounds) is not _SessionAccessBounds:
+        raise TypeError("Unknown session read bound.")
     scopes = []
     params: list[object] = []
     for scope in (bounds.admitted, bounds.current):

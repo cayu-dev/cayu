@@ -49,6 +49,14 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
   running handler instead of interrupting it. See
   [When a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
+- Enroll a fork controller from the environment. When
+  `CAYU_FORK_CONTROLLER_NAME` is set, `create_server` and `mount_cayu` enroll
+  that controller for `CAYU_FORK_CONTROLLER_AGENTS`, authenticate it with the
+  token digests in `CAYU_FORK_CONTROLLER_TOKEN_SHA256`, and serve its routes at
+  `<api path>/fork-controller`, so an app needs no controller code. Malformed
+  configuration stops the server from starting. See
+  [enrolling from the environment](fork-overlays.md#enrolling-from-the-environment).
+
 ### Breaking changes
 
 None.

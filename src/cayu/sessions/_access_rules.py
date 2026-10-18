@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal
@@ -10,6 +10,7 @@ from typing import Literal
 from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu._resource_access_errors import ResourceAccessDenied as SessionAccessDenied
 from cayu._validation import copy_label_map
+from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
 from cayu.sessions.queries import LabelSelectorOperator, LabelSelectorRequirement
 from cayu.sessions.records import Session
 from cayu.sessions.requests import RunRequest
@@ -246,9 +247,57 @@ def _require_scoped_session_creation(request: RunRequest, parent: Session | None
             raise SessionAccessDenied()
 
 
-_query_bounds: ContextVar[_SessionAccessBounds | None] = ContextVar(
+# Every read bound a store evaluates. A store dispatches on the exact type and
+# raises on any other value, so an unrecognized bound never reads unbounded.
+SessionReadBounds = _SessionAccessBounds | _ForkControllerReadBounds
+
+_query_bounds: ContextVar[SessionReadBounds | None] = ContextVar(
     "session_access_query", default=None
 )
+
+
+def session_read_admitted(
+    bounds: SessionReadBounds,
+    session: Session,
+    parent_of: Callable[[str], Session | None] | None = None,
+) -> bool:
+    """Evaluate one read bound against a loaded session, as the stores' SQL does.
+
+    ``parent_of`` reads the session's parents for a bound whose limit depends
+    on them, as a fork controller's does for sessions without a lineage marker.
+    """
+
+    if type(bounds) is _SessionAccessBounds:
+        return bounds.matches(session.labels)
+    if type(bounds) is _ForkControllerReadBounds:
+        return bounds.admits(session, parent_of)
+    raise TypeError("Unknown session read bound.")
+
+
+def require_session_read(
+    bounds: SessionReadBounds,
+    session: Session | None,
+    parent_of: Callable[[str], Session | None],
+) -> Session:
+    """``bounds.require_read`` for a store that can hand the bound a session's parents."""
+
+    if type(bounds) is _ForkControllerReadBounds:
+        return bounds.require_read(session, parent_of)
+    return bounds.require_read(session)
+
+
+def require_clause_admitted(bounds: SessionReadBounds, session: Session) -> Session:
+    """Recheck a row that ``session_access_clause`` admitted in SQL.
+
+    A fork controller's clause walks the row's parents in the same statement,
+    so only the row's own part of that limit is checked again here.
+    """
+
+    if type(bounds) is _ForkControllerReadBounds:
+        if not bounds.admits_row(session):
+            raise SessionAccessDenied()
+        return session
+    return bounds.require_read(session)
 
 
 def runtime_session_query(operation):

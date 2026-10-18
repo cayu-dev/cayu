@@ -297,6 +297,12 @@ def create_server(
             )
         if tool_authorization_grants.service.app is not app:
             raise ValueError("Tool authorization grant routes must use this server's CayuApp.")
+    # A disabled API serves no fork-controller routes either.
+    fork_controller_router = (
+        _environment_fork_controller_router(app, resolved_config.api.path)
+        if resolved_config.api.enabled
+        else None
+    )
     dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
     lifecycle = resolved_config.lifecycle
     resolved_fastapi_options = _validate_fastapi_options(FastAPI, fastapi_options)
@@ -508,6 +514,8 @@ def create_server(
             server.include_router(
                 tool_authorization_grants.router(auth=api_auth), prefix=control_plane_path
             )
+    if fork_controller_router is not None:
+        server.include_router(fork_controller_router)
 
     if resolved_config.dashboard.enabled:
         dashboard_mounted = mount_dashboard(
@@ -742,6 +750,7 @@ def mount_cayu(
         _request_timing=mount_request_timing,
     )
     client_router = browser_client_router(base_path=mount_path, auth=auth)
+    fork_controller_router = _environment_fork_controller_router(app, api_path)
 
     # All caller-controlled values and route construction are validated before
     # changing the host application. A rejected mount must leave it reusable.
@@ -766,6 +775,8 @@ def mount_cayu(
     )
     server.include_router(router)
     server.include_router(client_router)
+    if fork_controller_router is not None:
+        server.include_router(fork_controller_router)
     if prepared_dashboard is not None:
         prepared_mount_path, dashboard_app = prepared_dashboard
         _attach_dashboard_mount(
@@ -1416,6 +1427,20 @@ def _normalize_api_base_url(value: str) -> str:
     if _is_absolute_url(stripped):
         return stripped.rstrip("/")
     return normalize_api_path(stripped, field_name="api_base_url")
+
+
+def _environment_fork_controller_router(app: CayuApp, api_path: str) -> Any:
+    """The fork-controller router for a controller the process environment enrolls.
+
+    It is served at ``{api_path}/fork-controller`` with its own bearer
+    authentication, never the operator's. ``None`` without that configuration.
+    """
+
+    from cayu.server.fork_controller import environment_fork_controller_router
+
+    return environment_fork_controller_router(
+        app, prefix=_join_public_paths(api_path, "fork-controller")
+    )
 
 
 def _join_public_paths(base: str, child: str) -> str:

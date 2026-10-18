@@ -67,7 +67,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds, _SessionAccessBounds
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.storage.retention import (
@@ -1039,7 +1039,7 @@ class SQLiteSessionStore(
         return await sqlite_read(self, bounds, session_id, kind, offset, limit, max_bytes)
 
     async def _access_list_sessions(
-        self, bounds: _SessionAccessBounds, query: SessionQuery
+        self, bounds: SessionReadBounds, query: SessionQuery
     ) -> SessionListResult:
         return await session_queries.list_sessions(
             self._run_read,
@@ -1054,7 +1054,8 @@ class SQLiteSessionStore(
     ) -> Session:
         return await self.update_labels(session_id, labels, _access_bounds=bounds)
 
-    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+    async def _access_load_session(self, bounds: SessionReadBounds, session_id: str) -> Session:
+        from cayu.sessions._access_rules import require_clause_admitted
         from cayu.sessions.access import SessionAccessDenied
 
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1070,8 +1071,8 @@ class SQLiteSessionStore(
             if row is None:
                 raise SessionAccessDenied()
             labels = sqlite_records.load_session_labels_batch(connection, [session_id])
-            return bounds.require_read(
-                sqlite_records.session_from_row(row, labels=labels[session_id])
+            return require_clause_admitted(
+                bounds, sqlite_records.session_from_row(row, labels=labels[session_id])
             )
 
         def snapshot(connection):
@@ -1091,6 +1092,7 @@ class SQLiteSessionStore(
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
     supports_supervision_events: ClassVar[bool] = True
+    supports_fork_controller_reads: ClassVar[bool] = True
     child_session_notification_version: ClassVar[int | None] = 1
     supports_incremental_terminal_evidence: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True

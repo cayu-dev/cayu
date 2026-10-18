@@ -144,6 +144,8 @@ class SessionQuery(BaseModel):
     environment_name: str | None = None
     parent_session_id: str | None = None
     causal_budget_id: str | None = None
+    # Sessions created strictly after this instant.
+    created_after: datetime | None = None
     last_activity_before: datetime | None = None
     inactive_for_seconds: StrictInt | None = Field(
         default=None,
@@ -194,13 +196,13 @@ class SessionQuery(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("last_activity_before")
+    @field_validator("created_after", "last_activity_before")
     @classmethod
-    def validate_last_activity_before(cls, value: datetime | None) -> datetime | None:
+    def validate_aware_instants(cls, value: datetime | None, info) -> datetime | None:
         if value is None:
             return None
         if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("last_activity_before must be timezone-aware.")
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
         return value.astimezone(UTC)
 
     @field_validator("labels", mode="before")
@@ -324,6 +326,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         environment_name=query.environment_name,
         parent_session_id=query.parent_session_id,
         causal_budget_id=query.causal_budget_id,
+        created_after=query.created_after,
         last_activity_before=query.last_activity_before,
         inactive_for_seconds=query.inactive_for_seconds,
         labels=copy_label_map(query.labels, "labels"),
@@ -376,6 +379,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     if query.parent_session_id is not None and session.parent_session_id != query.parent_session_id:
         return False
     if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
+        return False
+    if query.created_after is not None and session.created_at <= query.created_after:
         return False
     if (
         query.last_activity_before is not None

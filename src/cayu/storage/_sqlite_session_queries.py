@@ -90,7 +90,7 @@ from cayu.storage._sqlite_connection import SQLiteOperationRunner
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds
 
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
@@ -1297,7 +1297,7 @@ async def list_sessions(
     query: SessionQuery | None,
     *,
     pending_interruption_cascade_only: bool,
-    access_bounds: _SessionAccessBounds | None = None,
+    access_bounds: SessionReadBounds | None = None,
     ownership_clock: Callable[[], datetime],
 ) -> SessionListResult:
     query = copy_session_query(query)

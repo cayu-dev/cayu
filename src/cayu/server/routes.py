@@ -2453,6 +2453,18 @@ _SUPERVISION_LINKAGE_FIELDS = (
 )
 
 
+def _supervision_event_query_from_request(body: SupervisionEventsRequest) -> SupervisionEventQuery:
+    """Carry every request field into the store query; only ``session_filter`` is renamed.
+
+    The query forbids unknown fields, so a request field without a query
+    counterpart fails loudly instead of being dropped from the filter.
+    """
+
+    fields = {name: getattr(body, name) for name in type(body).model_fields}
+    fields["sessions"] = fields.pop("session_filter")
+    return SupervisionEventQuery(**fields)
+
+
 def _serialize_supervision_event(
     cayu_app: Any,
     event: SupervisionEvent,
@@ -5072,19 +5084,7 @@ def create_router(
                 detail="The configured session store does not support supervision events.",
             )
         try:
-            query = SupervisionEventQuery(
-                start_at=body.start_at,
-                end_at=body.end_at,
-                sessions=body.session_filter,
-                exclude_forked_sessions=body.exclude_forked_sessions,
-                execution_profile_fingerprint=body.execution_profile_fingerprint,
-                release_id=body.release_id,
-                kinds=body.kinds,
-                actor_sources=body.actor_sources,
-                limit=body.limit,
-                max_bytes=body.max_bytes,
-                cursor=body.cursor,
-            )
+            query = _supervision_event_query_from_request(body)
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,

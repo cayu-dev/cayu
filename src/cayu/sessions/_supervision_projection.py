@@ -35,6 +35,7 @@ from cayu.sessions import queries as session_query_rules
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_baseline_from_session_metadata,
 )
+from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -42,6 +43,7 @@ from cayu.sessions._terminal_evidence import (
     INTERRUPTION_ORIGIN_PAYLOAD_KEY,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
+from cayu.sessions.fork_overlays import resolve_fork_lineage_async
 from cayu.sessions.pending_action_contracts import human_attention_id
 from cayu.sessions.queries import SessionQuery, session_query_from_aggregate_filter
 from cayu.sessions.records import EventRecord, PendingActionKind, Session
@@ -116,10 +118,18 @@ class _SessionEvidence:
         return self._sessions[session_id]
 
     async def forked(self, session_id: str) -> bool:
+        """Whether the session is in a forked lineage: a fork or created under one.
+
+        A session without a lineage marker is settled through its parents, as
+        the stores' SQL does, and one its parents cannot settle counts as forked.
+        """
+
         if session_id not in self._forked:
+            session = await self.session(session_id)
             self._forked[session_id] = (
-                await self.first_after(session_id, (EventType.SESSION_FORKED,), 0) is not None
-            )
+                session is not None
+                and (await resolve_fork_lineage_async(session, self.session)).forked
+            ) or await self.first_after(session_id, (EventType.SESSION_FORKED,), 0) is not None
         return self._forked[session_id]
 
     async def next_event(self, session_id: str, sequence: int) -> EventRecord | None:
@@ -354,7 +364,9 @@ def _cursor_audience(origin_tenant: str | None) -> str | None:
 
     parts: list[str] = []
     bounds = session_access_rules._query_bounds.get()
-    if bounds is not None:
+    if type(bounds) is _ForkControllerReadBounds:
+        parts.append(bounds.cursor_audience())
+    elif type(bounds) is session_access_rules._SessionAccessBounds:
         binding = bounds.binding
         parts.append(
             "scope:"
@@ -364,6 +376,8 @@ def _cursor_audience(origin_tenant: str | None) -> str | None:
                 else f"{binding.authority}:{binding.subject}:{binding.admitted_json}"
             )
         )
+    elif bounds is not None:
+        raise TypeError("Unknown session read bound.")
     if origin_tenant is not None:
         parts.append("tenant:" + origin_tenant)
     if not parts:

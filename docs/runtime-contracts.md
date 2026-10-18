@@ -2308,9 +2308,11 @@ fields are null when that work recorded no Release. Filtering by `release_id`
 is exact and applied after classification, like the other record filters, so a
 rarely seen Release can return empty pages with `has_more` true; continue with
 `next_cursor`.
-`exclude_forked_sessions` drops sessions whose origin is `session.forked`;
-subagent children remain included and every record carries
-`parent_session_id`. A non-empty `actor_sources` filter drops records without a
+`exclude_forked_sessions` drops every session in a forked lineage: a session
+whose origin is `session.forked`, and every session created under one, such as
+a fork's subagents and their children. A record's `forked` is true for exactly
+those sessions. Subagent children of unforked sessions remain included and
+every record carries `parent_session_id`. A non-empty `actor_sources` filter drops records without a
 recorded actor. `usage` is the usage of the anchor's model step attempt when
 recorded, otherwise null.
 

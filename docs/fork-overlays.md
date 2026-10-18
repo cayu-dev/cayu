@@ -39,6 +39,7 @@ app.enroll_fork_controller(
         agents=("finance-monthend",),
         host_tools=("lookup_ledger",),
         mcp_toolsets=(compass_tools,),
+        allow_model_runs=True,
     )
 )
 ```
@@ -59,12 +60,65 @@ Everything after `agents` is keyword-only.
 - `mcp_toolsets` is optional. A controller toolset must use a URL transport,
   so its tools run on the controller's side, and may not use `secret_env` or
   `secret_headers`, so no host secret is resolved for it.
+- `allow_model_runs` is False by default: the controller can create forks,
+  but not run them. See [Running forks](#running-forks).
 
 When a controller serves tools, enrollment registers one extra body per agent,
 named `<agent>@fork-controller:<controller>`. It is the host agent's exact
 registration (prompt, policies, hooks, context policy) plus the controller's
 tools. The body runs only as an overlay fork from that controller: ordinary
 runs, ordinary forks that name it, and host forks of its sessions are refused.
+
+### Enrolling from the environment
+
+A host can enroll one controller without code. When `CAYU_FORK_CONTROLLER_NAME`
+is set, `create_server` and `mount_cayu` (and so `cayu serve`) enroll that
+controller on the app after its agents are registered, and serve the
+fork-controller routes at `<api path>/fork-controller`: `/api/fork-controller`
+for `create_server` and `cayu serve`, `/cayu/api/fork-controller` for
+`mount_cayu` at its default path. The routes authenticate with the
+controller's own bearer token, never the operator login.
+
+| Variable | Value |
+| --- | --- |
+| `CAYU_FORK_CONTROLLER_NAME` | The controller name. Unset means no controller is enrolled from the environment. |
+| `CAYU_FORK_CONTROLLER_AGENTS` | Required. Comma-separated host agents it may fork. |
+| `CAYU_FORK_CONTROLLER_TOKEN_SHA256` | Required. Comma-separated lowercase hex SHA-256 digests of its bearer tokens. Give two during rotation. |
+| `CAYU_FORK_CONTROLLER_MODE` | Optional. Only `observe`. |
+| `CAYU_FORK_CONTROLLER_HOST_TOOLS` | Optional. Comma-separated host-tool allowance; the default is none. |
+| `CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS` | Optional. `true` or `false`; the default is `false`. |
+
+```bash
+token=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+export CAYU_FORK_CONTROLLER_NAME=compass
+export CAYU_FORK_CONTROLLER_AGENTS=finance-monthend
+export CAYU_FORK_CONTROLLER_TOKEN_SHA256=$(printf %s "$token" | shasum -a 256 | cut -d' ' -f1)
+cayu serve
+curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/fork-controller/enrollment
+```
+
+- The controller acts as subject `fork-controller:<name>`, which
+  `GET .../enrollment` reports. A fork's `profile_adoption.requested_by` names
+  that subject.
+- The host holds only digests, so the token never reaches its process. Cayu
+  can't check a token's length from its digest; use at least 32 random
+  characters.
+- Malformed configuration stops the server from starting: a missing required
+  variable, any of these variables set without a name, an empty list entry, a
+  repeated or malformed digest, an unknown mode or `ALLOW_MODEL_RUNS` value, an
+  unregistered agent, an unknown host tool, or a name or subject already
+  enrolled differently in code. Errors never include digests.
+- Mounting the same app twice reuses the one enrollment.
+- A `create_server` configuration with the API disabled serves no fork-controller
+  routes and enrolls nothing.
+- The parts are usable on their own:
+  `cayu.server.fork_controller.fork_controller_from_environment()` returns the
+  `ForkController` and its `ForkControllerBearerAuth`;
+  `ForkControllerBearerAuth.from_token_digests({...})` authenticates from
+  digests; and `environment_fork_controller_router(app)` enrolls and returns
+  the router for a host that mounts it itself.
+- A controller enrolled this way serves no tools; enroll in code to attach
+  `mcp_toolsets`.
 
 ## Forking with an overlay
 
@@ -92,28 +146,181 @@ events = controller.fork(
 ```
 
 `controller.resume(ResumeRequest(...))` continues a fork this controller
-created, while the host still enrolls the controller for that session's agent. `controller.snapshot_source(session_id)` returns the exact
+created, while the host still enrolls the controller for that session's agent
+and allows it to run forks (see [Running forks](#running-forks)). `controller.snapshot_source(session_id)` returns the exact
 `ForkSourceSnapshot` an `initial_invocation` fork needs; the child's first
 invocation then runs through the host's ordinary durable dispatch.
 
 `controller.enrollment()` returns a frozen `ForkControllerEnrollment`: the
 controller name, the authenticated subject, `mode`, the enrolled `agents`,
-`host_tools`, and `served_tools` (the names of the tools the controller
-serves). It describes only the caller's own enrollment. Other controllers,
+`host_tools`, `served_tools` (the names of the tools the controller
+serves) and `allow_model_runs`. It describes only the caller's own enrollment. Other controllers,
 other subjects of the same controller and agents outside the enrollment never
 appear.
 
 Hosts that expose the entrance over HTTP mount
 `cayu.server.fork_controller.create_fork_controller_router(app,
 authenticate=...)`, which serves `GET /fork-controller/enrollment`,
-`GET /fork-controller/sources/{id}/snapshot`, `POST /fork-controller/fork`
-and `POST /fork-controller/resume`. The host's
+`GET /fork-controller/sources/{id}/snapshot`, `POST /fork-controller/fork`,
+`POST /fork-controller/resume` and the read routes in
+[Reading sessions and events](#reading-sessions-and-events). The host's
 `authenticate` callback names the subject; request bodies never do. A body's
 `profile_adoption.requested_by` must name that same subject, and the recorded
 actor is rebuilt from it with `source="http_auth"`; body `tenant` and `claims`
 are dropped. A missing or empty subject returns 401. Denials, unknown sessions
 and foreign sessions all return the same 403; a conflicting fork, a rejected
 profile, or a source that changed after its exact snapshot returns 409.
+
+### Running forks
+
+A fork runs the host's model, and possibly the controller's tools, at the
+host's expense. Until a per-fork spend cap exists, running a controller's
+forks is the host's explicit choice: `ForkController(allow_model_runs=True)`.
+With the default, `False`:
+
+- `controller.fork(...)` with an `initial_invocation` is refused with
+  `ForkControllerDenied` (403 over HTTP);
+- `controller.resume(...)` is always refused the same way.
+
+The refusal comes before any child is created or dispatched, so no model,
+hosted tool or controller-served MCP tool is called. A fork without an
+`initial_invocation` is still created. The setting is read from the current
+enrollment on every request, so a host that restarts with
+`allow_model_runs=False` stops its controller from resuming forks created
+earlier.
+
+## Reading sessions and events
+
+A controller reads host sessions through the same entrance:
+
+| SDK (`ForkControllerAccess`) | HTTP |
+| --- | --- |
+| `sessions(SessionQuery)` | `GET /fork-controller/sessions` |
+| `session(id)` | `GET /fork-controller/sessions/{id}` |
+| `events(id, after_sequence=, before_sequence=, order_by=, limit=, max_bytes=)` | `GET /fork-controller/sessions/{id}/events` |
+| `query_events(EventQuery, exclude_forked_sessions=, max_bytes=)` | `POST /fork-controller/events/query` |
+| `supervision_events(SupervisionEventQuery)` | `POST /fork-controller/supervision-events/query` |
+
+The host enforces what a controller can read. A session is readable only when
+all of these hold:
+
+- its `agent_name` is one of the controller's enrolled `agents`, or the
+  controller's own body for one (`<agent>@fork-controller:<controller>`);
+- if it carries an overlay record, that record names this controller, so
+  another controller's forks, including instructions-only forks, stay private
+  to it;
+- if it carries a fork-lineage marker, the marker names this controller or no
+  controller, so everything created under another controller's fork stays
+  private to that controller too;
+- if it carries neither, its lineage settles through its parents (see
+  [Sessions without a marker](#sessions-without-a-marker)).
+
+A subagent child of an enrolled session is readable only when its own agent is
+enrolled.
+
+### Fork lineage
+
+Every fork, and every session created under a fork or under any of its
+descendants (a subagent, a delegated run, a grandchild), carries the
+runtime-owned metadata entry `cayu:fork_lineage`:
+`{"controller": <name or null>, "forked": true}`. A controller fork names its
+controller; a host fork, and everything under it, names no controller. A child
+copies the marker from its parent, or takes its controller from the parent's
+overlay record, inside the same store write that creates it, so the marker is
+durable on every store and survives restarts and the deletion of its parent.
+Ordinary children whose parent row settles an unforked lineage carry
+`{"controller": null, "forked": false}`. They inherit that marker through
+further descendants, so deleting or detaching a parent keeps their controller
+visibility and unforked supervision status unchanged.
+
+- A session whose marker names another controller is unreadable, like that
+  controller's fork itself. A marker that names no controller adds no limit.
+- A marker that is present but malformed makes the session unreadable to every
+  controller. The SQL clause and the memory predicate treat it the same way.
+- Callers cannot set, replace or remove the marker. Run and fork requests that
+  carry it are refused, metadata updates keep it, and subagent tool arguments
+  drop it. The HTTP run body has no metadata field.
+
+#### Sessions without a marker
+
+Sessions written before markers existed have none: forks and descendants
+already in a store when it is upgraded, and anything a writer from that
+release still creates. No migration adds markers. Instead, a session that
+carries neither an overlay record nor a marker settles its lineage through its
+parents, using facts every release stored: the parent link, each overlay
+record, and the `fork` invocation source every fork records. The walk climbs
+parents until one carries an overlay record or a marker, which then decides as
+above, or until it reaches a true root (no parent, and the root of its own
+session tree), which is unforked unless the walk passed a fork. A host fork
+passed on the way to a root puts the session in a host fork lineage.
+
+- A session whose parents do not settle its lineage is unreadable to every
+  controller and counts as forked. That covers a session whose parent was
+  deleted, since only a marker would have kept its owner, and a chain longer
+  than 256 parents.
+- A child copies its parent's marker. An unmarked ordinary root also establishes
+  an unforked marker for its children; other unmarked parents leave their children
+  unmarked and settling through the same parent walk. A new fork resolves its source's
+  lineage when it is created: a controller fork of a source that does not
+  settle is refused, and a host fork of one gets no marker.
+- SQLite and PostgreSQL walk the parents in the same SQL statement as the read,
+  with a recursive query; the memory store walks them under its lock.
+
+The session store evaluates this limit inside each read, in SQL on SQLite and
+PostgreSQL and as a predicate in the memory store. Labels play no part, and no
+read is filtered afterwards. Paging and counts are therefore exact. The limit
+is rebuilt from the current enrollment on every read, so narrowing `agents` or
+removing the controller when the host restarts cuts its reads at once. A store
+that does not declare `supports_fork_controller_reads` refuses every
+controller read with `NotImplementedError` (501 over HTTP).
+
+- Absent sessions, sessions of other agents and other controllers' forks look
+  identical: single-session reads raise `ForkControllerDenied` (403 over HTTP),
+  and lists, event queries and supervision pages leave them out. A
+  `session_ids` entry the controller cannot read matches nothing.
+- `SessionQuery(created_after=...)` (`created_after` over HTTP, timezone-aware)
+  lists only sessions created strictly after that instant, so a reader can
+  poll for new sessions.
+- Controller queries cannot set fields that carry host authority. Session and
+  supervision queries refuse `causal_budget_id`. An event query accepts only
+  `session_id`, `session_ids`, `event_type`, `event_types`,
+  `exclude_event_types`, `agent_name`, `environment_name`, `tool_name`, `since`,
+  `until`, `after_sequence`, `before_sequence`, `limit` and `order_by`; budget,
+  workflow and private linkage fields are refused with `ValueError` (422 over
+  HTTP).
+- `since` may be omitted from an event query, so a ledger can read events
+  older than its window, such as `session.execution_profile.decided`. Each page
+  is bounded by `after_sequence`, `limit` (at most 1,000 over HTTP) and
+  `max_bytes` (default 1 MiB, at most 4 MiB). A page over `max_bytes` raises
+  `EventQueryResultTooLarge` (413 over HTTP). HTTP pages report
+  `next_sequence` and `has_more`. `max_bytes` bounds only the records a page
+  returns: `has_more` is a separate existence check past the last one, so a
+  page whose records fit is returned even when the next record would not fit
+  with them.
+- An event query that is not for exactly one session reads in ascending
+  sequence order only; a descending one is refused with `ValueError` (422 over
+  HTTP). It starts after `after_sequence`, 0 when omitted, so on PostgreSQL
+  every page, the first one included, stops below any event a still-open
+  transaction holds, and continuing from the last returned sequence never
+  skips an event that commits late with a lower sequence. Single-session reads
+  keep both orders.
+- `exclude_forked_sessions` on event and supervision queries drops every
+  session in a forked lineage: a session with a `session.forked` event, an
+  overlay record or a forked lineage marker, one whose parents lead to such a
+  session or through a fork, and one whose lineage does not settle. That
+  includes the controller's own forks
+  and everything created under them, so a supervisor's investigations and
+  their subagents are not counted as the supervised agent's work. A
+  supervision record's `forked` is true for exactly those sessions.
+- Supervision pages never include content, and controllers cannot ask for it.
+  Every other filter the control plane accepts, `release_id` included, applies
+  over HTTP exactly as through the SDK. Cursors are bound to the controller and
+  to the query's filters: a cursor issued to another controller, by the control
+  plane, or for a differently filtered query is rejected
+  (`SupervisionEventCursorInvalid`, 422 over HTTP).
+- HTTP responses use the control plane's serializers, so session ids and
+  linkage are the same public values the control plane publishes. The routes
+  do not mount the control plane.
 
 ### Bearer-token authentication
 
@@ -160,7 +367,8 @@ rejected unless a configured `ExecutionProfilePolicy` adopts it.
 - An overlay fork belongs to the controller that created it, with or without
   granted tools: only that controller can fork it or snapshot it. Other
   controllers and ordinary host forks are refused, because the fork's durable
-  overlay record names its owner.
+  overlay record names its owner. The same holds for every session created
+  under the fork, whose lineage marker names the same owner.
 - Agent names containing `@fork-controller:` are reserved for the bodies that
   enrollment registers.
 - The host ceiling is still inherited or narrowed, and then limited to the
@@ -227,7 +435,8 @@ use. The controller's `tool_capability_ceiling` can only narrow that further.
 ## Operating mode
 
 `observe` is the only operating mode. An observing controller forks host
-sessions, continues and reads its own forks, and describes its enrollment. The
+sessions, continues its own forks when the host allows model runs, reads the
+sessions of its enrolled agents, and describes its enrollment. The
 controller entrance has no way to write to the session it forked from: it
 cannot add messages to it, steer it, resume it or resolve its approvals, and a
 fork cannot use it as the destination. Modes that write to the trunk are not

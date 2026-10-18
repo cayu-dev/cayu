@@ -206,7 +206,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.runtime.evidence_spool import EvidenceSpool
-    from cayu.sessions._access_rules import _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionReadBounds, _SessionAccessBounds
     from cayu.sessions._context_view_source import (
         CompletedTurnSnapshot,
         ContextViewPublicationSource,
@@ -436,11 +436,11 @@ class SessionStore(ABC):
     async def _access_read_records(self, bounds, session_id, kind, offset, limit, max_bytes):
         raise NotImplementedError("Atomic scoped record reads are unsupported.")
 
-    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+    async def _access_load_session(self, bounds: SessionReadBounds, session_id: str) -> Session:
         raise NotImplementedError("Atomic scoped session access is unsupported.")
 
     async def _access_list_sessions(
-        self, bounds: _SessionAccessBounds, query: SessionQuery
+        self, bounds: SessionReadBounds, query: SessionQuery
     ) -> SessionListResult:
         raise NotImplementedError("Atomic scoped session access is unsupported.")
 
@@ -461,6 +461,9 @@ class SessionStore(ABC):
     supports_session_topology: ClassVar[bool] = False
     supports_session_lineage: ClassVar[bool] = False
     supports_supervision_events: ClassVar[bool] = False
+    # Fork-controller reads evaluate _ForkControllerReadBounds on every read path.
+    # Declared on the class itself: a subclass that overrides a read must redeclare it.
+    supports_fork_controller_reads: ClassVar[bool] = False
     child_session_notification_version: ClassVar[int | None] = None
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_targeted_tool_grants: ClassVar[bool] = False

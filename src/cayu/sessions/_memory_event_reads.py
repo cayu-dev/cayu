@@ -211,13 +211,14 @@ async def event_exists(read: LockedEventRead, query: EventQuery) -> bool:
             else state.event_records
         )
         start = bisect_right(records, query.after_sequence or 0, key=lambda row: row.sequence)
+        session_matches = _session_matcher(query, state)
         for index in range(start, len(records)):
             record = records[index]
             if query.before_sequence is not None and record.sequence >= query.before_sequence:
                 break
             if event_query_rules._event_record_matches(
                 record, query, event_types, excluded_types
-            ) and _event_record_matches_session(record, query, state.sessions):
+            ) and session_matches(record):
                 return True
         return False
 
@@ -256,13 +257,14 @@ async def read_usage_accounting(
         )
         start = bisect_right(candidates, query.after_sequence or 0, key=lambda row: row.sequence)
         page: list[EventRecord] = []
+        session_matches = _session_matcher(query, state)
         for index in range(start, len(candidates)):
             record = candidates[index]
             if query.before_sequence is not None and record.sequence >= query.before_sequence:
                 break
             if not event_query_rules._event_record_matches(record, query, event_types, frozenset()):
                 continue
-            if not _event_record_matches_session(record, query, state.sessions):
+            if not session_matches(record):
                 continue
             page.append(record)
             if len(page) == USAGE_ACCOUNTING_PAGE_SIZE:
@@ -347,6 +349,7 @@ async def read_cost_accounting(
             additional_events=pending,
         )
         scanned = 0
+        session_matches = _session_matcher(query, state)
         for key, records in state.cost_event_index.groups(reducer):
             if query.session_id is not None and key[0] != query.session_id:
                 continue
@@ -366,7 +369,7 @@ async def read_cost_accounting(
                         continue
                     if event_query_rules._event_record_matches(
                         record, reducer.source_query, event_types, frozenset()
-                    ) and _event_record_matches_session(record, query, state.sessions):
+                    ) and session_matches(record):
                         reducer.add(record.sequence, record.event)
         return reducer.snapshot()
 
@@ -582,6 +585,7 @@ def _query_events_unlocked(
     )
     size_counter = None if max_bytes is None else JsonUtf8SizeCounter(max_bytes)
     records: list[EventRecord] = []
+    session_matches = _session_matcher(query, state)
     for index in indexes:
         record = candidates[index]
         if not event_query_rules._event_record_matches(
@@ -591,7 +595,7 @@ def _query_events_unlocked(
             excluded_event_types,
         ):
             continue
-        if not _event_record_matches_session(record, query, state.sessions):
+        if not session_matches(record):
             continue
         if size_counter is not None and not size_counter.value(record):
             assert max_bytes is not None
@@ -778,19 +782,57 @@ async def summarize_outcome(read: LockedEventRead, session_id: str) -> SessionOu
         return session_outcome_from_records(session, records)
 
 
-def _event_record_matches_session(
-    record: EventRecord,
+def _session_matcher(
     query: EventQuery,
-    sessions: dict[str, Session],
-) -> bool:
-    from cayu.sessions._access_rules import _query_bounds
+    state: MemoryEventReadState,
+) -> Callable[[EventRecord], bool]:
+    """Decide each owning session once per read, under the read's lock.
 
+    The read bound, the forked-lineage exclusion and the causal budget filter
+    depend only on the record's session, so a read costs one decision per
+    session rather than per record, and fork markers are indexed at most once.
+    """
+
+    from cayu.sessions._access_rules import _query_bounds, session_read_admitted
+    from cayu.sessions._fork_controller_bounds import _ForkControllerReadBounds
+
+    sessions = state.sessions
     bounds = _query_bounds.get()
-    if bounds is not None:
-        owner = sessions.get(record.event.session_id)
-        if owner is None or not bounds.matches(owner.labels):
-            return False
-    if query.causal_budget_id is None:
-        return True
-    session = sessions.get(record.event.session_id)
-    return session is not None and session.causal_budget_id == query.causal_budget_id
+    excludes = (
+        bounds.excludes
+        if type(bounds) is _ForkControllerReadBounds and bounds.exclude_forked
+        else None
+    )
+    decided: dict[str, bool] = {}
+    forked_session_ids: set[str] | None = None
+
+    def decide(session_id: str) -> bool:
+        nonlocal forked_session_ids
+        owner = sessions.get(session_id)
+        if bounds is not None:
+            if owner is None or not session_read_admitted(bounds, owner, sessions.get):
+                return False
+            if excludes is not None:
+                if excludes(owner, sessions.get):
+                    return False
+                if forked_session_ids is None:
+                    forked_session_ids = {
+                        marker.event.session_id
+                        for marker in state.type_event_records.get(
+                            str(EventType.SESSION_FORKED), ()
+                        )
+                    }
+                if owner.id in forked_session_ids:
+                    return False
+        if query.causal_budget_id is None:
+            return True
+        return owner is not None and owner.causal_budget_id == query.causal_budget_id
+
+    def matches(record: EventRecord) -> bool:
+        session_id = record.event.session_id
+        decision = decided.get(session_id)
+        if decision is None:
+            decision = decided[session_id] = decide(session_id)
+        return decision
+
+    return matches

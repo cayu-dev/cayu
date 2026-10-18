@@ -3,7 +3,9 @@
 Mount this router in a host application that authenticates its callers. The
 host's ``authenticate`` callback names the subject; request bodies never select
 the controller or carry its authority. ``ForkControllerBearerAuth`` is a stock
-``authenticate`` callback that maps bearer tokens to subjects.
+``authenticate`` callback that maps bearer tokens to subjects. Read routes use
+the control plane's serializers and byte limits; the store applies the
+controller's read limit to every read.
 """
 
 from __future__ import annotations
@@ -15,31 +17,73 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import aclosing, suppress
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
-from cayu._validation import require_durable_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    json_utf8_size_within_limit,
+    require_durable_clean_nonblank,
+)
 from cayu.applications import CayuApp
 from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.events import EventType
 from cayu.fork_controllers import (
+    FORK_CONTROLLER_READ_DEFAULT_BYTES,
+    FORK_CONTROLLER_READ_MAX_BYTES,
+    ForkController,
     ForkControllerAccess,
     ForkControllerDenied,
     ForkControllerEnrollment,
+    ForkControllerMode,
 )
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionRejected
 from cayu.server.auth import AuthConfigurationError
+from cayu.server.contracts import (
+    ApiEventRecord,
+    ApiSessionDetail,
+    ListSessionsResponse,
+    SupervisionEventsRequest,
+    SupervisionEventsResponse,
+)
+from cayu.server.routes import (
+    _BoundedPrivateJsonBodyRoute,
+    _BoundedSupervisionEventsRoute,
+    _serialize_event_record,
+    _serialize_session_base,
+    _serialize_session_cursor,
+    _serialize_session_detail,
+    _serialize_supervision_event,
+    _supervision_event_query_from_request,
+)
 from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.forks import ForkRequestConflict
+from cayu.sessions.queries import SessionOrder, SessionQuery
+from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest
+from cayu.sessions.supervision_events import (
+    SupervisionEventCursorInvalid,
+    SupervisionEventResultTooLarge,
+)
 
 _DENIED = "Fork controller access denied."
+_NO_STORE = {"Cache-Control": "private, no-store"}
+FORK_CONTROLLER_EVENT_PAGE_MAX = 1000
+FORK_CONTROLLER_EVENT_QUERY_MAX_SESSION_IDS = 500
+FORK_CONTROLLER_EVENT_QUERY_MAX_REQUEST_BYTES = 64 * 1024
 FORK_CONTROLLER_TOKENS_VARIABLE = "CAYU_FORK_CONTROLLER_TOKENS"
 FORK_CONTROLLER_TOKEN_MIN_CHARS = 32
 FORK_CONTROLLER_MAX_TOKENS = 64
 # RFC 6750 b64token: the only credential syntax a bearer header may carry.
 _BEARER_CREDENTIAL = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 def _token_digest(token: str) -> bytes:
@@ -62,12 +106,7 @@ class ForkControllerBearerAuth:
     def __init__(self, tokens: Mapping[str, str]) -> None:
         if not isinstance(tokens, Mapping):
             raise TypeError("tokens must map bearer tokens to subjects.")
-        if not tokens:
-            raise AuthConfigurationError("At least one fork-controller bearer token is required.")
-        if len(tokens) > FORK_CONTROLLER_MAX_TOKENS:
-            raise AuthConfigurationError(
-                f"At most {FORK_CONTROLLER_MAX_TOKENS} fork-controller bearer tokens are allowed."
-            )
+        _require_token_count(len(tokens))
         entries: list[tuple[bytes, str]] = []
         for index, (token, subject) in enumerate(tokens.items()):
             if (
@@ -79,18 +118,32 @@ class ForkControllerBearerAuth:
                     f"Fork-controller bearer token {index} must be a bearer credential of at "
                     f"least {FORK_CONTROLLER_TOKEN_MIN_CHARS} characters."
                 )
-            if type(subject) is not str:
-                raise AuthConfigurationError(
-                    f"The subject for fork-controller bearer token {index} must be a string."
-                )
-            try:
-                subject = require_durable_clean_nonblank(subject, "subject")
-            except ValueError:
-                raise AuthConfigurationError(
-                    f"The subject for fork-controller bearer token {index} is not a valid subject."
-                ) from None
-            entries.append((_token_digest(token), subject))
+            entries.append((_token_digest(token), _entry_subject(subject, index)))
         self._entries = tuple(entries)
+
+    @classmethod
+    def from_token_digests(cls, digests: Mapping[str, str]) -> ForkControllerBearerAuth:
+        """Map lowercase hex SHA-256 digests of bearer tokens to subjects.
+
+        Use it when the host holds only digests, so the tokens themselves never
+        reach the process. Cayu can't check a token's length from its digest;
+        issue tokens of at least ``FORK_CONTROLLER_TOKEN_MIN_CHARS`` random
+        characters. Digests never appear in errors, logs or ``repr``.
+        """
+
+        if not isinstance(digests, Mapping):
+            raise TypeError("digests must map token digests to subjects.")
+        _require_token_count(len(digests))
+        entries: list[tuple[bytes, str]] = []
+        for index, (digest, subject) in enumerate(digests.items()):
+            if type(digest) is not str or _SHA256_HEX.fullmatch(digest) is None:
+                raise AuthConfigurationError(
+                    f"Fork-controller token digest {index} must be a lowercase hex SHA-256 digest."
+                )
+            entries.append((bytes.fromhex(digest), _entry_subject(subject, index)))
+        auth = cls.__new__(cls)
+        auth._entries = tuple(entries)
+        return auth
 
     @classmethod
     def from_environment(
@@ -149,6 +202,28 @@ class ForkControllerBearerAuth:
         return f"ForkControllerBearerAuth(tokens={len(self._entries)})"
 
 
+def _require_token_count(count: int) -> None:
+    if not count:
+        raise AuthConfigurationError("At least one fork-controller bearer token is required.")
+    if count > FORK_CONTROLLER_MAX_TOKENS:
+        raise AuthConfigurationError(
+            f"At most {FORK_CONTROLLER_MAX_TOKENS} fork-controller bearer tokens are allowed."
+        )
+
+
+def _entry_subject(subject: object, index: int) -> str:
+    if type(subject) is not str:
+        raise AuthConfigurationError(
+            f"The subject for fork-controller bearer token {index} must be a string."
+        )
+    try:
+        return require_durable_clean_nonblank(subject, "subject")
+    except ValueError:
+        raise AuthConfigurationError(
+            f"The subject for fork-controller bearer token {index} is not a valid subject."
+        ) from None
+
+
 def _token_mapping(raw: str, source_name: str) -> dict[str, str]:
     # A JSON error keeps the whole document, tokens included, so it is not chained.
     parsed = True
@@ -202,6 +277,115 @@ async def _stream(events):
     return StreamingResponse(body(), media_type="text/event-stream")
 
 
+class ForkControllerEventQueryRequest(BaseModel):
+    """Cross-session event query for a controller; host-authority fields do not exist here.
+
+    ``since`` may be omitted; the page is bounded by ``after_sequence``,
+    ``limit`` and ``max_bytes``. A query that is not for exactly one session
+    reads in ascending order only and starts after ``after_sequence``, 0 when
+    omitted. Session ids the controller may not read match nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    session_id: str | None = None
+    session_ids: tuple[str, ...] = Field(
+        default=(), max_length=FORK_CONTROLLER_EVENT_QUERY_MAX_SESSION_IDS
+    )
+    event_type: EventType | str | None = None
+    event_types: tuple[EventType | str, ...] = Field(default=(), max_length=len(EventType))
+    exclude_event_types: tuple[EventType | str, ...] = Field(default=(), max_length=len(EventType))
+    agent_name: str | None = None
+    environment_name: str | None = None
+    tool_name: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+    after_sequence: StrictInt | None = None
+    before_sequence: StrictInt | None = None
+    limit: StrictInt = Field(default=100, ge=1, le=FORK_CONTROLLER_EVENT_PAGE_MAX)
+    order_by: EventOrder = EventOrder.SEQUENCE_ASC
+    exclude_forked_sessions: StrictBool = False
+    max_bytes: StrictInt = Field(
+        default=FORK_CONTROLLER_READ_DEFAULT_BYTES, ge=1, le=FORK_CONTROLLER_READ_MAX_BYTES
+    )
+
+
+class ForkControllerEventsResponse(BaseModel):
+    """One page of events; ``next_sequence`` continues it in ``order_by`` order."""
+
+    events: list[ApiEventRecord]
+    order_by: EventOrder
+    next_sequence: StrictInt | None
+    has_more: StrictBool
+
+
+class ForkControllerSessionEventsResponse(ForkControllerEventsResponse):
+    session_id: str
+
+
+class _BoundedEventQueryRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound controller event queries before FastAPI parses their filters."""
+
+    max_request_bytes = FORK_CONTROLLER_EVENT_QUERY_MAX_REQUEST_BYTES
+    invalid_request_detail = "Invalid fork-controller event query."
+    oversized_request_detail = "Fork-controller event query exceeds the server byte limit."
+
+
+def _too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail="The result exceeds the byte limit; request a smaller page.",
+        headers=_NO_STORE,
+    )
+
+
+async def _read(operation: Awaitable[Any]) -> Any:
+    """Map read failures to fixed details; an absent session and a foreign one look the same."""
+
+    try:
+        return await operation
+    except ForkControllerDenied:
+        raise HTTPException(status_code=403, detail=_DENIED, headers=_NO_STORE) from None
+    except NotImplementedError:
+        raise HTTPException(
+            status_code=501,
+            detail="The configured session store does not support fork-controller reads.",
+            headers=_NO_STORE,
+        ) from None
+    except (EventQueryResultTooLarge, SupervisionEventResultTooLarge):
+        raise _too_large() from None
+    except SupervisionEventCursorInvalid:
+        raise HTTPException(
+            status_code=422, detail="Invalid supervision event cursor.", headers=_NO_STORE
+        ) from None
+    except (ValueError, ValidationError):
+        raise HTTPException(
+            status_code=422, detail="Invalid fork-controller read.", headers=_NO_STORE
+        ) from None
+
+
+def _event_page(
+    app: CayuApp,
+    page: tuple[list[EventRecord], bool],
+    *,
+    order_by: EventOrder,
+    after_sequence: int | None,
+    before_sequence: int | None,
+    max_bytes: int,
+) -> dict[str, Any]:
+    records, has_more = page
+    cursor = after_sequence if order_by is EventOrder.SEQUENCE_ASC else before_sequence
+    payload = {
+        "events": [_serialize_event_record(app, record) for record in records],
+        "order_by": order_by,
+        "next_sequence": records[-1].sequence if records else cursor,
+        "has_more": has_more,
+    }
+    if not json_utf8_size_within_limit(payload["events"], max_bytes):
+        raise _too_large()
+    return payload
+
+
 def _with_authenticated_actor(body, subject: str):
     """Adoption provenance comes from authentication, never from the request body."""
 
@@ -230,7 +414,7 @@ def create_fork_controller_router(
     authenticate: Callable[[Request], Awaitable[str]],
     prefix: str = "/fork-controller",
 ) -> APIRouter:
-    """Mount enrollment, source snapshots, ``POST /fork`` and ``POST /resume`` for controllers."""
+    """Mount enrollment, source snapshots, forks, resumes and read routes for controllers."""
 
     if not callable(authenticate):
         raise TypeError("A trusted authentication callback is required.")
@@ -255,7 +439,8 @@ def create_fork_controller_router(
     async def snapshot(session_id: str, handle: ForkControllerAccess = access_dependency):
         try:
             return await handle.snapshot_source(session_id)
-        except (ForkControllerDenied, KeyError):
+        except (ForkControllerDenied, KeyError, ValueError):
+            # A malformed id is refused exactly like an absent or foreign one.
             raise HTTPException(status_code=403, detail=_DENIED) from None
 
     @router.post("/fork")
@@ -266,11 +451,310 @@ def create_fork_controller_router(
     async def resume(body: ResumeRequest, handle: ForkControllerAccess = access_dependency):
         return await _stream(handle.resume(_with_authenticated_actor(body, handle.subject)))
 
+    @router.get("/sessions", response_model=ListSessionsResponse)
+    async def sessions(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
+        status: SessionStatus | None = None,
+        agent_name: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+        created_after: datetime | None = None,
+        order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
+        handle: ForkControllerAccess = access_dependency,
+    ):
+        async def listed():
+            return await handle.sessions(
+                SessionQuery(
+                    status=status,
+                    agent_name=agent_name,
+                    created_after=created_after,
+                    limit=limit,
+                    cursor=cursor,
+                    include_total_count=True,
+                    order_by=order_by,
+                )
+            )
+
+        result = await _read(listed())
+        return {
+            "sessions": [_serialize_session_base(app, session) for session in result.sessions],
+            "next_cursor": _serialize_session_cursor(app, result.next_cursor),
+            "total_count": result.total_count,
+        }
+
+    @router.get("/sessions/{session_id}", response_model=ApiSessionDetail)
+    async def session(session_id: str, handle: ForkControllerAccess = access_dependency):
+        return _serialize_session_detail(app, await _read(handle.session(session_id)))
+
+    @router.get("/sessions/{session_id}/events", response_model=ForkControllerSessionEventsResponse)
+    async def session_events(
+        session_id: str,
+        after_sequence: Annotated[int | None, Query(ge=0, le=MAX_DURABLE_JSON_INTEGER)] = None,
+        before_sequence: Annotated[int | None, Query(ge=1, le=MAX_DURABLE_JSON_INTEGER)] = None,
+        order_by: EventOrder = EventOrder.SEQUENCE_ASC,
+        limit: Annotated[int, Query(ge=1, le=FORK_CONTROLLER_EVENT_PAGE_MAX)] = 100,
+        max_bytes: Annotated[
+            int, Query(ge=1, le=FORK_CONTROLLER_READ_MAX_BYTES)
+        ] = FORK_CONTROLLER_READ_DEFAULT_BYTES,
+        handle: ForkControllerAccess = access_dependency,
+    ):
+        loaded = await _read(handle.session(session_id))
+
+        async def queried():
+            # Built inside the guarded read, so an invalid range is a 422, not a 500.
+            return await handle._query_event_page(
+                EventQuery(
+                    session_id=loaded.id,
+                    after_sequence=after_sequence,
+                    before_sequence=before_sequence,
+                    order_by=order_by,
+                    limit=limit,
+                ),
+                exclude_forked_sessions=False,
+                max_bytes=max_bytes,
+            )
+
+        page = await _read(queried())
+        return {
+            "session_id": app.project_session_id_for_exposure(loaded.id),
+            **_event_page(
+                app,
+                page,
+                order_by=order_by,
+                after_sequence=after_sequence,
+                before_sequence=before_sequence,
+                max_bytes=max_bytes,
+            ),
+        }
+
+    async def query_events(
+        body: ForkControllerEventQueryRequest, handle: ForkControllerAccess = access_dependency
+    ):
+        fields = body.model_dump(
+            exclude={"exclude_forked_sessions", "max_bytes", "limit"}, exclude_defaults=True
+        )
+
+        async def queried():
+            return await handle._query_event_page(
+                EventQuery(**fields, limit=body.limit),
+                exclude_forked_sessions=body.exclude_forked_sessions,
+                max_bytes=body.max_bytes,
+            )
+
+        page = await _read(queried())
+        return _event_page(
+            app,
+            page,
+            order_by=body.order_by,
+            after_sequence=body.after_sequence,
+            before_sequence=body.before_sequence,
+            max_bytes=body.max_bytes,
+        )
+
+    router.add_api_route(
+        "/events/query",
+        query_events,
+        methods=["POST"],
+        response_model=ForkControllerEventsResponse,
+        route_class_override=_BoundedEventQueryRoute,
+    )
+
+    async def query_supervision_events(
+        body: SupervisionEventsRequest, handle: ForkControllerAccess = access_dependency
+    ):
+        async def paged():
+            return await handle._supervision_page_with_anchors(
+                _supervision_event_query_from_request(body)
+            )
+
+        page, anchors = await _read(paged())
+        return SupervisionEventsResponse.model_validate(
+            {
+                "events": [
+                    _serialize_supervision_event(app, event, anchors[event.sequence])
+                    for event in page.events
+                ],
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            }
+        )
+
+    router.add_api_route(
+        "/supervision-events/query",
+        query_supervision_events,
+        methods=["POST"],
+        response_model=SupervisionEventsResponse,
+        route_class_override=_BoundedSupervisionEventsRoute,
+    )
+
     return router
 
 
+FORK_CONTROLLER_NAME_VARIABLE = "CAYU_FORK_CONTROLLER_NAME"
+FORK_CONTROLLER_AGENTS_VARIABLE = "CAYU_FORK_CONTROLLER_AGENTS"
+FORK_CONTROLLER_TOKEN_SHA256_VARIABLE = "CAYU_FORK_CONTROLLER_TOKEN_SHA256"
+FORK_CONTROLLER_MODE_VARIABLE = "CAYU_FORK_CONTROLLER_MODE"
+FORK_CONTROLLER_HOST_TOOLS_VARIABLE = "CAYU_FORK_CONTROLLER_HOST_TOOLS"
+FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE = "CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS"
+#: The variables ``fork_controller_from_environment`` reads, all reserved for it.
+FORK_CONTROLLER_ENVIRONMENT_VARIABLES = (
+    FORK_CONTROLLER_NAME_VARIABLE,
+    FORK_CONTROLLER_AGENTS_VARIABLE,
+    FORK_CONTROLLER_TOKEN_SHA256_VARIABLE,
+    FORK_CONTROLLER_MODE_VARIABLE,
+    FORK_CONTROLLER_HOST_TOOLS_VARIABLE,
+    FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE,
+)
+#: A controller enrolled from the environment acts as ``fork-controller:<name>``.
+ENVIRONMENT_FORK_CONTROLLER_SUBJECT_PREFIX = "fork-controller:"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class EnvironmentForkController:
+    """One controller and its bearer authentication, read from the environment."""
+
+    controller: ForkController
+    authenticate: ForkControllerBearerAuth
+
+    def __repr__(self) -> str:
+        return f"EnvironmentForkController(controller={self.controller.name!r})"
+
+
+def _environment_names(raw: str, variable: str, *, allow_empty: bool) -> tuple[str, ...]:
+    if not raw.strip():
+        if allow_empty:
+            return ()
+        raise ValueError(f"{variable} must name at least one entry.")
+    names = tuple(item.strip() for item in raw.split(","))
+    if any(not name for name in names):
+        raise ValueError(f"{variable} must be a comma-separated list without empty entries.")
+    return names
+
+
+def fork_controller_from_environment(
+    environ: Mapping[str, str] | None = None,
+) -> EnvironmentForkController | None:
+    """Read one fork controller from the reserved ``CAYU_FORK_CONTROLLER_*`` variables.
+
+    Returns ``None`` when none of them is set. ``CAYU_FORK_CONTROLLER_NAME``,
+    ``CAYU_FORK_CONTROLLER_AGENTS`` (comma-separated) and
+    ``CAYU_FORK_CONTROLLER_TOKEN_SHA256`` (comma-separated lowercase hex
+    SHA-256 digests of the bearer tokens) are required. ``_MODE`` (``observe``),
+    ``_HOST_TOOLS`` (comma-separated, default none) and ``_ALLOW_MODEL_RUNS``
+    (``true`` or ``false``, default ``false``) are optional. The controller acts
+    as subject ``fork-controller:<name>``. Any malformed or partial
+    configuration raises, and errors never include digests. ``environ``
+    replaces ``os.environ``.
+    """
+
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    configured = {
+        name: source[name] for name in FORK_CONTROLLER_ENVIRONMENT_VARIABLES if name in source
+    }
+    if not configured:
+        return None
+    name = configured.get(FORK_CONTROLLER_NAME_VARIABLE, "").strip()
+    if not name:
+        raise ValueError(
+            f"{FORK_CONTROLLER_NAME_VARIABLE} must be set when any CAYU_FORK_CONTROLLER_* "
+            "enrollment variable is set."
+        )
+    for required in (FORK_CONTROLLER_AGENTS_VARIABLE, FORK_CONTROLLER_TOKEN_SHA256_VARIABLE):
+        if required not in configured:
+            raise ValueError(f"{required} must be set to enroll a fork controller.")
+    agents = _environment_names(
+        configured[FORK_CONTROLLER_AGENTS_VARIABLE],
+        FORK_CONTROLLER_AGENTS_VARIABLE,
+        allow_empty=False,
+    )
+    host_tools = _environment_names(
+        configured.get(FORK_CONTROLLER_HOST_TOOLS_VARIABLE, ""),
+        FORK_CONTROLLER_HOST_TOOLS_VARIABLE,
+        allow_empty=True,
+    )
+    allow_model_runs = configured.get(FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE, "false")
+    if allow_model_runs not in {"true", "false"}:
+        raise ValueError(f"{FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE} must be true or false.")
+    mode = configured.get(FORK_CONTROLLER_MODE_VARIABLE, ForkControllerMode.OBSERVE.value)
+    if mode not in {item.value for item in ForkControllerMode}:
+        raise ValueError(f"{FORK_CONTROLLER_MODE_VARIABLE} must be 'observe'.")
+    try:
+        controller = ForkController(
+            name=name,
+            subjects=(ENVIRONMENT_FORK_CONTROLLER_SUBJECT_PREFIX + name,),
+            agents=agents,
+            host_tools=host_tools,
+            mode=ForkControllerMode(mode),
+            allow_model_runs=allow_model_runs == "true",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"The CAYU_FORK_CONTROLLER_* enrollment is invalid: {exc}") from None
+    raw_digests = configured[FORK_CONTROLLER_TOKEN_SHA256_VARIABLE]
+    # Digests are split without echoing them; each is validated by position only.
+    digests = [item.strip() for item in raw_digests.split(",")] if raw_digests.strip() else []
+    if len(digests) != len(set(digests)):
+        raise AuthConfigurationError(f"{FORK_CONTROLLER_TOKEN_SHA256_VARIABLE} repeats a digest.")
+    subject = controller.subjects[0]
+    try:
+        authenticate = ForkControllerBearerAuth.from_token_digests(dict.fromkeys(digests, subject))
+    except AuthConfigurationError as exc:
+        raise AuthConfigurationError(f"{FORK_CONTROLLER_TOKEN_SHA256_VARIABLE}: {exc}") from None
+    return EnvironmentForkController(controller=controller, authenticate=authenticate)
+
+
+def environment_fork_controller_router(
+    app: CayuApp,
+    *,
+    prefix: str = "/fork-controller",
+    environ: Mapping[str, str] | None = None,
+) -> APIRouter | None:
+    """Enroll the environment's fork controller on ``app`` and return its router.
+
+    Returns ``None`` when the environment names no controller. The application's
+    agents must already be registered. Calling it again with the same
+    configuration reuses the enrollment; a controller enrolled in code under the
+    same name with a different enrollment is a conflict.
+    """
+
+    configured = fork_controller_from_environment(environ)
+    if configured is None:
+        return None
+    controller = configured.controller
+    try:
+        existing = app._agent_registry.fork_controller(controller.name)
+    except KeyError:
+        existing = None
+    if existing is None:
+        try:
+            app.enroll_fork_controller(controller)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"The fork controller named by {FORK_CONTROLLER_NAME_VARIABLE} cannot be "
+                f"enrolled: {exc}"
+            ) from None
+    elif existing != controller:
+        raise ValueError(
+            f"{FORK_CONTROLLER_NAME_VARIABLE} names a fork controller the application already "
+            "enrolled differently."
+        )
+    return create_fork_controller_router(app, authenticate=configured.authenticate, prefix=prefix)
+
+
 __all__ = [
+    "ENVIRONMENT_FORK_CONTROLLER_SUBJECT_PREFIX",
+    "FORK_CONTROLLER_AGENTS_VARIABLE",
+    "FORK_CONTROLLER_ALLOW_MODEL_RUNS_VARIABLE",
+    "FORK_CONTROLLER_ENVIRONMENT_VARIABLES",
+    "FORK_CONTROLLER_HOST_TOOLS_VARIABLE",
+    "FORK_CONTROLLER_MODE_VARIABLE",
+    "FORK_CONTROLLER_NAME_VARIABLE",
     "FORK_CONTROLLER_TOKENS_VARIABLE",
+    "FORK_CONTROLLER_TOKEN_SHA256_VARIABLE",
+    "EnvironmentForkController",
     "ForkControllerBearerAuth",
+    "ForkControllerEventQueryRequest",
+    "ForkControllerEventsResponse",
+    "ForkControllerSessionEventsResponse",
     "create_fork_controller_router",
+    "environment_fork_controller_router",
+    "fork_controller_from_environment",
 ]
