@@ -39,6 +39,7 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
         await task_store.create_task(
             TaskCreate(
                 task_id="leased_task",
+                concurrency_key="repo/app#42",
                 type="review",
                 assigned_agent_name="assistant",
             )
@@ -53,6 +54,8 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
 
     assert len(tasks) == 1
     assert tasks[0]["id"] == "leased_task"
+    assert tasks[0]["concurrency_key"] == "repo/app#42"
+    assert client.get("/api/tasks/leased_task").json()["concurrency_key"] == "repo/app#42"
     assert tasks[0]["type"] == "review"
     assert tasks[0]["title"] is None
     assert tasks[0]["status"] == "claimed"

@@ -1724,6 +1724,10 @@ export type ApiTaskDetail = {
      */
     completed_at: string | null;
     /**
+     * Concurrency Key
+     */
+    concurrency_key?: string | null;
+    /**
      * Created At
      */
     created_at: string;
@@ -1846,6 +1850,10 @@ export type ApiTaskListItem = {
      * Completed At
      */
     completed_at: string | null;
+    /**
+     * Concurrency Key
+     */
+    concurrency_key?: string | null;
     /**
      * Created At
      */

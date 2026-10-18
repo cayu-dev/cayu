@@ -32,7 +32,10 @@ def test_shutdown_waits_for_cleanup_then_requeues_or_respects_operator_cancel(
             InMemoryTaskStore() if backend == "memory" else SQLiteTaskStore(tmp_path / "tasks.db")
         )
         app = CayuApp(task_store=store, enable_logging=False)
-        created = await store.create_task(TaskCreate(type="job", restartable=True))
+        created = await store.create_task(
+            TaskCreate(type="job", restartable=True, concurrency_key="restart-job")
+        )
+        await store.create_task(TaskCreate(type="peer", concurrency_key="restart-job"))
         ready = asyncio.Event()
         cleaning = asyncio.Event()
         release = asyncio.Event()
@@ -75,6 +78,13 @@ def test_shutdown_waits_for_cleanup_then_requeues_or_respects_operator_cancel(
                     "first",
                     current.lease_expires_at,
                 )
+                # Cancellation during shutdown must retain the resource through
+                # cleanup longer than the lease observed by the operator.
+                await asyncio.sleep(3.1)
+                from datetime import UTC, datetime
+
+                assert (await store.load_task(created.id)).lease_expires_at > datetime.now(UTC)
+                assert await store.claim_task("same-key-competitor") is None
             worker.cancel()  # repeated shutdown signals must not interrupt cleanup
             release.set()
             with pytest.raises(asyncio.CancelledError):

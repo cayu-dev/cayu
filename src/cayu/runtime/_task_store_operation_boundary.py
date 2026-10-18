@@ -23,6 +23,7 @@ from cayu.tasks.admission import (
     WorkAttemptExecutionClaimLost,
     WorkAttemptRecoveryRequired,
     _GroupExecutionEntryRefused,
+    _WorkAttemptConcurrencyKeyBusy,
 )
 from cayu.tasks.completion_evaluations import CompletionEvaluationBudgetExhausted
 from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatchBudgetExhausted
@@ -574,6 +575,7 @@ def _detached_task_store_failure(
         WorkAttemptAdmissionConflict,
         WorkAttemptExecutionClaimLost,
         _GroupExecutionEntryRefused,
+        _WorkAttemptConcurrencyKeyBusy,
         WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
         CompletionEvaluationBudgetExhausted,
@@ -745,6 +747,7 @@ def _generic_task_store_failure(
         WorkAttemptAdmissionConflict,
         WorkAttemptExecutionClaimLost,
         _GroupExecutionEntryRefused,
+        _WorkAttemptConcurrencyKeyBusy,
         WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
         CompletionEvaluationBudgetExhausted,

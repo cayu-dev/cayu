@@ -34,6 +34,7 @@ from cayu._validation import require_durable_clean_nonblank as require_clean_non
 from cayu._validation import require_durable_nonblank as require_nonblank
 from cayu.sessions import records as session_record_rules
 from cayu.sessions.invocation import SessionInvocationBinding, TaskInvocation, copy_task_invocation
+from cayu.tasks._concurrency_keys import ConcurrencyKey
 from cayu.tasks.contracts import (
     WORK_CONTRACT_TASK_MAX_BYTES,
     WORK_CONTRACT_TASK_MAX_ITEMS,
@@ -341,6 +342,7 @@ class Task(BaseModel):
 
     id: str = Field(default_factory=lambda: str(uuid4()))
     type: str
+    concurrency_key: ConcurrencyKey = None
     restartable: StrictBool = False
     restart_count: StrictInt = Field(default=0, ge=0)
     title: str | None = None
@@ -519,6 +521,7 @@ class Task(BaseModel):
             if self.worker_id is not None:
                 _validate_task_retry_reconciliation_identity(self.worker_id, "worker_id")
             expected = _task_retry_attempt_authority_sha256(
+                concurrency_key=self.concurrency_key,
                 task_id=self.id,
                 task_type=self.type,
                 title=self.title,
@@ -566,6 +569,7 @@ def copy_task(task: Task) -> Task:
         _preflight_bounded_task_payloads(task)
     return Task(
         id=task.id,
+        concurrency_key=task.concurrency_key,
         restartable=task.restartable,
         restart_count=task.restart_count,
         type=task.type,
@@ -668,12 +672,14 @@ def _task_retry_attempt_authority_sha256(
     cumulative_tokens: int,
     cumulative_estimated_cost: Decimal,
     predecessor_task_id: str | None,
+    concurrency_key: str | None,
 ) -> str:
     """Bind one attempt to its complete immutable and cumulative authority."""
 
     material = canonical_durable_json_bytes(
         {
             "schema": "cayu.task-retry-attempt-authority.v1",
+            **({"concurrency_key": concurrency_key} if concurrency_key is not None else {}),
             "task_id": task_id,
             "task_type": task_type,
             "title": title,

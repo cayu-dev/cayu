@@ -136,6 +136,7 @@ from cayu.tasks.admission import (
     WorkAttemptExecutionEntryResult,
     WorkAttemptExecutionStopRequest,
     WorkAttemptRecoveryActivate,
+    _WorkAttemptConcurrencyKeyBusy,
     copy_admitted_completion_proposal_request,
     copy_work_attempt_admission_activate,
     copy_work_attempt_admission_prepare,
@@ -355,7 +356,14 @@ from cayu.tasks.work_receipts import (
 _T = TypeVar("_T")
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 123
+def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
+    return (
+        f"{prefix}status IN ('claimed', 'running') AND {prefix}worker_id IS NOT NULL "
+        f"AND {prefix}lease_expires_at > ?"
+    )
+
+
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 124
 
 
 @model_store_surface("tasks")
@@ -1348,16 +1356,19 @@ class SQLiteTaskStore(TaskStore):
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
         await self._admit_ordinary_session(session_id, cleanup_only=False)
 
+    def _raise_if_retired_task_session_unlocked(self, session_id: str) -> None:
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            is not None
+        ):
+            raise TaskClaimLost("A retired task session cannot execute again.")
+
     async def require_unretired_task_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
-            if (
-                self._connection.execute(
-                    "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = ?", (session_id,)
-                ).fetchone()
-                is not None
-            ):
-                raise TaskClaimLost("A retired task session cannot execute again.")
+            self._raise_if_retired_task_session_unlocked(session_id)
 
     async def admit_ordinary_session_cleanup(self, session_id: str) -> None:
         await self._admit_ordinary_session(session_id, cleanup_only=True)
@@ -1366,14 +1377,8 @@ class SQLiteTaskStore(TaskStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             with self._verified_transaction_unlocked():
-                if not cleanup_only and (
-                    self._connection.execute(
-                        "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = ?",
-                        (session_id,),
-                    ).fetchone()
-                    is not None
-                ):
-                    raise TaskClaimLost("A retired task session cannot execute again.")
+                if not cleanup_only:
+                    self._raise_if_retired_task_session_unlocked(session_id)
                 self._ensure_session_execution_authority_unlocked(session_id, "ordinary")
 
     async def hold_claimed_work_contract_task(
@@ -1668,6 +1673,8 @@ class SQLiteTaskStore(TaskStore):
                     session_id=request.session_id,
                     session_binding=request.session_invocation,
                 )
+                if not self._concurrency_key_available_unlocked(task, lease_now):
+                    raise _WorkAttemptConcurrencyKeyBusy("Task concurrency key is already leased.")
                 claim_request = WorkAttemptExecutionClaimRequest(
                     admission_id=request.admission_id,
                     claim_id=request.claim_id,
@@ -2341,6 +2348,8 @@ class SQLiteTaskStore(TaskStore):
                     is not None
                 ):
                     raise WorkAttemptAdmissionConflict("Execution-claim identity is already bound.")
+                if not self._concurrency_key_available_unlocked(task, now):
+                    raise _WorkAttemptConcurrencyKeyBusy("Task concurrency key is already leased.")
                 replacement = WorkAttemptExecutionClaim(
                     admission_id=request.admission_id,
                     claim_id=request.claim_id,
@@ -3923,9 +3932,9 @@ class SQLiteTaskStore(TaskStore):
                     invocation_json,
                     retry_series_json,
                     work_contract_json,
-                    schedule_json, restartable, restart_count
+                    schedule_json, restartable, restart_count, concurrency_key
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_records.task_to_row_values(task),
             )
@@ -5352,6 +5361,9 @@ class SQLiteTaskStore(TaskStore):
                     if not _task_matches_claim_filter(observed, query):
                         filtered += 1
                         continue
+                    if not self._concurrency_key_available_unlocked(observed, now):
+                        filtered += 1
+                        continue
                     candidate_handoff_id = observed.interrupted_handoff_id
                     if candidate_handoff_id is None:
                         raise AssertionError("Continuation candidate lost its handoff generation.")
@@ -5703,8 +5715,8 @@ class SQLiteTaskStore(TaskStore):
                             status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
-                            work_contract_json, schedule_json, restartable, restart_count
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            work_contract_json, schedule_json, restartable, restart_count, concurrency_key
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_records.task_to_row_values(successor),
                     )
@@ -6236,6 +6248,17 @@ class SQLiteTaskStore(TaskStore):
             updated = self._require_task_unlocked(task_id)
             return updated.model_copy(deep=True)
 
+    def _concurrency_key_available_unlocked(self, task: Task, now: datetime) -> bool:
+        return (
+            task.concurrency_key is None
+            or self._connection.execute(
+                "SELECT 1 FROM cayu_tasks WHERE concurrency_key = ? AND id != ? "
+                "AND " + _busy_concurrency_key_sql() + " LIMIT 1",
+                (task.concurrency_key, task.id, sqlite_records.format_datetime(now)),
+            ).fetchone()
+            is None
+        )
+
     async def claim_task(
         self,
         worker_id: str,
@@ -6265,6 +6288,9 @@ class SQLiteTaskStore(TaskStore):
             [
                 "status = ?",
                 "session_id IS NULL",
+                "(concurrency_key IS NULL OR NOT EXISTS (SELECT 1 FROM cayu_tasks AS busy "
+                "WHERE busy.concurrency_key = cayu_tasks.concurrency_key "
+                "AND " + _busy_concurrency_key_sql("busy.") + "))",
                 "(available_at IS NULL OR available_at <= ?)",
                 retry_deadline_clause,
                 "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
@@ -6374,6 +6400,7 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     [
                         str(TaskStatus.PENDING),
+                        sqlite_records.format_datetime(now),
                         sqlite_records.format_datetime(availability_now),
                         *(
                             [sqlite_records.format_datetime(availability_now)]
@@ -6467,7 +6494,13 @@ class SQLiteTaskStore(TaskStore):
         stamp = sqlite_records.format_datetime(as_of)
         rows = self._connection.execute(
             f"SELECT id FROM cayu_tasks WHERE {scope} "
-            "AND status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group') "
+            "AND status IN ('pending', 'paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group') "
+            "AND (status != 'pending' OR (concurrency_key IS NOT NULL AND EXISTS ("
+            "SELECT 1 FROM cayu_tasks AS busy WHERE busy.concurrency_key = cayu_tasks.concurrency_key "
+            "AND " + _busy_concurrency_key_sql("busy.") + "))) "
+            "AND (status != 'pending' OR retry_series_json IS NULL "
+            "OR json_extract(retry_series_json, '$.elapsed_deadline') IS NULL "
+            "OR julianday(json_extract(retry_series_json, '$.elapsed_deadline')) > julianday(?)) "
             "AND schedule_json IS NOT NULL AND json_extract(schedule_json, '$.admitted_at') IS NULL "
             "AND (replace(json_extract(schedule_json, '$.policy.expires_at'), 'Z', '+00:00') <= ? OR "
             "(json_extract(schedule_json, '$.policy.misfire_policy') = 'skip' AND "
@@ -6478,11 +6511,12 @@ class SQLiteTaskStore(TaskStore):
             "(cayu_tasks.retry_series_json IS NOT NULL AND attempt.retry_series_id = "
             "json_extract(cayu_tasks.retry_series_json, '$.series_id')))) "
             "ORDER BY available_at, id LIMIT 100",
-            [*params, stamp, stamp],
+            [*params, sqlite_records.format_datetime(now), stamp, stamp, stamp],
         ).fetchall()
         for row in rows:
             task = self._require_task_unlocked(row["id"])
             if task.status not in {
+                TaskStatus.PENDING,
                 TaskStatus.PAUSED,
                 TaskStatus.BLOCKED,
                 TaskStatus.NEEDS_ATTENTION,
@@ -7190,6 +7224,7 @@ class SQLiteTaskStore(TaskStore):
                     raise WorkAttemptExecutionClaimLost(
                         "Admitted work attempts cannot use ordinary task holds."
                     )
+                _ensure_can_hold_task(prior, status)
                 cursor = self._connection.execute(
                     """
                     UPDATE cayu_tasks

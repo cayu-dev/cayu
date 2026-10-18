@@ -52,6 +52,7 @@ from cayu.tasks.admission import (
     WorkAttemptExecutionEntryResult,
     WorkAttemptExecutionStopRequest,
     WorkAttemptRecoveryActivate,
+    _WorkAttemptConcurrencyKeyBusy,
     copy_admitted_completion_proposal_request,
     copy_work_attempt_admission_activate,
     copy_work_attempt_admission_prepare,
@@ -358,6 +359,10 @@ class PostgresVerifiedWorkMixin:
 
         async def _ensure_ready(self) -> None: ...
 
+        async def _claim_concurrency_key(self, cur: Any, task: Task) -> bool: ...
+        async def _lock_concurrency_key_for_renewal(self, cur: Any, task_id: str) -> None: ...
+        async def _concurrency_key_available(self, cur: Any, task: Task) -> bool: ...
+
         async def _record_task_transition(
             self,
             cur: Any,
@@ -451,6 +456,9 @@ class PostgresVerifiedWorkMixin:
             ) as checked_out_connection:
                 connection = checked_out_connection
                 connection_owner.acquire(connection)
+                # Key admission rechecks require a fresh statement snapshot,
+                # including behind transaction pools and nondefault DB roles.
+                await connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                 yield timed_postgres_connection(connection)
         finally:
             if connection is not None:
@@ -1222,15 +1230,18 @@ class PostgresVerifiedWorkMixin:
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
         await self._admit_ordinary_session(session_id, cleanup_only=False)
 
+    async def _raise_if_retired_task_session(self, cur: Any, session_id: str) -> None:
+        await cur.execute(
+            "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = %s", (session_id,)
+        )
+        if await cur.fetchone() is not None:
+            raise TaskClaimLost("A retired task session cannot execute again.")
+
     async def require_unretired_task_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = %s", (session_id,)
-            )
-            if await cur.fetchone() is not None:
-                raise TaskClaimLost("A retired task session cannot execute again.")
+            await self._raise_if_retired_task_session(cur, session_id)
 
     async def admit_ordinary_session_cleanup(self, session_id: str) -> None:
         await self._admit_ordinary_session(session_id, cleanup_only=True)
@@ -1242,12 +1253,7 @@ class PostgresVerifiedWorkMixin:
         async def operation(conn: Any, cur: Any) -> None:
             del conn
             if not cleanup_only:
-                await cur.execute(
-                    "SELECT 1 FROM cayu_retired_task_sessions WHERE session_id = %s",
-                    (session_id,),
-                )
-                if await cur.fetchone() is not None:
-                    raise TaskClaimLost("A retired task session cannot execute again.")
+                await self._raise_if_retired_task_session(cur, session_id)
             await self._ensure_session_authority(cur, session_id, "ordinary")
 
         await self._run_verified_work_mutation(operation)
@@ -1591,6 +1597,8 @@ class PostgresVerifiedWorkMixin:
                 session_id=request.session_id,
                 session_binding=request.session_invocation,
             )
+            if not await self._claim_concurrency_key(cur, task):
+                raise _WorkAttemptConcurrencyKeyBusy("Task concurrency key is already leased.")
             claim_request = WorkAttemptExecutionClaimRequest(
                 admission_id=request.admission_id,
                 claim_id=request.claim_id,
@@ -2165,6 +2173,12 @@ class PostgresVerifiedWorkMixin:
 
         async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
             del conn
+            observed = await self._load_work_attempt_admission_row(
+                cur, request.admission_id, for_update=False
+            )
+            if observed is None:
+                raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
+            await self._lock_concurrency_key_for_renewal(cur, observed.task_id)
             await self._lock_verified_work_identity(
                 cur,
                 "admission",
@@ -2191,6 +2205,10 @@ class PostgresVerifiedWorkMixin:
             await self._lock_verified_work_identity(cur, "claim", claim.claim_id)
             await self._lock_verified_work_task(cur, admission.task_id)
             task = await self._load_task_locked(cur, admission.task_id)
+            if task.concurrency_key is not None and not await self._concurrency_key_available(
+                cur, task
+            ):
+                raise WorkAttemptExecutionClaimLost("Task concurrency key is already leased.")
             lease_now = await self._verified_lease_now(cur)
             self._ensure_live_work_attempt_admission_claim(admission, now=lease_now)
             await cur.execute(
@@ -2354,6 +2372,8 @@ class PostgresVerifiedWorkMixin:
             )
             if await cur.fetchone() is not None:
                 raise WorkAttemptAdmissionConflict("Execution-claim identity is already bound.")
+            if not await self._claim_concurrency_key(cur, task):
+                raise _WorkAttemptConcurrencyKeyBusy("Task concurrency key is already leased.")
             replacement = WorkAttemptExecutionClaim(
                 admission_id=request.admission_id,
                 claim_id=request.claim_id,

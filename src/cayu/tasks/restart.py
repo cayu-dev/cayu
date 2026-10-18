@@ -34,7 +34,7 @@ def _restarted_task(
                 "completed_at": None,
                 "result": None,
                 "error": None,
-                "status_reason": "worker_shutdown_requeued",
+                "status_reason": None,
                 "status_payload": {
                     "restart": {
                         "count": task.restart_count + 1,

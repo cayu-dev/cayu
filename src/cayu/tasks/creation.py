@@ -34,6 +34,7 @@ from cayu.sessions.invocation import (
     copy_task_invocation,
     inherited_task_invocation,
 )
+from cayu.tasks._concurrency_keys import ConcurrencyKey
 from cayu.tasks._scheduling import schedule_creation_digest
 from cayu.tasks.contracts import (
     WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
@@ -118,6 +119,7 @@ class TaskCreate(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     retry_policy: TaskRetryPolicy | None = None
+    concurrency_key: ConcurrencyKey = None
     restartable: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
     work_contract: WorkContractRef | None = None
     invocation_origin: InvocationOriginClaim | None = None
@@ -127,6 +129,8 @@ class TaskCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_restartable(self) -> TaskCreate:
+        if self.concurrency_key is not None and self.session_id is not None:
+            raise ValueError("Concurrency-keyed tasks must start as unattached queue jobs.")
         if self.restartable and any(
             value is not None
             for value in (
@@ -241,6 +245,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         _preflight_bounded_task_payloads(request, ("input", "metadata"))
     copied = TaskCreate(
         task_id=request.task_id,
+        concurrency_key=request.concurrency_key,
         restartable=request.restartable,
         type=request.type,
         title=request.title,
@@ -572,6 +577,7 @@ def _task_from_create(
     else:
         retry_series_id = _task_retry_series_id(task_id)
         authority_sha256 = _task_retry_attempt_authority_sha256(
+            concurrency_key=request.concurrency_key,
             task_id=task_id,
             task_type=request.type,
             title=request.title,
@@ -606,6 +612,7 @@ def _task_from_create(
         title=request.title,
         description=request.description,
         status=TaskStatus.PENDING,
+        concurrency_key=request.concurrency_key,
         restartable=request.restartable,
         session_id=request.session_id,
         session_instance_id=(

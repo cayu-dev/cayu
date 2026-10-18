@@ -1498,6 +1498,7 @@ async def _await_task_handler(
                         heartbeat_task,
                         stop_heartbeat,
                         lease_authority=lease_authority,
+                        lease_seconds=lease_seconds,
                         cancellation_error={"code": "task_worker_lease_authority_lost"},
                         primary_failure=heartbeat_failure,
                     )
@@ -1510,6 +1511,7 @@ async def _await_task_handler(
                         heartbeat_task,
                         stop_heartbeat,
                         lease_authority=lease_authority,
+                        lease_seconds=lease_seconds,
                         cancellation_baseline=cancellation_baseline,
                         primary_failure=heartbeat_failure,
                     )
@@ -1533,6 +1535,7 @@ async def _await_task_handler(
                         heartbeat_task,
                         stop_heartbeat,
                         lease_authority=lease_authority,
+                        lease_seconds=lease_seconds,
                         cancellation_error={"code": "task_worker_lease_authority_lost"},
                         primary_failure=heartbeat_failure,
                     )
@@ -1545,6 +1548,7 @@ async def _await_task_handler(
                         heartbeat_task,
                         stop_heartbeat,
                         lease_authority=lease_authority,
+                        lease_seconds=lease_seconds,
                         cancellation_baseline=cancellation_baseline,
                         primary_failure=heartbeat_failure,
                     )
@@ -1722,6 +1726,7 @@ async def _await_task_handler(
                 heartbeat_task,
                 stop_heartbeat,
                 lease_authority=lease_authority,
+                lease_seconds=lease_seconds,
                 owner_cancellation=owner_cancellation,
             )
             raise owner_cancellation from exception_cause(owner_cancellation)
@@ -1733,11 +1738,46 @@ async def _await_task_handler(
             heartbeat_task,
             stop_heartbeat,
             lease_authority=lease_authority,
+            lease_seconds=lease_seconds,
             cancellation_error={"code": "task_worker_owner_cancelled"},
             primary_failure=owner_cancellation,
             owner_cancellation=owner_cancellation,
         )
         raise owner_cancellation from exception_cause(owner_cancellation)
+
+
+def _heartbeat_during_quiescence(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    lease_seconds: int,
+    heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
+    stop_heartbeat: asyncio.Event,
+    *,
+    lease_authority: _TaskLeaseAuthority,
+) -> asyncio.Task[_TaskHeartbeatOutcome]:
+    lease_authority.keep_renewing_on_cancellation = True
+    if (
+        heartbeat_task.done()
+        and not heartbeat_task.cancelled()
+        and heartbeat_task.exception() is None
+        and heartbeat_task.result() is _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
+    ):
+        # Cancellation may have been observed before the drain owner took over.
+        # Continue from the last acknowledged lease, never grant a new deadline.
+        return asyncio.create_task(
+            _heartbeat_until(
+                task_store,
+                task.id,
+                worker_id,
+                lease_seconds,
+                stop_heartbeat,
+                lease_authority=lease_authority,
+                handoff_id=task.interrupted_handoff_id,
+                claim_deadline_monotonic=lease_authority.deadline_monotonic,
+            )
+        )
+    return heartbeat_task
 
 
 async def _restart_task_handler_after_shutdown(
@@ -1749,8 +1789,19 @@ async def _restart_task_handler_after_shutdown(
     stop_heartbeat: asyncio.Event,
     *,
     lease_authority: _TaskLeaseAuthority,
+    lease_seconds: int,
     owner_cancellation: asyncio.CancelledError,
 ) -> None:
+    heartbeat_task = _heartbeat_during_quiescence(
+        task_store,
+        task,
+        worker_id,
+        lease_seconds,
+        heartbeat_task,
+        stop_heartbeat,
+        lease_authority=lease_authority,
+    )
+
     async def settle() -> None:
         stop_heartbeat.set()
         await heartbeat_task
@@ -1885,6 +1936,7 @@ async def _raise_task_retry_owner_cancellation(
                     heartbeat_task,
                     stop_heartbeat,
                     lease_authority=lease_authority,
+                    lease_seconds=lease_seconds,
                     cancellation_baseline=cancellation_baseline,
                     cancellation_error={"code": "task_worker_owner_cancelled"},
                     primary_failure=heartbeat_failure or owner_cancellation,
@@ -1926,6 +1978,7 @@ async def _raise_task_retry_owner_cancellation(
                 heartbeat_task,
                 stop_heartbeat,
                 lease_authority=lease_authority,
+                lease_seconds=lease_seconds,
                 cancellation_baseline=cancellation_baseline,
                 cancellation_error={"code": "task_worker_owner_cancelled"},
                 primary_failure=heartbeat_failure or owner_cancellation,
@@ -2055,12 +2108,23 @@ async def _drain_retry_task_handler_under_cancellation_fence(
     stop_heartbeat: asyncio.Event,
     *,
     lease_authority: _TaskLeaseAuthority,
+    lease_seconds: int,
     cancellation_baseline: int,
     cancellation_error: dict[str, Any] | None = None,
     primary_failure: BaseException,
     owner_cancellation: asyncio.CancelledError | None = None,
 ) -> None:
     """Fence a retry attempt before naturally draining cancellation-opaque work."""
+
+    heartbeat_task = _heartbeat_during_quiescence(
+        task_store,
+        task,
+        worker_id,
+        lease_seconds,
+        heartbeat_task,
+        stop_heartbeat,
+        lease_authority=lease_authority,
+    )
 
     async def cleanup() -> None:
         failures: list[BaseException] = []
@@ -2187,11 +2251,22 @@ async def _drain_ordinary_task_handler_under_cancellation_fence(
     stop_heartbeat: asyncio.Event,
     *,
     lease_authority: _TaskLeaseAuthority,
+    lease_seconds: int,
     cancellation_error: dict[str, Any],
     primary_failure: BaseException,
     owner_cancellation: asyncio.CancelledError | None = None,
 ) -> None:
     """Fence an ordinary task durably until its handler is positively quiescent."""
+
+    heartbeat_task = _heartbeat_during_quiescence(
+        task_store,
+        task,
+        worker_id,
+        lease_seconds,
+        heartbeat_task,
+        stop_heartbeat,
+        lease_authority=lease_authority,
+    )
 
     async def cleanup() -> None:
         failures: list[BaseException] = []
@@ -3819,8 +3894,12 @@ async def _heartbeat_until(
         return updated
 
     async def inspect_heartbeat(updated: Task | None) -> _TaskHeartbeatOutcome | None:
-        if updated is not None and (
-            _task_retry_cancellation_requested(updated) or _task_cancellation_requested(updated)
+        if (
+            updated is not None
+            and not lease_authority.keep_renewing_on_cancellation
+            and (
+                _task_retry_cancellation_requested(updated) or _task_cancellation_requested(updated)
+            )
         ):
             return _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
         if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(

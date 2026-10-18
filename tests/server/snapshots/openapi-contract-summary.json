@@ -3094,6 +3094,17 @@
           ],
           "title": "Completed At"
         },
+        "concurrency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Concurrency Key"
+        },
         "created_at": {
           "title": "Created At",
           "type": "string"
@@ -3377,6 +3388,17 @@
             }
           ],
           "title": "Completed At"
+        },
+        "concurrency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Concurrency Key"
         },
         "created_at": {
           "title": "Created At",

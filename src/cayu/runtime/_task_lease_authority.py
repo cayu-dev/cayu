@@ -26,6 +26,7 @@ class TaskLeaseAuthority:
         self.initial_lease_expires_at = lease_expires_at
         self._lease_expires_at = lease_expires_at
         self.deadline_monotonic = deadline_monotonic
+        self.keep_renewing_on_cancellation = False
         self.handoff_id = handoff_id
         self.lock = asyncio.Lock()
 

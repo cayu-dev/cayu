@@ -59,6 +59,7 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
     _GroupExecutionEntryRefused,
+    _WorkAttemptConcurrencyKeyBusy,
     require_work_attempt_admission_result,
     work_attempt_admission_prepare_sha256,
 )
@@ -1162,6 +1163,8 @@ class VerifiedTaskWorker:
         )
         try:
             ownership = await self.app._claim_work_attempt_recovery(request)
+        except _WorkAttemptConcurrencyKeyBusy:
+            return None
         except (WorkAttemptExecutionClaimLost, WorkAttemptAdmissionConflict):
             raw = await self._operation(
                 lambda: self.store.load_work_attempt_admission(admission.admission_id),
@@ -1329,12 +1332,17 @@ class VerifiedTaskWorker:
             await self._consume_verifier_settlement(self.callback_timeout_seconds)
             if result.settlement is not None:
                 return DurableWorkerStep(handled=1, activity=True)
-            proposal = await self._with_heartbeat(
-                owner,
-                lambda owner=owner, predecessor=admission.admission_id, decision_id=result.decision.decision_id: (
-                    self._continue_and_run(owner, contract, predecessor, decision_id)
-                ),
-            )
+            try:
+                proposal = await self._with_heartbeat(
+                    owner,
+                    lambda owner=owner, predecessor=admission.admission_id, decision_id=result.decision.decision_id: (
+                        self._continue_and_run(owner, contract, predecessor, decision_id)
+                    ),
+                )
+            except _WorkAttemptConcurrencyKeyBusy:
+                # The released predecessor and committed rejection remain
+                # discoverable. A later pass retries; unrelated queue work may run.
+                return DurableWorkerStep(idle=True)
             admission = owner.state
 
     async def _continue_and_run(self, owner, contract, predecessor, decision_id):

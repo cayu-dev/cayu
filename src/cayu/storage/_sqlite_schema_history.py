@@ -679,6 +679,9 @@ _MIGRATION_STEPS: dict[int, str] = {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS cayu_task_session_retention_current
     ON cayu_task_session_retention_epochs (session_id) WHERE retired = 0;""",
+    124: "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_concurrency_key "
+    "ON cayu_tasks (concurrency_key, lease_expires_at) "
+    "WHERE concurrency_key IS NOT NULL AND status IN ('claimed', 'running');",
     122: """CREATE TABLE IF NOT EXISTS cayu_retired_task_sessions (
         session_id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL
@@ -4329,6 +4332,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    124: (("cayu_tasks", "concurrency_key", "TEXT COLLATE BINARY"),),
     121: (
         ("cayu_tasks", "restartable", "INTEGER NOT NULL DEFAULT 0 CHECK (restartable IN (0, 1))"),
         ("cayu_tasks", "restart_count", "INTEGER NOT NULL DEFAULT 0 CHECK (restart_count >= 0)"),

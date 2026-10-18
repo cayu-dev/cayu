@@ -124,6 +124,10 @@ class WorkAttemptExecutionClaimLost(ValueError):
     """The caller no longer owns the exact active work-attempt generation."""
 
 
+class _WorkAttemptConcurrencyKeyBusy(WorkAttemptExecutionClaimLost):
+    """A new execution claim is deferred while another task holds its key."""
+
+
 class _GroupExecutionEntryRefused(WorkAttemptExecutionClaimLost):
     """The exact admission was refused before its first execution entry."""
 

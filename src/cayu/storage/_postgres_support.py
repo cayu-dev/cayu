@@ -192,6 +192,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         _dumps(list(task.prerequisite_task_ids)),
         task.restartable,
         task.restart_count,
+        task.concurrency_key,
     )
 
 
@@ -200,7 +201,7 @@ TASK_COLUMNS = (
     "assigned_agent_name, available_at, worker_id, lease_expires_at, interrupted_handoff_id, "
     "status_reason, status_payload, input, result, error, metadata, created_at, updated_at, "
     "started_at, completed_at, invocation, retry_series, work_contract, schedule, "
-    "graph_id, prerequisite_task_ids, restartable, restart_count"
+    "graph_id, prerequisite_task_ids, restartable, restart_count, concurrency_key"
 )
 
 
@@ -208,6 +209,7 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
     return Task(
         restartable=row[29],
         restart_count=row[30],
+        concurrency_key=row[31],
         id=row[0],
         type=row[1],
         title=row[2],

@@ -234,7 +234,15 @@ from cayu.tasks.topology import (
     decode_task_topology_cursor,
 )
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 123
+
+def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
+    return (
+        f"{prefix}status IN ('claimed', 'running') AND {prefix}worker_id IS NOT NULL "
+        f"AND {prefix}lease_expires_at > clock_timestamp()"
+    )
+
+
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 124
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -245,7 +253,7 @@ _TASK_RETURNING_COLUMNS = (
     "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
     "task.created_at, task.updated_at, task.started_at, task.completed_at, task.invocation, "
     "task.retry_series, task.work_contract, task.schedule, task.graph_id, task.prerequisite_task_ids, "
-    "task.restartable, task.restart_count"
+    "task.restartable, task.restart_count, task.concurrency_key"
 )
 
 
@@ -1105,7 +1113,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """,
                 pg_support.task_insert_values(task),
@@ -3048,6 +3056,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     if not _task_matches_claim_filter(observed, query):
                         filtered += 1
                         continue
+                    if not await self._claim_concurrency_key(cur, observed):
+                        filtered += 1
+                        continue
                     candidate_handoff_id = observed.interrupted_handoff_id
                     if candidate_handoff_id is None:
                         raise AssertionError("Continuation candidate lost its handoff generation.")
@@ -3428,7 +3439,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s, %s
                             )
                             """,
                             pg_support.task_insert_values(successor),
@@ -4022,13 +4033,26 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             self._pool,
             allowed_configure=self._postgres_mutation_allowed_configure,
         )
+
+        async def claim_available() -> Task | None:
+            excluded_keys: set[str] = set()
+            # A bounded pass skips whole contended key backlogs without imposing
+            # a worker poll delay on unrelated jobs behind them.
+            for _ in range(100):
+                task, blocked_key = await self._claim_task_unowned(
+                    worker_id,
+                    query,
+                    lease_seconds=lease_seconds,
+                    connection_owner=connection_owner,
+                    excluded_keys=excluded_keys,
+                )
+                if blocked_key is None:
+                    return task
+                excluded_keys.add(blocked_key)
+            return None
+
         return await self._await_owned_store_mutation(
-            self._claim_task_unowned(
-                worker_id,
-                query,
-                lease_seconds=lease_seconds,
-                connection_owner=connection_owner,
-            ),
+            claim_available(),
             connection_owner=connection_owner,
         )
 
@@ -4056,9 +4080,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         clauses, params = self._task_filter_clauses(query.model_copy(update={"status": None}))
         scope = " AND ".join(
             [
-                "status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group')",
+                "status IN ('pending', 'paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group')",
                 "session_id IS NULL",
                 "worker_id IS NULL",
+                "(status != 'pending' OR (concurrency_key IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM cayu_tasks AS busy WHERE busy.concurrency_key = cayu_tasks.concurrency_key AND "
+                + _busy_concurrency_key_sql("busy.")
+                + ")))",
+                "(status != 'pending' OR retry_series IS NULL "
+                "OR retry_series->>'elapsed_deadline' IS NULL "
+                "OR (retry_series->>'elapsed_deadline')::timestamptz > %s)",
                 "schedule IS NOT NULL AND schedule->>'admitted_at' IS NULL",
                 "((schedule->'policy'->>'expires_at')::timestamptz <= %s OR "
                 "(schedule->'policy'->>'misfire_policy' = 'skip' AND "
@@ -4071,7 +4102,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 *clauses,
             ]
         )
-        return scope, [now, now, *params]
+        return scope, [now, now, now, *params]
 
     async def _expire_held_schedules(
         self, cur: Any, query: TaskQuery, *, now: datetime, candidate_ids: tuple[str, ...]
@@ -4093,6 +4124,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             # Earlier source outcomes may already have terminalized descendants.
             task = await self._require_task(cur, task.id)
             if task.status not in {
+                TaskStatus.PENDING,
                 TaskStatus.PAUSED,
                 TaskStatus.BLOCKED,
                 TaskStatus.NEEDS_ATTENTION,
@@ -4111,6 +4143,44 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     cur, task, eligibility=eligibility, now=now
                 )
 
+    async def _lock_concurrency_key_for_renewal(self, cur: Any, task_id: str) -> None:
+        # The key is immutable. Wait before taking a task/admission row lock so
+        # ordinary key contention cannot masquerade as lost execution ownership.
+        await cur.execute("SELECT concurrency_key FROM cayu_tasks WHERE id = %s", (task_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if row[0] is not None:
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("cayu-task-concurrency:" + row[0],),
+            )
+
+    async def _concurrency_key_available(self, cur: Any, task: Task) -> bool:
+        await cur.execute(
+            "SELECT 1 FROM cayu_tasks WHERE concurrency_key = %s AND id != %s AND "
+            + _busy_concurrency_key_sql()
+            + " LIMIT 1",
+            (task.concurrency_key, task.id),
+        )
+        return await cur.fetchone() is None
+
+    async def _claim_concurrency_key(self, cur: Any, task: Task) -> bool:
+        if task.concurrency_key is None:
+            return True
+        if not await self._concurrency_key_available(cur, task):
+            return False
+        # Never wait with a candidate row locked. A fresh statement after taking
+        # the transaction lock sees any same-key claim that just committed.
+        await cur.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+            ("cayu-task-concurrency:" + task.concurrency_key,),
+        )
+        row = await cur.fetchone()
+        if row is None or not row[0]:
+            return False
+        return await self._concurrency_key_available(cur, task)
+
     async def _claim_task_unowned(
         self,
         worker_id: str,
@@ -4118,8 +4188,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         *,
         lease_seconds: int = 300,
         connection_owner: _PostgresMutationConnectionOwner,
-    ) -> Task | None:
+        excluded_keys: set[str],
+    ) -> tuple[Task | None, str | None]:
         clauses, params = self._task_filter_clauses(query)
+        if excluded_keys:
+            clauses.append("(concurrency_key IS NULL OR concurrency_key != ALL(%s))")
+            params.append(sorted(excluded_keys))
         retry_worker_id_is_bounded = _task_retry_reconciliation_identity_is_bounded(worker_id)
         if self._clock_is_injected:
             series_now = self._clock()
@@ -4162,6 +4236,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             [
                 "status = %s",
                 "session_id IS NULL",
+                "(concurrency_key IS NULL OR NOT EXISTS (SELECT 1 FROM cayu_tasks AS busy "
+                "WHERE busy.concurrency_key = cayu_tasks.concurrency_key AND "
+                + _busy_concurrency_key_sql("busy.")
+                + "))",
                 availability_clause,
                 retry_deadline_clause,
                 "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
@@ -4363,6 +4441,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     )
                 )
                 fenced = False
+                blocked_key = None
                 if claimed is not None:
                     await self._lock_local_execution_retry_fence(cur, claimed)
                     # Recheck in a fresh statement after the advisory-lock wait.
@@ -4372,6 +4451,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         cur,
                         claimed,
                     )
+                    if not fenced:
+                        fenced = not await self._claim_concurrency_key(cur, claimed)
+                        if fenced:
+                            blocked_key = claimed.concurrency_key
                     if not fenced:
                         post_fence_now = await self._database_now(cur)
                         post_fence_series_now = (
@@ -4498,9 +4581,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         await self._record_task_transition(cur, prior, claimed)
             if fenced:
                 await conn.rollback()
-                return None
+                return None, blocked_key
             await conn.commit()
-        return None if claimed is None else claimed.model_copy(deep=True)
+        return (None if claimed is None else claimed.model_copy(deep=True)), None
 
     async def heartbeat(
         self,
@@ -4519,7 +4602,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         await self._ensure_ready()
         async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
+                await self._lock_concurrency_key_for_renewal(cur, task_id)
                 task = await self._load_task_locked(cur, task_id)
+                if task.concurrency_key is not None and not await self._concurrency_key_available(
+                    cur, task
+                ):
+                    raise TaskClaimLost("Task concurrency key is no longer available to renew.")
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
                 if task.lease_expires_at != expected_lease:
@@ -4912,6 +5000,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     raise WorkAttemptExecutionClaimLost(
                         "Admitted work attempts cannot use ordinary task holds."
                     )
+                _ensure_can_hold_task(prior, status)
                 now = await self._database_now(cur)
                 await cur.execute(
                     f"""

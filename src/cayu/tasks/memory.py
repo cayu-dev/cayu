@@ -127,6 +127,7 @@ from cayu.tasks.admission import (
     WorkAttemptExecutionEntryResult,
     WorkAttemptExecutionStopRequest,
     WorkAttemptRecoveryActivate,
+    _WorkAttemptConcurrencyKeyBusy,
     copy_admitted_completion_proposal_request,
     copy_work_attempt_admission_activate,
     copy_work_attempt_admission_prepare,
@@ -870,6 +871,8 @@ class InMemoryTaskStore(TaskStore):
                 session_id=request.session_id,
                 session_binding=request.session_invocation,
             )
+            if not self._concurrency_key_available(task, lease_now):
+                raise _WorkAttemptConcurrencyKeyBusy("Task concurrency key is already leased.")
             claim_request = WorkAttemptExecutionClaimRequest(
                 admission_id=request.admission_id,
                 claim_id=request.claim_id,
@@ -1376,6 +1379,8 @@ class InMemoryTaskStore(TaskStore):
                 )
             if request.claim_id in self._work_attempt_execution_claims:
                 raise WorkAttemptAdmissionConflict("Execution-claim identity is already bound.")
+            if not self._concurrency_key_available(task, now):
+                raise _WorkAttemptConcurrencyKeyBusy("Task concurrency key is already leased.")
             replacement = WorkAttemptExecutionClaim(
                 admission_id=request.admission_id,
                 claim_id=request.claim_id,
@@ -3476,6 +3481,7 @@ class InMemoryTaskStore(TaskStore):
                 and (after is None or (task.created_at, task.id) > after)
             ]
             page = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[:scan_limit]
+            active_keys = self._live_concurrency_keys(now)
             rejected = 0
             filtered = 0
             for index, task in enumerate(page):
@@ -3484,6 +3490,9 @@ class InMemoryTaskStore(TaskStore):
                     continue
                 if self._latest_admission_id_by_task.get(task.id) is not None:
                     rejected += 1
+                    continue
+                if task.concurrency_key in active_keys:
+                    filtered += 1
                     continue
                 candidate_handoff_id = task.interrupted_handoff_id
                 if candidate_handoff_id is None:
@@ -3942,6 +3951,31 @@ class InMemoryTaskStore(TaskStore):
             self._store_task(updated)
             return self._require_task(task_id).model_copy(deep=True)
 
+    @staticmethod
+    def _holds_live_key_lease(task: Task, now: datetime) -> bool:
+        return (
+            task.concurrency_key is not None
+            and task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+            and task.worker_id is not None
+            and task.lease_expires_at is not None
+            and task.lease_expires_at > now
+        )
+
+    def _live_concurrency_keys(self, now: datetime) -> set[str]:
+        return {
+            task.concurrency_key
+            for task in self._tasks.values()
+            if task.concurrency_key is not None and self._holds_live_key_lease(task, now)
+        }
+
+    def _concurrency_key_available(self, task: Task, now: datetime) -> bool:
+        return task.concurrency_key is None or not any(
+            other.id != task.id
+            and other.concurrency_key == task.concurrency_key
+            and self._holds_live_key_lease(other, now)
+            for other in self._tasks.values()
+        )
+
     async def claim_task(
         self,
         worker_id: str,
@@ -4011,6 +4045,7 @@ class InMemoryTaskStore(TaskStore):
                         self._retry_settlements[(expired.id, retry_settlement.idempotency_key)] = (
                             retry_settlement
                         )
+            active_keys = self._live_concurrency_keys(now)
             candidates = [
                 task
                 for task in self._tasks.values()
@@ -4021,6 +4056,7 @@ class InMemoryTaskStore(TaskStore):
                 and (task.retry_series is None or retry_worker_id_is_bounded)
                 and not self._task_has_unsettled_local_execution_attempt(task.id)
                 and _task_matches_claim_filter(task, query)
+                and task.concurrency_key not in active_keys
             ]
             if not candidates:
                 return None

@@ -3,8 +3,16 @@
 ## Unreleased
 
 Upgrade: Stop all older writers and run `cayu storage migrate` before starting
-this build. Schema revision 122 preserves restartable task policy and requires
-exact worker claims for their session attachments.
+this build. Schema revision 124 preserves restartable task policy, provisional retention
+fences, and durable concurrency keys across every task claimant. All task stores must be migrated;
+older claimants do not understand key exclusion.
+
+- Add optional task concurrency keys. Workers skip jobs whose key already has
+  a live lease, allowing unrelated work to run without occupying waiting slots.
+  Retry and continuation claims preserve the same exclusion.
+
+- Skip stale recovery observers when another recovery owner closes the active
+  interaction during execution profile inspection.
 
 - Stop agent snapshot materializations from being reused across authority
   scopes. Two scopes that register the same snapshot content share a root, so a
@@ -121,15 +129,15 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
   while permanently rejecting the previous incarnation. Incarnation replacement
   compares the task-store predecessor observed before the session snapshot, so a
   delayed first write cannot displace a newer session. Database stores require
-  schema revision 123.
+  schema revision 124.
   `recover_abandoned_sessions(abandon_sessions_of_terminal_tasks=True)` does
   the same during the sweep for sessions whose tasks are all terminal, and
   revisits sessions left interrupted or half cleaned up by an earlier sweep.
 
 ### Breaking changes
 
-- Storage schema revision 122 requires all writers to understand restartable
-  task policy. Migrate with older processes stopped.
+- Storage schema revision 124 requires all writers to understand restartable
+  task policy and concurrency keys. Migrate with older processes stopped.
 
 ## v0.11.4
 

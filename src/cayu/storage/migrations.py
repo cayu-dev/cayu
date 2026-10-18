@@ -537,6 +537,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=122, kind=RevisionKind.BREAKING, compatible_from=122),
     # Provisional task retention must honor durable invocation epoch floors.
     Revision(revision=123, kind=RevisionKind.BREAKING, compatible_from=123),
+    # Every task claimant must honor durable concurrency keys.
+    Revision(revision=124, kind=RevisionKind.BREAKING, compatible_from=124),
 )
 
 #: The revision an empty database is initialized to.

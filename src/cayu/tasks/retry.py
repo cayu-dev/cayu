@@ -606,6 +606,7 @@ def _rescheduled_initial_task_retry_series(
             "Retry successor eligibility is owned by its predecessor receipt."
         )
     digest = _task_retry_attempt_authority_sha256(
+        concurrency_key=task.concurrency_key,
         task_id=task.id,
         task_type=task.type,
         title=task.title,
@@ -933,6 +934,7 @@ def _runtime_task_retry_terminal_settlement(
         max_digits=_TASK_RETRY_TOTAL_COST_MAX_DIGITS,
     )
     settled_authority_sha256 = _task_retry_attempt_authority_sha256(
+        concurrency_key=task.concurrency_key,
         task_id=task.id,
         task_type=task.type,
         title=task.title,
@@ -1257,6 +1259,7 @@ def _settled_task_retry_attempt(
             successor_task_id = _task_retry_successor_id(series.series_id, series.attempt + 1)
 
     settled_authority_sha256 = _task_retry_attempt_authority_sha256(
+        concurrency_key=task.concurrency_key,
         task_id=task.id,
         task_type=task.type,
         title=task.title,
@@ -1323,6 +1326,7 @@ def _settled_task_retry_attempt(
     )
     if successor_task_id is not None:
         successor_authority_sha256 = _task_retry_attempt_authority_sha256(
+            concurrency_key=task.concurrency_key,
             task_id=successor_task_id,
             task_type=task.type,
             title=task.title,
@@ -1355,6 +1359,7 @@ def _settled_task_retry_attempt(
             predecessor_task_id=task.id,
         )
         successor = Task(
+            concurrency_key=task.concurrency_key,
             id=successor_task_id,
             type=task.type,
             title=task.title,

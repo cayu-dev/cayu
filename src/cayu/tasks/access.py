@@ -41,6 +41,10 @@ def creation_invocation(invocation, request, parent):
     execution = execution_active.get()
     if access is None and execution is None:
         return invocation
+    if request.concurrency_key is not None:
+        # Keys arbitrate store-wide resources. Only the trusted, unscoped host
+        # may choose their namespace; caller-supplied tenant prefixes are not authority.
+        raise ResourceAccessDenied()
     if access is not None:
         bounds, labels = access.bounds, dict(access.labels)
     else:

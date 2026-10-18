@@ -139,7 +139,11 @@ class TaskStore(ABC):
     Worker-lease and recovery-owner transitions use store-authoritative time.
     Implementations sample, compare, and stamp that time inside the atomic
     ownership mutation; worker-provided timestamps or cutoffs are not lease
-    authority.
+    authority. Concurrency-keyed tasks require atomic same-key exclusion for
+    every new worker lease, including continuation and verified-work recovery.
+    Only live CLAIMED/RUNNING leases block another task; lease renewal must
+    reject expired ownership. Implementations must preserve keys across retries
+    and forbid unleased direct starts of keyed tasks.
     """
 
     _task_group_maintenance: TaskGroupMaintenance

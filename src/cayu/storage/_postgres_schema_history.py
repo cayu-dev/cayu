@@ -700,6 +700,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE UNIQUE INDEX IF NOT EXISTS cayu_task_session_retention_current "
         "ON cayu_task_session_retention_epochs (session_id) WHERE NOT retired",
     ),
+    124: (
+        'ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS concurrency_key TEXT COLLATE "C"',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_concurrency_key "
+        "ON cayu_tasks (concurrency_key, lease_expires_at) "
+        "WHERE concurrency_key IS NOT NULL AND status IN ('claimed', 'running')",
+    ),
     122: (
         """CREATE TABLE IF NOT EXISTS cayu_retired_task_sessions (
             session_id TEXT PRIMARY KEY,

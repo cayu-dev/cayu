@@ -27,6 +27,8 @@ from cayu.tasks.terminalization import (
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
+    if task.concurrency_key is not None and next_status is TaskStatus.RUNNING:
+        raise TaskClaimLost("Concurrency-keyed tasks require an exact worker claim.")
     if task.restartable and next_status is TaskStatus.RUNNING:
         raise TaskClaimLost("Restartable tasks must attach through an exact worker claim.")
     if (
@@ -67,6 +69,10 @@ def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
     if next_status not in _HELD_TASK_STATUSES:
         raise ValueError(f"Task {task.id} cannot be held as {next_status}.")
     _ensure_not_terminal(task)
+    if task.concurrency_key is not None and task.worker_id is not None:
+        raise TaskTerminalizationConflict(
+            "A claimed concurrency-keyed task cannot be held before its handler stops."
+        )
     if _task_retry_cancellation_requested(task) or _task_cancellation_requested(task):
         raise TaskTerminalizationConflict(
             "Task cancellation is still draining under its current owner."
@@ -284,6 +290,8 @@ def _require_direct_attached_task_resume(
 ) -> Task:
     """Validate a workerless direct attachment with no handoff generation."""
 
+    if task.concurrency_key is not None:
+        raise TaskClaimLost("Concurrency-keyed tasks require an exact continuation claim.")
     if (
         task.status is not TaskStatus.RUNNING
         or task.session_id != session_id

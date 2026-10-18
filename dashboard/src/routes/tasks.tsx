@@ -520,6 +520,14 @@ export function TasksPage() {
                   <span className="text-muted-foreground">Type</span>
                   <span className="max-w-56 truncate font-mono text-xs">{selectedTask.type}</span>
                 </div>
+                {selectedTask.concurrency_key && (
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-muted-foreground">Concurrency key</span>
+                    <span className="max-w-56 break-all font-mono text-xs">
+                      {selectedTask.concurrency_key}
+                    </span>
+                  </div>
+                )}
                 <div className="flex items-start justify-between gap-3">
                   <span className="text-muted-foreground">Agent</span>
                   {selectedTask.assigned_agent_name ? (

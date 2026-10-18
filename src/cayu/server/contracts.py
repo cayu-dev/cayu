@@ -2954,6 +2954,7 @@ class ApiTaskScheduleEvent(ApiBaseModel):
 
 
 class ApiTaskListItem(ApiBaseModel):
+    concurrency_key: str | None = None
     id: str
     type: str
     title: str | None

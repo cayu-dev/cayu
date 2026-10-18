@@ -3851,6 +3851,7 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
         cayu_app,
         {
             "id": task.id,
+            "concurrency_key": task.concurrency_key,
             "type": task.type,
             "title": task.title,
             "description": task.description,

@@ -143,6 +143,43 @@ the worker applies the same cancellation-fence and quiescent-settlement rules to
 every slot as to one worker; ordinary handlers may continue draining. An
 infrastructure exception stops and drains all slots before propagating.
 
+To serialize jobs for the same resource across workers, set a durable key when
+creating the task:
+
+```python
+await task_store.create_task(TaskCreate(
+    type="review_pr",
+    concurrency_key="acme/app#42",
+    input={"repository": "acme/app", "pull_request": 42},
+))
+```
+
+Concurrency keys share a namespace across the task store. Choose them in trusted
+host code; scoped task creation (including `/resources/tasks`) rejects keys
+because a caller-chosen tenant prefix cannot authorize access to a shared key.
+A keyed task always needs an exact worker or interrupted-continuation claim;
+releasing its worker does not authorize direct `app.resume(...)`.
+
+
+Only one task with that key can hold a live worker lease in the same task store.
+Claims skip busy keys, leaving those jobs pending while unrelated keys and
+unkeyed jobs run. Completion, failure, settled cancellation, explicit release,
+and lease expiry free the key. A cancellation request keeps the key while its
+owner drains. A claimed keyed task cannot be paused, blocked, or held for attention
+until its handler stops and releases ownership. Interrupted continuations and
+verified-work admissions use the same exclusion. A verified continuation that
+finds its key busy stays waiting while the worker services unrelated jobs; it
+retries after the key is released. Retries and restartable jobs retain their key.
+Keyed tasks must start as queue jobs and attach through an exact worker claim.
+
+Keys are case-sensitive public identifiers: 1–256 ASCII characters, starting
+with a letter or digit and using only letters, digits, `._:/@#=+-` afterward.
+Use namespaced keys when applications share a store. The key appears in task
+inspection and dashboard details. This is lease-based mutual exclusion, with no
+per-key ordering or rate guarantee. A worker that loses its lease must stop its
+work; the key does not fence writes to an external business system.
+
+
 The loop owns claim → heartbeat → handle → reclaim-expired-leases, and keeps
 going if one task's handler raises or returns without terminalizing its task (it
 marks that task failed). Pass a `stop: asyncio.Event` for graceful shutdown and

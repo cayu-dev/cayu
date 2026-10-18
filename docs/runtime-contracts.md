@@ -1782,7 +1782,7 @@ passes it as `expected_session_instance_id`. Replacement compares that predecess
 under the task-store lock; an unseen, delayed incarnation cannot retire a newer
 owner. A comparison conflict retries the read/check/advance sequence only while
 the requested session incarnation remains current. Database stores require schema
-revision 123. Custom task stores opt into this protocol with
+revision 124. Custom task stores opt into this protocol with
 `supports_session_retention_epochs=True` and implement both epoch methods.
 Session closure claims alone continue to support deletion and ordinary runs;
 abandonment requires both capabilities. If an epoch operation fails after a
