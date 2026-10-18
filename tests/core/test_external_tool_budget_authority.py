@@ -6,10 +6,11 @@ from contextlib import suppress
 import pytest
 from tests.core.test_external_agents import ScriptedAdapter, pricing, request
 
-from cayu import CayuApp
+from cayu import CayuApp, RunRequest
 from cayu.approvals import PendingToolApprovalEventView
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.budgets import BudgetLimit, BudgetPolicy, default_price_book
+from cayu.deadlines import ExecutionDeadline
 from cayu.events import EventType
 from cayu.external_agents import ExternalAgentEvent, run_external_agent
 from cayu.external_agents.recording import ExternalAgentRecorder
@@ -70,7 +71,15 @@ def test_native_bridge_reports_known_zero_usage_under_budget(custom, scope):
 
         result = await run_external_agent(
             app,
-            request(task_id=task.id, budget_limits=() if scope == "policy" else (limit,)),
+            # This checks full-catalog budget accounting, not deadline expiry.
+            # The catalog can take over 20 seconds to validate on a loaded runner.
+            RunRequest(
+                agent_name="vendor-agent",
+                messages=[],
+                task_id=task.id,
+                budget_limits=() if scope == "policy" else (limit,),
+                execution_deadline=ExecutionDeadline.after(300),
+            ),
             Adapter([]),
             prompt="review",
         )
