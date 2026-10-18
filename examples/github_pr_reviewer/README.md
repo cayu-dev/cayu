@@ -61,7 +61,9 @@ To run the webhook trigger instead of a one-shot review, serve
 `build_webhook_app(task_store, webhook_secret=...)` with any ASGI server and run
 a worker loop that calls `run_task_worker(...)`. The example's
 `run_pr_review_worker_once(...)` helper uses that same durable
-claim/heartbeat/reclaim path with `max_tasks=1`.
+claim/heartbeat/reclaim path with `max_tasks=1`. Pass the same `workspace_root`
+as `build_app`; the handler prepares a directory and the built-in
+`LocalWorkspaceEnvironmentFactory` validates and attaches it before execution.
 
 ## Environment variables
 
@@ -97,5 +99,9 @@ service in a cloud container and execute checkout/QA commands in Lambda MicroVM;
 use `cayu[egress]` for Docker or `cayu[aws,egress]` for Lambda MicroVM when those
 commands need approved network destinations. Follow
 the [sandbox and network guide](../../docs/execution-capabilities.md#choose-a-sandbox-and-restrict-network-access)
-for runner/workspace composition and host requirements. Back the app with
+for runner/workspace composition and host requirements. Replace
+`PRReviewWorkspaceFactory` with an `EnvironmentFactory` that creates a matching
+sandbox runner and workspace. `LocalWorkspaceEnvironmentFactory` always creates
+a host workspace, so changing only `runner_factory` does not move the checkout
+into the sandbox. Back the app with
 `PostgresSessionStore`/`PostgresTaskStore` for multi-worker durability.

@@ -13,6 +13,7 @@ import importlib
 import importlib.util
 import shutil
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,7 @@ def test_build_provider_requires_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_pr_workspace_fetches_github_pull_ref(tmp_path: Path) -> None:
+    (tmp_path / sha256(b"review-42").hexdigest()).mkdir()
     factory = mod.PRReviewWorkspaceFactory(tmp_path, with_credentials=False)
 
     result = asyncio.run(
@@ -117,6 +119,7 @@ def test_pr_workspace_fetches_github_pull_ref(tmp_path: Path) -> None:
                 agent_name="pr-reviewer",
                 environment_name="pr-workspace",
                 metadata={
+                    "workspace_root": str(tmp_path / sha256(b"review-42").hexdigest()),
                     "repo_url": "https://github.com/acme/app.git",
                     "head_ref": "feature-from-fork",
                     "base_ref": "main",
@@ -137,6 +140,7 @@ def test_pr_workspace_can_rebind_same_pull_ref(tmp_path: Path) -> None:
     if shutil.which("git") is None:
         pytest.skip("git executable is required for this example")
     origin, pr_head = demo_mod._create_demo_origin(tmp_path)
+    (tmp_path / "workspaces" / sha256(b"review-1").hexdigest()).mkdir(parents=True)
     factory = mod.PRReviewWorkspaceFactory(tmp_path / "workspaces", with_credentials=False)
     result = asyncio.run(
         factory.create(
@@ -145,6 +149,9 @@ def test_pr_workspace_can_rebind_same_pull_ref(tmp_path: Path) -> None:
                 agent_name="pr-reviewer",
                 environment_name="pr-workspace",
                 metadata={
+                    "workspace_root": str(
+                        tmp_path / "workspaces" / sha256(b"review-1").hexdigest()
+                    ),
                     "repo_url": str(origin),
                     "head_ref": "fixture-pr",
                     "base_ref": "main",
@@ -180,7 +187,7 @@ def test_pr_workspace_can_rebind_same_pull_ref(tmp_path: Path) -> None:
     )
 
 
-def test_worker_once_uses_generic_task_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_once_uses_generic_task_worker(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     captured = {}
 
     async def fake_run_task_worker(app, task_store, handler, **kwargs):
@@ -191,19 +198,24 @@ def test_worker_once_uses_generic_task_worker(monkeypatch: pytest.MonkeyPatch) -
 
     app = object()
     task_store = object()
-    handled = asyncio.run(mod.run_pr_review_worker_once(app, task_store, worker_id="worker-9"))
+    handled = asyncio.run(
+        mod.run_pr_review_worker_once(
+            app, task_store, workspace_root=tmp_path, worker_id="worker-9"
+        )
+    )
 
     assert handled == 1
     assert captured["app"] is app
     assert captured["task_store"] is task_store
-    assert captured["handler"] is mod._handle_pr_review_task
+    assert captured["handler"].func is mod._handle_pr_review_task
+    assert captured["handler"].keywords == {"workspace_root": tmp_path}
     assert captured["worker_id"] == "worker-9"
     assert captured["query"].type == "review_pr"
     assert captured["query"].assigned_agent_name == "pr-reviewer"
     assert captured["max_tasks"] == 1
 
 
-def test_pr_review_session_identity_includes_head_sha() -> None:
+def test_pr_review_session_identity_includes_head_sha(tmp_path) -> None:
     captured = {}
 
     class FakeApp:
@@ -231,11 +243,13 @@ def test_pr_review_session_identity_includes_head_sha() -> None:
         invocation=unattributed_task_invocation(),
     )
 
-    asyncio.run(mod._handle_pr_review_task(FakeApp(), task, "worker-1"))
+    asyncio.run(mod._handle_pr_review_task(FakeApp(), task, "worker-1", workspace_root=tmp_path))
 
     request = captured["request"]
     assert request.session_id == "pr-review-acme-app-7-abcdef123456"
     assert request.metadata["head_sha"] == "abcdef1234567890"
+    assert Path(request.metadata["workspace_root"]).is_dir()
+    assert Path(request.metadata["workspace_root"]).is_relative_to(tmp_path)
     assert 590 < request.execution_deadline.remaining_seconds() <= 600
     assert "abcdef123456" in request.messages[0].content[0].text
 
@@ -655,3 +669,24 @@ def test_qa_policy_denies_raw_shell_but_allows_allowlisted() -> None:
     # Pure-logic guard on the safety rail that lets the agent "QA end-to-end".
     assert "python3" in mod._ALLOWED_QA_COMMANDS
     assert "rm" in mod._DENYLISTED_TOKENS
+
+
+def test_review_workspace_factory_ignores_metadata_workspace_hijack(tmp_path):
+    owned = tmp_path / sha256(b"owned-session").hexdigest()
+    victim = tmp_path / "victim"
+    owned.mkdir()
+    victim.mkdir()
+    factory = mod.PRReviewWorkspaceFactory(tmp_path, with_credentials=False)
+    request = EnvironmentFactoryRequest(
+        session_id="owned-session",
+        agent_name="reviewer",
+        environment_name="review",
+        metadata={
+            "workspace_root": str(victim),
+            "repo_url": "https://example.test/repo.git",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
+        },
+    )
+    result = asyncio.run(factory.create(request))
+    assert result.environment.workspace.root == owned

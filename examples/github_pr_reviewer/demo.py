@@ -48,7 +48,9 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> None:
         head_sha=pr["head"]["sha"],
         base_ref=pr["base"]["ref"],
     )
-    handled = await run_pr_review_worker_once(app, task_store, worker_id="live-worker")
+    handled = await run_pr_review_worker_once(
+        app, task_store, workspace_root=scratch / "workspaces", worker_id="live-worker"
+    )
     assert handled == 1
     finished = await task_store.load_task(task.id)
     assert finished is not None
@@ -153,7 +155,9 @@ async def demo() -> None:
         head_sha=pr_head,
         base_ref="main",
     )
-    handled = await run_pr_review_worker_once(app, task_store, worker_id="demo-worker")
+    handled = await run_pr_review_worker_once(
+        app, task_store, workspace_root=scratch / "workspaces", worker_id="demo-worker"
+    )
     assert handled == 1
     finished = await task_store.load_task(task.id)
     assert finished is not None

@@ -76,14 +76,18 @@ into a fresh `RunRequest`:
 async def handle_pr_review_task(app, task, worker_id):
     owner, repo, pr = task.input["owner"], task.input["repo"], task.input["pr_number"]
     short_head_sha = task.input["head_sha"][:12]
+    session_id = f"pr-review-{owner}-{repo}-{pr}-{short_head_sha}"
+    root = workspace_root.resolve() / sha256(session_id.encode()).hexdigest()
+    root.mkdir(parents=True, exist_ok=True)
     request = RunRequest(
         agent_name="pr-reviewer",
-        session_id=f"pr-review-{owner}-{repo}-{pr}-{short_head_sha}",
+        session_id=session_id,
         task_id=task.id,
         task_worker_id=worker_id,
         task_lease_expires_at=task.lease_expires_at,
         environment_name="pr-workspace",
-        metadata={"repo_owner": owner, "repo_name": repo, "pr_number": pr,
+        metadata={"workspace_root": str(root),
+                  "repo_owner": owner, "repo_name": repo, "pr_number": pr,
                   "repo_url": task.input["repo_url"],
                   "head_ref": task.input["head_ref"],
                   "head_sha": task.input["head_sha"],
@@ -123,28 +127,40 @@ Two things worth calling out:
 
 ## 3. A fresh review workspace per PR
 
-Register an `EnvironmentFactory` (not a static `Environment`) so every review gets
-its own workspace + runner + git checkout, driven by the request metadata:
+Use `LocalWorkspaceEnvironmentFactory` to derive the prepared directory from
+the session ID, check it against the allowed roots, and
+forward the exact runner's admission evidence. The worker above prepares that
+directory before `app.run`; pre-create admission does not allocate resources.
+`workspace_root` is an application-owned absolute base directory, and `sha256`
+comes from `hashlib`, so GitHub names never become filesystem path components.
 
 ```python
-class PRReviewWorkspaceFactory(EnvironmentFactory):
-    async def create(self, request):
-        root = self._base_root / request.session_id
-        pr_number = request.metadata["pr_number"]
-        head_sha = request.metadata["head_sha"]
-        checkout_ref = f"refs/cayu/pr-{pr_number}"
-        return EnvironmentFactoryResult(environment=Environment(
-            EnvironmentSpec(name=request.environment_name),
-            workspace=LocalWorkspace(root, workspace_id=request.session_id),
-            runner=LocalRunner(root),
-            binding=GitRepositoryBinding(
-                repo_url=request.metadata["repo_url"],
-                ref=head_sha,
-                fetch_refspecs=[f"+refs/pull/{pr_number}/head:{checkout_ref}"],
-            ),
-            vault=vault, proxy=proxy,
-        ))
+from cayu.environments import LocalWorkspaceEnvironmentFactory
+
+
+def review_binding(root, request):
+    pr_number = request.metadata["pr_number"]
+    return GitRepositoryBinding(
+        repo_url=request.metadata["repo_url"],
+        ref=request.metadata["head_sha"],
+        fetch_refspecs=[f"+refs/pull/{pr_number}/head:refs/cayu/pr-{pr_number}"],
+    )
+
+
+factory = LocalWorkspaceEnvironmentFactory(
+    allowed_roots=[workspace_root],
+    root_from_request=lambda request: workspace_root.resolve() / sha256(request.session_id.encode()).hexdigest(),
+    binding_factory=review_binding,
+    vault=vault,
+    proxy=proxy,
+)
+app.register_environment_factory(EnvironmentSpec(name="pr-workspace"), factory, default=True)
 ```
+
+The runnable example adds PR-metadata validation in its binding callback. Root
+selection ignores caller metadata, so it cannot select another session's checkout. The reusable
+`workspace_root_from_metadata` and `require_allowed_workspace_root` helpers also
+work with custom factories; see [environment factories](../environment-factories.md#per-request-local-workspaces).
 
 - **Same-repo and fork PRs** use the same GitHub pull-ref path:
   fetch `refs/pull/N/head` into a local review ref, then bind `ref=head_sha`.
@@ -153,7 +169,7 @@ class PRReviewWorkspaceFactory(EnvironmentFactory):
   queued `head_sha` before returning diff metadata. If the PR moved, enqueue a new
   review for the new head.
 - **Reviewer/QA split:** if you want an orchestrator agent with no checkout and a
-  separate QA agent with a checkout, branch the *same* factory on
+  separate QA agent with a checkout, branch `binding_factory` on
   `request.agent_name` — it is a per-session field — returning `NoWorkspaceBinding`
   for one and a `GitRepositoryBinding` for the other.
 - **Sandbox the checkout and QA:** use Docker (`DockerRunner` or
@@ -163,6 +179,9 @@ class PRReviewWorkspaceFactory(EnvironmentFactory):
   for the shared-kernel caveat, host compatibility and `cayu[egress]` network
   restrictions. The local snippet above is only for trusted fixtures; a QA
   command allowlist does not make code from a pull request safe to execute.
+  Replace `LocalWorkspaceEnvironmentFactory` with an `EnvironmentFactory`
+  that creates a matching sandbox runner and workspace; changing only
+  `runner_factory` leaves the workspace on the host.
 
 ## 4. GitHub egress: two options
 

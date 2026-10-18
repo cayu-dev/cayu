@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from functools import partial
+from hashlib import sha256
+from pathlib import Path
+
 from cayu import CayuApp, Message, RunRequest
 from cayu.budgets import RunLimits
 from cayu.deadlines import ExecutionDeadline
@@ -49,18 +53,24 @@ async def enqueue_pr_review(
     )
 
 
-async def _handle_pr_review_task(app: CayuApp, task: Task, worker_id: str) -> None:
+async def _handle_pr_review_task(
+    app: CayuApp, task: Task, worker_id: str, *, workspace_root: Path
+) -> None:
     owner, repo, pr_number = task.input["owner"], task.input["repo"], task.input["pr_number"]
     head_sha = task.input["head_sha"]
     short_head_sha = str(head_sha)[:12]
+    session_id = f"pr-review-{owner}-{repo}-{pr_number}-{short_head_sha}"
+    root = workspace_root.resolve() / sha256(session_id.encode()).hexdigest()
+    root.mkdir(parents=True, exist_ok=True)
     request = RunRequest(
         agent_name="pr-reviewer",
-        session_id=f"pr-review-{owner}-{repo}-{pr_number}-{short_head_sha}",
+        session_id=session_id,
         task_id=task.id,
         task_worker_id=worker_id,
         task_lease_expires_at=task.lease_expires_at,
         environment_name="pr-workspace",
         metadata={
+            "workspace_root": str(root),
             "repo_owner": owner,
             "repo_name": repo,
             "pr_number": pr_number,
@@ -85,13 +95,13 @@ async def _handle_pr_review_task(app: CayuApp, task: Task, worker_id: str) -> No
 
 
 async def run_pr_review_worker_once(
-    app: CayuApp, task_store: SQLiteTaskStore, *, worker_id: str = "worker-1"
+    app: CayuApp, task_store: SQLiteTaskStore, *, workspace_root: Path, worker_id: str = "worker-1"
 ) -> int:
     """Claim and handle one pending review_pr task through the generic task worker."""
     return await run_task_worker(
         app,
         task_store,
-        _handle_pr_review_task,
+        partial(_handle_pr_review_task, workspace_root=workspace_root),
         worker_id=worker_id,
         query=TaskQuery(type="review_pr", assigned_agent_name="pr-reviewer"),
         lease_seconds=900,

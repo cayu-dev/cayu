@@ -207,6 +207,15 @@ from cayu.environments.lifecycle import (
 from cayu.environments.lifecycle import (
     environment_lifecycle_transition_from_event as environment_lifecycle_transition_from_event,
 )
+from cayu.environments.local_workspace import (
+    LocalWorkspaceEnvironmentFactory as LocalWorkspaceEnvironmentFactory,
+)
+from cayu.environments.local_workspace import (
+    require_allowed_workspace_root as require_allowed_workspace_root,
+)
+from cayu.environments.local_workspace import (
+    workspace_root_from_metadata as workspace_root_from_metadata,
+)
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
 from cayu.environments.snapshot_lifecycle import (
     inspect_execution_snapshots as inspect_execution_snapshots,

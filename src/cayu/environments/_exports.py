@@ -1,6 +1,18 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "LocalWorkspaceEnvironmentFactory": (
+        "cayu.environments.local_workspace",
+        "LocalWorkspaceEnvironmentFactory",
+    ),
+    "workspace_root_from_metadata": (
+        "cayu.environments.local_workspace",
+        "workspace_root_from_metadata",
+    ),
+    "require_allowed_workspace_root": (
+        "cayu.environments.local_workspace",
+        "require_allowed_workspace_root",
+    ),
     "DmtcpExecutionSnapshotAdapter": (
         "cayu.environments.dmtcp_snapshots",
         "DmtcpExecutionSnapshotAdapter",
@@ -333,6 +345,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "LocalWorkspaceEnvironmentFactory",
+    "workspace_root_from_metadata",
+    "require_allowed_workspace_root",
     "DmtcpExecutionSnapshotAdapter",
     "ExecutionSnapshotAdapter",
     "ExecutionSnapshotArtifact",

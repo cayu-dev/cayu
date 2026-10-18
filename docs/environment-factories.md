@@ -149,6 +149,79 @@ Register it as the default (or under a name) instead of a static `register_envir
 app.register_environment_factory(EnvironmentSpec(name="local"), LocalNativeFactory(base), default=True)
 ```
 
+### Per-request local workspaces
+
+`LocalWorkspaceEnvironmentFactory` attaches a prepared directory whose ownership
+the application has already established. It resolves symlinks, rejects missing
+directories and roots outside `allowed_roots`, and forwards runner admission
+proof. A parent-directory allowlist does not authorize access to another
+session's or tenant's directory.
+
+```python
+from pathlib import Path
+from cayu.environments import LocalWorkspaceEnvironmentFactory
+
+# Populate this trusted mapping when the application admits and prepares a job.
+prepared_roots = {"review-42": Path("/srv/reviews/review-42").resolve()}
+factory = LocalWorkspaceEnvironmentFactory(
+    allowed_roots=["/srv/reviews"],
+    root_from_request=lambda request: prepared_roots[request.session_id],
+)
+app.register_environment_factory(EnvironmentSpec(name="checkout"), factory, default=True)
+request = RunRequest(
+    session_id="review-42", agent_name="reviewer",
+    messages=[Message.text("user", "Review this checkout")],
+)
+```
+
+Metadata selection is also supported, but requires an explicit
+`authorize_root(request, resolved_root)` callback returning exactly `True` for
+an owned session/path pair. Metadata can be authored by users or subagents:
+never treat the path itself as authorization. For the same trusted mapping:
+
+```python
+factory = LocalWorkspaceEnvironmentFactory(
+    allowed_roots=["/srv/reviews"],
+    metadata_key="checkout",
+    authorize_root=lambda request, root: prepared_roots.get(request.session_id) == root,
+)
+```
+
+`workspace_root_from_metadata` only parses a path and
+`require_allowed_workspace_root` only checks containment; custom integrations
+must separately enforce ownership. All callbacks are synchronous and
+side-effect free. Prepare directories before `app.run`.
+
+For Docker, retain the actual `DockerRunner` returned by preparation. A bare
+`DockerRunner(name)` lacks the exact container identity needed by final
+executable admission. Prepare the container before admission, using an image
+with the tools your agent requires:
+
+```python
+root = prepared_roots["review-42"]
+prepared_runners = {"review-42": await DockerRunner.create(
+    "review-42", image="your-review-image:tag", mount_path=str(root),
+    close_action="none",
+)}
+factory = LocalWorkspaceEnvironmentFactory(
+    allowed_roots=["/srv/reviews"],
+    root_from_request=lambda request: prepared_roots[request.session_id],
+    runner_factory=lambda root, request: prepared_runners[request.session_id],
+    binding_factory=lambda root, request: NativeBinding(default_path=str(root)),
+)
+```
+
+`mount_path` mounts the host root at the same absolute guest path. The
+application owns allocation, mapping, and disposal, and the callback must return
+the same prepared runner at admission and creation. Use
+`DockerCodingEnvironmentFactory` when Cayu should allocate and own the container.
+A `binding_factory` can also select `GitRepositoryBinding` for a queued commit.
+
+Give each concurrent run a different root. Local execution and path checks do
+not sandbox hostile code or prevent a hostile filesystem owner from replacing
+paths. Supply `execution_profile_identity` when declaring stable callback
+behavior for recovery.
+
 When a factory attaches an already-configured durable artifact store to every
 concrete environment, register that same store with the factory registration:
 
