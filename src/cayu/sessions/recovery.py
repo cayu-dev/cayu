@@ -60,6 +60,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     PENDING_ALLOCATION_CLEANUP = "pending_allocation_cleanup"
     REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
+    ABANDONED_TOOL_EFFECT = "abandoned_tool_effect"
     FINALIZED_INTERRUPT = "finalized_interrupt"
     FAILED = "failed"
 
@@ -931,6 +932,9 @@ __all__ = [
 
 
 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY = "incomplete_session_recovery_claim"
+# A failed session abandoned with unknown tool outcomes. Invocation admission
+# refuses it, so no continuation can replace the abandonment or its cleanup.
+_ABANDONED_SESSION_CHECKPOINT_KEY = "abandoned_session"
 
 
 def _incomplete_recovery_claim_from_checkpoint(

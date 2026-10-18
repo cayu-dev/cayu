@@ -622,6 +622,7 @@ class SessionRecovery:
         *,
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        abandon_unknown_tool_effects: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
         (
@@ -681,6 +682,7 @@ class SessionRecovery:
                 before_mutation=admit_before_mutation,
                 participant_context=participant_context,
                 execution_to_wait=execution_to_wait,
+                abandon_unknown_tool_effects=abandon_unknown_tool_effects,
             )
         finally:
             if interaction_id is not None:
@@ -746,6 +748,7 @@ class SessionRecovery:
         before_mutation: Callable[[], Awaitable[None]],
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        abandon_unknown_tool_effects: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         retained_invocation_context: InvocationContext | None = None
 
@@ -763,6 +766,7 @@ class SessionRecovery:
         result = await self._incomplete_recovery.recover_incomplete_session(
             request,
             execution_to_wait=execution_to_wait,
+            abandon_unknown_tool_effects=abandon_unknown_tool_effects,
             before_mutation=before_mutation,
             participant_context=participant_context,
             retain_open_interaction_invocation=(interaction_id is not None),

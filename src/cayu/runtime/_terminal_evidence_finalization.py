@@ -65,6 +65,10 @@ from cayu.runtime._recovery_ownership import (
 from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
+from cayu.runtime._session_abandonment import (
+    abandoned_session_failure_payload,
+    abandoned_session_from_checkpoint,
+)
 from cayu.runtime._session_control import (
     SessionControl,
 )
@@ -799,6 +803,7 @@ class TerminalEvidenceFinalization:
                 pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
                 run_operation=inspection.run_operation,
                 interruption_reason=interruption_reason,
+                abandoned=abandoned_session_from_checkpoint(checkpoint),
             )
             if session.status is SessionStatus.COMPLETED:
                 repair_event.payload.update(
@@ -857,6 +862,7 @@ class TerminalEvidenceFinalization:
         pending_action_interrupt_payload: dict[str, Any] | None,
         run_operation: _SessionRunOperation | None,
         interruption_reason: str | None = None,
+        abandoned: dict[str, Any] | None = None,
     ) -> Event:
         event_type = _TERMINAL_EVENT_TYPE_BY_STATUS[session.status]
         pending_interrupt_request_id = (
@@ -885,6 +891,8 @@ class TerminalEvidenceFinalization:
                 "recovered": True,
                 "terminal_evidence_repaired": True,
             }
+        elif session.status == SessionStatus.FAILED and abandoned is not None:
+            payload = abandoned_session_failure_payload(abandoned)
         elif session.status == SessionStatus.FAILED:
             payload = {
                 "error": "Original terminal failure details were not durably recorded.",

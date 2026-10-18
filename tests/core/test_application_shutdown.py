@@ -26,6 +26,7 @@ from cayu.tools.knowledge import RememberKnowledgeTool
 # Entrances that start or continue model/tool execution, verifiers, or workers.
 GATED_ENTRANCES = frozenset(
     {
+        "abandon_session",
         "admit_work_attempt",
         "compact_session",
         "dispatch",

@@ -167,6 +167,7 @@ from cayu.sessions.records import (
     SessionRuntimeIdentity,
     SessionStateSnapshot,
     SessionStatus,
+    SessionStatusConflict,
     StoreTimeCheckpointTransform,
     TranscriptRecord,
 )
@@ -1176,6 +1177,10 @@ class SessionStore(ABC):
             checkpoint: dict[str, Any] | None,
             now: datetime | None = None,
         ) -> dict[str, Any]:
+            from cayu.sessions.recovery import _ABANDONED_SESSION_CHECKPOINT_KEY
+
+            if checkpoint is not None and _ABANDONED_SESSION_CHECKPOINT_KEY in checkpoint:
+                raise SessionStatusConflict("An abandoned session cannot be continued.")
             current_active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
             if current_active_profile is not None and not (
                 active_invocation_execution_profile_is_released(

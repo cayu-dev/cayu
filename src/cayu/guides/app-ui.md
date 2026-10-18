@@ -200,6 +200,16 @@ calling the provider again. Background provider operations and contracted tasks
 retain their existing recovery paths; inspect the per-session results for work
 that needs an explicit decision.
 
+A session that died during an `EXTERNAL` tool call ends `interrupted` with
+`pending_tool_effect` and keeps its environment allocation, because only an
+explicit receipt or lookup may continue it. When the application has already
+given up on that work, call `await app.abandon_session(session_id)`. It keeps
+the unknown outcome without dispatching the call again, fails the session, and
+releases its environment through the factory. The session can no longer be
+resumed. Pass `abandon_sessions_of_terminal_tasks=True` to the sweep to do this
+for every such session whose tasks are all terminal; later sweeps also pick up
+sessions whose tasks finished after an earlier sweep interrupted them.
+
 Transient renewal errors do not release the row, and the heartbeat keeps retrying
 for as long as the run is active, even after a store outage outlasts the lease.
 Once the store answers again, the expired lease cannot be renewed, so the same

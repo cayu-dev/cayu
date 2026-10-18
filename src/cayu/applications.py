@@ -437,6 +437,7 @@ from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
 )
+from cayu.runtime._session_abandonment import SessionAbandonment
 from cayu.runtime._session_checkpoint_admission import _reject_unresumable_session_checkpoint
 from cayu.runtime._session_closure_projection import (
     project_closure_export,
@@ -1907,6 +1908,13 @@ class CayuApp:
             session_control=self._session_control,
             session_finalization=self._session_finalization,
             terminal_evidence=self._terminal_evidence,
+        )
+        self._session_abandonment = SessionAbandonment(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            session_recovery=self._session_recovery,
+            environment_lifecycle=self._environment_lifecycle,
+            resolve_registered_environment=self._get_registered_environment_for_session,
         )
 
         self._work_attempt_execution = WorkAttemptExecution(
@@ -7672,6 +7680,7 @@ class CayuApp:
         self,
         *,
         inactive_for_seconds: int = 3600,
+        abandon_sessions_of_terminal_tasks: bool = False,
     ) -> tuple[IncompleteSessionRecoveryResult, ...]:
         """Recover running sessions whose process died and that nothing has resumed since.
 
@@ -7685,10 +7694,22 @@ class CayuApp:
         recovery paths. Keep the window longer than the gap after which a
         conversation's next message would still take
         its session over, so that message's takeover replays interrupted calls.
+
+        A session stopped on an unknown external tool outcome is left
+        ``interrupted`` with ``pending_tool_effect``. With
+        ``abandon_sessions_of_terminal_tasks``, such a session is abandoned
+        as by :meth:`abandon_session` when it has at least one task and every
+        one of its tasks is terminal, which requires a ``task_store``. The
+        sweep then also revisits interrupted sessions whose tasks finished
+        later, and abandoned sessions whose cleanup did not finish.
         """
 
         if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
             raise ValueError("inactive_for_seconds must be a non-negative integer.")
+        if type(abandon_sessions_of_terminal_tasks) is not bool:
+            raise TypeError("abandon_sessions_of_terminal_tasks must be a bool.")
+        if abandon_sessions_of_terminal_tasks and self.task_store is None:
+            raise ValueError("abandon_sessions_of_terminal_tasks requires a task_store.")
         results: list[IncompleteSessionRecoveryResult] = []
         cursor: str | None = None
         while True:
@@ -7702,14 +7723,65 @@ class CayuApp:
                 recover_abandoned_models=True,
             )
             for result in page.results:
+                if abandon_sessions_of_terminal_tasks:
+                    result = await self._session_abandonment.abandon_swept(result)
                 results.append(
                     await self._project_incomplete_recovery_result_for_public_api(result)
                 )
             if page.next_cursor is None:
+                if abandon_sessions_of_terminal_tasks:
+                    for result in await self._session_abandonment.abandon_retained(
+                        inactive_for_seconds=inactive_for_seconds
+                    ):
+                        results.append(
+                            await self._project_incomplete_recovery_result_for_public_api(result)
+                        )
                 return tuple(results)
             if page.next_cursor == cursor:
                 raise RuntimeError("Abandoned-session recovery returned a repeated cursor.")
             cursor = page.next_cursor
+
+    @_admitted_entrance
+    @execution_owned_by("recovery")
+    async def abandon_session(
+        self,
+        session_id: str,
+        *,
+        reason: str = "session_abandoned",
+        metadata: dict[str, Any] | None = None,
+        inactive_for_seconds: int = 0,
+    ) -> IncompleteSessionRecoveryResult:
+        """End a session stopped on an unknown tool outcome and release its environment.
+
+        Use this when the application will never continue the session, for
+        example after cancelling its work across a restart. The session may be
+        ``interrupted`` with ``pending_tool_effect`` or not yet recovered after
+        its process died. Each unknown external effect keeps its
+        ``outcome_unknown`` record and is never dispatched again; the pending
+        round is retained as evidence but leaves resumable work. The session
+        then fails with a ``session.failed`` event whose payload has
+        ``error_type: "SessionAbandoned"`` and lists the unknown calls, and
+        recovery finalizes its environment binding through the factory. No
+        model call is made.
+
+        The result reports ``abandoned_tool_effect`` on success. A session
+        with no unknown tool outcome is recovered normally and left as it
+        was. Refuses while any task of the session is not terminal, and skips a
+        session with a live execution owner or activity within
+        ``inactive_for_seconds``. Repeating the call after an interruption
+        finishes the cleanup. An abandoned session can no longer be resumed;
+        fork it to continue its conversation.
+        """
+
+        if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
+            raise ValueError("inactive_for_seconds must be a non-negative integer.")
+        result = await self._session_abandonment.abandon(
+            await self._resolve_public_session_id(session_id),
+            reason=reason,
+            metadata={} if metadata is None else metadata,
+            inactive_for_seconds=inactive_for_seconds,
+        )
+        return await self._project_incomplete_recovery_result_for_public_api(result)
 
     @_admitted_entrance
     @execution_owned_by("recovery")

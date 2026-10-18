@@ -274,6 +274,17 @@ unknown call and finishes any pending session interruption without invoking the
 tool or receipt validator. Inspect that call and submit an explicit receipt or
 lookup request to continue; this recovery action is not a completed tool result.
 
+If the application will never continue the session, `CayuApp.abandon_session`
+ends it instead. The effect record stays `outcome_unknown` and the call is never
+dispatched again; the round is retained as evidence but leaves resumable work.
+The session fails with `error_type: "SessionAbandoned"`, its `session.failed`
+payload lists the unknown calls under `tool_effect_outcome_unknown`, and
+recovery finalizes its environment binding. The result reports
+`abandoned_tool_effect`. Abandonment is permanent: resuming the session raises
+`SessionStatusConflict`, while a fork of it starts without the abandonment.
+Abandonment does not reconcile the downstream system: check it with the
+call's idempotency key if the effect may have happened.
+
 After receipt selection, an abandoned reconciliation stream still needs its
 explicit continuation. For ordinary tool rounds, recovery plans report
 `tool_effect_continuation_required`

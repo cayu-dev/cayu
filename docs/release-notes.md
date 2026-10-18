@@ -66,6 +66,21 @@ whose task workers can be stopped mid-handler can settle the stranded tasks with
   configuration stops the server from starting. See
   [enrolling from the environment](fork-overlays.md#enrolling-from-the-environment).
 
+- `CayuApp.abandon_session(session_id)` ends a session that stopped on an
+  unknown external tool outcome and that the application will never continue,
+  and releases its environment. Before, such a session stayed `interrupted`
+  with `pending_tool_effect`, and its bound allocation (for example a Docker
+  coding container) stayed alive until someone resumed the conversation. The
+  call keeps each unknown effect as `outcome_unknown`, never dispatches it
+  again, moves the session to `failed` with a `session.failed` event whose
+  `error_type` is `SessionAbandoned`, and finalizes the environment binding
+  through the factory with the usual lifecycle evidence. No model call is made.
+  It refuses while any task of the session is not terminal. Abandonment is
+  permanent: the session can no longer be resumed, while a fork of it can.
+  `recover_abandoned_sessions(abandon_sessions_of_terminal_tasks=True)` does
+  the same during the sweep for sessions whose tasks are all terminal, and
+  revisits sessions left interrupted or half cleaned up by an earlier sweep.
+
 ### Breaking changes
 
 - Storage schema revision 122 requires all writers to understand restartable

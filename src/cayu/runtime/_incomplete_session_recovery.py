@@ -130,6 +130,11 @@ from cayu.runtime._recovery_requests import (
 from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
+from cayu.runtime._session_abandonment import (
+    ABANDONED_SESSION_CHECKPOINT_KEY,
+    abandoned_session_from_checkpoint,
+    abandoned_session_record,
+)
 from cayu.runtime._session_control import (
     SessionControl,
 )
@@ -592,6 +597,7 @@ class IncompleteSessionRecovery:
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
+        abandon_unknown_tool_effects: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         """Repair incomplete state, including an exact post-close child continuation.
 
@@ -644,6 +650,7 @@ class IncompleteSessionRecovery:
                 raise ValueError("Governed recovery session authority changed before admission.")
         recovered = await self.recover_incomplete_session_scoped(
             execution_to_wait=execution_to_wait,
+            abandon_unknown_tool_effects=abandon_unknown_tool_effects,
             participant_context=participant_context,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
@@ -1230,6 +1237,7 @@ class IncompleteSessionRecovery:
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
         recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
+        abandon_unknown_tool_effects: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
 
@@ -1267,6 +1275,7 @@ class IncompleteSessionRecovery:
 
         return await self._recover_incomplete_session_owned(
             recover_abandoned_model=recover_abandoned_model,
+            abandon_unknown_tool_effects=abandon_unknown_tool_effects,
             execution_to_wait=execution_to_wait,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
@@ -1309,6 +1318,7 @@ class IncompleteSessionRecovery:
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
         recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
+        abandon_unknown_tool_effects: bool = False,
     ) -> IncompleteSessionRecoveryResult:
 
         external_recovery_record = None
@@ -1639,10 +1649,19 @@ class IncompleteSessionRecovery:
             if (
                 not has_pending_work
                 and active_invocation_profile is not None
-                and not active_invocation_execution_profile_is_released(
-                    active_invocation_profile,
-                    session_id=session.id,
-                    run_epoch=session.run_epoch,
+                and (
+                    # An abandoned session was interrupted, which released its
+                    # profile, before it failed. Its binding still owns the
+                    # environment, so finalize it as for any failed run.
+                    (
+                        session.status is SessionStatus.FAILED
+                        and abandoned_session_from_checkpoint(checkpoint) is not None
+                    )
+                    or not active_invocation_execution_profile_is_released(
+                        active_invocation_profile,
+                        session_id=session.id,
+                        run_epoch=session.run_epoch,
+                    )
                 )
             ):
                 terminal_binding_finalization = (
@@ -2349,6 +2368,7 @@ class IncompleteSessionRecovery:
                         raise
                 recovered = await self._recover_incomplete_session(
                     recover_abandoned_model=recover_abandoned_model,
+                    abandon_unknown_tool_effects=abandon_unknown_tool_effects,
                     retain_cleanup_context=retain_cleanup_context,
                     preserve_interaction_id=preserve_interaction_id,
                     participant_context=participant_context,
@@ -2993,6 +3013,7 @@ class IncompleteSessionRecovery:
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
         recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
+        abandon_unknown_tool_effects: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         if (execution_profile_snapshot is None) != (invocation_context is None):
             raise RuntimeError(
@@ -4032,6 +4053,32 @@ class IncompleteSessionRecovery:
                     ),
                     invocation_context=invocation_context,
                 )
+                if (
+                    abandon_unknown_tool_effects
+                    and not isinstance(unresolved, ForegroundSubagentRecoveryRequired)
+                    and session.status is SessionStatus.INTERRUPTED
+                ):
+                    abandoned = await self._abandon_unknown_tool_round(
+                        session=session,
+                        pending_round=pending_tool_round,
+                        reason=reason,
+                        metadata=metadata,
+                    )
+                    if abandoned is not None:
+                        return IncompleteSessionRecoveryResult(
+                            session_id=abandoned.id,
+                            previous_status=previous_status,
+                            status=abandoned.status,
+                            actions=(
+                                *actions,
+                                IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT,
+                            ),
+                            events=tuple(events),
+                            message=(
+                                "Abandoned the session; its unknown tool outcomes were not "
+                                "dispatched again."
+                            ),
+                        )
                 return IncompleteSessionRecoveryResult(
                     session_id=session.id,
                     previous_status=previous_status,
@@ -4331,7 +4378,6 @@ class IncompleteSessionRecovery:
     ) -> None:
         """Retain quarantined evidence while removing it from resumable work."""
 
-        expected_identity = pending_rounds.pending_tool_round_identity(pending_round)
         if session.status not in _UNREPLAYABLE_TOOL_ROUND_ARCHIVE_SESSION_STATUSES:
             raise RuntimeError(
                 "An unreplayable tool round can only be abandoned from a recoverable "
@@ -4349,35 +4395,108 @@ class IncompleteSessionRecovery:
                 raise RuntimeError(
                     "Session changed before its unreplayable tool round was abandoned."
                 )
-            current = pending_round_reader.pending_tool_round_from_checkpoint(
-                checkpoint,
-                redactor=self._secret_redactor,
-                consume_on_rejection=True,
-                runtime_session=current_session,
+            copied, durable_round = self._checkpoint_without_pending_tool_round(
+                current_session, checkpoint, pending_round
             )
-            if (
-                current is None
-                or pending_rounds.pending_tool_round_identity(current) != expected_identity
-            ):
-                raise RuntimeError(
-                    "Pending tool round changed before its unreplayable state was abandoned."
-                )
-            copied = copy_durable_record(checkpoint, "checkpoint")
-            durable_round = copied.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
-            pointer = model_completion_publication.model_step_publication_from_checkpoint(copied)
-            if pointer is not None:
-                if (
-                    not pointer.assistant_message_deferred
-                    or pointer.logical_step_id != expected_identity.model_step_id
-                    or pointer.tool_round_id != expected_identity.tool_round_id
-                ):
-                    raise RuntimeError(
-                        "Unreplayable tool round conflicts with its durable model-step pointer."
-                    )
-                copied.pop(model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
             return _retain_abandoned_unreplayable_tool_round(copied, durable_round)
 
         await self._session_store.transform_checkpoint(session.id, archive)
+
+    def _checkpoint_without_pending_tool_round(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        pending_round: pending_rounds.PendingToolRound,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Remove one exact round, and its deferred assistant step, from resumable work."""
+
+        expected_identity = pending_rounds.pending_tool_round_identity(pending_round)
+        current = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if (
+            current is None
+            or pending_rounds.pending_tool_round_identity(current) != expected_identity
+        ):
+            raise RuntimeError("Pending tool round changed before it was abandoned.")
+        copied = copy_durable_record(checkpoint, "checkpoint")
+        durable_round = copied.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+        pointer = model_completion_publication.model_step_publication_from_checkpoint(copied)
+        if pointer is not None:
+            if (
+                not pointer.assistant_message_deferred
+                or pointer.logical_step_id != expected_identity.model_step_id
+                or pointer.tool_round_id != expected_identity.tool_round_id
+            ):
+                raise RuntimeError(
+                    "Abandoned tool round conflicts with its durable model-step pointer."
+                )
+            copied.pop(model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
+        return copied, durable_round
+
+    async def _abandon_unknown_tool_round(
+        self,
+        *,
+        session: Session,
+        pending_round: pending_rounds.PendingToolRound,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> Session | None:
+        """Fail an interrupted session whose round holds unknown tool outcomes.
+
+        Each unknown effect keeps its ``outcome_unknown`` record and is never
+        dispatched again. The round leaves resumable work in the same store
+        transition that fails the session; recovery then publishes the
+        terminal evidence and releases the environment binding.
+        """
+
+        effects = ToolEffectStateOwner(self._session_store)
+        unknown_tool_calls = []
+        for call in pending_round.tool_calls:
+            record = await effects.resolve_call(
+                session,
+                tool_round_id=pending_round.tool_round_id,
+                tool_call_id=call.tool_call_id,
+            )
+            if record is not None and record.state in {"executing", "outcome_unknown"}:
+                unknown_tool_calls.append(
+                    {
+                        "tool_round_id": pending_round.tool_round_id,
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                    }
+                )
+        if not unknown_tool_calls:
+            return None
+
+        def abandon(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if current_session.run_epoch != session.run_epoch:
+                raise RuntimeError("Session changed before it was abandoned.")
+            copied, durable_round = self._checkpoint_without_pending_tool_round(
+                current_session, checkpoint, pending_round
+            )
+            if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
+                raise RuntimeError("Session already retains abandonment evidence.")
+            copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
+                reason=reason,
+                metadata=metadata,
+                tool_round=durable_round,
+                unknown_tool_calls=unknown_tool_calls,
+            )
+            return copied
+
+        return await self._session_store.transition_status_and_checkpoint(
+            session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.FAILED,
+            checkpoint_transform=abandon,
+        )
 
     async def _finalize_interrupting_for_recovery(
         self,

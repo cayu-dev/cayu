@@ -18,6 +18,7 @@ from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
+from cayu.sessions.recovery import _ABANDONED_SESSION_CHECKPOINT_KEY
 
 _SESSION_OPERATIONS_CHECKPOINT_KEY = "session_operations"
 _SESSION_RUN_OPERATION_CHECKPOINT_KEY = "session_run_operation"
@@ -48,6 +49,8 @@ _SOURCE_OWNED_CHECKPOINT_KEYS = frozenset(
         "environment_factory_allocation_generations",
         "session_continuations",
         "execution_snapshots",
+        # Abandonment ends the source session only; a fork may still run.
+        _ABANDONED_SESSION_CHECKPOINT_KEY,
     }
 )
 
