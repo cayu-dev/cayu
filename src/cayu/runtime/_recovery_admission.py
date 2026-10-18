@@ -194,6 +194,13 @@ class RecoveryAdmission:
         cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
         if stream is not None:
             cleanup_steps.append(("nested stream close", stream.aclose))
+        if authoritative_failure is not None:
+            cleanup_steps.append(
+                (
+                    "expired continuation effect preservation",
+                    lambda: self._preserve_expired_continuation_effects(session_id),
+                )
+            )
         if finalize_abandoned:
             cleanup_steps.append(
                 (
@@ -234,6 +241,26 @@ class RecoveryAdmission:
             authoritative_failure=authoritative_failure,
             steps=tuple(cleanup_steps),
         )
+
+    async def _preserve_expired_continuation_effects(self, session_id: str) -> None:
+        from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+        from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+        from cayu.sessions._pending_tool_round_reader import load_pending_tool_round
+
+        session = await self._session_store.load(session_id)
+        if session is None or not session.execution_deadline.expired:
+            return
+        checkpoint, pending_round = await load_pending_tool_round(self._session_store, session_id)
+        pending_input, _intent = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint, current_run_epoch=session.run_epoch, runtime_session=session
+        )
+        for pending in (pending_round, pending_input):
+            if pending is not None:
+                await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+                    session,
+                    tool_round_id=pending.tool_round_id,
+                    tool_call_ids=tuple(call.tool_call_id for call in pending.tool_calls),
+                )
 
     async def cleanup_entrypoint_handoff(
         self,

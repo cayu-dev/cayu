@@ -12612,6 +12612,11 @@ cleanup keep their existing bounded settlement budgets after expiry. They do not
 application-work admission. Their receipts and secondary cleanup failures remain distinct
 from the execution timeout. A durable settled outcome can still be reconciled; an
 unfinished operation is never turned into success merely because its deadline elapsed.
+For an ordinary task already failed by that deadline, tool-result recovery accepts
+only the exact original task/session authority and durable deadline-failure evidence.
+It records the verified result and leaves the task failed and the session interrupted;
+it cannot execute pending siblings or another model step. Protected external effects
+still require their registered receipt validator through `reconcile_tool_effect`.
 Unconfigured executions retain the existing unbounded behavior.
 
 ### Workflow failure evidence

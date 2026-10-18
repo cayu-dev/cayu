@@ -367,6 +367,7 @@ class SessionTaskLifecycle:
         task_worker_id: str | None,
         task_handoff_id: str | None = None,
         allow_terminal_failure_replay: bool = False,
+        allow_deadline_settlement: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
     ) -> None:
         if task_handoff_id is not None and task_worker_id is None:
@@ -384,6 +385,7 @@ class SessionTaskLifecycle:
             session_id=session_id,
             session_instance_id=session_instance_id,
             allow_terminal_failure_replay=allow_terminal_failure_replay,
+            allow_deadline_settlement=allow_deadline_settlement,
             approval_failure_identity=approval_failure_identity,
         )
 
@@ -1202,6 +1204,42 @@ class SessionTaskLifecycle:
             _deactivate_session_interaction(session.id)
         return True, tuple(replay_events)
 
+    async def prepare_continuation_recovery_authority(
+        self,
+        *,
+        require_ordinary_execution: Callable[..., Awaitable[None]],
+        session_id: str,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        allow_terminal_failure_replay: bool = False,
+        allow_deadline_settlement: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> tuple[str | None, str | None, tuple[Event, ...] | None]:
+        task_id, session_instance_id = await self.linked_continuation_task_id(
+            session_id=session_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            allow_deadline_settlement=allow_deadline_settlement,
+            approval_failure_identity=approval_failure_identity,
+        )
+        (
+            replayed_failure,
+            replay_events,
+        ) = await self.replay_runtime_task_failure_if_needed(
+            session_id=session_id,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+        )
+        if not replayed_failure:
+            await require_ordinary_execution(
+                session_id=session_id,
+                task_id=task_id,
+                admit_session=False,
+            )
+        return task_id, session_instance_id, replay_events if replayed_failure else None
+
     async def linked_resume_task_id(
         self,
         request: ResumeRequest,
@@ -1219,6 +1257,7 @@ class SessionTaskLifecycle:
         task_worker_id: str | None,
         task_handoff_id: str | None,
         allow_terminal_failure_replay: bool = False,
+        allow_deadline_settlement: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
     ) -> tuple[str | None, str | None]:
         """Find the running task that ordinary resume must terminalize.
@@ -1282,6 +1321,7 @@ class SessionTaskLifecycle:
                     session_id=session_id,
                     session_instance_id=live_session.instance_id,
                     allow_terminal_failure_replay=allow_terminal_failure_replay,
+                    allow_deadline_settlement=allow_deadline_settlement,
                     approval_failure_identity=approval_failure_identity,
                 )
                 return task.id, live_session.instance_id
@@ -1334,6 +1374,7 @@ class SessionTaskLifecycle:
         session_id: str,
         session_instance_id: str,
         allow_terminal_failure_replay: bool = False,
+        allow_deadline_settlement: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
         expected_runtime_task_terminalization_request_sha256: str | None = None,
     ) -> None:
@@ -1352,7 +1393,7 @@ class SessionTaskLifecycle:
             redactor=self._secret_redactor,
             authority_kind="task continuation authority",
         )
-        if allow_terminal_failure_replay:
+        if allow_terminal_failure_replay or allow_deadline_settlement:
             from cayu.runtime._deadline_task_failure import load_deadline_task_failure
 
             deadline_failure = await load_deadline_task_failure(

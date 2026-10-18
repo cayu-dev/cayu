@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, cast
@@ -653,6 +653,7 @@ class TerminalEventPublication:
         invocation_context: InvocationContext | None = None,
         run_runtime_hooks: bool = True,
         yield_terminal_event: bool = True,
+        _retain_current_terminal: bool = False,
     ) -> AsyncGenerator[Event, None]:
         """Replay exact terminal evidence and converge any unclaimed hook slots."""
 
@@ -681,11 +682,12 @@ class TerminalEventPublication:
             raise SessionRuntimePublicationConflict(
                 "Terminal replay evidence conflicts with its durable event."
             )
-        _mark_session_invocation_terminal_event(durable_event)
-        await self.clear_run_operation_after_terminal_event(
-            session=session,
-            terminal_event=durable_event,
-        )
+        if not _retain_current_terminal:
+            _mark_session_invocation_terminal_event(durable_event)
+            await self.clear_run_operation_after_terminal_event(
+                session=session,
+                terminal_event=durable_event,
+            )
         if yield_terminal_event:
             yield copy_event(durable_event)
         if not run_runtime_hooks:
@@ -1189,7 +1191,7 @@ class TerminalEventPublication:
     def publish_recovered(
         self,
         request: RecoveryTerminalEventRequest,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         if request.terminal_event_already_durable:
             return self.replay(
                 event=request.event,
@@ -1220,6 +1222,24 @@ class TerminalEventPublication:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
+
+    def replay_recovered_hooks(
+        self, request: RecoveryTerminalEventRequest
+    ) -> AsyncGenerator[Event, None]:
+        """Finish original hook slots without replacing the current invocation's terminal."""
+        if not request.terminal_event_already_durable:
+            raise ValueError("Terminal hook replay requires a durable terminal event.")
+        return self.replay(
+            event=request.event,
+            phase=request.phase,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+            yield_terminal_event=False,
+            _retain_current_terminal=True,
+        )
 
     async def recovered_hooks_are_settled(
         self,

@@ -1869,6 +1869,7 @@ class CayuApp:
             foreground_gate_policy_owner=self._foreground_gate_policy_owner,
             require_participant_execution=self._require_participant_execution,
             task_store=self.task_store,
+            fail_deadline_task=self._session_tasks.fail_task_for_execution_deadline,
             event_writer=self._event_writer,
             session_control=self._session_control,
             environment_lifecycle=self._environment_lifecycle,
@@ -9007,31 +9008,18 @@ class CayuApp:
         task_worker_id: str | None,
         task_handoff_id: str | None,
         allow_terminal_failure_replay: bool = False,
+        allow_deadline_settlement: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
     ) -> tuple[str | None, str | None, tuple[Event, ...] | None]:
-        task_id, session_instance_id = await self._session_tasks.linked_continuation_task_id(
+        return await self._session_tasks.prepare_continuation_recovery_authority(
+            require_ordinary_execution=self._require_ordinary_recovery_execution,
             session_id=session_id,
             task_worker_id=task_worker_id,
             task_handoff_id=task_handoff_id,
             allow_terminal_failure_replay=allow_terminal_failure_replay,
+            allow_deadline_settlement=allow_deadline_settlement,
             approval_failure_identity=approval_failure_identity,
         )
-        (
-            replayed_failure,
-            replay_events,
-        ) = await self._session_tasks.replay_runtime_task_failure_if_needed(
-            session_id=session_id,
-            task_id=task_id,
-            task_worker_id=task_worker_id,
-            task_handoff_id=task_handoff_id,
-        )
-        if not replayed_failure:
-            await self._require_ordinary_recovery_execution(
-                session_id=session_id,
-                task_id=task_id,
-                admit_session=False,
-            )
-        return task_id, session_instance_id, replay_events if replayed_failure else None
 
     async def _require_continuation_recovery_execution(
         self,
@@ -9044,6 +9032,7 @@ class CayuApp:
         task_handoff_id: str | None = None,
         enforce_task_handoff_identity: bool = False,
         allow_terminal_failure_replay: bool = False,
+        allow_deadline_settlement: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> None:
@@ -9057,6 +9046,7 @@ class CayuApp:
             task_worker_id=task_worker_id,
             task_handoff_id=task_handoff_id,
             allow_terminal_failure_replay=allow_terminal_failure_replay,
+            allow_deadline_settlement=allow_deadline_settlement,
             approval_failure_identity=approval_failure_identity,
         )
         await self._require_ordinary_recovery_execution(
@@ -9217,6 +9207,7 @@ class CayuApp:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
         request = copy_user_input_recovery_request(request)
         session = await self.session_store.load(request.session_id)
+        deadline_settlement = session is not None and session.execution_deadline.expired
         if session is not None:
             await self._require_participant_execution(session, participant_context)
         (
@@ -9227,6 +9218,7 @@ class CayuApp:
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
+            allow_deadline_settlement=deadline_settlement,
         )
         if replay_events is not None:
             for event in replay_events:
@@ -9245,6 +9237,7 @@ class CayuApp:
                 task_id=task_id,
                 task_worker_id=task_worker_id,
                 task_handoff_id=task_handoff_id,
+                allow_deadline_settlement=deadline_settlement,
                 admit_session=True,
             ),
             after_admission=(
@@ -9256,6 +9249,7 @@ class CayuApp:
                     task_id=task_id,
                     task_worker_id=task_worker_id,
                     task_handoff_id=task_handoff_id,
+                    allow_deadline_settlement=deadline_settlement,
                 )
             ),
         )
@@ -9537,6 +9531,7 @@ class CayuApp:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         request = _validate_tool_approval_recovery_request(request)
         session = await self.session_store.load(request.session_id)
+        deadline_settlement = session is not None and session.execution_deadline.expired
         if session is not None:
             await self._require_participant_execution(session, participant_context)
         (
@@ -9547,6 +9542,7 @@ class CayuApp:
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
+            allow_deadline_settlement=deadline_settlement,
         )
         if replay_events is not None:
             for event in replay_events:
@@ -9565,6 +9561,7 @@ class CayuApp:
                 task_id=task_id,
                 task_worker_id=task_worker_id,
                 task_handoff_id=task_handoff_id,
+                allow_deadline_settlement=deadline_settlement,
                 admit_session=True,
             ),
             after_admission=(
@@ -9576,6 +9573,7 @@ class CayuApp:
                     task_id=task_id,
                     task_worker_id=task_worker_id,
                     task_handoff_id=task_handoff_id,
+                    allow_deadline_settlement=deadline_settlement,
                 )
             ),
         )
@@ -9788,6 +9786,7 @@ class CayuApp:
         else:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
         session = await self.session_store.load(request.session_id)
+        deadline_settlement = session is not None and session.execution_deadline.expired
         if session is not None:
             await self._require_participant_execution(session, participant_context)
         if type(request) is ToolEffectReconciliationRequest:
@@ -9803,6 +9802,7 @@ class CayuApp:
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
+            allow_deadline_settlement=deadline_settlement,
         )
         if replay_events is not None:
             for event in replay_events:
@@ -9821,6 +9821,7 @@ class CayuApp:
                 task_id=task_id,
                 task_worker_id=task_worker_id,
                 task_handoff_id=task_handoff_id,
+                allow_deadline_settlement=deadline_settlement,
                 admit_session=True,
             ),
             after_admission=(
@@ -9832,6 +9833,7 @@ class CayuApp:
                     task_id=task_id,
                     task_worker_id=task_worker_id,
                     task_handoff_id=task_handoff_id,
+                    allow_deadline_settlement=deadline_settlement,
                 )
             ),
         )

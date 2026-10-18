@@ -67,6 +67,7 @@ from cayu.approvals.tools import (
 )
 from cayu.approvals.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
+    USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
     USER_INPUT_SUPERSESSION_INTENT_KEY,
     PendingUserInput,
     UserInputPauseState,
@@ -129,7 +130,7 @@ from cayu.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
 )
-from cayu.failure_evidence import exception_evidence
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.messages import Message, detach_message
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.providers.retry_policy import RetryPolicy
@@ -159,6 +160,7 @@ from cayu.runtime._continuation_task_failure import (
     approval_task_terminalization_request,
     load_direct_task_failure_replay,
 )
+from cayu.runtime._deadline_manual_settlement import ManualUserInputDeadlineSettlement
 from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._diagnostics import (
     exception_diagnostic,
@@ -627,6 +629,7 @@ class RecoveryCoordinator:
             [Session, CollaborationAccessContext | None], Awaitable[None]
         ],
         task_store: TaskStore | None,
+        fail_deadline_task: Callable[..., Awaitable[bool]],
         event_writer: RuntimeEventWriter,
         session_control: SessionControl[SessionUsageTracker],
         environment_lifecycle: EnvironmentLifecycle,
@@ -661,6 +664,7 @@ class RecoveryCoordinator:
         self._require_participant_execution = require_participant_execution
         self._foreground_gate_policy_owner = foreground_gate_policy_owner
         self._task_store = task_store
+        self._fail_deadline_task = fail_deadline_task
         self._event_writer = event_writer
         self._session_control = session_control
         self._environment_lifecycle = environment_lifecycle
@@ -905,17 +909,17 @@ class RecoveryCoordinator:
         except Exception:
             raise HumanReviewDenied() from None
 
-    async def _has_exact_persisted_user_input_manual_recovery(
+    async def _exact_persisted_user_input_manual_recovery(
         self,
         *,
         session: Session,
         pending: PendingUserInput,
         resolution_intent: UserInputResolutionIntent,
-    ) -> bool:
+    ) -> Event | None:
         """Prove that a manual-recovery claim produced its exact terminal evidence."""
 
         if resolution_intent.resolution_stage != "manual-recovery":
-            return False
+            return None
         require_resolution_intent_matches_pending(resolution_intent, pending=pending)
         round_identity = ToolRoundIdentity(
             tool_round_id=pending.tool_round_id,
@@ -952,7 +956,7 @@ class RecoveryCoordinator:
             raise SessionRuntimePublicationConflict(
                 "User-input manual recovery has duplicate exact terminal evidence."
             )
-        return len(matches) == 1
+        return matches[0] if matches else None
 
     async def _pause_gate_on_child(
         self,
@@ -1296,11 +1300,14 @@ class RecoveryCoordinator:
             else:
                 resume_after_manual_recovery = (
                     loaded_session.status is SessionStatus.INTERRUPTED
-                    and await self._has_exact_persisted_user_input_manual_recovery(
-                        session=loaded_session,
-                        pending=pending,
-                        resolution_intent=candidate_intent,
+                    and (
+                        await self._exact_persisted_user_input_manual_recovery(
+                            session=loaded_session,
+                            pending=pending,
+                            resolution_intent=candidate_intent,
+                        )
                     )
+                    is not None
                 )
                 if not resume_after_manual_recovery:
                     raise SessionRuntimePublicationConflict(
@@ -1474,6 +1481,23 @@ class RecoveryCoordinator:
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
             )
+            if session.execution_deadline.expired:
+                await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=authoritative_failure,
+                    steps=(
+                        (
+                            "expired continuation task settlement",
+                            lambda: self._fail_deadline_task(
+                                task_id=pending.task_id,
+                                task_worker_id=response.task_worker_id,
+                                task_handoff_id=response.task_handoff_id,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                            ),
+                        ),
+                    ),
+                )
 
     async def recover_user_input_request(
         self,
@@ -1584,6 +1608,32 @@ class RecoveryCoordinator:
             raise SessionRuntimePublicationConflict(
                 "User input was already claimed with a different resolution request."
             )
+        expired_replay: Event | None = None
+        if (
+            loaded_session.status is SessionStatus.INTERRUPTED
+            and loaded_session.execution_deadline.expired
+            and candidate_intent is not None
+            and candidate_intent.resolution_stage == "manual-recovery"
+        ):
+            persisted = await self._exact_persisted_user_input_manual_recovery(
+                session=loaded_session, pending=pending, resolution_intent=candidate_intent
+            )
+            if persisted is not None:
+                if before_mutation is not None:
+                    await before_mutation()
+                self._require_human_review_decision(
+                    request.review_reference,
+                    loaded_session,
+                    checkpoint,
+                    denying=False,
+                    accepted_request=True,
+                )
+                if await ManualUserInputDeadlineSettlement(
+                    self._session_store, loaded_session, persisted
+                ).completed("settlement"):
+                    yield persisted
+                    return
+                expired_replay = persisted
         effective_structured_output = _effective_user_input_structured_output(
             structured_output=request.structured_output,
             pending=pending,
@@ -1604,17 +1654,18 @@ class RecoveryCoordinator:
             pending_calls=pending.tool_calls,
             tool_call_id=request.tool_call_id,
         )
-        approval_support.validate_round_recovery_target(
-            events=await self._session_store.load_events(loaded_session.id),
-            pending_calls=pending.tool_calls,
-            tool_call_id=request.tool_call_id,
-            input_id=pending.input_id,
-            tool_round_identity=ToolRoundIdentity(
-                tool_round_id=pending.tool_round_id,
-                model_step_id=pending.model_step_id,
-                model_attempt_id=pending.model_attempt_id,
-            ),
-        )
+        if expired_replay is None:
+            approval_support.validate_round_recovery_target(
+                events=await self._session_store.load_events(loaded_session.id),
+                pending_calls=pending.tool_calls,
+                tool_call_id=request.tool_call_id,
+                input_id=pending.input_id,
+                tool_round_identity=ToolRoundIdentity(
+                    tool_round_id=pending.tool_round_id,
+                    model_step_id=pending.model_step_id,
+                    model_attempt_id=pending.model_attempt_id,
+                ),
+            )
         execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
             session=loaded_session,
             checkpoint=checkpoint,
@@ -1671,12 +1722,23 @@ class RecoveryCoordinator:
                     current_session.status is SessionStatus.INTERRUPTED
                 ),
             )
+            if expired_replay is not None and current_intent is not None:
+                # Receipt settlement rebinds accepted work; it must not turn
+                # an executing resolution back into supersedable pending work.
+                claimed_intent = claimed_intent.model_copy(
+                    update={"execution_state": current_intent.execution_state}
+                )
+                claimed_checkpoint[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = (
+                    claimed_intent.model_dump(mode="json")
+                )
             return claimed_checkpoint
 
         async def admit_exact_user_input_recovery_execution(
             claimed_session: Session,
         ) -> bool:
             nonlocal claimed_intent
+            if expired_replay is not None:
+                return False
             if claimed_intent is None:
                 raise RuntimeError("User-input recovery claim completed without durable intent.")
             try:
@@ -1714,6 +1776,71 @@ class RecoveryCoordinator:
                 update={"run_epoch": session.run_epoch}
             ),
         )
+        if expired_replay is not None:
+            replay_failure: BaseException | None = None
+            environment = ContinuationEnvironment(
+                lifecycle=self._environment_lifecycle,
+                session=session,
+                agent=registered_agent,
+                profile=execution_profile_snapshot.profile,
+                registered_environment=registered_environment,
+                invocation_context=invocation_context,
+            )
+            try:
+                async with contextlib.aclosing(environment.reconnect()) as preparation:
+                    async for _ in preparation:
+                        pass
+                if environment.error is not None:
+                    raise environment.error
+                hook_stream = self._recovery_tool_hook_events(
+                    session=session,
+                    tool_event=expired_replay,
+                    manual_input=True,
+                    registered_agent=registered_agent,
+                    registered_environment=environment.registered_environment,
+                    tool_call=approval_support.tool_call_request_from_pending(
+                        pending_tool_call, arguments={}
+                    ),
+                    result=ToolResult.model_validate(expired_replay.payload["result"]),
+                    task_id=pending.task_id,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=environment.invocation_context,
+                    redactor=self._secret_redactor,
+                    output_redactor=self._secret_redactor,
+                    allow_modification=False,
+                )
+                async with _close_delegated_event_stream(hook_stream) as owned_hooks:
+                    async for _ in owned_hooks:
+                        pass
+                async with _close_delegated_event_stream(
+                    self._interrupt_deadline_settlement(
+                        session,
+                        environment.invocation_context,
+                        task_id=pending.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                        manual_event=expired_replay,
+                    )
+                ) as settlement_stream:
+                    async for _ in settlement_stream:
+                        pass
+            except BaseException as exc:
+                replay_failure = exc
+                raise
+            finally:
+                await self._recovery_admission.cleanup_entrypoint_handoff(
+                    stream=None,
+                    session_id=session.id,
+                    registered_agent=registered_agent,
+                    registered_environment=environment.registered_environment,
+                    authoritative_failure=replay_failure,
+                    finalize_abandoned=replay_failure is not None,
+                    release_run_fence=True,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=environment.invocation_context,
+                )
+            yield expired_replay
+            return
         recovery_stream = self.recover_user_input(
             request=request,
             participant_context=participant_context,
@@ -2184,6 +2311,23 @@ class RecoveryCoordinator:
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
             )
+            if session.execution_deadline.expired:
+                await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=authoritative_failure,
+                    steps=(
+                        (
+                            "expired continuation task settlement",
+                            lambda: self._fail_deadline_task(
+                                task_id=pending_approval.task_id,
+                                task_worker_id=request.task_worker_id,
+                                task_handoff_id=request.task_handoff_id,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                            ),
+                        ),
+                    ),
+                )
 
     async def resolve_provider_operation(
         self,
@@ -2627,14 +2771,25 @@ class RecoveryCoordinator:
         if record is None or record.terminal is None:
             return None
         replay = await self._load_reconciled_tool_effect_replay(session=session, request=request)
-        if (
-            not isinstance(replay, _ReconciledToolEffectReplay)
-            or replay.consumption_receipt is None
-        ):
+        if not isinstance(replay, _ReconciledToolEffectReplay):
             return None
-        if record.intent.approval_id is not None:
+        if replay.consumption_receipt is None:
+            from cayu.runtime._deadline_effect_settlement import (
+                deadline_effect_settlement_completed,
+            )
+
+            if not await deadline_effect_settlement_completed(self._session_store, session, record):
+                return None
+        if record.intent.approval_id is not None or record.intent.pause_id is not None:
             await self.require_human_review_resolution_authority(
                 session.id, request.review_reference
+            )
+        if record.intent.pause_id is not None:
+            response = request.user_input_response
+            if response is None or response.input_id != record.intent.pause_id:
+                raise ToolEffectConflict("Receipt replay lacks its exact user-input response.")
+            await self.require_human_review_resolution_authority(
+                session.id, response.review_reference
             )
         return copy_event(replay.terminal_event)
 
@@ -3546,9 +3701,10 @@ class RecoveryCoordinator:
                     pending_calls=pending.tool_calls,
                     tool_call_id=effect_reconciliation.tool_call_id,
                 )
-                async for event, _modified in self._tool_invocation.hooks.after_call(
+                hook_stream = self._recovery_tool_hook_events(
                     session=session,
                     tool_event=effect_settlement.terminal_event,
+                    effect_record=effect_settlement.record,
                     registered_agent=registered_agent,
                     registered_environment=environment.registered_environment,
                     tool_call=approval_support.tool_call_request_from_pending(
@@ -3563,8 +3719,24 @@ class RecoveryCoordinator:
                     redactor=self._secret_redactor,
                     output_redactor=self._secret_redactor,
                     allow_modification=False,
-                ):
-                    yield event
+                )
+                async with _close_delegated_event_stream(hook_stream) as owned_hooks:
+                    async for event in owned_hooks:
+                        yield event
+                if session.execution_deadline.expired:
+                    async with _close_delegated_event_stream(
+                        self._interrupt_deadline_settlement(
+                            session,
+                            environment.invocation_context,
+                            task_id=pending.task_id,
+                            task_worker_id=response.task_worker_id,
+                            task_handoff_id=response.task_handoff_id,
+                            effect_record=effect_settlement.record,
+                        )
+                    ) as settlement_stream:
+                        async for event in settlement_stream:
+                            yield event
+                    return
                 resume_events = await self._session_store.load_events(session.id)
             if emit_resume_event:
                 yield await self._event_writer.emit(
@@ -5733,6 +5905,8 @@ class RecoveryCoordinator:
         execution_profile: ExecutionProfileIdentity,
         invocation_context: InvocationContext | None = None,
         payload: dict[str, Any],
+        terminal_event_id: str | None = None,
+        run_runtime_hooks: bool = True,
     ) -> AsyncGenerator[Event, None]:
         """Close a durable or acknowledgement-ambiguous recovery to resumable state."""
         try:
@@ -5762,12 +5936,15 @@ class RecoveryCoordinator:
         async for event in self._terminal_event_publication.publish_recovered(
             RecoveryTerminalEventRequest(
                 event=event_with_execution_profile_authority(
-                    Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=interrupted.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=_environment_name(registered_environment),
-                        payload=payload,
+                    event_with_runtime_generated_id(
+                        Event(
+                            id=terminal_event_id or str(uuid4()),
+                            type=EventType.SESSION_INTERRUPTED,
+                            session_id=interrupted.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=_environment_name(registered_environment),
+                            payload=payload,
+                        )
                     ),
                     execution_profile,
                 ),
@@ -5777,6 +5954,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
+                run_runtime_hooks=run_runtime_hooks,
             )
         ):
             yield event
@@ -5989,9 +6167,10 @@ class RecoveryCoordinator:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._tool_invocation.hooks.after_call(
+            hook_stream = self._recovery_tool_hook_events(
                 session=session,
                 tool_event=tool_event,
+                manual_input=True,
                 registered_agent=registered_agent,
                 registered_environment=environment.registered_environment,
                 tool_call=tool_call,
@@ -6002,8 +6181,24 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
-            ):
-                yield event
+            )
+            async with _close_delegated_event_stream(hook_stream) as owned_hooks:
+                async for event in owned_hooks:
+                    yield event
+            if session.execution_deadline.expired:
+                async with _close_delegated_event_stream(
+                    self._interrupt_deadline_settlement(
+                        session,
+                        environment.invocation_context,
+                        task_id=pending.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                        manual_event=tool_event,
+                    )
+                ) as settlement_stream:
+                    async for event in settlement_stream:
+                        yield event
+                return
             recovery_prepared = True
         except (GeneratorExit, asyncio.CancelledError) as exc:
             authoritative_failure = exc
@@ -6313,6 +6508,7 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
+            effect_record: ToolEffectRecord | None = None
             if type(request) is ToolEffectReconciliationRequest:
                 if environment.invocation_context is None:
                     raise RuntimeError(
@@ -6349,6 +6545,7 @@ class RecoveryCoordinator:
                     ):
                         yield event
                     return
+                effect_record = settlement.record
                 publication.event = settlement.terminal_event
                 publication.persisted = True
                 emitted_recovery_events = [settlement.terminal_event]
@@ -6426,9 +6623,10 @@ class RecoveryCoordinator:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._tool_invocation.hooks.after_call(
+            hook_stream = self._recovery_tool_hook_events(
                 session=session,
                 tool_event=tool_event,
+                effect_record=effect_record,
                 registered_agent=registered_agent,
                 registered_environment=environment.registered_environment,
                 tool_call=tool_call,
@@ -6439,8 +6637,24 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
-            ):
-                yield event
+            )
+            async with _close_delegated_event_stream(hook_stream) as owned_hooks:
+                async for event in owned_hooks:
+                    yield event
+            if session.execution_deadline.expired:
+                async with _close_delegated_event_stream(
+                    self._interrupt_deadline_settlement(
+                        session,
+                        environment.invocation_context,
+                        task_id=pending_approval.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                        effect_record=effect_record,
+                    )
+                ) as settlement_stream:
+                    async for event in settlement_stream:
+                        yield event
+                return
             recovery_prepared = True
         except (GeneratorExit, asyncio.CancelledError) as exc:
             authoritative_failure = exc
@@ -7922,7 +8136,7 @@ class RecoveryCoordinator:
             tool_event = emitted_recovery_events[-1]
             # The operator outcome is durable before hooks run. Recovery hooks are
             # observe-only so they cannot rewrite externally verified evidence.
-            async for event, _modified in self._tool_invocation.hooks.after_call(
+            hook_stream = self._recovery_tool_hook_events(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -7935,9 +8149,24 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
-            ):
-                yield event
+            )
+            async with _close_delegated_event_stream(hook_stream) as owned_hooks:
+                async for event in owned_hooks:
+                    yield event
 
+            if session.execution_deadline.expired:
+                async with _close_delegated_event_stream(
+                    self._interrupt_deadline_settlement(
+                        session,
+                        invocation_context,
+                        task_id=pending_round.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                    )
+                ) as settlement_stream:
+                    async for event in settlement_stream:
+                        yield event
+                return
             events = await self._session_store.load_events(session.id)
             recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
                 events=events,
@@ -8239,6 +8468,224 @@ class RecoveryCoordinator:
                 abort_environment_setup=False,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
+            )
+
+    async def _recovery_tool_hook_events(
+        self,
+        *,
+        session: Session,
+        tool_event: Event,
+        effect_record: ToolEffectRecord | None = None,
+        manual_input: bool = False,
+        **hook_arguments: Any,
+    ) -> AsyncGenerator[Event, None]:
+        """Join verified recovery hooks before their invocation can close or expire."""
+        from cayu.runtime._deadline_effect_settlement import (
+            complete_deadline_effect_settlement,
+            deadline_effect_settlement_completed,
+        )
+
+        async def completed() -> bool:
+            if effect_record is not None:
+                return await deadline_effect_settlement_completed(
+                    self._session_store, session, effect_record, phase="tool-hooks"
+                )
+            return await ManualUserInputDeadlineSettlement(
+                self._session_store, session, tool_event
+            ).completed("tool-hooks")
+
+        async def complete() -> None:
+            if effect_record is not None:
+                await complete_deadline_effect_settlement(
+                    self._session_store, session, effect_record, phase="tool-hooks"
+                )
+            else:
+                await ManualUserInputDeadlineSettlement(
+                    self._session_store, session, tool_event
+                ).complete("tool-hooks")
+
+        owns_settlement = effect_record is not None or manual_input
+        if owns_settlement and await completed():
+            return
+        hooks = self._tool_invocation.hooks.after_call(
+            session=session, tool_event=tool_event, **hook_arguments
+        )
+        if not owns_settlement:
+            async for event, _modified in hooks:
+                yield event
+            return
+
+        events: asyncio.Queue[Event | None] = asyncio.Queue()
+
+        async def drain() -> None:
+            try:
+                async for event, _modified in hooks:
+                    events.put_nowait(event)
+                await complete()
+            finally:
+                events.put_nowait(None)
+
+        # Delivery may stop between any two hook events. This owner keeps the
+        # callback and its outcome publication alive until the whole phase is
+        # durably settled, including repeated cancellation of the caller.
+        owner = asyncio.create_task(drain())
+
+        async def join() -> None:
+            await owner
+
+        failure: BaseException | None = None
+        try:
+            while (event := await events.get()) is not None:
+                yield event
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            await self._recovery_ownership.run_cleanup_steps(
+                authoritative_failure=failure,
+                steps=(("verified recovery tool hook settlement", join),),
+            )
+
+    async def _interrupt_deadline_settlement(
+        self,
+        session: Session,
+        invocation_context: InvocationContext | None,
+        *,
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        effect_record: ToolEffectRecord | None = None,
+        manual_event: Event | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        """Keep verified outcomes durable without restarting an expired run."""
+        if invocation_context is None or not session.execution_deadline.expired:
+            raise RuntimeError("Deadline settlement requires expired invocation authority.")
+
+        interrupted: Event | None = None
+        source_event_id = (
+            effect_record.terminal.event_id
+            if effect_record is not None and effect_record.terminal is not None
+            else manual_event.id
+            if manual_event is not None
+            else None
+        )
+        terminal_event_id = (
+            "deadline-settlement:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {"session_instance_id": session.instance_id, "event_id": source_event_id},
+                    "deadline settlement identity",
+                )
+            ).hexdigest()
+            if source_event_id is not None
+            else None
+        )
+
+        hook_terminal: Event | None = None
+        if terminal_event_id is not None:
+            records = await self._session_store.query_events(
+                EventQuery(session_id=session.id, event_id=terminal_event_id, limit=2)
+            )
+            if records:
+                hook_terminal = records[0].event
+                if (
+                    len(records) != 1
+                    or hook_terminal.type is not EventType.SESSION_INTERRUPTED
+                    or hook_terminal.payload.get("deadline_settlement_only") is not True
+                ):
+                    raise SessionRuntimePublicationConflict("Conflicting settlement terminal.")
+
+        async def settle_task() -> None:
+            await self._fail_deadline_task(
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                session=session,
+                registered_agent=invocation_context.registered_agent,
+                registered_environment=invocation_context.registered_environment,
+            )
+            if interrupted is not None:
+                current = await self._recovery_ownership.require_session(session.id)
+                terminal = RecoveryTerminalEventRequest(
+                    event=hook_terminal or interrupted,
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=current,
+                    registered_agent=invocation_context.registered_agent,
+                    registered_environment=invocation_context.registered_environment,
+                    execution_profile=invocation_context.profile,
+                    invocation_context=invocation_context,
+                    terminal_event_already_durable=True,
+                    yield_durable_terminal_event=False,
+                )
+                publication = self._terminal_event_publication
+                hooks_settled = await publication.recovered_hooks_are_settled(terminal)
+                if not hooks_settled:
+                    # Delivery can close at the terminal event before its hooks
+                    # run. Drain their durable slots while recovery still owns
+                    # the invocation, then attest completion only after joining.
+                    async with _close_delegated_event_stream(
+                        publication.replay_recovered_hooks(terminal)
+                    ) as hook_stream:
+                        async for _ in hook_stream:
+                            pass
+                    hooks_settled = await publication.recovered_hooks_are_settled(terminal)
+                if hooks_settled:
+                    if effect_record is not None:
+                        from cayu.runtime._deadline_effect_settlement import (
+                            complete_deadline_effect_settlement,
+                        )
+
+                        await complete_deadline_effect_settlement(
+                            self._session_store, session, effect_record
+                        )
+                    if manual_event is not None:
+                        await ManualUserInputDeadlineSettlement(
+                            self._session_store, session, manual_event
+                        ).complete("settlement")
+
+        failure: BaseException | None = None
+        try:
+            async with _close_delegated_event_stream(
+                self._interrupt_for_resumable_manual_recovery(
+                    session=session,
+                    registered_agent=invocation_context.registered_agent,
+                    registered_environment=invocation_context.registered_environment,
+                    execution_profile=invocation_context.profile,
+                    invocation_context=invocation_context,
+                    terminal_event_id=terminal_event_id if hook_terminal is None else None,
+                    run_runtime_hooks=hook_terminal is None,
+                    payload={
+                        "interruption_type": "limit_reached",
+                        "reason": "limit_reached",
+                        "limit": "execution_deadline",
+                        "deadline_settlement_only": True,
+                        "execution_deadline": session.execution_deadline.inspection(),
+                        "failure_evidence": FailureEvidence(
+                            classification="deadline",
+                            deadline=session.execution_deadline,
+                            deadline_phase="in_flight",
+                            session_id=session.id,
+                            run_epoch=session.run_epoch,
+                        ).model_dump(mode="json"),
+                    },
+                )
+            ) as interruption_stream:
+                async for event in interruption_stream:
+                    if event.type is EventType.SESSION_INTERRUPTED:
+                        interrupted = event
+                    yield event
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            await self._recovery_ownership.run_cleanup_steps(
+                authoritative_failure=failure,
+                steps=(
+                    (
+                        "expired receipt recovery task settlement",
+                        settle_task,
+                    ),
+                ),
             )
 
     async def _interrupt_unresolved_tool_effect(
@@ -8652,9 +9099,10 @@ class RecoveryCoordinator:
                 return
             # Receipt selection is already durable. Hooks observe the selected
             # result through the existing hook owner and cannot replace it.
-            async for event, _modified in self._tool_invocation.hooks.after_call(
+            hook_stream = self._recovery_tool_hook_events(
                 session=session,
                 tool_event=settlement.terminal_event,
+                effect_record=settlement.record,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 tool_call=approval_support.tool_call_request_from_pending(
@@ -8667,8 +9115,24 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
-            ):
-                yield event
+            )
+            async with _close_delegated_event_stream(hook_stream) as owned_hooks:
+                async for event in owned_hooks:
+                    yield event
+            if session.execution_deadline.expired:
+                async with _close_delegated_event_stream(
+                    self._interrupt_deadline_settlement(
+                        session,
+                        invocation_context,
+                        task_id=pending_round.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                        effect_record=settlement.record,
+                    )
+                ) as settlement_stream:
+                    async for event in settlement_stream:
+                        yield event
+                return
             continuation = await self._recovery_admission.prepare_recovered_tool_round_continuation(
                 session=session,
                 participant_context=participant_context,

@@ -14,6 +14,10 @@ older claimants do not understand key exclusion.
 - Skip stale recovery observers when another recovery owner closes the active
   interaction during execution profile inspection.
 
+- Expired task runs retain exact receipt recovery for already-started tools.
+  Recovery settles the recorded outcome without running sibling tools or another
+  model step, and the task remains failed.
+
 - Stop agent snapshot materializations from being reused across authority
   scopes. Two scopes that register the same snapshot content share a root, so a
   request with another scope's candidate and trial ids used to receive that

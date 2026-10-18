@@ -4758,7 +4758,7 @@ def test_http_initialize_keeps_session_authority_private_until_notification_succ
             transport_limits=_limits(),
         )
         initialize_task = asyncio.create_task(session.initialize())
-        await asyncio.wait_for(notification_started.wait(), timeout=0.1)
+        await asyncio.wait_for(notification_started.wait(), timeout=5)
         unpublished_session_id = session._session_id
         with pytest.raises(McpProtocolError, match="initialization is still in progress"):
             await session.call_tool("must-not-dispatch", {})

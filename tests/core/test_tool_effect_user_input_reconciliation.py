@@ -475,7 +475,7 @@ def test_user_input_sibling_receipt_recovers_without_repeating_external_effect(
             assert len(calls) == len(lookups) == 1
             return
         assert any(e.type == EventType.SESSION_COMPLETED for e in recovered)
-        assert hook_results == ["deployment confirmed"] * (2 if close_fault == "precommit" else 1)
+        assert hook_results == ["deployment confirmed"]
         durable = await store.load_events("input-effect")
         terminals = [e for e in durable if e.payload.get("effect_reconciled") is True]
         assert len(terminals) == 1
@@ -503,7 +503,7 @@ def test_user_input_sibling_receipt_recovers_without_repeating_external_effect(
         assert len(provider.requests) == 2
         assert len(calls) == 1
         assert len(lookups) == expected_lookups
-        assert hook_results == ["deployment confirmed"] * (2 if close_fault == "precommit" else 1)
+        assert hook_results == ["deployment confirmed"]
 
     async def run():
         codec = PublicAuthorityAliasCodec(
