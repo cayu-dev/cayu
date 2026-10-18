@@ -7,8 +7,13 @@ confirms timeout/cancellation cleanup before reporting a terminal result. Comman
 the explicit environment supplied by Cayu; the image environment is not inherited. When that
 environment has no `PATH`, the sidecar uses the guest shell's default
 (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) so process commands, shell
-commands, and executable admission probes resolve programs identically. The image ships `git`
-and a pinned, digest-verified `ripgrep` for coding tools.
+commands, and executable admission probes resolve programs identically. Agent commands run as
+`cayu-agent` (UID 1000) inside the agent network namespace. The root-owned `ip` and `setpriv`
+launchers that put them there start with only that default `PATH`; the command's environment is
+applied by `env -i` after setpriv has dropped the identity, groups, and capabilities, so values
+such as `LD_PRELOAD` never reach a process running as root. Because `env` reads `NAME=VALUE`
+arguments, an agent command's program and environment names must not contain `=`. The image
+ships `git` and a pinned, digest-verified `ripgrep` for coding tools.
 
 ## Export the installed artifact
 

@@ -73,6 +73,23 @@ def test_sidecar_entrypoint_forwards_signals_and_reaps_adopted_children() -> Non
     assert 'wait "$sidecar_pid"' in entrypoint
 
 
+_LAUNCHER_PREFIX = [
+    "/usr/sbin/ip",
+    "netns",
+    "exec",
+    "cayu-agent",
+    "/usr/bin/setpriv",
+    "--reuid=1000",
+    "--regid=1000",
+    "--clear-groups",
+    "--no-new-privs",
+    "--inh-caps=-all",
+    "--ambient-caps=-all",
+    "--bounding-set=-all",
+    "--",
+]
+
+
 def test_agent_execution_boundary_drops_identity_and_capabilities() -> None:
     boundary = CommandExecutionBoundary(
         agent_uid=1000,
@@ -80,26 +97,81 @@ def test_agent_execution_boundary_drops_identity_and_capabilities() -> None:
         agent_netns="cayu-agent",
     )
 
-    assert boundary.argv_for(
+    assert boundary.command_for(
         ["python3", "-V"],
+        {"PATH": "/usr/bin"},
         execution_profile="agent",
-    ) == [
-        "/usr/sbin/ip",
-        "netns",
-        "exec",
-        "cayu-agent",
-        "/usr/bin/setpriv",
-        "--reuid=1000",
-        "--regid=1000",
-        "--clear-groups",
-        "--no-new-privs",
-        "--inh-caps=-all",
-        "--ambient-caps=-all",
-        "--bounding-set=-all",
+    ) == (
+        [*_LAUNCHER_PREFIX, "/usr/bin/env", "-i", "--", "PATH=/usr/bin", "python3", "-V"],
+        {"PATH": SUPERVISOR_MODULE.DEFAULT_COMMAND_PATH},
+    )
+
+
+def test_agent_environment_reaches_only_the_unprivileged_process(tmp_path: Path) -> None:
+    # The root-owned `ip` and `setpriv` launchers must never see the command's
+    # environment: the loader honors LD_PRELOAD and friends before the drop.
+    spawned: list[tuple[list[str], dict[str, str]]] = []
+
+    def record_popen(argv: list[str], **kwargs: Any) -> Any:
+        spawned.append((list(argv), dict(kwargs["env"])))
+        raise OSError("not spawned in this test")
+
+    boundary = CommandExecutionBoundary(agent_uid=1000, agent_gid=1000, agent_netns="cayu-agent")
+    supervisor = CommandSupervisor(root=tmp_path, execution_boundary=boundary)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(SUPERVISOR_MODULE.subprocess, "Popen", record_popen)
+        supervisor.start(
+            "preload",
+            {
+                "kind": "process",
+                "argv": ["python3", "-V"],
+                "cwd": str(tmp_path),
+                "env": {"LD_PRELOAD": "/workspace/evil.so", "GCONV_PATH": "/workspace"},
+            },
+        )
+        deadline = time.monotonic() + 5
+        while supervisor.get("preload")["state"] not in {"failed", "completed"}:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+    [(argv, launcher_environment)] = spawned
+    assert launcher_environment == {"PATH": SUPERVISOR_MODULE.DEFAULT_COMMAND_PATH}
+    assert argv[: len(_LAUNCHER_PREFIX)] == _LAUNCHER_PREFIX
+    assert argv[len(_LAUNCHER_PREFIX) :] == [
+        "/usr/bin/env",
+        "-i",
         "--",
+        "LD_PRELOAD=/workspace/evil.so",
+        "GCONV_PATH=/workspace",
+        f"PATH={SUPERVISOR_MODULE.DEFAULT_COMMAND_PATH}",
         "python3",
         "-V",
     ]
+
+
+@pytest.mark.parametrize(
+    ("argv", "env", "message"),
+    [
+        (["A=B"], {}, "program must not contain"),
+        (["python3"], {"A=B": "c"}, "env key must not contain"),
+    ],
+)
+def test_agent_execution_boundary_refuses_ambiguous_env_arguments(
+    argv: list[str], env: dict[str, str], message: str
+) -> None:
+    boundary = CommandExecutionBoundary(agent_uid=1000, agent_gid=1000)
+
+    with pytest.raises(ValueError, match=message):
+        boundary.command_for(argv, env, execution_profile="agent")
+
+
+def test_unconfined_execution_passes_the_environment_to_the_command() -> None:
+    boundary = CommandExecutionBoundary()
+
+    assert boundary.command_for(["true"], {"A": "1"}, execution_profile="agent") == (
+        ["true"],
+        {"A": "1"},
+    )
 
 
 def test_agent_execution_boundary_relays_only_configured_private_proxy() -> None:
@@ -165,10 +237,10 @@ def test_agent_execution_boundary_rejects_non_rfc1918_proxy(proxy_url: str) -> N
 def test_trusted_execution_stays_in_supervisor_profile(tmp_path: Path) -> None:
     boundary = CommandExecutionBoundary(agent_uid=1000, agent_gid=1000)
 
-    assert boundary.argv_for(["mount", "-a"], execution_profile="trusted") == [
-        "mount",
-        "-a",
-    ]
+    assert boundary.command_for(["mount", "-a"], {"A": "1"}, execution_profile="trusted") == (
+        ["mount", "-a"],
+        {"A": "1"},
+    )
 
     supervisor = CommandSupervisor(root=tmp_path, execution_boundary=boundary)
     with pytest.raises(ValueError, match="execution_profile"):

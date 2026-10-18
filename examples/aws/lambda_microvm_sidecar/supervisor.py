@@ -45,6 +45,12 @@ AGENT_CONTROL_RELAY_PORT = 18443
 AGENT_CONTROL_HOSTNAME = "cayu-control"
 _AGENT_GATEWAY = "192.0.2.1"
 DEFAULT_COMMAND_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# The root-owned launchers that enter the agent namespace and drop identity
+# (`ip`, `setpriv`) run with only this fixed environment. The dynamic loader and
+# libc honor variables such as LD_PRELOAD in a root process, so the command's
+# own environment is applied by `env -i` only after setpriv has dropped to the
+# agent identity.
+LAUNCHER_ENVIRONMENT = {"PATH": DEFAULT_COMMAND_PATH}
 
 ExecutionProfile = Literal["agent", "trusted"]
 
@@ -371,16 +377,28 @@ class CommandExecutionBoundary:
             "target": f"{target[0]}:{target[1]}",
         }
 
-    def argv_for(
+    def command_for(
         self,
         argv: list[str],
+        environment: dict[str, str],
         *,
         execution_profile: ExecutionProfile,
-    ) -> list[str]:
-        if execution_profile == "trusted":
-            return list(argv)
-        if self.agent_uid is None or self.agent_gid is None:
-            return list(argv)
+    ) -> tuple[list[str], dict[str, str]]:
+        """Return the argv and environment the supervisor spawns for one command.
+
+        An agent command is started through root-owned launchers. They get only
+        ``LAUNCHER_ENVIRONMENT``; the command's environment is applied by
+        ``env -i`` after setpriv has dropped the identity, capabilities and
+        privileges, so no workload value reaches a process running as root.
+        """
+        if execution_profile == "trusted" or self.agent_uid is None or self.agent_gid is None:
+            return list(argv), dict(environment)
+        if "=" in argv[0]:
+            # env(1) would read the program as another NAME=VALUE assignment.
+            raise CommandRequestError("agent command program must not contain '='")
+        for key in environment:
+            if "=" in key:
+                raise CommandRequestError("env key must not contain '='")
         prefix = (
             ["/usr/sbin/ip", "netns", "exec", self.agent_netns]
             if self.agent_netns is not None
@@ -397,8 +415,12 @@ class CommandExecutionBoundary:
             "--ambient-caps=-all",
             "--bounding-set=-all",
             "--",
+            "/usr/bin/env",
+            "-i",
+            "--",
+            *(f"{key}={value}" for key, value in environment.items()),
             *argv,
-        ]
+        ], dict(LAUNCHER_ENVIRONMENT)
 
     def environment_for(
         self,
@@ -795,10 +817,6 @@ def _validated_payload(
     else:
         shell = _nonblank_string(request.get("shell"), "shell")
         argv = ["/bin/bash", "-c", shell]
-    argv = execution_boundary.argv_for(
-        argv,
-        execution_profile=execution_profile,
-    )
 
     cwd = Path(_nonblank_string(request.get("cwd"), "cwd")).resolve()
     if not cwd.is_relative_to(root):
@@ -819,6 +837,7 @@ def _validated_payload(
         # probes and shell commands) also searches /usr/local, so a probe could
         # admit a program that a process command then cannot start.
         env["PATH"] = DEFAULT_COMMAND_PATH
+    argv, env = execution_boundary.command_for(argv, env, execution_profile=execution_profile)
 
     raw_stdin = request.get("stdin_base64")
     if raw_stdin is None:
