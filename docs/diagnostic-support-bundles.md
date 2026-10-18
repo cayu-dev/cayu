@@ -254,12 +254,13 @@ stalled write is terminated, and its exact staging name is reconciled by a
 second independently bounded process. Publication, both owned-process teardown
 sequences, and reconciliation share the complete command's absolute deadline;
 later phases can receive less than their individual maximum when earlier phases
-consume that budget. If the filesystem also prevents cleanup,
-that reconciler is terminated and the staging leaf can remain for manual
-recovery; the command still reports `output_write_failed` and never reports
-success without a settled publisher. Collection-deadline or aggregate evidence-byte exhaustion
-produces a validated `partial` bundle whose skipped results make the omissions
-explicit.
+consume that budget. The complete command deadline starts when the `doctor`
+command begins, after interpreter startup and CLI argument parsing. If the
+filesystem also prevents cleanup, that reconciler is terminated and the staging
+leaf can remain for manual recovery; the command still reports
+`output_write_failed` and never reports success without a settled publisher.
+Collection-deadline or aggregate evidence-byte exhaustion produces a validated
+`partial` bundle whose skipped results make the omissions explicit.
 
 ## Related diagnostic boundaries
 

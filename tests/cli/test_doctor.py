@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import cayu.cli.doctor as doctor_cli
+from cayu.cli import _build_parser as _build_cli_parser
 from cayu.cli import main
 from cayu.cli.doctor import _run_bounded_worker
 from cayu.events import Event
@@ -776,6 +777,11 @@ def test_complete_command_deadline_bounds_stacked_publication_teardown(
         _block_past_child_deadline_during_reconciliation,
     )
     bundle = tmp_path / "stacked-timeout.zip"
+    # The command deadline starts when `run_doctor` begins. Building the CLI
+    # parser first imports every subcommand module, which can take about a
+    # second on a cold process and is outside that deadline, so pay it before
+    # the clock starts.
+    _build_cli_parser()
     started = time.monotonic()
 
     assert main(["doctor", "--bundle", str(bundle), "--json"]) == 4
