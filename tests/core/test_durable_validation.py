@@ -53,6 +53,35 @@ _DURABLE_VALUES = st.recursive(
 )
 
 
+@given(left=_DURABLE_VALUES, right=_DURABLE_VALUES)
+@settings(max_examples=250)
+def test_runtime_publication_equality_matches_canonical_numeric_semantics(left, right):
+    from cayu.sessions.authority import _runtime_publication_json_equal
+
+    assert _runtime_publication_json_equal(left, right) == (
+        canonical_durable_json_bytes(left, "runtime_publication")
+        == canonical_durable_json_bytes(right, "runtime_publication")
+    )
+    assert _runtime_publication_json_equal(left, copy_durable_json_value(left, "copy"))
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "equal"),
+    [
+        ({"value": True}, {"value": 1}, False),
+        ([False], [0.0], False),
+        ({"a": [1.0, -0.0], "b": None}, {"b": None, "a": [1, 0]}, True),
+        ([0.1], [0.10000000000000002], False),
+    ],
+)
+def test_runtime_publication_equality_distinguishes_booleans_and_normalizes_numbers(
+    left, right, equal
+):
+    from cayu.sessions.authority import _runtime_publication_json_equal
+
+    assert _runtime_publication_json_equal(left, right) is equal
+
+
 @pytest.mark.parametrize(
     "suffix",
     ["plain", "é😀", '\n"\\\x01', "\x00", "\ud800", "x" * 256],

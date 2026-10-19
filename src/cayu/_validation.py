@@ -998,6 +998,16 @@ def _walk_bounded_durable_json(
             if cached_size is not None and cached_size <= remaining:
                 remaining -= cached_size
                 return
+            if _JSON_ESCAPED_OR_NONPORTABLE_RE.search(text) is None:
+                # Most durable fields are short identifiers. Avoid creating a
+                # chunk iterator and repeating length tests for a single chunk.
+                size = len(text) if text.isascii() else len(text.encode("utf-8"))
+                remaining -= size
+                if remaining < 0:
+                    raise too_large(string_path(is_key))
+                if len(string_sizes) < 128:
+                    string_sizes[text] = size
+                return
         # Bound temporary allocation and avoid Python work per character for
         # ordinary text. Special characters retain the ordered scalar checks
         # below, so a later invalid scalar cannot hide an exhausted byte bound.

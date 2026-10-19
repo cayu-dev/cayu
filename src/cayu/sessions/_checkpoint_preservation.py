@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
-from cayu._validation import copy_durable_json_object
+from cayu._validation import copy_durable_json_object, thaw_json_value
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_visible,
@@ -382,7 +381,9 @@ def _copy_checkpoint_for_transform(
         # Exact controller-position comparison includes all private domain
         # roots. Their independent projectors still preserve mutation authority.
         return (
-            deepcopy(checkpoint) if decoded else copy_durable_json_object(checkpoint, "checkpoint")
+            thaw_json_value(checkpoint)
+            if decoded
+            else copy_durable_json_object(checkpoint, "checkpoint")
         )
     lifecycle_authority_allowed = (
         _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get()
@@ -419,7 +420,7 @@ def _copy_checkpoint_for_transform(
         copied.pop(producers.ROOT_KEY, None)
     if not lifecycle_authority_allowed:
         copied.pop("execution_snapshots", None)
-    return deepcopy(copied) if decoded else copied
+    return thaw_json_value(copied) if decoded else copied
 
 
 def _checkpoint_transform_result_preserving_completion_result_event_publications(

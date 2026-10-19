@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
+    copy_durable_json_value,
+)
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -175,9 +179,31 @@ def checkpoint_root_field_projection_from_storage(
 def _runtime_publication_json_equal(left: Any, right: Any) -> bool:
     """Compare validated JSON material under the durable canonicalization contract."""
 
-    return _canonical_runtime_publication_digest(left) == _canonical_runtime_publication_digest(
-        right
+    return _validated_runtime_publication_json_equal(
+        copy_durable_json_value(left, "runtime_publication"),
+        copy_durable_json_value(right, "runtime_publication"),
     )
+
+
+def _validated_runtime_publication_json_equal(left: Any, right: Any) -> bool:
+    """Compare detached durable JSON without encoding and hashing it again.
+
+    Inputs must have passed durable copying, including integral-float
+    normalization. Python container equality alone conflates booleans/numbers.
+    """
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return left.keys() == right.keys() and all(
+            _validated_runtime_publication_json_equal(value, right[key])
+            for key, value in left.items()
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _validated_runtime_publication_json_equal(a, b)
+            for a, b in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _validate_required_runtime_fence(value: int, field_name: str) -> int:

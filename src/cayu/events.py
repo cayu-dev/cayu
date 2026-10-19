@@ -38,6 +38,18 @@ class _PayloadStampMismatch(Exception):
     """Internal signal that an Event payload changed after validation."""
 
 
+class _CandidateEnvelopeStamp:
+    """Compare admitted envelope values without exposing them in private reprs."""
+
+    __slots__ = ("values",)
+
+    def __init__(self, values: tuple[object, ...]) -> None:
+        self.values = values
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _CandidateEnvelopeStamp and self.values == other.values
+
+
 def _empty_runtime_authority() -> frozenset[tuple[str, str]]:
     """Return a precisely typed empty private-authority registry."""
 
@@ -308,20 +320,32 @@ class Event(BaseModel):
     # root/container/scalar identity graph and therefore fall back to the full
     # durable validator.
     _payload_validation_stamp: object | None = PrivateAttr(default=None)
+    _candidate_envelope_stamp: _CandidateEnvelopeStamp | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
         del __context
         self._id_origin = "caller" if "id" in self.model_fields_set else "runtime"
         self._runtime_generated_id = self.id if self._id_origin == "runtime" else None
-        self._payload_validation_stamp = _durable_payload_stamp(self.payload)
 
-    @model_validator(mode="after")
-    def validate_durable_envelope(self) -> Event:
-        # Unpublished candidates can retain pre-hook content in a bounded
-        # checkpoint. Store/writer/SSE admission separately applies the smaller
-        # full event-envelope ceiling; candidate validity is not publication.
-        _validate_event_candidate(self)
-        return self
+    @model_validator(mode="wrap")
+    @classmethod
+    def validate_durable_envelope(cls, value: Any, handler: Any) -> Event:
+        try:
+            existing = isinstance(value, Event)
+            event = handler(value)
+            # Unpublished candidates have the larger document ceiling;
+            # store/writer/SSE admission still applies the publication ceiling.
+            envelope_stamp = _validate_event_candidate(event)
+            if not existing:
+                # Only fresh field admission gives us a private detached payload.
+                # Revalidating an existing Event skips field validators and can
+                # race with caller mutation, so it must never refresh proofs.
+                # model_construct bypasses this wrapper and mints neither proof.
+                event._payload_validation_stamp = _durable_payload_stamp(event.payload)
+                event._candidate_envelope_stamp = envelope_stamp
+            return event
+        finally:
+            value = None
 
     def __eq__(self, other: object) -> bool:
         """Compare only public durable fields, never private projection metadata."""
@@ -454,17 +478,22 @@ def validate_event_envelope(event: Event) -> None:
     )
 
 
-def _validate_event_candidate(event: Event) -> None:
+def _validate_event_candidate(event: Event) -> _CandidateEnvelopeStamp:
     """Bound private preparation without admitting the candidate for publication."""
 
+    envelope = event_durable_envelope(event)
     inspect_bounded_durable_json(
-        event_durable_envelope(event),
+        envelope,
         "event",
         max_bytes=DURABLE_DOCUMENT_LIMITS.max_bytes,
         max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
         max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
         canonical_numbers=False,
     )
+    # Capture the same immutable envelope values that were inspected, including
+    # timestamp serialization, rather than recomputing a potentially changed view.
+    envelope.pop("payload")
+    return _CandidateEnvelopeStamp(tuple((type(value), value) for value in envelope.values()))
 
 
 def copy_event(event: Event) -> Event:
@@ -497,7 +526,8 @@ def copy_event(event: Event) -> Event:
     )
     if payload_is_unchanged:
         copied.payload = payload
-        _validate_event_candidate(copied)
+        if event._candidate_envelope_stamp != copied._candidate_envelope_stamp:
+            copied._candidate_envelope_stamp = _validate_event_candidate(copied)
         copied._payload_validation_stamp = _durable_payload_stamp(payload)
     copied._id_origin = event._id_origin
     copied._runtime_generated_id = event._runtime_generated_id

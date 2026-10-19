@@ -21,6 +21,11 @@ from cayu._validation import (
     inspect_bounded_durable_json,
     require_durable_clean_nonblank,
 )
+from cayu.collaboration._validation_snapshot import (
+    SnapshotChanged,
+    current_validation_snapshots,
+    validation_snapshot_scope,
+)
 
 MAX_ENVELOPE_BYTES = 64 * 1024
 MAX_NODES = 8192
@@ -134,14 +139,32 @@ class ContractValue(BaseModel):
     )
     unordered_fields: ClassVar[frozenset[str]] = frozenset()
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def validation_scope(cls, value: Any, handler: Any) -> Any:
+        try:
+            with validation_snapshot_scope():
+                return handler(value)
+        finally:
+            value = None
+
     @model_validator(mode="before")
     @classmethod
     def bounded_input(cls, value: object) -> Any:
         failed = False
         try:
-            value = snapshot_input(value)
+            snapshots = current_validation_snapshots()
+            if snapshots is not None and type(value) is dict:
+                try:
+                    value = snapshots.copy(value)
+                except SnapshotChanged:
+                    value = snapshot_input(value)
+            else:
+                value = snapshot_input(value)
             if type(value) is not dict or not set(value) <= set(cls.model_fields):
                 failed = True
+            elif snapshots is not None:
+                snapshots.remember(value)
         except (ValueError, TypeError, AttributeError):
             failed = True
         if failed:

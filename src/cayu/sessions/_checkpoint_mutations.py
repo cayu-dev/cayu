@@ -11,7 +11,7 @@ from cayu._validation import require_durable_clean_nonblank as require_clean_non
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY
 from cayu.sessions.authority import (
     _canonical_runtime_publication_digest,
-    _runtime_publication_json_equal,
+    _validated_runtime_publication_json_equal,
 )
 from cayu.sessions.checkpoints import COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY
 
@@ -217,7 +217,7 @@ def runtime_publication_checkpoint_mutation(
         if (
             source_present
             and target_present
-            and _runtime_publication_json_equal(
+            and _validated_runtime_publication_json_equal(
                 source[key],
                 target[key],
             )

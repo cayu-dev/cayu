@@ -6,6 +6,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 import cayu._validation as validation
 from cayu._validation import DurableValueError
@@ -17,6 +18,7 @@ from cayu.events import (
 )
 from cayu.runtime._event_projection import prepare_new_runtime_event
 from cayu.sessions.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
+from cayu.sessions.records import EventRecord
 from cayu.tools.terminal_publication import ToolTerminalPublicationGovernor
 from cayu.vaults.redaction import SecretRedactor
 
@@ -282,6 +284,95 @@ def test_copy_event_reuses_validated_text_but_revalidates_mutation(monkeypatch) 
 
     event.payload["result"]["structured"]["nested"][0] = object()
     with pytest.raises(DurableValueError, match="invalid_json_type"):
+        copy_event(event)
+
+
+def test_copy_event_reuses_only_the_exact_admitted_envelope(monkeypatch):
+    from cayu import events
+
+    event = Event(type=EventType.MODEL_TEXT_DELTA, session_id="s", payload={"delta": "text"})
+    inspected = []
+    validate = events._validate_event_candidate
+
+    def observe(candidate):
+        inspected.append(candidate.payload)
+        return validate(candidate)
+
+    monkeypatch.setattr(events, "_validate_event_candidate", observe)
+    copied = copy_event(event)
+    assert inspected == [{}]
+    assert copied == event and copied.payload is not event.payload
+    inspected.clear()
+    event.session_id = "changed"
+    assert copy_event(event).session_id == "changed"
+    assert inspected == [{}, {"delta": "text"}]
+
+
+def test_revalidated_event_cannot_combine_payload_and_envelope_from_different_admissions():
+    event = Event(
+        type="custom.test",
+        session_id="s",
+        payload={"text": "x" * (validation.DURABLE_DOCUMENT_LIMITS.max_bytes - 1024)},
+    )
+    original_payload = event.payload
+    event.payload = {}
+    event.agent_name = "a" * 2048
+    assert Event.model_validate(event) is event
+    event.payload = original_payload
+    with pytest.raises(ValueError, match="json_value_too_large"):
+        copy_event(event)
+
+
+@pytest.mark.parametrize("payload", [[], "text", 42, True, None])
+def test_revalidated_event_cannot_bypass_payload_object_admission(payload):
+    event = Event(type=EventType.MODEL_TEXT_DELTA, session_id="s", payload={"delta": "text"})
+    changed = event.model_copy(update={"payload": payload})
+    assert Event.model_validate(changed) is changed
+    with pytest.raises(ValidationError) as copy_failure:
+        copy_event(changed)
+    assert copy_failure.value.errors()[0]["type"] == "dict_type"
+    with pytest.raises(ValidationError) as record_failure:
+        EventRecord(sequence=1, event=changed)
+    assert record_failure.value.errors()[0]["type"] == "dict_type"
+
+
+def test_existing_event_revalidation_cannot_stamp_a_concurrent_payload_mutation(monkeypatch):
+    from cayu import events
+
+    event = Event(type=EventType.MODEL_TEXT_DELTA, session_id="s", payload={"delta": "safe"})
+    checked, mutated = threading.Event(), threading.Event()
+    validate = events._validate_event_candidate
+
+    def observe(candidate):
+        result = validate(candidate)
+        if candidate is event:
+            checked.set()
+            assert mutated.wait(5)
+        return result
+
+    def mutate():
+        if checked.wait(5):
+            event.payload["delta"] = "bad\x00"
+            mutated.set()
+
+    monkeypatch.setattr(events, "_validate_event_candidate", observe)
+    thread = threading.Thread(target=mutate)
+    thread.start()
+    try:
+        assert Event.model_validate(event) is event
+    finally:
+        checked.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    with pytest.raises(DurableValueError, match="nul_character"):
+        copy_event(event)
+
+
+def test_constructed_event_cannot_claim_envelope_validation():
+    event = Event.model_construct(
+        type=EventType.MODEL_TEXT_DELTA, session_id="s", payload={"delta": "bad\x00"}
+    )
+    with pytest.raises(DurableValueError, match="nul_character"):
         copy_event(event)
 
 
