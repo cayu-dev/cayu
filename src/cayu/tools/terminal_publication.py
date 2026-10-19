@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
@@ -20,8 +21,19 @@ TOOL_TERMINAL_PUBLICATION_SLICE_BYTES = 256 * 1024
 TOOL_TERMINAL_PUBLICATION_CAPACITY_BYTES = 4 * 1024 * 1024
 TOOL_TERMINAL_PUBLICATION_MAX_OFFLOADS = 4
 TOOL_TERMINAL_STAGED_CAPACITY_BYTES = 128 * 1024 * 1024
+TOOL_ROUND_ADMISSION_TIMEOUT_SECONDS = 600.0
+TOOL_ROUND_ADMISSION_NOTICE_SECONDS = 60.0
+
+logger = logging.getLogger(__name__)
 
 _ResultT = TypeVar("_ResultT")
+
+
+class ToolRoundAdmissionTimeoutError(RuntimeError):
+    """A deferred tool round got no publication capacity before its deadline.
+
+    Raised before any of the round's tools run, so failing the round is safe.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +78,11 @@ class _RoundReservation:
     group: tuple[str, ...]
 
 
+def _require_positive_seconds(value: float, name: str) -> None:
+    if type(value) not in (int, float) or not isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number of seconds.")
+
+
 class ToolTerminalPublicationGovernor:
     """One fair CPU/capacity domain shared by all sessions in a ``CayuApp``."""
 
@@ -76,6 +93,8 @@ class ToolTerminalPublicationGovernor:
         capacity_bytes: int = TOOL_TERMINAL_PUBLICATION_CAPACITY_BYTES,
         max_offloads: int = TOOL_TERMINAL_PUBLICATION_MAX_OFFLOADS,
         staged_capacity_bytes: int = TOOL_TERMINAL_STAGED_CAPACITY_BYTES,
+        round_admission_timeout_s: float | None = TOOL_ROUND_ADMISSION_TIMEOUT_SECONDS,
+        round_admission_notice_s: float = TOOL_ROUND_ADMISSION_NOTICE_SECONDS,
     ) -> None:
         for value, name in (
             (slice_bytes, "slice_bytes"),
@@ -87,10 +106,20 @@ class ToolTerminalPublicationGovernor:
                 raise ValueError(f"{name} must be a positive integer.")
         if slice_bytes > capacity_bytes:
             raise ValueError("slice_bytes must not exceed capacity_bytes.")
+        if round_admission_timeout_s is not None:
+            _require_positive_seconds(round_admission_timeout_s, "round_admission_timeout_s")
+        _require_positive_seconds(round_admission_notice_s, "round_admission_notice_s")
         self.slice_bytes = slice_bytes
         self.capacity_bytes = capacity_bytes
         self.max_offloads = max_offloads
         self.staged_capacity_bytes = staged_capacity_bytes
+        # A deferred round waits for this lease before any of its tools run.
+        # Related rounds may bypass the queue, so a waiter can starve while one
+        # family keeps a lease alive; the deadline turns that into a failure.
+        self.round_admission_timeout_s = (
+            None if round_admission_timeout_s is None else float(round_admission_timeout_s)
+        )
+        self.round_admission_notice_s = float(round_admission_notice_s)
         self._condition = asyncio.Condition()
         self._small_waiters: deque[object] = deque()
         self._oversized_waiters: deque[object] = deque()
@@ -196,6 +225,14 @@ class ToolTerminalPublicationGovernor:
             group=group,
         )
         token = object()
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        deadline = (
+            None
+            if self.round_admission_timeout_s is None
+            else started_at + self.round_admission_timeout_s
+        )
+        notice_at: float | None = started_at + self.round_admission_notice_s
         async with self._condition:
             existing = self._round_reservations.get(key)
             if existing is not None:
@@ -261,12 +298,46 @@ class ToolTerminalPublicationGovernor:
                         )
                         self._condition.notify_all()
                         return
-                    await self._condition.wait()
+                    now = loop.time()
+                    if deadline is not None and now >= deadline:
+                        raise ToolRoundAdmissionTimeoutError(
+                            f"Tool round waited {now - started_at:.0f}s for terminal "
+                            "publication capacity before running any tool; "
+                            f"{self._capacity_holders(others)}"
+                        )
+                    if notice_at is not None and now >= notice_at:
+                        notice_at = None
+                        logger.warning(
+                            "Tool round is still waiting for terminal publication capacity: "
+                            "session_id=%s tool_round_id=%s waited_s=%.0f %s",
+                            session_id,
+                            tool_round_id,
+                            now - started_at,
+                            self._capacity_holders(others),
+                        )
+                    wake_at = min(
+                        (moment for moment in (deadline, notice_at) if moment is not None),
+                        default=None,
+                    )
+                    # On timeout the lock is held again; re-check before failing.
+                    with suppress(TimeoutError):
+                        async with asyncio.timeout_at(wake_at):
+                            await self._condition.wait()
             except BaseException:
                 with suppress(ValueError):
                     self._round_waiters.remove(token)
                 self._condition.notify_all()
                 raise
+
+    def _capacity_holders(self, others: list[tuple[int, bool]]) -> str:
+        """Describe, without content, what holds the lease a round waits for."""
+
+        return (
+            f"other_reservation_groups={len(others)} "
+            f"exclusive_groups={sum(is_exclusive for _, is_exclusive in others)} "
+            f"reserved_round_bytes={self._reserved_round_bytes} "
+            f"round_waiters={len(self._round_waiters)}"
+        )
 
     def release_round(self, *, session_id: str, tool_round_id: str) -> None:
         """Release one process-local round lease after its stages drain."""

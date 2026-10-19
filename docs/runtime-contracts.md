@@ -3314,6 +3314,16 @@ parent. An already exclusive family permits its related rounds to enter ahead
 of unrelated waiters; unrelated families remain excluded until that ownership
 has drained. Caller-supplied parent metadata does not establish this grouping.
 
+Because related rounds can enter ahead of unrelated waiters, a family whose
+rounds keep overlapping can hold capacity for as long as it stays busy. A round
+therefore waits a bounded time for its lease: Cayu logs a warning naming the
+round after 60 seconds, and after 600 seconds the round fails with
+`ToolRoundAdmissionTimeoutError` before any of its tools run. The session's
+`session.failed` event then carries content-free counts of the families that
+held the lease. Closing an interrupted or cancelled round that staged no
+terminal takes no lease, so a round cancelled while waiting for admission
+closes at once instead of queuing again behind the same holders.
+
 A tool that exceeds its declaration receives one bounded authoritative
 `invalid_tool_output` failure; Cayu does not truncate a successful result or
 erase workspace-settlement evidence. If the fixed failure plus runtime-owned

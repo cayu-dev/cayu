@@ -1478,8 +1478,19 @@ class DurableToolRound:
                 ),
             ),
         )
-        await recovery_publication_coordinator.reserve_capacity()
-        await recovery_publication_coordinator.restore_staged_capacity(recovery_staged_records)
+        if recovery_staged_records:
+            # Only staged terminals occupy the byte lease. A round that staged
+            # nothing must not queue behind other sessions' rounds: its live
+            # admission may have been cancelled while waiting for that lease.
+            await recovery_publication_coordinator.reserve_capacity()
+            await recovery_publication_coordinator.restore_staged_capacity(recovery_staged_records)
+        else:
+            # A stage write whose outcome was unknown may still hold this
+            # round's lease. Nothing is staged durably, so release it here.
+            publication_governor.release_round(
+                session_id=session.id,
+                tool_round_id=tool_round_identity.tool_round_id,
+            )
         for staged in recovery_staged_records:
             if staged.tool_call_id not in durable_terminal_ids:
                 continue

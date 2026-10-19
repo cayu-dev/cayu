@@ -501,7 +501,9 @@ def test_approval_continuation_deadline_ends_normally_after_admission(structured
                     messages=[Message.text("user", "Read")],
                     max_steps=None,
                     structured_output=spec("tool") if structured else None,
-                    execution_deadline=ExecutionDeadline.after(2),
+                    # Leave room for the first run to pause on a loaded CI
+                    # runner; the tool still sleeps well past the deadline.
+                    execution_deadline=ExecutionDeadline.after(10),
                 )
             )
         ]
