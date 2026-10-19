@@ -4,9 +4,11 @@ A fork controller's per-fork cap reserves one step's worst case, the
 reservation's tokens, before each dispatch. That bounds the fork's spend only if
 the request itself cannot use more: its input must fit the reserved input
 tokens, and the provider must stop output at the reserved output tokens. Input
-is bounded by the request's serialized size in bytes, which is at least its token
-count for text; content whose tokens bytes cannot bound (files, peer content,
-tool-result artifacts) is refused. Output is clamped through the adapter's own
+is bounded by the serialized size in bytes of everything the request carries to
+an adapter (messages, tools, tool projections and options such as a native
+structured-output schema), which is at least its token count for text; input
+whose tokens bytes cannot bound (files, peer content, tool-result artifacts,
+provider-hosted tools) is refused. Output is clamped through the adapter's own
 output-token option, and an adapter that declares none is refused.
 """
 
@@ -61,6 +63,9 @@ def request_input_token_upper_bound(request: ModelRequest) -> int | None:
 
     if request.options.get(RESOLVED_FILE_ATTACHMENTS_OPTION):
         return None
+    if request.hosted_tools:
+        # A provider-hosted tool adds results the request's bytes can't bound.
+        return None
     for message in request.messages:
         for part in message.content:
             if isinstance(part, FilePart | PeerContentPart):
@@ -69,12 +74,14 @@ def request_input_token_upper_bound(request: ModelRequest) -> int | None:
                 return None
     # Every text token covers at least one byte, and the JSON framing adds more
     # bytes per message than a provider adds tokens for roles and separators.
-    return compact_json_utf8_size(
-        {
-            "messages": [message.model_dump(mode="json") for message in request.messages],
-            "tools": request.tools,
-        }
-    )
+    # The whole request counts, not only messages and tools: an adapter also
+    # sends option fields (a native structured-output schema, instructions)
+    # and tool projections. Counting fields it doesn't send can only make the
+    # bound more conservative.
+    try:
+        return compact_json_utf8_size(request.model_dump(mode="json"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _option_path(provider: ModelProvider) -> tuple[str, ...]:
@@ -91,7 +98,8 @@ def _require_input_within(request: ModelRequest, max_input_tokens: int) -> None:
     bound = request_input_token_upper_bound(request)
     if bound is None:
         raise ForkCapRequestRefused(
-            "A request with files or other non-text input cannot run under a per-fork cap."
+            "A request with files, hosted tools or other input its size can't bound cannot "
+            "run under a per-fork cap."
         )
     if bound > max_input_tokens:
         raise ForkCapRequestRefused(
