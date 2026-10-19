@@ -462,7 +462,13 @@ def test_single_call_round_has_no_sibling_wait(sqlite_resources):
 
 def test_parallel_dispatch_overlaps_call_execution(sqlite_resources):
     class SlowTool(_TimedTool):
+        def __init__(self):
+            self.started = asyncio.Barrier(3)
+
         async def run(self, ctx, args):
+            # Start-persistence latency can exceed the tool's execution time.
+            # Hold each call until all three run; serial dispatch must time out.
+            await asyncio.wait_for(self.started.wait(), timeout=10)
             await asyncio.sleep(0.1)
             return ToolResult(content="done")
 

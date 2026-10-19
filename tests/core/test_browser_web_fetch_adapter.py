@@ -1360,7 +1360,9 @@ def test_guest_browser_cleanup_finishes_every_owner_before_republishing_cancella
                 unexpected_page_observed=object(),
                 browser=Browser(),
                 playwright=Playwright(),
-                timeout_seconds=2.0,
+                # This test controls caller cancellation; cleanup must not
+                # expire before the outer watchdogs on a busy runner.
+                timeout_seconds=60.0,
             )
         )
         supervisor = asyncio.create_task(
@@ -1369,7 +1371,7 @@ def test_guest_browser_cleanup_finishes_every_owner_before_republishing_cancella
         await asyncio.wait_for(blocked_stage_started.wait(), timeout=10.0)
         supervisor.cancel("caller stopped browser fetch")
         release_blocked_stage.set()
-        outcome = await asyncio.wait_for(supervisor, timeout=1.0)
+        outcome = await asyncio.wait_for(supervisor, timeout=10.0)
 
         assert outcome.errors == ()
         assert outcome.cancellation is not None
@@ -1390,10 +1392,20 @@ def test_guest_browser_cleanup_finishes_every_owner_before_republishing_cancella
 def test_guest_browser_cleanup_timeout_still_attempts_later_owners() -> None:
     async def exercise() -> None:
         calls: list[str] = []
+        timers: list[asyncio.Timeout] = []
+        real_timeout = asyncio.timeout
+
+        def capture_timeout(seconds: float) -> asyncio.Timeout:
+            timer = real_timeout(seconds)
+            timers.append(timer)
+            return timer
 
         class Context:
             async def close(self) -> None:
                 calls.append("context")
+                # Expire the real stage timer only once this owner starts.
+                # Later owners retain their budget despite scheduling delays.
+                timers[-1].reschedule(asyncio.get_running_loop().time())
                 await asyncio.Event().wait()
 
         class Browser:
@@ -1404,20 +1416,25 @@ def test_guest_browser_cleanup_timeout_still_attempts_later_owners() -> None:
             async def stop(self) -> None:
                 calls.append("playwright")
 
-        errors = await guest._cleanup_browser_resources(
-            violation_task=None,
-            navigation_task=None,
-            context=Context(),
-            page=None,
-            response_observed=None,
-            unexpected_page_observed=None,
-            browser=Browser(),
-            playwright=Playwright(),
-            timeout_seconds=0.3,
-        )
+        with patch.object(guest.asyncio, "timeout", side_effect=capture_timeout):
+            errors = await asyncio.wait_for(
+                guest._cleanup_browser_resources(
+                    violation_task=None,
+                    navigation_task=None,
+                    context=Context(),
+                    page=None,
+                    response_observed=None,
+                    unexpected_page_observed=None,
+                    browser=Browser(),
+                    playwright=Playwright(),
+                    timeout_seconds=60.0,
+                ),
+                timeout=10.0,
+            )
 
         assert len(errors) == 1
         assert isinstance(errors[0], TimeoutError)
+        assert timers[0].expired()
         assert calls == ["context", "browser", "playwright"]
 
     asyncio.run(exercise())
