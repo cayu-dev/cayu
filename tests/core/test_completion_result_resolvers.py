@@ -13,6 +13,11 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from tests.core._bounded_waits import (
+    FAKE_STEP_TIMEOUT_SECONDS,
+    wait_for_caller_settlement,
+    wait_for_fake_step,
+)
 from tests.core.completion_result_resolver_conformance import (
     assert_completion_result_resolver_cross_instance_concurrency,
     assert_completion_result_resolver_store_conformance,
@@ -629,16 +634,32 @@ def test_completed_owner_does_not_retire_a_slower_concurrent_owner(
         slow_operation = asyncio.create_task(
             first.resolve_completion_result(_resolution_request(decision_id))
         )
-        await slow.started.wait()
+        await wait_for_fake_step(slow.started, slow_operation)
         completed = await second.resolve_completion_result(_resolution_request(decision_id))
         assert completed.status is TaskStatus.COMPLETED
-        await asyncio.sleep(0.05)
 
-        checkpoint = await session_store.load_checkpoint("session:application")
-        assert checkpoint is not None
-        reservations = checkpoint["completion_result_event_publications"]["reservations"]
-        assert len(reservations) == 1
-        assert len(next(iter(reservations.values()))["owners"]) == 1
+        async def surviving_owner() -> tuple[str, str]:
+            checkpoint = await session_store.load_checkpoint("session:application")
+            assert checkpoint is not None
+            reservations = checkpoint["completion_result_event_publications"]["reservations"]
+            assert len(reservations) == 1
+            owners = next(iter(reservations.values()))["owners"]
+            assert len(owners) == 1
+            ((owner_id, owner),) = owners.items()
+            return owner_id, owner["expires_at"]
+
+        # The slower owner must keep renewing after the faster one finished.
+        # Wait for one observed renewal rather than a fixed sleep.
+        owner_id, expires_at = await surviving_owner()
+        renewal_deadline = asyncio.get_running_loop().time() + FAKE_STEP_TIMEOUT_SECONDS
+        while (await surviving_owner()) == (owner_id, expires_at):
+            if slow_operation.done():
+                slow_operation.result()
+                raise AssertionError("The slower owner finished before it was released.")
+            if asyncio.get_running_loop().time() >= renewal_deadline:
+                raise AssertionError("The slower owner did not renew its publication lease.")
+            await asyncio.sleep(0.01)
+
         with pytest.raises(
             ValueError,
             match="completion-result event publication is incomplete",
@@ -646,16 +667,14 @@ def test_completed_owner_does_not_retire_a_slower_concurrent_owner(
             await session_store.delete_session("session:application")
 
         slow.release.set()
-        assert await slow_operation == completed
+        await wait_for_caller_settlement(slow_operation)
+        assert slow_operation.result() == completed
         checkpoint = await session_store.load_checkpoint("session:application")
         assert checkpoint is not None
         assert "completion_result_event_publications" not in checkpoint
 
-    monkeypatch.setattr(
-        resolver_coordinator_module,
-        "_PUBLICATION_OWNER_LEASE_SECONDS",
-        0.2,
-    )
+    # Keep the production lease so a stalled runner cannot let it lapse; a short
+    # heartbeat makes the renewal the scenario waits for happen quickly.
     monkeypatch.setattr(
         resolver_coordinator_module,
         "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",

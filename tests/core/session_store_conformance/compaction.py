@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.core._bounded_waits import FAKE_STEP_TIMEOUT_SECONDS
 from tests.core._execution_profile_fixtures import (
     profiled_session_identity,
 )
@@ -123,15 +124,42 @@ def test_automatic_compaction_publication_contention_conformance(
             for index, barrier in enumerate(barriers)
         )
 
+        # Each session's first compaction start pauses at its barrier, and the
+        # runtime must give up on it, cancel it, and publish it again. Time out
+        # only that paused publication, once it is at its barrier, and leave
+        # every other publication its production deadline. A short global
+        # deadline also failed publications that were merely slow on a busy
+        # runner, before their session reached its barrier.
+        barrier_by_session = {
+            f"sess_compaction_contention_{session_store_case[0]}_{index}": barrier
+            for index, barrier in enumerate(barriers)
+        }
+        paused_start_barriers: dict[object, PublicationBarrier] = {}
+        original_persist_exact_replay = app._event_writer.persist_exact_replay
+        original_await_shielded_task_outcome = _automatic_compaction.await_shielded_task_outcome
+
+        def persist_exact_replay(event: Event):
+            publication = original_persist_exact_replay(event)
+            if (
+                event.type is EventType.MODEL_STARTED
+                and event.payload.get("purpose") == "context_compaction"
+                and event.session_id in barrier_by_session
+            ):
+                paused_start_barriers[publication] = barrier_by_session.pop(event.session_id)
+            return publication
+
+        async def await_shielded_task_outcome(task, **kwargs):
+            barrier = paused_start_barriers.pop(task.get_coro(), None)
+            if barrier is not None:
+                await barrier.wait_until_entered(timeout=FAKE_STEP_TIMEOUT_SECONDS)
+                kwargs["timeout_s"] = 0.0
+            return await original_await_shielded_task_outcome(task, **kwargs)
+
+        monkeypatch.setattr(app._event_writer, "persist_exact_replay", persist_exact_replay)
         monkeypatch.setattr(
             _automatic_compaction,
-            "_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S",
-            0.5,
-        )
-        monkeypatch.setattr(
-            _automatic_compaction,
-            "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
-            0.5,
+            "await_shielded_task_outcome",
+            await_shielded_task_outcome,
         )
         try:
             async with SessionOperationFaultHarness(
