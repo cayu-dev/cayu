@@ -11607,7 +11607,21 @@ without a claim of backend acceptance. See the shipped
 for exact rules, sources, precedence, and operational-proof boundaries.
 
 Readable reasoning streams as `model.thinking.delta` and is persisted as a
-`ThinkingPart`. `include_in_transcript=False` omits newly produced display-only
+`ThinkingPart`. Within a synchronous model attempt, consecutive display-only
+thinking and text deltas are coalesced before durable event publication. The
+first delta is immediate; subsequent batches contain up to 4,096 characters
+(an indivisible larger provider chunk remains intact), or flush on the first
+arrival at least one second after the previous publication. Semantic boundaries,
+stream exhaustion and provider failure flush accepted text in order. Provider
+completion and its buffered tail cross into the attempt together, so cancellation
+during tail persistence or delivery cannot discard already-observed completion
+usage. Interruption and provider-close failures remain distinct failure evidence.
+Provider deadlines still observe every original chunk. Signed thinking blocks, opaque
+state and reconnectable provider-operation cursors keep their original boundaries.
+Replay preserves the published batches; provider chunk boundaries are not a
+durable contract. Unpublished buffered text is lost if the process dies, just as
+an in-flight provider observation is; completed transcript text is unchanged.
+`include_in_transcript=False` omits newly produced display-only
 reasoning, but does not suppress live deltas or discard opaque provider state
 required to continue a tool-use turn. Reasoning token usage is exposed through
 `usage_metrics.reasoning_output_tokens` when the provider reports it.

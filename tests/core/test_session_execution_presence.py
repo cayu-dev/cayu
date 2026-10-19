@@ -1201,7 +1201,14 @@ def test_sqlite_owner_writes_follow_heartbeat_cadence_not_delta_count(
                 await asyncio.gather(*(group.task for group in groups))
                 store._connection.set_trace_callback(None)
             elapsed = time.monotonic() - started
-            assert sum(event.type == EventType.MODEL_TEXT_DELTA for event in events) == delta_count
+            assert (
+                "".join(
+                    event.payload["delta"]
+                    for event in events
+                    if event.type == EventType.MODEL_TEXT_DELTA
+                )
+                == "x" * delta_count
+            )
             assert writes >= 4  # claim, multiple actual renewals, release
             assert writes <= math.ceil(elapsed / 0.05) + 3
 

@@ -46,6 +46,7 @@ from cayu.execution_units import ModelAttemptIdentity, copy_model_attempt_identi
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import ProviderStatePart
 from cayu.providers._credential_boundary import (
+    _merge_provider_cancellation_failures,
     aclosing_provider_stream,
     credential_safe_provider_cancellation,
     detach_credential_safe_provider_cancellation,
@@ -140,6 +141,10 @@ from cayu.runtime._provider_stream import (
 )
 from cayu.runtime._run_limits import SessionUsageTracker
 from cayu.runtime._session_control import SessionControl, SessionInterruptedByRequest
+from cayu.runtime._stream_delta_buffer import (
+    BufferedModelCompletion,
+    coalesce_model_stream_deltas,
+)
 from cayu.runtime._structured_output_tool_round import (
     _redact_structured_output_validation,
     _validate_structured_output_tool_round,
@@ -590,7 +595,7 @@ class LiveModelAttempt:
                     context_exposure_ref(ambiguous_suffix),
                 )
 
-        provider_events: AsyncIterator[ModelStreamEvent] | None = None
+        provider_events: AsyncIterator[ModelStreamEvent | BufferedModelCompletion] | None = None
         provider_events_owned = False
         provider_operation_adapter: ProviderOperationAdapter | None = None
         provider_operation_state: ProviderOperationState | None = None
@@ -690,17 +695,20 @@ class LiveModelAttempt:
                         await cleanup_writer.persist(event_with_runtime_generated_id(event))
 
                     cleanup_observer = _LocalHttpCleanupObserver(publish_http_cleanup)
-                provider_events = _owned_model_provider_events(
-                    lambda: _admitted_model_provider_events(
-                        provider,
-                        model_request,
-                        deadline_admission,
-                        refresh_live_model_semantics,
-                        cleanup_observer,
-                        error_redactor=self._secret_redactor,
+                provider_events = coalesce_model_stream_deltas(
+                    _owned_model_provider_events(
+                        lambda: _admitted_model_provider_events(
+                            provider,
+                            model_request,
+                            deadline_admission,
+                            refresh_live_model_semantics,
+                            cleanup_observer,
+                            error_redactor=self._secret_redactor,
+                        ),
+                        cancellation_baseline=provider_cancellation_baseline,
+                        max_concurrent_streams=deadline_admission.max_concurrent_streams,
                     ),
-                    cancellation_baseline=provider_cancellation_baseline,
-                    max_concurrent_streams=deadline_admission.max_concurrent_streams,
+                    before_accept=interrupt_poll.raise_if_interrupted,
                 )
                 provider_events_owned = True
             else:
@@ -757,6 +765,17 @@ class LiveModelAttempt:
                         break
                 finally:
                     reset_provider_error_workload_redactor(redactor_token)
+                buffered_delta = None
+                if isinstance(raw_stream_event, BufferedModelCompletion):
+                    buffered_delta = _validate_assistant_stream_event(
+                        _validate_stream_event(
+                            raw_stream_event.delta,
+                            provider_name=registered_provider.name,
+                            requested_model=model_request.model,
+                            usage_dialect=registered_provider.usage_dialect,
+                        ).event
+                    ).event
+                    raw_stream_event = raw_stream_event.completion
                 boundary_value = _validate_stream_event(
                     raw_stream_event,
                     provider_name=registered_provider.name,
@@ -785,7 +804,11 @@ class LiveModelAttempt:
                             ContextExposureEvidenceKind.PROVIDER_ACKNOWLEDGEMENT,
                             context_exposure_ref("response"),
                         )
-                await interrupt_poll.raise_if_interrupted()
+                if not provider_events_owned:
+                    await interrupt_poll.raise_if_interrupted()
+                # Synchronous output passed interruption admission before it
+                # entered the buffer. Rechecking here would discard accepted
+                # text and the pending cancellation's cleanup evidence.
                 if model_completed:
                     if (
                         provider_operation_state is not None
@@ -1024,6 +1047,17 @@ class LiveModelAttempt:
                             yield progress_emitted_event, None
                         continue
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
+                    if buffered_delta is not None:
+                        if buffered_delta.type is ModelStreamEventType.TEXT_DELTA:
+                            transcript_helpers.append_assistant_text_delta(
+                                assistant_parts, buffered_delta.delta
+                            )
+                        else:
+                            transcript_helpers.append_assistant_thinking_delta(
+                                assistant_parts,
+                                buffered_delta.delta,
+                                include=include_thinking_in_transcript,
+                            )
                     terminal_progress_failure: BaseException | None = None
                     terminal_progress_verified = False
                     if provider_operation_state is not None:
@@ -1232,9 +1266,6 @@ class LiveModelAttempt:
                             model_attempt_identity=model_attempt_identity,
                             targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
-                    if model_completion_publisher is None:
-                        completion_event = record_model_completion(completion_event)
-                        yield await self._event_writer.emit(completion_event), None
                     if terminal_progress_failure is not None:
                         post_completion_failure = _combine_post_completion_failures(
                             post_completion_failure,
@@ -1248,6 +1279,31 @@ class LiveModelAttempt:
                                 post_completion_failure,
                                 completion_terminal_error,
                             )
+                    if buffered_delta is not None:
+                        # Retain the completion and its accounting before any
+                        # cancellable tail write or sink delivery. The existing
+                        # completion owner then settles usage if this flush fails.
+                        delta_event = _model_stream_event_to_runtime_event(
+                            buffered_delta,
+                            session=session,
+                            requested_model=model_request.model,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            provider_name=registered_provider.name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                            usage_dialect=registered_provider.usage_dialect,
+                            execution_profile_fingerprint=(
+                                None if execution_profile is None else execution_profile.fingerprint
+                            ),
+                        )
+                        yield await self._event_writer.emit(delta_event), None
+                    if model_completion_publisher is None:
+                        completion_event = record_model_completion(completion_event)
+                        yield await self._event_writer.emit(completion_event), None
+                    if completion_terminal_error is not None:
                         break
                     if provider_operation_state is not None:
                         break
@@ -1865,14 +1921,16 @@ class LiveModelAttempt:
                     if provider_events_owned:
                         # The wrapper owns the one credential-safe provider close.
                         await cast(
-                            "AsyncGenerator[ModelStreamEvent, None]",
+                            "AsyncGenerator[ModelStreamEvent | BufferedModelCompletion, None]",
                             provider_events,
                         ).aclose()
                     else:
                         async with aclosing_provider_stream(provider_events):
                             pass
                 except BaseException as cleanup_failure:
-                    if isinstance(cleanup_failure, asyncio.CancelledError):
+                    if isinstance(cleanup_failure, asyncio.CancelledError) and (
+                        model_completion_publisher is None or not model_completed
+                    ):
                         raise
                     primary_failure = (
                         post_completion_failure
@@ -1880,14 +1938,34 @@ class LiveModelAttempt:
                         or durable_stream_failure
                         or active_failure
                     )
-                    combined_failure = (
-                        cleanup_failure
-                        if primary_failure is None or primary_failure is cleanup_failure
-                        else _combine_post_completion_failures(
-                            primary_failure,
-                            cleanup_failure,
+                    if primary_failure is None or primary_failure is cleanup_failure:
+                        combined_failure = cleanup_failure
+                    elif isinstance(primary_failure, asyncio.CancelledError) and isinstance(
+                        cleanup_failure, asyncio.CancelledError
+                    ):
+                        # Keep cancellation pending through bounded provider
+                        # cleanup, then retain one caller cancellation carrying
+                        # the authenticated diagnostics from both owners.
+                        combined_failure = credential_safe_provider_cancellation(
+                            "Provider operation cancelled",
+                            preserve_empty_artifacts=False,
+                            stream_cleanup_cancelled_after_failure=(
+                                stream_cleanup_cancelled_after_provider_failure(primary_failure)
+                                or stream_cleanup_cancelled_after_provider_failure(cleanup_failure)
+                            ),
+                            native_admission_deadline=(
+                                provider_cancellation_admission_deadline(primary_failure)
+                                or provider_cancellation_admission_deadline(cleanup_failure)
+                            ),
+                            provider_cancellation_failures=_merge_provider_cancellation_failures(
+                                provider_cancellation_failures(primary_failure),
+                                provider_cancellation_failures(cleanup_failure),
+                            ),
                         )
-                    )
+                    else:
+                        combined_failure = _combine_post_completion_failures(
+                            primary_failure, cleanup_failure
+                        )
                     if background_dispatch_invoked and model_completed:
                         post_completion_failure = combined_failure
                     elif model_completion_publisher is None or not model_completed:

@@ -102,7 +102,9 @@ def test_streaming_does_not_load_session_per_delta(monkeypatch):
     assert baseline_events[-1].type == EventType.SESSION_COMPLETED
     assert events[-1].type == EventType.SESSION_COMPLETED
     delta_events = [event for event in events if event.type == EventType.MODEL_TEXT_DELTA]
-    assert len(delta_events) == delta_count
+    assert "".join(event.payload["delta"] for event in delta_events) == "".join(
+        f"chunk {index} " for index in range(delta_count)
+    )
     # Freeze interval expiry rather than relying on machine speed. Adding 199
     # deltas must not add any durable session reads while the poll window stays
     # open; a per-delta load would make the second count grow by 199.
