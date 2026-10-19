@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from tests.core._bounded_waits import wait_for_caller_settlement, wait_for_fake_step
 from tests.core._explicit_compaction_fixtures import (
     ContextualBedrockCompactionProvider,
     FinalRenewalFailureBudgetLedger,
@@ -1319,8 +1321,9 @@ def test_compact_session_cancellation_reconciles_observed_completion_usage() -> 
             ]
 
         task = asyncio.create_task(collect())
-        await provider.completed.wait()
+        await wait_for_fake_step(provider.completed, task)
         task.cancel("cancel after completed")
+        await wait_for_caller_settlement(task)
         with pytest.raises(asyncio.CancelledError, match="cancel after completed"):
             await task
 
@@ -1338,9 +1341,19 @@ def test_compact_session_cancellation_reconciles_observed_completion_usage() -> 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("terminal_signal", ["caller_cancellation", "lease_loss"])
+@pytest.mark.parametrize(
+    ("terminal_signal", "stream_delay_seconds"),
+    [
+        pytest.param("caller_cancellation", 0.0, id="caller_cancellation"),
+        pytest.param("lease_loss", 0.0, id="lease_loss"),
+        # A slow runner reaches the provider after the renewal loop's first tick
+        # (TTL / 3). The lease must still be lost only after completion.
+        pytest.param("lease_loss", 0.5, id="lease_loss_after_slow_stream_start"),
+    ],
+)
 def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_child_failure(
     terminal_signal: str,
+    stream_delay_seconds: float,
 ) -> None:
     class CompletedToolCallThenBlockingProvider(ModelProvider):
         name = "compaction-provider"
@@ -1351,6 +1364,8 @@ def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_
 
         async def stream(self, request: ModelRequest):
             self.calls += 1
+            if stream_delay_seconds:
+                await asyncio.sleep(stream_delay_seconds)
             yield ModelStreamEvent.text_delta("unusable provider summary")
             yield ModelStreamEvent.tool_call(name="unexpected", arguments={})
             yield ModelStreamEvent.completed({"usage": {"input_tokens": 8, "output_tokens": 2}})
@@ -1363,13 +1378,24 @@ def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_
                 raise RuntimeError("provider failed during stream cleanup") from exc
 
     class LoseLeaseOnSecondHeartbeatLedger(InMemoryBudgetLedger):
-        def __init__(self) -> None:
-            super().__init__(reservation_ttl_seconds=1)
+        """Lose the lease on the first timed renewal, after the provider completes.
+
+        The one-second TTL only makes the renewal loop tick quickly. The lease loss
+        waits for the provider's completion so a slow runner cannot lose the lease
+        before the tool call and usage are observed, and the frozen clock keeps
+        the reservation from expiring by wall time before dispatch.
+        """
+
+        def __init__(self, provider_completed: asyncio.Event) -> None:
+            frozen_now = datetime.now(UTC)
+            super().__init__(clock=lambda: frozen_now, reservation_ttl_seconds=1)
             self.heartbeat_calls = 0
+            self.provider_completed = provider_completed
 
         async def heartbeat(self, *, reservation_id: str) -> bool:
             self.heartbeat_calls += 1
             if self.heartbeat_calls == 2:
+                await self.provider_completed.wait()
                 return False
             return await super().heartbeat(reservation_id=reservation_id)
 
@@ -1386,7 +1412,7 @@ def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_
         )
         provider = CompletedToolCallThenBlockingProvider()
         ledger = (
-            LoseLeaseOnSecondHeartbeatLedger()
+            LoseLeaseOnSecondHeartbeatLedger(provider.completed)
             if terminal_signal == "lease_loss"
             else InMemoryBudgetLedger(reservation_ttl_seconds=30)
         )
@@ -1448,9 +1474,10 @@ def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_
             ]
 
         task = asyncio.create_task(collect())
-        await provider.completed.wait()
+        await wait_for_fake_step(provider.completed, task)
         if terminal_signal == "caller_cancellation":
             task.cancel("cancel after completed tool call")
+            await wait_for_caller_settlement(task)
             with pytest.raises(
                 asyncio.CancelledError,
                 match="cancel after completed tool call",
@@ -1459,6 +1486,7 @@ def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_
             assert task.cancelling() == 0
             assert task.cancelled()
         else:
+            await wait_for_caller_settlement(task)
             with pytest.raises(ContextBuildError, match="lease was lost") as raised:
                 await task
             assert isinstance(raised.value.__cause__, BudgetReservationLeaseLost)
