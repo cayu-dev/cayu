@@ -67,9 +67,11 @@ async def _drain(app):
         pass
 
 
-async def _wait_for_round_waiter(governor: ToolTerminalPublicationGovernor) -> None:
+async def _wait_for_round_waiter(
+    governor: ToolTerminalPublicationGovernor, *, count: int = 1
+) -> None:
     for _ in range(2000):
-        if governor.snapshot().round_reservation_waiters:
+        if governor.snapshot().round_reservation_waiters >= count:
             return
         await asyncio.sleep(0.005)
     raise AssertionError("The tool round never waited for publication capacity.")
@@ -168,7 +170,7 @@ def test_round_waiting_past_admission_deadline_fails_before_any_tool_runs():
     asyncio.run(scenario())
 
 
-def test_related_rounds_that_keep_a_lease_alive_cannot_hold_a_waiter_forever(caplog):
+def test_related_rounds_of_unknown_lineage_cannot_hold_a_waiter_forever(caplog):
     async def scenario():
         governor = ToolTerminalPublicationGovernor(
             round_admission_timeout_s=0.3, round_admission_notice_s=0.1
@@ -190,8 +192,9 @@ def test_related_rounds_that_keep_a_lease_alive_cannot_hold_a_waiter_forever(cap
             )
         )
         await _wait_for_round_waiter(governor)
-        # Siblings overlap their rounds. Each one joins the family's lease
-        # ahead of the queued root, so the family never drains.
+        # Without lineage every related round may be awaited by the family's
+        # holder, so each one joins the lease ahead of the queued root and the
+        # family never drains.
         for index in range(1, 12):
             await reserve_sibling(index)
             governor.release_round(
@@ -212,6 +215,109 @@ def test_related_rounds_that_keep_a_lease_alive_cannot_hold_a_waiter_forever(cap
         and "tool_round_id=root-round" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_sibling_rounds_queue_behind_a_waiter_when_no_ancestor_holds_a_lease():
+    async def scenario():
+        # No deadline: the waiter must be admitted on its own merits.
+        governor = ToolTerminalPublicationGovernor(round_admission_timeout_s=None)
+        family = _family("builder-parent")
+
+        async def reserve_sibling(index: int) -> None:
+            session_id = f"builder-{index % 2}"
+            await governor._reserve_invocation_round(
+                session_id=session_id,
+                tool_round_id=f"builder-round-{index}",
+                maximum_bytes=None,
+                invocation=family,
+                lineage=(session_id, "builder-parent"),
+            )
+
+        await reserve_sibling(0)
+        waiter = asyncio.create_task(
+            governor.reserve_round(
+                session_id="root", tool_round_id="root-round", maximum_bytes=None
+            )
+        )
+        await _wait_for_round_waiter(governor)
+        # The other sibling starts a round while the first one still holds the
+        # family's lease. It takes its turn behind the root instead of keeping
+        # the lease alive.
+        sibling = asyncio.create_task(reserve_sibling(1))
+        await _wait_for_round_waiter(governor, count=2)
+        assert governor.snapshot().round_reservation_waiters == 2
+        governor.release_round(session_id="builder-0", tool_round_id="builder-round-0")
+        await asyncio.wait_for(waiter, timeout=2)
+        assert not sibling.done()
+        governor.release_round(session_id="root", tool_round_id="root-round")
+        await asyncio.wait_for(sibling, timeout=2)
+        governor.release_round(session_id="builder-1", tool_round_id="builder-round-1")
+        snapshot = governor.snapshot()
+        assert snapshot.active_round_reservations == 0
+        assert snapshot.round_reservation_waiters == 0
+
+    asyncio.run(scenario())
+
+
+def test_rounds_nested_under_a_held_family_lease_still_skip_queued_waiters():
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(round_admission_timeout_s=None)
+        family = _family("parent")
+        await governor._reserve_invocation_round(
+            session_id="parent",
+            tool_round_id="parent-round",
+            maximum_bytes=None,
+            invocation=family,
+            lineage=("parent",),
+        )
+        waiter = asyncio.create_task(
+            governor.reserve_round(
+                session_id="root", tool_round_id="root-round", maximum_bytes=None
+            )
+        )
+        await _wait_for_round_waiter(governor)
+        # The parent may be awaiting any of its descendants, so they must not
+        # wait behind a round that is itself waiting for the parent to finish.
+        for session_id, lineage in (
+            ("child-0", ("child-0", "parent")),
+            ("child-1", ("child-1", "parent")),
+            ("grandchild", ("grandchild", "child-0", "parent")),
+        ):
+            await asyncio.wait_for(
+                governor._reserve_invocation_round(
+                    session_id=session_id,
+                    tool_round_id=f"{session_id}-round",
+                    maximum_bytes=None,
+                    invocation=family,
+                    lineage=lineage,
+                ),
+                timeout=2,
+            )
+        assert not waiter.done()
+        for session_id in ("grandchild", "child-1", "child-0", "parent"):
+            governor.release_round(session_id=session_id, tool_round_id=f"{session_id}-round")
+        await asyncio.wait_for(waiter, timeout=2)
+        governor.release_round(session_id="root", tool_round_id="root-round")
+        assert governor.snapshot().active_round_reservations == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("lineage", [(), ("other",), ("builder", ""), ["builder"]])
+def test_round_lineage_must_start_with_the_requesting_session(lineage):
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor()
+        with pytest.raises(ValueError, match="lineage must start with session_id"):
+            await governor._reserve_invocation_round(
+                session_id="builder",
+                tool_round_id="builder-round",
+                maximum_bytes=None,
+                invocation=_family("parent"),
+                lineage=lineage,
+            )
+        assert governor.snapshot().active_round_reservations == 0
+
+    asyncio.run(scenario())
 
 
 def test_round_admitted_before_its_deadline_keeps_waiting_normally():

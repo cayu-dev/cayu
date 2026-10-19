@@ -114,8 +114,9 @@ class ToolTerminalPublicationGovernor:
         self.max_offloads = max_offloads
         self.staged_capacity_bytes = staged_capacity_bytes
         # A deferred round waits for this lease before any of its tools run.
-        # Related rounds may bypass the queue, so a waiter can starve while one
-        # family keeps a lease alive; the deadline turns that into a failure.
+        # A round nested under a reservation its family already holds may
+        # bypass the queue, so a waiter can wait while that reservation's
+        # descendants keep running; the deadline turns that into a failure.
         self.round_admission_timeout_s = (
             None if round_admission_timeout_s is None else float(round_admission_timeout_s)
         )
@@ -174,18 +175,34 @@ class ToolTerminalPublicationGovernor:
         tool_round_id: str,
         maximum_bytes: int | None,
         invocation: SessionInvocation,
+        lineage: tuple[str, ...] | None = None,
     ) -> None:
         """Reserve using provenance resolved by the runtime's session owner.
 
         This internal entrance does not accept caller-provided parent metadata.
         Related rounds share an exclusive domain, not execution authority.
+
+        ``lineage`` is the requesting session followed by its durable
+        ancestors. A related round skips queued unrelated rounds only when one
+        of those sessions already holds a reservation in the family, because
+        that holder may be awaiting this round. Other related rounds, such as
+        siblings whose parent holds nothing, take their turn in the queue. When
+        the lineage is unknown, every related round keeps the queue bypass.
         """
         invocation = copy_session_invocation(invocation)
+        if lineage is not None and (
+            type(lineage) is not tuple
+            or not lineage
+            or lineage[0] != session_id
+            or any(type(item) is not str or not item for item in lineage)
+        ):
+            raise ValueError("lineage must start with session_id and contain session IDs.")
         await self._reserve_round(
             session_id=session_id,
             tool_round_id=tool_round_id,
             maximum_bytes=maximum_bytes,
             group=("invocation", invocation.root_invocation_id, invocation.root_session_id),
+            lineage=None if lineage is None else frozenset(lineage),
         )
 
     def _group_usage(self) -> dict[tuple[str, ...], tuple[int, bool]]:
@@ -212,6 +229,7 @@ class ToolTerminalPublicationGovernor:
         tool_round_id: str,
         maximum_bytes: int | None,
         group: tuple[str, ...],
+        lineage: frozenset[str] | None = None,
     ) -> None:
         if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes <= 0):
             raise ValueError("maximum_bytes must be a positive integer or None.")
@@ -253,15 +271,15 @@ class ToolTerminalPublicationGovernor:
                     previous_group = groups.get(group)
                     related = previous_group is not None
                     prior_weight, prior_exclusive = previous_group or (0, False)
-                    members = [
-                        reservation
-                        for reservation in self._round_reservations.values()
+                    members = {
+                        holder: reservation
+                        for holder, reservation in self._round_reservations.items()
                         if reservation.group == group
-                    ]
+                    }
                     group_weight = (
                         self.staged_capacity_bytes
                         if maximum_bytes is None
-                        or any(member.maximum_bytes is None for member in members)
+                        or any(member.maximum_bytes is None for member in members.values())
                         else prior_weight + weight
                     )
                     # A durable invocation family is one capacity domain. Its
@@ -281,14 +299,22 @@ class ToolTerminalPublicationGovernor:
                             <= self.staged_capacity_bytes
                         )
                     )
-                    if related and not admissible:
+                    # Only a round that a held family reservation may be
+                    # awaiting skips the queue. Letting every family member in
+                    # ahead of queued rounds lets overlapping siblings keep the
+                    # family's lease alive and starve an unrelated waiter.
+                    nested = related and (
+                        lineage is None
+                        or any(holder_session_id in lineage for holder_session_id, _ in members)
+                    )
+                    if nested and not admissible:
                         # Waiting could deadlock a parent that already owns a
                         # reservation and is awaiting this child. Refuse before
                         # this round dispatches, without releasing that parent.
                         raise RuntimeError(
                             "Related tool round exceeds available publication capacity."
                         )
-                    if (related or self._round_waiters[0] is token) and admissible:
+                    if (nested or self._round_waiters[0] is token) and admissible:
                         self._round_waiters.remove(token)
                         self._round_reservations[key] = requested
                         self._reserved_round_bytes += group_weight - prior_weight

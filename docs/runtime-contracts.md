@@ -3308,16 +3308,21 @@ Each round retains its own payload declaration and release ownership; releasing
 the parent does not release an active child's reservation or vice versa.
 Bounded declarations aggregate across the family and unrelated families. A family
 whose aggregate exceeds capacity uses the same exclusive admission as one
-oversized round; exclusivity is recalculated as its members release. If a
-related round cannot fit because another family is active, admission fails
-before that round dispatches tools instead of waiting on its
-parent. An already exclusive family permits its related rounds to enter ahead
-of unrelated waiters; unrelated families remain excluded until that ownership
-has drained. Caller-supplied parent metadata does not establish this grouping.
+oversized round; exclusivity is recalculated as its members release. A
+related round is nested when the session itself or one of its durable ancestor
+sessions (by `parent_session_id`) already holds a reservation in the family,
+because that holder may be awaiting it. A nested round enters ahead of
+unrelated waiters, and if it cannot fit because another family is active,
+admission fails before that round dispatches tools instead of waiting on its
+parent. Other related rounds, such as sibling children whose parent holds no
+lease, take their turn in the queue like any other round, so overlapping
+siblings cannot keep their family's capacity busy and starve an unrelated
+waiter. Unrelated families remain excluded until the family's ownership has
+drained. Caller-supplied parent metadata does not establish this grouping.
 
-Because related rounds can enter ahead of unrelated waiters, a family whose
-rounds keep overlapping can hold capacity for as long as it stays busy. A round
-therefore waits a bounded time for its lease: Cayu logs a warning naming the
+Because nested rounds can enter ahead of unrelated waiters, a family whose
+nested work keeps overlapping can hold capacity for as long as it stays busy. A
+round therefore waits a bounded time for its lease: Cayu logs a warning naming the
 round after 60 seconds, and after 600 seconds the round fails with
 `ToolRoundAdmissionTimeoutError` before any of its tools run. The session's
 `session.failed` event then carries content-free counts of the families that

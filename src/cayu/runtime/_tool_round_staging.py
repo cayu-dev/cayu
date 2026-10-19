@@ -161,6 +161,8 @@ _TOOL_TERMINAL_TIMING_FIELDS = (
 
 _TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES = 64 * 1024
 
+_TOOL_ROUND_LINEAGE_MAX_DEPTH = 256
+
 
 class _ToolRoundPublicationCoordinator:
     """Serialize actual secret discovery with private terminal staging."""
@@ -271,8 +273,29 @@ class _ToolRoundPublicationCoordinator:
                 tool_round_id=self._tool_round_identity.tool_round_id,
                 maximum_bytes=self._capacity_maximum_bytes,
                 invocation=session.invocation,
+                lineage=await self._session_lineage(session),
             )
         self._capacity_reserved = True
+
+    async def _session_lineage(self, session: Session) -> tuple[str, ...] | None:
+        """Return this session and its durable ancestors, or None if unknown.
+
+        The governor lets a round skip queued rounds only when an ancestor in
+        this lineage holds a family reservation and may be awaiting it.
+        Unknown lineage keeps that bypass for every related round.
+        """
+
+        lineage = [session.id]
+        parent_session_id = session.parent_session_id
+        while parent_session_id is not None:
+            if parent_session_id in lineage or len(lineage) >= _TOOL_ROUND_LINEAGE_MAX_DEPTH:
+                return None
+            lineage.append(parent_session_id)
+            parent = await self._session_store.load(parent_session_id)
+            if parent is None:
+                return None
+            parent_session_id = parent.parent_session_id
+        return tuple(lineage)
 
     async def restore_staged_capacity(
         self,
