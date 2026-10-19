@@ -67,6 +67,75 @@ def _allow_test_postgres_mutation_boundary(monkeypatch) -> None:
     )
 
 
+# Upper bound for one step of a fake Postgres scenario. The fakes answer
+# immediately, so reaching this means the scenario is stuck.
+_FAKE_POSTGRES_STEP_TIMEOUT_SECONDS = 10.0
+
+
+class _FakeMutationConnection:
+    """Accept the session statements the mutation boundary sends at checkout."""
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    async def execute(self, query: str, params: object = None) -> None:
+        del params
+        self.executed.append(query)
+
+
+async def _wait_for_fake_step(event: asyncio.Event, caller: asyncio.Task) -> None:
+    """Wait for a fake operation step, failing fast if the caller ends first.
+
+    Waiting on the event alone hangs forever when the mutation fails before it
+    reaches the fake operation, and hides that failure.
+    """
+
+    step = asyncio.ensure_future(event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {step, caller},
+            timeout=_FAKE_POSTGRES_STEP_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        step.cancel()
+    if step in done:
+        return
+    if caller in done:
+        if not caller.cancelled():
+            caller.result()
+        raise AssertionError("The Postgres mutation finished before the fake step ran.")
+    raise AssertionError(
+        f"The fake step did not run within {_FAKE_POSTGRES_STEP_TIMEOUT_SECONDS} seconds."
+    )
+
+
+async def _wait_for_fake_settlement(caller: asyncio.Task) -> None:
+    """Bound the wait for a cancelled mutation without cancelling it again."""
+
+    await asyncio.wait({caller}, timeout=_FAKE_POSTGRES_STEP_TIMEOUT_SECONDS)
+    if not caller.done():
+        raise AssertionError(
+            "The cancelled Postgres mutation did not settle within "
+            f"{_FAKE_POSTGRES_STEP_TIMEOUT_SECONDS} seconds."
+        )
+
+
+def test_fake_step_wait_surfaces_a_caller_that_fails_before_the_step() -> None:
+    async def scenario() -> None:
+        never_set = asyncio.Event()
+
+        async def fails_at_checkout() -> None:
+            raise AttributeError("fake connection is missing a driver method")
+
+        caller = asyncio.create_task(fails_at_checkout())
+        async with asyncio.timeout(_FAKE_POSTGRES_STEP_TIMEOUT_SECONDS / 2):
+            with pytest.raises(AttributeError, match="missing a driver method"):
+                await _wait_for_fake_step(never_set, caller)
+
+    asyncio.run(scenario())
+
+
 def _digest(value: str) -> str:
     return sha256(value.encode()).hexdigest()
 
@@ -748,8 +817,9 @@ def test_postgres_verified_work_rollback_failure_preserves_primary_and_fences_co
         async def __aexit__(self, exc_type, exc, traceback):
             return False
 
-    class Connection:
+    class Connection(_FakeMutationConnection):
         def __init__(self) -> None:
+            super().__init__()
             self.closed = False
             self.pgconn = PgConnection(self)
 
@@ -828,8 +898,9 @@ def test_postgres_cancelled_mutation_closes_exact_connection_before_return(
             async def __aexit__(self, exc_type, exc, traceback):
                 return False
 
-        class Connection:
+        class Connection(_FakeMutationConnection):
             def __init__(self) -> None:
+                super().__init__()
                 self.closed = False
                 self.commit_count = 0
                 self.rollback_count = 0
@@ -881,18 +952,20 @@ def test_postgres_cancelled_mutation_closes_exact_connection_before_return(
                 raise
 
         caller = asyncio.create_task(Store()._run_verified_work_mutation(operation))
-        await operation_started.wait()
+        await _wait_for_fake_step(operation_started, caller)
         caller.cancel("stop blocked Postgres mutation")
         assert caller.cancelling() == 1
-        await cancellation_received.wait()
+        await _wait_for_fake_step(cancellation_received, caller)
         caller.cancel("repeat blocked Postgres mutation cancellation")
         assert caller.cancelling() == 2
+        await _wait_for_fake_settlement(caller)
         with pytest.raises(asyncio.CancelledError, match="stop blocked Postgres mutation"):
             await caller
 
         assert caller.cancelled()
         assert caller.cancelling() == 2
         assert connection.closed is True
+        assert connection.executed == ["SET TRANSACTION ISOLATION LEVEL READ COMMITTED"]
         assert connection.commit_count == 0
         assert connection.rollback_count == 1
         assert not any(
@@ -926,8 +999,9 @@ def test_postgres_cancelled_mutation_preserves_owner_and_abort_failures(
             async def __aexit__(self, exc_type, exc, traceback):
                 return False
 
-        class Connection:
+        class Connection(_FakeMutationConnection):
             def __init__(self) -> None:
+                super().__init__()
                 self.closed = False
                 self.pgconn = PgConnection(self)
 
@@ -975,9 +1049,10 @@ def test_postgres_cancelled_mutation_preserves_owner_and_abort_failures(
             await asyncio.Event().wait()
 
         caller = asyncio.create_task(Store()._run_verified_work_mutation(operation))
-        await operation_started.wait()
+        await _wait_for_fake_step(operation_started, caller)
         caller.cancel("cancel with compound settlement failures")
 
+        await _wait_for_fake_settlement(caller)
         with pytest.raises(asyncio.CancelledError) as captured:
             await caller
 
@@ -1019,8 +1094,9 @@ def test_public_boundary_preserves_redacted_postgres_cancellation_settlement_fai
             async def __aexit__(self, exc_type, exc, traceback):
                 return False
 
-        class Connection:
+        class Connection(_FakeMutationConnection):
             def __init__(self) -> None:
+                super().__init__()
                 self.closed = False
                 self.pgconn = PgConnection(self)
 
@@ -1096,9 +1172,10 @@ def test_public_boundary_preserves_redacted_postgres_cancellation_settlement_fai
             result_resolver=_resolver(),
         )
         caller = asyncio.create_task(app.create_work_contract(draft))
-        await operation_started.wait()
+        await _wait_for_fake_step(operation_started, caller)
         caller.cancel("cancel public Postgres mutation")
 
+        await _wait_for_fake_settlement(caller)
         with pytest.raises(asyncio.CancelledError) as captured:
             await caller
 
