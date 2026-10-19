@@ -1000,6 +1000,20 @@ async def _handle_with_heartbeat(
             settlement=settlement,
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
         )
+        # This worker owns the settlement it created. A write that outlives one
+        # observation window is slow, not failed: keep joining it for up to one
+        # task lease instead of ending the worker loop. Repeated store failures
+        # (as many as one attempt allows), or a write still running after the
+        # lease, transfer the retry handle to the caller through ``finish``.
+        if settlement.acknowledgement_in_flight:
+            logger.warning(
+                "Task group execution acknowledgement is slow; waiting for the "
+                "in-flight store write: task_id=%s",
+                app.redact_json(task.id),
+            )
+            wait_until = monotonic() + lease_seconds
+            while settlement.acknowledgement_in_flight and monotonic() < wait_until:
+                await settlement.attempt()
     except BaseException as exc:
         primary = exc
         raise

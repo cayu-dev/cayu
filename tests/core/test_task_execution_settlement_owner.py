@@ -987,8 +987,12 @@ async def test_ordinary_store_without_group_capability_never_needs_ack_owner(
     )
 
 
-@pytest.mark.parametrize("dispatch", [False, True])
-@pytest.mark.parametrize("cancel_owner", [False, True])
+@pytest.mark.parametrize(
+    ("dispatch", "cancel_owner"),
+    # An uncancelled task worker joins its own slow write instead of handing
+    # out the retry owner; see test_task_worker_joins_slow_acknowledgement.
+    [(False, True), (True, False), (True, True)],
+)
 async def test_timed_out_write_and_cancelled_retries_join_the_same_late_commit(
     store, monkeypatch, dispatch, cancel_owner
 ):
@@ -1097,3 +1101,111 @@ async def test_timed_out_write_and_cancelled_retries_join_the_same_late_commit(
         if retry is not None:
             await asyncio.gather(retry, return_exceptions=True)
         await asyncio.wait_for(completed.wait(), 3)
+
+
+@pytest.mark.parametrize("outcome", ["commit", "fail", "fail_then_slow"])
+async def test_task_worker_joins_slow_acknowledgement(store, monkeypatch, outcome):
+    import cayu.tasks._execution_settlement as ownership
+
+    monkeypatch.setattr(ownership, "_OBSERVATION_TIMEOUT_SECONDS", 0.05)
+    app = CayuApp(task_store=store, enable_logging=False)
+    await create_group(app, TaskCreate(task_id="member", type="member"))
+    await store.create_task(TaskCreate(task_id="next", type="member"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = store._settle_task_group_execution
+    calls = []
+    repaired = False
+
+    async def slow_write(self, task):
+        calls.append((task.id, task.worker_id, task.started_at))
+        if outcome == "fail_then_slow" and len(calls) == 1:
+            # A busy store can fail one call fast and then be slow on the next.
+            # The earlier failure must not hide the still-running call.
+            raise RuntimeError("database is locked")
+        entered.set()
+        await release.wait()
+        if outcome == "fail" and not repaired:
+            raise RuntimeError("acknowledgement unavailable")
+        await original(task)
+
+    monkeypatch.setattr(type(store), "_settle_task_group_execution", slow_write)
+    handled = []
+
+    async def handler(_app, task, _worker):
+        handled.append(task.id)
+
+    owner = asyncio.create_task(
+        run_task_worker(
+            app, store, handler, worker_id="owner", query=TaskQuery(type="member"), max_tasks=2
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        # Several observation windows pass with no reported store failure. The
+        # worker owns this settlement, so a slow write must not end its loop.
+        await asyncio.sleep(0.3)
+        assert not owner.done()
+        assert len(calls) == (2 if outcome == "fail_then_slow" else 1)
+        assert handled == ["member"]
+        release.set()
+        if outcome != "fail":
+            assert await asyncio.wait_for(owner, 3) == 2
+            assert handled == ["member", "next"]
+            assert calls[0][0] == "member"
+            await assert_settled(app, "member")
+        else:
+            # A concrete store failure still transfers the retry owner.
+            with pytest.raises(TaskExecutionSettlementPending) as raised:
+                await asyncio.wait_for(owner, 3)
+            assert raised.value.__cause__ is not None
+            assert handled == ["member"] and len(set(calls)) == 1 and len(calls) == 3
+            repaired = True
+            await retry_until_settled(raised.value.settlement)
+            assert len(set(calls)) == 1 and handled == ["member"]
+            await assert_settled(app, "member")
+    finally:
+        release.set()
+        repaired = True
+        if not owner.done():
+            owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+
+
+async def test_task_worker_stops_joining_after_repeated_slow_failures(store, monkeypatch):
+    import cayu.tasks._execution_settlement as ownership
+
+    monkeypatch.setattr(ownership, "_OBSERVATION_TIMEOUT_SECONDS", 0.05)
+    app = CayuApp(task_store=store, enable_logging=False)
+    await create_group(app, TaskCreate(task_id="member", type="member"))
+    original = store._settle_task_group_execution
+    calls = []
+    repaired = False
+
+    async def slow_failure(self, task):
+        # A busy SQLite store can block for its busy timeout and then fail.
+        calls.append((task.id, task.worker_id, task.started_at))
+        await asyncio.sleep(0.15)
+        if not repaired:
+            raise RuntimeError("database is locked")
+        await original(task)
+
+    monkeypatch.setattr(type(store), "_settle_task_group_execution", slow_failure)
+
+    async def handler(*args):
+        pass
+
+    # Every call fails, just after its observation window. The worker must
+    # surface that failure after one attempt's worth of calls, not keep
+    # reissuing the write for its whole (default 300 s) lease.
+    with pytest.raises(TaskExecutionSettlementPending) as raised:
+        await asyncio.wait_for(
+            run_task_worker(
+                app, store, handler, worker_id="owner", query=TaskQuery(type="member"), max_tasks=1
+            ),
+            5,
+        )
+    assert raised.value.__cause__ is not None
+    assert len(set(calls)) == 1 and len(calls) <= 4
+    repaired = True
+    await retry_until_settled(raised.value.settlement)
+    await assert_settled(app, "member")

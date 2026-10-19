@@ -19,6 +19,7 @@ from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 _OBSERVATION_TIMEOUT_SECONDS = 1.0
+_ATTEMPT_CALLS = 3
 
 
 class _WithheldSettlementRedactor(SecretRedactor):
@@ -63,6 +64,7 @@ class TaskExecutionSettlement:
         self.result: Any = None
         self._pending = False
         self._failure: BaseException | None = None
+        self._failed_calls = 0
         self._lock = asyncio.Lock()
         self._operation: asyncio.Task[TaskStoreOperationOutcome[None]] | None = None
         self._entry_claim: Task | None = None
@@ -217,7 +219,7 @@ class TaskExecutionSettlement:
             if not self._pending:
                 return
             assert self._authority is not None or self._entry_claim is not None
-            for _attempt in range(3):
+            for _attempt in range(_ATTEMPT_CALLS):
                 if self._operation is None:
                     self._operation = asyncio.create_task(
                         capture_task_store_operation(
@@ -243,8 +245,20 @@ class TaskExecutionSettlement:
                 if outcome.failure is None:
                     self._pending = False
                     return
+                self._failed_calls += 1
                 if not isinstance(outcome.failure, Exception):
                     raise_task_store_operation_failure(outcome.failure)
+
+    @property
+    def acknowledgement_in_flight(self) -> bool:
+        """The latest acknowledgement call is still running and may yet succeed.
+
+        Another ``attempt`` joins that same call. An earlier failed call does
+        not hide a running one, but once as many calls have failed as one
+        attempt allows, the acknowledgement counts as failed even while a later
+        call runs: an owner stops joining, and ``finish`` reports the failure.
+        """
+        return self._pending and self._operation is not None and self._failed_calls < _ATTEMPT_CALLS
 
     async def retry(self) -> Any:
         """Retry only exact acknowledgement, returning the retained outcome."""

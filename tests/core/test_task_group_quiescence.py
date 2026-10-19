@@ -4259,6 +4259,8 @@ async def test_terminal_task_does_not_release_a_handler_still_finalizing(
         assert await store.claim_task("finalizer", TaskQuery(type="finalize")) is None
         finish.set()
         observed_pending = False
+        # The worker joins a blocked write for one lease (3 s) before it hands
+        # the retry owner to its caller.
         async with asyncio.timeout(8):
             try:
                 await worker
