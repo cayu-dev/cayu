@@ -1020,13 +1020,17 @@ class EnvironmentLifecycle:
             for item in releases
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        if (
-            released
-            and self._allocation_coordinator.receipt_from_checkpoint(
-                checkpoint, environment_name=name
-            )
-            is None
-        ):
+        # Teardown after a failed or interrupted run finalizes the binding and
+        # disposes of its container before the session can be settled, for
+        # example when a lost model call keeps it fenced. That disposal records
+        # an exact retirement rather than a discard release; it equally proves
+        # the recorded allocation is gone and nothing remains to finalize.
+        disposed = self._retired_disposal_matches(
+            checkpoint, environment_name=name, allocation=record.get("allocation")
+        )
+        if (released or disposed) and self._allocation_coordinator.receipt_from_checkpoint(
+            checkpoint, environment_name=name
+        ) is None:
             reconnect, owner = _factory_reconnect_state_from_checkpoint(
                 checkpoint, environment_name=name
             )
@@ -1059,6 +1063,30 @@ class EnvironmentLifecycle:
             record_bytes=canonical_durable_json_bytes(record, "terminal binding record"),
             marker_bytes=canonical_durable_json_bytes(marker, "terminal binding marker"),
         )
+
+    def _retired_disposal_matches(
+        self,
+        checkpoint: dict[str, Any] | None,
+        *,
+        environment_name: str,
+        allocation: object,
+    ) -> bool:
+        """Whether a completed disposal retired exactly this binding's allocation."""
+        if type(allocation) is not str or checkpoint is None:
+            return False
+        retired = checkpoint.get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
+        if (
+            type(retired) is not dict
+            or type(retired.get("reconnect_metadata")) is not dict
+            or checkpoint.get(_PENDING_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
+            is not None
+            or self._allocation_coordinator.record_from_checkpoint(
+                checkpoint, environment_name=environment_name
+            )
+            is not None
+        ):
+            return False
+        return _reconnect_allocation_fingerprint(retired["reconnect_metadata"]) == allocation
 
     async def checkpoint_terminal_binding_finalization(
         self,
