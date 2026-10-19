@@ -265,3 +265,31 @@ def test_local_relative_path_lookup_uses_workload_root_not_controller_cwd(tmp_pa
         "controller-only": "unavailable",
         "local-python": "live_verified",
     }
+
+
+def test_local_admission_evidence_accepts_inodes_beyond_the_signed_range(tmp_path, monkeypatch):
+    """Amazon EFS hands out inode numbers above 2**63 - 1; admission must not fail on them."""
+
+    import os
+    from pathlib import Path
+
+    requirements = ExecutionRequirements(required_executables=(sys.executable,))
+    runner = LocalRunner(tmp_path)
+    small = runner.execution_admission_candidate_for(requirements)
+    real_stat = Path.stat
+
+    def large_inode(self, *args, **kwargs):
+        info = real_stat(self, *args, **kwargs)
+        if self != runner.root:
+            return info
+        fields = list(info)
+        fields[1] = 2**63 + 12345  # st_ino
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(Path, "stat", large_inode)
+    large = runner.execution_admission_candidate_for(requirements)
+
+    assert large.evidence.environment_fingerprint != small.evidence.environment_fingerprint
+    assert large.evidence.environment_fingerprint == (
+        runner.execution_admission_candidate_for(requirements).evidence.environment_fingerprint
+    )

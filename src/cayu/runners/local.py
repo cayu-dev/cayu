@@ -9,7 +9,11 @@ from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
-from cayu._validation import canonical_durable_json_bytes, require_durable_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
+    require_durable_nonblank,
+)
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._secrets import (
     merge_secret_env_values,
@@ -71,6 +75,18 @@ SAFE_LOCAL_ENV_KEYS = (
     "TEMP",
     "TMP",
 )
+
+
+def _durable_stat_number(value: int) -> int | str:
+    """A stat number as durable JSON accepts it.
+
+    Device and inode numbers are unsigned 64-bit; some filesystems (Amazon EFS, for
+    one) hand out inodes above the signed 64-bit range durable JSON allows. Those
+    are kept as decimal text, and every smaller number stays an integer, so existing
+    identities don't change.
+    """
+
+    return value if value <= MAX_DURABLE_JSON_INTEGER else str(value)
 
 
 class LocalRunner(Runner, RunnerBinaryStreamCapability):
@@ -191,8 +207,8 @@ class LocalRunner(Runner, RunnerBinaryStreamCapability):
                         # when composed with local executable observations.
                         "candidate_environment_fingerprint": candidate.evidence.environment_fingerprint,
                         "root": str(self.root),
-                        "device": root_stat.st_dev,
-                        "inode": root_stat.st_ino,
+                        "device": _durable_stat_number(root_stat.st_dev),
+                        "inode": _durable_stat_number(root_stat.st_ino),
                         "path": search_path,
                         "platform": os.name,
                         "pathext": os.environ.get("PATHEXT"),
