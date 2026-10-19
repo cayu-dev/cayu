@@ -1,207 +1,337 @@
 # Release notes
 
-## Unreleased
+## v0.12.0
 
-Upgrade: Stop all older writers and run `cayu storage migrate` before starting
-this build. Schema revision 124 preserves restartable task policy, provisional retention
-fences, and durable concurrency keys across every task claimant. All task stores must be migrated;
-older claimants do not understand key exclusion.
-
-- Abandon sessions whose unknown external tool outcome is held by a resolved
-  approval or an answered `ask_user` pause. `abandon_session` and the
-  abandoned-session sweep now end the round together with its gate, so the gate
-  cannot be resolved afterwards. A session still waiting on a decision or an
-  answer is not abandoned. The sweep also abandons the previous session of a
-  restarted task once that task is terminal; it used to skip it, keeping the
-  session's environment allocated.
-
-- Stream server-sent events and newline-delimited JSON responses through the
-  egress proxy as they arrive instead of buffering the whole body, so a long
-  streamed model call through virtual egress no longer hits the client's
-  300-second idle deadline. Policy checks, credential substitution, secret
-  scrubbing, the response byte limit and the buffer budget all still apply, per
-  chunk; a stream stopped part-way closes the connection without the terminal
-  chunk. Custom upstreams can stream through `EgressUpstreamLimits.response_stream`
-  ([streamed responses](virtual-egress.md#streamed-responses)).
-
-- Add optional task concurrency keys. Workers skip jobs whose key already has
-  a live lease, allowing unrelated work to run without occupying waiting slots.
-  Retry and continuation claims preserve the same exclusion.
-
-- Skip stale recovery observers when another recovery owner closes the active
-  interaction during execution profile inspection.
-
-- Expired task runs retain exact receipt recovery for already-started tools.
-  Recovery settles the recorded outcome without running sibling tools or another
-  model step, and the task remains failed.
-
-Upgrade: Admitted runs that expire their execution deadline now end normally with
-`session.interrupted`, `reason="limit_reached"`, and `limit="execution_deadline"`.
-Read the terminal event instead of catching the expiry exception. Pre-admission
-expiry still raises `ExecutionDeadlineExceeded`. Task-backed runs have no implicit
-step cap; set `max_steps=64` explicitly to retain that bound. Applications can use
-`send_turn` to create or continue a conversation and await one result. Services
-whose task workers can be stopped mid-handler can settle the stranded tasks with
-`reconcile_abandoned_task_cancellation`.
-
-- Stop agent snapshot materializations from being reused across authority
-  scopes. Two scopes that register the same snapshot content share a root, so a
-  request with another scope's candidate and trial ids used to receive that
-  scope's materialization and overlays. The materialization state scope now
-  includes the requesting authority scope on the in-memory, SQLite and
-  PostgreSQL stores, and materializations record it. No migration is needed.
-  Materializations recorded before this release still begin trials and recover,
-  but a new `materialize()` call starts a fresh scope instead of resuming one.
-
-- Skip stale recovery observers when another recovery owner closes the active
-  interaction during execution profile inspection.
-- Keep budget reservations durable by default. `open_application_stores` now
-  also builds a budget ledger in the same database: a `SQLiteBudgetLedger` in
-  the SQLite file, or a `PostgresBudgetLedger` on the shared pool, exposed as
-  `ApplicationStores.budget_ledger`. A `CayuApp` built on those stores' session
-  store without its own `budget_ledger` uses it instead of the in-memory ledger,
-  so `create_server`, `mount_cayu`, `cayu serve` and a fork controller enrolled
-  from `CAYU_FORK_CONTROLLER_*` get durable reservations with no app code. An
-  app-supplied `budget_ledger` still wins; `budget_ledger=False` builds none.
-
-- Cancel a restartable task on worker shutdown when it is running as the
-  continuation of an interrupted session. Shutdown previously tried to requeue
-  it, was refused, and left it running under the stopped worker until its lease
-  expired.
-
-- Add opt-in restartable queue jobs. On worker shutdown, cancellation cleanup
-  finishes under the renewed lease before the same task returns to pending.
-  Operator cancellation and lost ownership never become automatic retries.
-  Custom workers can use `requeue_restartable_task` after proving quiescence.
-
-Upgrade: Install `cayu[claude-agent-sdk]` or `cayu[codex]` only when running a
-vendor harness. Configure a private model gateway and a whole-process sandbox;
-service credentials stay outside the guest. Existing native agents are unchanged.
-
-- Add optional external-agent adapters that record vendor runs as Cayu sessions
-  and tasks, with usage, after-step budgets, deadlines, native approval/MCP
-  bridges and joined process cleanup. See [external agents](external-agents.md).
-
-- Make `max_steps=None` an explicit unlimited allowance and omit implicit step
-  caps for task-backed SDK runs. HTTP runs and product services retain the
-  configured application step cap (64 by default). Add `RunLimits(on_limit="finish")` to reserve one
-  structured-answer step near a time, cost, token, tool-call, or step limit;
-  ordinary tools are withdrawn and existing deadlines and budgets remain in force.
-  Limit interruptions report whether structured output is still pending. See
-  [Run limits and finishing](runtime-contracts.md#run-limits-and-finishing).
-- Normalize admitted execution-deadline expiry to the same terminal limit event.
-  Cleanup still joins before the iterator ends; lower-level deadline utilities
-  raise `ExecutionDeadlineExceeded`, and unrelated timeout errors keep their identity.
-  A deadline a tool opens for its own work still fails only that tool call.
-- Add `send_turn` and `TurnRequest` for applications that create or continue a
-  conversation and await one result. Creation races and session replacement
-  retain native admission checks. `RunOutcome` now reports invocation usage,
-  model identity, public tool-call summaries and interruption information, with
-  bounded presentation exports and a shared collector for recovery streams.
-  Streaming APIs remain available. See the
-  [terminal-turn contract](runtime-contracts.md#terminal-turn-convenience).
-- Record which Release each run came from. A host states the Release a process
-  runs with `CAYU_RELEASE_ID` and optionally `CAYU_RELEASE_SNAPSHOT_ROOT`, or with
-  `CayuApp(release_identity=...)`; when both are set they must agree, and
-  without either the process records none. The process records it as `release`
-  on `session.started`, `session.resumed` and every `model.started`, so a
-  session resumed or recovered after a rollout reports the Release of each part
-  of its work. An invocation that fails while its environment is created, bound
-  or reconnected, before its start event, records no Release of its own, so its
-  failure is attributed to the Release in force before it. Supervision events
-  report `release_id` and `release_snapshot_root` for the invocation a touch
-  belongs to, and `SupervisionEventQuery.release_id` filters by Release on every
-  built-in store, through the SDK and over HTTP. Cayu never acts on the Release.
-  `cayu serve` labels Evals results with the same Release id, and an invalid
-  `CAYU_RELEASE_ID` now fails application construction. See
-  [release identity](runtime-contracts.md#release-identity).
-- Add `PostgresAgentSnapshotStore`, so hosts that require PostgreSQL
-  (`CAYU_REQUIRE_POSTGRES=1`) can capture, pin, read and collect agent
-  snapshots. It keeps the SQLite store's records and checks in the shared
-  database. Additive storage revision 120 adds its tables; run
-  `cayu storage migrate` before using it. `open_agent_snapshot_store` picks the
-  SQLite or PostgreSQL store from `CAYU_DATABASE_URL`, and
-  `open_application_stores(..., agent_snapshots=True)` adds one on the shared
-  pool. Provider objects stay in the `AgentSnapshotObjectStore` composed with
-  it. Storage retention on PostgreSQL now also keeps sessions, eval runs and
-  artifacts that pinned PostgreSQL snapshots name.
-
-- Add `reconcile_abandoned_task_cancellation` for an ordinary task whose worker
-  process died while its cancellation was draining. Such a task stayed `claimed`
-  with a pending cancellation that no worker reclaims; the helper builds the exact
-  quiescent owner-lost reconciliation from the application's validator and evidence
-  identity. The `run_task_worker` documentation now says that reclamation returns
-  only unstarted tasks to `pending`, and that cancelling the worker waits for the
-  running handler instead of interrupting it. See
-  [When a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
-
-- Enroll a fork controller from the environment. When
-  `CAYU_FORK_CONTROLLER_NAME` is set, `create_server` and `mount_cayu` enroll
-  that controller for `CAYU_FORK_CONTROLLER_AGENTS`, authenticate it with the
-  token digests in `CAYU_FORK_CONTROLLER_TOKEN_SHA256`, and serve its routes at
-  `<api path>/fork-controller`, so an app needs no controller code. Malformed
-  configuration stops the server from starting. See
-  [enrolling from the environment](fork-overlays.md#enrolling-from-the-environment).
-- Cap what a fork controller's forks spend. `ForkController(allow_model_runs=True)`
-  now requires `fork_budget_limit`, a session-scoped `BudgetLimit` with a
-  reservation, which the budget ledger enforces before every model step,
-  compaction and auxiliary call of every session in the controller's fork
-  lineage, whoever starts the run. Each such request is held inside the
-  reservation: output is capped through the adapter's
-  `ModelProvider.output_token_option_path()`, and input larger than the
-  reservation is refused before dispatch. With a durable session store, the app needs
-  a durable budget ledger. From the environment, set
-  `CAYU_FORK_CONTROLLER_FORK_BUDGET_USD` and the two
-  `CAYU_FORK_CONTROLLER_FORK_RESERVATION_*_TOKENS` variables. See
-  [running forks](fork-overlays.md#running-forks).
-- Optionally cap what all of a fork controller's forks spend together with
-  `ForkController(total_budget_limit=...)`. Every session in the controller's
-  fork lineage reserves against one ledger entry for the total, so concurrent
-  forks cannot overshoot it, and the check before each step counts the whole
-  lineage's spend. `SessionStore.read_cost_accounting` takes
-  `fork_lineage_owner` for that reading on every built-in store. From the
-  environment, set `CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD`. See
-  [a total across the controller's forks](fork-overlays.md#a-total-across-the-controllers-forks).
-
-- `CayuApp.abandon_session(session_id)` ends a session that stopped on an
-  unknown external tool outcome and that the application will never continue,
-  and releases its environment. Before, such a session stayed `interrupted`
-  with `pending_tool_effect`, and its bound allocation (for example a Docker
-  coding container) stayed alive until someone resumed the conversation. The
-  call keeps each unknown effect as `outcome_unknown`, never dispatches it
-  again, moves the session to `failed` with a `session.failed` event whose
-  `error_type` is `SessionAbandoned`, and finalizes the environment binding
-  through the factory with the usual lifecycle evidence. No model call is made.
-  It refuses while any task of the session is not terminal. Abandonment is
-  permanent: the session can no longer be resumed, while a fork of it can.
-  Generic checkpoint writes preserve its immutable abandonment record. Before
-  failing the session, Runtime atomically freezes its complete terminal task set;
-  later task creation and attachment are refused. A custom task store must support
-  session closure claims and opt into `supports_session_retention_epochs` with
-  monotonic epoch reads and advances for abandonment. Closure-only custom stores
-  keep their ordinary run and deletion behavior. A retention-store failure after
-  admission joins interruption and invocation release before propagating; failed
-  resumes can be retried after the store recovers.
-  If session failure does not commit, cleanup or the next admitted recovery
-  releases the provisional task fence; delayed writes from its old owner are
-  refused. A committed abandonment retains its fence, including after a lost
-  acknowledgement. Reusing a deleted session ID starts fresh retention authority
-  while permanently rejecting the previous incarnation. Incarnation replacement
-  compares the task-store predecessor observed before the session snapshot, so a
-  delayed first write cannot displace a newer session. Database stores require
-  schema revision 124.
-  `recover_abandoned_sessions(abandon_sessions_of_terminal_tasks=True)` does
-  the same during the sweep for sessions whose tasks are all terminal, and
-  revisits sessions left interrupted or half cleaned up by an earlier sweep.
+Upgrade: stop every 0.11.x process that writes to or claims from the store,
+back the store up, and run `cayu storage migrate --acknowledge-breaking 121
+--acknowledge-breaking 122 --acknowledge-breaking 123 --acknowledge-breaking 124`
+before starting 0.12.0. Then check the breaking changes below if you catch
+`ExecutionDeadlineExceeded`, rely on the default step cap for task-backed runs,
+run the Lambda MicroVM sidecar, or use `cayu cloud deploy --no-promote`. Storage
+revision 124 (was 118), compatibility floor 124 (was 115), server contract 49
+(unchanged), manifest schema 17 (unchanged). Existing sessions continue without
+an `ExecutionProfilePolicy`; the runtime-only profile change is adopted on resume
+as before.
 
 ### Breaking changes
 
-- Storage schema revision 124 requires all writers to understand restartable
-  task policy and concurrency keys. Migrate with older processes stopped.
-- Task-backed runs no longer inherit the framework's 64-step cap. Explicit
-  request and application caps remain effective; `None` means unlimited.
-- Deadline expiry after run admission ends the iterator normally with a limit
-  interruption. Pre-admission expiry and deadline scopes still raise.
+- Storage revisions 121, 122, 123 and 124 are breaking writer boundaries. They
+  add restartable-task policy, retired-session fences, durable retention epochs
+  for session abandonment, and task concurrency keys, and every task claimant
+  must understand them. Migrate session and task stores with all 0.11.x
+  processes stopped; 0.11.x writers must not run against an upgraded store, and
+  rolling back needs a database restore. Revisions 119 (tool authorization
+  grants) and 120 (PostgreSQL agent snapshots) are additive.
+- An admitted run whose execution deadline expires now ends normally with
+  `session.interrupted` (`reason="limit_reached"`, `limit="execution_deadline"`)
+  after its cleanup joins, instead of raising `ExecutionDeadlineExceeded` from the
+  iterator. Read the terminal event instead of catching the exception.
+  Pre-admission expiry and lower-level deadline scopes still raise, and a
+  deadline a tool opens for its own work still fails only that tool call.
+- Task-backed SDK runs no longer get the implicit 64-step cap. Explicit request
+  and application caps still apply, HTTP runs and product services keep the
+  application cap (64 by default), and sessions keep the cap they recorded. Set
+  `max_steps=64` on task-backed requests to keep the old bound.
+- Security fix: the Lambda MicroVM sidecar applies an agent command's
+  environment only after the network-namespace entry and privilege drop. Before,
+  the root-owned launchers inherited variables such as `LD_PRELOAD`, so anyone
+  who could set an agent command's environment could run code as root in the
+  guest. Agent commands whose program or environment variable names contain `=`
+  are now refused. Rebuild sidecar images from this release's manifest.
+- `cayu cloud deploy --no-promote` now stages a candidate release that Cayu Cloud
+  builds and smoke-tests but publishes only on `cayu cloud deployment promote`,
+  and it requires `--evaluated-against DEPLOYMENT_ID|none`. Before, Cloud
+  published the release anyway. Against a Cloud without candidate releases it
+  exits `2` with `candidate_unsupported` and deploys nothing.
+- Some limits are now checked where a value is admitted instead of failing
+  later in the run. `ArtifactExternalizingToolResultPolicy` rejects
+  `max_inline_bytes` above the 64 KiB projection ceiling; egress policies reject
+  operation, destination and denied-prefix lists over their limits when built;
+  strict hosted Tool Search raises a size error before the session exists; and a
+  run whose request budget limits plus a copy of every reserving policy limit
+  exceed 1.5 MiB is rejected when its execution profile is resolved, even on a
+  provider that would not have copied them.
+- Fork controllers are new in this release; this only affects code written
+  against development builds. `ForkController(allow_model_runs=True)` now
+  requires `fork_budget_limit`, a hard session-scoped `BudgetLimit` with a
+  `reservation`, and with a durable session store the app needs a durable budget
+  ledger. Provider-hosted tools cannot be named in `host_tools`, and a capped
+  fork needs a provider that declares `ModelProvider.output_token_option_path()`.
+  Environment enrollment with `CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS=true` also
+  needs `CAYU_FORK_CONTROLLER_FORK_BUDGET_USD`,
+  `CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS` and
+  `CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS`.
+
+### Changes
+
+#### Approvals and supervision
+
+- Approve a tool call with changed arguments. `ToolApprovalRequest.arguments`
+  (`arguments` on `POST /api/tool-approvals/resolve`) carries replacement
+  arguments, at most 64 KiB, for an approve decision. They are checked against
+  the tool's schema and re-authorized on the run's own context before the
+  decision is accepted; an edit the policy would not allow under the same gate
+  is refused with `ToolApprovalArgumentsRefused` and the approval stays pending.
+  The approved arguments are stored before dispatch, so they run exactly once
+  across restarts and lost acknowledgements. `tool.call.approved` records
+  `arguments_revision`, the terminal publishes `approved_arguments`, and every
+  result of that call tells the model a person changed it, including results
+  recovered from a receipt. See
+  [tool policy](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/runtime-contracts.md#toolpolicy).
+- Add reusable tool authorization grants. `ToolAuthorizationGrantPolicy` wraps
+  any `ToolPolicy` and turns `require_approval` into `allow` only for a call that
+  matches an active grant bound to the same agent, environment, workspace and
+  principal; workspace grants need a workspace the application named. It never overrides a denial, never grants mandatory
+  controls, supports sampled review, and records every use before allowing.
+  `ToolAuthorizationGrantService` creates grants from pending approvals and
+  activates them only after the runtime durably approves the call. In-memory,
+  SQLite and PostgreSQL stores are included (storage revision 119), and
+  `create_server(..., tool_authorization_grants=...)` mounts opt-in routes under
+  `/api/tool-authorization-grants`. See
+  [tool authorization grants](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/tool-authorization-grants.md).
+- Query supervision events across sessions with
+  `SessionStore.query_supervision_events(SupervisionEventQuery)`,
+  `CayuApp.query_supervision_events`, scoped access and
+  `POST /api/supervision-events/query`. Each record is one settled human touch
+  (`approve`, `edit`, `deny`, `expire`, `answer`, `recover`, `interrupt`,
+  `steer`) in durable order, filtered by time window, session filters, kinds,
+  actor sources, execution profile fingerprint and Release. Records name the
+  human-attention request they settled, the authorization grant they created or
+  sampled, and the joined model-step usage; `price_supervision_events` prices
+  them. Applications can declare an edit they made outside Cayu with
+  `approval_revision_metadata`. Background subagent interrupts that cascade
+  from a parent interrupt carry `interruption_origin="background_cascade"`, so an
+  operator interrupt counts once. Memory, SQLite and PostgreSQL stores support
+  the query with no migration.
+- `GET /api/human-attention/{attention_id}` reports the settled state of a
+  human-attention request (`active`, `resolved`, `cancelled`, `superseded`,
+  `expired`, `unavailable`) without request content, scoped to the caller's
+  verified tenant.
+- Record which Release each run came from. A host states the Release a process
+  runs with `CAYU_RELEASE_ID` and optionally `CAYU_RELEASE_SNAPSHOT_ROOT`, or with
+  `CayuApp(release_identity=...)`; when both are set they must agree. The process
+  records it as `release` on `session.started`, `session.resumed` and every
+  `model.started`, so a session resumed after a rollout reports the Release of
+  each part of its work. Supervision events report `release_id` and
+  `release_snapshot_root`, and `SupervisionEventQuery.release_id` filters by
+  Release. Cayu never acts on the Release. `cayu serve` labels Evals results with
+  the same id, and an invalid `CAYU_RELEASE_ID` fails application construction.
+  See [release identity](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/runtime-contracts.md#release-identity).
+
+#### Fork controllers
+
+- Let an enrolled outside controller, such as a supervisor, fork a host session
+  with its own instructions, memory and MCP-served tools through a fork overlay,
+  without shipping controller code to the host or changing the source session.
+  Hosts enroll it with `ForkController` and `CayuApp.enroll_fork_controller`;
+  `CayuApp.fork_controller_access(subject)` is the only entrance that attaches an
+  overlay, and `create_fork_controller_router` serves it over HTTP. Controller
+  forks hold only the host tools named in `ForkController.host_tools` (none by
+  default), and `ForkControllerBearerAuth` authenticates controllers from token
+  digests. See [fork overlays](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/fork-overlays.md).
+- Controllers can read the sessions, events and supervision events of the agents
+  they are enrolled for and of their own forks, through
+  `/fork-controller/sessions`, `/fork-controller/events/query` and
+  `/fork-controller/supervision-events/query`. Reads carry stable correlation
+  ids keyed from the host's alias keyring, so a reader can pair each start with
+  its terminal without seeing private ids. Sessions written before this release
+  are placed in their lineage at read time; no migration is needed.
+- Enroll a controller from the environment. When `CAYU_FORK_CONTROLLER_NAME` is
+  set, `create_server`, `mount_cayu` and `cayu serve` enroll that controller for
+  `CAYU_FORK_CONTROLLER_AGENTS`, authenticate it with the digests in
+  `CAYU_FORK_CONTROLLER_TOKEN_SHA256`, and serve its routes at
+  `<api path>/fork-controller`. Malformed configuration stops the server from
+  starting. See [enrolling from the environment](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/fork-overlays.md#enrolling-from-the-environment).
+- Controllers run their forks' models only when enrolled with
+  `allow_model_runs=True`, and every fork is held to the controller's
+  `fork_budget_limit` before each model step, compaction and auxiliary call,
+  whoever starts the run. Output is capped through the adapter's output-token
+  option and oversized input is refused before dispatch. See
+  [running forks](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/fork-overlays.md#running-forks).
+- Optionally cap what all of a controller's forks spend together with
+  `ForkController(total_budget_limit=...)`, a hard `BudgetLimit` of the same
+  shape as the per-fork cap. Every session in the controller's fork lineage
+  reserves against one ledger entry for the total, so concurrent forks cannot
+  overshoot it, and the check before each step counts the whole lineage's
+  spend. Set the total before the forks run models: if a session in the lineage
+  has a model attempt that did not reserve against it, the controller's forks
+  fail with `ForkControllerDenied`. `SessionStore.read_cost_accounting` takes
+  `fork_lineage_owner` for the same reading on every built-in store. From the
+  environment, set `CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD`. See
+  [a total across the controller's forks](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/fork-overlays.md#a-total-across-the-controllers-forks).
+- MCP tool adapters with an explicit `connection_id` now have a portable
+  execution-profile identity, so MCP-backed sessions can resume in a new process
+  without adoption. Sessions started before this release keep their
+  process-local baseline.
+
+#### Tasks, workers and sessions
+
+- Add `send_turn` and `TurnRequest` for applications that create or continue a
+  conversation and await one result. Creation races and session replacement keep
+  native admission checks, and `ResumeRequest.expected_run_epoch` makes a resume
+  conditional, raising `SessionRunFenced` when another process continued the
+  session first. `RunOutcome` now reports invocation usage, model identity,
+  public tool-call summaries and interruption information, and public tool
+  lifecycle events carry a correlation handle that groups one call's start and
+  terminal. See the
+  [terminal-turn contract](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/runtime-contracts.md#terminal-turn-convenience).
+- `max_steps=None` is an explicit unlimited allowance. `RunLimits(on_limit="finish")`
+  reserves one structured-answer step near a time, cost, token, tool-call or step
+  limit; ordinary tools are withdrawn for that step and existing deadlines and
+  budgets stay in force. Limit interruptions report whether structured output is
+  still pending. See
+  [run limits and finishing](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/runtime-contracts.md#run-limits-and-finishing).
+- Expired task runs keep exact receipt and manual user-input recovery for tools
+  that already started. Recovery settles the recorded outcome without running
+  sibling tools or another model step, and the task stays failed.
+- `run_task_worker(..., concurrency=N)` handles several durable tasks at once,
+  each slot with its own lease renewal and cancellation settlement.
+- Add optional task concurrency keys. Workers skip jobs whose key already has a
+  live lease, so unrelated work runs without occupying waiting slots; retry and
+  continuation claims keep the same exclusion.
+- Add opt-in restartable queue jobs (`TaskCreate.restartable`). On worker
+  shutdown, cancellation cleanup finishes under the renewed lease before the task
+  returns to pending; a restartable task running as the continuation of an
+  interrupted session is cancelled instead. Operator cancellation and lost
+  ownership never become automatic retries. Custom workers can use
+  `requeue_restartable_task` after proving quiescence.
+- `reconcile_abandoned_task_cancellation` settles an ordinary task whose worker
+  died while its cancellation was draining. See
+  [when a worker dies mid-task](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/triggering-runs.md#when-a-worker-dies-mid-task).
+- `CayuApp.abandon_session(session_id)` ends a session that stopped on an unknown
+  external tool outcome and that the application will never continue, and
+  releases its environment. Unknown effects stay `outcome_unknown` and are never
+  dispatched again; the session moves to `failed` with `error_type`
+  `SessionAbandoned`, and it refuses while any of the session's tasks is not
+  terminal. Abandonment freezes the session's task set, so later task creation
+  and attachment are refused. `recover_abandoned_sessions(abandon_sessions_of_terminal_tasks=True)`
+  does the same during the sweep. A custom task store must support session
+  closure claims and opt into `supports_session_retention_epochs` to abandon.
+  Abandonment also ends a round whose unknown outcome is held by a resolved
+  approval or an answered `ask_user` pause, together with its gate, so the gate
+  cannot be resolved afterwards, and the sweep reaches the previous session of a
+  restarted task once that task is terminal. A session still waiting on a
+  decision or an answer is never abandoned, and neither is a parent while its
+  foreground child still awaits a human decision.
+- Task-backed product services take `execution_timeout_s`, and services
+  generated by `cayu new` set ten minutes. Expiry fails the task and product
+  operation after cancellation cleanup and keeps recovery evidence on the
+  session; the dashboard labels the outcome timed out. The framework default
+  stays unlimited.
+- Restart recovery logs one info-level side-effect summary per session and
+  sweep, with acknowledged, pending, skipped and timed-out claim counts.
+- A recovery observer that loses a race with another recovery owner now skips
+  the session instead of failing on the interaction the other owner closed.
+  Only one allocation cleanup runs.
+
+#### Budgets
+
+- `BudgetLimit.usd(5)` is a one-line session spend cap priced by the bundled
+  price book, and `PriceBook.with_prices(...)` overrides individual prices. See
+  `cayu guide references#cost-control`.
+- `open_application_stores` also builds a durable budget ledger in the same
+  database (`ApplicationStores.budget_ledger`), and a `CayuApp` on those stores
+  uses it unless it supplies its own, so `create_server`, `mount_cayu`,
+  `cayu serve` and environment-enrolled fork controllers get durable
+  reservations with no app code. `budget_ledger=False` builds none.
+
+#### Environments, sandboxes and egress
+
+- Add `SandboxCodingEnvironmentFactory` (`cayu.egress`), a provider-neutral
+  coding environment that gives each session its own cloud sandbox, copies a
+  `LocalWorkspace` in before the first tool call and copies changes back with
+  revision checks. AWS Lambda MicroVM is the first adapter; another cloud plugs
+  in through its own `SandboxEgressAdapter`. See
+  [coding in a cloud sandbox](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/environment-factories.md#coding-in-a-cloud-sandbox).
+- Add `OpenInternetEgressPolicy`, an explicit credentialless mode for isolated
+  sandboxes that admits any public HTTPS host on port 443 through the egress
+  proxy, so package installs and git fetches work without a host list. Private,
+  loopback, link-local and metadata addresses, IP literals, other ports and plain
+  HTTP are refused, and every request is audited. See
+  [open internet egress](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/virtual-egress.md#credentialless-open-internet-for-isolated-sandboxes).
+- Stream server-sent events and newline-delimited JSON through the egress proxy
+  as they arrive instead of buffering the whole body, so long streamed model
+  calls through virtual egress no longer hit the client's idle deadline. Policy
+  checks, credential substitution, secret scrubbing and size limits still apply
+  per chunk. See
+  [streamed responses](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/virtual-egress.md#streamed-responses).
+- Add `LocalWorkspaceEnvironmentFactory` for prepared per-request directories,
+  with allowed-root checks and runner admission forwarding. See
+  [per-request local workspaces](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/environment-factories.md#per-request-local-workspaces).
+- Execution-admission errors name each tool and requirement, list alternatives
+  and tell missing evidence from malformed evidence.
+- Runner, E2B and Microsandbox workspaces default to the 4 MiB tool read limit
+  instead of 256 KiB.
+
+#### External agents
+
+- Add optional external-agent adapters that record Claude Agent SDK and Codex
+  runs as Cayu sessions and tasks, with usage, after-step budgets, deadlines,
+  native approval and MCP bridges, and joined process cleanup. Install
+  `cayu[claude-agent-sdk]` or `cayu[codex]` only when running a vendor harness,
+  with a private model gateway and a whole-process sandbox. See
+  [external agents](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/external-agents.md).
+
+#### Storage and snapshots
+
+- Add `PostgresAgentSnapshotStore`, so hosts that require PostgreSQL can
+  capture, pin, read and collect agent snapshots (storage revision 120).
+  `open_agent_snapshot_store` picks the SQLite or PostgreSQL store from
+  `CAYU_DATABASE_URL`, and `open_application_stores(..., agent_snapshots=True)`
+  adds one on the shared pool. Storage retention on PostgreSQL also keeps
+  sessions, eval runs and artifacts that pinned PostgreSQL snapshots name.
+- Agent snapshot materializations are no longer shared across authority scopes.
+  Two scopes that registered the same snapshot content used to receive each
+  other's materialization and overlays. The materialization scope now includes
+  the requesting authority scope on every store, with no migration.
+- Accept session ids up to 2,048 bytes everywhere they are admitted, and stop
+  retention from ignoring references longer than 512 characters, which could
+  delete data a long session id referenced.
+- Bound tool-result content at the 64 KiB publication ceiling after every
+  terminal-result policy, keeping redaction markers whole and the artifact
+  readback instruction of externalized results.
+- Recovery plans page every active task status instead of reading one page of
+  1,000 tasks, so an active task behind newer finished ones is no longer offered
+  for repair.
+
+#### Projects, tooling and documentation
+
+- `cayu new NAME --preset long-running` scaffolds approvals, external waits,
+  reminder and deadline timers, a spend cap and restart tests, with a one-page
+  `cayu guide long-running`.
+- `cayu.testing.RestartHarness` runs a request until it pauses, restarts the app
+  on the same durable stores and continues it, for restart tests. See
+  `cayu guide restart-tests`.
+- `ExecutionProfileMismatchError` explains what changed in each component class
+  and what to run next, and `cayu execution-profile compare SESSION_ID` shows the
+  stored and current identities side by side. See
+  `cayu guide diagnostics#execution-profile-mismatch`.
+- A project can declare its objectives and improvement evals in
+  `[tool.cayu.improvement]` and a versioned objectives file, validated with
+  `cayu objectives validate`.
+- `VerifiedTaskWorker` takes `verifier_timeout_seconds` and
+  `verifier_lease_seconds`.
+- Adopt the [stability policy](https://github.com/cayu-dev/cayu/blob/v0.12.0/docs/stability.md),
+  which sets what may change in patch and minor releases and requires the
+  upgrade summary and breaking-changes heading in every release section.
+- Fill in the PyPI summary, classifiers, keywords and documentation link, and
+  open the README, `cayu guide` and generated `AGENTS.md` with what Cayu is.
+- Cut per-step runtime CPU by avoiding repeated durable-JSON walks and
+  fingerprint computation.
+
+### Upgrade
+
+- `cayu storage migrate` keeps a SQLite backup by default. On PostgreSQL, take
+  an application-consistent backup first and pass `--backup-sha256` or
+  `--backup-managed`. Cloud-hosted Agents pass the same four
+  `--acknowledge-breaking` revisions to `cayu cloud deploy`.
+- Materializations recorded before this release still begin trials and recover,
+  but a new `materialize()` call for the same content starts a fresh scope
+  instead of resuming the old one.
+- Rebuild Lambda MicroVM sidecar images from this release's manifest.
+- Task-backed jobs that relied on the 64-step default should set `max_steps`
+  explicitly, and code that caught `ExecutionDeadlineExceeded` around an
+  admitted run should read the terminal `session.interrupted` event instead.
 
 ## v0.11.4
 

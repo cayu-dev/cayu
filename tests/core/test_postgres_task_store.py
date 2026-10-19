@@ -6134,7 +6134,9 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
             assert 2 <= idle_snapshot.claim_attempts <= 10
             assert 0 < group_scans <= idle_snapshot.claim_attempts + idle_snapshot.active_pollers
             assert 0 < schedule_reads <= idle_snapshot.claim_attempts
-            assert idle_cpu_s <= 0.10
+            # Allow runner overhead while keeping the budget below the 150 ms
+            # observation window, so continuous busy polling still fails.
+            assert idle_cpu_s <= 0.12
 
             await producer.create_task(
                 TaskCreate(

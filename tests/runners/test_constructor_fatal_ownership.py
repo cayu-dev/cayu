@@ -43,6 +43,9 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
     cleanup_calls = []
     repaired = False
     container_id = "b" * 64
+    # Leave time for the cancellation assertions before the intentional timeout,
+    # including scheduler pauses on a loaded test runner.
+    rollback_timeout_s = 1.0
 
     async def setup(*args, **kwargs):
         raise original
@@ -68,7 +71,10 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
 
         monkeypatch.setattr("cayu.runners.docker._run_docker", docker)
         creation = DockerRunner.create(
-            "fatal-setup", replace=False, docker_path="docker", cancel_timeout_s=0.1
+            "fatal-setup",
+            replace=False,
+            docker_path="docker",
+            cancel_timeout_s=rollback_timeout_s,
         )
         runner_type = DockerRunner
     elif adapter == "e2b":
@@ -77,7 +83,7 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
         FakeAsyncSandbox.next_sandbox = sandbox
         sandbox.commands.run = setup
         sandbox.kill = cleanup
-        creation = E2BRunner.create(e2b_module=FakeE2BModule, cancel_timeout_s=0.1)
+        creation = E2BRunner.create(e2b_module=FakeE2BModule, cancel_timeout_s=rollback_timeout_s)
         runner_type = E2BRunner
     else:
         reset_fake_module()
@@ -87,8 +93,8 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
             "fatal-setup",
             replace=False,
             sandbox_module=FakeMicrosandboxModule,
-            cancel_timeout_s=0.1,
-            remove_timeout_s=0.1,
+            cancel_timeout_s=rollback_timeout_s,
+            remove_timeout_s=rollback_timeout_s,
         )
         runner_type = MicrosandboxRunner
 

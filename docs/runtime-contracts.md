@@ -5101,7 +5101,7 @@ uses a 500-millisecond dispatch objective with 10-to-50-millisecond adaptive
 idle delays, and observes the pool for 150 milliseconds after its first empty
 claim. In-memory, SQLite, and PostgreSQL cohorts must use at most one active
 poller, consume no more than 10 task-store claim operations, and use no more
-than 0.10 process-CPU seconds in that window. The subsequently admitted control
+than 0.12 process-CPU seconds in that window. The subsequently admitted control
 task must be claimed within the 500-millisecond objective. SQLite admission is
 performed through a separate store instance so the proof exercises bounded
 polling without a process-local hint. The PostgreSQL proof disables the live

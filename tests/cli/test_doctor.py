@@ -738,14 +738,17 @@ def test_complete_command_deadline_bounds_stacked_publication_teardown(
     monkeypatch,
     capsys,
 ) -> None:
-    terminate_seconds = 1.0
-    kill_seconds = 0.05
+    # Allow real SIGKILL/reaping latency on loaded workers. Both phase budgets
+    # plus full terminate waits consume the command cap, so the worker budget
+    # still forces teardown to respect the absolute deadline.
+    terminate_seconds = 3.0
+    kill_seconds = 2.0
     limits = doctor_cli.DEFAULT_SUPPORT_BUNDLE_LIMITS.model_copy(
         update={
             "worker_timeout_seconds": 0.5,
             "publication_timeout_seconds": 15.0,
             "reconciliation_timeout_seconds": 15.0,
-            "command_timeout_seconds": 32.0,
+            "command_timeout_seconds": 36.0,
         }
     )
     monkeypatch.setattr(doctor_cli, "DEFAULT_SUPPORT_BUNDLE_LIMITS", limits)

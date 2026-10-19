@@ -188,7 +188,7 @@ wheels = [
 
 [[package]]
 name = "cayu"
-version = "0.11.4"
+version = "0.12.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },

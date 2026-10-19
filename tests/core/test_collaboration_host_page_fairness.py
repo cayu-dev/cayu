@@ -40,7 +40,8 @@ async def test_pending_delivery_head_does_not_starve_settlement(
         key = peer.append_key.model_copy(update={"occurrence_id": occurrence.occurrence_id})
         sibling_peer = peer.model_copy(
             update={
-                "operation_key": "sibling-peer",
+                # PostgreSQL retains receipts across cases in this module.
+                "operation_key": f"sibling-{peer.operation_key}",
                 "occurrence": occurrence,
                 "append_key": key,
                 "attempt_key": peer.attempt_key.model_copy(update={"append_key": key}),
