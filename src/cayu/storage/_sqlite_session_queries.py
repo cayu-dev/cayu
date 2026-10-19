@@ -576,11 +576,14 @@ async def read_cost_accounting(
     max_detail_bytes: int | None = None,
     previous: CostAccountingSnapshot | None = None,
     cost_authority: CostAccountingAuthority,
+    fork_lineage_owner: str | None = None,
+    without_reservation_for: str | None = None,
 ) -> CostAccountingSnapshot:
     from cayu.runtime._cost_accounting import (
         COST_ACCOUNTING_PAGE_SIZE,
         cost_accounting_query,
         cost_pending_events,
+        require_no_pending_for_reservation_filter,
     )
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
     from cayu.storage._cost_accounting_sql import (
@@ -592,7 +595,18 @@ async def read_cost_accounting(
 
     query = cost_accounting_query(query)
     pending = cost_pending_events(query, additional_events)
-    plan = session_store_sql.build_accounting_event_query_sql(query, dialect=SQL_DIALECT)
+    filters, lineage = session_store_sql.cost_read_filter_clauses(
+        fork_lineage_owner=fork_lineage_owner,
+        without_reservation_for=without_reservation_for,
+        dialect=SQL_DIALECT,
+    )
+    require_no_pending_for_reservation_filter(without_reservation_for, additional_events)
+    if filters:
+        # A filtered read never refreshes another read's snapshot.
+        previous = None
+    plan = session_store_sql.build_accounting_event_query_sql(
+        query, dialect=SQL_DIALECT, extra_after_sequence_clauses=filters
+    )
 
     def read(connection: sqlite3.Connection) -> CostAccountingSnapshot:
         with connection:
@@ -618,6 +632,21 @@ async def read_cost_accounting(
                 }
                 scoped_pending = tuple(
                     event for event in pending if event.session_id in allowed_sessions
+                )
+            if lineage is not None and scoped_pending:
+                owned_sessions = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT id FROM cayu_sessions WHERE id IN (SELECT value FROM json_each(?)) "
+                        f"AND {lineage.sql}",
+                        (
+                            json.dumps([event.session_id for event in scoped_pending]),
+                            *lineage.params,
+                        ),
+                    )
+                }
+                scoped_pending = tuple(
+                    event for event in scoped_pending if event.session_id in owned_sessions
                 )
             scoped_pending = tuple(
                 event
@@ -646,7 +675,7 @@ async def read_cost_accounting(
                 additional_events=scoped_pending,
             )
             source_plan = session_store_sql.build_accounting_event_query_sql(
-                reducer.source_query, dialect=SQL_DIALECT
+                reducer.source_query, dialect=SQL_DIALECT, extra_after_sequence_clauses=filters
             )
             event_columns = ", ".join(
                 f"cayu_events.{name}" for name in sqlite_records.EVENT_COLUMN_NAMES
@@ -693,7 +722,8 @@ async def read_cost_accounting(
                             reducer.add(row["sequence"], sqlite_records.event_from_row(row))
                 finally:
                     cursor.close()
-            return reducer.snapshot()
+            snapshot = reducer.snapshot()
+            return snapshot if not filters else snapshot.model_copy(update={"cursor": None})
 
     return await run_read(read)
 

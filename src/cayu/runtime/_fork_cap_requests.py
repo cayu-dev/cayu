@@ -19,7 +19,11 @@ from typing import Any
 from cayu._fork_controller_errors import ForkControllerDenied
 from cayu._validation import compact_json_utf8_size
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION
-from cayu.budgets.base import BudgetLimit, _is_fork_controller_session_cap
+from cayu.budgets.base import (
+    BudgetLimit,
+    _is_fork_controller_session_cap,
+    fork_controller_total_owner,
+)
 from cayu.messages import FilePart, PeerContentPart, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelRequest
 
@@ -29,12 +33,20 @@ class ForkCapRequestRefused(ForkControllerDenied):
 
 
 def fork_cap_reservation(limits: Iterable[BudgetLimit]) -> tuple[int, int] | None:
-    """The tightest reserved (input, output) tokens among a session's fork caps."""
+    """The tightest reserved (input, output) tokens among a session's fork caps.
+
+    A controller total reserves each step against its own reservation too, so
+    it joins the minimum: a request held only to a looser per-fork reservation
+    could use more than the total reserved for it.
+    """
 
     caps = [
         limit.reservation
         for limit in limits
-        if _is_fork_controller_session_cap(limit) and limit.reservation is not None
+        if (
+            _is_fork_controller_session_cap(limit) or fork_controller_total_owner(limit) is not None
+        )
+        and limit.reservation is not None
     ]
     if not caps:
         return None

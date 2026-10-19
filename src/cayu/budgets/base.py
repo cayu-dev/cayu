@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from bisect import bisect_right, insort
 from collections.abc import Callable, Iterable, Mapping
@@ -3238,6 +3239,7 @@ def copy_request_budget_limits(
             limit.reservation is not None
             and limit.scope in ("session", "run")
             and not _is_fork_controller_session_cap(limit)
+            and fork_controller_total_owner(limit) is None
         ):
             raise ValueError(
                 "Request budget limits must not use reservations for "
@@ -3264,6 +3266,41 @@ def _is_fork_controller_session_cap(limit: BudgetLimit) -> bool:
 
 def _is_fork_controller_session_cap_namespace(namespace: str) -> bool:
     return namespace.startswith("fork_controller:") and ":session:" in namespace
+
+
+_FORK_CONTROLLER_TOTAL_NAMESPACE_PREFIX = "fork_controller_total:"
+
+
+def fork_controller_total_namespace(controller: str, currency: str) -> str:
+    """Name the one ledger identity a controller's total shares across its lineage.
+
+    The controller and currency are JSON-encoded, so no controller name can
+    make the namespace ambiguous. Every session of the lineage gets the same
+    identity, so the ledger counts all of their reservations against one total.
+    """
+
+    controller = require_clean_nonblank(controller, "controller")
+    currency = require_clean_nonblank(currency, "currency")
+    return _FORK_CONTROLLER_TOTAL_NAMESPACE_PREFIX + json.dumps(
+        [controller, currency], separators=(",", ":")
+    )
+
+
+def fork_controller_total_owner(limit: BudgetLimit) -> str | None:
+    """The controller whose lineage total ``limit`` is, or ``None`` for any other limit.
+
+    Only the runtime builds a total, so a caller's plain ``BudgetLimit`` never matches.
+    """
+
+    if type(limit) is not _EffectiveBudgetLimit or limit.scope != "session":
+        return None
+    namespace = limit.identity_namespace
+    if not namespace.startswith(_FORK_CONTROLLER_TOTAL_NAMESPACE_PREFIX):
+        return None
+    controller, _currency = json.loads(
+        namespace.removeprefix(_FORK_CONTROLLER_TOTAL_NAMESPACE_PREFIX)
+    )
+    return controller
 
 
 def budget_limits_for_session(
@@ -3712,10 +3749,12 @@ def _budget_limit_id_from_material(
     definition_occurrences: int,
     occurrence: int,
 ) -> str:
-    if _is_fork_controller_session_cap_namespace(namespace):
-        # A host's per-fork cap keeps one ledger identity for its session while
-        # the host changes the amount, price book or reservation, so charges
-        # for unfinished requests still count against the new cap.
+    if _is_fork_controller_session_cap_namespace(namespace) or namespace.startswith(
+        _FORK_CONTROLLER_TOTAL_NAMESPACE_PREFIX
+    ):
+        # A host's per-fork cap and controller total keep one ledger identity
+        # while the host changes the amount, price book or reservation, so
+        # charges for unfinished requests still count against the new limit.
         definition_digest = "fork-controller-cap"
     identity_material = canonical_durable_json_bytes(
         {

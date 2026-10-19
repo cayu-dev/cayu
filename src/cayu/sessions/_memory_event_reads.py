@@ -296,18 +296,61 @@ async def read_cost_accounting(
     additional_events: tuple[Event, ...] = (),
     max_detail_bytes: int | None = None,
     previous: CostAccountingSnapshot | None = None,
+    fork_lineage_owner: str | None = None,
+    without_reservation_for: str | None = None,
 ) -> CostAccountingSnapshot:
     from cayu.runtime._cost_accounting import (
         COST_ACCOUNTING_PAGE_SIZE,
         cost_accounting_query,
         cost_pending_events,
+        require_cost_read_filters,
+        require_no_pending_for_reservation_filter,
     )
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
+    from cayu.sessions._fork_controller_bounds import fork_lineage_owned_by
+    from cayu.sessions.fork_overlays import resolve_fork_lineage
 
     query = cost_accounting_query(query)
     pending = cost_pending_events(query, additional_events)
     event_types = frozenset(str(kind) for kind in query.event_types)
+    fork_lineage_owner, without_reservation_for = require_cost_read_filters(
+        fork_lineage_owner, without_reservation_for
+    )
+    require_no_pending_for_reservation_filter(without_reservation_for, additional_events)
+    filtered = fork_lineage_owner is not None or without_reservation_for is not None
+    if filtered:
+        # A filtered read never refreshes another read's snapshot.
+        previous = None
     async with read() as state:
+        owned: dict[str, bool] = {}
+
+        def in_lineage(session_id: str) -> bool:
+            if fork_lineage_owner is None:
+                return True
+            decided = owned.get(session_id)
+            if decided is None:
+                session = state.sessions.get(session_id)
+                decided = session is not None and fork_lineage_owned_by(
+                    resolve_fork_lineage(session, state.sessions.get), fork_lineage_owner
+                )
+                owned[session_id] = decided
+            return decided
+
+        reserved: dict[str, frozenset[str]] = {}
+
+        def unreserved(event: Event) -> bool:
+            if without_reservation_for is None:
+                return True
+            attempts = reserved.get(event.session_id)
+            if attempts is None:
+                attempts = reserved_attempts(
+                    state.session_event_records.get(event.session_id, ()),
+                    without_reservation_for,
+                )
+                reserved[event.session_id] = attempts
+            return event.payload.get("model_attempt_id") not in attempts
+
+        pending = tuple(event for event in pending if in_lineage(event.session_id))
         if query.causal_budget_id is not None:
             pending = tuple(
                 event
@@ -360,6 +403,8 @@ async def read_cost_accounting(
                 and state.sessions[key[0]].causal_budget_id != query.causal_budget_id
             ):
                 continue
+            if not in_lineage(key[0]):
+                continue
             for hosted_phase in (True, False):
                 for record in records:
                     scanned += 1
@@ -367,11 +412,29 @@ async def read_cost_accounting(
                         await asyncio.sleep(0)
                     if (record.event.type == EventType.MODEL_HOSTED_TOOL_CALL) != hosted_phase:
                         continue
-                    if event_query_rules._event_record_matches(
-                        record, reducer.source_query, event_types, frozenset()
-                    ) and session_matches(record):
+                    if (
+                        event_query_rules._event_record_matches(
+                            record, reducer.source_query, event_types, frozenset()
+                        )
+                        and session_matches(record)
+                        and unreserved(record.event)
+                    ):
                         reducer.add(record.sequence, record.event)
-        return reducer.snapshot()
+        snapshot = reducer.snapshot()
+        return snapshot if not filtered else snapshot.model_copy(update={"cursor": None})
+
+
+def reserved_attempts(records, budget_limit_id: str) -> frozenset[str]:
+    """Model attempts in one session's records with an accepted reservation for the limit."""
+
+    return frozenset(
+        attempt
+        for record in records
+        if record.event.type == EventType.BUDGET_RESERVED
+        and record.event.payload.get("budget_limit_id") == budget_limit_id
+        and record.event.payload.get("accepted") is True
+        and type(attempt := record.event.payload.get("model_attempt_id")) is str
+    )
 
 
 @runtime_session_query

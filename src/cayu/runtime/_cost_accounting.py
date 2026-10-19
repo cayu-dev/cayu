@@ -98,6 +98,34 @@ def cost_accounting_query(query: EventQuery) -> EventQuery:
     )
 
 
+def require_cost_read_filters(
+    fork_lineage_owner: object, without_reservation_for: object
+) -> tuple[str | None, str | None]:
+    """Validate a cost read's optional lineage owner and reservation filter."""
+
+    from cayu.execution_units import BudgetLimitIdentity
+    from cayu.sessions.fork_overlays import validate_fork_controller_name
+
+    if fork_lineage_owner is not None:
+        if type(fork_lineage_owner) is not str:
+            raise TypeError("fork_lineage_owner must be a string.")
+        fork_lineage_owner = validate_fork_controller_name(fork_lineage_owner, "fork_lineage_owner")
+    if without_reservation_for is not None:
+        if type(without_reservation_for) is not str:
+            raise TypeError("without_reservation_for must be a budget limit id.")
+        without_reservation_for = BudgetLimitIdentity(
+            budget_limit_id=without_reservation_for
+        ).budget_limit_id
+    return fork_lineage_owner, without_reservation_for
+
+
+def require_no_pending_for_reservation_filter(
+    without_reservation_for: str | None, additional_events: tuple[Event, ...]
+) -> None:
+    if without_reservation_for is not None and additional_events:
+        raise ValueError("A read without_reservation_for counts durable evidence only.")
+
+
 def cost_pending_events(query: EventQuery, events: tuple[Event, ...]) -> tuple[Event, ...]:
     """Copy and filter a bounded in-flight tail; stores additionally check causal membership."""
     from cayu.events import copy_event

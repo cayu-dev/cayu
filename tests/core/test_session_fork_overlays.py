@@ -294,6 +294,7 @@ def _host_app(
     environment: Environment | None = None,
     allow_model_runs: bool = True,
     budget_limit: BudgetLimit | None = None,
+    total_budget_limit: BudgetLimit | None = None,
     **app_options: Any,
 ) -> tuple[CayuApp, PostJournal]:
     if enroll and allow_model_runs and "budget_ledger" not in app_options:
@@ -322,6 +323,7 @@ def _host_app(
                 # These scenarios run their forks; the gate's default is tested on its own.
                 allow_model_runs=allow_model_runs,
                 fork_budget_limit=(fork_budget_limit() if budget_limit is None else budget_limit),
+                total_budget_limit=total_budget_limit,
                 **allowance,
             )
         )
@@ -2107,6 +2109,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         # The default enrollment creates forks but never runs them.
         "allow_model_runs": False,
         "fork_budget_limit": None,
+        "total_budget_limit": None,
     }
     assert unknown.status_code == 403
     assert anonymous.status_code == 401

@@ -164,6 +164,31 @@ def test_model_runs_from_the_environment_need_a_complete_cap(overrides, message)
         fork_controller_from_environment(_environment(**overrides))
 
 
+def test_a_total_from_the_environment_shares_the_per_fork_reservation() -> None:
+    variables = {
+        "CAYU_FORK_CONTROLLER_ALLOW_MODEL_RUNS": "true",
+        "CAYU_FORK_CONTROLLER_FORK_BUDGET_USD": "2.50",
+        "CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS": "200000",
+        "CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS": "16000",
+    }
+    without = fork_controller_from_environment(_environment(**variables))
+    assert without is not None and without.controller.total_budget_limit is None
+    configured = fork_controller_from_environment(
+        _environment(**variables, CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD="20")
+    )
+    assert configured is not None
+    total = configured.controller.total_budget_limit
+    cap = configured.controller.fork_budget_limit
+    assert total is not None and total.max_estimated_cost == Decimal("20")
+    assert cap is not None and total.reservation == cap.reservation
+    with pytest.raises(ValueError, match="needs the per-fork cap variables"):
+        fork_controller_from_environment(_environment(CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD="20"))
+    with pytest.raises(ValueError, match="controller total is invalid"):
+        fork_controller_from_environment(
+            _environment(**variables, CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD="lots")
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -246,6 +271,7 @@ def test_mount_cayu_serves_the_environment_controller_with_its_own_bearer(enviro
             "served_tools": [],
             "allow_model_runs": False,
             "fork_budget_limit": None,
+            "total_budget_limit": None,
         }
     assert client.get(path, headers=_bearer(OPERATOR)).status_code == 401
     assert client.get(path, headers=_bearer("x" * 48)).status_code == 401

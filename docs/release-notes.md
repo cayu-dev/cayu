@@ -146,6 +146,14 @@ service credentials stay outside the guest. Existing native agents are unchanged
   `CAYU_FORK_CONTROLLER_FORK_BUDGET_USD` and the two
   `CAYU_FORK_CONTROLLER_FORK_RESERVATION_*_TOKENS` variables. See
   [running forks](fork-overlays.md#running-forks).
+- Optionally cap what all of a fork controller's forks spend together with
+  `ForkController(total_budget_limit=...)`. Every session in the controller's
+  fork lineage reserves against one ledger entry for the total, so concurrent
+  forks cannot overshoot it, and the check before each step counts the whole
+  lineage's spend. `SessionStore.read_cost_accounting` takes
+  `fork_lineage_owner` for that reading on every built-in store. From the
+  environment, set `CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD`. See
+  [a total across the controller's forks](fork-overlays.md#a-total-across-the-controllers-forks).
 
 - `CayuApp.abandon_session(session_id)` ends a session that stopped on an
   unknown external tool outcome and that the application will never continue,

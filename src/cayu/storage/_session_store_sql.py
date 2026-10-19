@@ -706,6 +706,125 @@ def fork_lineage_unforked_sql(dialect: SessionStoreSqlDialect) -> str:
     )
 
 
+def _fork_lineage_entries_name(dialect: SessionStoreSqlDialect, metadata: str) -> str:
+    """Compile ``fork_lineage_entries_name_owner`` for one row; binds the controller twice."""
+
+    from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, FORK_OVERLAY_METADATA_KEY
+
+    string = "'text'" if dialect.contains_style == "sqlite_nocase_like" else "'string'"
+    record = _present(_json_type(dialect, metadata, FORK_OVERLAY_METADATA_KEY))
+    named = (FORK_OVERLAY_METADATA_KEY, "overlay", "controller")
+    owner = (FORK_LINEAGE_METADATA_KEY, "controller")
+    return (
+        f"(({record} AND {_json_type(dialect, metadata, *named)} = {string} AND "
+        f"{_json_text(dialect, metadata, *named)} = {dialect.placeholder}) OR "
+        f"(NOT {record} AND {_json_type(dialect, metadata, *owner)} = {string} AND "
+        f"{_json_text(dialect, metadata, *owner)} = {dialect.placeholder}))"
+    )
+
+
+def fork_lineage_owner_clause(controller: str, *, dialect: SessionStoreSqlDialect) -> SqlClause:
+    """True for a ``cayu_sessions`` row whose fork lineage ``controller`` owns.
+
+    Mirrors ``fork_lineage_owned_by``: a row with its own overlay record or
+    lineage marker is judged by it, and any other row by the nearest parent
+    that carries one, so a session written before lineage markers existed
+    counts with the fork it descends from.
+    """
+
+    def settles_and_names(metadata: str) -> str:
+        return (
+            "("
+            + _carries_fork_lineage(dialect, metadata)
+            + " AND "
+            + _fork_lineage_entries_name(dialect, metadata)
+            + ")"
+        )
+
+    metadata = _row_metadata(dialect)
+    walk = (
+        "EXISTS ("
+        + _fork_chain(
+            dialect, "SELECT 1 FROM fork_chain WHERE " + settles_and_names("fork_chain.metadata")
+        )
+        + ")"
+    )
+    sql = (
+        "("
+        + settles_and_names(metadata)
+        + " OR (NOT "
+        + _carries_fork_lineage(dialect, metadata)
+        + f" AND cayu_sessions.parent_session_id IS NOT NULL AND {walk}))"
+    )
+    return SqlClause(sql, (controller, controller, controller, controller))
+
+
+def without_reservation_clause(
+    budget_limit_id: str, *, dialect: SessionStoreSqlDialect
+) -> SqlClause:
+    """True for a cost event whose model attempt has no accepted reservation for the limit.
+
+    Mirrors ``reserved_attempts``: the reservation is a ``budget.reserved``
+    event in the same session naming the limit and the event's model attempt.
+    A cost event without a model attempt never has one.
+    """
+
+    if dialect.contains_style == "sqlite_nocase_like":
+        reserved = "json_extract(reserved.payload_json, '$.{}')"
+        accepted = "json_type(reserved.payload_json, '$.accepted') = 'true'"
+        cost_attempt = "json_extract(cayu_events.payload_json, '$.model_attempt_id')"
+    else:
+        reserved = "(reserved.event -> 'payload' ->> '{}')"
+        accepted = "jsonb_typeof(reserved.event -> 'payload' -> 'accepted') = 'boolean' AND " + (
+            f"{reserved.format('accepted')} = 'true'"
+        )
+        cost_attempt = "(cayu_events.event -> 'payload' ->> 'model_attempt_id')"
+    sql = (
+        "NOT EXISTS (SELECT 1 FROM cayu_events AS reserved "
+        "WHERE reserved.session_id = cayu_events.session_id "
+        f"AND reserved.event_type = {dialect.placeholder} "
+        f"AND {reserved.format('budget_limit_id')} = {dialect.placeholder} "
+        f"AND {reserved.format('model_attempt_id')} = {cost_attempt} "
+        f"AND {accepted})"
+    )
+    return SqlClause(sql, (str(EventType.BUDGET_RESERVED), budget_limit_id))
+
+
+def cost_read_filter_clauses(
+    *,
+    fork_lineage_owner: str | None,
+    without_reservation_for: str | None,
+    dialect: SessionStoreSqlDialect,
+) -> tuple[tuple[SqlClause, ...], SqlClause | None]:
+    """Validate a cost read's optional filters and compile them.
+
+    Returns every filter clause for the event queries, and the lineage clause
+    alone, which stores also apply to in-flight events' sessions.
+    """
+
+    from cayu.runtime._cost_accounting import require_cost_read_filters
+
+    fork_lineage_owner, without_reservation_for = require_cost_read_filters(
+        fork_lineage_owner, without_reservation_for
+    )
+    lineage = (
+        None
+        if fork_lineage_owner is None
+        else fork_lineage_owner_clause(fork_lineage_owner, dialect=dialect)
+    )
+    clauses = tuple(
+        clause
+        for clause in (
+            lineage,
+            None
+            if without_reservation_for is None
+            else without_reservation_clause(without_reservation_for, dialect=dialect),
+        )
+        if clause is not None
+    )
+    return clauses, lineage
+
+
 def fork_controller_read_clause(
     bounds: _ForkControllerReadBounds, *, dialect: SessionStoreSqlDialect
 ) -> SqlClause:

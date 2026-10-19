@@ -98,6 +98,7 @@ controller's own bearer token, never the operator login.
 | `CAYU_FORK_CONTROLLER_FORK_BUDGET_USD` | The per-fork cap in US dollars, priced with Cayu's bundled price book. See [Running forks](#running-forks). |
 | `CAYU_FORK_CONTROLLER_FORK_RESERVATION_INPUT_TOKENS` | The cap's reservation: the most input tokens one model step may use. |
 | `CAYU_FORK_CONTROLLER_FORK_RESERVATION_OUTPUT_TOKENS` | The cap's reservation: the most output tokens one model step may use. |
+| `CAYU_FORK_CONTROLLER_TOTAL_BUDGET_USD` | Optional. The [controller total](#a-total-across-the-controllers-forks) in US dollars. Needs the three cap variables and shares their reservation. |
 
 ```bash
 token=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
@@ -117,7 +118,8 @@ curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/fork-controller
 - Malformed configuration stops the server from starting: a missing required
   variable, any of these variables set without a name, an empty list entry, a
   repeated or malformed digest, an unknown mode or `ALLOW_MODEL_RUNS` value,
-  `ALLOW_MODEL_RUNS=true` without all three cap variables, a malformed cap, a
+  `ALLOW_MODEL_RUNS=true` without all three cap variables, a malformed cap or
+  total, `TOTAL_BUDGET_USD` without the cap variables, a
   durable session store without a durable budget ledger when model runs are on, an
   unregistered agent, an unknown host tool, or a name or subject already
   enrolled differently in code. Errors never include digests.
@@ -173,8 +175,9 @@ invocation then runs through the host's ordinary durable dispatch.
 `controller.enrollment()` returns a frozen `ForkControllerEnrollment`: the
 controller name, the authenticated subject, `mode`, the enrolled `agents`,
 `host_tools`, `served_tools` (the names of the tools the controller
-serves), `allow_model_runs` and `fork_budget_limit` (the cap's
-`max_estimated_cost` and `currency`, without the price book, or `None`). It
+serves), `allow_model_runs`, `fork_budget_limit` (the cap's
+`max_estimated_cost` and `currency`, without the price book, or `None`) and
+`total_budget_limit` (the controller total in the same form, or `None`). It
 describes only the caller's own enrollment. Other controllers,
 other subjects of the same controller and agents outside the enrollment never
 appear.
@@ -290,7 +293,9 @@ the step that crosses the cap finishes. Every later resume stops at once.
   a new fork that reuses a deleted fork's id starts fresh, but not the amount, price
   book or reservation, so a host that changes the cap keeps charging the
   fork's earlier reservations against the new one. Budget inspection reports
-  such a session's cost as `partial`, since its checks name two different caps. There is no per-controller total yet; app and causal
+  such a session's cost as `partial`, since its checks name two different caps. A
+  host that also wants a bound on what all the forks spend together sets a
+  [controller total](#a-total-across-the-controllers-forks). App and causal
   budgets still apply to forks as usual.
 - The controller's own `budget_limits` can only tighten what a fork may spend.
 - Spend is read from durable events, and the cap and the gate from the current
@@ -306,6 +311,63 @@ the step that crosses the cap finishes. Every later resume stops at once.
   existed, settles its owner through its parents (see
   [Sessions without a marker](#sessions-without-a-marker)). One whose lineage
   does not settle cannot run.
+
+#### A total across the controller's forks
+
+The per-fork cap bounds each session, but a controller can open as many forks
+as it likes. A host that wants to bound what the controller spends in all of
+them sets `total_budget_limit`. It is optional, and nothing needs it unless the
+host asks for a total:
+
+```python
+step = BudgetReservation(max_input_tokens=200_000, max_output_tokens=16_000)
+ForkController(
+    name="compass",
+    subjects=("svc:compass",),
+    agents=("finance-monthend",),
+    allow_model_runs=True,
+    fork_budget_limit=BudgetLimit.usd(2, reservation=step),
+    # At most 20 USD across every fork, resume and subagent of this controller.
+    total_budget_limit=BudgetLimit.usd(20, reservation=step),
+)
+```
+
+The total is a `BudgetLimit` with the same hard shape as the per-fork cap:
+the default `scope="session"`, `action="interrupt"`, an all-time window, no
+`allow_unpriced` and a `reservation`. Construction refuses anything looser.
+It applies on top of the per-fork cap, through the same entrances and checks:
+
+- Every session in the controller's lineage gets the same ledger identity for
+  the total, keyed by the controller and currency. Each model step,
+  compaction and auxiliary call in any of them reserves against that one entry,
+  so concurrent forks cannot together spend past the total, and a request a
+  fork abandons stays charged at its reservation. Like the per-fork cap, the
+  identity does not depend on the amount, so changing the total keeps charging
+  earlier reservations.
+- The check before each step counts the spend of every session the
+  controller's lineage owns, not only the session about to run. A session
+  without a lineage marker counts through its parents. The host's own sessions
+  and other controllers' lineages never count. A fork that brings the lineage
+  to its total stops with `budget.limit_reached`, and every other fork of the
+  controller then stops before its next model request.
+- With a durable session store and durable budget ledger, spend before a
+  restart keeps counting after it.
+- The ledger entry can only hold spend that reserved against the total. Set
+  the total before the controller's forks run models: if any session in the
+  lineage has a model attempt that did not reserve against it, for example
+  because the host added the total later, the controller's forks fail closed
+  with `ForkControllerDenied` instead of running under a total they could
+  jointly pass. To start a new total over such forks, enroll the controller
+  under a new name.
+- Choose its reservation as for the per-fork cap. A total smaller than one
+  reservation stops every fork before its first step. When the total's
+  reservation is tighter than the per-fork cap's, each request is held to the
+  tighter of the two.
+
+`SessionStore.read_cost_accounting(..., fork_lineage_owner="compass")` gives
+the same lineage-wide reading the check uses, on every built-in store, and
+`without_reservation_for=<budget_limit_id>` narrows a read to model attempts
+that never reserved against that limit.
 
 ## Reading sessions and events
 

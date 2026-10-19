@@ -6531,6 +6531,8 @@ class InMemorySessionStore(
         additional_events: tuple[Event, ...] = (),
         max_detail_bytes: int | None = None,
         previous: CostAccountingSnapshot | None = None,
+        fork_lineage_owner: str | None = None,
+        without_reservation_for: str | None = None,
     ) -> CostAccountingSnapshot:
         return await memory_event_reads.read_cost_accounting(
             self._read_event_state,
@@ -6542,6 +6544,8 @@ class InMemorySessionStore(
             additional_events=additional_events,
             max_detail_bytes=max_detail_bytes,
             previous=previous,
+            fork_lineage_owner=fork_lineage_owner,
+            without_reservation_for=without_reservation_for,
         )
 
     async def query_events_bounded(

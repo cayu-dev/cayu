@@ -481,11 +481,14 @@ async def read_cost_accounting(
     max_detail_bytes: int | None = None,
     previous: CostAccountingSnapshot | None = None,
     cost_authority: CostAccountingAuthority,
+    fork_lineage_owner: str | None = None,
+    without_reservation_for: str | None = None,
 ) -> CostAccountingSnapshot:
     from cayu.runtime._cost_accounting import (
         COST_ACCOUNTING_PAGE_SIZE,
         cost_accounting_query,
         cost_pending_events,
+        require_no_pending_for_reservation_filter,
     )
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
     from cayu.storage._cost_accounting_sql import (
@@ -499,6 +502,15 @@ async def read_cost_accounting(
         raise TypeError("previous must be a CostAccountingSnapshot.")
     query = cost_accounting_query(query)
     pending = cost_pending_events(query, additional_events)
+    filters, lineage = session_store_sql.cost_read_filter_clauses(
+        fork_lineage_owner=fork_lineage_owner,
+        without_reservation_for=without_reservation_for,
+        dialect=SQL_DIALECT,
+    )
+    require_no_pending_for_reservation_filter(without_reservation_for, additional_events)
+    if filters:
+        # A filtered read never refreshes another read's snapshot.
+        previous = None
     async with connect() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -514,8 +526,20 @@ async def read_cost_accounting(
                 )
                 allowed_sessions = {row[0] for row in await cur.fetchall()}
                 pending = tuple(event for event in pending if event.session_id in allowed_sessions)
+            if lineage is not None and pending:
+                await cur.execute(
+                    cast(
+                        "LiteralString",
+                        f"SELECT id FROM cayu_sessions WHERE id = ANY(%s) AND {lineage.sql}",
+                    ),
+                    ([event.session_id for event in pending], *lineage.params),
+                )
+                owned_sessions = {row[0] for row in await cur.fetchall()}
+                pending = tuple(event for event in pending if event.session_id in owned_sessions)
 
-        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=SQL_DIALECT)
+        plan = session_store_sql.build_accounting_event_query_sql(
+            query, dialect=SQL_DIALECT, extra_after_sequence_clauses=filters
+        )
         unique_pending: list[Event] = []
         async with conn.cursor() as cur:
             for event in pending:
@@ -553,6 +577,7 @@ async def read_cost_accounting(
         source_plan = session_store_sql.build_accounting_event_query_sql(
             reducer.source_query,
             dialect=SQL_DIALECT,
+            extra_after_sequence_clauses=filters,
         )
         columns = "cayu_events.sequence, cayu_events.event, cayu_events.session_id, cayu_events.event_id, cayu_events.event_type"
 
@@ -596,7 +621,9 @@ async def read_cost_accounting(
         # Global sequence allocation is not commit order. A later commit can
         # become visible below this snapshot's maximum sequence, so it is not
         # a safe incremental baseline across independently written sessions.
-        if not _event_query_is_single_session(query):
+        # A filtered read's cursor would carry only the EventQuery's scope, so
+        # an ordinary read could adopt it as a baseline it never counted.
+        if filters or not _event_query_is_single_session(query):
             result = result.model_copy(update={"cursor": None})
         return result
 

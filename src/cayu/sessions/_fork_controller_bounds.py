@@ -79,6 +79,31 @@ def fork_controller_lineage_admits(metadata: Mapping[str, Any], controller: str)
     )
 
 
+def fork_lineage_entries_name_owner(metadata: Mapping[str, Any], controller: str) -> bool:
+    """Whether a row's overlay record, or else its lineage marker, names ``controller``.
+
+    The check is structural so stores evaluate it identically in SQL. It counts
+    a session toward a controller's spend: a malformed entry that still names
+    the controller counts, which can only make a total stop sooner.
+    """
+
+    record = metadata.get(FORK_OVERLAY_METADATA_KEY)
+    if record is not None:
+        overlay = record.get("overlay") if isinstance(record, Mapping) else None
+        named = overlay.get("controller") if isinstance(overlay, Mapping) else None
+    else:
+        marker = metadata.get(FORK_LINEAGE_METADATA_KEY)
+        named = marker.get("controller") if isinstance(marker, Mapping) else None
+    return type(named) is str and named == controller
+
+
+def fork_lineage_owned_by(lineage: ForkLineage, controller: str) -> bool:
+    """Whether a resolved lineage settles on a session that names ``controller`` as owner."""
+
+    terminal = lineage.terminal
+    return terminal is not None and fork_lineage_entries_name_owner(terminal.metadata, controller)
+
+
 def fork_lineage_admits(lineage: ForkLineage, controller: str) -> bool:
     """Whether a resolved lineage lets ``controller`` read the session it was resolved for."""
 

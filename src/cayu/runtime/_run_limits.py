@@ -68,6 +68,7 @@ from cayu.budgets.base import (
     budget_reservation_payload,
     budget_settlement_id,
     events_for_budget_window,
+    fork_controller_total_owner,
     has_deferred_contextual_price,
     model_completion_budget_settlements,
     new_budget_reservation_id,
@@ -1396,6 +1397,8 @@ class BudgetReservationIdentityGuard:
 
 
 _UNRESOLVED_FORK_LINEAGE = object()
+# Enough for a few unreserved cost lines; a larger output proves there are some.
+_UNRESERVED_SPEND_DETAIL_BYTES = 64 * 1024
 _FORK_LINEAGE_OWNER_CACHE_SIZE = 4096
 
 
@@ -1462,9 +1465,48 @@ class RunLimitController:
             raise ForkControllerDenied(
                 "The session's fork lineage cannot be resolved; it cannot run."
             ) from None
-        return self._fork_lineage_budget_limits(
+        limits = self._fork_lineage_budget_limits(
             cast("str | None", owner), session.id, session.instance_id
         )
+        for limit in limits:
+            if (lineage_owner := fork_controller_total_owner(limit)) is not None:
+                await self._require_total_holds_lineage_spend(lineage_owner, limit)
+        return limits
+
+    async def _require_total_holds_lineage_spend(
+        self, owner: str, limit: _EffectiveBudgetLimit
+    ) -> None:
+        """Refuse a total whose ledger entry does not hold all of the lineage's spend.
+
+        Concurrent forks are bounded by the total's ledger entry, which holds
+        only model attempts that reserved against it. Spend from before the
+        host set the total, or from a process running without it, would let
+        forks jointly pass the total, so the lineage fails closed instead.
+        """
+
+        from cayu.runtime._cost_accounting import CostAccountingOutputTooLarge
+
+        # Any cost line counts, priced or not: provider-hosted evidence without
+        # a completion is a line that neither step counter records.
+        try:
+            snapshot = await self._session_store.read_cost_accounting(
+                EventQuery(),
+                limit.pricing,
+                currency=limit.currency,
+                details=True,
+                max_detail_bytes=_UNRESERVED_SPEND_DETAIL_BYTES,
+                fork_lineage_owner=owner,
+                without_reservation_for=limit.budget_limit_id,
+            )
+            unreserved = snapshot.details is None or bool(snapshot.details.line_items)
+        except CostAccountingOutputTooLarge:
+            unreserved = True
+        if unreserved:
+            raise ForkControllerDenied(
+                "The controller's forks spent before its total_budget_limit was set, so the "
+                "budget ledger cannot hold that spend against the total; they cannot run "
+                "under it. Enroll the controller under a new name to start a new total."
+            )
 
     def known_fork_lineage_budget_limits(
         self, session: Session
@@ -2170,8 +2212,21 @@ class RunLimitController:
                 )
         pending = tuple(unresolved.values())
 
+        lineage_owner = fork_controller_total_owner(limit)
+
         async def read(previous: CostAccountingSnapshot | None) -> CostAccountingSnapshot:
-            if limit.scope in {"app", "agent", "causal"}:
+            if lineage_owner is not None:
+                # A controller's total counts every session its fork lineage
+                # owns, so a session-scoped read would see only this one.
+                since, until = limit.window.bounds(now)
+                snapshot = await self._session_store.read_cost_accounting(
+                    EventQuery(since=since, until=until),
+                    limit.pricing,
+                    currency=limit.currency,
+                    additional_events=pending,
+                    fork_lineage_owner=lineage_owner,
+                )
+            elif limit.scope in {"app", "agent", "causal"}:
                 snapshot = await self._budget_store.read_cost_for_budget(
                     scope=limit.scope,
                     key=limit.key,

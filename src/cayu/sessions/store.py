@@ -4736,11 +4736,19 @@ class SessionStore(ABC):
         additional_events: tuple[Event, ...] = (),
         max_detail_bytes: int | None = None,
         previous: CostAccountingSnapshot | None = None,
+        fork_lineage_owner: str | None = None,
+        without_reservation_for: str | None = None,
     ) -> CostAccountingSnapshot:
         """Price a stable snapshot with bounded working memory plus requested output.
 
         Built-ins group hosted evidence and completions by session and attempt;
         totals-only reads retain no historical line items. Unsupported stores fail closed.
+        ``fork_lineage_owner`` narrows the read to sessions whose fork lineage
+        that controller owns, judged as ``resolve_fork_lineage`` does.
+        ``without_reservation_for`` counts only model attempts that have no
+        accepted ``budget.reserved`` event for that budget limit id, and takes
+        no ``additional_events``. A filtered read ignores ``previous`` and
+        returns no refresh cursor.
         """
         raise NotImplementedError("This SessionStore does not support bounded cost accounting.")
 

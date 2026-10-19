@@ -33,6 +33,7 @@ from cayu.budgets.base import (
     _copy_budget_limit,
     _effective_budget_limits,
     _EffectiveBudgetLimit,
+    fork_controller_total_namespace,
 )
 from cayu.mcp.tools import McpToolset
 from cayu.sessions._fork_controller_bounds import fork_lineage_admits
@@ -123,6 +124,8 @@ class ForkController:
     ``initial_invocation`` and every resume are refused before any work starts.
     Turning it on requires ``fork_budget_limit``, the host's spend cap for each
     session in the controller's fork lineage; see ``fork_lineage_budget_limits``.
+    ``total_budget_limit`` is optional: a host that sets it also caps what the
+    whole lineage spends together, across every fork, resume and subagent.
     """
 
     name: str
@@ -135,6 +138,7 @@ class ForkController:
     mode: ForkControllerMode = ForkControllerMode.OBSERVE
     allow_model_runs: bool = False
     fork_budget_limit: BudgetLimit | None = None
+    total_budget_limit: BudgetLimit | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", validate_fork_controller_name(self.name, "name"))
@@ -143,6 +147,12 @@ class ForkController:
         if self.fork_budget_limit is not None:
             object.__setattr__(
                 self, "fork_budget_limit", _validated_fork_budget_limit(self.fork_budget_limit)
+            )
+        if self.total_budget_limit is not None:
+            object.__setattr__(
+                self,
+                "total_budget_limit",
+                _validated_fork_budget_limit(self.total_budget_limit, "total_budget_limit"),
             )
         if self.allow_model_runs and self.fork_budget_limit is None:
             raise ValueError(
@@ -204,43 +214,57 @@ class ForkController:
         return tuple(sorted(tool.name for toolset in self.mcp_toolsets for tool in toolset.tools))
 
 
-def _validated_fork_budget_limit(value: object) -> BudgetLimit:
-    """Copy a per-fork cap, refusing anything that would not bound a fork's spend."""
+def _validated_fork_budget_limit(value: object, field: str = "fork_budget_limit") -> BudgetLimit:
+    """Copy a per-fork cap or controller total, refusing anything that would not bound spend.
+
+    Both are hard limits of the same shape. The total keeps the default
+    ``scope='session'`` too: the runtime, not the scope, makes it count the
+    controller's whole lineage.
+    """
 
     if type(value) is not BudgetLimit:
-        raise TypeError("fork_budget_limit must be a BudgetLimit.")
+        raise TypeError(f"{field} must be a BudgetLimit.")
     limit = _copy_budget_limit(value)
     if limit.scope != "session":
         raise ValueError(
-            "fork_budget_limit must have scope='session'; it caps each fork session, "
-            "as BudgetLimit.usd(amount) does by default."
+            f"{field} must have scope='session', as BudgetLimit.usd(amount) does by default; "
+            + (
+                "it caps each fork session."
+                if field == "fork_budget_limit"
+                else "the runtime counts it across the controller's whole fork lineage."
+            )
         )
     if limit.action != "interrupt":
-        raise ValueError("fork_budget_limit must use action='interrupt' to stop a fork.")
+        raise ValueError(f"{field} must use action='interrupt' to stop a fork.")
     if limit.allow_unpriced:
-        raise ValueError(
-            "fork_budget_limit cannot allow unpriced models; their spend would not count."
-        )
+        raise ValueError(f"{field} cannot allow unpriced models; their spend would not count.")
     if limit.window.kind != "all_time":
-        raise ValueError("fork_budget_limit must count a fork's whole life (an all_time window).")
+        counted = "a fork's" if field == "fork_budget_limit" else "the lineage's"
+        raise ValueError(f"{field} must count {counted} whole life (an all_time window).")
     if limit.reservation is None:
         # Without a reservation, a dispatch that ends without usage evidence (a
         # stream the caller abandons, a lost response) would cost nothing, so a
         # controller could spend past the cap by abandoning its own requests.
         raise ValueError(
-            "fork_budget_limit needs a reservation: the most tokens one model step may "
+            f"{field} needs a reservation: the most tokens one model step may "
             "use, charged until the step's real usage is known."
         )
     return limit
 
 
 class ForkBudgetLimitView(BaseModel):
-    """The per-fork cap as a controller sees it: the amount, never the price book."""
+    """A per-fork cap or total as a controller sees it: the amount, never the price book."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_estimated_cost: Decimal
     currency: str
+
+
+def _budget_limit_view(limit: BudgetLimit | None) -> ForkBudgetLimitView | None:
+    if limit is None:
+        return None
+    return ForkBudgetLimitView(max_estimated_cost=limit.max_estimated_cost, currency=limit.currency)
 
 
 class ForkControllerEnrollment(BaseModel):
@@ -260,6 +284,7 @@ class ForkControllerEnrollment(BaseModel):
     served_tools: tuple[str, ...]
     allow_model_runs: bool
     fork_budget_limit: ForkBudgetLimitView | None = None
+    total_budget_limit: ForkBudgetLimitView | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -326,14 +351,8 @@ class ForkControllerAccess:
             host_tools=controller.host_tools,
             served_tools=controller.served_tool_names,
             allow_model_runs=controller.allow_model_runs,
-            fork_budget_limit=(
-                None
-                if controller.fork_budget_limit is None
-                else ForkBudgetLimitView(
-                    max_estimated_cost=controller.fork_budget_limit.max_estimated_cost,
-                    currency=controller.fork_budget_limit.currency,
-                )
-            ),
+            fork_budget_limit=_budget_limit_view(controller.fork_budget_limit),
+            total_budget_limit=_budget_limit_view(controller.total_budget_limit),
         )
 
     async def fork(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
@@ -651,6 +670,29 @@ def fork_controller_budget_limits(
     )
 
 
+def fork_controller_total_budget_limits(
+    controller: ForkController,
+) -> tuple[_EffectiveBudgetLimit, ...]:
+    """Return the controller's total, with one ledger identity for its whole lineage.
+
+    Every session the controller's lineage owns gets this same identity, so each
+    model step, compaction and auxiliary call in any of them reserves against
+    one ledger entry: concurrent forks cannot jointly spend past the total.
+    Like the per-fork cap, the identity names the controller and currency but
+    not the amount, so a host that changes the total keeps charging earlier
+    reservations. The runtime's check before each step counts the spend of
+    every session in the lineage, not only the session about to run.
+    """
+
+    limit = controller.total_budget_limit
+    if limit is None:
+        return ()
+    return _effective_budget_limits(
+        (limit,),
+        identity_namespace=fork_controller_total_namespace(controller.name, limit.currency),
+    )
+
+
 def fork_lineage_budget_limits(
     owner: str | None,
     session_id: str,
@@ -663,9 +705,10 @@ def fork_lineage_budget_limits(
     or anything created under the fork), or ``None`` outside any controller's
     lineage, which gets no limits. A controller's lineage runs only while that
     controller is enrolled with ``allow_model_runs``, and then under its
-    per-fork cap. The runtime applies this before each model step, whatever
-    started the run, so a host resume, a dispatch, a recovery or a subagent
-    under the fork is gated and capped exactly like the controller's own resume.
+    per-fork cap, and under its total when the host set one. The runtime
+    applies this before each model step, whatever started the run, so a host
+    resume, a dispatch, a recovery or a subagent under the fork is gated and
+    capped exactly like the controller's own resume.
     """
 
     if owner is None:
@@ -674,7 +717,10 @@ def fork_lineage_budget_limits(
     if controller is None:
         raise ForkControllerDenied("The host has not allowed this controller to run its forks.")
     require_fork_controller_model_runs(controller)
-    return fork_controller_budget_limits(controller, session_id, instance_id)
+    return (
+        *fork_controller_budget_limits(controller, session_id, instance_id),
+        *fork_controller_total_budget_limits(controller),
+    )
 
 
 def require_fork_controller_hosted_tools(
