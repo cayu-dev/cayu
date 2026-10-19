@@ -1,5 +1,18 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: no action needed.
+
+- `CayuApp(owned_resources=...)` now accepts resources that close with an async
+  `aclose()`, such as every built-in model provider, as well as an async
+  `close()`. Handing a provider to the app used to raise `TypeError`. A resource
+  with an async `close()` is still closed through it.
+
+### Breaking changes
+
+None.
+
 ## v0.12.0
 
 Upgrade: stop every 0.11.x process that writes to or claims from the store,

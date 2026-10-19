@@ -177,11 +177,12 @@ async def main(provider: ModelProvider) -> None:
     stores = open_application_stores(
         configured_database_url(), sqlite_path=Path("state/app.sqlite3").resolve()
     )
-    # The app closes the stores, but only after every subsystem settled.
+    # The app closes the provider and then the stores, but only after every
+    # subsystem settled.
     app = CayuApp(
         session_store=stores.session_store,
         task_store=stores.task_store,
-        owned_resources=(stores,),
+        owned_resources=(stores, provider),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="your-model"))
@@ -196,8 +197,10 @@ async def main(provider: ModelProvider) -> None:
 ```
 
 `async with app:` calls `aclose()` on exit. `aclosing(...)` closes a stream you
-stop reading early, so shutdown does not wait for it. Without `owned_resources`,
-close your own stores only once `app.shutdown_outcome.settled` is true. Do not
+stop reading early, so shutdown does not wait for it. The app closes
+`owned_resources` in reverse order, each through its async `close()` or, as
+model providers do, `aclose()`. Without `owned_resources`, close your own stores
+and providers only once `app.shutdown_outcome.settled` is true. Do not
 nest the app inside `async with stores:`, which closes them unconditionally. The
 order, deadline, and outcome are specified in the runtime contracts.
 

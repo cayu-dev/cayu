@@ -64,6 +64,22 @@ class SupportsAsyncClose(Protocol):
     async def close(self) -> None: ...
 
 
+class SupportsAsyncAclose(Protocol):
+    """A transferred resource that closes with ``aclose()``, such as a model provider."""
+
+    async def aclose(self) -> None: ...
+
+
+def _async_closer(resource: object) -> Callable[[], Awaitable[None]]:
+    # An async close() keeps working as before; otherwise an async aclose(), the
+    # method model providers close with, or one next to a synchronous close().
+    for name in ("close", "aclose"):
+        close = getattr(resource, name, None)
+        if callable(close) and inspect.iscoroutinefunction(close):
+            return close
+    raise TypeError("owned_resources must provide an async close() or aclose() method.")
+
+
 class ShutdownBudget:
     """One deadline shared by a sequence of bounded shutdown operations."""
 
@@ -470,17 +486,14 @@ class ApplicationShutdown:
         admission: ApplicationAdmission,
         stages: Callable[[], Sequence[ShutdownStage]],
         late_work: Callable[[], Mapping[str, ApplicationShutdownStepReason]] = dict,
-        owned_resources: Iterable[SupportsAsyncClose] = (),
+        owned_resources: Iterable[SupportsAsyncClose | SupportsAsyncAclose] = (),
     ) -> None:
         self.admission = admission
         self._stages = stages
         self._late_work = late_work
         # Each resource closes once, even when it is handed over more than once.
         resources = tuple({id(resource): resource for resource in owned_resources}.values())
-        for resource in resources:
-            close = getattr(resource, "close", None)
-            if not callable(close) or not inspect.iscoroutinefunction(close):
-                raise TypeError("owned_resources must provide an async close() method.")
+        self._closers = {id(resource): _async_closer(resource) for resource in resources}
         self._owned_resources = resources
         self._released: set[int] = set()
         self._attempt = 0
@@ -663,7 +676,7 @@ class ApplicationShutdown:
             closing = self._closing.get(key)
             if closing is None:
                 closing = asyncio.create_task(
-                    capture_awaitable_outcome(resource.close),
+                    capture_awaitable_outcome(self._closers[key]),
                     name="cayu-application-owned-resource-close",
                 )
                 closing.add_done_callback(_consume_task_outcome)
@@ -743,5 +756,6 @@ __all__ = [
     "ShutdownBudget",
     "ShutdownStage",
     "ShutdownStepSpec",
+    "SupportsAsyncAclose",
     "SupportsAsyncClose",
 ]

@@ -30,6 +30,7 @@ from cayu.runtime.application_lifecycle import (
 from cayu.runtime.application_lifecycle import ApplicationShutdownStep as ApplicationShutdownStep
 from cayu.runtime.application_lifecycle import ShutdownBudget as ShutdownBudget
 from cayu.runtime.application_lifecycle import ShutdownStepSpec as ShutdownStepSpec
+from cayu.runtime.application_lifecycle import SupportsAsyncAclose as SupportsAsyncAclose
 from cayu.runtime.application_lifecycle import SupportsAsyncClose as SupportsAsyncClose
 from cayu.runtime.checks import AVAILABLE_CHECK_TAGS as AVAILABLE_CHECK_TAGS
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES as BUILTIN_DIAGNOSTIC_CODES
@@ -531,6 +532,7 @@ __all__ = [
     "StopDecision",
     "StopLimit",
     "StoreManifest",
+    "SupportsAsyncAclose",
     "SupportsAsyncClose",
     "TaskSessionClosureStore",
     "ToolCompletionPolicy",

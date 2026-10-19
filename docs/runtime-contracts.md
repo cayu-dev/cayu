@@ -662,11 +662,12 @@ never the exception's message or causes, which could carry secrets.
 
 **Ownership.** The app never closes stores, providers, or other resources a caller
 supplied. Pass `owned_resources=(...)` to hand some over: each needs an async
-`close()`, and they are closed once (even if handed over twice), in reverse order,
-only after every step settled. Each close is bounded by the deadline. A close that
+`close()` or, like the built-in model providers, an async `aclose()` (an async
+`close()` is used when both exist). They are closed once (even if handed over
+twice), in reverse order, only after every step settled. Each close is bounded by the deadline. A close that
 fails or runs over stops the release there: the remaining resources stay open, the
 outcome is `failed` or `incomplete`, and the next attempt joins a close still
-running or calls a failed `close()` again. Otherwise release your own resources
+running or calls a failed close again. Otherwise release your own resources
 only once `app.shutdown_outcome.settled` is true; on an incomplete outcome keep
 them open and call `aclose()` again. Do not wrap the app in `async with` blocks of stores
 that close unconditionally on exit, such as `ApplicationStores`; hand them to the

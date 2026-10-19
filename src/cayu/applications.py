@@ -507,6 +507,7 @@ from cayu.runtime.application_lifecycle import (
     ApplicationShutdownStepReason,
     ShutdownStage,
     ShutdownStepSpec,
+    SupportsAsyncAclose,
     SupportsAsyncClose,
     _admitted_entrance,
     _tracked_entrance,
@@ -1010,7 +1011,7 @@ class CayuApp:
         session_execution: SessionExecutionConfig | None = None,
         model_policy: ModelPolicy | None = None,
         release_identity: ReleaseIdentity | None = None,
-        owned_resources: Iterable[SupportsAsyncClose] = (),
+        owned_resources: Iterable[SupportsAsyncClose | SupportsAsyncAclose] = (),
     ) -> None:
         if model_policy is not None and type(model_policy) is not ModelPolicy:
             raise TypeError("model_policy must be ModelPolicy.")

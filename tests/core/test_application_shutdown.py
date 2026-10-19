@@ -269,6 +269,69 @@ def test_owned_resources_close_once_in_reverse_order_only_after_settling(monkeyp
     asyncio.run(scenario())
 
 
+def test_owned_resources_close_a_model_provider_through_aclose(monkeypatch) -> None:
+    from cayu.providers import ChatCompletionsProvider
+
+    async def scenario() -> None:
+        log: list[str] = []
+        provider = ChatCompletionsProvider(api_key="test-key")
+        real_aclose = provider.aclose
+
+        async def aclose() -> None:
+            log.append("provider")
+            await real_aclose()
+
+        monkeypatch.setattr(provider, "aclose", aclose)
+        app = _app(owned_resources=(_Resource(log, "stores"), provider))
+        outcome = await app.aclose(timeout_s=5)
+        assert outcome.settled and outcome.owned_resources == "released"
+        assert log == ["provider", "stores"]
+
+    asyncio.run(scenario())
+
+
+class _BothClose:
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    async def close(self) -> None:
+        self.log.append("close")
+
+    async def aclose(self) -> None:
+        self.log.append("aclose")
+
+
+class _SyncCloseAsyncAclose:
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    def close(self) -> None:
+        self.log.append("sync close")
+
+    async def aclose(self) -> None:
+        self.log.append("aclose")
+
+
+def test_owned_resources_use_async_close_first_then_async_aclose() -> None:
+    async def scenario() -> None:
+        log: list[str] = []
+        app = _app(owned_resources=(_BothClose(log), _SyncCloseAsyncAclose(log)))
+        assert (await app.aclose(timeout_s=5)).settled
+        assert log == ["aclose", "close"]
+
+    asyncio.run(scenario())
+
+
+class _SyncCloseOnly:
+    def close(self) -> None:
+        pass
+
+
+def test_owned_resources_without_an_async_close_or_aclose_are_refused() -> None:
+    with pytest.raises(TypeError, match=r"async close\(\) or aclose\(\) method"):
+        CayuApp(enable_logging=False, owned_resources=(_SyncCloseOnly(),))
+
+
 def test_a_stalled_drain_is_bounded_by_the_shared_deadline(monkeypatch) -> None:
     async def scenario() -> None:
         app = _app()
