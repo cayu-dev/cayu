@@ -420,6 +420,104 @@ Not yet available on the cloud factory: Docker toolchain profiles
 immutable inputs, a guest git baseline (Docker's `git_baseline`), and a
 network-free sandbox.
 
+### Coding in a sandbox brokered by Cayu Cloud
+
+On Cayu Cloud an Agent holds no cloud-provider permission. It doesn't call
+Lambda MicroVM itself. Cloud allocates the sandbox, runs its egress proxy,
+leases it, audits it and destroys it (Cloud's `cayu.cloud.sandbox` v1
+contract). `BrokeredSandboxCodingEnvironmentFactory` (in `cayu.sandbox_broker`)
+is the sibling of `SandboxCodingEnvironmentFactory` for that setup. It takes
+the same workspace options: `source_workspace`, `transfer_limits`, `sync_back`,
+`sandbox_excluded_directory_names` and `staging_capacity`. It also keeps the
+same protected directories and revision-aware copy-back. In place of Runtime
+egress policies it takes one of Cloud's egress modes:
+
+```python
+from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory, SandboxBrokerClient
+from cayu.workspaces import LocalWorkspace
+
+factory = BrokeredSandboxCodingEnvironmentFactory(
+    broker=SandboxBrokerClient.from_env(),
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    egress="public_web",  # or "none"
+)
+# Or configure everything from the environment:
+factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+)
+```
+
+| Variable | Meaning |
+|---|---|
+| `CAYU_CLOUD_API_URL` | Cloud API base URL. Must be HTTPS; plain HTTP works only for a loopback host. Cloud sets it. |
+| `CAYU_CLOUD_APPLICATION_ID` | The Agent whose `/sandboxes` routes to use. Cloud sets it. |
+| `CAYU_CLOUD_SANDBOX_TOKEN` | The Agent's sandbox credential (Cloud sets it), or an Organization API key with the `sandboxes` scope. |
+| `CAYU_CLOUD_SANDBOX_EGRESS` | `none` (no outbound network) or `public_web` (the open internet through Cloud's logging proxy). Required by `from_env`. |
+| `CAYU_CLOUD_SANDBOX_IMAGE` | Catalog image, default `coding-python`. |
+| `CAYU_CLOUD_SANDBOX_LEASE_SECONDS` | Lease length, 60 to 3600, default 900. |
+| `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 30. |
+
+Each session creates one sandbox. Its lease starts when the sandbox is ready,
+and the factory renews it at a third of the lease length. The factory waits up
+to 330 seconds for the sandbox, since Cloud fails one still provisioning after
+five minutes. Copy-in and copy-back use the broker's archive routes. Copy-in
+uploads the tree in archives of at most 8 MiB. Copy-back reads the changed
+files by name, in batches, splitting any batch the broker reports as too
+large. So a tree of any size moves, but one file must fit in one archive
+(`transfer_limits.max_file_bytes` is capped just under 8 MiB). File tools and
+commands run as broker commands. The sandbox is destroyed when the session's
+binding finalizes, or when setup fails. If copy-back fails, the factory keeps
+the sandbox for a retry but stops renewing it. If the Agent process dies,
+nothing renews the lease, and Cloud destroys the sandbox once the lease lapses.
+Each turn of a session gets a new sandbox, copied in from the source
+workspace. Completion recovery after a crash is refused, because it would run
+against an empty replacement and copy that emptiness back as deletions. The
+source keeps its last published state.
+
+Each command starts under a fresh command id and is polled until it finishes:
+
+- Its timeout is bounded only by the sandbox's remaining lifetime (eight hours
+  from ready). A command with no timeout gets the rest of that lifetime.
+- If the connection drops while a command starts or runs, the runner replays
+  the same id, and the broker never runs it twice.
+- If the caller cancels a command, the runner cancels it in the sandbox and
+  waits for the broker to confirm it stopped. Only when that confirmation
+  never comes does the runner close its exec path for good.
+- A busy answer (4 commands already running) is retried, since the command
+  never started.
+- Output is captured up to 2 MiB per stream. The broker measures that limit
+  on the JSON it returns, where a control character takes six bytes, so the
+  runner asks for up to six times the caller's limit and cuts the result back
+  to the raw bytes the caller asked for.
+- stdin over 1 MiB, any argv argument over 131,071 bytes (Linux's per-argument
+  limit), argv over 256 KiB in all, and env over 64 KiB are refused before
+  anything is sent.
+
+A broker answer without a contract code (from authentication, a proxy or the
+ingress) is retried only for 408, 429 and 5xx. Any other 4xx, such as a 401
+for a revoked credential, is final.
+
+Final admission uses the sandbox record's versioned `guarantees`. A capability
+such as `untrusted_code_isolation`, `real_credential_non_possession`,
+`guest_privilege_containment` or `deny_by_default_network` is available only
+when the guarantee item behind it is present. `deny_by_default_network` also
+needs `egress="none"`: `public_web` reaches the open internet through a proxy
+that logs but denies nothing. So a workload built with
+`ExecutionRequirements.untrusted()` is admitted only on a `none` sandbox that
+carries every item.
+Required executables are probed live in the sandbox.
+
+Each part also works alone:
+
+- `SandboxBrokerClient` is the wire client;
+- `SandboxLeaseKeeper` renews one lease;
+- `BrokeredSandboxRunner` is a `Runner` over one sandbox and destroys it when
+  closed;
+- `BrokeredSandboxWorkspace` is a `RunnerWorkspace` whose bulk copies use the
+  broker's archive routes.
+
+None of them imports a provider SDK or reads a cloud credential.
+
 ### Per-child workspaces for subagents
 
 A `SubagentTool` child runs in its parent's environment by default. Set
