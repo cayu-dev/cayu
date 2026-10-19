@@ -205,3 +205,60 @@ def test_retained_abandonment_rechecks_inactivity_after_selection(
             assert len(provider.requests) == tool.calls == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_sweep_abandons_the_previous_session_of_a_restarted_task(
+    backend, request, sqlite_resources
+):
+    async def scenario():
+        async with _stores(backend, request, sqlite_resources) as (store, _):
+            tasks = InMemoryTaskStore()
+            app = CayuApp(session_store=store, task_store=tasks, enable_logging=False)
+            provider = VersionedFakeProvider(_tool_call_response(7))
+            app.register_provider(provider, default=True)
+            tool = _UnknownEffect()
+            app.register_agent(
+                AgentSpec(name="agent", model="fake-model"),
+                tools=[tool],
+                tool_effect_reconcilers={
+                    "record": ToolEffectReconciliationRegistration(
+                        reconciler=_RetryableReconciler(), spec=_spec(supports_lookup=True)
+                    )
+                },
+            )
+            await tasks.create_task(TaskCreate(task_id="job", type="job", restartable=True))
+            claimed = await tasks.claim_task("worker")
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id="sweep",
+                        agent_name="agent",
+                        messages=[Message.text("user", "go")],
+                        task_id="job",
+                        task_worker_id="worker",
+                        task_lease_expires_at=claimed.lease_expires_at,
+                    )
+                )
+            ]
+            assert (await store.load("sweep")).status is SessionStatus.INTERRUPTED
+            # The worker shuts down and requeues the task, detaching this
+            # session; the next attempt then ends the task.
+            current = await tasks.load_task("job")
+            restarted = await tasks.restart_task(
+                "job", "worker", lease_expires_at=current.lease_expires_at
+            )
+            assert restarted.session_id is None
+            await tasks.cancel_task("job")
+
+            [result] = await app.recover_abandoned_sessions(
+                inactive_for_seconds=0, abandon_sessions_of_terminal_tasks=True
+            )
+            assert result.session_id == "sweep"
+            assert IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT in result.actions
+            assert (await store.load("sweep")).status is SessionStatus.FAILED
+            assert len(provider.requests) == tool.calls == 1
+
+    asyncio.run(scenario())

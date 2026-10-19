@@ -24,6 +24,8 @@ from cayu.approvals.tools import (
     PendingToolApproval,
 )
 from cayu.approvals.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
     PendingUserInput,
     UserInputPauseState,
     ambiguous_pending_user_input_from_checkpoint,
@@ -319,6 +321,23 @@ def _retain_abandoned_unreplayable_tool_round(
     abandoned["prior_tool_rounds"] = [*prior, abandoned["tool_round"]]
     abandoned["tool_round"] = durable_round
     return copied
+
+
+def _pop_abandoned_round_model_step_pointer(
+    checkpoint: dict[str, Any], *, model_step_id: str, tool_round_id: str
+) -> None:
+    """Drop the deferred model-step pointer of a round leaving resumable work."""
+
+    pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
+    if pointer is None:
+        return
+    if (
+        not pointer.assistant_message_deferred
+        or pointer.logical_step_id != model_step_id
+        or pointer.tool_round_id != tool_round_id
+    ):
+        raise RuntimeError("Abandoned tool round conflicts with its durable model-step pointer.")
+    checkpoint.pop(model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
 
 
 logger = logging.getLogger(__name__)
@@ -4091,19 +4110,11 @@ class IncompleteSessionRecovery:
                         metadata=metadata,
                     )
                     if abandoned is not None:
-                        return IncompleteSessionRecoveryResult(
-                            session_id=abandoned.id,
+                        return self._abandoned_round_result(
+                            abandoned,
                             previous_status=previous_status,
-                            status=abandoned.status,
-                            actions=(
-                                *actions,
-                                IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT,
-                            ),
-                            events=tuple(events),
-                            message=(
-                                "Abandoned the session; its unknown tool outcomes were not "
-                                "dispatched again."
-                            ),
+                            actions=actions,
+                            events=events,
                         )
                 return IncompleteSessionRecoveryResult(
                     session_id=session.id,
@@ -4254,6 +4265,31 @@ class IncompleteSessionRecovery:
                 ),
                 invocation_context=invocation_context,
             )
+            if (
+                abandon_unknown_tool_effects
+                and unresolved_effect
+                and not pending_child_ids
+                and pending_tool_round is not None
+                and session.status is SessionStatus.INTERRUPTED
+                and not await self._pending_foreground_children_at_human_gate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    pending=pending_approval,
+                    registered_agent=registered_agent,
+                    include_child_actions=True,
+                )
+            ):
+                abandoned = await self._abandon_unknown_tool_round(
+                    session=session,
+                    pending_round=pending_tool_round,
+                    pending_approval=pending_approval,
+                    reason=reason,
+                    metadata=metadata,
+                )
+                if abandoned is not None:
+                    return self._abandoned_round_result(
+                        abandoned, previous_status=previous_status, actions=actions, events=events
+                    )
             actions.append(IncompleteSessionRecoveryAction.PENDING_APPROVAL)
             return IncompleteSessionRecoveryResult(
                 session_id=session.id,
@@ -4342,6 +4378,30 @@ class IncompleteSessionRecovery:
                 ),
                 invocation_context=invocation_context,
             )
+            if (
+                abandon_unknown_tool_effects
+                and unresolved_effect
+                and not pending_child_ids
+                and session.status is SessionStatus.INTERRUPTED
+                and not await self._pending_foreground_children_at_human_gate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    pending=pending_user_input,
+                    registered_agent=registered_agent,
+                    include_child_actions=True,
+                )
+            ):
+                abandoned = await self._abandon_unknown_tool_round(
+                    session=session,
+                    pending_round=None,
+                    pending_user_input=pending_user_input,
+                    reason=reason,
+                    metadata=metadata,
+                )
+                if abandoned is not None:
+                    return self._abandoned_round_result(
+                        abandoned, previous_status=previous_status, actions=actions, events=events
+                    )
             actions.append(IncompleteSessionRecoveryAction.PENDING_USER_INPUT)
             return IncompleteSessionRecoveryResult(
                 session_id=session.id,
@@ -4428,6 +4488,30 @@ class IncompleteSessionRecovery:
 
         await self._session_store.transform_checkpoint(session.id, archive)
 
+    @staticmethod
+    def _abandoned_round_result(
+        abandoned: Session,
+        *,
+        previous_status: SessionStatus,
+        actions: list[IncompleteSessionRecoveryAction],
+        events: list[Event],
+    ) -> IncompleteSessionRecoveryResult:
+        return IncompleteSessionRecoveryResult(
+            session_id=abandoned.id,
+            previous_status=previous_status,
+            status=abandoned.status,
+            actions=(
+                *(
+                    action
+                    for action in actions
+                    if action is not IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT
+                ),
+                IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT,
+            ),
+            events=tuple(events),
+            message="Abandoned the session; its unknown tool outcomes were not dispatched again.",
+        )
+
     def _checkpoint_without_pending_tool_round(
         self,
         session: Session,
@@ -4450,49 +4534,103 @@ class IncompleteSessionRecovery:
             raise RuntimeError("Pending tool round changed before it was abandoned.")
         copied = copy_durable_record(checkpoint, "checkpoint")
         durable_round = copied.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
-        pointer = model_completion_publication.model_step_publication_from_checkpoint(copied)
-        if pointer is not None:
-            if (
-                not pointer.assistant_message_deferred
-                or pointer.logical_step_id != expected_identity.model_step_id
-                or pointer.tool_round_id != expected_identity.tool_round_id
-            ):
-                raise RuntimeError(
-                    "Abandoned tool round conflicts with its durable model-step pointer."
-                )
-            copied.pop(model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
+        _pop_abandoned_round_model_step_pointer(
+            copied,
+            model_step_id=expected_identity.model_step_id,
+            tool_round_id=expected_identity.tool_round_id,
+        )
+        return copied, durable_round
+
+    def _checkpoint_without_pending_approval_round(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        pending_round: pending_rounds.PendingToolRound,
+        pending_approval: PendingToolApproval,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Remove an approval-gated round together with its approval and claim."""
+
+        current = pending_approval_reader.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        if current != pending_approval:
+            raise RuntimeError("Pending tool approval changed before it was abandoned.")
+        copied, durable_round = self._checkpoint_without_pending_tool_round(
+            session, checkpoint, pending_round
+        )
+        copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
+        copied.pop(pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
+        return copied, durable_round
+
+    def _checkpoint_without_pending_user_input_round(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        pending_user_input: PendingUserInput,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Remove a user-input pause, which owns its round, and its answer claim."""
+
+        current, _intent = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
+            runtime_session=session,
+        )
+        if current != pending_user_input:
+            raise RuntimeError("Pending user input changed before it was abandoned.")
+        copied = copy_durable_record(checkpoint, "checkpoint")
+        durable_round = copied.pop(PENDING_USER_INPUT_CHECKPOINT_KEY)
+        copied.pop(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
+        _pop_abandoned_round_model_step_pointer(
+            copied,
+            model_step_id=pending_user_input.model_step_id,
+            tool_round_id=pending_user_input.tool_round_id,
+        )
         return copied, durable_round
 
     async def _abandon_unknown_tool_round(
         self,
         *,
         session: Session,
-        pending_round: pending_rounds.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound | None,
         reason: str,
         metadata: dict[str, Any],
+        pending_approval: PendingToolApproval | None = None,
+        pending_user_input: PendingUserInput | None = None,
     ) -> Session | None:
         """Fail an interrupted session whose round holds unknown tool outcomes.
 
         Each unknown effect keeps its ``outcome_unknown`` record and is never
         dispatched again. The round leaves resumable work in the same store
         transition that fails the session; recovery then publishes the
-        terminal evidence and releases the environment binding.
+        terminal evidence and releases the environment binding. A round held
+        by an approval or a user-input pause leaves together with that gate
+        and its resolution claim, so nothing can resolve it afterwards.
         """
 
+        held = pending_round if pending_user_input is None else pending_user_input
+        if held is None:
+            return None
+        tool_round_id = held.tool_round_id
+        tool_calls = [(call.tool_call_id, call.tool_name) for call in held.tool_calls]
+        task_id = held.task_id
         effects = ToolEffectStateOwner(self._session_store)
         unknown_tool_calls = []
-        for call in pending_round.tool_calls:
+        for tool_call_id, tool_name in tool_calls:
             record = await effects.resolve_call(
                 session,
-                tool_round_id=pending_round.tool_round_id,
-                tool_call_id=call.tool_call_id,
+                tool_round_id=tool_round_id,
+                tool_call_id=tool_call_id,
             )
             if record is not None and record.state in {"executing", "outcome_unknown"}:
                 unknown_tool_calls.append(
                     {
-                        "tool_round_id": pending_round.tool_round_id,
-                        "tool_call_id": call.tool_call_id,
-                        "tool_name": call.tool_name,
+                        "tool_round_id": tool_round_id,
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
                     }
                 )
         if not unknown_tool_calls:
@@ -4504,9 +4642,20 @@ class IncompleteSessionRecovery:
         ) -> dict[str, Any]:
             if current_session.run_epoch != session.run_epoch:
                 raise RuntimeError("Session changed before it was abandoned.")
-            copied, durable_round = self._checkpoint_without_pending_tool_round(
-                current_session, checkpoint, pending_round
-            )
+            if pending_user_input is not None:
+                copied, durable_round = self._checkpoint_without_pending_user_input_round(
+                    current_session, checkpoint, pending_user_input
+                )
+            elif pending_approval is not None:
+                assert pending_round is not None
+                copied, durable_round = self._checkpoint_without_pending_approval_round(
+                    current_session, checkpoint, pending_round, pending_approval
+                )
+            else:
+                assert pending_round is not None
+                copied, durable_round = self._checkpoint_without_pending_tool_round(
+                    current_session, checkpoint, pending_round
+                )
             if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
                 raise RuntimeError("Session already retains abandonment evidence.")
             copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
@@ -4552,7 +4701,7 @@ class IncompleteSessionRecovery:
                 return
 
         try:
-            await claim_abandonment_task_fence(tasks, session, task_id=pending_round.task_id)
+            await claim_abandonment_task_fence(tasks, session, task_id=task_id)
             with abandonment_checkpoint_publication():
                 return await self._session_store.transition_status_and_checkpoint(
                     session.id,
@@ -4672,8 +4821,14 @@ class IncompleteSessionRecovery:
         checkpoint: dict[str, Any] | None,
         pending: PendingToolApproval | PendingUserInput,
         registered_agent: runtime_records.RegisteredAgentState,
+        include_child_actions: bool = False,
     ) -> tuple[str, ...]:
-        """Read exact child obligations without repairing submissions or consuming a gate."""
+        """Read exact child obligations without repairing submissions or consuming a gate.
+
+        With ``include_child_actions``, an interrupted foreground child that still
+        owns an approval, a user-input pause or a delegated wait also counts: the
+        parent's unknown outcome is then that child's wait, not a lost result.
+        """
         children = await self._pending_tool_round_recovery.subagent_children_by_idempotency_key(
             session.id
         )
@@ -4719,11 +4874,79 @@ class IncompleteSessionRecovery:
             ):
                 continue
             metadata = child.metadata.get("subagent")
-            if (
-                type(metadata) is dict
-                and metadata.get("mode") == "foreground"
-                and child.status
-                in {SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+            if type(metadata) is not dict or metadata.get("mode") != "foreground":
+                continue
+            if child.status in {
+                SessionStatus.PENDING,
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+            } or (
+                include_child_actions
+                and child.status is SessionStatus.INTERRUPTED
+                and await self._foreground_child_owns_pending_action(child)
             ):
                 selected.append(child.id)
         return tuple(selected)
+
+    async def _foreground_child_owns_pending_action(self, child: Session) -> bool:
+        """Whether an interrupted child still waits for a human decision.
+
+        A resolved gate stays in the checkpoint while its calls run. Once one of
+        those calls holds an unknown outcome, the child waits for no decision.
+        A child that left this interrupted snapshot meanwhile, for example
+        because its gate was resolved, counts as pending: its calls are live.
+        """
+
+        from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
+
+        def changed(current: Session | None) -> bool:
+            return (
+                current is None
+                or current.instance_id != child.instance_id
+                or current.status is not SessionStatus.INTERRUPTED
+                or current.run_epoch != child.run_epoch
+            )
+
+        current, checkpoint = await load_runtime_session_checkpoint_snapshot(
+            self._session_store, child.id
+        )
+        if changed(current):
+            return True
+        pending = await self._foreground_child_checkpoint_owns_pending_action(current, checkpoint)
+        return changed(await self._session_store.load(child.id)) or pending
+
+    async def _foreground_child_checkpoint_owns_pending_action(
+        self, child: Session, checkpoint: dict[str, Any] | None
+    ) -> bool:
+        from cayu.runtime._foreground_child_wait import owned_delegated_wait
+
+        if (
+            await owned_delegated_wait(self._session_store, child=child, checkpoint=checkpoint)
+            is not None
+        ):
+            return True
+        gate: PendingToolApproval | PendingUserInput | None = (
+            pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
+        )
+        if gate is not None:
+            resolved = (
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(checkpoint)
+                is not None
+            )
+        else:
+            gate, intent = user_input_lifecycle_authority_from_checkpoint(
+                checkpoint, current_run_epoch=child.run_epoch
+            )
+            if gate is None:
+                return False
+            resolved = intent is not None
+        if not resolved:
+            return True
+        effects = ToolEffectStateOwner(self._session_store)
+        for call in gate.tool_calls:
+            record = await effects.resolve_call(
+                child, tool_round_id=gate.tool_round_id, tool_call_id=call.tool_call_id
+            )
+            if record is not None and record.state == "outcome_unknown":
+                return False
+        return True

@@ -132,6 +132,7 @@ class _LocalE2BHandle:
         self.options = options
         self.stdin_parts: list[str] = []
         self._process: asyncio.subprocess.Process | None = None
+        self._start_task: asyncio.Task[asyncio.subprocess.Process] | None = None
 
     async def send_stdin(self, data: str) -> None:
         self.stdin_parts.append(data)
@@ -144,15 +145,20 @@ class _LocalE2BHandle:
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             **self.options.get("envs", {}),
         }
-        self._process = await asyncio.create_subprocess_shell(
-            self.script,
-            cwd=self.options["cwd"],
-            env=environment,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+        self._start_task = asyncio.create_task(
+            asyncio.create_subprocess_shell(
+                self.script,
+                cwd=self.options["cwd"],
+                env=environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
         )
+        # Cancellation can arrive after the child starts but before asyncio
+        # hands back its handle. Keep that launch owned so kill() can join it.
+        self._process = await asyncio.shield(self._start_task)
         if self._process.stdin is not None:
             if self.options.get("stdin"):
                 self._process.stdin.write("".join(self.stdin_parts).encode("utf-8"))
@@ -195,10 +201,55 @@ class _LocalE2BHandle:
         )
 
     async def kill(self) -> bool:
+        if self._start_task is not None:
+            self._process = await asyncio.shield(self._start_task)
         if self._process is not None and self._process.returncode is None:
             _kill_local_process(self._process)
             await self._process.wait()
         return True
+
+
+def test_e2b_fixture_cancellation_retains_launch_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def run() -> None:
+        launched = asyncio.Event()
+        handoff = asyncio.Event()
+        process: asyncio.subprocess.Process | None = None
+        real_create = asyncio.create_subprocess_shell
+
+        async def delayed_create(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            nonlocal process
+            process = await real_create(*args, **kwargs)
+            launched.set()
+            await handoff.wait()
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_shell", delayed_create)
+        handle = _LocalE2BHandle("sleep 30", {"cwd": str(tmp_path)})
+        waiter = asyncio.create_task(handle.wait())
+        try:
+            async with asyncio.timeout(10):
+                await launched.wait()
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+                cleanup = asyncio.create_task(handle.kill())
+                await asyncio.sleep(0)
+                handoff.set()
+                await cleanup
+                assert process is not None and process.returncode is not None
+        finally:
+            handoff.set()
+            if process is not None:
+                _kill_local_process(process)
+                await process.wait()
+            if not waiter.done():
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter
+
+    asyncio.run(run())
 
 
 class _LocalE2BCommands:
@@ -1562,8 +1613,12 @@ def test_runner_conformance_cancellation_cannot_leave_command_running(
                 await task
             evidence.cleanup_artifact = getattr(exc_info.value, "artifacts", None)
             # The child cannot perform its mutation before cancellation, however
-            # long the parent is descheduled. Prove it stopped before releasing
-            # that gate, rather than inferring cleanup from a timed observation.
+            # long the parent is descheduled. SIGKILL can still be pending on a
+            # descendant after its shell exits, so wait for its terminal state
+            # before releasing the gate. Missing cleanup still times out here.
+            async with asyncio.timeout(5):
+                while _local_process_running(child_pid):
+                    await asyncio.sleep(0.01)
             evidence.observed = {
                 "started": started.exists(),
                 "child_running": _local_process_running(child_pid),

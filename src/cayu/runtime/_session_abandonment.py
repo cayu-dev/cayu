@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_durable_metadata
+from cayu.approvals.user_input import pending_user_input_from_checkpoint
 from cayu.events import EventType
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
@@ -15,6 +16,7 @@ from cayu.sessions._completion_finalization import (
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
@@ -86,6 +88,29 @@ def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _abandonable_tool_round(
+    checkpoint: dict[str, Any] | None,
+) -> tuple[str, tuple[str, ...], str | None] | None:
+    """The round abandonment would end, as its ID, tool call IDs and attached task.
+
+    An approval or user-input gate holds its round while the approved or
+    answered calls run, so an unknown outcome can be retained under either.
+    """
+
+    held = (
+        pending_approval_from_checkpoint(checkpoint)
+        or pending_user_input_from_checkpoint(checkpoint)
+        or pending_tool_round_from_checkpoint(checkpoint)
+    )
+    if held is None:
+        return None
+    return (
+        held.tool_round_id,
+        tuple(call.tool_call_id for call in held.tool_calls),
+        held.task_id,
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,11 +178,11 @@ class SessionAbandonment:
         session = await self._session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}")
-        pending_round = pending_tool_round_from_checkpoint(
+        pending_round = _abandonable_tool_round(
             await self._session_store.load_checkpoint(session_id)
         )
         if not await self.tasks_are_terminal(
-            session_id, task_id=None if pending_round is None else pending_round.task_id
+            session_id, task_id=None if pending_round is None else pending_round[2]
         ):
             raise SessionStatusConflict(
                 "Only a session whose tasks are all terminal can be abandoned."
@@ -226,10 +251,16 @@ class SessionAbandonment:
         """
 
         try:
-            if prior is not None and not await self.tasks_are_terminal(
-                session_id, require_task=True
-            ):
-                return prior
+            if prior is not None:
+                pending_round = _abandonable_tool_round(
+                    await self._session_store.load_checkpoint(session_id)
+                )
+                if not await self.tasks_are_terminal(
+                    session_id,
+                    require_task=True,
+                    task_id=None if pending_round is None else pending_round[2],
+                ):
+                    return prior
             return await self.abandon(
                 session_id,
                 reason="abandoned_session_recovered",
@@ -330,23 +361,18 @@ class SessionAbandonment:
             return not failures or failures[0].event.payload.get("error_type") != (
                 "SessionAbandoned"
             )
-        if (
-            checkpoint is None
-            or checkpoint.get("pending_tool_approval") is not None
-            or checkpoint.get("pending_user_input") is not None
-        ):
+        pending_round = _abandonable_tool_round(checkpoint)
+        if pending_round is None:
             return False
-        pending_round = pending_tool_round_from_checkpoint(checkpoint)
-        if pending_round is None or not await self.tasks_are_terminal(
-            session.id, require_task=True, task_id=pending_round.task_id
-        ):
+        tool_round_id, tool_calls, task_id = pending_round
+        if not await self.tasks_are_terminal(session.id, require_task=True, task_id=task_id):
             return False
         effects = ToolEffectStateOwner(self._session_store)
-        for call in pending_round.tool_calls:
+        for tool_call_id in tool_calls:
             record = await effects.resolve_call(
                 session,
-                tool_round_id=pending_round.tool_round_id,
-                tool_call_id=call.tool_call_id,
+                tool_round_id=tool_round_id,
+                tool_call_id=tool_call_id,
             )
             if record is not None and record.state in {"executing", "outcome_unknown"}:
                 return True
@@ -367,11 +393,15 @@ class SessionAbandonment:
                     "Abandoning a session attached to a task requires its task store."
                 )
             return not require_task
+        found = False
         if task_id is not None:
             task = await self._task_store.load_task(task_id)
-            if task is not None and task.status not in _TERMINAL_TASK_STATUSES:
-                return False
-        found = False
+            if task is not None:
+                if task.status not in _TERMINAL_TASK_STATUSES:
+                    return False
+                # A restart detaches its task from this session, so the query
+                # below no longer finds it; the attached task still counts.
+                found = True
         offset = 0
         while True:
             page = await self._task_store.list_tasks(

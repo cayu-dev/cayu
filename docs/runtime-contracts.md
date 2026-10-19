@@ -1767,7 +1767,12 @@ The built-in `ask_user` tool (`UserInputTool`, opt-in — register it only on ag
 
 `CayuApp.abandon_session` permanently fails a session stopped on an unknown
 external tool effect, retaining the uncertain receipt evidence and releasing its
-environment without another tool or model call. Its abandonment record is immutable
+environment without another tool or model call. When that call ran under a resolved
+approval or an answered user-input pause, the gate and its resolution claim leave
+resumable work with the round, so the gate cannot be resolved afterwards; a gate
+still awaiting its decision has no unknown outcome and is never abandoned. The
+task attached to the round counts as one of the session's tasks even after a
+restart detached it. Its abandonment record is immutable
 runtime authority and survives ordinary checkpoint replacement. With a task store,
 Runtime first atomically claims the complete quiescent terminal task set using the
 store's session closure protocol. Concurrent task creation or attachment either

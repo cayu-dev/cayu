@@ -7,6 +7,14 @@ this build. Schema revision 124 preserves restartable task policy, provisional r
 fences, and durable concurrency keys across every task claimant. All task stores must be migrated;
 older claimants do not understand key exclusion.
 
+- Abandon sessions whose unknown external tool outcome is held by a resolved
+  approval or an answered `ask_user` pause. `abandon_session` and the
+  abandoned-session sweep now end the round together with its gate, so the gate
+  cannot be resolved afterwards. A session still waiting on a decision or an
+  answer is not abandoned. The sweep also abandons the previous session of a
+  restarted task once that task is terminal; it used to skip it, keeping the
+  session's environment allocated.
+
 - Stream server-sent events and newline-delimited JSON responses through the
   egress proxy as they arrive instead of buffering the whole body, so a long
   streamed model call through virtual egress no longer hits the client's
