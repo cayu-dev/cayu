@@ -169,6 +169,7 @@ _DURABLE_ERROR_MESSAGES = {
 _JSON_SHORT_ESCAPES = ('"', "\\", "\b", "\f", "\n", "\r", "\t")
 _JSON_OTHER_CONTROL_RE = re.compile(r"[\x00-\x07\x0b\x0e-\x1f]")
 _NONPORTABLE_STRING_RE = re.compile(r"[\x00\ud800-\udfff]")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _JSON_ESCAPED_OR_NONPORTABLE_RE = re.compile(r'[\x00-\x1f"\\\ud800-\udfff]')
 _DURABLE_STRING_CHUNK_CHARS = 4096
 _ASCII_ESCAPED_BMP_RE = re.compile(r"[\x7f-\uffff]")
@@ -611,12 +612,16 @@ def require_clean_nonblank(value: str, field_name: str) -> str:
     return value
 
 
+def _contains_surrogate(value: str) -> bool:
+    return not value.isascii() and _SURROGATE_RE.search(value) is not None
+
+
 def require_unicode_scalar_text(value: str, field_name: str) -> str:
     """Reject lone UTF-16 surrogate code points from a validated string."""
 
     if type(value) is not str:
         raise ValueError(f"`{field_name}` must be a string.")
-    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+    if _contains_surrogate(value):
         raise ValueError(f"`{field_name}` must not contain Unicode surrogate code points.")
     return value
 
@@ -656,7 +661,7 @@ def _require_durable_text(value: Any, field_name: str, *, path: str) -> str:
         raise DurableValueError("invalid_text_type", field_name, path=path)
     if "\x00" in value:
         raise DurableValueError("nul_character", field_name, path=path)
-    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+    if _contains_surrogate(value):
         raise DurableValueError("unicode_surrogate", field_name, path=path)
     return value
 

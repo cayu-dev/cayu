@@ -52,6 +52,7 @@ from cayu.sessions._pending_tool_round import (
     PENDING_TOOL_ROUND_CHECKPOINT_KEY,
     PendingToolRound,
     pending_tool_round_identity,
+    revalidated_pending_tool_round,
 )
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions._runtime_publication import (
@@ -895,7 +896,7 @@ def _raise_with_cancellation(
 def _copy_pending_round(pending_round: PendingToolRound) -> PendingToolRound:
     if type(pending_round) is not PendingToolRound:
         raise TypeError("pending_round must be a PendingToolRound.")
-    return PendingToolRound.model_validate(pending_round.model_dump(mode="json"))
+    return revalidated_pending_tool_round(pending_round)
 
 
 def _copy_publication_request(

@@ -437,8 +437,7 @@ class _ToolRoundPublicationCoordinator:
             lambda: _durable_payload_utf8_size(public_event.payload),
         )
         self.validate_staged_payload(staged.tool_call_id, public_payload_bytes)
-        await self._session_store.transform_checkpoint(
-            self._session_id,
+        transform, committed_stage = _committed_stage_capture(
             tool_round_recovery.started_staged_terminal_publication_transform(
                 tool_round_identity=self._tool_round_identity,
                 tool_call_id=staged.tool_call_id,
@@ -448,19 +447,10 @@ class _ToolRoundPublicationCoordinator:
                 staged_at=staged_at,
                 publication_started_at=publication_started_at,
             ),
+            tool_call_id=staged.tool_call_id,
         )
-        checkpoint = await self._session_store.load_checkpoint(self._session_id)
-        stored = next(
-            (
-                item
-                for item in staged_terminal_reader.checkpoint_staged_terminals(
-                    checkpoint,
-                    tool_round_identity=self._tool_round_identity,
-                )
-                if item.tool_call_id == staged.tool_call_id
-            ),
-            None,
-        )
+        await self._session_store.transform_checkpoint(self._session_id, transform)
+        stored = committed_stage()
         if (
             stored is None
             or stored.publication_started_at != publication_started_at
@@ -615,6 +605,7 @@ class _ToolRoundPublicationCoordinator:
                 staged_at=staged_at,
             )
             self._stage_attempted_event_ids.add(projected.id)
+            committed_stage = None
             try:
                 transform = self._checkpoint_transform(
                     tool_call_id=tool_call_id,
@@ -717,6 +708,9 @@ class _ToolRoundPublicationCoordinator:
                         mutation=mutation,
                     )
                 else:
+                    transform, committed_stage = _committed_stage_capture(
+                        transform, tool_call_id=tool_call_id
+                    )
                     await self._session_store.transform_checkpoint(self._session_id, transform)
             except BaseException:
                 # A transform error may be either a definite rejection or a
@@ -739,15 +733,18 @@ class _ToolRoundPublicationCoordinator:
                     elif stored.event.id == projected.id:
                         self._record_durable_stage(stored)
                 raise
-            checkpoint = await self._session_store.load_checkpoint(self._session_id)
-            stored_stages = staged_terminal_reader.checkpoint_staged_terminals(
-                checkpoint,
-                tool_round_identity=self._tool_round_identity,
-            )
-            stored = next(
-                (item for item in stored_stages if item.tool_call_id == tool_call_id),
-                None,
-            )
+            if committed_stage is not None:
+                stored = committed_stage()
+            else:
+                checkpoint = await self._session_store.load_checkpoint(self._session_id)
+                stored_stages = staged_terminal_reader.checkpoint_staged_terminals(
+                    checkpoint,
+                    tool_round_identity=self._tool_round_identity,
+                )
+                stored = next(
+                    (item for item in stored_stages if item.tool_call_id == tool_call_id),
+                    None,
+                )
             if stored is None or stored.event.id != event.id:
                 raise RuntimeError("Staged terminal acknowledgement conflicts with its event.")
             self._record_durable_stage(stored)
@@ -817,8 +814,7 @@ class _ToolRoundPublicationCoordinator:
             if type(tool_call_id) is not str:
                 raise ValueError("Projected terminal lost its tool-call identity.")
             self.validate_staged_payload(tool_call_id, payload_bytes)
-            await self._session_store.transform_checkpoint(
-                self._session_id,
+            transform, committed_stage = _committed_stage_capture(
                 (
                     tool_round_recovery.completed_staged_terminal_transform
                     if hooks_completed
@@ -828,16 +824,10 @@ class _ToolRoundPublicationCoordinator:
                     event=projected,
                     payload_bytes=payload_bytes,
                 ),
+                tool_call_id=tool_call_id,
             )
-            checkpoint = await self._session_store.load_checkpoint(self._session_id)
-            stored_stages = staged_terminal_reader.checkpoint_staged_terminals(
-                checkpoint,
-                tool_round_identity=self._tool_round_identity,
-            )
-            stored = next(
-                (item for item in stored_stages if item.tool_call_id == tool_call_id),
-                None,
-            )
+            await self._session_store.transform_checkpoint(self._session_id, transform)
+            stored = committed_stage()
             if (
                 stored is None
                 or stored.event.id != projected.id
@@ -1200,6 +1190,31 @@ def _normalized_event_timestamp(value: datetime) -> datetime:
     """Apply Cayu's legacy offset-less-as-UTC event timestamp convention."""
 
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _committed_stage_capture(
+    transform: CheckpointTransform,
+    *,
+    tool_call_id: str,
+) -> tuple[CheckpointTransform, Callable[[], tool_round_recovery.StagedToolCallTerminal | None]]:
+    """Keep the stage that a successful checkpoint transform stored for one call.
+
+    Store preservation restores only private roots, so the round owner the
+    transform returns is the one committed. A normal return acknowledges the
+    stage without reloading the checkpoint; a failure leaves nothing captured.
+    """
+
+    committed: list[tool_round_recovery.StagedToolCallTerminal | None] = [None]
+
+    def capturing(session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+        committed[0] = None
+        updated = transform(session, checkpoint)
+        committed[0] = staged_terminal_reader.staged_terminal_from_owned_checkpoint(
+            updated, tool_call_id=tool_call_id
+        )
+        return updated
+
+    return capturing, lambda: committed[0]
 
 
 def _durable_payload_utf8_size(payload: dict[str, Any]) -> int:

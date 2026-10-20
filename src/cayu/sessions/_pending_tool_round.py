@@ -411,3 +411,13 @@ def pending_tool_round_identity(pending_round: PendingToolRound) -> ToolRoundIde
         model_step_id=pending_round.model_step_id,
         model_attempt_id=pending_round.model_attempt_id,
     )
+
+
+def revalidated_pending_tool_round(pending_round: PendingToolRound) -> PendingToolRound:
+    """Return a detached copy validated once from its own freshly dumped JSON."""
+
+    if type(pending_round) is not PendingToolRound:
+        raise TypeError("Pending tool round must be a PendingToolRound.")
+    return PendingToolRound.model_validate(
+        pending_round.model_dump(mode="json"), context=_OWNED_ROUND_JSON_CONTEXT
+    )

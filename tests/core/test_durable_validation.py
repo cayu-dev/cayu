@@ -25,6 +25,8 @@ from cayu._validation import (
     copy_durable_json_value,
     inspect_bounded_durable_json,
     json_utf8_size_within_limit,
+    require_durable_text,
+    require_unicode_scalar_text,
 )
 
 _SCALAR_TEXT = st.text(
@@ -176,6 +178,30 @@ def test_bounded_json_rejects_invalid_text_within_byte_limit(text: str, code: st
     with pytest.raises(DurableValueError) as caught:
         copy_bounded_durable_json_value(text, "record", max_bytes=32, max_nodes=10)
     assert caught.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("text", "valid"),
+    [
+        ("plain ascii", True),
+        ("héllo € 😀 \uffff", True),
+        ("x" * 10_000 + "😀", True),
+        ("\ud800", False),
+        ("\udfff", False),
+        ("x" * 10_000 + "\udc00", False),
+        ("é\ud83d", False),
+    ],
+)
+def test_durable_text_rejects_only_surrogate_code_points(text: str, valid: bool) -> None:
+    if valid:
+        assert require_durable_text(text, "text") == text
+        assert require_unicode_scalar_text(text, "text") == text
+        return
+    with pytest.raises(DurableValueError) as caught:
+        require_durable_text(text, "text")
+    assert caught.value.code == "unicode_surrogate"
+    with pytest.raises(ValueError, match="surrogate"):
+        require_unicode_scalar_text(text, "text")
 
 
 @pytest.mark.parametrize("text", ["ascii", "é", "€", "😀", "\n", '"', "\\"])

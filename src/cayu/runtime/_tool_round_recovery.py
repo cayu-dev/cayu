@@ -133,9 +133,7 @@ def checkpoint_with_assistant_publication_snapshot(
         updated_round = pending_round.model_copy(
             update={"assistant_publication": updated_publication},
         )
-        updated_round = pending_rounds.PendingToolRound.model_validate(
-            updated_round.model_dump(mode="json")
-        )
+        updated_round = pending_rounds.revalidated_pending_tool_round(updated_round)
         copied_checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
             updated_round.model_dump(mode="json")
         )
@@ -220,9 +218,7 @@ def checkpoint_with_assistant_publication_redactor(
                 )
             },
         )
-        updated_round = pending_rounds.PendingToolRound.model_validate(
-            updated_round.model_dump(mode="json")
-        )
+        updated_round = pending_rounds.revalidated_pending_tool_round(updated_round)
         copied_checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
             updated_round.model_dump(mode="json")
         )
@@ -734,12 +730,12 @@ def _replace_owned_staged_terminals(
     staged_terminals: list[StagedToolCallTerminal],
 ) -> dict[str, Any]:
     """Replace stages on a call-local owned checkpoint and revalidate its owner."""
-    copied_stages = [
-        StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
-        for item in staged_terminals
-    ]
-    updated_owner = owner.model_copy(update={"staged_terminals": copied_stages})
-    updated_owner = type(owner).model_validate(updated_owner.model_dump(mode="json"))
+    updated_owner = owner.model_copy(update={"staged_terminals": list(staged_terminals)})
+    # Validating the owner's freshly dumped JSON admits every stage once.
+    updated_owner = type(owner).model_validate(
+        updated_owner.model_dump(mode="json"),
+        context=pending_rounds._OWNED_ROUND_JSON_CONTEXT,
+    )
     copied[owner_key] = updated_owner.model_dump(mode="json")
     return copied
 

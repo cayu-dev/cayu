@@ -7,8 +7,10 @@ import pytest
 from tests.core.test_tool_round_publication import _lifecycle_events, _pending_round
 
 import cayu.runtime._tool_round_recovery as recovery
+import cayu.runtime._tool_round_staging as staging
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 
 
@@ -66,6 +68,48 @@ def test_terminal_transition_parses_owner_once_and_detaches(monkeypatch, kind):
     assert fresh["pending_tool_round"]["staged_terminals"][0]["hooks_state"] == (
         "completed" if kind == "completion" else "pending"
     )
+
+
+def test_committed_stage_capture_reads_the_returned_round_detached():
+    checkpoint, event, identity = state()
+    transform, committed = staging._committed_stage_capture(
+        recovery.completed_staged_terminal_transform(tool_round_identity=identity, event=event),
+        tool_call_id="call-a",
+    )
+    assert committed() is None
+    updated = transform(None, checkpoint)
+    stage = committed()
+    assert stage is not None
+    assert stage.hooks_state == "completed"
+    assert stage.event.id == event.id
+    stored_result = updated["pending_tool_round"]["staged_terminals"][0]["event"]["payload"]
+    content = stage.event.payload["result"]["content"]
+    stored_result["result"]["content"] = "changed after commit"
+    assert stage.event.payload["result"]["content"] == content
+
+    foreign = identity.model_copy(update={"tool_round_id": "tround_" + "9" * 32})
+    failing, failed = staging._committed_stage_capture(
+        recovery.completed_staged_terminal_transform(tool_round_identity=foreign, event=event),
+        tool_call_id="call-a",
+    )
+    with pytest.raises(RuntimeError):
+        failing(None, checkpoint)
+    assert failed() is None
+
+
+def test_owned_checkpoint_stage_lookup_ignores_other_calls():
+    checkpoint, _, _ = state()
+    assert (
+        staged_terminal_reader.staged_terminal_from_owned_checkpoint(
+            checkpoint, tool_call_id="call-b"
+        )
+        is None
+    )
+    stage = staged_terminal_reader.staged_terminal_from_owned_checkpoint(
+        checkpoint, tool_call_id="call-a"
+    )
+    assert stage is not None
+    assert stage.tool_call_id == "call-a"
 
 
 @pytest.mark.parametrize("change", ["unrelated_invalid", "foreign_round", "foreign_call"])
@@ -145,6 +189,16 @@ def test_native_round_delivers_all_results_with_bounded_parse_work(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(pending_round_reader, "_pending_tool_round_from_owned_checkpoint", observed)
+    store_type = InMemorySessionStore if backend == "memory" else SQLiteSessionStore
+    loads = 0
+    load_checkpoint = store_type.load_checkpoint
+
+    async def counted_load(self, session_id):
+        nonlocal loads
+        loads += 1
+        return await load_checkpoint(self, session_id)
+
+    monkeypatch.setattr(store_type, "load_checkpoint", counted_load)
 
     async def scenario():
         store = (
@@ -199,7 +253,10 @@ def test_native_round_delivers_all_results_with_bounded_parse_work(
             }
             # Bound actual round parses separately for each native backend.
             # Base e829882e5 needs 29 + 30*N (memory), 9 + 13*N (SQLite).
-            assert parses <= (29 + 22 * count if backend == "memory" else 9 + 11 * count)
+            assert parses <= (29 + 20 * count if backend == "memory" else 9 + 9 * count)
+            # Staging acknowledges each write from the committed transform, so
+            # a call needs only a fixed few checkpoint reads.
+            assert loads <= 20 + 3 * count
         finally:
             if isinstance(store, SQLiteSessionStore):
                 await store.close()

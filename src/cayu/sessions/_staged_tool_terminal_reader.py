@@ -6,7 +6,7 @@ from typing import Any
 
 from cayu._validation import copy_durable_json_value
 from cayu.approvals.tools import ToolPolicyEvidence
-from cayu.approvals.user_input import PendingUserInput
+from cayu.approvals.user_input import PENDING_USER_INPUT_CHECKPOINT_KEY, PendingUserInput
 from cayu.events import Event, EventType, copy_event
 from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions import _pending_tool_round as pending_rounds
@@ -66,10 +66,37 @@ def checkpoint_staged_terminals(
         checkpoint,
         tool_round_identity=tool_round_identity,
     )
-    return [
-        StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
-        for item in owner.staged_terminals
-    ]
+    # The owner was parsed from this call's private copy and is not returned.
+    return list(owner.staged_terminals)
+
+
+def staged_terminal_from_owned_checkpoint(
+    copied: dict[str, Any],
+    *,
+    tool_call_id: str,
+) -> StagedToolCallTerminal | None:
+    """Read one call's stage from a checkpoint a staging transform just returned.
+
+    The transform has already validated the owning round; only this stage is
+    admitted again, so it matches what a durable round trip would return.
+    """
+
+    for owner_key in (
+        pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+    ):
+        owner = copied.get(owner_key)
+        if type(owner) is not dict:
+            continue
+        stages = owner.get("staged_terminals")
+        if type(stages) is not list:
+            continue
+        for item in stages:
+            if type(item) is dict and item.get("tool_call_id") == tool_call_id:
+                return StagedToolCallTerminal.model_validate(
+                    copy_durable_json_value(item, "staged_terminal")
+                )
+    return None
 
 
 def _checkpoint_staged_terminal_owner(
