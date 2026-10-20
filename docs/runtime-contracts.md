@@ -14106,8 +14106,10 @@ extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for
 sidecar health interface, and terminates a newly created MicroVM if setup fails or is cancelled.
 `from_existing(...)` restores identity from `get_microvm` and generates a fresh endpoint token;
 JWE tokens are memory-only and never belong in reconnect metadata. Both process and shell forms
-cross sidecar protocol version `4` without host-environment inheritance; readiness rejects an
-image that reports another version. Protocol 4 carries up to 24 MiB of stdin (larger stdin is
+cross sidecar protocol version `6` without host-environment inheritance; readiness rejects an
+image that reports another version. Protocol 6 adds interactive processes through
+`interactive_process_capability()`: stdio streams by byte offset, and each process runs in its
+own guest PID namespace, so `close()` confirms that the whole process tree exited. Protocol 4 carries up to 24 MiB of stdin (larger stdin is
 refused by `preflight_exec` before dispatch) and up to 32 MiB of output per command, keeps only a
 digest of each start payload, and lets the runner release a terminal result after reading it so
 command output does not stay in sidecar memory. `verify_browser_workload()` runs a trusted probe

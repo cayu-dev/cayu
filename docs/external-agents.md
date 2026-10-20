@@ -218,6 +218,138 @@ flows without the provider's required authorization. Consult the current
 [Claude Agent SDK documentation](https://platform.claude.com/docs/en/agent-sdk/overview)
 and [Codex app-server documentation](https://developers.openai.com/codex/app-server/).
 
+## Launchers without Docker
+
+A launcher is an async context manager that receives the run's
+`ExternalAgentContext` and yields an `ExternalAgentLaunch`; pass it to an adapter as
+`launch=`. `docker_agent_launch` is one launcher. Where there is no Docker daemon,
+use `runner_agent_launch` or write your own.
+
+### Run the CLI in a Cayu runner
+
+`runner_agent_launch(runner=..., cli=..., environment=..., cwd=None, timeout_s=None)`
+runs the CLI inside any runner whose `interactive_process_capability()` returns a
+`RunnerInteractiveProcessCapability`. `LambdaMicroVMRunner` provides one through
+sidecar protocol 6. Each CLI process runs in its own PID namespace in the MicroVM,
+so closing it confirms that every process the CLI started has exited, including
+processes that left its process group. Another sandbox plugs in by implementing
+the capability on its runner; the launcher and the adapters stay the same.
+
+The runner is borrowed: you create it, put the CLI in its image, and close it.
+The SDK starts a local stand-in that relays the CLI's arguments and stdio to the
+runner over a private Unix socket. The launch's `cwd` is a host directory, because
+the SDK starts the stand-in there; in the guest the same path links to the
+runner's working directory. `timeout_s` bounds each guest process if the service
+disappears without closing it, so derive it from the run's deadline. As with the
+Docker launcher, model keys are refused in `environment`. The runner's network
+must give the CLI a model route that keeps keys outside the guest. The adapters
+install a secret protector before starting the CLI; the launcher registers each
+process's newly issued secrets before forwarding output. Direct launcher users
+that publish output must call `prepared.protect_secrets(protector)` first.
+
+```python
+import math
+from contextlib import asynccontextmanager
+
+from cayu.external_agents import ClaudeAgentAdapter, runner_agent_launch
+
+@asynccontextmanager
+async def launch(context):
+    # runner: a runner you own, such as a LambdaMicroVMRunner whose image has the CLI.
+    async with runner_agent_launch(
+        runner=runner,
+        cli="/usr/local/bin/claude",
+        environment=model_route_environment,
+        timeout_s=(None if (remaining := context.execution_deadline.remaining_seconds()) is None
+                   else math.ceil(remaining) + 60),
+    ) as prepared:
+        yield prepared
+
+adapter = ClaudeAgentAdapter(model=model, launch=launch)
+```
+
+### Write your own launcher
+
+Yield `ExternalAgentLaunch(executable, cwd, close, environment, secret_values)`:
+
+- `executable` is a local command that runs the whole CLI inside your sandbox and
+  relays its stdin and stdout. The SDK starts it with `environment` (inherited host
+  variables are blanked) and the CLI's arguments.
+- `cwd` must exist on the host, where the SDK starts `executable`, and name the
+  checkout in the sandbox, because Codex also uses it as its working directory.
+- `close` stops every process the CLI started and returns only once they have all
+  exited. Removing a container or ending a PID namespace gives that guarantee;
+  killing one process does not. It may be called more than once. If it raises,
+  Cayu keeps the run's task live and retries it.
+- `secret_values` lists every token you hand to the CLI, so Cayu redacts them.
+- `mcp_servers` (Claude) and `codex_config_overrides` (Codex) are optional
+  per-run settings.
+
+This launcher uses Podman, which needs no daemon. It runs one container per run on
+an existing internal network whose only reachable service is the gateway, mounts
+only the checkout at the same path, and removes the container on close:
+
+```python
+import asyncio
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from cayu.external_agents import ExternalAgentLaunch
+
+async def podman(*args: str) -> str:
+    process = await asyncio.create_subprocess_exec(
+        "podman", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"podman {args[0]} failed")
+    return stdout.decode().strip()
+
+@asynccontextmanager
+async def podman_launch(checkout: Path, environment: dict[str, str]):
+    container = await podman(
+        "run", "--detach", "--network", "agent-internal", "--userns", "keep-id",
+        "--volume", f"{checkout}:{checkout}", "--workdir", str(checkout),
+        "my-agent-image:version", "sleep", "infinity",
+    )
+
+    async def close() -> None:
+        # Removal kills and waits for every process in the container, and
+        # --force tolerates a container that is already gone.
+        await podman("rm", "--force", "--time", "0", container)
+
+    try:
+        with TemporaryDirectory() as state:
+            cli = Path(state) / "cli"
+            flags = " ".join(f"--env {key}" for key in environment)
+            cli.write_text(
+                "#!/bin/sh\n"
+                f'exec podman exec --interactive {flags} {container} '
+                '/usr/local/bin/claude "$@"\n'
+            )
+            cli.chmod(0o700)
+            yield ExternalAgentLaunch(
+                executable=str(cli),
+                cwd=str(checkout),
+                close=close,
+                # Rootless Podman needs its own home and runtime directory.
+                environment={
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": os.environ["HOME"],
+                    "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
+                    **environment,
+                },
+                secret_values=(environment["ANTHROPIC_AUTH_TOKEN"],),
+            )
+    finally:
+        await close()
+```
+
+Use it inside a per-run `launch(context)` like the Docker example above, passing
+the gateway capability's `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`.
+
 ## Native tools and permission decisions
 
 `CayuToolBridge(app, name=..., tools=..., policy=..., environment_name=...)` must be

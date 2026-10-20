@@ -95,9 +95,7 @@ class CodexAgentAdapter:
             client = None
             pending: asyncio.Task[Any] | None = None
             try:
-                if context.protect_secret is not None:
-                    for secret in launch.secret_values:
-                        context.protect_secret(secret)
+                launch.protect_secrets(context.protect_secret)
 
                 class Client(BoundedCodexTransport, sdk.CodexClient):
                     pass

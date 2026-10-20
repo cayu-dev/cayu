@@ -100,6 +100,16 @@ class ExternalAgentLaunch:
     secret_values: tuple[str, ...] = ()
     mcp_servers: Mapping[str, Any] = field(default_factory=dict)
     codex_config_overrides: tuple[str, ...] = ()
+    # Install before the SDK starts the CLI so launchers can register credentials
+    # created by individual processes before forwarding their output.
+    bind_secret_protector: Callable[[Callable[[str], None]], None] | None = None
+
+    def protect_secrets(self, protector: Callable[[str], None] | None) -> None:
+        if protector is not None:
+            for secret in self.secret_values:
+                protector(secret)
+            if self.bind_secret_protector is not None:
+                self.bind_secret_protector(protector)
 
 
 class ExternalAgentError(RuntimeError):

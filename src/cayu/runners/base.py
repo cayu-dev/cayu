@@ -198,6 +198,74 @@ class RunnerBinaryStreamCapability(ABC):
         """
 
 
+class RunnerInteractiveProcess(ABC):
+    """One live guest process whose stdio streams while it runs.
+
+    The caller owns the handle and must ``close`` it. ``close`` is the cleanup
+    authority: it stops the process and returns only after confirming that the
+    process and every descendant it started have exited, including descendants
+    that left its process group. When that cannot be confirmed it raises, and the
+    caller may retry it. It is idempotent once it has succeeded.
+    """
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        """Values in the process environment that its output must never publish."""
+
+        return ()
+
+    @abstractmethod
+    async def write(self, data: bytes) -> None:
+        """Deliver ``data`` to stdin in order. Raises ``BrokenPipeError`` once stdin is closed."""
+
+    @abstractmethod
+    async def close_stdin(self) -> None:
+        """Signal end of input."""
+
+    @abstractmethod
+    async def read(self) -> bytes:
+        """Return the next stdout bytes as they arrive, or ``b""`` at end of output."""
+
+    @abstractmethod
+    async def wait(self) -> int:
+        """Wait for the process to exit and return its exit code."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Stop the process and confirm its whole process tree has exited."""
+
+
+class RunnerInteractiveProcessCapability(ABC):
+    """Nominal runner capability for interactive processes with streaming stdio.
+
+    Like other capabilities it does not own the runner's lifecycle. Opening a
+    process applies the runner's execution fences and environment overlay, as
+    ``exec`` does. Stderr is not exposed: guest diagnostics are not a governed
+    publication channel.
+    """
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        """Values the runner places in every process environment that must stay private."""
+
+        return ()
+
+    @abstractmethod
+    async def open_interactive_process(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+    ) -> RunnerInteractiveProcess:
+        """Start ``command`` and return its live handle.
+
+        ``timeout_s`` bounds the process lifetime in the guest, so a caller that
+        disappears without closing the handle cannot leave it running forever.
+        """
+
+
 class RemoteWorkspaceBranchCapability(RunnerWorkspaceCapability):
     """Explicit provider proof for the durable guest branch protocol.
 
@@ -1325,6 +1393,15 @@ class Runner(ABC):
         """
 
         return self if isinstance(self, RunnerBinaryStreamCapability) else None
+
+    def interactive_process_capability(self) -> RunnerInteractiveProcessCapability | None:
+        """Return interactive process execution when this runner supports it.
+
+        Discovery must not provision a runner or execute commands. Only runners
+        that can confirm teardown of a whole guest process tree return one.
+        """
+
+        return None
 
     def reopen_exec(self) -> None:
         """Clear an intentional execution fence on an otherwise-open runner.

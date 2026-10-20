@@ -53,6 +53,10 @@ from cayu.runners.base import Runner as Runner
 from cayu.runners.base import RunnerBinaryStreamCapability as RunnerBinaryStreamCapability
 from cayu.runners.base import RunnerExecutionAdmissionObserver as RunnerExecutionAdmissionObserver
 from cayu.runners.base import RunnerExecutionError as RunnerExecutionError
+from cayu.runners.base import RunnerInteractiveProcess as RunnerInteractiveProcess
+from cayu.runners.base import (
+    RunnerInteractiveProcessCapability as RunnerInteractiveProcessCapability,
+)
 from cayu.runners.base import RunnerLifecycleState as RunnerLifecycleState
 from cayu.runners.base import RunnerSystemExecutionMode as RunnerSystemExecutionMode
 from cayu.runners.base import RunnerUnavailableError as RunnerUnavailableError

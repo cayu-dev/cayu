@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-Upgrade: rebuild Lambda MicroVM workspace images from the new sidecar; its
-content digest changes. Storage revision 124, compatibility floor 124, server
-contract 49 and manifest schema 17 are all unchanged.
+Upgrade: rebuild Lambda MicroVM images from this release's sidecar
+(`cayu lambda-microvm sidecar export`). `LambdaMicroVMRunner` now requires sidecar
+protocol 6 and refuses an image built from an earlier release at readiness.
+Storage revision 124, compatibility floor 124, server contract 49 and manifest
+schema 17 are all unchanged.
 
 ### Breaking changes
 
@@ -21,6 +23,14 @@ None.
   runner workspace in one guest operation instead of listing it and reading
   every file. File hashes are taken from the files' own bytes, as in direct
   observations of the same workspace.
+- Add `runner_agent_launch`, which runs Claude Code or Codex through the external
+  agent adapters inside any runner that can open interactive processes, with no
+  Docker daemon. Runners expose this through the new provider-neutral
+  `RunnerInteractiveProcessCapability`, and `LambdaMicroVMRunner` is the first
+  implementation: sidecar protocol 6 streams a command's stdio and runs it in its
+  own PID namespace, so closing it confirms every descendant has exited.
+  `docker_agent_launch` remains available, and the external-agents guide now
+  explains how to write your own launcher.
 
 ## v0.12.1
 

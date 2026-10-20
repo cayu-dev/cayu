@@ -108,9 +108,10 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `5`. `GET /health` returns
-`{"status":"ok","protocol_version":"5"}` so the host can reject an incompatible image before
-sending a command. Version 2 added the boolean `omit_truncated_output` command field: redacted
+The sidecar implements Cayu Lambda MicroVM command protocol version `6`. `GET /health` returns
+`{"status":"ok","protocol_version":"6"}` so the host can reject an incompatible image before
+sending a command. The host requires the exact version, so an image built from an earlier
+release must be rebuilt. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
 secret, while ordinary and trusted executions retain their bounded output.
 
@@ -172,6 +173,34 @@ stays end to end. The target is fixed for the current owner (a different target 
 409), and a superseding owner claim or the suspend hook clears it. Browser operator view,
 takeover, and recording use this path; they never use the egress proxy.
 
+Version 6 adds interactive commands, whose stdio streams while they run. A start with
+`"interactive": true` (agent profile only, no `stdin_base64`) returns
+`"process_tree": "pid_namespace"`: `unshare --pid --fork --kill-child` gives the command its own
+PID namespace, and inside it, after setpriv has dropped the identity, a small init runs the
+command and reaps orphans. When the command exits the init exits with its status and the kernel
+kills everything else in the namespace, so a descendant that left the process group cannot
+survive it. Cancellation kills the init rather than `unshare`, and `unshare` exits only after
+reaping it, so a terminal result reports `"process_tree_stopped": true` only once the whole tree
+is gone. A record whose tree was not confirmed stopped is never pruned, so a later cancel cannot
+be answered by a tombstone.
+
+Interactive stdio is plain request/response over the same authenticated endpoint, and only the
+current owner may move it:
+
+- `POST /v1/commands/{command_id}/stdin` with `owner_claim`, a byte `offset`, `data_base64` (up
+  to 4 MiB) and `eof`. Bytes before the sidecar's current offset are skipped, so a retried write
+  is idempotent; an offset past it is refused. The response reports the new offset and whether
+  stdin is closed.
+- `POST /v1/commands/{command_id}/stdout` with `owner_claim`, an `offset`, `max_bytes` (up to
+  4 MiB) and `wait_s` (up to 20 seconds). It long-polls for bytes at that offset. Reading at an
+  offset acknowledges every earlier byte, which is then dropped; reading the same offset again
+  recovers a lost response. Unread output is held up to 8 MiB, after which the sidecar stops
+  draining the pipe, so a slow host slows the command instead of growing sidecar memory. The
+  response reports `eof` once all output was read, with the command state.
+
+Stderr of an interactive command is drained and discarded, and its terminal result carries no
+output. Stdio requests run on their own thread pool so long polls cannot starve other endpoints.
+
 - `GET /health`
 - `POST /v1/owner`
 - `POST /v1/owner/check`
@@ -180,6 +209,8 @@ takeover, and recording use this path; they never use the egress proxy.
 - `POST /v1/commands`
 - `GET /v1/commands/{command_id}`
 - `POST /v1/commands/{command_id}/release`
+- `POST /v1/commands/{command_id}/stdin`
+- `POST /v1/commands/{command_id}/stdout`
 - `POST /v1/control-relay`
 - `DELETE /v1/commands/{command_id}`
 - AWS lifecycle hooks under `/aws/lambda-microvms/runtime/v1/`

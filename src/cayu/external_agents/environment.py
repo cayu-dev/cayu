@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
+import struct
 import sys
-from collections.abc import AsyncIterator, Awaitable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TypeVar
@@ -17,6 +20,7 @@ from uuid import uuid4
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu.external_agents.base import ExternalAgentLaunch
+from cayu.runners.base import ExecCommand, Runner, RunnerInteractiveProcess
 from cayu.runners.docker import DockerRunner
 
 _T = TypeVar("_T")
@@ -38,6 +42,29 @@ async def join_cleanup(operation: Awaitable[_T]) -> _T | None:
 def scrub_external_environment(environment: Mapping[str, str]) -> dict[str, str]:
     """Override SDK inheritance without changing this process's environment."""
     return {**dict.fromkeys(os.environ, ""), **environment}
+
+
+_MODEL_CREDENTIAL_KEYS = frozenset(
+    {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"}
+)
+
+
+def _validated_guest_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    if _MODEL_CREDENTIAL_KEYS.intersection(environment):
+        raise ValueError("Model credentials must stay in the service proxy.")
+    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in environment):
+        raise ValueError("External environment keys must be portable variable names.")
+    if any(type(value) is not str for value in environment.values()):
+        raise TypeError("External environment values must be strings.")
+    return dict(environment)
+
+
+def _guest_secret_values(environment: Mapping[str, str]) -> tuple[str, ...]:
+    return tuple(
+        value
+        for key, value in environment.items()
+        if any(word in key.upper() for word in ("KEY", "TOKEN", "AUTHORIZATION"))
+    )
 
 
 async def _require_internal_network(docker: str, network: str) -> None:
@@ -87,11 +114,7 @@ async def docker_agent_launch(
     root = workspace.resolve(strict=True)
     if not root.is_dir():
         raise ValueError("External workspace must be a prepared directory.")
-    forbidden = {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"}
-    if forbidden.intersection(environment):
-        raise ValueError("Model credentials must stay in the service proxy.")
-    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in environment):
-        raise ValueError("External environment keys must be portable variable names.")
+    environment = _validated_guest_environment(environment)
     docker = shutil.which("docker")
     if docker is None:
         raise RuntimeError("Docker is required for the external agent launcher.")
@@ -146,16 +169,281 @@ async def docker_agent_launch(
                 str(root),
                 runner.close,
                 {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": directory, **environment},
-                tuple(
-                    value
-                    for key, value in environment.items()
-                    if any(word in key.upper() for word in ("KEY", "TOKEN", "AUTHORIZATION"))
-                ),
+                _guest_secret_values(environment),
             )
     finally:
         from cayu.external_agents._cleanup import close_external_guest
 
         await close_external_guest(runner.close)
+
+
+_GUEST_HOME = "/tmp/cayu-agent"
+# Create the guest home and make the launch's working-directory path ($2, which
+# also exists on the host for the SDK) name the guest working directory, then
+# replace the shell with the CLI. "$0" is only a label.
+_GUEST_ENTRY = (
+    'mkdir -p -- "$HOME" "$1" && { [ -e "$2" ] || ln -s -- "$PWD" "$2"; } && shift 2 && exec "$@"'
+)
+_MAX_SHIM_FRAME_BYTES = 4 * 1024 * 1024
+_SHIM_HELLO_TIMEOUT_SECONDS = 30.0
+# The SDK starts the CLI through this stand-in. It forwards its arguments and
+# stdio over a private Unix socket to the launcher, which runs the real CLI in
+# the guest, and exits with the guest's exit code. Frames are one kind byte and
+# a big-endian length: h(ello), i(nput), e(nd of input) toward the launcher;
+# o(utput) and x (exit code) back.
+_SHIM_SOURCE = """\
+import json, os, socket, struct, sys, threading
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.connect({socket_path!r})
+lock = threading.Lock()
+def send(kind, payload=b""):
+    with lock:
+        connection.sendall(kind + struct.pack(">I", len(payload)) + payload)
+send(b"h", json.dumps({{"token": {token!r}, "argv": sys.argv[1:]}}).encode())
+def forward_input():
+    try:
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                break
+            send(b"i", chunk)
+        send(b"e")
+    except OSError:
+        pass
+threading.Thread(target=forward_input, daemon=True).start()
+def receive(size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+status = 1
+while True:
+    header = receive(5)
+    if header is None:
+        break
+    payload = receive(struct.unpack(">I", header[1:])[0])
+    if payload is None:
+        break
+    if header[:1] == b"o":
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(1, view):]
+    elif header[:1] == b"x":
+        status = struct.unpack(">i", payload)[0]
+        break
+os._exit(status if 0 <= status < 256 else 1)
+"""
+
+
+async def _read_shim_frame(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
+    header = await reader.readexactly(5)
+    (size,) = struct.unpack(">I", header[1:])
+    if size > _MAX_SHIM_FRAME_BYTES:
+        raise ValueError("External CLI stand-in frame is too large.")
+    return header[:1], await reader.readexactly(size)
+
+
+def _shim_frame(kind: bytes, payload: bytes = b"") -> bytes:
+    return kind + struct.pack(">I", len(payload)) + payload
+
+
+@asynccontextmanager
+async def runner_agent_launch(
+    *,
+    runner: Runner,
+    cli: str,
+    environment: Mapping[str, str],
+    cwd: str | None = None,
+    timeout_s: int | None = None,
+    max_processes: int = 4,
+) -> AsyncIterator[ExternalAgentLaunch]:
+    """Run the CLI inside any runner that can open interactive processes.
+
+    The runner (for example a ``LambdaMicroVMRunner`` whose image has the CLI)
+    is borrowed, not owned: the caller keeps its lifecycle and its network,
+    which is where model credentials belong. The SDK starts a host-side stand-in
+    that relays its arguments and stdio over a private Unix socket; each start
+    opens one guest process through ``Runner.interactive_process_capability()``
+    in ``cwd`` (default: the runner's working directory). ``close`` stops every
+    guest process and returns only after the runner confirmed each whole
+    process tree exited. ``timeout_s`` bounds each guest process even if this
+    host disappears.
+
+    The yielded ``cwd`` is a host directory, because the SDK starts the stand-in
+    there; in the guest the same path is a link to the working directory, so a
+    harness that reports or reuses its working directory sees one path.
+    """
+    if not Path(cli).is_absolute():
+        raise ValueError("The guest CLI path must be absolute.")
+    guest_environment = {"HOME": _GUEST_HOME, **_validated_guest_environment(environment)}
+    if type(max_processes) is not int or max_processes < 1:
+        raise ValueError("max_processes must be a positive integer.")
+    capability = runner.interactive_process_capability()
+    if capability is None:
+        raise ValueError(
+            "The runner cannot open interactive processes; use a runner that supports "
+            "them, such as LambdaMicroVMRunner with sidecar protocol 6."
+        )
+    protect_secret: Callable[[str], None] | None = None
+    declared_secrets = tuple(
+        dict.fromkeys((*_guest_secret_values(guest_environment), *capability.secret_values))
+    )
+
+    def bind_secret_protector(protector: Callable[[str], None]) -> None:
+        nonlocal protect_secret
+        protect_secret = protector
+
+    token = secrets.token_hex(32)
+    processes: set[RunnerInteractiveProcess] = set()
+    connections: set[asyncio.Task[None]] = set()
+    closing = False
+
+    async def relay(process: RunnerInteractiveProcess, writer: asyncio.StreamWriter) -> None:
+        while data := await process.read():
+            writer.write(_shim_frame(b"o", data))
+            await writer.drain()
+        writer.write(_shim_frame(b"x", struct.pack(">i", await process.wait())))
+        await writer.drain()
+
+    async def forward(process: RunnerInteractiveProcess, reader: asyncio.StreamReader) -> None:
+        while True:
+            kind, payload = await _read_shim_frame(reader)
+            if kind not in {b"i", b"e"}:
+                raise ValueError("Unexpected external CLI stand-in frame.")
+            try:
+                if kind == b"i":
+                    await process.write(payload)
+                else:
+                    await process.close_stdin()
+                    return
+            except (BrokenPipeError, ConnectionResetError):
+                # Closed guest stdin does not settle its independent output
+                # channel. Relay that channel through its real exit status.
+                return
+
+    async def connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        connections.add(task)
+        process = None
+        try:
+            if closing or len(connections) > max_processes:
+                return
+            async with asyncio.timeout(_SHIM_HELLO_TIMEOUT_SECONDS):
+                kind, payload = await _read_shim_frame(reader)
+            hello = json.loads(payload) if kind == b"h" else None
+            if (
+                not isinstance(hello, dict)
+                or type(hello.get("token")) is not str
+                or not hmac.compare_digest(hello["token"], token)
+                or type(hello.get("argv")) is not list
+                or any(type(argument) is not str for argument in hello["argv"])
+            ):
+                return
+            process = await capability.open_interactive_process(
+                ExecCommand.process(
+                    "/bin/sh",
+                    "-c",
+                    _GUEST_ENTRY,
+                    "cayu-agent",
+                    directory,
+                    workdir,
+                    cli,
+                    *hello["argv"],
+                ),
+                cwd=cwd,
+                env=guest_environment,
+                timeout_s=timeout_s,
+            )
+            processes.add(process)
+            for secret in process.secret_values:
+                if not secret:
+                    continue
+                if protect_secret is None:
+                    # Static launch secrets are already declared; newly issued
+                    # credentials require a live publication registry.
+                    if secret not in declared_secrets:
+                        raise RuntimeError("Interactive process secrets require a protector.")
+                else:
+                    protect_secret(secret)
+            output = asyncio.create_task(relay(process, writer))
+            source = asyncio.create_task(forward(process, reader))
+            try:
+                done, _ = await asyncio.wait((output, source), return_when=asyncio.FIRST_COMPLETED)
+                if source in done and source.exception() is None:
+                    # Guest stdin may close before its final output and exit
+                    # status. Keep the independent output channel alive.
+                    await output
+            finally:
+                for pending in (output, source):
+                    pending.cancel()
+                await asyncio.gather(output, source, return_exceptions=True)
+        except Exception:
+            # Guest and transport failures are content-free here: the stand-in
+            # exits non-zero and the SDK reports the CLI as failed.
+            pass
+        finally:
+            connections.discard(task)
+            writer.close()
+            if process is not None and not closing:
+                # An unconfirmed stop keeps the process for the launch's close.
+                with suppress(Exception):
+                    await join_cleanup(process.close())
+                    processes.discard(process)
+
+    async def close() -> None:
+        nonlocal closing
+        closing = True
+        server.close()
+        pending = tuple(connections)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await server.wait_closed()
+        failures = []
+        for process in tuple(processes):
+            try:
+                await process.close()
+            except Exception as error:
+                failures.append(error)
+            else:
+                processes.discard(process)
+        if failures:
+            raise ExceptionGroup("External guest processes were not confirmed stopped.", failures)
+
+    # A short path under /tmp fits a Unix socket address and can be created in
+    # the guest too.
+    with TemporaryDirectory(
+        prefix="cayu-agent-", dir="/tmp" if os.path.isdir("/tmp") else None
+    ) as directory:
+        workdir = os.path.join(directory, "workspace")
+        os.mkdir(workdir)
+        socket_path = os.path.join(directory, "s")
+        server = await asyncio.start_unix_server(connect, path=socket_path)
+        try:
+            os.chmod(socket_path, 0o600)
+            launcher = Path(directory) / "cli"
+            launcher.write_text(
+                f"#!{sys.executable} -I\n"
+                + _SHIM_SOURCE.format(socket_path=socket_path, token=token),
+                encoding="utf-8",
+            )
+            launcher.chmod(0o700)
+            yield ExternalAgentLaunch(
+                str(launcher),
+                workdir,
+                close,
+                {"PATH": "/usr/bin:/bin", "HOME": directory},
+                declared_secrets,
+                bind_secret_protector=bind_secret_protector,
+            )
+        finally:
+            from cayu.external_agents._cleanup import close_external_guest
+
+            await close_external_guest(close)
 
 
 def codex_proxy_overrides(base_url: str) -> tuple[str, ...]:

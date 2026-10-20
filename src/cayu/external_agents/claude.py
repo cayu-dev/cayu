@@ -164,9 +164,7 @@ class ClaudeAgentAdapter:
         final_usage: set[str | None] = set()
         async with self.launch(context) as launch:
             try:
-                if context.protect_secret is not None:
-                    for secret in launch.secret_values:
-                        context.protect_secret(secret)
+                launch.protect_secrets(context.protect_secret)
                 options = sdk.ClaudeAgentOptions(
                     model=self.model,
                     cwd=launch.cwd,

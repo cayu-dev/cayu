@@ -153,6 +153,8 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerExecutionAdmissionObserver,
+    RunnerInteractiveProcess,
+    RunnerInteractiveProcessCapability,
     RunnerLifecycleState,
     RunnerWorkloadAuthority,
     RunnerWorkspaceCapabilityT,
@@ -2389,6 +2391,19 @@ class _EgressManagedRunner(Runner):
 
         return self._runner.workspace_capability(capability_type)
 
+    def interactive_process_capability(self) -> RunnerInteractiveProcessCapability | None:
+        """Delegate interactive processes under this runner's dispatch fences.
+
+        Each open process counts as one workspace dispatch until its close
+        confirms the process tree stopped, and the session's virtual credentials
+        are declared as secret values of its output.
+        """
+
+        inner = self._runner.interactive_process_capability()
+        if inner is None:
+            return None
+        return _EgressInteractiveProcessCapability(self, inner)
+
     @_clean_runner_preflight
     def preflight_exec(
         self,
@@ -4384,6 +4399,93 @@ class _EgressManagedRunner(Runner):
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         return self._runner.resolve_cwd(cwd)
+
+
+class _EgressInteractiveProcessCapability(RunnerInteractiveProcessCapability):
+    def __init__(
+        self, runner: _EgressManagedRunner, inner: RunnerInteractiveProcessCapability
+    ) -> None:
+        self._runner = runner
+        self._inner = inner
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *(grant.presented_value for grant in self._runner._egress_grants),
+                    *self._inner.secret_values,
+                )
+            )
+        )
+
+    async def open_interactive_process(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+    ) -> RunnerInteractiveProcess:
+        dispatch_id = self._runner._begin_workspace_dispatch()
+        try:
+            process = await self._inner.open_interactive_process(
+                command, cwd=cwd, env=env, timeout_s=timeout_s
+            )
+        except BaseException as error:
+            self._runner._finish_workspace_dispatch(dispatch_id=dispatch_id, error=error)
+            raise
+        return _EgressInteractiveProcess(self._runner, process, dispatch_id, self.secret_values)
+
+
+class _EgressInteractiveProcess(RunnerInteractiveProcess):
+    def __init__(
+        self,
+        runner: _EgressManagedRunner,
+        process: RunnerInteractiveProcess,
+        dispatch_id: int,
+        secret_values: tuple[str, ...],
+    ) -> None:
+        self._runner = runner
+        self._process = process
+        self._dispatch_id: int | None = dispatch_id
+        self._secret_values = tuple(dict.fromkeys((*secret_values, *process.secret_values)))
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        return self._secret_values
+
+    async def write(self, data: bytes) -> None:
+        await self._process.write(data)
+
+    async def close_stdin(self) -> None:
+        await self._process.close_stdin()
+
+    async def read(self) -> bytes:
+        return await self._process.read()
+
+    async def wait(self) -> int:
+        return await self._process.wait()
+
+    async def close(self) -> None:
+        try:
+            await self._process.close()
+        except BaseException as error:
+            # An unconfirmed stop leaves workspace quiescence uncertain, which
+            # binding finalization treats as such. Retrying close still retries
+            # the inner stop.
+            self._finish_dispatch(error=error)
+            raise
+        self._finish_dispatch(result=ExecResult(exit_code=0))
+
+    def _finish_dispatch(
+        self, *, result: ExecResult | None = None, error: BaseException | None = None
+    ) -> None:
+        dispatch_id, self._dispatch_id = self._dispatch_id, None
+        if dispatch_id is not None:
+            self._runner._finish_workspace_dispatch(
+                dispatch_id=dispatch_id, result=result, error=error
+            )
 
 
 async def require_active_egress_transition_environment(

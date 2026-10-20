@@ -12,6 +12,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -27,6 +28,40 @@ MAX_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 DEFAULT_CANCEL_TIMEOUT_SECONDS = 5.0
 MAX_STDIN_BYTES = 24 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
+# Interactive commands stream stdio while they run. Unread stdout is held up to
+# this window; beyond it the reader stops draining the pipe, so a slow host
+# applies backpressure to the guest process instead of growing sidecar memory.
+INTERACTIVE_STDOUT_WINDOW_BYTES = 8 * 1024 * 1024
+MAX_INTERACTIVE_STDIN_CHUNK_BYTES = 4 * 1024 * 1024
+MAX_INTERACTIVE_READ_BYTES = 4 * 1024 * 1024
+MAX_INTERACTIVE_WAIT_SECONDS = 20.0
+_INTERACTIVE_START_TIMEOUT_SECONDS = 5.0
+# The first process inside an interactive command's PID namespace. It starts
+# the command, reaps orphaned descendants, and exits with the command's status.
+# When it exits the kernel kills every other process in the namespace, so a
+# descendant that left the process group (``setsid``) still cannot outlive it.
+PID_NAMESPACE_INIT = """
+import os, signal, sys
+argv = sys.argv[1:]
+child = os.fork()
+if child == 0:
+    try:
+        os.execvp(argv[0], argv)
+    finally:
+        os._exit(127)
+for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(number, lambda *_: os.kill(child, signal.SIGKILL))
+status = 127
+while True:
+    try:
+        pid, raw = os.wait()
+    except ChildProcessError:
+        break
+    if pid == child:
+        status = os.waitstatus_to_exitcode(raw)
+        break
+sys.exit(status if status >= 0 else 128 - status)
+"""
 
 _TERMINAL_STATES = frozenset({"completed", "cancelled", "failed", "released"})
 _PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
@@ -210,6 +245,10 @@ class CommandConflictError(RuntimeError):
     """A command ID was reused with a different payload."""
 
 
+class CommandNotFoundError(LookupError):
+    """No command with this ID is known to the sidecar."""
+
+
 class _TcpRelay:
     """Root-namespace TCP relay exposed only on the agent veth gateway."""
 
@@ -334,6 +373,7 @@ class CommandExecutionBoundary:
         agent_netns: str | None = None,
         relay_factory: Any | None = None,
         control_relay_factory: Any | None = None,
+        init_interpreter: str = sys.executable,
     ) -> None:
         if (agent_uid is None) != (agent_gid is None):
             raise ValueError("agent_uid and agent_gid must be configured together")
@@ -354,6 +394,17 @@ class CommandExecutionBoundary:
         self._control_relay_factory = control_relay_factory or _control_relay
         self._control_relay: Any | None = None
         self._control_target: tuple[str, int] | None = None
+        if not init_interpreter or not os.path.isabs(init_interpreter):
+            raise ValueError("init_interpreter must be an absolute path")
+        self.init_interpreter = init_interpreter
+
+    def isolates_process_tree(self, *, execution_profile: ExecutionProfile) -> bool:
+        """Whether an interactive command of this profile runs in its own PID namespace."""
+        return (
+            execution_profile == "agent"
+            and self.agent_uid is not None
+            and self.agent_gid is not None
+        )
 
     def configure_control_relay(self, host: object, port: object) -> dict[str, Any]:
         """Relay the agent namespace's control hostname to one trusted private target.
@@ -383,6 +434,7 @@ class CommandExecutionBoundary:
         environment: dict[str, str],
         *,
         execution_profile: ExecutionProfile,
+        interactive: bool = False,
     ) -> tuple[list[str], dict[str, str]]:
         """Return the argv and environment the supervisor spawns for one command.
 
@@ -390,6 +442,11 @@ class CommandExecutionBoundary:
         ``LAUNCHER_ENVIRONMENT``; the command's environment is applied by
         ``env -i`` after setpriv has dropped the identity, capabilities and
         privileges, so no workload value reaches a process running as root.
+
+        An interactive agent command also gets its own PID namespace: ``unshare``
+        (still root) forks the unprivileged chain, whose last step is a small
+        init that runs the command and reaps orphans. The init exits with the
+        command, and the kernel then kills everything left in the namespace.
         """
         if execution_profile == "trusted" or self.agent_uid is None or self.agent_gid is None:
             return list(argv), dict(environment)
@@ -404,6 +461,9 @@ class CommandExecutionBoundary:
             if self.agent_netns is not None
             else []
         )
+        if interactive:
+            prefix.extend(["/usr/bin/unshare", "--pid", "--fork", "--kill-child", "--"])
+            argv = [self.init_interpreter, "-I", "-c", PID_NAMESPACE_INIT, *argv]
         return [
             *prefix,
             "/usr/bin/setpriv",
@@ -488,6 +548,111 @@ class _CommandRecord:
     finished_at: float | None = None
     finished: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    interactive: _InteractiveStreams | None = None
+    # "pid_namespace" when the kernel tears down every descendant with the
+    # command; "process_group" when only the command's process group is signalled.
+    process_tree: str = "process_group"
+    namespace_init: tuple[int, str] | None = None
+
+
+class _InteractiveStreams:
+    """Live stdio of one interactive command, addressed by byte offsets.
+
+    Both directions are idempotent under retries. A stdin write names the
+    offset it starts at, so a replayed chunk is skipped instead of written
+    twice. A stdout read names the offset it wants; reading at an offset
+    acknowledges every earlier byte, which is then dropped, and a lost
+    response is recovered by reading the same offset again.
+    """
+
+    def __init__(self, window_bytes: int = INTERACTIVE_STDOUT_WINDOW_BYTES) -> None:
+        self.window_bytes = window_bytes
+        self.condition = threading.Condition()
+        self.started = threading.Event()
+        self.buffer = bytearray()
+        self.base = 0
+        self.total_bytes = 0
+        self.eof = False
+        self.abandoned = False
+        self.stdin: Any | None = None
+        self.stdin_lock = threading.Lock()
+        self.stdin_offset = 0
+        self.stdin_closed = False
+
+    def attach(self, stdin: Any | None) -> None:
+        self.stdin = stdin
+        self.started.set()
+
+    def add_stdout(self, chunk: bytes) -> None:
+        with self.condition:
+            while len(self.buffer) >= self.window_bytes and not self.abandoned:
+                self.condition.wait()
+            self.total_bytes += len(chunk)
+            if not self.abandoned:
+                self.buffer.extend(chunk)
+            self.condition.notify_all()
+
+    def finish_stdout(self) -> None:
+        with self.condition:
+            self.eof = True
+            self.condition.notify_all()
+
+    def abandon(self) -> None:
+        """Stop holding output nobody will read and release a blocked reader."""
+        with self.condition:
+            self.abandoned = True
+            self.buffer.clear()
+            self.condition.notify_all()
+        self.started.set()
+
+    def read(self, offset: int, *, max_bytes: int, wait_s: float) -> tuple[bytes, bool]:
+        with self.condition:
+            if self.abandoned:
+                # Cancelled or timed out: nothing more will be delivered.
+                return b"", True
+            end = self.base + len(self.buffer)
+            if not self.base <= offset <= end:
+                raise CommandRequestError("stdout offset is outside the retained window")
+            del self.buffer[: offset - self.base]
+            self.base = offset
+            self.condition.notify_all()
+            deadline = time.monotonic() + wait_s
+            while not self.buffer and not self.eof and not self.abandoned:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(remaining)
+            if self.abandoned:
+                return b"", True
+            data = bytes(self.buffer[:max_bytes])
+            return data, self.eof and len(data) == len(self.buffer)
+
+    def write(self, offset: int, data: bytes, *, eof: bool) -> dict[str, Any]:
+        if not self.started.wait(_INTERACTIVE_START_TIMEOUT_SECONDS):
+            raise CommandRequestError("interactive command has not started")
+        with self.stdin_lock:
+            if offset > self.stdin_offset:
+                raise CommandRequestError("stdin offset skips bytes that were never written")
+            pending = data[self.stdin_offset - offset :]
+            if pending and self.stdin_closed:
+                return {"offset": self.stdin_offset, "closed": True}
+            try:
+                if pending and self.stdin is not None:
+                    self.stdin.write(pending)
+                    self.stdin.flush()
+                self.stdin_offset += len(pending)
+                if eof and not self.stdin_closed:
+                    self.stdin_closed = True
+                    if self.stdin is not None:
+                        self.stdin.close()
+            except (BrokenPipeError, ValueError, OSError):
+                self.stdin_closed = True
+                if self.stdin is not None:
+                    # Closing discards the unwritten buffer instead of leaving
+                    # it for a failing flush at garbage collection.
+                    with contextlib.suppress(OSError, ValueError):
+                        self.stdin.close()
+            return {"offset": self.stdin_offset, "closed": self.stdin_closed}
 
 
 class _LimitedBuffer:
@@ -574,14 +739,84 @@ class CommandSupervisor:
                 payload_fingerprint=fingerprint,
                 owner_generation=owner_generation,
             )
+            if validated["interactive"]:
+                record.interactive = _InteractiveStreams()
+                record.process_tree = validated["process_tree"]
             self._records[identifier] = record
         threading.Thread(
-            target=self._run,
+            target=self._run_interactive if validated["interactive"] else self._run,
             args=(record, validated),
             name=f"cayu-command-{identifier}",
             daemon=True,
         ).start()
-        return {"command_id": identifier, "state": "accepted"}
+        accepted: dict[str, Any] = {"command_id": identifier, "state": "accepted"}
+        if validated["interactive"]:
+            accepted.update(interactive=True, process_tree=record.process_tree)
+        return accepted
+
+    def write_stdin(
+        self, command_id: str, *, offset: object, data_base64: object, eof: object
+    ) -> dict[str, Any]:
+        """Write the next stdin bytes of an interactive command, idempotently by offset."""
+        record = self._interactive_record(command_id)
+        if type(offset) is not int or offset < 0:
+            raise CommandRequestError("offset must be a non-negative integer")
+        if type(data_base64) is not str:
+            raise CommandRequestError("data_base64 must be a string")
+        try:
+            data = base64.b64decode(data_base64, validate=True)
+        except ValueError as exc:
+            raise CommandRequestError("data_base64 must be valid base64") from exc
+        if len(data) > MAX_INTERACTIVE_STDIN_CHUNK_BYTES:
+            raise CommandRequestError(
+                f"stdin chunk exceeds {MAX_INTERACTIVE_STDIN_CHUNK_BYTES} bytes"
+            )
+        streams = cast("_InteractiveStreams", record.interactive)
+        return {
+            "command_id": record.command_id,
+            **streams.write(offset, data, eof=_boolean(eof, "eof")),
+        }
+
+    def read_stdout(
+        self, command_id: str, *, offset: object, max_bytes: object, wait_s: object
+    ) -> dict[str, Any]:
+        """Return stdout from ``offset``, waiting up to ``wait_s`` for new bytes."""
+        record = self._interactive_record(command_id)
+        if type(offset) is not int or offset < 0:
+            raise CommandRequestError("offset must be a non-negative integer")
+        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_INTERACTIVE_READ_BYTES:
+            raise CommandRequestError(
+                f"max_bytes must be an integer from 1 to {MAX_INTERACTIVE_READ_BYTES}"
+            )
+        if (
+            not isinstance(wait_s, (int, float))
+            or isinstance(wait_s, bool)
+            or not 0 <= wait_s <= MAX_INTERACTIVE_WAIT_SECONDS
+        ):
+            raise CommandRequestError(
+                f"wait_s must be from 0 to {MAX_INTERACTIVE_WAIT_SECONDS:g} seconds"
+            )
+        streams = cast("_InteractiveStreams", record.interactive)
+        data, eof = streams.read(offset, max_bytes=max_bytes, wait_s=float(wait_s))
+        response: dict[str, Any] = {
+            "command_id": record.command_id,
+            "offset": offset,
+            "data_base64": base64.b64encode(data).decode("ascii"),
+            "eof": eof,
+        }
+        if eof:
+            response["state"] = self._snapshot(record)["state"]
+        return response
+
+    def _interactive_record(self, command_id: str) -> _CommandRecord:
+        identifier = _command_id(command_id)
+        with self._lock:
+            record = self._records.get(identifier)
+        if record is None:
+            raise CommandNotFoundError("command not found")
+        if record.interactive is None:
+            raise CommandRequestError("command is not interactive")
+        return record
 
     def get(self, command_id: str) -> dict[str, Any]:
         identifier = _command_id(command_id)
@@ -630,14 +865,30 @@ class CommandSupervisor:
                 self._records[identifier] = record
                 return self._snapshot(record)
         with record.lock:
-            if record.state in _TERMINAL_STATES:
+            terminal = record.state in _TERMINAL_STATES
+            if terminal and not (
+                record.interactive is not None
+                and record.result is not None
+                and record.result.get("process_tree_stopped") is False
+            ):
                 return self._snapshot_locked(record)
-            record.cancel_requested = True
-            record.cancel_reason = reason
+            if not terminal:
+                record.cancel_requested = True
+                record.cancel_reason = reason
             process = record.process
-        if process is not None:
+        if record.interactive is not None:
+            record.interactive.abandon()
+            if process is not None:
+                _stop_interactive(record, process)
+        elif process is not None:
             _stop_process_group(process)
         record.finished.wait(timeout=self.cancel_timeout_s)
+        if terminal and process is not None and process.poll() is not None:
+            stopped = _process_tree_stopped(record, timeout_s=self.cancel_timeout_s)
+            if stopped:
+                with record.lock:
+                    assert record.result is not None
+                    record.result["process_tree_stopped"] = True
         return self._snapshot(record)
 
     def cancel_all(
@@ -787,13 +1038,123 @@ class CommandSupervisor:
                 record.finished_at = time.monotonic()
             record.finished.set()
 
+    def _run_interactive(self, record: _CommandRecord, payload: dict[str, Any]) -> None:
+        """Run one interactive command and settle it only once its tree has exited.
+
+        Stdout is held for the host in a bounded window, stderr is drained and
+        discarded (it is not a governed channel), and stdin arrives through
+        ``write_stdin``. The terminal result carries no output, only whether the
+        whole process tree was confirmed stopped.
+        """
+        streams = cast("_InteractiveStreams", record.interactive)
+        stderr = _LimitedBuffer(0)
+        process: subprocess.Popen[bytes] | None = None
+        readers: list[threading.Thread] = []
+        timed_out = False
+        error: BaseException | None = None
+        deadline = None if payload["timeout_s"] is None else time.monotonic() + payload["timeout_s"]
+        try:
+            with record.lock:
+                if record.cancel_requested:
+                    record.state = "cancelled"
+                    record.result = _interactive_result(
+                        record, state="cancelled", exit_code=-1, timed_out=False, stopped=True
+                    )
+                    return
+                process = subprocess.Popen(
+                    payload["argv"],
+                    cwd=payload["cwd"],
+                    env=payload["env"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                record.process = process
+                record.state = "running"
+            if record.process_tree == "pid_namespace":
+                record.namespace_init = _await_namespace_init(process)
+            streams.attach(process.stdin)
+            for target, args in (
+                (_drain_interactive, (process.stdout, streams)),
+                (_drain, (process.stderr, stderr)),
+            ):
+                reader = threading.Thread(target=target, args=args, daemon=True)
+                reader.start()
+                readers.append(reader)
+            try:
+                process.wait(timeout=payload["timeout_s"])
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                streams.abandon()
+                _stop_interactive(record, process)
+                process.wait(timeout=self.cancel_timeout_s)
+            # Remaining stdout belongs to the host until it reads EOF; a cancel
+            # abandons it. A process tree in its own namespace has fully exited
+            # here, so nothing else can hold the pipe open.
+            while readers[0].is_alive():
+                readers[0].join(timeout=0.2)
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                if record.cancel_requested or streams.abandoned or timed_out:
+                    streams.abandon()
+                    readers[0].join(timeout=self.cancel_timeout_s)
+                    break
+            readers[1].join(timeout=self.cancel_timeout_s)
+        except BaseException as exc:
+            error = exc
+            streams.abandon()
+            if process is not None and process.poll() is None:
+                _stop_interactive(record, process)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=self.cancel_timeout_s)
+        finally:
+            streams.finish_stdout()
+            if process is None:
+                streams.abandon()
+            stopped = process is None or (
+                process.poll() is not None
+                and _process_tree_stopped(record, timeout_s=self.cancel_timeout_s)
+            )
+            with record.lock:
+                cancelled = record.cancel_requested and not timed_out
+                state = "cancelled" if cancelled else ("failed" if error else "completed")
+                exit_code = (
+                    -1 if process is None or process.returncode is None else process.returncode
+                )
+                if record.result is None:
+                    record.state = state
+                    record.result = _interactive_result(
+                        record,
+                        state=state,
+                        exit_code=exit_code,
+                        timed_out=timed_out,
+                        stopped=stopped,
+                        stdout_bytes=streams.total_bytes,
+                        stderr_bytes=stderr.total_bytes,
+                        error=error,
+                    )
+                record.finished_at = time.monotonic()
+            record.finished.set()
+
     def _prune(self) -> None:
         cutoff = time.monotonic() - self.result_ttl_s
         with self._lock:
             expired: list[str] = []
             for command_id, record in self._records.items():
                 with record.lock:
-                    if record.finished_at is not None and record.finished_at <= cutoff:
+                    # An interactive tree that was never confirmed stopped stays
+                    # visible, so a later cancel cannot be answered by a tombstone.
+                    unconfirmed = (
+                        record.interactive is not None
+                        and record.result is not None
+                        and record.result.get("process_tree_stopped") is False
+                    )
+                    if (
+                        record.finished_at is not None
+                        and record.finished_at <= cutoff
+                        and not unconfirmed
+                    ):
                         expired.append(command_id)
             for command_id in expired:
                 self._records.pop(command_id, None)
@@ -843,6 +1204,9 @@ def _validated_payload(
     env: dict[str, str] = {}
     for key, value in raw_env.items():
         env[_nonblank_string(key, "env key")] = _string(value, "env value")
+    interactive = _boolean(request.get("interactive", False), "interactive")
+    if interactive and execution_profile != "agent":
+        raise CommandRequestError("interactive commands run only in the agent profile")
     env = execution_boundary.environment_for(env, execution_profile=execution_profile)
     if "PATH" not in env:
         # Resolve programs exactly as the guest shell does. Without this the
@@ -850,7 +1214,9 @@ def _validated_payload(
         # probes and shell commands) also searches /usr/local, so a probe could
         # admit a program that a process command then cannot start.
         env["PATH"] = DEFAULT_COMMAND_PATH
-    argv, env = execution_boundary.command_for(argv, env, execution_profile=execution_profile)
+    argv, env = execution_boundary.command_for(
+        argv, env, execution_profile=execution_profile, interactive=interactive
+    )
 
     raw_stdin = request.get("stdin_base64")
     if raw_stdin is None:
@@ -864,6 +1230,8 @@ def _validated_payload(
         raise CommandRequestError("stdin_base64 must be a string or null")
     if len(stdin) > MAX_STDIN_BYTES:
         raise CommandRequestError(f"stdin exceeds {MAX_STDIN_BYTES} bytes")
+    if interactive and stdin:
+        raise CommandRequestError("interactive commands receive stdin through write_stdin")
 
     timeout_s = request.get("timeout_s")
     if timeout_s is not None and (type(timeout_s) not in {int, float} or timeout_s <= 0):
@@ -886,6 +1254,13 @@ def _validated_payload(
         "omit_truncated_output": _boolean(
             request.get("omit_truncated_output", False),
             "omit_truncated_output",
+        ),
+        "interactive": interactive,
+        "process_tree": (
+            "pid_namespace"
+            if interactive
+            and execution_boundary.isolates_process_tree(execution_profile=execution_profile)
+            else "process_group"
         ),
     }
 
@@ -1016,6 +1391,119 @@ def _feed_stdin(pipe: Any, content: bytes) -> None:
             pipe.close()
 
 
+def _drain_interactive(pipe: Any, streams: _InteractiveStreams) -> None:
+    if pipe is None:
+        return
+    try:
+        while True:
+            chunk = pipe.read1(READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            streams.add_stdout(chunk)
+    except (OSError, ValueError):
+        return
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def _proc_stat(pid: int, *, proc_root: str = "/proc") -> tuple[str, int, str] | None:
+    """Return (state, parent pid, start time) for ``pid``, or None once it is gone."""
+    try:
+        raw = Path(proc_root, str(pid), "stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    # The command name is parenthesized and may itself contain spaces or ")".
+    fields = raw[raw.rfind(")") + 2 :].split()
+    if len(fields) < 20:
+        return None
+    return fields[0], int(fields[1]), fields[19]
+
+
+def _child_pids(parent: int, *, proc_root: str = "/proc") -> list[int]:
+    children = []
+    with contextlib.suppress(OSError):
+        for entry in os.listdir(proc_root):
+            if entry.isdigit():
+                stat = _proc_stat(int(entry), proc_root=proc_root)
+                if stat is not None and stat[1] == parent:
+                    children.append(int(entry))
+    return children
+
+
+def _await_namespace_init(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_s: float = _INTERACTIVE_START_TIMEOUT_SECONDS,
+    proc_root: str = "/proc",
+) -> tuple[int, str] | None:
+    """Find the namespace init that ``unshare --fork`` starts, with its start time.
+
+    The start time guards against PID reuse when the init is later checked.
+    """
+    deadline = time.monotonic() + timeout_s
+    while process.poll() is None:
+        for child in _child_pids(process.pid, proc_root=proc_root):
+            stat = _proc_stat(child, proc_root=proc_root)
+            if stat is not None:
+                return child, stat[2]
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.005)
+    return None
+
+
+def _stop_interactive(record: _CommandRecord, process: subprocess.Popen[bytes]) -> None:
+    """Stop an interactive command's whole tree.
+
+    In a PID namespace, killing the namespace init makes the kernel kill every
+    other process in it, and ``unshare`` exits only after reaping the init, so
+    its exit proves the tree is gone. ``unshare`` itself is not signalled while
+    its init is known: killing it first would only start that teardown
+    asynchronously. A command without a namespace falls back to its process group.
+    """
+    if record.process_tree != "pid_namespace":
+        _stop_process_group(process)
+        return
+    if record.namespace_init is None and process.poll() is None:
+        record.namespace_init = _await_namespace_init(process, timeout_s=0.5)
+    if record.namespace_init is None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        return
+    pid, started = record.namespace_init
+    stat = _proc_stat(pid)
+    if stat is not None and stat[2] == started:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _process_tree_stopped(
+    record: _CommandRecord, *, timeout_s: float, proc_root: str = "/proc"
+) -> bool:
+    """Confirm that an exited command left no descendant running.
+
+    Only a PID namespace gives that proof: once its init has exited (it is gone
+    or a zombie), the kernel has already killed and reaped every other member.
+    A process group cannot prove it, because descendants may leave the group.
+    """
+    if record.process_tree != "pid_namespace":
+        return False
+    if record.namespace_init is None:
+        process = record.process
+        # unshare reaps its init before exiting, unless something killed unshare.
+        return process is not None and process.returncode is not None and process.returncode >= 0
+    pid, started = record.namespace_init
+    deadline = time.monotonic() + timeout_s
+    while True:
+        stat = _proc_stat(pid, proc_root=proc_root)
+        if stat is None or stat[2] != started or stat[0] in {"Z", "X"}:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     process_group_id = process.pid
     if not _process_group_exists(process_group_id):
@@ -1087,7 +1575,43 @@ def _result(
     return result
 
 
+def _interactive_result(
+    record: _CommandRecord,
+    *,
+    state: str,
+    exit_code: int,
+    timed_out: bool,
+    stopped: bool,
+    stdout_bytes: int = 0,
+    stderr_bytes: int = 0,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    """Terminal state of an interactive command; its output was already streamed."""
+    result: dict[str, Any] = {
+        "command_id": record.command_id,
+        "state": state,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "cancelled": state == "cancelled",
+        "stdout_base64": "",
+        "stderr_base64": "",
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "interactive": True,
+        "process_tree": record.process_tree,
+        "process_tree_stopped": stopped,
+    }
+    if error is not None:
+        result["error_type"] = type(error).__name__
+    if state == "cancelled" and record.cancel_reason is not None:
+        result["cancel_reason"] = record.cancel_reason
+    return result
+
+
 def _cancelled_result(command_id: str) -> dict[str, Any]:
+    # Nothing was ever spawned for this command, so no process tree remains.
     return {
         "command_id": command_id,
         "state": "cancelled",
@@ -1100,6 +1624,7 @@ def _cancelled_result(command_id: str) -> dict[str, Any]:
         "stderr_bytes": 0,
         "stdout_truncated": False,
         "stderr_truncated": False,
+        "process_tree_stopped": True,
     }
 
 

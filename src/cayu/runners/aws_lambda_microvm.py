@@ -63,6 +63,8 @@ from cayu.runners.base import (
     RemoteWorkspaceBranchCapability,
     Runner,
     RunnerExecutionAdmissionObserver,
+    RunnerInteractiveProcess,
+    RunnerInteractiveProcessCapability,
     RunnerSystemExecutionMode,
     RunnerWorkloadAuthority,
     RunnerWorkspaceCapabilityT,
@@ -95,7 +97,7 @@ DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "5"
+LAMBDA_MICROVM_PROTOCOL_VERSION = "6"
 # Sized for the built-in browser worker: a default session response envelope
 # plus a browser-profile checkpoint, and a default upload batch on stdin. Both
 # match the first-party sidecar's own ceilings.
@@ -111,6 +113,10 @@ LAMBDA_MICROVM_CONTROL_RELAY_PORT = 18443
 _BROWSER_RECORDING_FINALIZE_TIMEOUT_SECONDS = 6
 _CONTROL_CA_MAX_BYTES = 64 * 1024
 LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES + 2) // 3)
+# Interactive stdio moves in bounded chunks. A stdout read long-polls the sidecar
+# for at most this long, well inside one endpoint request timeout.
+LAMBDA_MICROVM_INTERACTIVE_CHUNK_BYTES = 1024 * 1024
+LAMBDA_MICROVM_INTERACTIVE_READ_WAIT_SECONDS = 10.0
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
 _LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _LAMBDA_OWNER_SUPERSEDED_HTTP_STATUS = 412
@@ -531,6 +537,58 @@ class HttpxLambdaMicroVMEndpointTransport:
             endpoint=endpoint,
             token=token,
             path=f"/v1/commands/{command_id}/release",
+            timeout_s=timeout_s,
+        )
+
+    async def write_command_stdin(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        command_id: str,
+        owner_claim: str,
+        offset: int,
+        data_base64: str,
+        eof: bool,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/commands/{command_id}/stdin",
+            payload={
+                "owner_claim": owner_claim,
+                "offset": offset,
+                "data_base64": data_base64,
+                "eof": eof,
+            },
+            timeout_s=timeout_s,
+        )
+
+    async def read_command_stdout(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        command_id: str,
+        owner_claim: str,
+        offset: int,
+        max_bytes: int,
+        wait_s: float,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/commands/{command_id}/stdout",
+            payload={
+                "owner_claim": owner_claim,
+                "offset": offset,
+                "max_bytes": max_bytes,
+                "wait_s": wait_s,
+            },
             timeout_s=timeout_s,
         )
 
@@ -2252,6 +2310,22 @@ class LambdaMicroVMRunner(Runner):
             return cast("RunnerWorkspaceCapabilityT", capability)
         return super().workspace_capability(capability_type)
 
+    def interactive_process_capability(self) -> RunnerInteractiveProcessCapability | None:
+        """Stream a process's stdio through sidecar protocol 6.
+
+        Each interactive command runs in its own PID namespace in the guest, so
+        closing it confirms that every descendant has exited. Endpoint transports
+        without the interactive methods report no capability.
+        """
+
+        transport = self._endpoint_transport
+        if not all(
+            callable(getattr(transport, name, None))
+            for name in ("write_command_stdin", "read_command_stdout")
+        ):
+            return None
+        return _LambdaInteractiveProcessCapability(self)
+
     @property
     def owner_fence_generation(self) -> str | None:
         """Non-secret identity of this runner's current sidecar owner claim.
@@ -2438,6 +2512,250 @@ class _LambdaRemoteWorkspaceBranchCapability(RemoteWorkspaceBranchCapability):
     def allocation_fingerprint(self) -> str:
         encoded = f"lambda-microvm\0{self._runner.microvm_id}".encode()
         return "sha256:" + sha256(encoded).hexdigest()
+
+
+class _LambdaInteractiveProcessCapability(RunnerInteractiveProcessCapability):
+    """Interactive processes in one MicroVM; the runner keeps its own lifecycle."""
+
+    def __init__(self, runner: LambdaMicroVMRunner) -> None:
+        self._runner = runner
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(copy_runner_env(self._runner.env_overlay, inherit_env=False).values())
+        )
+
+    async def open_interactive_process(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+    ) -> RunnerInteractiveProcess:
+        runner = self._runner
+        owned_command, working_dir, environment, timeout, _stdin, _limit = (
+            runner._prepare_exec_request(
+                command,
+                cwd=cwd,
+                env=env,
+                env_remove=(),
+                timeout_s=timeout_s,
+                stdin=None,
+                output_limit_bytes=None,
+            )
+        )
+        payload: dict[str, Any] = {
+            "execution_profile": "agent",
+            "kind": owned_command.kind,
+            "cwd": working_dir,
+            "env": environment,
+            "stdin_base64": None,
+            "timeout_s": timeout,
+            "interactive": True,
+        }
+        if owned_command.kind == "process":
+            payload["argv"] = list(owned_command.argv or [])
+        else:
+            payload["shell"] = owned_command.shell
+        process = _LambdaInteractiveProcess(
+            runner, f"cmd-{uuid.uuid4()}", secret_values=self.secret_values
+        )
+        del environment
+        try:
+            response = await runner._endpoint_start(process.command_id, payload)
+            if response.get("process_tree") != "pid_namespace":
+                raise LambdaMicroVMProtocolError(
+                    "Lambda MicroVM sidecar cannot confirm teardown of an interactive "
+                    "process tree; rebuild the image from this Cayu release's sidecar."
+                )
+        except BaseException:
+            # The start may have reached the sidecar. Stop it before reporting,
+            # even if the caller is being cancelled.
+            outcome = await await_shielded_task_outcome(asyncio.ensure_future(process.close()))
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+            )
+            if outcome.error is not None:
+                runner._poison_exec("Lambda MicroVM interactive command cleanup is unconfirmed")
+            raise
+        finally:
+            del payload
+        return process
+
+
+class _LambdaInteractiveProcess(RunnerInteractiveProcess):
+    """Offset-addressed stdio of one sidecar interactive command.
+
+    Every stdin write and stdout read names its byte offset, so a request that
+    timed out is retried without duplicating or losing bytes.
+    """
+
+    def __init__(
+        self, runner: LambdaMicroVMRunner, command_id: str, *, secret_values: tuple[str, ...] = ()
+    ) -> None:
+        self._runner = runner
+        self.command_id = command_id
+        self._secret_values = secret_values
+        self._stdin_offset = 0
+        self._stdout_offset = 0
+        self._stdin_closed = False
+        self._stdout_eof = False
+        self._terminal: Mapping[str, Any] | None = None
+        self._closed = False
+        self._write_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+
+    @property
+    def secret_values(self) -> tuple[str, ...]:
+        return self._secret_values
+
+    async def write(self, data: bytes) -> None:
+        async with self._write_lock:
+            if self._stdin_closed:
+                raise BrokenPipeError("Interactive process stdin is closed.")
+            data = bytes(data)
+            for start in range(0, len(data), LAMBDA_MICROVM_INTERACTIVE_CHUNK_BYTES):
+                chunk = data[start : start + LAMBDA_MICROVM_INTERACTIVE_CHUNK_BYTES]
+                await self._write_chunk(chunk, eof=False)
+                if self._stdin_closed:
+                    raise BrokenPipeError("Interactive process stdin is closed.")
+
+    async def close_stdin(self) -> None:
+        async with self._write_lock:
+            if not self._stdin_closed:
+                await self._write_chunk(b"", eof=True)
+                self._stdin_closed = True
+
+    async def _write_chunk(self, chunk: bytes, *, eof: bool) -> None:
+        response = await self._stdio_call(
+            "write_command_stdin",
+            offset=self._stdin_offset,
+            data_base64=base64.b64encode(chunk).decode("ascii"),
+            eof=eof,
+        )
+        closed = response.get("closed")
+        offset = response.get("offset")
+        if type(closed) is not bool or type(offset) is not int:
+            raise LambdaMicroVMProtocolError("Lambda MicroVM stdin response is malformed.")
+        if closed:
+            self._stdin_closed = True
+        elif offset != self._stdin_offset + len(chunk):
+            raise LambdaMicroVMProtocolError("Lambda MicroVM stdin offset is inconsistent.")
+        self._stdin_offset = offset
+
+    async def read(self) -> bytes:
+        async with self._read_lock:
+            wait_s = min(
+                LAMBDA_MICROVM_INTERACTIVE_READ_WAIT_SECONDS, self._runner.request_timeout_s / 2
+            )
+            while not self._stdout_eof:
+                response = await self._stdio_call(
+                    "read_command_stdout",
+                    offset=self._stdout_offset,
+                    max_bytes=LAMBDA_MICROVM_INTERACTIVE_CHUNK_BYTES,
+                    wait_s=wait_s,
+                )
+                encoded = response.get("data_base64")
+                eof = response.get("eof")
+                if (
+                    response.get("offset") != self._stdout_offset
+                    or type(encoded) is not str
+                    or type(eof) is not bool
+                    or len(encoded) > 4 * ((LAMBDA_MICROVM_INTERACTIVE_CHUNK_BYTES + 2) // 3)
+                ):
+                    raise LambdaMicroVMProtocolError("Lambda MicroVM stdout response is malformed.")
+                try:
+                    data = base64.b64decode(encoded, validate=True)
+                except ValueError:
+                    raise LambdaMicroVMProtocolError(
+                        "Lambda MicroVM stdout response is malformed."
+                    ) from None
+                self._stdout_offset += len(data)
+                self._stdout_eof = eof
+                if data:
+                    return data
+            return b""
+
+    async def wait(self) -> int:
+        delay = max(self._runner.poll_interval_s, DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS)
+        while self._terminal is None:
+            response = await self._runner._endpoint_get(self.command_id)
+            if _required_response_string(response, "state") in {"completed", "cancelled", "failed"}:
+                self._terminal = self._settled(response)
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 1.0)
+        exit_code = self._settled(self._terminal).get("exit_code")
+        if type(exit_code) is not int:
+            raise LambdaMicroVMProtocolError("Lambda MicroVM command returned no exit code.")
+        return exit_code
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            runner = self._runner
+            self._stdin_closed = True
+            if self._terminal is None or self._terminal.get("process_tree_stopped") is not True:
+                response = await runner._endpoint_cancel(self.command_id)
+                state = _required_response_string(response, "state")
+                deadline = asyncio.get_running_loop().time() + 2 * (runner.cancel_timeout_s or 5.0)
+                while state not in {"completed", "cancelled", "failed", "not_found"}:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise LambdaMicroVMError(
+                            "Lambda MicroVM interactive command did not stop in time."
+                        )
+                    await asyncio.sleep(max(runner.poll_interval_s, 0.05))
+                    response = await runner._endpoint_get(self.command_id)
+                    state = _required_response_string(response, "state")
+                if state == "not_found":
+                    # The start never reached the sidecar: the cancellation tombstone
+                    # it just recorded keeps a delayed start from ever running.
+                    self._closed = True
+                    return
+                self._terminal = self._settled(response, cleanup=True)
+            if self._terminal.get("process_tree_stopped") is not True:
+                raise LambdaMicroVMError(
+                    "Lambda MicroVM could not confirm that the interactive process tree exited."
+                )
+            self._closed = True
+        await runner._release_command(self.command_id)
+
+    def _settled(self, response: Mapping[str, Any], *, cleanup: bool = False) -> Mapping[str, Any]:
+        if response.get("cancel_reason") == _LAMBDA_OWNER_SUPERSEDED_CANCEL_REASON:
+            self._runner._mark_superseded()
+            if not cleanup:
+                raise LambdaMicroVMOwnershipSuperseded(
+                    "A newer Lambda MicroVM owner cancelled this command."
+                )
+        return {
+            key: response[key]
+            for key in ("state", "exit_code", "process_tree_stopped", "cancel_reason")
+            if key in response
+        }
+
+    async def _stdio_call(self, method_name: str, **kwargs: Any) -> Mapping[str, Any]:
+        runner = self._runner
+        for attempt in range(_LAMBDA_POLL_ATTEMPTS):
+            try:
+                return await runner._endpoint_call(
+                    method_name,
+                    command_id=self.command_id,
+                    owner_claim=runner._owner_claim,
+                    **kwargs,
+                )
+            except LambdaMicroVMOwnershipSuperseded:
+                runner._mark_superseded()
+                raise
+            except LambdaMicroVMEndpointTransientError:
+                # The offset makes the retry idempotent.
+                if attempt == _LAMBDA_POLL_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(0.05 * (2**attempt))
+        raise AssertionError("unreachable interactive retry loop")
 
 
 class _LambdaMicroVMCommandHandle:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -11,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from .supervisor import (
     CommandConflictError,
     CommandExecutionBoundary,
+    CommandNotFoundError,
     CommandRequestError,
     CommandSupervisor,
     OwnerFence,
@@ -19,7 +22,7 @@ from .supervisor import (
 )
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
-PROTOCOL_VERSION = "5"
+PROTOCOL_VERSION = "6"
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
 AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
@@ -35,6 +38,9 @@ OWNER = OwnerFence()
 OWNER_SUPERSEDED_STATUS = 412
 OWNER_LIFECYCLE_LEASED_STATUS = 423
 OWNER_SUPERSEDED_REASON = "owner_superseded"
+# Interactive stdio blocks on pipes and long polls. Its own pool keeps that
+# waiting from starving the default pool that serves every other endpoint.
+INTERACTIVE_IO = ThreadPoolExecutor(max_workers=32, thread_name_prefix="cayu-interactive")
 app = FastAPI(title="Cayu Lambda MicroVM sidecar", docs_url=None, redoc_url=None)
 
 
@@ -185,6 +191,56 @@ async def get_command(command_id: str) -> dict[str, Any]:
     if result["state"] == "not_found":
         raise HTTPException(status_code=404, detail="command not found")
     return result
+
+
+@app.post("/v1/commands/{command_id}/stdin")
+async def write_command_stdin(command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Write stdin of an interactive command; ``offset`` makes a retry idempotent."""
+    return await _interactive_call(
+        payload,
+        SUPERVISOR.write_stdin,
+        command_id,
+        offset=payload.get("offset"),
+        data_base64=payload.get("data_base64", ""),
+        eof=payload.get("eof", False),
+    )
+
+
+@app.post("/v1/commands/{command_id}/stdout")
+async def read_command_stdout(command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Long-poll stdout of an interactive command from ``offset``.
+
+    Reading at an offset acknowledges every earlier byte, so the sidecar holds
+    only output the host has not yet confirmed.
+    """
+    return await _interactive_call(
+        payload,
+        SUPERVISOR.read_stdout,
+        command_id,
+        offset=payload.get("offset"),
+        max_bytes=payload.get("max_bytes"),
+        wait_s=payload.get("wait_s", 0),
+    )
+
+
+async def _interactive_call(
+    payload: dict[str, Any], operation: Any, command_id: str, **arguments: Any
+) -> dict[str, Any]:
+    # Only the current owner moves a command's stdio. The fence is checked, not
+    # held: a takeover cancels the earlier owner's commands itself.
+    try:
+        await asyncio.to_thread(OWNER.require, payload.get("owner_claim"))
+        return await asyncio.get_running_loop().run_in_executor(
+            INTERACTIVE_IO, functools.partial(operation, command_id, **arguments)
+        )
+    except OwnerSupersededError as exc:
+        raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
+    except OwnerLifecycleLeasedError as exc:
+        raise HTTPException(status_code=OWNER_LIFECYCLE_LEASED_STATUS, detail=str(exc)) from exc
+    except CommandNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CommandRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/commands/{command_id}/release")
