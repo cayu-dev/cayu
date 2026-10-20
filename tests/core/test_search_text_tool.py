@@ -389,6 +389,67 @@ def test_search_text_count_mode_pages_paths_containing_colons() -> None:
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+def test_search_text_real_runner_matches_several_patterns_with_context(tmp_path) -> None:
+    (tmp_path / "a.py").write_text("one\ndef load():\ntwo\nthree\nfour\nclass Store:\nfive\n")
+    (tmp_path / "b.py").write_text("x\ny\n")
+
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(session_id="sess_1", runner=LocalRunner(tmp_path)),
+            {"patterns": ["^def ", "^class "], "mode": "content", "context_lines": 1},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == (
+        "a.py-1-one\na.py:2:def load():\na.py-3-two\na.py-5-four\na.py:6:class Store:\na.py-7-five"
+    )
+    assert result.structured is not None
+    assert result.structured["patterns"] == ["^def ", "^class "]
+    assert "pattern" not in result.structured
+    assert result.structured["matches"][:2] == [
+        {"path": "a.py", "line": 1, "preview": "one", "context": True},
+        {"path": "a.py", "line": 2, "preview": "def load():"},
+    ]
+
+
+def test_search_text_passes_each_pattern_to_ripgrep() -> None:
+    runner = _ResultRunner(ExecResult(exit_code=1))
+
+    asyncio.run(
+        SearchTextTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"patterns": ["-v", "needle"], "mode": "files"},
+        )
+    )
+
+    assert runner.command is not None
+    argv = list(runner.command.argv)
+    assert argv[-6:] == ["--regexp", "-v", "--regexp", "needle", "--", "."]
+
+
+def test_search_text_reports_an_invalid_pattern_among_several() -> None:
+    stderr = "rg: regex parse error:\n    (?:a()|(?:b)\n    ^\nerror: unclosed group"
+    runner = _ResultRunner(ExecResult(exit_code=2, stderr=stderr))
+
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"patterns": ["a(", "b"]},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured is not None
+    assert result.structured["error"] == "invalid_pattern"
+    assert result.structured["pattern_diagnostic"] == {
+        "reason": "unclosed_group",
+        "offset": None,
+        "offset_unit": "utf8_byte",
+    }
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
 def test_search_text_real_runner_honors_project_search_scope(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / ".github" / "workflows").mkdir(parents=True)
@@ -562,6 +623,15 @@ def test_search_text_returns_typed_operational_failures(
         {"pattern": "needle", "offset": -1},
         {"pattern": "needle", "offset": 10_000_001},
         {"pattern": "needle", "case_sensitive": "yes"},
+        {},
+        {"pattern": "needle", "patterns": ["other"]},
+        {"patterns": []},
+        {"patterns": "needle"},
+        {"patterns": ["needle", "   "]},
+        {"patterns": ["needle"] * 11},
+        {"pattern": "needle", "context_lines": 1},
+        {"pattern": "needle", "mode": "content", "context_lines": 11},
+        {"pattern": "needle", "mode": "content", "context_lines": -1},
     ],
 )
 def test_search_text_rejects_invalid_model_arguments(args: dict) -> None:
@@ -1707,3 +1777,80 @@ def test_search_regex_multiline_location_is_explicitly_unavailable():
     }
     assert "Pattern location unavailable" in result.content
     assert "SECRET" not in json.dumps(result.model_dump())
+
+
+@pytest.mark.parametrize("mode", ["deny", "allowlist", "approval", "allowed"])
+def test_pattern_batches_authorize_each_pattern_before_search(tmp_path, mode):
+    from cayu.tools.policy import (
+        AllowlistRule,
+        DenyPatternRule,
+        ParameterConstrainedToolPolicy,
+        ToolPolicyDecision,
+    )
+
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep is unavailable")
+    searches = []
+
+    class ObservedSearch(SearchTextTool):
+        async def run(self, ctx, arguments):
+            searches.append(arguments)
+            return await super().run(ctx, arguments)
+
+    runner = LocalRunner(tmp_path)
+    tool = ObservedSearch()
+    rule = (
+        AllowlistRule("pattern", values=["public"])
+        if mode == "allowlist"
+        else DenyPatternRule("pattern", patterns=["secret"])
+    )
+    policy = ParameterConstrainedToolPolicy(
+        {tool.name: [rule]},
+        decision=ToolPolicyDecision.REQUIRE_APPROVAL
+        if mode == "approval"
+        else ToolPolicyDecision.DENY,
+    )
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="search",
+                    name=tool.name,
+                    arguments={
+                        "patterns": ["public", "public" if mode == "allowed" else "secret"],
+                        "mode": "content",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="search"), runner=runner, workspace=LocalWorkspace(tmp_path)
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="a", model="scripted"), tools=[tool], tool_policy=policy)
+
+    async def scenario():
+        return [
+            event
+            async for event in app.run(
+                RunRequest(agent_name="a", messages=[Message.text("user", "search")])
+            )
+        ]
+
+    events = asyncio.run(scenario())
+    if mode == "allowed":
+        assert searches
+    else:
+        assert searches == []
+        assert (
+            any("approval" in e.type.value for e in events)
+            if mode == "approval"
+            else any(e.type == EventType.TOOL_CALL_BLOCKED for e in events)
+        )

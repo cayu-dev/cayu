@@ -1195,6 +1195,250 @@ def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
     assert suffix.structured["revision"] is None
 
 
+def _workspace_read_ctx(tmp_path, **kwargs) -> ToolContext:
+    return ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+        **kwargs,
+    )
+
+
+def _read_text(result: ToolResult) -> str:
+    return result.content.rsplit("[/read_file metadata]\n", 1)[1]
+
+
+def test_read_file_line_range_returns_whole_lines_with_line_metadata(tmp_path):
+    (tmp_path / "notes.txt").write_text("one\ntwo\nthree\nfour\n")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(
+        ReadFileTool().run(ctx, {"path": "notes.txt", "start_line": 2, "end_line": 3})
+    )
+
+    assert result.is_error is False
+    assert _read_text(result) == "two\nthree\n"
+    assert result.content.startswith(
+        "[read_file metadata]\n"
+        '{"path":"notes.txt","bytes":10,"total_bytes":19,"start_line":2,"end_line":3,'
+        '"total_lines":4,"next_start_line":null,"revision":null,"sha256":null,'
+        '"truncated":false}\n'
+    )
+
+
+def test_read_file_line_range_bounded_by_max_bytes_reports_next_start_line(tmp_path):
+    (tmp_path / "notes.txt").write_text("one\ntwo\nthree\nfour")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    first = asyncio.run(
+        ReadFileTool().run(ctx, {"path": "notes.txt", "start_line": 2, "max_bytes": 9})
+    )
+    rest = asyncio.run(
+        ReadFileTool().run(
+            ctx, {"path": "notes.txt", "start_line": first.structured["next_start_line"]}
+        )
+    )
+
+    assert _read_text(first) == "two\n"
+    assert first.structured["end_line"] == 2
+    assert first.structured["next_start_line"] == 3
+    assert first.structured["truncated"] is True
+    assert _read_text(rest) == "three\nfour"
+    assert rest.structured["next_start_line"] is None
+    assert rest.structured["truncated"] is False
+
+
+def test_read_file_line_range_covering_the_whole_file_includes_its_revision(tmp_path):
+    content = b"one\ntwo\n"
+    (tmp_path / "notes.txt").write_bytes(content)
+    ctx = _workspace_read_ctx(tmp_path)
+
+    whole = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "start_line": 1}))
+    part = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "end_line": 1}))
+
+    assert whole.structured["revision"] == f"sha256:{hashlib.sha256(content).hexdigest()}"
+    assert part.structured["revision"] is None
+    assert _read_text(part) == "one\n"
+
+
+def test_read_file_line_range_redacts_secrets(tmp_path):
+    (tmp_path / "config.txt").write_text("name=app\ntoken=hunter22\nport=1\n")
+    ctx = _workspace_read_ctx(
+        tmp_path,
+        invocation_secret_redactor=lambda: SecretRedactor("hunter22"),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(ctx, {"path": "config.txt", "start_line": 2, "end_line": 2})
+    )
+
+    assert _read_text(result) == f"token={REDACTED_SECRET}\n"
+    assert "hunter22" not in json.dumps(result.model_dump())
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"path": "notes.txt", "start_line": 9}, "past the end of the file (2 lines)"),
+        ({"path": "notes.txt", "start_line": 3, "end_line": 2}, "must not be less than"),
+        ({"path": "notes.txt", "start_line": 0}, "must be a positive integer"),
+        ({"path": "notes.txt", "start_line": 1, "offset": 2}, "cannot be combined"),
+        ({"artifact_id": "art_1", "start_line": 1}, "only valid with `path`"),
+    ],
+)
+def test_read_file_rejects_invalid_line_ranges(tmp_path, args, message):
+    (tmp_path / "notes.txt").write_text("one\ntwo\n")
+
+    result = asyncio.run(ReadFileTool().run(_workspace_read_ctx(tmp_path), args))
+
+    assert result.is_error is True
+    assert result.structured["error"] == "invalid_arguments"
+    assert message in result.content
+
+
+def test_read_file_reads_several_files_and_reports_failures_per_file(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\n")
+    (tmp_path / "b.py").write_text("one\ntwo\nthree\n")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "files": [
+                    {"path": "a.txt"},
+                    {"path": "missing.txt"},
+                    {"path": "b.py", "start_line": 2, "end_line": 2},
+                    {"path": "../outside.txt"},
+                ]
+            },
+        )
+    )
+
+    assert result.is_error is False
+    files = result.structured["files"]
+    assert [item["path"] for item in files] == ["a.txt", "missing.txt", "b.py", "../outside.txt"]
+    alpha_digest = hashlib.sha256(b"alpha\n").hexdigest()
+    assert files[0]["revision"] == f"sha256:{alpha_digest}"
+    assert files[1]["error"] == "not_found"
+    assert files[2]["start_line"] == 2
+    assert files[2]["end_line"] == 2
+    assert files[3]["error"] == "invalid_arguments"
+    assert result.structured["failed"] == 2
+    assert result.structured["bytes"] == len("alpha\n") + len("two\n")
+    sections = result.content.split("[read_file metadata]\n")[1:]
+    assert len(sections) == 4
+    assert sections[0].endswith("[/read_file metadata]\nalpha\n\n")
+    assert '"error":"not_found"' in sections[1]
+    assert "workspace file not found: missing.txt" in sections[1]
+    assert sections[2].endswith("[/read_file metadata]\ntwo\n\n")
+    assert "escapes the workspace root" in sections[3]
+
+
+def test_read_file_batch_shares_max_bytes_across_files(tmp_path):
+    (tmp_path / "a.txt").write_text("abcd")
+    (tmp_path / "b.txt").write_text("b" * 20)
+    (tmp_path / "c.txt").write_text("c" * 20)
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"files": [{"path": "a.txt"}, {"path": "b.txt"}, {"path": "c.txt"}], "max_bytes": 10},
+        )
+    )
+
+    files = result.structured["files"]
+    assert [item["bytes"] for item in files] == [4, 3, 3]
+    assert [item["next_offset"] for item in files] == [None, 3, 3]
+    assert result.structured["bytes"] == 10
+    assert result.structured["truncated"] is True
+
+    continued = asyncio.run(ReadFileTool().run(ctx, {"files": [{"path": "a.txt", "offset": 3}]}))
+    assert _read_text(continued) == "d"
+
+
+def test_read_file_batch_marks_files_past_the_byte_budget(tmp_path):
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("x")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"files": [{"path": "a.txt"}, {"path": "b.txt"}, {"path": "c.txt"}], "max_bytes": 2},
+        )
+    )
+
+    assert [item.get("error") for item in result.structured["files"]] == [
+        None,
+        None,
+        "max_bytes_exhausted",
+    ]
+
+
+def test_read_file_batch_leaves_images_and_pdfs_to_single_reads(tmp_path):
+    (tmp_path / "doc.pdf").write_bytes(_tiny_pdf_bytes())
+    (tmp_path / "a.txt").write_text("alpha")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(
+        ReadFileTool().run(ctx, {"files": [{"path": "doc.pdf"}, {"path": "a.txt"}]})
+    )
+
+    assert result.structured["files"][0] == {
+        "path": "doc.pdf",
+        "error": "attachment_requires_single_read",
+        "message": "Images and PDFs are read one at a time with `path`.",
+    }
+    assert result.structured["files"][1]["bytes"] == 5
+
+
+def test_read_file_batch_reports_binary_files_per_file(tmp_path):
+    (tmp_path / "blob.dat").write_bytes(b"\x00\x01\x02binary")
+    (tmp_path / "a.txt").write_text("alpha")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(
+        ReadFileTool().run(ctx, {"files": [{"path": "blob.dat"}, {"path": "a.txt"}]})
+    )
+
+    assert result.structured["files"][0]["error"] == "binary_file"
+    assert "appears to be binary" in result.structured["files"][0]["message"]
+    assert result.structured["files"][1]["bytes"] == 5
+
+
+def test_read_file_batch_is_an_error_only_when_every_file_fails(tmp_path):
+    ctx = _workspace_read_ctx(tmp_path)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"files": [{"path": "missing.txt"}]}))
+
+    assert result.is_error is True
+    assert result.structured["files"][0]["error"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"files": [{"path": "a.txt"}], "path": "a.txt"}, "cannot be combined with `path`"),
+        ({"files": [{"path": "a.txt"}], "offset": 1}, "cannot be combined with `offset`"),
+        ({"files": []}, "cannot be empty"),
+        ({"files": [{"path": "a.txt"}] * 21}, "at most 20 items"),
+        ({"files": [{"path": "a.txt", "extra": 1}]}, "unknown fields"),
+        ({"files": [{}]}, "Missing fields: path"),
+        ({"files": [{"path": "a.txt", "offset": 1, "start_line": 1}]}, "cannot be combined"),
+        ({"files": "a.txt"}, "must be an array"),
+    ],
+)
+def test_read_file_rejects_invalid_batches(tmp_path, args, message):
+    (tmp_path / "a.txt").write_text("alpha")
+
+    result = asyncio.run(ReadFileTool().run(_workspace_read_ctx(tmp_path), args))
+
+    assert result.is_error is True
+    assert result.structured["error"] == "invalid_arguments"
+    assert message in result.content
+
+
 def test_read_file_pages_text_with_workspace_bounded_read_limit(tmp_path):
     (tmp_path / "notes.txt").write_text("abcde")
     workspace = BoundedReadWorkspace(tmp_path, cap=2)
@@ -1889,8 +2133,10 @@ def test_read_file_retries_with_latest_redactor_after_secret_resolves_during_rea
     assert secret[:16] not in rendered
 
 
+@pytest.mark.parametrize("window", [{}, {"start_line": 1}, {"start_line": 1, "end_line": 1}])
 def test_read_file_capture_fails_closed_when_secret_resolves_before_publication(
     tmp_path,
+    window,
 ) -> None:
     secret = "workspace-late-publication-secret-canary-ABCDEFGHIJKLMNOP"
     workspace = LocalWorkspace(tmp_path, workspace_id="local")
@@ -1915,7 +2161,7 @@ def test_read_file_capture_fails_closed_when_secret_resolves_before_publication(
             del args
             result = await ReadFileTool().run(
                 tool_ctx,
-                {"path": "secret.txt", "max_bytes": 16},
+                {"path": "secret.txt", "max_bytes": 16, **window},
             )
             tracker.record(
                 ResolvedSecret(
@@ -6691,3 +6937,141 @@ def test_runtime_rejects_conflicting_file_attachment_references(tmp_path):
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_partial_line_continuation_retries_the_cut_line(tmp_path, batch):
+    (tmp_path / "line.txt").write_text("abcdefghij\nsecond\n")
+    ctx = _workspace_read_ctx(tmp_path)
+    entry = {"path": "line.txt", "start_line": 1, "end_line": 1}
+    args = {"files": [entry]} if batch else entry
+    first = asyncio.run(ReadFileTool().run(ctx, {**args, "max_bytes": 4}))
+    metadata = first.structured["files"][0] if batch else first.structured
+    assert metadata["next_start_line"] == 1
+    assert metadata["line_truncated"] is True
+    assert "larger max_bytes" in first.content
+    retry = asyncio.run(
+        ReadFileTool().run(
+            ctx, {"path": "line.txt", "start_line": metadata["next_start_line"], "max_bytes": 20}
+        )
+    )
+    assert "abcdefghij" in retry.content
+
+
+@pytest.mark.parametrize("mode", ["deny", "allowlist", "approval", "allowed"])
+@pytest.mark.parametrize("rename", [False, True])
+def test_read_file_batch_authorizes_every_path_before_reading(tmp_path, mode, rename):
+    from cayu.tools.files import ReadFileTool
+    from cayu.tools.policy import (
+        AllowlistRule,
+        DenyPatternRule,
+        ParameterConstrainedToolPolicy,
+        ToolPolicyDecision,
+    )
+
+    (tmp_path / "safe.txt").write_text("public")
+    (tmp_path / ".env").write_text("private-file-canary")
+    reads = []
+
+    class ObservedWorkspace(LocalWorkspace):
+        async def read_bytes(self, path, **kwargs):
+            reads.append(path)
+            return await super().read_bytes(path, **kwargs)
+
+    tool = ReadFileTool(
+        spec=ReadFileTool.spec.model_copy(update={"name": "read_sources"}) if rename else None
+    )
+    targets = ["safe.txt", "safe.txt" if mode == "allowed" else ".env"]
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="read",
+                    name=tool.name,
+                    arguments={"files": [{"path": path} for path in targets]},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    rule = (
+        AllowlistRule("path", values=["safe.txt"])
+        if mode == "allowlist"
+        else DenyPatternRule("path", patterns=[r"^\.env$"])
+    )
+    policy = ParameterConstrainedToolPolicy(
+        {tool.name: [rule]},
+        decision=(
+            ToolPolicyDecision.REQUIRE_APPROVAL if mode == "approval" else ToolPolicyDecision.DENY
+        ),
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="files"),
+            workspace=ObservedWorkspace(tmp_path, workspace_id="local"),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake"), tools=[tool], tool_policy=policy)
+    events = asyncio.run(
+        collect_events(
+            app, RunRequest(agent_name="assistant", messages=[Message.text("user", "read")])
+        )
+    )
+    if mode == "allowed":
+        assert reads == ["safe.txt", "safe.txt"]
+    else:
+        assert reads == []
+        assert "private-file-canary" not in repr([e.model_dump() for e in events])
+        if mode == "approval":
+            assert any("approval" in e.type.value for e in events)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("batch", [False, True])
+def test_read_file_multiline_redaction_preserves_source_line_numbers(tmp_path, newline, batch):
+    secret = newline.join(["BEGIN KEY", "credential-part-one", "credential-part-two", "END KEY"])
+    (tmp_path / "config.txt").write_bytes(
+        (f"line1{newline}{secret}{newline}line6{newline}line7{newline}").encode()
+    )
+    ctx = _workspace_read_ctx(tmp_path, invocation_secret_redactor=lambda: SecretRedactor(secret))
+    for start, end in [(1, 7), (2, 4), (6, 7)]:
+        entry = {"path": "config.txt", "start_line": start, "end_line": end}
+        result = asyncio.run(ReadFileTool().run(ctx, {"files": [entry]} if batch else entry))
+        assert not result.is_error
+        metadata = result.structured["files"][0] if batch else result.structured
+        assert metadata["total_lines"] == 7
+        assert metadata["start_line"] == start and metadata["end_line"] == end
+        assert "credential-part" not in result.content
+        if start == 6:
+            assert "line6" in result.content and "line7" in result.content
+        if start == 1:
+            assert REDACTED_SECRET in result.content
+
+
+@pytest.mark.parametrize("trailing_newline", ["", "\n"])
+def test_read_file_multiline_secret_at_eof_keeps_last_line(tmp_path, trailing_newline):
+    secret = "first-secret-line\nlast-secret-line" + trailing_newline
+    (tmp_path / "config.txt").write_text("public\n" + secret)
+    ctx = _workspace_read_ctx(tmp_path, invocation_secret_redactor=lambda: SecretRedactor(secret))
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "config.txt", "start_line": 3}))
+    assert not result.is_error
+    assert result.structured["total_lines"] == 3
+    assert _read_text(result) == REDACTED_SECRET + trailing_newline
+
+
+def test_read_file_line_range_rejects_redaction_that_consumes_restored_newlines(tmp_path):
+    (tmp_path / "config.txt").write_text("public\nfirst-secret\nlast-secret\nlast\n")
+    ctx = _workspace_read_ctx(
+        tmp_path,
+        invocation_secret_redactor=lambda: SecretRedactor(
+            ["first-secret\nlast-secret", REDACTED_SECRET + "\n"]
+        ),
+    )
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "config.txt", "start_line": 4}))
+    assert result.is_error
+    assert result.structured["error"] == "line_range_redaction_unavailable"
+    assert "first-secret" not in result.content

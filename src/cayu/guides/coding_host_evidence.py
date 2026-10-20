@@ -13,6 +13,32 @@ class MaintenanceReconciliationUnavailable(ValueError):
         super().__init__("Exact maintenance cancellation evidence is unavailable or conflicting.")
 
 
+def _completed_workspace_read(value):
+    if type(value) is not dict or "error" in value:
+        return False
+    if not (
+        value.get("source") == "workspace"
+        and value.get("encoding") == "utf-8"
+        and type(value.get("path")) is str
+        and bool(value["path"])
+        and all(type(value.get(key)) is int and value[key] >= 0 for key in ("bytes", "total_bytes"))
+        and type(value.get("truncated")) is bool
+    ):
+        return False
+    if "start_line" not in value:
+        return type(value.get("offset")) is int and value["offset"] >= 0
+    start, end, total = value.get("start_line"), value.get("end_line"), value.get("total_lines")
+    return (
+        "offset" not in value
+        and type(start) is int
+        and start >= 1
+        and type(end) is int
+        and end >= start - 1
+        and "total_lines" in value
+        and (total is None or (type(total) is int and total >= end))
+    )
+
+
 def _completed_workspace_tool_result(name, kind, result):
     """Recognize maintained file-tool success, not arbitrary tool completion.
 
@@ -34,13 +60,35 @@ def _completed_workspace_tool_result(name, kind, result):
         return all(type(value.get(field)) is int and value[field] >= 0 for field in fields)
 
     if name == "read_file":
-        return (
+        if "files" not in value:
+            return _completed_workspace_read(value)
+        files = value["files"]
+        if not (
             value.get("source") == "workspace"
-            and value.get("encoding") == "utf-8"
-            and text_fields("path")
-            and counts("bytes", "total_bytes", "offset")
+            and type(files) is list
+            and 1 <= len(files) <= 20
+            and counts("bytes", "max_bytes", "failed")
+            and value["max_bytes"] > 0
+            and value["bytes"] <= value["max_bytes"]
             and type(value.get("truncated")) is bool
-        )
+        ):
+            return False
+        failed = 0
+        for entry in files:
+            if type(entry) is dict and "error" in entry:
+                # A batch records bounded per-file failures only after the read
+                # has returned; backend exceptions still fail the whole call.
+                if not all(
+                    type(entry.get(key)) is str and entry[key]
+                    for key in ("path", "error", "message")
+                ):
+                    return False
+                failed += 1
+            elif not _completed_workspace_read(entry):
+                return False
+        # Batch bytes count redacted output; byte-window entries count raw source
+        # bytes. Their sum is not comparable when redaction changes the size.
+        return failed == value["failed"] < len(files)
     if name == "write_file":
         return (
             text_fields("path", "revision", "sha256")
@@ -99,8 +147,20 @@ def _completed_workspace_tool_result(name, kind, result):
             )
         )
     if name == "search_text":
+        patterns = value.get("patterns")
+        pattern_evidence = (
+            text_fields("pattern")
+            if "patterns" not in value
+            else (
+                "pattern" not in value
+                and type(patterns) is list
+                and 1 <= len(patterns) <= 10
+                and all(type(pattern) is str and bool(pattern) for pattern in patterns)
+            )
+        )
         return (
-            text_fields("pattern", "path")
+            pattern_evidence
+            and text_fields("path")
             and value.get("mode") in {"files", "content", "count"}
             and type(value.get("matches")) is list
             and counts("returned", "offset", "limit", "stdout_bytes")

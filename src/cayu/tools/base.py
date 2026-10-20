@@ -1377,6 +1377,14 @@ class Tool(ABC):
 
         return self.spec.execution_profile_identity
 
+    def _policy_argument_sets(self, arguments: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        """Argument views which must all pass policy before this call executes.
+
+        Built-in batching tools retain the complete call and project each
+        target into the single-target fields understood by existing policies.
+        """
+        return (arguments,)
+
     @property
     def _publish_arguments(self) -> bool:
         """Whether terminal events may publish redacted invocation arguments."""

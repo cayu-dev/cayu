@@ -1169,37 +1169,84 @@ class ToolInvocationAdmission:
         policy_metadata = request_metadata
         if taint_labels:
             policy_metadata = metadata_with_taint_labels(request_metadata, taint_labels)
-        policy_result = await registered_agent.tool_policy.authorize(
-            ToolPolicyRequest(
-                session=session.model_copy(deep=True),
-                # A fork-controller body is governed as its host agent.
-                agent=_copy_agent_spec(registered_agent.spec).model_copy(
-                    update={"name": registered_agent.policy_agent_name}
-                ),
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-                tool_round_id=tool_round_id,
-                tool_effect=_tool_effect(registered_agent, tool_call),
-                arguments=tool_call.arguments,
-                environment_name=(
-                    _environment_name(registered_environment)
-                    if recorded_scope is None
-                    else recorded_scope.environment_name
-                ),
-                workspace_id=(
-                    _workspace_id(registered_environment)
-                    if recorded_scope is None
-                    else recorded_scope.workspace_id
-                ),
-                workspace_id_explicit=(
-                    _workspace_id_explicit(registered_environment)
-                    if recorded_scope is None
-                    else recorded_scope.workspace_id_explicit
-                ),
-                metadata=policy_metadata,
-            )
+        request = ToolPolicyRequest(
+            session=session.model_copy(deep=True),
+            # A fork-controller body is governed as its host agent.
+            agent=_copy_agent_spec(registered_agent.spec).model_copy(
+                update={"name": registered_agent.policy_agent_name}
+            ),
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.id,
+            tool_round_id=tool_round_id,
+            tool_effect=_tool_effect(registered_agent, tool_call),
+            arguments=tool_call.arguments,
+            environment_name=(
+                _environment_name(registered_environment)
+                if recorded_scope is None
+                else recorded_scope.environment_name
+            ),
+            workspace_id=(
+                _workspace_id(registered_environment)
+                if recorded_scope is None
+                else recorded_scope.workspace_id
+            ),
+            workspace_id_explicit=(
+                _workspace_id_explicit(registered_environment)
+                if recorded_scope is None
+                else recorded_scope.workspace_id_explicit
+            ),
+            metadata=policy_metadata,
         )
-        return tool_execution.validate_tool_policy_result(policy_result)
+        argument_sets = (
+            (request.arguments,)
+            if registered_tool is None
+            else registered_tool.tool._policy_argument_sets(request.arguments)
+        )
+        if not argument_sets or len(argument_sets) > 64:
+            raise ValueError("Tool policy argument sets must contain between 1 and 64 entries.")
+        if len(argument_sets) == 1:
+            if argument_sets[0] is not request.arguments:
+                request.arguments = copy_durable_json_value(argument_sets[0], "policy arguments")
+            return tool_execution.validate_tool_policy_result(
+                await registered_agent.tool_policy.authorize(request)
+            )
+        selected: ToolPolicyResult | None = None
+        metadata: dict[str, Any] = {}
+        for arguments in argument_sets:
+            projected = request.model_copy(deep=True)
+            projected.arguments = copy_durable_json_value(arguments, "policy arguments")
+            result = tool_execution.validate_tool_policy_result(
+                await registered_agent.tool_policy.authorize(projected)
+            )
+            if result.decision is ToolPolicyDecision.DENY:
+                return result
+            # One batch has one approval/evidence record. Distinct gates or
+            # conflicting policy evidence must be authorized as separate calls.
+            if any(
+                key in metadata and metadata[key] != value for key, value in result.metadata.items()
+            ):
+                return ToolPolicyResult(
+                    decision=ToolPolicyDecision.DENY,
+                    reason="Batch targets require different policy evidence; call them separately.",
+                )
+            metadata.update(result.metadata)
+            if selected is None:
+                selected = result
+            elif result.decision is ToolPolicyDecision.REQUIRE_APPROVAL:
+                if selected.decision is ToolPolicyDecision.REQUIRE_APPROVAL:
+                    expiries = [
+                        value
+                        for value in (
+                            selected.approval_expires_in_seconds,
+                            result.approval_expires_in_seconds,
+                        )
+                        if value is not None
+                    ]
+                    selected.approval_expires_in_seconds = min(expiries) if expiries else None
+                else:
+                    selected = result
+        assert selected is not None
+        return selected.model_copy(update={"metadata": metadata})
 
     async def prior_taint_labels(
         self,

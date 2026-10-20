@@ -404,8 +404,13 @@ class SecretRedactor:
         page_end: int,
         max_bytes: int,
         source_complete: bool,
+        preserve_line_breaks: bool = False,
     ) -> tuple[str, bool]:
-        """Project one raw-source page without exposing cross-page secret fragments."""
+        """Project one raw-source page without exposing cross-page secret fragments.
+
+        Line-preserving mode replaces every covered source line with a marker.
+        It raises ValueError if stabilizing marker edges consumes a newline.
+        """
 
         if type(value) is not bytes:
             raise TypeError("SecretRedactor.redact_utf8_page expects bytes.")
@@ -425,6 +430,9 @@ class SecretRedactor:
             raise ValueError("max_bytes must be a positive integer.")
         if type(source_complete) is not bool:
             raise TypeError("source_complete must be a bool.")
+
+        if type(preserve_line_breaks) is not bool:
+            raise TypeError("preserve_line_breaks must be a bool.")
 
         if not self.has_values:
             raw_page = value[page_offset - window_offset : page_end - window_offset]
@@ -450,7 +458,15 @@ class SecretRedactor:
                 if piece.source_start < relative_start:
                     omitted_leading_atomic_piece = True
                     continue
-                projected.extend(piece.value)
+                if preserve_line_breaks:
+                    # Redact the complete source before restoring only its line
+                    # separators; no secret fragment is selected independently.
+                    source = value[piece.source_start : min(piece.source_end, relative_end)]
+                    projected.extend((piece.value + b"\n") * source.count(b"\n"))
+                    if not source.endswith(b"\n"):
+                        projected.extend(piece.value)
+                else:
+                    projected.extend(piece.value)
                 continue
             local_start = max(relative_start, piece.source_start) - piece.source_start
             local_end = min(relative_end, piece.source_end) - piece.source_start
@@ -460,6 +476,8 @@ class SecretRedactor:
             bytes(projected),
             secret_patterns=self._secret_byte_patterns(),
         )
+        if preserve_line_breaks and stabilized.count(b"\n") != projected.count(b"\n"):
+            raise ValueError("Secret redaction cannot preserve source line boundaries.")
         text, boundary_truncated = self.redact_utf8_head(
             stabilized,
             max_bytes=max_bytes,

@@ -378,3 +378,79 @@ def test_docker_observer_rejects_missing_or_conflicting_evidence(monkeypatch, fa
     monkeypatch.setattr(module.subprocess, "run", inspect)
     with pytest.raises(module.WorkerOwnerUnavailable):
         module._inspect("a" * 64)
+
+
+@pytest.mark.parametrize(
+    "shape", ["lines", "cut-line", "batch", "mixed-batch", "partial-batch", "patterns"]
+)
+@pytest.mark.parametrize("fault", [None, "malformed", "missing", "failed"])
+@pytest.mark.parametrize("secret", [None, "first", "first line\nsecond line\n"])
+def test_new_workspace_result_shapes_reconcile_only_with_positive_evidence(
+    tmp_path, shape, fault, secret
+):
+    import shutil
+
+    from cayu.guides import coding_host_evidence as module
+    from cayu.runners import LocalRunner
+    from cayu.tools.base import ToolContext
+    from cayu.tools.files import ReadFileTool
+    from cayu.tools.search import SearchTextTool
+    from cayu.vaults.redaction import SecretRedactor
+    from cayu.workspaces import LocalWorkspace
+
+    (tmp_path / "a.txt").write_text("first line\nsecond line\n")
+    (tmp_path / "b.txt").write_text("third line\n")
+    args = {
+        "lines": {"path": "a.txt", "start_line": 2},
+        "cut-line": {"path": "a.txt", "start_line": 1, "max_bytes": 3},
+        "batch": {"files": [{"path": "a.txt"}, {"path": "b.txt"}]},
+        "mixed-batch": {"files": [{"path": "a.txt", "start_line": 2}, {"path": "b.txt"}]},
+        "partial-batch": {"files": [{"path": "a.txt"}, {"path": "missing.txt"}]},
+        "patterns": {"patterns": ["first", "second"], "mode": "content", "context_lines": 1},
+    }[shape]
+    if shape == "patterns" and shutil.which("rg") is None:
+        pytest.skip("ripgrep is unavailable")
+    tool = SearchTextTool() if shape == "patterns" else ReadFileTool()
+    result = asyncio.run(
+        tool.run(
+            ToolContext(
+                session_id="fixture",
+                workspace=LocalWorkspace(tmp_path),
+                runner=LocalRunner(tmp_path),
+                invocation_secret_redactor=lambda: (
+                    SecretRedactor(secret) if secret else SecretRedactor()
+                ),
+            ),
+            args,
+        )
+    )
+    assert not result.is_error
+    serialized = result.model_dump(mode="json")
+    value = serialized["structured"]
+    if secret and shape in {"batch", "partial-batch"}:
+        assert value["bytes"] != sum(entry.get("bytes", 0) for entry in value["files"])
+    if fault == "malformed":
+        if shape == "patterns":
+            value["patterns"] = ["first", None]
+        elif "batch" in shape:
+            value["files"][0]["bytes"] = True
+        else:
+            value["start_line"] = True
+    elif fault == "missing":
+        del value["path" if shape == "patterns" else "bytes"]
+    elif fault == "failed":
+        serialized["is_error"] = True
+    started = Event(type=EventType.TOOL_CALL_STARTED, session_id="fixture", tool_name=tool.name)
+    terminal = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="fixture",
+        tool_name=tool.name,
+        payload={"result": serialized},
+    )
+    events = _events()
+    history = (*events[:2], started, terminal, *events[2:])
+    if fault is None:
+        module._require_serial_check_quiescence(history)
+    else:
+        with pytest.raises(module.MaintenanceReconciliationUnavailable):
+            module._require_serial_check_quiescence(history)

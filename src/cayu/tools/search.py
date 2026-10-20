@@ -42,6 +42,8 @@ DEFAULT_SEARCH_RESULT_LIMIT_BYTES = 20_000
 MAX_SEARCH_RESULT_LIMIT_BYTES = 128 * 1024
 MAX_SEARCH_ARGUMENT_BYTES = 4 * 1024
 MAX_SEARCH_OFFSET = 10_000_000
+MAX_SEARCH_PATTERNS = 10
+MAX_SEARCH_CONTEXT_LINES = 10
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 30
 MAX_SEARCH_TIMEOUT_SECONDS = 120
 DEFAULT_SEARCH_CAPTURE_LIMIT_BYTES = 1024 * 1024
@@ -66,9 +68,21 @@ DEFAULT_SEARCH_EXCLUDE_DIRECTORIES = (
 )
 _MATCH_SEPARATOR = "\x1f"
 _MATCH_SEPARATOR_ARG = r"\x1f"
+_CONTEXT_SEPARATOR = "\x1e"
+_CONTEXT_SEPARATOR_ARG = r"\x1e"
 _PREVIEW_TRUNCATION_MARKER = " [match preview truncated]"
 _SEARCH_TEXT_ARGUMENTS = frozenset(
-    {"pattern", "path", "glob", "mode", "limit", "offset", "case_sensitive"}
+    {
+        "pattern",
+        "patterns",
+        "path",
+        "glob",
+        "mode",
+        "limit",
+        "offset",
+        "case_sensitive",
+        "context_lines",
+    }
 )
 
 
@@ -116,7 +130,10 @@ def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
         effect=ToolEffect.NONE,
         description=(
             "Search text in the active runner workspace with bounded, pageable results. "
-            "Use mode='files' to locate matching files before requesting content."
+            "Use mode='files' to locate matching files before requesting content. "
+            "Pass `patterns` to search for several regexes in one call; a line matches if any "
+            "of them matches. In content mode, `context_lines` adds surrounding lines, which "
+            "count toward `limit` and `offset`."
         ),
         input_schema={
             "type": "object",
@@ -127,6 +144,18 @@ def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
                     "minLength": 1,
                     "maxLength": MAX_SEARCH_ARGUMENT_BYTES,
                     "pattern": r"\S",
+                },
+                "patterns": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_SEARCH_PATTERNS,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SEARCH_ARGUMENT_BYTES,
+                        "pattern": r"\S",
+                    },
+                    "description": "Several regexes instead of `pattern`; lines matching any.",
                 },
                 "path": {
                     "type": "string",
@@ -152,8 +181,14 @@ def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
                     "default": 0,
                 },
                 "case_sensitive": {"type": "boolean", "default": True},
+                "context_lines": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_SEARCH_CONTEXT_LINES,
+                    "default": 0,
+                    "description": "Lines of context around each match in content mode.",
+                },
             },
-            "required": ["pattern"],
         },
     )
 
@@ -166,10 +201,17 @@ class SearchTextTool(Tool):
         max_limit=MAX_SEARCH_LIMIT,
     )
 
+    def _policy_argument_sets(self, arguments: dict) -> tuple[dict, ...]:
+        patterns = arguments.get("patterns")
+        if not isinstance(patterns, list) or not patterns:
+            return (arguments,)
+        return tuple({**arguments, "pattern": pattern} for pattern in patterns)
+
     def _execution_profile_material(self) -> dict[str, Any]:
         """Return the bounded configuration that governs search behavior."""
 
         return {
+            "batch_pattern_policy_version": 1,
             "default_limit": self.default_limit,
             "max_limit": self.max_limit,
             "max_preview_bytes": self.max_preview_bytes,
@@ -262,7 +304,7 @@ class SearchTextTool(Tool):
                 is_error=True,
             )
         with tool_argument_validation():
-            pattern = _required_text(args, "pattern")
+            patterns = _search_patterns(args)
             path = _validate_search_path(_optional_text(args, "path", default="."))
             glob = _optional_nullable_text(args, "glob")
             if glob is not None:
@@ -277,6 +319,13 @@ class SearchTextTool(Tool):
             if offset > MAX_SEARCH_OFFSET:
                 raise ValueError(f"Tool argument `offset` must be at most {MAX_SEARCH_OFFSET}.")
             case_sensitive = _optional_bool(args, "case_sensitive", default=True)
+            context_lines = _optional_int(args, "context_lines", default=0, minimum=0)
+            if context_lines > MAX_SEARCH_CONTEXT_LINES:
+                raise ValueError(
+                    f"Tool argument `context_lines` must be at most {MAX_SEARCH_CONTEXT_LINES}."
+                )
+            if context_lines and mode != "content":
+                raise ValueError("Tool argument `context_lines` is only valid in content mode.")
 
         excluded_path = _matching_excluded_directory(
             path,
@@ -378,6 +427,16 @@ class SearchTextTool(Tool):
                     "--max-columns-preview",
                 ]
             )
+            if context_lines:
+                argv.extend(
+                    [
+                        "--context",
+                        str(context_lines),
+                        "--field-context-separator",
+                        _CONTEXT_SEPARATOR_ARG,
+                        "--no-context-separator",
+                    ]
+                )
         else:
             argv.extend(["--with-filename", "--count-matches", "--null"])
         if not case_sensitive:
@@ -389,7 +448,12 @@ class SearchTextTool(Tool):
             exclude_directories=self.exclude_directories,
             protected_entry_names=self.protected_entry_names,
         )
-        argv.extend(["--", pattern, "."])
+        if len(patterns) == 1:
+            argv.extend(["--", patterns[0], "."])
+        else:
+            for pattern in patterns:
+                argv.extend(["--regexp", pattern])
+            argv.extend(["--", "."])
         raw = await _run_search_command(
             ctx,
             runner,
@@ -417,7 +481,7 @@ class SearchTextTool(Tool):
                 duration_ms=duration_ms,
                 artifacts=artifacts,
                 artifacts_truncated=artifacts_truncated,
-                pattern=pattern,
+                pattern=patterns[0] if len(patterns) == 1 else "",
             )
 
         parsed_page = _parse_search_page(
@@ -427,6 +491,7 @@ class SearchTextTool(Tool):
             limit=limit,
             max_preview_bytes=self.max_preview_bytes,
             allowed_paths=visible_paths,
+            include_context=context_lines > 0,
         )
         stdout_bytes = (
             result.stdout_bytes
@@ -484,7 +549,7 @@ class SearchTextTool(Tool):
             content=bounded_page.content,
             structured={
                 "mode": mode,
-                "pattern": pattern,
+                **({"pattern": patterns[0]} if len(patterns) == 1 else {"patterns": patterns}),
                 "path": path,
                 "glob": glob,
                 "matches": bounded_page.matches,
@@ -502,6 +567,21 @@ class SearchTextTool(Tool):
             },
             artifacts=artifacts,
         )
+
+
+def _search_patterns(args: dict[str, Any]) -> list[str]:
+    if (args.get("pattern") is None) == (args.get("patterns") is None):
+        raise ValueError("Tool arguments must include exactly one of `pattern` or `patterns`.")
+    if args.get("pattern") is not None:
+        return [_required_text(args, "pattern")]
+    values = args["patterns"]
+    if type(values) is not list or not values:
+        raise ValueError("Tool argument `patterns` must be a non-empty array.")
+    if len(values) > MAX_SEARCH_PATTERNS:
+        raise ValueError(
+            f"Tool argument `patterns` must contain at most {MAX_SEARCH_PATTERNS} items."
+        )
+    return [_required_text({"patterns": value}, "patterns") for value in values]
 
 
 def _required_text(args: dict[str, Any], key: str) -> str:
@@ -732,6 +812,7 @@ def _parse_search_page(
     limit: int,
     max_preview_bytes: int,
     allowed_paths: set[str] | None = None,
+    include_context: bool = False,
 ) -> _ParsedSearchPage:
     if mode == "files":
         parsed_matches = _iter_file_matches(output)
@@ -739,6 +820,7 @@ def _parse_search_page(
         parsed_matches = _iter_content_matches(
             output,
             max_preview_bytes=max_preview_bytes,
+            include_context=include_context,
         )
     else:
         parsed_matches = _iter_count_matches(output)
@@ -759,7 +841,9 @@ def _iter_content_matches(
     output: str,
     *,
     max_preview_bytes: int,
+    include_context: bool = False,
 ) -> Iterable[_ParsedSearchMatch]:
+    separators = {_MATCH_SEPARATOR, _CONTEXT_SEPARATOR} if include_context else {_MATCH_SEPARATOR}
     cursor = 0
     while cursor < len(output):
         path_end = output.find("\0", cursor)
@@ -769,28 +853,26 @@ def _iter_content_matches(
         if record_end < 0:
             break
         record = output[path_end + 1 : record_end]
-        line_text, separator, preview = record.partition(_MATCH_SEPARATOR)
-        if not separator:
+        digits = len(record) - len(record.lstrip("0123456789"))
+        separator = record[digits : digits + 1]
+        if not digits or separator not in separators:
             cursor = record_end + 1
             continue
-        try:
-            line = int(line_text)
-        except ValueError:
-            cursor = record_end + 1
-            continue
+        line = int(record[:digits])
+        preview = record[digits + 1 :]
         preview, line_truncated = _truncate_utf8(
             preview,
             max_preview_bytes,
             marker=_PREVIEW_TRUNCATION_MARKER,
         )
-        yield _ParsedSearchMatch(
-            value={
-                "path": _workspace_relative_path(output[cursor:path_end]),
-                "line": line,
-                "preview": preview,
-            },
-            line_truncated=line_truncated,
-        )
+        value: dict[str, Any] = {
+            "path": _workspace_relative_path(output[cursor:path_end]),
+            "line": line,
+            "preview": preview,
+        }
+        if separator == _CONTEXT_SEPARATOR:
+            value["context"] = True
+        yield _ParsedSearchMatch(value=value, line_truncated=line_truncated)
         cursor = record_end + 1
 
 
@@ -823,7 +905,11 @@ def _render_matches(mode: str, matches: list[dict[str, Any]]) -> str:
     if mode == "files":
         return "\n".join(match["path"] for match in matches)
     if mode == "content":
-        return "\n".join(f"{match['path']}:{match['line']}:{match['preview']}" for match in matches)
+        return "\n".join(
+            f"{match['path']}{'-' if match.get('context') else ':'}{match['line']}"
+            f"{'-' if match.get('context') else ':'}{match['preview']}"
+            for match in matches
+        )
     return "\n".join(f"{match['path']}:{match['count']}" for match in matches)
 
 

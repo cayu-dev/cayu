@@ -10,7 +10,7 @@ import ntpath
 import posixpath
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from itertools import pairwise
 from pathlib import PurePosixPath, PureWindowsPath
@@ -45,6 +45,7 @@ from cayu.tools._errors import (
     tool_argument_validation,
 )
 from cayu.tools._redaction import (
+    InvocationRedactorSnapshot,
     active_secret_redactor,
     active_secret_redactor_snapshot,
     await_revision_stable_secret_output,
@@ -82,11 +83,34 @@ MAX_LIST_RESULT_LIMIT_BYTES = 200_000
 MAX_LIST_OFFSET = 1_000_000
 DEFAULT_LIST_SCAN_LIMIT = 100_000
 MAX_LIST_SCAN_LIMIT = 1_000_000
+MAX_READ_FILES = 20
 _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
 _ARTIFACT_PAGE_METADATA_MAX_BYTES = 192
 
 _READ_FILE_ARGUMENTS = frozenset(
-    {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages", "image_region"}
+    {
+        "path",
+        "files",
+        "artifact_id",
+        "max_bytes",
+        "offset",
+        "start_line",
+        "end_line",
+        "max_attachment_bytes",
+        "pages",
+        "image_region",
+    }
+)
+_READ_FILE_ENTRY_ARGUMENTS = frozenset({"path", "offset", "start_line", "end_line"})
+_SINGLE_READ_ARGUMENTS = (
+    "path",
+    "artifact_id",
+    "offset",
+    "start_line",
+    "end_line",
+    "max_attachment_bytes",
+    "pages",
+    "image_region",
 )
 _EDIT_FILE_ARGUMENTS = frozenset(
     {"path", "expected_revision", "edits", "max_bytes", "max_diff_bytes"}
@@ -152,6 +176,27 @@ class ReadFileOptions:
 
 
 @dataclass(frozen=True)
+class _LineRange:
+    start: int
+    end: int | None
+
+
+@dataclass(frozen=True)
+class _ReadFileEntry:
+    path: str
+    offset: int
+    line_range: _LineRange | None
+    path_error: str | None
+
+
+@dataclass(frozen=True)
+class _WorkspaceText:
+    text: str
+    structured: dict
+    capture_snapshot: InvocationRedactorSnapshot
+
+
+@dataclass(frozen=True)
 class _TextEdit:
     old_text: str
     new_text: str
@@ -198,6 +243,9 @@ def _read_file_tool_spec(
         description=(
             "Read a file from the active workspace or read an artifact by id. "
             "Use `path` for workspace files and `artifact_id` for uploaded/generated artifacts. "
+            "To read several workspace text files, pass `files` instead of `path`; request every "
+            "file you already know you need in one call. `start_line` and `end_line` select whole "
+            "lines of a workspace text file. "
             "Workspace text results begin with model-visible JSON metadata. A complete offset-zero "
             "read includes the opaque revision required by edit_file, write_file overwrite mode, "
             "and delete_file. Text artifact pages append JSON continuation metadata; repeat the "
@@ -214,6 +262,49 @@ def _read_file_tool_spec(
                 "path": {
                     "type": "string",
                     "description": "Workspace-relative file path to read.",
+                },
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_READ_FILES,
+                    "description": (
+                        "Several workspace text files to read in one call, instead of `path`. "
+                        "max_bytes bounds the whole result: files are read in order and each "
+                        "may use an equal share of what earlier files left unused. A file that "
+                        "can't be read reports its own error without failing the others. "
+                        "Images and PDFs are read one at a time with `path`."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative file path to read.",
+                            },
+                            "start_line": {"type": "integer", "minimum": 1},
+                            "end_line": {"type": "integer", "minimum": 1},
+                            "offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Byte offset to continue from; use next_offset.",
+                            },
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+                "start_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "First line to return (1-based) from a workspace text file. Line "
+                        "results include total_lines and next_start_line instead of byte offsets."
+                    ),
+                },
+                "end_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Last line to return, inclusive. Defaults to the end of the file.",
                 },
                 "artifact_id": {
                     "type": "string",
@@ -269,6 +360,14 @@ class ReadFileTool(Tool):
         max_attachment_limit_bytes=DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES,
     )
 
+    def _policy_argument_sets(self, arguments: dict) -> tuple[dict, ...]:
+        files = arguments.get("files")
+        if not isinstance(files, list) or not files:
+            return (arguments,)
+        # Schema validation precedes authorization. Keep the whole batch visible
+        # while checking every path, even with a renamed tool or custom policy.
+        return tuple({**arguments, **entry} for entry in files)
+
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return bounded reader configuration when every reader is Cayu-owned."""
 
@@ -285,6 +384,8 @@ class ReadFileTool(Tool):
             "default_attachment_limit_bytes": self.default_attachment_limit_bytes,
             "max_attachment_limit_bytes": self.max_attachment_limit_bytes,
             "artifact_readers": artifact_readers,
+            "batch_policy_projection_version": 1,
+            "line_redaction_version": 1,
         }
 
     def __init__(
@@ -337,11 +438,19 @@ class ReadFileTool(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
             reject_unknown_tool_arguments(args, allowed=_READ_FILE_ARGUMENTS)
+            entries = None
+            if args.get("files") is not None:
+                conflicting = [key for key in _SINGLE_READ_ARGUMENTS if args.get(key) is not None]
+                if conflicting:
+                    raise ValueError(
+                        f"Tool argument `files` cannot be combined with `{conflicting[0]}`."
+                    )
+                entries = _read_file_entries(args["files"])
             path = _optional_arg_string(args, "path")
             artifact_id = _optional_arg_string(args, "artifact_id")
-            if (path is None) == (artifact_id is None):
+            if entries is None and (path is None) == (artifact_id is None):
                 raise ValueError(
-                    "Tool arguments must include exactly one of `path` or `artifact_id`."
+                    "Tool arguments must include exactly one of `path`, `files` or `artifact_id`."
                 )
             max_bytes = _optional_int(
                 args,
@@ -350,6 +459,16 @@ class ReadFileTool(Tool):
                 maximum=MAX_READ_LIMIT_BYTES,
             )
             offset = _optional_nonnegative_int(args, "offset", default=0)
+            line_range = _optional_line_range(args)
+            if line_range is not None:
+                if artifact_id is not None:
+                    raise ValueError(
+                        "Tool arguments `start_line` and `end_line` are only valid with `path`."
+                    )
+                if offset != 0:
+                    raise ValueError(
+                        "Tool argument `offset` cannot be combined with `start_line` or `end_line`."
+                    )
             max_attachment_bytes = _optional_int(
                 args,
                 "max_attachment_bytes",
@@ -381,6 +500,8 @@ class ReadFileTool(Tool):
                 image_region=region,
                 offset=offset,
             )
+        if entries is not None:
+            return await _read_workspace_files(ctx, entries=entries, max_bytes=max_bytes)
         if path is not None:
             return await _read_workspace_file(
                 ctx,
@@ -388,6 +509,7 @@ class ReadFileTool(Tool):
                 artifact_readers=self.artifact_readers,
                 offset=offset,
                 options=options,
+                line_range=line_range,
             )
         if artifact_id is not None:
             return await _read_artifact(
@@ -436,6 +558,7 @@ async def _read_workspace_file(
     artifact_readers: list[ArtifactReader],
     offset: int,
     options: ReadFileOptions,
+    line_range: _LineRange | None = None,
 ) -> ToolResult:
     workspace = _require_workspace(ctx)
     if workspace is None:
@@ -445,6 +568,13 @@ async def _read_workspace_file(
         if offset != 0:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `offset` is only valid for workspace text files.")
+            )
+        if line_range is not None:
+            return invalid_tool_arguments_result(
+                ValueError(
+                    "Tool arguments `start_line` and `end_line` are only valid for "
+                    "workspace text files."
+                )
             )
         try:
             result, _ = await _read_workspace_bytes(
@@ -463,7 +593,33 @@ async def _read_workspace_file(
             options=options,
             initial_result=result,
         )
+    read = await _read_workspace_window(
+        ctx,
+        workspace,
+        path=path,
+        content_type=content_type,
+        offset=offset,
+        line_range=line_range,
+        options=options,
+    )
+    if isinstance(read, ToolResult):
+        return read
+    return ToolResult(
+        content=_model_visible_workspace_text(read.text, read.structured),
+        structured=read.structured,
+    )
 
+
+async def _read_workspace_text(
+    ctx: ToolContext,
+    workspace: Workspace,
+    *,
+    path: str,
+    content_type: str,
+    offset: int,
+    options: ReadFileOptions,
+    preserve_line_breaks: bool = False,
+) -> _WorkspaceText | ToolResult:
     async def read_window(redactor):
         if redactor.has_values:
             redaction_overlap = redactor.pagination_overlap_utf8_bytes
@@ -608,14 +764,24 @@ async def _read_workspace_file(
     if exact_eof:
         text, redaction_truncated = "", False
     elif redactor.has_values:
-        text, redaction_truncated = redactor.redact_utf8_page(
-            result.content,
-            window_offset=result.offset,
-            page_offset=offset,
-            page_end=page_end,
-            max_bytes=options.max_bytes,
-            source_complete=next_offset is None,
-        )
+        try:
+            text, redaction_truncated = redactor.redact_utf8_page(
+                result.content,
+                window_offset=result.offset,
+                page_offset=offset,
+                page_end=page_end,
+                max_bytes=options.max_bytes,
+                source_complete=next_offset is None,
+                preserve_line_breaks=preserve_line_breaks,
+            )
+        except ValueError:
+            if not preserve_line_breaks:
+                raise
+            return ToolResult(
+                content="The active secret scope cannot preserve source line boundaries. Use byte-offset reads.",
+                structured={"error": "line_range_redaction_unavailable"},
+                is_error=True,
+            )
     else:
         # With no registered values there is no redaction boundary to enforce.
         # In particular, a literal public marker is ordinary workspace content
@@ -639,9 +805,216 @@ async def _read_workspace_file(
         "encoding": "utf-8",
         "truncated": truncated,
     }
+    return _WorkspaceText(text=text, structured=structured, capture_snapshot=capture_snapshot)
+
+
+async def _read_workspace_lines(
+    ctx: ToolContext,
+    workspace: Workspace,
+    *,
+    path: str,
+    content_type: str,
+    line_range: _LineRange,
+    options: ReadFileOptions,
+) -> _WorkspaceText | ToolResult:
+    """Select whole lines from the redacted text of the file's first read window."""
+
+    read = await _read_workspace_text(
+        ctx,
+        workspace,
+        path=path,
+        content_type=content_type,
+        offset=0,
+        options=replace(options, max_bytes=MAX_READ_LIMIT_BYTES),
+        preserve_line_breaks=True,
+    )
+    if isinstance(read, ToolResult):
+        return read
+    source = read.structured
+    complete = not source["truncated"]
+    lines = _text_lines(read.text)
+    if not complete and lines and not lines[-1].endswith("\n"):
+        lines.pop()
+    start = line_range.start
+    if start > len(lines) and (start > 1 or not complete):
+        if complete:
+            return invalid_tool_arguments_result(
+                ValueError(
+                    f"Tool argument `start_line` ({start}) is past the end of the file "
+                    f"({len(lines)} lines)."
+                )
+            )
+        return ToolResult(
+            content=(
+                f"Line ranges cover the first {MAX_READ_LIMIT_BYTES} bytes of a file, which end "
+                f"at line {len(lines)}. Use `offset` to read further."
+            ),
+            structured={
+                "error": "line_range_beyond_read_window",
+                "path": path,
+                "start_line": start,
+                "readable_lines": len(lines),
+            },
+            is_error=True,
+        )
+    stop = len(lines) if line_range.end is None else min(line_range.end, len(lines))
+    selected: list[str] = []
+    used_bytes = 0
+    line_cut = False
+    for line in lines[start - 1 : stop]:
+        line_bytes = len(line.encode("utf-8"))
+        if used_bytes + line_bytes > options.max_bytes:
+            if not selected:
+                selected.append(
+                    line.encode("utf-8")[: options.max_bytes].decode("utf-8", errors="ignore")
+                )
+                line_cut = True
+            break
+        selected.append(line)
+        used_bytes += line_bytes
+    end_line = start - 1 + len(selected)
+    next_start_line = end_line if line_cut else end_line + 1 if end_line < stop else None
+    window_exhausted = not complete and (line_range.end is None or line_range.end > end_line)
+    whole_file = complete and start == 1 and end_line == len(lines) and not line_cut
+    text = "".join(selected)
+    structured = {
+        "source": "workspace",
+        "path": path,
+        "bytes": len(text.encode("utf-8")),
+        "total_bytes": source["total_bytes"],
+        "start_line": start,
+        "end_line": end_line,
+        "total_lines": len(lines) if complete else None,
+        "next_start_line": next_start_line,
+        "revision": source["revision"] if whole_file else None,
+        "sha256": source["sha256"] if whole_file else None,
+        "encoding": "utf-8",
+        "truncated": next_start_line is not None or line_cut or window_exhausted,
+    }
+    if line_cut:
+        structured["line_truncated"] = True
+        structured["continuation_hint"] = (
+            "Retry next_start_line with a larger max_bytes to read the complete line."
+        )
+    if not whole_file:
+        record_ambiguous_secret_output(ctx, read.capture_snapshot)
+    return _WorkspaceText(text=text, structured=structured, capture_snapshot=read.capture_snapshot)
+
+
+def _text_lines(text: str) -> list[str]:
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+async def _read_workspace_files(
+    ctx: ToolContext,
+    *,
+    entries: tuple[_ReadFileEntry, ...],
+    max_bytes: int,
+) -> ToolResult:
+    workspace = _require_workspace(ctx)
+    if workspace is None:
+        return _missing_workspace_result()
+    remaining = max_bytes
+    sections: list[str] = []
+    files: list[dict] = []
+    for index, entry in enumerate(entries):
+        # Each file may use an equal share of what earlier files left unused.
+        budget = -(-remaining // (len(entries) - index))
+        read = await _read_workspace_entry(ctx, workspace, entry, max_bytes=budget)
+        if isinstance(read, _WorkspaceText):
+            remaining -= len(read.text.encode("utf-8"))
+            files.append(read.structured)
+            sections.append(_model_visible_workspace_text(read.text, read.structured))
+            continue
+        structured = read.structured or {}
+        failure = {
+            "path": entry.path,
+            "error": (
+                structured.get("error")
+                or structured.get("reason")
+                or ("binary_file" if structured.get("binary") else "read_failed")
+            ),
+            "message": read.content,
+        }
+        files.append(failure)
+        sections.append(_model_visible_workspace_text(read.content, failure))
     return ToolResult(
-        content=_model_visible_workspace_text(text, structured),
-        structured=structured,
+        content="\n".join(sections),
+        structured={
+            "source": "workspace",
+            "files": files,
+            "max_bytes": max_bytes,
+            "bytes": max_bytes - remaining,
+            "truncated": any(item.get("truncated") is True for item in files),
+            "failed": sum(1 for item in files if "error" in item),
+        },
+        is_error=all("error" in item for item in files),
+    )
+
+
+async def _read_workspace_entry(
+    ctx: ToolContext,
+    workspace: Workspace,
+    entry: _ReadFileEntry,
+    *,
+    max_bytes: int,
+) -> _WorkspaceText | ToolResult:
+    if entry.path_error is not None:
+        return invalid_tool_arguments_result(ValueError(entry.path_error))
+    if max_bytes == 0:
+        return ToolResult(
+            content="Not read: earlier files used the whole max_bytes budget.",
+            structured={"error": "max_bytes_exhausted"},
+            is_error=True,
+        )
+    content_type = _guess_workspace_content_type(entry.path)
+    if _is_workspace_file_attachment_content_type(content_type):
+        return ToolResult(
+            content="Images and PDFs are read one at a time with `path`.",
+            structured={"error": "attachment_requires_single_read"},
+            is_error=True,
+        )
+    return await _read_workspace_window(
+        ctx,
+        workspace,
+        path=entry.path,
+        content_type=content_type,
+        offset=entry.offset,
+        line_range=entry.line_range,
+        options=ReadFileOptions(max_bytes=max_bytes),
+    )
+
+
+async def _read_workspace_window(
+    ctx: ToolContext,
+    workspace: Workspace,
+    *,
+    path: str,
+    content_type: str,
+    offset: int,
+    line_range: _LineRange | None,
+    options: ReadFileOptions,
+) -> _WorkspaceText | ToolResult:
+    if line_range is None:
+        return await _read_workspace_text(
+            ctx,
+            workspace,
+            path=path,
+            content_type=content_type,
+            offset=offset,
+            options=options,
+        )
+    return await _read_workspace_lines(
+        ctx,
+        workspace,
+        path=path,
+        content_type=content_type,
+        line_range=line_range,
+        options=options,
     )
 
 
@@ -675,21 +1048,28 @@ def _secret_redaction_window_unavailable_result(
 
 
 def _model_visible_workspace_text(text: str, structured: dict) -> str:
-    metadata = {
-        key: structured[key]
-        for key in (
-            "path",
-            "bytes",
-            "total_bytes",
-            "offset",
-            "next_offset",
-            "revision",
-            "sha256",
-            "truncated",
-        )
-    }
+    metadata = {key: structured[key] for key in _MODEL_VISIBLE_READ_METADATA if key in structured}
     encoded = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
     return f"[read_file metadata]\n{encoded}\n[/read_file metadata]\n{text}"
+
+
+_MODEL_VISIBLE_READ_METADATA = (
+    "path",
+    "error",
+    "bytes",
+    "total_bytes",
+    "offset",
+    "next_offset",
+    "start_line",
+    "end_line",
+    "total_lines",
+    "next_start_line",
+    "line_truncated",
+    "continuation_hint",
+    "revision",
+    "sha256",
+    "truncated",
+)
 
 
 def _utf8_workspace_page(
@@ -2986,6 +3366,55 @@ def _optional_nonnegative_int(args: dict, key: str, *, default: int) -> int:
     if value < 0:
         raise ValueError(f"Tool argument `{key}` must be non-negative.")
     return value
+
+
+def _optional_line_range(args: dict) -> _LineRange | None:
+    start = args.get("start_line")
+    end = args.get("end_line")
+    if start is None and end is None:
+        return None
+    for key, value in (("start_line", start), ("end_line", end)):
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError(f"Tool argument `{key}` must be a positive integer.")
+    start = 1 if start is None else start
+    if end is not None and end < start:
+        raise ValueError("Tool argument `end_line` must not be less than `start_line`.")
+    return _LineRange(start=start, end=end)
+
+
+def _read_file_entries(value: object) -> tuple[_ReadFileEntry, ...]:
+    if not isinstance(value, list):
+        raise ValueError("Tool argument `files` must be an array.")
+    if not value:
+        raise ValueError("Tool argument `files` cannot be empty.")
+    if len(value) > MAX_READ_FILES:
+        raise ValueError(f"Tool argument `files` must contain at most {MAX_READ_FILES} items.")
+    entries: list[_ReadFileEntry] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("Tool argument `files` must contain objects.")
+        reject_unknown_tool_arguments(
+            item,
+            allowed=_READ_FILE_ENTRY_ARGUMENTS,
+            required=frozenset({"path"}),
+        )
+        path = _require_arg_string(item, "path")
+        offset = _optional_nonnegative_int(item, "offset", default=0)
+        line_range = _optional_line_range(item)
+        if line_range is not None and offset != 0:
+            raise ValueError(
+                "Tool argument `offset` cannot be combined with `start_line` or `end_line`."
+            )
+        # A rejected path fails only its own entry, like a missing file.
+        try:
+            path = _validate_workspace_path_argument(path)
+            path_error = None
+        except ValueError as exc:
+            path_error = str(exc)
+        entries.append(
+            _ReadFileEntry(path=path, offset=offset, line_range=line_range, path_error=path_error)
+        )
+    return tuple(entries)
 
 
 def _truncate_utf8_text(value: str, maximum: int, *, marker: str) -> tuple[str, bool]:
