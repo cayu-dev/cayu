@@ -222,16 +222,16 @@ async def test_semantic_timing_survives_sqlite_readback(tmp_path):
     app.register_provider(Provider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="synthetic"))
     observed = []
-    with pytest.raises(ModelStreamDeadlineError):
-        async for event in app.run(
-            RunRequest(
-                session_id="timing",
-                agent_name="assistant",
-                messages=[Message.text("user", "fixture")],
-                retry_policy=RetryPolicy(max_attempts=1),
-            )
-        ):
-            observed.append(event)
+    async for event in app.run(
+        RunRequest(
+            session_id="timing",
+            agent_name="assistant",
+            messages=[Message.text("user", "fixture")],
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+    ):
+        observed.append(event)
+    assert observed[-1].type is EventType.SESSION_FAILED
     stored = await SQLiteSessionStore(database).load_events("timing")
     for collection in (observed, stored):
         errors = [event.payload for event in collection if event.type is EventType.MODEL_ERROR]

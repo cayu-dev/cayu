@@ -446,20 +446,20 @@ async def test_final_response_deadline_records_unknown_outcome_without_retry():
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="gpt-5.6"))
-    with pytest.raises(ModelStreamDeadlineError):
-        _events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="final-deadline",
-                    messages=[Message.text("user", "go")],
-                    retry_policy=RetryPolicy(
-                        max_attempts=5, max_unknown_attempts=2, initial_delay_s=0
-                    ),
-                )
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="final-deadline",
+                messages=[Message.text("user", "go")],
+                retry_policy=RetryPolicy(max_attempts=5, max_unknown_attempts=2, initial_delay_s=0),
             )
-        ]
+        )
+    ]
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert events[-1].payload["provider_effect_outcome"] == "unknown"
+    assert await store.load_active_model_completion_stage("final-deadline") is None
     assert started.is_set() and stopped.is_set() and calls == 1
     errors = [
         e.payload

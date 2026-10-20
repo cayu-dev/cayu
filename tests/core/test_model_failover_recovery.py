@@ -17,6 +17,7 @@ from cayu import (
     Message,
     ResumeRequest,
     RunRequest,
+    SessionStatus,
     Tool,
     ToolResult,
     ToolSpec,
@@ -33,6 +34,7 @@ from cayu.providers.base import (
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import ExecutionProfileMismatchError
+from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import (
     IncompleteSessionRecoveryRequest,
@@ -145,6 +147,15 @@ def _application(
 def test_public_recovery_plan_after_fallback_deadline_and_sqlite_reopen(
     monkeypatch, tmp_path, drift, budgeted
 ):
+
+    # Stand in for a process lost after model.error, before the live run
+    # could settle the deadline, which leaves the stage fenced.
+    async def keep_fenced(self, context, exc):
+        return False
+
+    monkeypatch.setattr(
+        SessionOutcomePublication, "_stream_deadline_settles_as_failure", keep_fenced
+    )
 
     async def scenario():
         path = tmp_path / "cancelled-fallback.sqlite"
@@ -302,6 +313,39 @@ def test_public_recovery_plan_after_fallback_deadline_and_sqlite_reopen(
                 await ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_fallback_stream_deadline_fails_session_with_unknown_outcome(tmp_path):
+    async def scenario():
+        store = _StageSQLiteStore(tmp_path / "fallback-deadline.sqlite")
+        ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite", reservation_ttl_seconds=None)
+        app, primary, backup = _application(store, entered=asyncio.Event(), ledger=ledger)
+        try:
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="agent",
+                        session_id="fallback-deadline",
+                        messages=[Message.text("user", "hello")],
+                        retry_policy=RetryPolicy(max_attempts=1, initial_delay_s=0),
+                        failover=ModelFailoverPolicy(
+                            fallbacks=(ModelTarget(provider_name="backup", model="large"),)
+                        ),
+                    )
+                )
+            ]
+            assert events[-1].type is EventType.SESSION_FAILED
+            assert events[-1].payload["provider_effect_outcome"] == "unknown"
+            assert len(primary.requests) == len(backup.requests) == 1
+            assert (await store.load("fallback-deadline")).status is SessionStatus.FAILED
+            assert await store.load_active_model_completion_stage("fallback-deadline") is None
+            assert EventType.BUDGET_RECONCILED in {event.type for event in events}
+        finally:
+            await store.close()
+            await ledger.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=60))
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "sqlite_drift"])

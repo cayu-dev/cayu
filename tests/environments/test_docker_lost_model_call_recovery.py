@@ -28,6 +28,7 @@ from cayu.providers import (
 from cayu.runners.docker import DockerRunner, _DockerRuntimeEvidence
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.local import LocalRunner
+from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import (
     IncompleteSessionRecoveryAction,
@@ -145,6 +146,14 @@ class _LosesFirstCall(ModelProvider):
 
 
 def _app(root: Path, monkeypatch, tasks):
+    # Stand in for a process lost after model.error, before the live run
+    # could settle the deadline, which leaves the dispatched call fenced.
+    async def keep_fenced(self, context, exc):
+        return False
+
+    monkeypatch.setattr(
+        SessionOutcomePublication, "_stream_deadline_settles_as_failure", keep_fenced
+    )
     (root / "source").mkdir()
     containers: list[_LocalContainer] = []
 

@@ -109,6 +109,7 @@ from cayu.observability.hooks import (
 from cayu.providers._credential_boundary import (
     copy_provider_cancellation_failures,
 )
+from cayu.providers.base import ModelStreamDeadlineError
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -2227,7 +2228,9 @@ class SessionFinalization:
                         "provider_authentication_failed"
                         if provider_rejected_before_effect
                         else (
-                            "model_attempt_failed"
+                            "provider_stream_deadline"
+                            if type(model_completion_failure) is ModelStreamDeadlineError
+                            else "model_attempt_failed"
                             if to_status is SessionStatus.FAILED
                             else "model_attempt_interrupted"
                         )

@@ -15,6 +15,7 @@ from cayu.providers import _credential_boundary as credential_boundary
 from cayu.providers import deadlines as ds
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
+from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workflows.base import WorkflowSpec
@@ -36,25 +37,46 @@ def frame(x):
 @pytest.mark.anyio
 @pytest.mark.parametrize("streaming", [True, False], ids=["stream", "final-json"])
 @pytest.mark.parametrize(
-    "mode,traffic",
+    "mode,traffic,fenced",
     [
-        (mode, traffic)
+        (mode, traffic, False)
         for mode in ("socket", "mock", "delayed", "failure")
         for traffic in ("silence", "heartbeat", "whitespace")
     ]
     + [
-        ("socket_preheaders", "silence"),
-        ("socket_preheaders_delayed", "silence"),
-        ("socket_preheaders_failure", "silence"),
-        ("mock_preheaders", "silence"),
-        ("noncooperative", "silence"),
-        ("receipt_failure", "silence"),
-        ("delayed_receipt", "silence"),
-        ("socket_delayed_receipt", "whitespace"),
+        ("socket_preheaders", "silence", False),
+        ("socket_preheaders_delayed", "silence", False),
+        ("socket_preheaders_failure", "silence", False),
+        ("mock_preheaders", "silence", False),
+        ("noncooperative", "silence", False),
+        ("receipt_failure", "silence", False),
+        ("delayed_receipt", "silence", False),
+        ("socket_delayed_receipt", "whitespace", False),
+    ]
+    # A stage that stays fenced (a provider operation, a contracted task, or
+    # a process lost before settlement) reports cleanup on its recovery plan.
+    + [
+        (mode, "silence", True)
+        for mode in (
+            "mock",
+            "delayed",
+            "failure",
+            "mock_preheaders",
+            "receipt_failure",
+            "delayed_receipt",
+        )
     ],
 )
-async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, streaming):
+async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, fenced, streaming):
     baseline_tasks = set(asyncio.all_tasks())
+    if fenced:
+
+        async def keep_fenced(self, context, exc):
+            return False
+
+        monkeypatch.setattr(
+            SessionOutcomePublication, "_stream_deadline_settles_as_failure", keep_fenced
+        )
 
     def cleanup_owners():
         # A close that reaches publication before deadline-read teardown is
@@ -284,23 +306,31 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
             # bounded 100/50 ms joins on a loaded worker. The original error
             # can therefore report unconfirmed cleanup even when it later
             # succeeds. Require the immutable, exact durable receipt below.
-            if mode == "mock_preheaders":
+            if not fenced:
+                # The live run settled the stage with an unknown provider
+                # outcome and failed the session; cleanup can finish later.
+                assert initial_plan.status == "failed"
+                assert initial_plan.active_model_stage is None
+                assert [e.type for e in events].count("session.failed") == 1
+            if mode == "mock_preheaders" and fenced:
                 assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
-            elif mode not in {"socket", "socket_preheaders", "mock"}:
+            elif mode not in {"socket", "socket_preheaders", "mock", "mock_preheaders"}:
                 assert error.payload["stream_cleanup_failed"] is True
-            elif not error.payload.get("stream_cleanup_failed", False):
+            elif fenced and not error.payload.get("stream_cleanup_failed", False):
                 assert initial_plan.active_model_stage.local_http_cleanup == "succeeded"
             if mode in {"delayed", "noncooperative", "socket_preheaders_delayed"}:
                 assert not closed.is_set()
                 assert cleanup_owners()
-                assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
+                if fenced:
+                    assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
             if mode in {"delayed_receipt", "socket_delayed_receipt"}:
                 # For a socket, peer EOF observation is independent of the
                 # local close/receipt task; join it explicitly before checking.
                 await asyncio.wait_for(closed.wait(), 30)
                 assert closed.is_set()
                 assert cleanup_owners()
-                assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
+                if fenced:
+                    assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
             release.set()
             # Receipt persistence and peer EOF are eventual cleanup, not the
             # 200 ms behavior deadline. Allow loaded CI workers ample time.
@@ -309,7 +339,27 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
                     await asyncio.sleep(0.001)
             events, settled_plan = await snapshot()
             receipts = [e for e in events if e.type == "model.http_cleanup"]
-            assert len(receipts) == (0 if mode in {"receipt_failure", "mock_preheaders"} else 1)
+            late_close = mode in {
+                "delayed",
+                "noncooperative",
+                "socket_preheaders_delayed",
+                "delayed_receipt",
+                "socket_delayed_receipt",
+            }
+            if mode in {"receipt_failure", "mock_preheaders"}:
+                assert receipts == []
+            elif fenced:
+                assert len(receipts) == 1
+            elif late_close:
+                # The failed run no longer owns the session's run epoch, so a
+                # close that finishes after session.failed leaves no receipt.
+                assert receipts == []
+            else:
+                # A close confirmed within the bounded join precedes the failure.
+                assert len(receipts) <= 1
+                if receipts:
+                    types = [e.type for e in events]
+                    assert types.index("model.http_cleanup") < types.index("session.failed")
             expected = (
                 "unknown"
                 if mode in {"receipt_failure", "mock_preheaders"}
@@ -317,14 +367,18 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
                 if mode in {"failure", "socket_preheaders_failure"}
                 else "succeeded"
             )
-            assert settled_plan.active_model_stage.local_http_cleanup == expected
+            if fenced:
+                assert settled_plan.active_model_stage.local_http_cleanup == expected
+                assert settled_plan.run_epoch == 1
+            else:
+                assert settled_plan.active_model_stage is None
             assert settled_plan.allowed_actions == initial_plan.allowed_actions
             assert settled_plan.blockers == initial_plan.blockers
-            assert settled_plan.status == "running"
+            assert settled_plan.status == ("running" if fenced else "failed")
             if receipts:
                 receipt = receipts[0]
                 assert receipt.payload["local_http_cleanup"] == expected
-                assert receipt.payload["source_run_epoch"] == settled_plan.run_epoch == 1
+                assert receipt.payload["source_run_epoch"] == 1
                 for key in (
                     "model_attempt_id",
                     "model_step_id",
@@ -336,7 +390,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
                 assert receipt.session_id == error.session_id == sid
                 assert receipt.interaction_id == error.interaction_id
                 assert receipt.payload["provider_effect_outcome"] == "unknown"
-            if (mode, traffic) == ("mock", "silence"):
+            if (mode, traffic, fenced) == ("mock", "silence", True):
                 query_events = store.query_events
                 for field, wrong in (
                     ("model_attempt_id", "matt_unrelated"),
@@ -416,7 +470,9 @@ async def test_semantic_http_cleanup_watchdog_excludes_session_setup(tmp_path, m
         return await prepare(self, request, **kwargs)
 
     monkeypatch.setattr(SessionPreparation, "prepare_initial_run", slow_prepare)
-    await test_semantic_idle_http_cleanup(tmp_path, monkeypatch, "delayed", "whitespace", True)
+    await test_semantic_idle_http_cleanup(
+        tmp_path, monkeypatch, "delayed", "whitespace", fenced=False, streaming=True
+    )
 
 
 @pytest.mark.anyio

@@ -7,10 +7,23 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 protocol 6 and refuses an image built from an earlier release at readiness.
 Storage revision 124, compatibility floor 124, server contract 49 and manifest
 schema 17 are all unchanged.
+Check the breaking change below if you catch `ModelStreamDeadlineError` from
+`app.run` or `app.resume`.
 
 ### Breaking changes
 
-None.
+- A model stream that hits its idle or absolute deadline on an ordinary assistant
+  turn now fails the session instead of leaving it `running`. `app.run` and
+  `app.resume` yield `interaction.failed` and `session.failed` rather than
+  raising `ModelStreamDeadlineError`, and a linked task fails. The in-flight
+  stage is settled as `provider_effect_outcome_unknown` with its reserved budget
+  charged in full, and the request is never sent again. The `session.failed`
+  payload carries the deadline evidence and `provider_effect_outcome: "unknown"`.
+  Before, these sessions stayed `running` until incomplete-session recovery and
+  explicit stage settlement. Provider-operation stages, contracted tasks and
+  combined failures keep that fence and still raise. A `model.http_cleanup`
+  receipt for a response that closes after the session failed is no longer
+  written.
 
 ### Changes
 

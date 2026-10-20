@@ -53,7 +53,6 @@ from cayu.providers.operations import (
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions._model_stage import ModelCompletionManualRecoveryRequest
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
@@ -430,18 +429,19 @@ def _run_until_semantic_deadline_process_exit(database: str, marker: str) -> Non
         )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        try:
-            async for _ in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id=_SEMANTIC_DEADLINE_PROCESS_SESSION_ID,
-                    messages=[Message.text("user", "wait until the semantic deadline")],
-                )
-            ):
-                pass
-        except ModelStreamDeadlineError as failure:
-            if failure.deadline_evidence.deadline_kind.value != "semantic_idle":
-                raise
+        # The process dies after model.error and before the live run can
+        # settle the stage, so only recovery can find the deadline.
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=_SEMANTIC_DEADLINE_PROCESS_SESSION_ID,
+                messages=[Message.text("user", "wait until the semantic deadline")],
+            )
+        ):
+            if event.type is not EventType.MODEL_ERROR:
+                continue
+            if event.payload.get("provider_deadline_kind") != "semantic_idle":
+                raise AssertionError("the model error was not a semantic deadline")
             active = await store.load_active_model_completion_stage(
                 _SEMANTIC_DEADLINE_PROCESS_SESSION_ID
             )
@@ -539,7 +539,7 @@ def test_semantic_deadline_process_loss_cannot_redispatch_before_settlement(
     asyncio.run(store.close())
 
 
-def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
+def test_cayu_app_fails_typed_semantic_stream_deadline_with_unknown_outcome(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -625,36 +625,34 @@ def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def collect_until_deadline() -> tuple[list[Event], ModelStreamDeadlineError]:
+    async def collect_until_deadline() -> list[Event]:
         observed: list[Event] = []
-        with pytest.raises(ModelStreamDeadlineError) as caught:
-            async for event in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="sess_retry_sse_idle",
-                    messages=[Message.text("user", "hi")],
-                )
-            ):
-                observed.append(event)
-        return (
-            _without_request_evidence(_without_interaction_lifecycle(observed)),
-            caught.value,
-        )
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_sse_idle",
+                messages=[Message.text("user", "hi")],
+            )
+        ):
+            observed.append(event)
+        return _without_request_evidence(_without_interaction_lifecycle(observed))
 
-    events, failure = asyncio.run(collect_until_deadline())
+    events = asyncio.run(collect_until_deadline())
     transcript = asyncio.run(store.load_transcript("sess_retry_sse_idle"))
     private_events = asyncio.run(
         _private_events_for_public_events(store, "sess_retry_sse_idle", events)
     )
 
     assert FlakyHttpClient.calls == 1
-    assert [event.type for event in events] == [
+    assert [event.type for event in events][:4] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_ERROR,
     ]
-    assert failure.deadline_evidence.deadline_kind.value == "semantic_idle"
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert events[-1].payload["provider_deadline_kind"] == "semantic_idle"
+    assert events[-1].payload["provider_effect_outcome"] == "unknown"
     assert EventType.MODEL_RETRY not in {event.type for event in events}
     assert EventType.MODEL_ATTEMPT_DISCARDED not in {event.type for event in events}
     assert events[2].payload == {
@@ -701,72 +699,24 @@ def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
     )
     assert [message.role for message in transcript] == ["user"]
 
-    active = asyncio.run(store.load_active_model_completion_stage("sess_retry_sse_idle"))
     session = asyncio.run(store.load("sess_retry_sse_idle"))
-    assert active is not None
-    assert active.stage.state == "in_flight"
-    assert active.stage.logical_step_id == private_started.payload["model_step_id"]
-    assert active.stage.intent["model_attempt_id"] == private_started.payload["model_attempt_id"]
-    assert session is not None and session.status is SessionStatus.RUNNING
-    assert (
+    assert session is not None and session.status is SessionStatus.FAILED
+    assert asyncio.run(store.load_active_model_completion_stage("sess_retry_sse_idle")) is None
+    step_id = private_started.payload["model_step_id"]
+    settlements = [
         asyncio.run(
-            store.load_model_completion_stage_dispatch(
-                "sess_retry_sse_idle",
-                active.stage.stage_id,
+            store.load_model_completion_stage_settlement(
+                "sess_retry_sse_idle", f"{step_id}:dispatch:{ordinal}"
             )
         )
-        is not None
-    )
-
-    asyncio.run(store.close())
-    reopened_store = SQLiteSessionStore(database)
-    restarted_provider = ChatCompletionsProvider(
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=1.0,
-            semantic_progress_timeout_s=0.05,
-            protocol_idle_timeout_s=1.0,
-            absolute_stream_timeout_s=1.0,
-        ),
-    )
-    restarted = CayuApp(session_store=reopened_store, enable_logging=False)
-    restarted.register_provider(restarted_provider, default=True)
-    restarted.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    with pytest.raises(ModelCompletionManualRecoveryRequired):
-        asyncio.run(
-            restarted.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id="sess_retry_sse_idle",
-                    inactive_for_seconds=0,
-                )
-            )
-        )
-    assert FlakyHttpClient.calls == 1
-    recovered_owner = asyncio.run(reopened_store.load("sess_retry_sse_idle"))
-    assert recovered_owner is not None
-    assert recovered_owner.run_epoch > session.run_epoch
-
-    settlement = asyncio.run(
-        restarted.recover_model_completion_stage(
-            ModelCompletionManualRecoveryRequest(
-                session_id="sess_retry_sse_idle",
-                stage_id=active.stage.stage_id,
-                expected_run_epoch=recovered_owner.run_epoch,
-                terminal_status=SessionStatus.FAILED,
-            )
-        )
-    )
-    assert settlement.settlement.disposition is (
+        for ordinal in range(4)
+    ]
+    [settlement] = [item for item in settlements if item is not None]
+    assert settlement.disposition is (
         sessions_module.ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
     )
-    assert settlement.settlement.reason_code == "operator_outcome_unknown"
-    assert (
-        asyncio.run(reopened_store.load_active_model_completion_stage("sess_retry_sse_idle"))
-        is None
-    )
-    assert FlakyHttpClient.calls == 1
-    asyncio.run(reopened_store.close())
+    assert settlement.reason_code == "provider_stream_deadline"
+    asyncio.run(store.close())
 
 
 def test_cayu_app_preserves_stream_deadline_when_model_error_acknowledgement_is_lost() -> None:

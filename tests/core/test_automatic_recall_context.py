@@ -4309,15 +4309,18 @@ def test_runtime_records_stream_deadline_exposure_as_indeterminate() -> None:
             context_policy=_policy(),
         )
 
-        with pytest.raises(ModelStreamDeadlineError):
-            async for _ in app.run(
+        events = [
+            event
+            async for event in app.run(
                 RunRequest(
                     agent_name="assistant",
                     session_id="automatic-recall-stream-deadline",
                     messages=[Message.text("user", "When is Atlas released?")],
                 )
-            ):
-                pass
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].payload["error_type"] == "ModelStreamDeadlineError"
 
         exposures = (
             await sessions.list_context_exposures(

@@ -11411,16 +11411,46 @@ than reclassifying it as an ambiguous stream deadline.
 
 A stream deadline raises content-free `ModelStreamDeadlineError` evidence and is
 not retried after dispatch because the external effect outcome is unknown. Cayu
-persists one `model.error`, leaves the exact in-flight completion stage fenced,
-and requires incomplete-session recovery plus explicit manual stage settlement;
-it does not infer failure from acknowledgement loss or replay the request.
+persists one `model.error` and never replays the request. That event keeps
+`provider_recovery_disposition="manual_settlement_required"`: it is written
+before the run settles anything, and it names what recovery needs if the stage
+stays fenced.
+
+For an ordinary synchronous assistant turn, the live run then settles the exact
+in-flight stage as `provider_effect_outcome_unknown` (reason
+`provider_stream_deadline`), keeps the reserved budget charged in full as
+unknown post-dispatch usage, fails a linked task, and publishes
+`interaction.failed` and `session.failed`. `app.run` and `app.resume` yield that
+`session.failed` instead of raising, so `run_to_completion` reports `failed`
+from a stored terminal event. The `session.failed` payload carries the
+content-free deadline evidence, `provider_error_code`, and
+`provider_effect_outcome="unknown"`. `failed` describes the run: Cayu received
+no complete response. It is not a claim about the provider's effect, which stays
+recorded as unknown on the stage settlement and in the budget charge. This holds
+even when the stalled turn streamed only text: no tool call was accepted, so no
+Cayu-side effect can follow from it, while provider-side work (compute, billing,
+hosted tools after the last observed progress) remains unknown. The session can
+be resumed like any failed session; that sends a new request from the stored
+transcript, not a replay of the stalled one.
+
+The deadline keeps the fence instead when the stage belongs to a provider
+operation that can be reattached, when the run is a contracted task attempt
+that needs an explicit completion decision, when the stage is not an assistant
+turn (for example context compaction), or when the deadline is combined with
+another failure such as a lost `model.error` acknowledgement. Then `app.run`
+raises the deadline, the exact in-flight stage stays fenced, and the session
+needs incomplete-session recovery plus explicit stage settlement, as does a
+stage whose process died before the live run could settle it. Cayu does not
+infer failure from acknowledgement loss in any of these cases.
+
 Deadline expiry cancels the in-flight read without trusting cancellation as
 proof that opaque provider work stopped. A read that suppresses cancellation is
 retained under process-local ownership until it settles, and any late value is
-discarded while the durable stage remains fenced. Cancellation remains
-cancellation and is never translated into a deadline. The exact deadline values
-and material versions are part of execution-profile identity, so continuation
-with changed values requires the normal explicit profile-adoption flow.
+discarded, both while a stage remains fenced and after the live run settled it.
+Cancellation remains cancellation and is never translated into a deadline. The
+exact deadline values and material versions are part of execution-profile
+identity, so continuation with changed values requires the normal explicit
+profile-adoption flow.
 
 For bundled synchronous streams, semantic-idle expiry allows up to 100 ms for
 cooperative read finalization before reporting local cleanup as unconfirmed.
@@ -11436,7 +11466,11 @@ task or deadline controller owns receipt persistence. Publication gets a bounded
 50 ms join on semantic expiry; any remaining write stays under the same dispatch
 ownership. It does not start an unbounded detached writer or call user event
 sinks. A delayed close can append this receipt after
-`model.error`; the original error is immutable. If closure or persistence has
+`model.error`; the original error is immutable. The receipt is written only
+while the dispatching run still owns the session's run epoch. When the live run
+has already failed the session, a close that finishes later leaves no receipt;
+`model.error` still reports `stream_cleanup_failed` when the bounded join did
+not confirm the close. If closure or persistence has
 not been confirmed, recovery reports `local_http_cleanup="unknown"` on the
 active model stage. A matching durable receipt changes that evidence to
 `succeeded` or `failed`, including after store reopen. This describes local HTTP

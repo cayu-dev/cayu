@@ -45,6 +45,7 @@ from cayu.observability.hooks import (
     RuntimeHookPhase,
 )
 from cayu.providers.base import (
+    MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
     ModelStreamDeadlineError,
 )
 from cayu.runtime import _approval_support as approval_support
@@ -124,8 +125,10 @@ from cayu.runtime.loop_policies import (
     LoopPolicy,
 )
 from cayu.runtime.provider_operations import (
+    ProviderOperationEvidenceError,
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
+    load_recoverable_provider_operation,
 )
 from cayu.runtime.tool_completion import (
     ToolCompletionResult,
@@ -801,6 +804,42 @@ class SessionOutcomePublication:
         ):
             yield event
 
+    async def _stream_deadline_settles_as_failure(
+        self,
+        context: SessionOutcomeContext,
+        exc: Exception,
+    ) -> bool:
+        """Whether an ordinary synchronous stream deadline can fail the session.
+
+        The dispatched request's outcome stays unknown: the stage is settled as
+        ``provider_effect_outcome_unknown`` with its reservations charged in
+        full, and the request is never sent again. Only an unmixed deadline on
+        an assistant turn qualifies; anything else keeps its fenced recovery.
+        """
+
+        if type(exc) is not ModelStreamDeadlineError:
+            return False
+        if exc.recovery_disposition != MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION:
+            return False
+        if context.invocation_context.work_attempt is not None:
+            return False
+        active = await self.session_store.load_active_model_completion_stage(
+            context.state.session.id
+        )
+        if (
+            active is None
+            or active.stage.state != "in_flight"
+            or active.stage.purpose != "assistant-turn"
+            or active.stage.intent.get("provider_operation_start") is not None
+        ):
+            return False
+        try:
+            return (
+                await load_recoverable_provider_operation(self.session_store, active.stage) is None
+            )
+        except ProviderOperationEvidenceError:
+            return False
+
     async def fail(
         self,
         context: SessionOutcomeContext,
@@ -843,11 +882,18 @@ class SessionOutcomePublication:
             isinstance(candidate, ModelStreamDeadlineError)
             for candidate in iter_exception_tree(exc)
         ):
-            # A dispatched synchronous request has an unknown external outcome.
-            # Keep the open interaction and exact model stage fenced so only
-            # incomplete-session recovery followed by explicit stage settlement
-            # can release or replace its authority.
-            raise exc
+            try:
+                settles_as_failure = await self._stream_deadline_settles_as_failure(context, exc)
+            except BaseException as eligibility_failure:
+                _raise_primary_with_secondary_failure(
+                    exc,
+                    eligibility_failure,
+                    group_message="Stream deadline and settlement eligibility check failed.",
+                )
+            if not settles_as_failure:
+                # Keep provider operations, contracted tasks and combined
+                # failures fenced for incomplete-session recovery.
+                raise exc
         ambiguous_provider_start = is_ambiguous_provider_operation_start_error(exc)
         if not ambiguous_provider_start:
             provider_operation = await inspect_provider_operation(
@@ -991,6 +1037,12 @@ class SessionOutcomePublication:
                         redactor=self._secret_redactor,
                     )
                 )
+            if type(error) is ModelStreamDeadlineError:
+                # Content-free deadline evidence. The stage settlement keeps the
+                # provider outcome unknown; say so where the failure is read.
+                failure_payload.update(error.deadline_evidence.payload())
+                failure_payload["provider_error_code"] = error.error_code
+                failure_payload["provider_effect_outcome"] = "unknown"
             if isinstance(error, resume_ledger.ToolCallEvidenceConflict):
                 failure_payload[tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
             compaction_failure = automatic_compaction_failure_payload(
