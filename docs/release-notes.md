@@ -23,6 +23,21 @@ None.
   runner workspace in one guest operation instead of listing it and reading
   every file. File hashes are taken from the files' own bytes, as in direct
   observations of the same workspace.
+- Run untrusted code locally in a hardened container with allowlisted egress:
+  `DockerEgressAdapter(workload_restrictions=DockerWorkloadRestrictions())` with
+  `VirtualEgressEnvironmentFactory`. `DockerRunner.create` now accepts
+  `workload_restrictions` without `image_identity`, on any network; it verifies
+  the live container and runs Cayu's own guest helpers and `setup_commands` as
+  the restricted user. Such containers report `guest_privilege_containment` and
+  `unprivileged_guest` as available and still report `untrusted_code_isolation`
+  as unsupported, because they share the host kernel. Strict, evidence-bearing
+  Docker creation still requires `network="none"`, and Docker egress reconnect
+  refuses `workload_restrictions`. `cayu guide untrusted-code` explains which
+  path to use locally and in production.
+- A `DockerTmpfsMount` with `noexec=False` (the `/tmp` and `/workspace`
+  defaults) is now mounted executable. Docker mounts tmpfs `noexec` unless told
+  otherwise, so these mounts used to be non-executable despite the setting.
+  Containers created before this change still verify on reconnect.
 - Add `runner_agent_launch`, which runs Claude Code or Codex through the external
   agent adapters inside any runner that can open interactive processes, with no
   Docker daemon. Runners expose this through the new provider-neutral

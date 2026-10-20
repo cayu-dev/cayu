@@ -257,8 +257,9 @@ class DockerWorkloadRestrictions(BaseModel):
                 f"gid={self.gid}",
                 f"mode={mount.mode:o}",
             ]
-            if mount.noexec:
-                options.append("noexec")
+            # Docker mounts a tmpfs noexec unless told otherwise, so an
+            # executable mount must say "exec" explicitly.
+            options.append("noexec" if mount.noexec else "exec")
             args += ["--tmpfs", f"{mount.target}:{','.join(options)}"]
         return tuple(args)
 

@@ -627,7 +627,13 @@ Cayu makes safety boundaries explicit, but configuration still matters:
 - `LocalRunner` executes directly on a trusted local machine and provides no
   sandbox isolation.
 - `DockerRunner` is useful for development and CI; ordinary Docker isolation
-  is not presented as a secure untrusted-code boundary.
+  is not presented as a secure untrusted-code boundary. To run untrusted code
+  locally, use a hardened container with allowlisted egress:
+  `DockerEgressAdapter(workload_restrictions=DockerWorkloadRestrictions())` with
+  `VirtualEgressEnvironmentFactory` (non-root, read-only root, no capabilities,
+  resource limits, only allowlisted hosts). It still shares the host kernel. In
+  production, use `SandboxCodingEnvironmentFactory` on Lambda MicroVM. Run
+  `cayu guide untrusted-code` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/untrusted-code.md)).
 - Environment registration does not imply selection: mark a default explicitly
   or name the environment on the request. Provider defaults and model-pattern
   routing should likewise be configured deliberately and kept unambiguous.
@@ -683,6 +689,7 @@ Start with the document that matches the job:
 | Configure primary or compatible model services | `cayu guide providers` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md)) |
 | Classify and verify tool mutation and replay behavior | `cayu guide tool-effects` |
 | Build a durable propose, authorize, act, verify, and recover lifecycle | `cayu guide durable-operations` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-operations.md)) |
+| Run untrusted code in a hardened container with allowlisted egress | `cayu guide untrusted-code` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/untrusted-code.md)) |
 | Complete a task only after an independent verifier accepts its evidence | `cayu guide verified-work` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/verified-work.md), [example](https://github.com/cayu-dev/cayu/blob/main/examples/durable_file_workflow/verified.py)) |
 | Notify people about durable questions, approvals, and recovery gates | `cayu guide human-attention` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/human-attention.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/human_attention/)) |
 | Reconstruct service-backed tools with stable identities and scoped knowledge | `cayu guide durable-service-tools` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-service-tools.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/durable_service_tools/)) |

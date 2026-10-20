@@ -551,3 +551,102 @@ def test_credentialless_factory_crosses_real_docker_boundary_without_fake_secret
             assert event.payload["authorization_kind"] == "transport"
         else:
             assert event.payload["authorization_kind"] == "credentialless"
+
+
+async def _drive_hardened_factory() -> dict[str, object]:
+    from cayu.egress.runtime import VirtualEgressEnvironmentFactory
+    from cayu.environments import EnvironmentFactoryRequest
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    class _Index:
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            del request, limits
+
+            async def send() -> CapturedResponse:
+                return CapturedResponse(status_code=200, headers={}, body=b"index-ok")
+
+            return EgressUpstreamOperation(send)
+
+    adapter = DockerEgressAdapter(workload_restrictions=DockerWorkloadRestrictions())
+    factory = VirtualEgressEnvironmentFactory(
+        policies={
+            "index": HttpEgressPolicy(
+                name="index",
+                allowed_hosts=["pypi.example.com"],
+                allowed_endpoints=[("GET", "/simple/")],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(destination="pypi.example.com", policy_name="index")
+        ],
+        adapter=adapter,
+        image=CONTAINER_IMAGE,
+        upstream=_Index(),
+    )
+    result = await factory.create(
+        EnvironmentFactoryRequest(
+            session_id="e2e-hardened",
+            agent_name="agent",
+            environment_name="hardened-env",
+        )
+    )
+    runner = result.environment.runner
+    binding = result.environment.binding
+    assert runner is not None
+    assert binding is not None
+    script = (
+        "import os, socket, urllib.error, urllib.request as u\n"
+        "print('uid', os.getuid(), os.getgid())\n"
+        "status = dict(line.split(':\\t', 1) for line in open('/proc/self/status'))\n"
+        "print('caps', status['CapEff'].strip(), 'nnp', status['NoNewPrivs'].strip())\n"
+        "def writable(path):\n"
+        "    try:\n"
+        "        open(path, 'w').close()\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
+        "print('root-writable', writable('/etc/cayu-probe'))\n"
+        "print('workspace-writable', writable('/workspace/probe'))\n"
+        "print(u.urlopen('https://pypi.example.com/simple/', timeout=25).read().decode())\n"
+        "try:\n"
+        "    u.urlopen('https://canary.example.com/', timeout=25)\n"
+        "except urllib.error.HTTPError as exc:\n"
+        "    print('denied', exc.code)\n"
+        "except urllib.error.URLError as exc:\n"
+        "    if 'Tunnel connection failed: 403 Forbidden' not in str(exc.reason): raise\n"
+        "    print('denied', 403)\n"
+        "try:\n"
+        "    socket.create_connection(('1.1.1.1', 443), timeout=2).close()\n"
+        "    print('direct-ip-denied', False)\n"
+        "except OSError:\n"
+        "    print('direct-ip-denied', True)\n"
+    )
+    try:
+        call = await runner.exec(ExecCommand.process("python3", "-c", script), timeout_s=60)
+        evidence = runner.execution_admission_candidate().evidence
+    finally:
+        bound = await binding.bind(None, runner, session_id="e2e-hardened")
+        await binding.finalize(bound, outcome="completed")
+    return {"call": call, "evidence": evidence}
+
+
+def test_hardened_container_reaches_only_allowlisted_hosts() -> None:
+    results = asyncio.run(_drive_hardened_factory())
+    call = results["call"]
+    assert call.exit_code == 0, call.stderr
+    stdout = call.stdout
+    assert "uid 1000 1000" in stdout
+    assert "caps 0000000000000000 nnp 1" in stdout
+    assert "root-writable False" in stdout
+    assert "workspace-writable True" in stdout
+    assert "index-ok" in stdout
+    assert "denied 403" in stdout
+    assert "direct-ip-denied True" in stdout
+    evidence = results["evidence"]
+    assert evidence.state_for("unprivileged_guest") == "available"
+    assert evidence.state_for("untrusted_code_isolation") == "unsupported"

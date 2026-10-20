@@ -20,6 +20,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Application UIs over sessions](../src/cayu/guides/app-ui.md) (`cayu guide app-ui`)
 - [Durable service-backed tools](../src/cayu/guides/durable-service-tools.md) (`cayu guide durable-service-tools`)
 - [Verified work](../src/cayu/guides/verified-work.md) (`cayu guide verified-work`)
+- [Running untrusted code](../src/cayu/guides/untrusted-code.md) (`cayu guide untrusted-code`): hardened Docker with allowlisted egress locally, Lambda MicroVM in production
 
 - [Advanced runtime examples](advanced-runtime-examples.md)
 - [Agent-authoring evaluations](authoring-evals.md)

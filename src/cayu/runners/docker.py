@@ -216,6 +216,72 @@ class _DockerRuntimeEvidence:
         return self.image_identity.fingerprint
 
 
+def docker_privilege_claims(
+    restrictions: DockerWorkloadRestrictions,
+    *,
+    observed_at: datetime | None = None,
+    valid_until: datetime | None = None,
+):
+    """Return the privilege claims one verified set of restrictions supports.
+
+    The claims describe the guest user, capabilities, no-new-privileges and
+    read-only root, which do not depend on the container's network. With an
+    observation window they are live-verified strict evidence; without one they
+    are ``available`` from the inspection made when the container was created.
+    Weakened restrictions support neither claim.
+    """
+
+    from cayu.environments.admission import ExecutionCapabilityClaim
+
+    if not restrictions.supports_strict_privilege_evidence:
+        return tuple(
+            ExecutionCapabilityClaim.unsupported(
+                capability,
+                reason_code="docker_privilege_restrictions_weakened",
+                remediation_code="use_verified_docker_restrictions",
+            )
+            for capability in ("guest_privilege_containment", "unprivileged_guest")
+        )
+    details = (
+        CapabilityDetail(name="nonroot", value=True),
+        CapabilityDetail(name="uid", value=restrictions.uid),
+        CapabilityDetail(name="gid", value=restrictions.gid),
+        CapabilityDetail(name="read_only_root", value=restrictions.read_only_root),
+        CapabilityDetail(name="no_new_privileges", value=restrictions.no_new_privileges),
+        CapabilityDetail(name="cap_drop_all", value=True),
+        CapabilityDetail(name="capability_add_empty", value=not restrictions.capability_add),
+        CapabilityDetail(name="pids_limit", value=restrictions.pids_limit),
+        CapabilityDetail(name="memory_bytes", value=restrictions.memory_bytes),
+        CapabilityDetail(name="memory_swap_bytes", value=restrictions.memory_swap_bytes),
+        CapabilityDetail(name="cpu_period_us", value=restrictions.cpu_period_us),
+        CapabilityDetail(name="cpu_quota_us", value=restrictions.cpu_quota_us),
+        CapabilityDetail(name="shm_size_bytes", value=restrictions.shm_size_bytes),
+    )
+    if observed_at is None:
+        return tuple(
+            ExecutionCapabilityClaim(
+                capability=capability,
+                state="available",
+                proof_source="integration_validation",
+                observation="available",
+                adapter_details=details,
+            )
+            for capability in ("guest_privilege_containment", "unprivileged_guest")
+        )
+    return tuple(
+        ExecutionCapabilityClaim(
+            capability=capability,
+            state="live_verified",
+            proof_source="runtime_preflight",
+            observation="supported",
+            observed_at=observed_at,
+            valid_until=valid_until,
+            adapter_details=details,
+        )
+        for capability in ("guest_privilege_containment", "unprivileged_guest")
+    )
+
+
 class DockerContainerOwnershipError(RuntimeError):
     """Docker allocation did not yield an exact owned container identity."""
 
@@ -348,6 +414,13 @@ def _seccomp_profile_fingerprint(path: str | None) -> str | None:
     return "sha256:" + digest.hexdigest()
 
 
+def _cwd_in_tmpfs(cwd: str, restrictions: DockerWorkloadRestrictions) -> bool:
+    return any(
+        cwd == mount.target or cwd.startswith(mount.target.rstrip("/") + "/")
+        for mount in restrictions.tmpfs
+    )
+
+
 def _strict_tmpfs_options(
     restrictions: DockerWorkloadRestrictions,
 ) -> dict[str, frozenset[str]]:
@@ -400,82 +473,18 @@ def _verify_strict_container_inspection(
     image_reference = config.get("Image")
     if type(image_reference) is not str or image_reference != image_identity.reference:
         raise DockerRuntimeConfigurationError("image_reference_mismatch")
-    if config.get("User") != restrictions.user:
-        raise DockerRuntimeConfigurationError("nonroot_user_drift")
-
-    configured_env = _require_sequence(config.get("Env"), "home_environment_missing")
-    for name, value in restrictions.home_environment.items():
-        if [
-            item for item in configured_env if isinstance(item, str) and item.startswith(name + "=")
-        ] != [f"{name}={value}"]:
-            raise DockerRuntimeConfigurationError("home_environment_drift")
-
-    host = _require_mapping(inspection.get("HostConfig"), "host_config_missing")
-    if host.get("NetworkMode") != network_mode:
-        raise DockerRuntimeConfigurationError("network_mode_drift")
-    if host.get("Privileged") is not False:
-        raise DockerRuntimeConfigurationError("privileged_mode_enabled")
-    if host.get("ReadonlyRootfs") is not restrictions.read_only_root:
-        raise DockerRuntimeConfigurationError("read_only_root_drift")
-    if runtime is not None and host.get("Runtime") != runtime:
-        raise DockerRuntimeConfigurationError("runtime_drift")
-    if host.get("PidsLimit") != restrictions.pids_limit:
-        raise DockerRuntimeConfigurationError("pids_limit_drift")
-    if host.get("Memory") != restrictions.memory_bytes:
-        raise DockerRuntimeConfigurationError("memory_limit_drift")
-    if host.get("MemorySwap") != restrictions.memory_swap_bytes:
-        raise DockerRuntimeConfigurationError("memory_swap_limit_drift")
-    if host.get("CpuPeriod") != restrictions.cpu_period_us:
-        raise DockerRuntimeConfigurationError("cpu_period_drift")
-    if host.get("CpuQuota") != restrictions.cpu_quota_us:
-        raise DockerRuntimeConfigurationError("cpu_quota_drift")
-    if host.get("ShmSize") != restrictions.shm_size_bytes:
-        raise DockerRuntimeConfigurationError("shm_size_drift")
-
-    security_options = {
-        value
-        for value in _require_sequence(host.get("SecurityOpt"), "security_options_malformed")
-        if type(value) is str
-    }
-    if restrictions.no_new_privileges and not security_options.intersection(
-        {"no-new-privileges", "no-new-privileges=true"}
-    ):
-        raise DockerRuntimeConfigurationError("no_new_privileges_drift")
-    if seccomp_profile is not None and f"seccomp={seccomp_profile}" not in security_options:
-        raise DockerRuntimeConfigurationError("seccomp_profile_drift")
-
-    cap_drop = {
-        str(value).upper()
-        for value in _require_sequence(host.get("CapDrop"), "capability_drop_malformed")
-    }
-    if cap_drop != {"ALL"}:
-        raise DockerRuntimeConfigurationError("capability_drop_drift")
-    cap_add = tuple(
-        sorted(
-            str(value).upper()
-            for value in _require_sequence(host.get("CapAdd"), "capability_add_malformed")
-        )
+    host = _verify_container_restrictions(
+        inspection,
+        container_id=container_id,
+        restrictions=restrictions,
+        network_mode=network_mode,
+        runtime=runtime,
+        seccomp_profile=seccomp_profile,
     )
-    if cap_add != restrictions.capability_add:
-        raise DockerRuntimeConfigurationError("capability_add_drift")
-
-    expected_tmpfs = _strict_tmpfs_options(restrictions)
-    raw_tmpfs = _require_mapping(host.get("Tmpfs"), "tmpfs_configuration_missing")
-    if set(raw_tmpfs) != set(expected_tmpfs):
-        raise DockerRuntimeConfigurationError("tmpfs_target_drift")
-    for target, expected_options in expected_tmpfs.items():
-        raw_options = raw_tmpfs.get(target)
-        if type(raw_options) is not str:
-            raise DockerRuntimeConfigurationError("tmpfs_options_malformed")
-        if frozenset(raw_options.split(",")) != expected_options:
-            raise DockerRuntimeConfigurationError("tmpfs_options_drift")
 
     if _require_sequence(host.get("Binds"), "bind_configuration_malformed"):
         raise DockerRuntimeConfigurationError("host_bind_mount_present")
-    if _require_sequence(host.get("Devices"), "device_configuration_malformed"):
-        raise DockerRuntimeConfigurationError("host_device_present")
-    if _require_sequence(host.get("DeviceRequests"), "device_request_malformed"):
-        raise DockerRuntimeConfigurationError("host_device_request_present")
+    expected_tmpfs = _strict_tmpfs_options(restrictions)
     expected_by_target = {mount.target_path: mount for mount in immutable_input_mounts}
     observed_host_mounts: set[tuple[str, str]] = set()
     for mount in _require_sequence(host.get("Mounts"), "mount_configuration_malformed"):
@@ -513,6 +522,120 @@ def _verify_strict_container_inspection(
     if observed_immutable_mounts != expected_mounts:
         raise DockerRuntimeConfigurationError("immutable_input_mount_missing")
     return image_id, image_reference
+
+
+def _verify_container_restrictions(
+    inspection: Mapping[str, object],
+    *,
+    container_id: str,
+    restrictions: DockerWorkloadRestrictions,
+    network_mode: str | None,
+    runtime: str | None,
+    seccomp_profile: str | None,
+) -> Mapping[str, object]:
+    """Check the live container against its declared privilege and resource controls.
+
+    These controls do not depend on the network, image or host mounts, so the
+    same check backs strict evidence and hardened containers on other networks.
+    ``network_mode=None`` leaves the network to its owner (for example an egress
+    adapter that verifies its own internal network).
+    """
+
+    if inspection.get("Id") != container_id:
+        raise DockerRuntimeConfigurationError("container_identity_drift")
+    config = _require_mapping(inspection.get("Config"), "container_config_missing")
+    if config.get("User") != restrictions.user:
+        raise DockerRuntimeConfigurationError("nonroot_user_drift")
+
+    configured_env = _require_sequence(config.get("Env"), "home_environment_missing")
+    for name, value in restrictions.home_environment.items():
+        if [
+            item for item in configured_env if isinstance(item, str) and item.startswith(name + "=")
+        ] != [f"{name}={value}"]:
+            raise DockerRuntimeConfigurationError("home_environment_drift")
+
+    host = _require_mapping(inspection.get("HostConfig"), "host_config_missing")
+    if network_mode is not None and host.get("NetworkMode") != network_mode:
+        raise DockerRuntimeConfigurationError("network_mode_drift")
+    if host.get("Privileged") is not False:
+        raise DockerRuntimeConfigurationError("privileged_mode_enabled")
+    if host.get("ReadonlyRootfs") is not restrictions.read_only_root:
+        raise DockerRuntimeConfigurationError("read_only_root_drift")
+    if runtime is not None and host.get("Runtime") != runtime:
+        raise DockerRuntimeConfigurationError("runtime_drift")
+    if host.get("PidsLimit") != restrictions.pids_limit:
+        raise DockerRuntimeConfigurationError("pids_limit_drift")
+    if host.get("Memory") != restrictions.memory_bytes:
+        raise DockerRuntimeConfigurationError("memory_limit_drift")
+    if host.get("MemorySwap") != restrictions.memory_swap_bytes:
+        raise DockerRuntimeConfigurationError("memory_swap_limit_drift")
+    if host.get("CpuPeriod") != restrictions.cpu_period_us:
+        raise DockerRuntimeConfigurationError("cpu_period_drift")
+    if host.get("CpuQuota") != restrictions.cpu_quota_us:
+        raise DockerRuntimeConfigurationError("cpu_quota_drift")
+    if host.get("ShmSize") != restrictions.shm_size_bytes:
+        raise DockerRuntimeConfigurationError("shm_size_drift")
+
+    security_options = {
+        value
+        for value in _require_sequence(host.get("SecurityOpt"), "security_options_malformed")
+        if type(value) is str
+    }
+    if restrictions.no_new_privileges and not security_options.intersection(
+        {"no-new-privileges", "no-new-privileges=true"}
+    ):
+        raise DockerRuntimeConfigurationError("no_new_privileges_drift")
+    if seccomp_profile is not None:
+        observed_profiles = [
+            value.removeprefix("seccomp=")
+            for value in security_options
+            if value.startswith("seccomp=")
+        ]
+        try:
+            with open(seccomp_profile, encoding="utf-8") as handle:
+                expected_profile = json.load(handle)
+            matches = (
+                len(observed_profiles) == 1 and json.loads(observed_profiles[0]) == expected_profile
+            )
+        except (OSError, ValueError):
+            matches = False
+        if not matches:
+            raise DockerRuntimeConfigurationError("seccomp_profile_drift")
+
+    cap_drop = {
+        str(value).upper()
+        for value in _require_sequence(host.get("CapDrop"), "capability_drop_malformed")
+    }
+    if cap_drop != {"ALL"}:
+        raise DockerRuntimeConfigurationError("capability_drop_drift")
+    cap_add = tuple(
+        sorted(
+            str(value).upper()
+            for value in _require_sequence(host.get("CapAdd"), "capability_add_malformed")
+        )
+    )
+    if cap_add != restrictions.capability_add:
+        raise DockerRuntimeConfigurationError("capability_add_drift")
+
+    expected_tmpfs = _strict_tmpfs_options(restrictions)
+    raw_tmpfs = _require_mapping(host.get("Tmpfs"), "tmpfs_configuration_missing")
+    if set(raw_tmpfs) != set(expected_tmpfs):
+        raise DockerRuntimeConfigurationError("tmpfs_target_drift")
+    for target, expected_options in expected_tmpfs.items():
+        raw_options = raw_tmpfs.get(target)
+        if type(raw_options) is not str:
+            raise DockerRuntimeConfigurationError("tmpfs_options_malformed")
+        observed_options = frozenset(raw_options.split(","))
+        # Containers created before Cayu passed "exec" got Docker's default
+        # noexec tmpfs. That is stricter than declared, so they still verify.
+        if observed_options not in {expected_options, expected_options - {"exec"}}:
+            raise DockerRuntimeConfigurationError("tmpfs_options_drift")
+
+    if _require_sequence(host.get("Devices"), "device_configuration_malformed"):
+        raise DockerRuntimeConfigurationError("host_device_present")
+    if _require_sequence(host.get("DeviceRequests"), "device_request_malformed"):
+        raise DockerRuntimeConfigurationError("host_device_request_present")
+    return host
 
 
 def _normalize_immutable_input_mounts(
@@ -1699,6 +1822,12 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         return self.container_id or self.name
 
     @property
+    def workload_restrictions(self) -> DockerWorkloadRestrictions | None:
+        """Restrictions verified on this container at creation, or ``None``."""
+
+        return self._workload_restrictions
+
+    @property
     def container_removed(self) -> bool:
         """Whether this owner has positively completed removal of its container.
 
@@ -1742,7 +1871,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 ),
                 "durable_command_receipt": "cayu.docker_command_receipt.v1",
             }
-        return {
+        material: dict[str, object] = {
             "name": self.name,
             "image": self.image,
             "default_cwd": self.default_cwd,
@@ -1754,6 +1883,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             "cancellation_cleanup": self.cancellation_cleanup,
             "timeout_cleanup": self.timeout_cleanup,
         }
+        if self._workload_restrictions is not None:
+            material["restrictions"] = self._workload_restrictions.model_dump(mode="json")
+        return material
 
     def __init__(
         self,
@@ -1777,6 +1909,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         _runtime_evidence: _DockerRuntimeEvidence | None = None,
         _strict_seccomp_profile: str | None = None,
         _strict_immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
+        _workload_restrictions: DockerWorkloadRestrictions | None = None,
         _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -1791,6 +1924,19 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         ):
             raise TypeError("_runtime_evidence must be Docker runtime evidence or None.")
         self._runtime_evidence = _runtime_evidence
+        if _workload_restrictions is not None and not isinstance(
+            _workload_restrictions, DockerWorkloadRestrictions
+        ):
+            raise TypeError("_workload_restrictions must be DockerWorkloadRestrictions or None.")
+        if (
+            _runtime_evidence is not None
+            and _workload_restrictions is not None
+            and _workload_restrictions != _runtime_evidence.restrictions
+        ):
+            raise ValueError("Docker runtime evidence names different workload restrictions.")
+        self._workload_restrictions = _workload_restrictions or (
+            None if _runtime_evidence is None else _runtime_evidence.restrictions
+        )
         self._strict_seccomp_profile = validate_docker_seccomp_profile(_strict_seccomp_profile)
         self._strict_immutable_input_mounts = _normalize_immutable_input_mounts(
             _strict_immutable_input_mounts,
@@ -1965,7 +2111,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         ``default_cwd`` is created (hardened; pair with ``RunnerWorkspace``, which
         needs python3 — install it via ``setup_commands``). ``runtime`` is passed
         to ``docker run --runtime`` (e.g. ``runsc``/``kata``). ``setup_commands``
-        run as root.
+        run as root, or as the restricted user with ``workload_restrictions``.
 
         For virtual egress, ``network`` attaches the container to a Docker network
         (e.g. an ``--internal`` one that blocks direct internet), ``extra_hosts``
@@ -1980,6 +2126,14 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         Managed containers always use Docker's minimal init as PID 1 so cleanup
         descendants orphaned by a worker exit are reaped after they finish.
 
+        ``workload_restrictions`` alone hardens the container (non-root user,
+        read-only root, no-new-privileges, dropped capabilities, pid, memory and
+        CPU limits, bounded tmpfs) on any ``network``, including a virtual-egress
+        network. Cayu verifies the live Docker inspection and the guest user before
+        returning the runner, and runs its own helpers as that user. A hardened
+        container still shares the host kernel; it is not an untrusted-code
+        isolation boundary.
+
         ``image_identity`` plus ``workload_restrictions`` selects the strict,
         evidence-bearing path. It requires an exact no-network, no-writable-host-mount,
         credential-free container and ``replace=False``; manager-issued immutable
@@ -1990,10 +2144,12 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
         image = require_clean_nonblank(image, "image")
-        if (image_identity is None) != (workload_restrictions is None):
-            raise ValueError(
-                "image_identity and workload_restrictions must be configured together."
-            )
+        if image_identity is not None and workload_restrictions is None:
+            raise ValueError("image_identity requires workload_restrictions.")
+        if workload_restrictions is not None and not isinstance(
+            workload_restrictions, DockerWorkloadRestrictions
+        ):
+            raise TypeError("workload_restrictions must be DockerWorkloadRestrictions or None.")
         if allocation_identity is not None and (
             type(allocation_identity) is not str
             or re.fullmatch(r"sha256:[0-9a-f]{64}", allocation_identity) is None
@@ -2114,14 +2270,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 raise ValueError(
                     "Evidence-bearing Docker creation requires container-level cleanup."
                 )
-            if not any(
-                default_cwd == mount.target
-                or default_cwd.startswith(mount.target.rstrip("/") + "/")
-                for mount in owned_restrictions.tmpfs
-            ):
+            if not _cwd_in_tmpfs(default_cwd, owned_restrictions):
                 raise ValueError(
                     "Evidence-bearing Docker default_cwd must be inside bounded tmpfs."
                 )
+        elif owned_restrictions is not None and mount_path is None:
+            if not _cwd_in_tmpfs(default_cwd, owned_restrictions):
+                raise ValueError("Hardened Docker default_cwd must be inside a configured tmpfs.")
+        # Without capabilities, root cannot override file permissions or signal
+        # the workload, so Cayu's own guest helpers run as the restricted user.
+        helper_user = "root" if owned_restrictions is None else owned_restrictions.user
         seccomp_profile_sha256 = _seccomp_profile_fingerprint(seccomp_profile)
         owned_container_id: str | None = None
         runtime_evidence: _DockerRuntimeEvidence | None = None
@@ -2189,7 +2347,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             candidate_container_id = started.stdout.strip()
             if _DOCKER_CONTAINER_ID_PATTERN.fullmatch(candidate_container_id) is not None:
                 owned_container_id = candidate_container_id
-            elif strict_mode:
+            elif owned_restrictions is not None:
                 raise DockerContainerOwnershipError(
                     "Docker did not return a full exact container ID; cleanup ownership is "
                     "ambiguous and no name-based cleanup was attempted."
@@ -2204,7 +2362,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                     [
                         "exec",
                         "-u",
-                        "root",
+                        helper_user,
                         container_reference,
                         "sh",
                         "-c",
@@ -2238,7 +2396,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             setup_environment = dict(env_overlay or {})
             for cmd in setup_commands:
                 with runner_env_file(setup_environment) as setup_env_file:
-                    setup_argv = ["exec", "-u", "root"]
+                    setup_argv = ["exec", "-u", helper_user]
                     if setup_env_file is not None:
                         setup_argv += ["--env-file", setup_env_file]
                     setup_argv += [container_reference, "sh", "-c", cmd]
@@ -2311,6 +2469,29 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                     observed_at=observed_at,
                     valid_until=observed_at + timedelta(seconds=300),
                 )
+            elif owned_restrictions is not None:
+                assert owned_container_id is not None
+                inspection = await _inspect_strict_container(
+                    docker,
+                    owned_container_id,
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                )
+                _verify_container_restrictions(
+                    inspection,
+                    container_id=owned_container_id,
+                    restrictions=owned_restrictions,
+                    network_mode=network,
+                    runtime=runtime,
+                    seccomp_profile=seccomp_profile,
+                )
+                await _probe_strict_container(
+                    docker,
+                    owned_container_id,
+                    restrictions=owned_restrictions,
+                    required_executables=(),
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                    supervise_guest=False,
+                )
         except BaseException as create_error:
             # Retained rollback must never target a name that a replacement
             # can reuse after this failed constructor returns.
@@ -2357,6 +2538,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             _runtime_evidence=runtime_evidence,
             _strict_seccomp_profile=seccomp_profile,
             _strict_immutable_input_mounts=immutable_mounts,
+            _workload_restrictions=owned_restrictions,
             _execution_environment_authority=_execution_environment_authority,
         )
 
@@ -2397,10 +2579,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             workload_restrictions.model_dump(mode="python")
         )
         default_cwd = _validate_guest_cwd(default_cwd)
-        if not any(
-            default_cwd == mount.target or default_cwd.startswith(mount.target.rstrip("/") + "/")
-            for mount in owned_restrictions.tmpfs
-        ):
+        if not _cwd_in_tmpfs(default_cwd, owned_restrictions):
             raise ValueError("Strict Docker reconnect cwd must be inside bounded tmpfs.")
         runtime = _validate_runtime(runtime)
         seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
@@ -2636,11 +2815,21 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 "read_only_host_inputs": "docker_host_filesystem_unverified",
                 "reconnect": "docker_reconnect_unsupported",
             }
+            # Hardening verified at creation backs the privilege claims on any
+            # network; it says nothing about the network or host filesystem.
+            hardened_claims = (
+                ()
+                if self._workload_restrictions is None
+                else docker_privilege_claims(self._workload_restrictions)
+            )
+            for claim in hardened_claims:
+                unsupported.pop(claim.capability)
             return ExecutionCapabilityEvidence(
                 subject="docker",
                 claims=(
                     ExecutionCapabilityClaim.available("confirmed_cancellation"),
                     ExecutionCapabilityClaim.available("confirmed_cleanup"),
+                    *hardened_claims,
                     *(
                         ExecutionCapabilityClaim.unsupported(
                             capability,
@@ -2672,60 +2861,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 adapter_details=details,
             )
 
-        restrictions = evidence.restrictions
-        privilege_details = (
-            CapabilityDetail(name="nonroot", value=True),
-            CapabilityDetail(name="uid", value=restrictions.uid),
-            CapabilityDetail(name="gid", value=restrictions.gid),
-            CapabilityDetail(
-                name="read_only_root",
-                value=restrictions.read_only_root,
-            ),
-            CapabilityDetail(
-                name="no_new_privileges",
-                value=restrictions.no_new_privileges,
-            ),
-            CapabilityDetail(name="cap_drop_all", value=True),
-            CapabilityDetail(
-                name="capability_add_empty",
-                value=not restrictions.capability_add,
-            ),
-            CapabilityDetail(name="pids_limit", value=restrictions.pids_limit),
-            CapabilityDetail(name="memory_bytes", value=restrictions.memory_bytes),
-            CapabilityDetail(
-                name="memory_swap_bytes",
-                value=restrictions.memory_swap_bytes,
-            ),
-            CapabilityDetail(name="cpu_period_us", value=restrictions.cpu_period_us),
-            CapabilityDetail(name="cpu_quota_us", value=restrictions.cpu_quota_us),
-            CapabilityDetail(name="shm_size_bytes", value=restrictions.shm_size_bytes),
+        privilege_claims = docker_privilege_claims(
+            evidence.restrictions,
+            observed_at=evidence.observed_at,
+            valid_until=evidence.valid_until,
         )
-        if restrictions.supports_strict_privilege_evidence:
-            privilege_claims = (
-                live_claim(
-                    "guest_privilege_containment",
-                    observation="supported",
-                    details=privilege_details,
-                ),
-                live_claim(
-                    "unprivileged_guest",
-                    observation="supported",
-                    details=privilege_details,
-                ),
-            )
-        else:
-            privilege_claims = (
-                ExecutionCapabilityClaim.unsupported(
-                    "guest_privilege_containment",
-                    reason_code="docker_privilege_restrictions_weakened",
-                    remediation_code="use_verified_docker_restrictions",
-                ),
-                ExecutionCapabilityClaim.unsupported(
-                    "unprivileged_guest",
-                    reason_code="docker_privilege_restrictions_weakened",
-                    remediation_code="use_verified_docker_restrictions",
-                ),
-            )
         read_only_input_claim = (
             live_claim(
                 "read_only_host_inputs",
@@ -3523,14 +3663,18 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         """Terminate detached guest work while retaining container/workspace identity."""
 
         self._ensure_exec_open()
+        restrictions = self._workload_restrictions
         result = await _run_docker(
             self.docker_path,
             [
                 "exec",
                 "-u",
-                "root",
+                # Root without capabilities cannot signal the restricted workload.
+                "root" if restrictions is None else restrictions.user,
                 self.container_reference,
                 "python3",
+                "-I",
+                "-S",
                 "-c",
                 _DOCKER_EGRESS_CUTOVER_FENCE_SCRIPT,
             ],

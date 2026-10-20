@@ -61,7 +61,12 @@ from cayu.environments.admission import (
 )
 from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners.base import Runner
-from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
+from cayu.runners.docker import (
+    DockerRunner,
+    docker_privilege_claims,
+    validate_docker_seccomp_profile,
+)
+from cayu.runners.docker_workload import DockerWorkloadRestrictions
 from cayu.vaults import SecretRedactor
 
 #: Where the per-session CA is mounted inside the container and trusted from.
@@ -269,6 +274,13 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     topology does not make the container a secure sandbox boundary. Returns the
     network/env the runner must use; ``teardown`` removes the sidecar and network
     and revokes the grants.
+
+    ``workload_restrictions`` optionally hardens each guest container (non-root
+    user, read-only root, no-new-privileges, dropped capabilities, pid, memory
+    and CPU limits) on the same egress network. Cayu verifies those controls on
+    the live container, and the adapter then reports the guest privilege claims
+    as available. The container still shares the host kernel, so untrusted-code
+    isolation stays unsupported.
     """
 
     runner_kind = "docker"
@@ -307,9 +319,24 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             available = (*available, "reconnect")
             if runner is not None:
                 self.reconnect_metadata(runner)
+        restrictions = self._workload_restrictions
+        privilege_claims: tuple[ExecutionCapabilityClaim, ...] = ()
+        if restrictions is not None:
+            if runner is None and restrictions.supports_strict_privilege_evidence:
+                privilege_claims = (
+                    ExecutionCapabilityClaim.declared("guest_privilege_containment"),
+                    ExecutionCapabilityClaim.declared("unprivileged_guest"),
+                )
+            elif runner is None or runner.workload_restrictions == restrictions:
+                # A created runner has verified these exact controls on its live
+                # container; weakened controls yield unsupported claims here.
+                privilege_claims = docker_privilege_claims(restrictions)
+        for claim in privilege_claims:
+            unsupported.pop(claim.capability)
         return ExecutionCapabilityEvidence(
             subject=self.runner_kind,
             claims=(
+                *privilege_claims,
                 *(
                     ExecutionCapabilityClaim(
                         capability=capability,
@@ -355,9 +382,21 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         control_server_container_id: str | None = None,
         reconnect_state_dir: str | Path | None = None,
         reconnect_timeout_s: float = 20.0,
+        workload_restrictions: DockerWorkloadRestrictions | None = None,
     ) -> None:
         if type(reconnect_timeout_s) not in {int, float} or not 0 < reconnect_timeout_s <= 60:
             raise ValueError("reconnect_timeout_s must be positive and at most 60 seconds.")
+        if workload_restrictions is not None:
+            if not isinstance(workload_restrictions, DockerWorkloadRestrictions):
+                raise TypeError("workload_restrictions must be DockerWorkloadRestrictions or None.")
+            if reconnect_state_dir is not None:
+                # Reconnect freezes and thaws guests as root, which a container
+                # without capabilities does not allow.
+                raise ValueError("Docker egress reconnect does not support workload_restrictions.")
+            workload_restrictions = DockerWorkloadRestrictions.model_validate(
+                workload_restrictions.model_dump(mode="python")
+            )
+        self._workload_restrictions = workload_restrictions
         self._reconnect = (
             None
             if reconnect_state_dir is None
@@ -852,6 +891,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             seccomp_profile=self._seccomp_profile_for_image(request.image),
             setup_commands=request.setup_commands,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
+            workload_restrictions=self._workload_restrictions,
         )
 
     async def egress_environment_fingerprint(self, runner: Runner) -> str:

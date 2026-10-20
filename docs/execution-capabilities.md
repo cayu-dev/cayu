@@ -27,7 +27,10 @@ commands a separate sandbox.
   [`DockerCodingEnvironmentFactory`](docker-coding-toolchains.md) for a fresh
   coding workspace and admitted toolchain. Docker needs a daemon, not nested
   virtualization. It shares the Docker host's kernel, so a container escape can
-  compromise that host. Use only code whose risk you accept on that host.
+  compromise that host. Use only code whose risk you accept on that host. For
+  such code, harden the container and allowlist its network together:
+  `DockerEgressAdapter(workload_restrictions=DockerWorkloadRestrictions())`
+  with `VirtualEgressEnvironmentFactory` (`cayu guide untrusted-code`).
 - **Run untrusted code with a stronger boundary:** compose
   `VirtualEgressEnvironmentFactory` with `LambdaMicroVMEgressAdapter` in a cloud
   sandbox, using `metadata_isolation="required"`. That adapter supplies the
@@ -71,7 +74,7 @@ Fargate's host and privilege restrictions are described in
 | Untrusted-code isolation | No. A container is not a secure sandbox boundary; admission of `ExecutionRequirements.untrusted()` refuses it (`docker_untrusted_isolation_unsupported`). | Yes through `VirtualEgressEnvironmentFactory` + `LambdaMicroVMEgressAdapter` in required metadata-isolation mode. A bare `LambdaMicroVMRunner` does not claim these capabilities. |
 | Credential non-possession (virtual egress) | Yes with Docker virtual egress, through the per-session broker. The Docker coding environment has no network at all (`docker_network_disabled`). | Yes, through the private proxy in the control-plane task. |
 | Deny-by-default network with metadata denial | Yes (egress adapter preflight). | Yes in `metadata_isolation="required"` mode, verified by preflight before agent code runs (`aws-lambda-microvm-metadata-isolation-live`). |
-| Unprivileged agent commands | Container user as configured. | Yes: UID/GID 1000, no capabilities, `no_new_privs`, no AWS credentials, verified by a guest probe on every create and reconnect. |
+| Unprivileged agent commands | With `DockerWorkloadRestrictions`: UID/GID 1000, read-only root, no capabilities, `no_new_privs`, verified by live inspection on create, on `network="none"` or a virtual-egress network. Otherwise the container user as configured. | Yes: UID/GID 1000, no capabilities, `no_new_privs`, no AWS credentials, verified by a guest probe on every create and reconnect. |
 | Executable admission evidence | Yes: live container probes (`docker-live-toolchain-profiles`). | Yes: live probes bound to the MicroVM, image version, sidecar protocol, and guest boot id (`aws-lambda-microvm-tool-admission-live`). |
 
 ## Coding

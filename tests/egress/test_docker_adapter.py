@@ -947,3 +947,82 @@ def test_packaged_browser_seccomp_matches_maintained_profile():
             Path(__file__).resolve().parents[2] / "examples/browser_fetch/seccomp_profile.json"
         ).read_bytes()
     )
+
+
+def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch) -> None:
+    from cayu.runners.docker import DockerRunner
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    restrictions = DockerWorkloadRestrictions(pids_limit=256)
+    observed: dict[str, object] = {}
+
+    class FakeDockerRunner(DockerRunner):
+        @classmethod
+        async def create(cls, name: str, **kwargs):
+            observed.update(kwargs)
+            return cls(
+                name,
+                docker_path="/usr/bin/docker",
+                _container_id="d" * 64,
+                _workload_restrictions=kwargs["workload_restrictions"],
+            )
+
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", FakeDockerRunner)
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        proxy_host="127.0.0.1",
+        workload_restrictions=restrictions,
+    )
+    request = VirtualEgressRunnerRequest(
+        name="hardened-tests",
+        runner_kind="docker",
+        image="python:3.12-slim",
+        binding=EgressBinding(runner_kind="docker", network="internal"),
+        env_overlay={},
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path=GUEST_CA_PATH,
+        setup_commands=(),
+        egress_destinations=(),
+    )
+
+    declared = adapter.execution_capability_evidence()
+    runner = asyncio.run(adapter.create_runner(request))
+    evidence = adapter.execution_capability_evidence(runner)
+
+    assert observed["workload_restrictions"] == restrictions
+    assert observed["network"] == "internal"
+    assert declared.state_for("unprivileged_guest") == "declared"
+    for capability in ("guest_privilege_containment", "unprivileged_guest"):
+        assert evidence.state_for(capability) == "available"
+    for capability in ("deny_by_default_network", "brokered_egress"):
+        assert evidence.state_for(capability) == "available"
+    # A hardened container still shares the host kernel.
+    assert evidence.state_for("untrusted_code_isolation") == "unsupported"
+    assert evidence.state_for("host_filesystem_isolation") == "unsupported"
+
+    # Without hardening the adapter keeps refusing privilege claims, and a
+    # runner whose verified controls differ from the adapter's is not trusted.
+    plain = DockerEgressAdapter(docker_exec=_FakeDocker(), proxy_host="127.0.0.1")
+    assert plain.execution_capability_evidence(runner).state_for("unprivileged_guest") == (
+        "unsupported"
+    )
+    other = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        proxy_host="127.0.0.1",
+        workload_restrictions=DockerWorkloadRestrictions(),
+    )
+    assert other.execution_capability_evidence(runner).state_for("unprivileged_guest") == (
+        "unsupported"
+    )
+
+
+def test_hardened_egress_refuses_reconnect_and_untyped_restrictions(tmp_path) -> None:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    with pytest.raises(ValueError, match="reconnect does not support workload_restrictions"):
+        DockerEgressAdapter(
+            reconnect_state_dir=tmp_path,
+            workload_restrictions=DockerWorkloadRestrictions(),
+        )
+    with pytest.raises(TypeError, match="DockerWorkloadRestrictions"):
+        DockerEgressAdapter(workload_restrictions={"read_only_root": True})  # type: ignore[arg-type]

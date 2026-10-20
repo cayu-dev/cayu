@@ -73,6 +73,10 @@ _GUIDES = {
     ),
     "thinking": ("thinking.md", "Reasoning effort vocabulary and provider compatibility."),
     "tool-effects": ("tool-effects.md", "Replay and mutation effect decisions."),
+    "untrusted-code": (
+        "untrusted-code.md",
+        "Hardened Docker with allowlisted egress locally; Lambda MicroVM in production.",
+    ),
     "verified-work": (
         "verified-work.md",
         "Contract-bound tasks: proposals, independent verifiers, and bounded attempts.",
@@ -117,6 +121,7 @@ _RELATED = {
     "restart-tests": ("durable-operations", "durable-service-tools", "order-support"),
     "structured-output": ("authoring", "diagnostics"),
     "tool-effects": ("authoring", "durable-operations"),
+    "untrusted-code": ("references", "authoring"),
     "verified-work": ("durable-operations", "tool-effects", "evals-ai-quality", "authoring"),
 }
 

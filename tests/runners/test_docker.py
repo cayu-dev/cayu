@@ -123,16 +123,18 @@ def test_docker_egress_cutover_fence_terminates_detached_guest_work(monkeypatch)
 
     asyncio.run(runner.fence_guest_processes_for_egress_cutover())
 
-    assert issued[0][:7] == [
+    assert issued[0][:9] == [
         "/usr/bin/docker",
         "exec",
         "-u",
         "root",
         "agent",
         "python3",
+        "-I",
+        "-S",
         "-c",
     ]
-    assert 'os.listdir("/proc")' in issued[0][7]
+    assert 'os.listdir("/proc")' in issued[0][9]
 
 
 def test_docker_egress_cutover_fence_fails_closed(monkeypatch) -> None:
