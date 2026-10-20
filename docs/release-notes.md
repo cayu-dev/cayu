@@ -1,5 +1,27 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: rebuild Lambda MicroVM workspace images from the new sidecar; its
+content digest changes. Storage revision 124, compatibility floor 124, server
+contract 49 and manifest schema 17 are all unchanged.
+
+### Breaking changes
+
+None.
+
+### Changes
+
+- The Lambda MicroVM command sidecar closes each command's pipes and releases
+  its process as soon as the command finishes, instead of holding them until
+  the result expires five minutes later. Sustained command traffic, such as a
+  long coding turn, no longer exhausts the sidecar's file descriptors and fails
+  commands with `OSError: [Errno 24] Too many open files`.
+- Workspace revision observations made from a tool, such as `run_check`, hash a
+  runner workspace in one guest operation instead of listing it and reading
+  every file. File hashes are taken from the files' own bytes, as in direct
+  observations of the same workspace.
+
 ## v0.12.1
 
 Upgrade: no storage migration is needed from 0.12.0. Allow for batched display

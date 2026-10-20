@@ -1744,6 +1744,69 @@ def test_command_manifest_bulk_operation_count_and_identities(tmp_path, file_cou
     assert runner.calls == 3
 
 
+def test_invocation_handle_observes_runner_workspace_in_one_guest_operation(tmp_path):
+    from cayu.tools._redaction import InvocationRedactorSnapshot
+    from cayu.tools._resources import InvocationWorkspaceHandle
+    from cayu.vaults import SecretRedactor
+    from cayu.workspaces import (
+        WorkspaceRevisionObservationLimits,
+        WorkspaceRevisionObservationStatus,
+    )
+    from cayu.workspaces.revisions import observe_deterministic_workspace
+
+    class RecordingRunner(LocalRunner):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.operations: list[str] = []
+
+        async def exec(self, command, *args, **kwargs):
+            argv = command.argv or []
+            self.operations.append(argv[3] if argv[1:2] == ["-c"] else argv[0])
+            return await super().exec(command, *args, **kwargs)
+
+    class CustomRunnerWorkspace(RunnerWorkspace):
+        pass
+
+    file_count = 20
+    (tmp_path / "src").mkdir()
+    for index in range(file_count):
+        (tmp_path / "src" / f"module_{index}.py").write_bytes(f"value = {index}\n".encode())
+    (tmp_path / "run.sh").write_bytes(b"#!/bin/sh\n")
+    (tmp_path / "run.sh").chmod(0o755)
+    runner = RecordingRunner(tmp_path, inherit_env=False)
+    snapshot = InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    def handle(workspace):
+        return InvocationWorkspaceHandle(
+            workspace, redactor_snapshot_provider=lambda: snapshot, capture_observer=lambda _: None
+        )
+
+    def observe(workspace):
+        runner.operations.clear()
+        observation = asyncio.run(
+            observe_deterministic_workspace(
+                workspace, observer="check", limits=WorkspaceRevisionObservationLimits()
+            )
+        )
+        return observation, list(runner.operations)
+
+    raw = RunnerWorkspace(runner, workspace_id="workspace", python_executable=sys.executable)
+    through_handle, handle_operations = observe(handle(raw))
+    through_nested_handle, nested_operations = observe(handle(handle(raw)))
+    direct, direct_operations = observe(raw)
+    # A subclass may change list/read semantics, so it keeps the per-file path.
+    custom = CustomRunnerWorkspace(
+        runner, workspace_id="workspace", python_executable=sys.executable
+    )
+    per_file, per_file_operations = observe(handle(custom))
+
+    assert handle_operations == nested_operations == direct_operations == ["revision_manifest"]
+    assert len(per_file_operations) == 1 + file_count + 1
+    assert through_handle.status is WorkspaceRevisionObservationStatus.SUPPORTED
+    assert through_handle.total_paths == file_count + 1
+    assert through_handle == through_nested_handle == direct == per_file
+
+
 @pytest.mark.parametrize(
     ("limit", "value"), [("max_paths", 1), ("max_file_bytes", 1), ("max_total_bytes", 3)]
 )

@@ -30,6 +30,8 @@ from cayu.workspaces import (
     WorkspaceMutationResult,
     WorkspaceReadResult,
 )
+from cayu.workspaces.base import WorkspaceContentManifest
+from cayu.workspaces.revisions import _runner_revision_manifest_capture
 
 
 class InvocationResourceReadError(RuntimeError):
@@ -595,6 +597,16 @@ class InvocationWorkspaceHandle(Workspace):
         if not callable(capture):
             return None
         return await capture(**limits)
+
+    def _runner_revision_manifest_capture(
+        self,
+    ) -> Callable[..., Awaitable[WorkspaceContentManifest | str]] | None:
+        """Return the delegate's in-guest revision capture, if it has one.
+
+        Revision evidence carries no file content to redact. The delegate still
+        owns path exclusions and observation limits.
+        """
+        return _runner_revision_manifest_capture(self.__workspace)
 
     async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
         result = await self.__workspace.list_git_entries(limit=limit)

@@ -511,6 +511,9 @@ def test_sidecar_reader_failure_marks_partial_output_for_omission() -> None:
                 return prefix
             raise OSError(f"reader failed with {secret}")
 
+        def close(self) -> None:
+            pass
+
     stdout = _LimitedBuffer(128)
     stderr = _LimitedBuffer(128)
 
@@ -531,6 +534,38 @@ def test_sidecar_reader_failure_marks_partial_output_for_omission() -> None:
     assert result["stdout_truncated"] is True
     assert secret not in repr(result)
     assert secret[:12] not in repr(result)
+
+
+def open_descriptor_count() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def test_sidecar_closes_each_finished_commands_pipes(tmp_path: Path) -> None:
+    # Results outlive their commands by the result TTL; the pipes must not. The
+    # command exits without reading its stdin, so its stdin pipe also breaks.
+    supervisor = CommandSupervisor(root=tmp_path)
+    baseline = open_descriptor_count()
+
+    for index in range(20):
+        command_id = f"cmd-descriptors-{index}"
+        supervisor.start(
+            command_id,
+            {
+                "kind": "process",
+                "argv": [sys.executable, "-c", "print('done')"],
+                "cwd": str(tmp_path),
+                "env": {},
+                "stdin_base64": base64.b64encode(b"x" * (1024 * 1024)).decode("ascii"),
+                "timeout_s": 5,
+            },
+        )
+        assert wait_for_terminal(supervisor, command_id)["exit_code"] == 0
+        supervisor.release(command_id)
+
+    deadline = time.monotonic() + 3
+    while open_descriptor_count() > baseline and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert open_descriptor_count() <= baseline
 
 
 def test_sidecar_times_out_and_stops_process_group(tmp_path: Path) -> None:

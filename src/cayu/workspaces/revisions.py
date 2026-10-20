@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import Literal
 
@@ -21,7 +22,12 @@ from cayu.workspaces._revision_records import WorkspacePathRevision as Workspace
 from cayu.workspaces._revision_records import (
     WorkspacePathRevisionDelta as WorkspacePathRevisionDelta,
 )
-from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.workspaces.base import (
+    Workspace,
+    WorkspaceContentManifest,
+    WorkspaceListResult,
+    WorkspaceReadResult,
+)
 
 _WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS = 256
 
@@ -497,12 +503,9 @@ async def observe_deterministic_workspace(
     """Observe one backend-neutral workspace through its bounded public API."""
 
     identity = WorkspaceIdentity(workspace_id=workspace.id, observer=observer)
-    # Native runner workspaces hash in the guest; no per-file RPC or content
-    # transfer is necessary. Do not bypass custom subclass list/read semantics.
-    from cayu.workspaces.runner import RunnerWorkspace
-
-    if type(workspace) is RunnerWorkspace:
-        return await _observe_runner_workspace(workspace, identity=identity, limits=limits)
+    capture = _runner_revision_manifest_capture(workspace)
+    if capture is not None:
+        return await _observe_runner_workspace(capture, identity=identity, limits=limits)
     try:
         raw_listed = await workspace.list("**/*", limit=limits.max_paths + 1)
         if type(raw_listed) is not WorkspaceListResult:
@@ -628,17 +631,35 @@ async def observe_deterministic_workspace(
     )
 
 
-async def _observe_runner_workspace(
+def _runner_revision_manifest_capture(
     workspace: Workspace,
+) -> Callable[..., Awaitable[WorkspaceContentManifest | str]] | None:
+    """Return the in-guest revision capture that observes ``workspace``, if any.
+
+    Native runner workspaces hash in the guest, so no per-file RPC or content
+    transfer is necessary. Only an exact ``RunnerWorkspace`` qualifies: the guest
+    program would bypass a subclass's own list/read semantics. An exact
+    invocation handle answers for its delegate, because an observation carries
+    hashes, sizes and modes but no file content for the handle to redact.
+    """
+    from cayu.tools._resources import InvocationWorkspaceHandle
+    from cayu.workspaces.runner import RunnerWorkspace
+
+    if type(workspace) is RunnerWorkspace:
+        return workspace._capture_revision_manifest
+    if type(workspace) is InvocationWorkspaceHandle:
+        return workspace._runner_revision_manifest_capture()
+    return None
+
+
+async def _observe_runner_workspace(
+    capture: Callable[..., Awaitable[WorkspaceContentManifest | str]],
     *,
     identity: WorkspaceIdentity,
     limits: WorkspaceRevisionObservationLimits,
 ) -> WorkspaceRevisionObservation:
-    from cayu.workspaces.runner import RunnerWorkspace
-
-    assert type(workspace) is RunnerWorkspace
     try:
-        captured = await workspace._capture_revision_manifest(
+        captured = await capture(
             max_paths=limits.max_paths,
             max_path_bytes=limits.max_path_bytes,
             max_file_bytes=limits.max_file_bytes,

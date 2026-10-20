@@ -673,6 +673,8 @@ class CommandSupervisor:
         stderr = _LimitedBuffer(payload["output_limit_bytes"])
         process: subprocess.Popen[bytes] | None = None
         readers: list[tuple[threading.Thread, _LimitedBuffer]] = []
+        # Each of the process's pipes with the thread that reads or writes it.
+        pipes: list[tuple[Any, threading.Thread]] = []
         timed_out = False
         try:
             argv = payload["argv"]
@@ -713,16 +715,21 @@ class CommandSupervisor:
                     stderr,
                 ),
             ]
-            for reader, output in pending_readers:
-                reader.start()
-                # Only a successfully started thread may be joined during
-                # failure cleanup; Thread.join() rejects unstarted threads.
-                readers.append((reader, output))
             writer = threading.Thread(
                 target=_feed_stdin,
                 args=(process.stdin, payload["stdin"]),
                 daemon=True,
             )
+            pipes = [
+                (process.stdout, pending_readers[0][0]),
+                (process.stderr, pending_readers[1][0]),
+                (process.stdin, writer),
+            ]
+            for reader, output in pending_readers:
+                reader.start()
+                # Only a successfully started thread may be joined during
+                # failure cleanup; Thread.join() rejects unstarted threads.
+                readers.append((reader, output))
             writer.start()
             try:
                 process.wait(timeout=payload["timeout_s"])
@@ -770,7 +777,13 @@ class CommandSupervisor:
                     cancel_reason=record.cancel_reason if cancelled else None,
                 )
         finally:
+            # The record outlives the command by the result TTL, so it must not
+            # hold the command's pipes or process. A pipe whose thread is still
+            # running (a descendant holds it open) is closed by that thread when
+            # it ends. cancel() reads the process only before a terminal state.
+            _close_settled_pipes(pipes)
             with record.lock:
+                record.process = None
                 record.finished_at = time.monotonic()
             record.finished.set()
 
@@ -960,6 +973,21 @@ def _drain(pipe: Any, output: _LimitedBuffer) -> None:
         # the observed bytes as an incomplete prefix so negotiated redacted
         # executions omit them instead of treating thread termination as EOF.
         output.truncated = True
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def _close_settled_pipes(pipes: list[tuple[Any, threading.Thread]]) -> None:
+    """Close each pipe whose thread has ended or never started.
+
+    Closing a pipe another thread is reading would wait for that read, so a
+    running thread's pipe is left to the thread.
+    """
+    for pipe, thread in pipes:
+        if not thread.is_alive():
+            with contextlib.suppress(OSError):
+                pipe.close()
 
 
 def _join_output_readers(
@@ -981,9 +1009,11 @@ def _feed_stdin(pipe: Any, content: bytes) -> None:
         return
     try:
         pipe.write(content)
-        pipe.close()
     except BrokenPipeError:
         pass
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
 
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
