@@ -286,3 +286,50 @@ def test_superseded_process_can_close_but_cannot_wait(tmp_path: Path) -> None:
             await process.wait()
 
     asyncio.run(scenario())
+
+
+class FailedStartTransport(InteractiveTransport):
+    def __init__(self, root: Path, error: BaseException) -> None:
+        super().__init__(root)
+        self.start_error = error
+        self.fail_cancel = True
+
+    async def start_command(self, **kwargs):
+        await super().start_command(**kwargs)
+        raise self.start_error
+
+    async def cancel_command(self, **kwargs):
+        if self.fail_cancel:
+            raise LambdaMicroVMEndpointTransientError("cancel unavailable")
+        return await super().cancel_command(**kwargs)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_failed_start_retains_cleanup_and_original_error(tmp_path, cancelled):
+    async def scenario():
+        error = (
+            asyncio.CancelledError("caller cancelled")
+            if cancelled
+            else LambdaMicroVMEndpointTransientError("lost start response")
+        )
+        transport = FailedStartTransport(tmp_path, error)
+        runner = _runner(tmp_path, transport)
+        capability = runner.interactive_process_capability()
+        try:
+            with pytest.raises(type(error)) as raised:
+                await capability.open_interactive_process(_python("import time; time.sleep(60)"))
+            assert raised.value is error
+            pending = capability.failed_start_process(error)
+            assert pending is not None
+            assert not transport.released
+            with pytest.raises(LambdaMicroVMEndpointTransientError):
+                await pending.close()
+            transport.fail_cancel = False
+            await pending.close()
+            assert transport.released == [pending.command_id]
+        finally:
+            transport.fail_cancel = False
+            for command_id in tuple(transport.supervisor._records):
+                await transport.cancel_command(command_id=command_id)
+
+    asyncio.run(scenario())

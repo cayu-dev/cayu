@@ -37,7 +37,7 @@ from pydantic import (
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from cayu._exception_groups import iter_exception_tree
-from cayu._exception_state import exception_state
+from cayu._exception_state import exception_state, set_exception_state
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
@@ -244,6 +244,22 @@ class RunnerInteractiveProcessCapability(ABC):
     publication channel.
     """
 
+    @staticmethod
+    def retain_failed_start(error: BaseException, process: RunnerInteractiveProcess) -> None:
+        """Transfer an unconfirmed start's cleanup handle with its original error.
+
+        The caller must recover it with ``failed_start_process`` and retry
+        ``close`` before reporting quiescence. Cancellation identity is preserved.
+        """
+        if not set_exception_state(error, "_cayu_interactive_start_cleanup", process):
+            raise RuntimeError("Interactive process cleanup ownership could not be retained.")
+
+    @staticmethod
+    def failed_start_process(error: BaseException) -> RunnerInteractiveProcess | None:
+        """Return the cleanup handle retained by an unsuccessful interactive start."""
+        process = exception_state(error, "_cayu_interactive_start_cleanup")
+        return process if isinstance(process, RunnerInteractiveProcess) else None
+
     @property
     def secret_values(self) -> tuple[str, ...]:
         """Values the runner places in every process environment that must stay private."""
@@ -263,6 +279,8 @@ class RunnerInteractiveProcessCapability(ABC):
 
         ``timeout_s`` bounds the process lifetime in the guest, so a caller that
         disappears without closing the handle cannot leave it running forever.
+        If a failed start cannot confirm cleanup, call ``retain_failed_start``
+        before re-raising the original error, including cancellation.
         """
 
 

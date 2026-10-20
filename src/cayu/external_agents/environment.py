@@ -381,10 +381,15 @@ async def runner_agent_launch(
                 for pending in (output, source):
                     pending.cancel()
                 await asyncio.gather(output, source, return_exceptions=True)
-        except Exception:
-            # Guest and transport failures are content-free here: the stand-in
-            # exits non-zero and the SDK reports the CLI as failed.
-            pass
+        except BaseException as error:
+            if process is None:
+                process = capability.failed_start_process(error)
+                if process is not None:
+                    processes.add(process)
+            # Keep the original cancellation while retaining any failed start's
+            # cleanup handle. Other failures make the stand-in exit non-zero.
+            if not isinstance(error, Exception):
+                raise
         finally:
             connections.discard(task)
             writer.close()

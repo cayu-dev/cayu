@@ -941,3 +941,100 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         "Stop a hung background job",
     ):
         assert phrase in cayu_map
+
+
+def test_external_agents_guide_example_records_a_scrubbed_priced_session(
+    capsys, tmp_path, monkeypatch
+) -> None:
+    import importlib
+
+    from cayu.budgets import default_price_book
+    from cayu.external_agents import ExternalAgentEvent
+    from cayu.tasks import TaskStatus
+
+    assert main(["guide", "external-agents"]) == 0
+    guide = capsys.readouterr().out
+    quick_start, rest = guide.split("## Launchers", 1)
+    launchers = rest.split("## Reference", 1)[0]
+    for extra in ("cayu[server,claude-agent-sdk]", "cayu[server,codex]"):
+        assert extra in quick_start
+    for name in ("docker_agent_launch", "ExternalAgentLaunch", "Docker"):
+        assert name in launchers
+    example, codex = re.findall(r"```python\n(.*?)```", quick_start, re.DOTALL)
+
+    # The Codex snippet is not executed, so check its imports.
+    for snippet in (codex,):
+        compile(snippet, "external-agents", "exec")
+        for module, names in re.findall(r"^from (cayu[\w.]*) import (.+)$", snippet, re.M):
+            for name in names.split(","):
+                assert hasattr(importlib.import_module(module), name.strip()), name
+
+    namespace: dict[str, Any] = {"__name__": "external_agents_guide"}
+    exec(compile(example, "external-agents", "exec"), namespace)
+    secret = "sk-guide-example-secret"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CAYU_ALIAS_KEY", "a" * 42 + "A")
+
+    class ScriptedClaude:
+        name = "scripted-claude"
+        provider_name = "anthropic"
+        model = namespace["MODEL"]
+
+        async def stream(self, context):
+            assert context.execution_deadline.expires_at is not None
+            assert await context.allow_tool("Read", {"file_path": "app.py"}, "read-1")
+            assert not await context.allow_tool("Bash", {"command": "rm -rf ."}, "bash-1")
+            yield ExternalAgentEvent(
+                "usage", {"input_tokens": 1000, "output_tokens": 200}, "step-1", self.model
+            )
+            yield ExternalAgentEvent("text", {"text": f"Reading with {secret}."}, "text-1")
+            yield ExternalAgentEvent("result", {"output": f"Three problems. {secret}"}, "done")
+
+    async def scenario() -> None:
+        app = namespace["build_app"](secret)
+        try:
+            result = await namespace["review"](app, ScriptedClaude())
+            assert result.output.startswith("Three problems.")
+            assert secret not in result.output
+            events = await app.session_store.load_events(result.session_id)
+            stored = json.dumps([event.model_dump(mode="json") for event in events])
+            assert secret not in stored
+            task = await app.task_store.load_task(result.task_id)
+            assert task is not None and task.status is TaskStatus.COMPLETED
+            cost = await app.get_session_cost(result.session_id, default_price_book())
+            assert cost.priced_model_steps == 1
+            assert cost.total_cost > 0
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+    printed = capsys.readouterr().out
+    assert "1000 input and 200 output tokens" in printed
+    assert secret not in printed
+
+    for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
+        assert main(["guide", reference]) == 0, reference
+        capsys.readouterr()
+
+
+def test_external_agents_guide_is_indexed_and_its_extras_are_listed(capsys) -> None:
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+    extras = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    for extra in ("claude-agent-sdk", "codex"):
+        assert extra in extras
+        assert f"| `cayu[{extra}]` |" in readme
+    assert "`cayu guide external-agents`" in readme
+    index = (root / "docs" / "README.md").read_text(encoding="utf-8")
+    assert "(../src/cayu/guides/external-agents.md) (`cayu guide external-agents`)" in index
+    pointer = (root / "docs" / "external-agents.md").read_text(encoding="utf-8")
+    assert "cayu guide external-agents" in pointer
+    assert len(pointer.splitlines()) < 10
+
+    for topic in ("authoring#cayu-map", "references#external-agents"):
+        assert main(["guide", topic]) == 0
+        assert "cayu guide external-agents" in capsys.readouterr().out

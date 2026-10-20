@@ -36,6 +36,11 @@ Check the breaking change below if you catch `ModelStreamDeadlineError` from
   runner workspace in one guest operation instead of listing it and reading
   every file. File hashes are taken from the files' own bytes, as in direct
   observations of the same workspace.
+- `cayu guide external-agents` now ships with the package. It starts with a
+  complete example that runs Claude Code through `cayu[claude-agent-sdk]`, or
+  Codex through `cayu[codex]`, as a Cayu session with recorded tokens and cost, a
+  deadline, a USD cap and secret scrubbing, and says what the launcher needs
+  today. The README extras table now lists both extras.
 - `run_task_worker` takes `execution_timeout_s` to bound the runs each handler
   call starts. A hung run ends `session.interrupted` with `limit_reached`, an
   attached task fails with `ExecutionDeadlineExceeded` instead of staying
@@ -68,6 +73,8 @@ Check the breaking change below if you catch `ModelStreamDeadlineError` from
   own PID namespace, so closing it confirms every descendant has exited.
   `docker_agent_launch` remains available, and the external-agents guide now
   explains how to write your own launcher.
+  Failed interactive starts retain their process cleanup handles when cancellation
+  is unavailable, so external runs cannot settle before cleanup is confirmed.
 
 ## v0.12.1
 

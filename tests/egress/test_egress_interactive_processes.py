@@ -138,3 +138,31 @@ def test_runner_without_interactive_processes_reports_none() -> None:
     runner, _ = _managed(None)
 
     assert runner.interactive_process_capability() is None
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_failed_start_retains_egress_dispatch_until_cleanup(cancelled):
+    error = asyncio.CancelledError("cancelled") if cancelled else RuntimeError("lost start")
+
+    class PendingCapability(_Capability):
+        async def open_interactive_process(self, *args, **kwargs):
+            self.retain_failed_start(error, self.process)
+            raise error
+
+    inner = PendingCapability()
+    runner, dispatches = _managed(inner)
+
+    async def scenario():
+        capability = runner.interactive_process_capability()
+        with pytest.raises(type(error)) as raised:
+            await capability.open_interactive_process(ExecCommand.process("cli"))
+        assert raised.value is error
+        assert dispatches.active == {1}
+        pending = capability.failed_start_process(error)
+        assert pending is not inner.process
+        await pending.close()
+        assert not dispatches.active
+        [(_, result, failure)] = dispatches.finished
+        assert failure is None and result.exit_code == 0
+
+    asyncio.run(scenario())

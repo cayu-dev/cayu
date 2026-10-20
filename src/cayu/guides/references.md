@@ -249,6 +249,13 @@ and execution policy. Parent and child retain separate durable identities.
 Test child completion/interruption assertions and define cancellation or
 background behavior rather than treating delegation as an in-process function.
 
+## external-agents
+
+To run a vendor's whole agent, such as Claude Code or Codex, as a Cayu session
+with recorded tokens and cost, a deadline, a USD cap and secret scrubbing,
+install `cayu[claude-agent-sdk]` or `cayu[codex]` and run
+`cayu guide external-agents`.
+
 ## evals
 
 An `EvalPlan` combines a `CayuApp` and `EvalSuite`. Use

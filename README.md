@@ -536,10 +536,14 @@ deployment:
 | `cayu[files]` | Image and PDF inspection |
 | `cayu[console]` | Interactive application console |
 | `cayu[otel]` | OpenTelemetry tracing and metrics support |
-| `cayu[all]` | Every runtime integration extra above |
+| `cayu[claude-agent-sdk]` | Claude Code runs as Cayu sessions, with tokens, cost, deadlines and secret scrubbing (`cayu guide external-agents`) |
+| `cayu[codex]` | Codex runs as Cayu sessions, with tokens, cost, deadlines and secret scrubbing (`cayu guide external-agents`) |
+| `cayu[all]` | Every runtime integration extra above except the two vendor SDKs |
 
-`cayu[all]` intentionally excludes `cayu[browser]`, which is dashboard and
-browser verification tooling rather than a runtime integration.
+`cayu[all]` intentionally excludes `cayu[claude-agent-sdk]` and `cayu[codex]`,
+which install vendor SDKs and their bundled CLI binaries, and `cayu[browser]`,
+which is dashboard and browser verification tooling rather than a runtime
+integration.
 
 Providers normalize text, thinking, tool calls, usage, completion reasons, and
 typed failures behind one runtime contract. Applications register providers
@@ -695,6 +699,7 @@ Start with the document that matches the job:
 | Reconstruct service-backed tools with stable identities and scoped knowledge | `cayu guide durable-service-tools` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-service-tools.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/durable_service_tools/)) |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Build a browser UI that follows sessions without hot polling | `cayu guide app-ui` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/app-ui.md)) |
+| Run Claude Code or Codex as Cayu sessions with tokens, cost, deadlines and secret scrubbing | `cayu guide external-agents` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/external-agents.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Produce a durable checked patch without external delivery | [Maintained coding product](https://github.com/cayu-dev/cayu/blob/main/docs/coding-product.md) |

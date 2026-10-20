@@ -20,6 +20,8 @@ authoritative only where a maintained guide points to the implementation or the
 - [Application UIs over sessions](../src/cayu/guides/app-ui.md) (`cayu guide app-ui`)
 - [Durable service-backed tools](../src/cayu/guides/durable-service-tools.md) (`cayu guide durable-service-tools`)
 - [Verified work](../src/cayu/guides/verified-work.md) (`cayu guide verified-work`)
+- [External agents source pointer](external-agents.md): redirects to the packaged guide
+- [External agents](../src/cayu/guides/external-agents.md) (`cayu guide external-agents`): Claude Code and Codex runs as Cayu sessions, with tokens, cost, deadlines and secret scrubbing
 - [Running untrusted code](../src/cayu/guides/untrusted-code.md) (`cayu guide untrusted-code`): hardened Docker with allowlisted egress locally, Lambda MicroVM in production
 
 - [Advanced runtime examples](advanced-runtime-examples.md)
@@ -35,7 +37,6 @@ authoritative only where a maintained guide points to the implementation or the
 - [Common-root budget bindings](common-root-budgets.md)
 - [Docker coding toolchains](docker-coding-toolchains.md)
 - [Environment factories](environment-factories.md)
-- [External vendor harnesses](external-agents.md)
 - [Execution capabilities: Docker and Lambda MicroVM](execution-capabilities.md)
 - [Execution snapshots: managed process and workspace restoration](execution-snapshots.md)
 - [Session fork overlays: outside controllers with their own instructions, tools and memory](fork-overlays.md)

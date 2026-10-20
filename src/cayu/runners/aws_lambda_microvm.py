@@ -2570,7 +2570,7 @@ class _LambdaInteractiveProcessCapability(RunnerInteractiveProcessCapability):
                     "Lambda MicroVM sidecar cannot confirm teardown of an interactive "
                     "process tree; rebuild the image from this Cayu release's sidecar."
                 )
-        except BaseException:
+        except BaseException as error:
             # The start may have reached the sidecar. Stop it before reporting,
             # even if the caller is being cancelled.
             outcome = await await_shielded_task_outcome(asyncio.ensure_future(process.close()))
@@ -2578,6 +2578,7 @@ class _LambdaInteractiveProcessCapability(RunnerInteractiveProcessCapability):
                 outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
             )
             if outcome.error is not None:
+                self.retain_failed_start(error, process)
                 runner._poison_exec("Lambda MicroVM interactive command cleanup is unconfirmed")
             raise
         finally:

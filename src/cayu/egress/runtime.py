@@ -4433,7 +4433,16 @@ class _EgressInteractiveProcessCapability(RunnerInteractiveProcessCapability):
                 command, cwd=cwd, env=env, timeout_s=timeout_s
             )
         except BaseException as error:
-            self._runner._finish_workspace_dispatch(dispatch_id=dispatch_id, error=error)
+            pending = self.failed_start_process(error)
+            if pending is None:
+                self._runner._finish_workspace_dispatch(dispatch_id=dispatch_id, error=error)
+            else:
+                self.retain_failed_start(
+                    error,
+                    _EgressInteractiveProcess(
+                        self._runner, pending, dispatch_id, self.secret_values
+                    ),
+                )
             raise
         return _EgressInteractiveProcess(self._runner, process, dispatch_id, self.secret_values)
 

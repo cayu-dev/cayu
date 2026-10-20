@@ -408,3 +408,37 @@ def test_stdin_transport_failure_terminates_the_shim(tmp_path, operation):
         assert capability.processes[0].process.returncode is not None
 
     asyncio.run(scenario())
+
+
+def test_lost_interactive_start_keeps_launch_cleanup_retryable(tmp_path):
+    from tests.runners.test_aws_lambda_microvm_interactive import FailedStartTransport, _runner
+
+    from cayu.runners.aws_lambda_microvm import LambdaMicroVMEndpointTransientError
+
+    async def scenario():
+        transport = FailedStartTransport(
+            tmp_path, LambdaMicroVMEndpointTransientError("lost start response")
+        )
+        runner = _runner(tmp_path, transport)
+        try:
+            with pytest.raises(ExternalCleanupIncomplete) as failure:
+                async with runner_agent_launch(
+                    runner=runner, cli=sys.executable, environment={}
+                ) as launch:
+                    code, _ = await _run_shim(
+                        launch, "-c", "import time; time.sleep(60)", stdin=b""
+                    )
+                    assert code != 0
+            [record] = transport.supervisor._records.values()
+            assert record.process is not None and record.process.poll() is None
+            assert not transport.released
+            transport.fail_cancel = False
+            await failure.value.retry()
+            assert record.process.poll() is not None
+            assert len(transport.released) == 1
+        finally:
+            transport.fail_cancel = False
+            for command_id in tuple(transport.supervisor._records):
+                await transport.cancel_command(command_id=command_id)
+
+    asyncio.run(scenario())

@@ -50,6 +50,10 @@ _GUIDES = {
         "evals-production.md",
         "Production sessions, scenarios, tools, process behavior, and memory.",
     ),
+    "external-agents": (
+        "external-agents.md",
+        "Claude Code and Codex as Cayu sessions: tokens, cost, deadlines, secret scrubbing.",
+    ),
     "human-attention": (
         "human-attention.md",
         "Durable notifications over canonical pending actions.",
@@ -110,6 +114,7 @@ _RELATED = {
         "human-attention",
     ),
     "durable-service-tools": ("durable-operations", "references", "anatomy"),
+    "external-agents": ("long-running", "references", "authoring"),
     "human-attention": ("durable-operations", "references", "anatomy"),
     "evals-ai-quality": ("evals-first", "evals-production", "authoring"),
     "evals-first": ("evals-ai-quality", "evals-production", "authoring"),
