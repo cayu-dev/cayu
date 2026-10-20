@@ -7,6 +7,7 @@ Dockerized Postgres. They skip automatically when Docker is unavailable.
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import subprocess
 import sys
@@ -6047,7 +6048,34 @@ def test_postgres_lost_notification_converges_at_bounded_poll(postgres_dsn):
 
 
 @pytest.mark.qualification
-def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgres_dsn, monkeypatch):
+def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgres_dsn):
+    # process_time includes collection and background work left by earlier tests.
+    # Measure the real pool in a fresh process instead of relaxing its CPU budget.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os\n"
+            "import pytest\n"
+            "from tests.core.test_postgres_task_store import _assert_postgres_idle_worker_budget\n"
+            "with pytest.MonkeyPatch.context() as patch:\n"
+            "    _assert_postgres_idle_worker_budget("
+            "os.environ['CAYU_TEST_WORKER_IDLE_POSTGRES_DSN'], patch)\n",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, "CAYU_TEST_WORKER_IDLE_POSTGRES_DSN": postgres_dsn},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def _assert_postgres_idle_worker_budget(postgres_dsn, monkeypatch):
+    # Keep GC enabled throughout pool startup and the measured idle window.
+    gc.collect()
+
     async def run() -> None:
         await _truncate(postgres_dsn)
         producer = _new_store(postgres_dsn)

@@ -1940,6 +1940,7 @@ def test_guest_profile_owner_start_timeout_kills_and_reaps_blocked_child(
     profile_home.mkdir()
     spawned: list[subprocess.Popen[bytes]] = []
     real_popen = guest.subprocess.Popen
+    startup_timeout: asyncio.Timeout | None = None
 
     def blocked_cleanup_command(
         _home: Path,
@@ -1951,15 +1952,20 @@ def test_guest_profile_owner_start_timeout_kills_and_reaps_blocked_child(
             sys.executable,
             "-I",
             "-c",
-            "import time; time.sleep(10)",
+            "import time; time.sleep(60)",
         )
 
     def record_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
         process = real_popen(*args, **kwargs)
         spawned.append(process)
+        assert startup_timeout is not None
+        # Expire the caller only after the real blocked child exists. Process
+        # startup and runner scheduling are not part of the cleanup assertion.
+        startup_timeout.reschedule(asyncio.get_running_loop().time())
         return process
 
     async def exercise() -> None:
+        nonlocal startup_timeout
         with (
             patch.object(guest, "_TEMPORARY_PROFILE_ROOT", tmp_path),
             patch.object(guest.tempfile, "mkdtemp", return_value=str(profile_home)),
@@ -1971,21 +1977,27 @@ def test_guest_profile_owner_start_timeout_kills_and_reaps_blocked_child(
             patch.object(guest.subprocess, "Popen", side_effect=record_spawn),
             pytest.raises(TimeoutError),
         ):
-            async with asyncio.timeout(0.05):
-                await guest._start_temporary_profile_owner(timeout_seconds=0.1)
+            async with asyncio.timeout(None) as startup_timeout:
+                await guest._start_temporary_profile_owner(timeout_seconds=5.0)
+        assert startup_timeout.expired()
 
-    started_at = time.monotonic()
+    async def bounded_exercise() -> None:
+        async with asyncio.timeout(10):
+            await exercise()
+
     try:
-        asyncio.run(exercise())
-        elapsed = time.monotonic() - started_at
+        asyncio.run(bounded_exercise())
 
         assert len(spawned) == 1
         process = spawned[0]
         assert process.poll() == -signal.SIGKILL
         with pytest.raises(ProcessLookupError):
             os.kill(process.pid, 0)
-        assert elapsed < 0.5
     finally:
+        for process in spawned:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
         if profile_home.exists():
             shutil.rmtree(profile_home)
 

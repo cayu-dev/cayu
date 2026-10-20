@@ -1,17 +1,40 @@
 # Release notes
 
-## Unreleased
+## v0.12.1
 
-Upgrade: no action needed.
-
-- `CayuApp(owned_resources=...)` now accepts resources that close with an async
-  `aclose()`, such as every built-in model provider, as well as an async
-  `close()`. Handing a provider to the app used to raise `TypeError`. A resource
-  with an async `close()` is still closed through it.
+Upgrade: no storage migration is needed from 0.12.0. Allow for batched display
+deltas and handle session failure if a tool round waits ten minutes for capacity.
+Storage revision 124, compatibility floor 124, server contract 49 and manifest
+schema 17 are all unchanged.
 
 ### Breaking changes
 
-None.
+- Text and readable reasoning deltas are now batched before durable publication.
+  The first delta is immediate; later batches flush at 4,096 characters, on the
+  first arrival at least one second after the previous publication, or at a
+  semantic boundary. An indivisible larger provider chunk remains intact.
+  Consumers must not depend on one event per provider chunk. Completed
+  transcript text, signed thinking boundaries and usage accounting are preserved.
+- A tool round waiting for terminal-publication capacity now fails with
+  `ToolRoundAdmissionTimeoutError` after 600 seconds, before any of its tools
+  run, instead of waiting indefinitely. A warning is logged after 60 seconds;
+  `session.failed` records content-free capacity counts when the wait expires.
+
+### Changes
+
+- Keep sibling tool rounds in queue order so overlapping siblings cannot starve
+  unrelated work, while allowing nested rounds to proceed without deadlocking
+  their parents. Cancelled rounds with no staged results close promptly.
+- Keep task workers running while acknowledgements settle slowly, and allow
+  Docker recovery to settle a lost model call after its container is disposed.
+- Add brokered sandbox coding environments with bounded command execution,
+  lease renewal and workspace synchronization.
+- Reduce repeated JSON validation and copying while preserving mutation
+  isolation, and support large filesystem identities in local admission.
+- Enforce fork input caps across the complete request, including structured
+  output and provider options.
+- Accept async `aclose()` resources in `CayuApp(owned_resources=...)`, including
+  built-in model providers. Resources with an async `close()` retain that path.
 
 ## v0.12.0
 

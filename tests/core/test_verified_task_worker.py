@@ -2994,16 +2994,19 @@ def test_worker_recovers_preparing_source_without_repeating_handler(
                     ]
                     assert sum(isinstance(error, ConnectionError) for error in leaves) == 1
                     assert len(leaves) in (1, 2)
-                    # Activation transfers the task lease before our injected
-                    # acknowledgement loss. A queued preparation heartbeat can
-                    # then correctly reject its old task authority; preserve
-                    # that secondary error rather than requiring it to vanish.
+                    # Preparation transfers the task to the admission's claim
+                    # before session creation or activation can lose their ack.
+                    # A queued task heartbeat must preserve rejection of its old
+                    # authority, even while the admission's new lease is valid.
                     assert all(
-                        isinstance(error, ConnectionError)
-                        or (fault == "activate" and isinstance(error, TaskClaimLost))
-                        for error in leaves
+                        isinstance(error, (ConnectionError, TaskClaimLost)) for error in leaves
                     )
             prepared = await tasks.load_latest_work_attempt_admission(task.id)
+            if any(isinstance(error, TaskClaimLost) for error in leaves):
+                transferred = await tasks.load_task(task.id)
+                assert transferred.status is TaskStatus.RUNNING
+                assert transferred.worker_id == prepared.claim.worker_id
+                assert transferred.lease_expires_at == prepared.claim.lease_expires_at
             assert prepared.state.value == ("active" if fault == "activate" else "preparing")
             assert prepared.source_request is not None
             assert prepared.kind == ("continuation" if continuing else "initial")

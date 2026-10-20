@@ -1323,6 +1323,7 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
     store, monkeypatch, repeat_start_clock
 ):
     from tests.core.test_verified_task_worker import _contract, _RecordingProvider, _StaticHandler
+    from tests.core.test_work_attempt_lifecycle import _lifecycle_clock_now
 
     from cayu import AgentSpec
     from cayu.runtime.verified_task_worker import VerifiedTaskWorker
@@ -1357,7 +1358,7 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
 
     def blocked_read():
         entered.set()
-        assert release.wait(20)
+        assert release.wait(60)
 
     class Handler(_StaticHandler):
         calls = 0
@@ -1403,8 +1404,8 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
         handler,
         worker_id="same-preparer",
         query=TaskQuery(type="b"),
-        lease_seconds=1,
-        callback_timeout_seconds=0.2,
+        lease_seconds=10,
+        callback_timeout_seconds=5,
     )
     assert await owner.run(max_tasks=1) == 1
     first = (await app.load_task_group("race")).quiescence.executions[0]
@@ -1420,7 +1421,11 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
         assert second.started_at > first.started_at and second.settled_at is None
         with pytest.raises(TaskGroupConflict):
             await store._settle_task_group_execution(entries[0])
-        await asyncio.sleep(1.1)
+        # Expire the actual claim without constraining database settlement to
+        # the short scheduling window used to trigger lease loss.
+        async with asyncio.timeout(20):
+            while await _lifecycle_clock_now(store) <= entries[-1].lease_expires_at:
+                await asyncio.sleep(0.05)
         await store.complete_task("a", {})
         await store.reclaim_expired()
         assert (await app.reconcile_task_group("race")).quiescence.status is (
@@ -1699,6 +1704,7 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
         _StaticHandler,
         _task_result,
     )
+    from tests.core.test_work_attempt_lifecycle import _lifecycle_clock_now
 
     from cayu import AgentSpec
     from cayu.runtime.completion_result_resolvers import CompletionResultResolverExecutionError
@@ -1749,7 +1755,7 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
 
     def blocked_read():
         entered.set()
-        assert release.wait(15)
+        assert release.wait(60)
 
     if phase in {"resolver_entry", "resolver_gate"}:
         observe = type(store)._observe_task_group_result_resolution
@@ -1833,13 +1839,13 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
         Handler(),
         worker_id="verified",
         query=TaskQuery(type="b"),
-        lease_seconds=1
+        lease_seconds=10
         if control.startswith("lease_expiry") or control == "hold_failure_late_winner"
         else 300,
-        callback_timeout_seconds=0.2
-        if control == "timeout" or control.startswith("lease_expiry")
-        else 0.9
-        if control == "hold_failure_late_winner"
+        callback_timeout_seconds=5
+        if control == "timeout"
+        or control.startswith("lease_expiry")
+        or control == "hold_failure_late_winner"
         else 60,
     ) as owner:
         worker = asyncio.create_task(owner.run(max_tasks=1))
@@ -1867,7 +1873,10 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
                 await store.complete_task("a", {})
             assert await store.claim_task("finalizer", TaskQuery(type="finalize")) is None
             if control.startswith("lease_expiry"):
-                await asyncio.sleep(1.1)
+                claim = await store.load_task("b")
+                async with asyncio.timeout(20):
+                    while await _lifecycle_clock_now(store) <= claim.lease_expires_at:
+                        await asyncio.sleep(0.05)
                 await store.reclaim_expired()
                 assert await store.claim_task("replacement", TaskQuery(type="b")) is None
                 assert await store.claim_task("finalizer", TaskQuery(type="finalize")) is None
@@ -1933,7 +1942,9 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
             if control == "cancel":
                 worker.cancel()
             if control != "return":
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(
+                    owner.callback_timeout_seconds + 0.1 if control == "timeout" else 0.3
+                )
                 if phase != "resolver" or control != "cancel":
                     assert not worker.done()
                 assert not release.is_set()
@@ -1990,7 +2001,10 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
                     await asyncio.wait_for(worker, 15)
                 if late_winner:
                     if control == "hold_failure_late_winner":
-                        await asyncio.sleep(1.1)
+                        claim = await store.load_task("b")
+                        async with asyncio.timeout(20):
+                            while await _lifecycle_clock_now(store) <= claim.lease_expires_at:
+                                await asyncio.sleep(0.05)
                     await store.complete_task("a", {})
                     await app.reconcile_task_group("race")
             elif control == "cancel":

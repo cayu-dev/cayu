@@ -1579,24 +1579,36 @@ def test_task_retry_reconciler_cannot_replace_worker_cancellation_receipt(
 def test_task_retry_deadline_drain_honors_late_operator_cancellation(
     store_kind: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import cayu.tasks.worker as task_worker
+
     async def run() -> None:
-        store = (
-            InMemoryTaskStore()
-            if store_kind == "memory"
-            else SQLiteTaskStore(tmp_path / "deadline-cancellation-race.sqlite")
-        )
+        clock = _MutableClock(datetime.now(UTC))
+        store = _store_for_kind(store_kind, tmp_path / "deadline-cancellation-race.sqlite", clock)
         app = CayuApp(task_store=store, enable_logging=False)
         await store.create_task(
             TaskCreate(
                 task_id="deadline-cancellation-race",
                 type="job",
-                retry_policy=TaskRetryPolicy(max_attempts=2, max_elapsed_seconds=0.1),
+                retry_policy=TaskRetryPolicy(max_attempts=2, max_elapsed_seconds=1),
             )
         )
+        started = asyncio.Event()
+        draining = asyncio.Event()
         release = asyncio.Event()
+        original_quiesce = task_worker._quiesce_task_retry_handler_before_terminalization
+
+        async def observe_drain(*args, **kwargs):
+            draining.set()
+            return await original_quiesce(*args, **kwargs)
+
+        monkeypatch.setattr(
+            task_worker, "_quiesce_task_retry_handler_before_terminalization", observe_drain
+        )
 
         async def handler(_app, _task, _worker_id):
+            started.set()
             await release.wait()
             return TaskRetryAttemptReport(
                 idempotency_key="deadline-cancellation-accounting",
@@ -1612,13 +1624,19 @@ def test_task_retry_deadline_drain_honors_late_operator_cancellation(
                 store,
                 handler,
                 worker_id="deadline-owner",
-                lease_seconds=1,
+                lease_seconds=30,
                 max_tasks=1,
                 poll_interval_s=0.01,
             )
         )
         try:
-            await asyncio.sleep(0.2)
+            # Expire only after dispatch, then cancel while the real deadline
+            # drain owns the still-running handler. Startup latency must not
+            # turn this into a pre-dispatch expiry test.
+            await asyncio.wait_for(started.wait(), timeout=10)
+            clock.value += timedelta(seconds=2)
+            await asyncio.wait_for(draining.wait(), timeout=10)
+            assert not worker.done()
             requested = await store.cancel_task(
                 "deadline-cancellation-race",
                 {"code": "operator"},
@@ -1626,7 +1644,7 @@ def test_task_retry_deadline_drain_honors_late_operator_cancellation(
             assert requested.status_reason == "retry_cancellation_requested"
             release.set()
 
-            assert await asyncio.wait_for(worker, timeout=3) == 1
+            assert await asyncio.wait_for(worker, timeout=10) == 1
             terminal = await store.load_task("deadline-cancellation-race")
             assert terminal is not None
             assert terminal.status is TaskStatus.CANCELLED
