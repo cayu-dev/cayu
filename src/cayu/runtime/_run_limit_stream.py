@@ -118,7 +118,7 @@ async def deadline_outcome_stream(
         )
         if previous:
             previous_lifecycle_id = previous[0].event.id
-        stream = deadline_stream(stream, boundary)
+    stream = deadline_stream(stream, boundary)
     try:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

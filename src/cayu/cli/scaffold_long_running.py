@@ -359,6 +359,9 @@ NO_REPLY_ANSWER = "No reply arrived before the deadline."
 # treated as abandoned: its process died. Live sessions are never taken over.
 ABANDONED_AFTER = timedelta(minutes=15)
 SWEEP_INTERVAL_S = 60.0
+# The longest a run started by a timer may take. Continuing a paused session
+# keeps the deadline that session started with.
+TIMER_RUN_TIMEOUT_S = 300.0
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +619,8 @@ async def run_timer_worker(app: CayuApp, stop: asyncio.Event) -> None:
                 worker_id=f"timers-{socket.gethostname()}-{os.getpid()}",
                 query=TaskQuery(type=TIMER_TASK_TYPE),
                 recover_interrupted_handoffs=False,
+                # A hung run ends with limit_reached instead of holding its task.
+                execution_timeout_s=TIMER_RUN_TIMEOUT_S,
                 stop=stop,
             )
         )

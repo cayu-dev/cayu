@@ -91,6 +91,8 @@ async def run_fresh_tasks(app: CayuApp, stop) -> None:
         handle_task,
         worker_id=worker_id("fresh"),
         query=TaskQuery(type="domain_job"),
+        # Ends a hung run with limit_reached and fails its task.
+        execution_timeout_s=600,
         stop=stop,
     )
 ```

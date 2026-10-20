@@ -272,6 +272,7 @@ from cayu.deadlines import (
     current_execution_deadline,
     deadline_stream,
     effective_deadline,
+    new_run_execution_deadline,
     resumed_execution_deadline,
 )
 from cayu.egress.transitions import (
@@ -6976,6 +6977,17 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
+        if (
+            "execution_deadline" not in request.model_fields_set
+            and request.parent_session_id is None
+        ):
+            request = request.model_copy(
+                update={
+                    "execution_deadline": effective_deadline(
+                        request.execution_deadline, new_run_execution_deadline()
+                    )
+                }
+            )
         request = self._with_application_run_defaults(request)
         request = _validate_run_request(request)
         parent = (

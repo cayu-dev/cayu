@@ -131,8 +131,23 @@ async def handle(app, task, worker_id):
 # Four independently heartbeated tasks in one process. More processes can
 # share the store; its atomic claims keep them from taking the same task.
 await run_task_worker(app, task_store, handle, worker_id="worker-1",
-                      query=TaskQuery(type="review_pr"), concurrency=4)
+                      query=TaskQuery(type="review_pr"), concurrency=4,
+                      execution_timeout_s=600)
 ```
+
+`execution_timeout_s` bounds the runs each handler call starts. The deadline is
+fixed when the handler starts and becomes the default `execution_deadline` of
+every `RunRequest` the handler builds, so retries in one call share it. A hung
+tool or model stream then ends the run with `session.interrupted`
+(`limit_reached`), the runtime fails the attached task with
+`ExecutionDeadlineExceeded`, and a later run in the same call is refused with
+that error. A `RunRequest` that sets its own `execution_deadline` keeps it, and
+resuming an existing session keeps the deadline that session started with. The
+deadline is wall-clock time and includes time paused for a person. It defaults
+to `None` (no limit). Code outside `app.run` is not timed, so a handler that
+catches every error and retries forever still holds its task. To give runs the
+same default without `run_task_worker`, wrap the code that builds them in
+`with default_run_deadline(ExecutionDeadline.after(600)):` from `cayu.deadlines`.
 
 `concurrency` defaults to one. `max_tasks`, when set, is a total for the whole
 call, not a per-slot quota; recovered continuations and contracted-task parking

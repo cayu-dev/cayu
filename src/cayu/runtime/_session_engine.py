@@ -5962,8 +5962,8 @@ class SessionEngine:
                 yield item
 
     def _run_session(self, *, session: Session, **kwargs: Any) -> AsyncGenerator[Event, None]:
-        # Internal admitted-work and continuation entrances also restore the
-        # durable boundary. Preserve the unconfigured stream's existing owner.
+        # Internal admitted-work and continuation entrances restore the durable
+        # boundary, including explicit absence of a deadline.
         boundary = effective_deadline(current_execution_deadline(), session.execution_deadline)
         stream = self._run_session_with_deadline(session=session, **kwargs)
         if session.invocation.resource_access is not None:
@@ -5997,7 +5997,7 @@ class SessionEngine:
             # operation. A new zero-duration timer would cancel its stop write
             # and cleanup, rather than stop any execution (none can be admitted).
             return stream
-        return stream if boundary.expires_at is None else deadline_stream(stream, boundary)
+        return deadline_stream(stream, boundary)
 
     async def _run_session_with_group_observation(
         self,

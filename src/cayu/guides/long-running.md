@@ -96,6 +96,39 @@ deadline. The handler checks the action and the session's status before acting;
 the preset's `operations/timers.py` runs as `cayu worker timers`.
 Deep guide: [task scheduling](https://github.com/cayu-dev/cayu/blob/main/docs/task-scheduling.md).
 
+## Time limit for worker runs
+
+```python
+from cayu import Message, RunRequest, SessionStatus, run_to_completion
+from cayu.tasks import TaskHandlerOutcome, TaskQuery, run_task_worker
+
+RUN_TIMEOUT_S = 300  # The longest one job may take, from handler start.
+
+
+async def handle_job(app, task, worker_id):
+    outcome = await run_to_completion(app, RunRequest(
+        agent_name="invoices", messages=[Message.text("user", task.input["request"])],
+        task_id=task.id, task_worker_id=worker_id, task_lease_expires_at=task.lease_expires_at,
+    ))
+    if outcome.status is SessionStatus.INTERRUPTED:
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+    return None
+
+
+async def run_jobs(app, stop=None):
+    await run_task_worker(app, app.task_store, handle_job, worker_id="jobs-1",
+                          query=TaskQuery(type="invoice-job"),
+                          execution_timeout_s=RUN_TIMEOUT_S, stop=stop)
+```
+
+Without `execution_timeout_s`, a hung tool or model stream keeps the task
+`claimed` forever. With it, every `RunRequest` the handler builds gets that
+deadline unless it sets its own. At expiry the run ends `session.interrupted`
+with `limit_reached`, the runtime fails the attached task with
+`ExecutionDeadlineExceeded`, and a retry in the same handler call is refused.
+Don't retry past it. The deadline also counts time paused for a person, so a
+job that waits for approval needs a limit that covers the wait.
+
 ## Spend cap
 
 ```python

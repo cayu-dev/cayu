@@ -845,9 +845,9 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
-    assert len(guide.splitlines()) <= 160
+    assert len(guide.splitlines()) <= 195
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
-    assert len(snippets) == 5
+    assert len(snippets) == 6
     namespace: dict[str, Any] = {}
     for snippet in snippets:
         exec(compile(snippet, "long-running", "exec"), namespace)
@@ -894,10 +894,50 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     asyncio.run(scenario())
 
+    # Worker time limit: the guide's worker ends a hung run and fails its task.
+    async def hung_worker() -> None:
+        from cayu.evals.testing import ScriptedModelProvider
+        from cayu.sessions.memory import InMemorySessionStore
+        from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
+
+        class StalledProvider(ScriptedModelProvider):
+            async def stream(self, request):
+                await asyncio.Event().wait()
+                yield ModelStreamEvent.completed()
+
+        app = namespace["build_app"](
+            provider=StalledProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        task = await app.task_store.create_task(
+            TaskCreate(type="invoice-job", input={"request": "Pay INV-9."})
+        )
+        namespace["RUN_TIMEOUT_S"] = 0.3
+        stop = asyncio.Event()
+        worker = asyncio.create_task(namespace["run_jobs"](app, stop))
+        async with asyncio.timeout(15):
+            while (await app.task_store.load_task(task.id)).status is not TaskStatus.FAILED:
+                await asyncio.sleep(0.05)
+        stop.set()
+        await worker
+        failed = await app.task_store.load_task(task.id)
+        assert failed.error["error"] == "ExecutionDeadlineExceeded"
+        events = await app.session_store.load_events(failed.session_id)
+        interrupted = [e for e in events if e.type.value == "session.interrupted"]
+        assert interrupted[-1].payload["reason"] == "limit_reached"
+
+    asyncio.run(hung_worker())
+
     for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
         assert main(["guide", reference]) == 0, reference
         capsys.readouterr()
     assert main(["guide", "authoring#cayu-map"]) == 0
     cayu_map = capsys.readouterr().out
-    for phrase in ("Remind after N hours", "Cap spending", "Wait for an email reply"):
+    for phrase in (
+        "Remind after N hours",
+        "Cap spending",
+        "Wait for an email reply",
+        "Stop a hung background job",
+    ):
         assert phrase in cayu_map

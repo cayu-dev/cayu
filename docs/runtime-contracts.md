@@ -10204,7 +10204,7 @@ estimated-cost bound. Add count limits only when the application needs them.
 
 | Setting | Default and meaning |
 | --- | --- |
-| `execution_deadline` | Unbounded unless supplied; cancels in-flight work when its absolute deadline expires. Continuations inherit it, including time spent waiting for a person. |
+| `execution_deadline` | Unbounded unless supplied; cancels in-flight work when its absolute deadline expires. Continuations inherit it, including time spent waiting for a person. An omitted value takes the enclosing `execution_deadline_scope`, or at run admission the default set by `default_run_deadline(...)` (which `run_task_worker(execution_timeout_s=...)` applies to each handler call); an explicit value replaces that default. |
 | `budget_limits` | No request budget; estimates cost from recorded usage and the selected price book. Existing policy budgets and reservations still apply. |
 | `max_steps` | 64 for interactive SDK runs; no cap for task-backed SDK runs unless explicitly configured. HTTP runs and product services use the application cap (64 by default). `None` disables it. |
 | `limits.max_tool_calls` | `None`, meaning no call-count cap. |

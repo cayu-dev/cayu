@@ -1148,3 +1148,260 @@ def test_task_deadline_releases_ownership_after_cancellation_drains(
             assert final.error["deadline_failure"]["terminal_event_id"] == terminal.id
 
     asyncio.run(scenario())
+
+
+def test_worker_default_does_not_change_serialized_requests():
+    from cayu._validation import canonical_bounded_durable_json_bytes
+    from cayu.collaboration.recipient_preparation import preparation_run_request
+    from cayu.deadlines import default_run_deadline
+    from cayu.runtime._durable_subagents import durable_subagent_request_sha256
+
+    original = RunRequest(agent_name="a", messages=[])
+    document = original.model_dump(mode="json")
+    encoded = canonical_bounded_durable_json_bytes(
+        document, "request", max_bytes=16384, max_nodes=8192
+    ).decode()
+    digest = durable_subagent_request_sha256(original)
+    with default_run_deadline(ExecutionDeadline.after(60, source="task_worker")):
+        assert RunRequest.model_validate(document).model_dump(mode="json") == document
+        assert (
+            RunRequest.model_validate_json(original.model_dump_json()).model_dump(mode="json")
+            == document
+        )
+        assert RunRequest(agent_name="a", messages=[]).execution_deadline.expires_at is None
+        restored = preparation_run_request(encoded)
+        assert restored.model_dump(mode="json") == document
+        assert durable_subagent_request_sha256(restored) == digest
+
+
+def test_task_worker_execution_timeout_is_validated():
+    from cayu.tasks import InMemoryTaskStore, run_task_worker
+
+    async def handler(app, task, worker_id):
+        raise AssertionError("unreachable")
+
+    for bad in (-1, float("inf"), True):
+        with pytest.raises(ValueError):
+            asyncio.run(
+                run_task_worker(
+                    CayuApp(enable_logging=False),
+                    InMemoryTaskStore(),
+                    handler,
+                    worker_id="w",
+                    max_tasks=1,
+                    execution_timeout_s=bad,
+                )
+            )
+
+
+@pytest.mark.parametrize("copied", [False, True])
+def test_task_worker_execution_timeout_defaults_runs_and_keeps_explicit_deadlines(copied):
+    from cayu.sessions.requests import copy_run_request
+    from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, run_task_worker
+    from cayu.tasks.worker import complete_managed_task
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        task = await store.create_task(TaskCreate(type="deadline-test"))
+        explicit = ExecutionDeadline.after(3600, source="application")
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    [ModelStreamEvent.text_delta("ok"), ModelStreamEvent.completed({})]
+                    for _ in range(3)
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="a", model="scripted"))
+        seen = []
+
+        async def handler(app, task, worker_id):
+            for kwargs in (
+                {},
+                {"execution_deadline": explicit},
+                {"execution_deadline": ExecutionDeadline()},
+            ):
+                request = RunRequest(
+                    agent_name="a", messages=[Message.text("user", "hi")], **kwargs
+                )
+                if copied:
+                    request = copy_run_request(request)
+                events = [event async for event in app.run(request)]
+                session = await app.session_store.load(events[-1].session_id)
+                seen.append(session.execution_deadline)
+            await complete_managed_task(store, task, worker_id, {})
+
+        handled = await run_task_worker(
+            app, store, handler, worker_id="w", max_tasks=1, execution_timeout_s=30
+        )
+        assert handled == 1
+        assert (await store.load_task(task.id)).status is TaskStatus.COMPLETED
+        default, kept, unbounded = seen
+        assert default.source == "task_worker"
+        assert 0 < default.remaining_seconds() <= 30
+        assert kept.model_dump() == explicit.model_dump()
+        assert unbounded.expires_at is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("attached", [True, False])
+def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached):
+    from cayu.sessions.outcomes import run_to_completion
+    from cayu.tasks import (
+        InMemoryTaskStore,
+        TaskCreate,
+        TaskHandlerOutcome,
+        TaskStatus,
+        run_task_worker,
+    )
+
+    async def scenario():
+        store = InMemoryTaskStore()
+
+        class StalledProvider(ScriptedModelProvider):
+            async def stream(self, request):
+                await asyncio.Event().wait()
+                yield ModelStreamEvent.completed()
+
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_provider(StalledProvider([]), default=True)
+        app.register_agent(AgentSpec(name="worker", model="scripted"))
+        task = await store.create_task(TaskCreate(type="deadline-test"))
+        outcomes = []
+
+        async def handler(app, task, worker_id):
+            # No deadline of its own, and a few attempts before giving up.
+            task_fields = (
+                {
+                    "task_id": task.id,
+                    "task_worker_id": worker_id,
+                    "task_lease_expires_at": task.lease_expires_at,
+                }
+                if attached
+                else {}
+            )
+            for attempt in range(3):
+                outcome = await run_to_completion(
+                    app,
+                    RunRequest(
+                        agent_name="worker",
+                        session_id=f"hung-{attempt}",
+                        messages=[Message.text("user", "go")],
+                        **task_fields,
+                    ),
+                )
+                outcomes.append(outcome)
+                if attached:
+                    # The documented handler shape hands off any interruption.
+                    return (
+                        TaskHandlerOutcome.SESSION_INTERRUPTED
+                        if outcome.status is SessionStatus.INTERRUPTED
+                        else None
+                    )
+                if outcome.ok:
+                    return None
+            raise RuntimeError(outcome.error)
+
+        handled = await asyncio.wait_for(
+            run_task_worker(
+                app, store, handler, worker_id="w", max_tasks=1, execution_timeout_s=0.3
+            ),
+            15,
+        )
+        assert handled == 1
+        final = await store.load_task(task.id)
+        assert final.status is TaskStatus.FAILED
+        assert final.worker_id is None and final.lease_expires_at is None
+        first, *retries = outcomes
+        assert first.status is SessionStatus.INTERRUPTED
+        assert first.interruption.reason == "limit_reached"
+        assert first.interruption.limit == "execution_deadline"
+        records = await app.session_store.load_events("hung-0")
+        assert any(
+            record.type is EventType.SESSION_INTERRUPTED
+            and record.payload["reason"] == "limit_reached"
+            for record in records
+        )
+        assert (await app.session_store.load("hung-0")).execution_deadline.source == "task_worker"
+        if attached:
+            # The runtime fails the attached task once the run settles.
+            assert retries == []
+            assert final.error["error"] == "ExecutionDeadlineExceeded"
+        else:
+            # The deadline is shared by the call, so each retry is refused at once.
+            assert [outcome.status for outcome in retries] == [SessionStatus.FAILED] * 2
+            assert all("ExecutionDeadlineExceeded" in outcome.error for outcome in retries)
+            assert "ExecutionDeadlineExceeded" in final.error["message"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_worker_default_does_not_tighten_subagents_or_workflow_anchors(bounded):
+    from cayu.deadlines import default_run_deadline
+    from cayu.sessions.queries import SessionQuery
+    from cayu.tools.subagents import SubagentSpec, SubagentTool
+
+    async def scenario():
+        boundary = ExecutionDeadline.after(3600) if bounded else ExecutionDeadline()
+        app = CayuApp(enable_logging=False)
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call", name="subagent", arguments={"agent": "child", "task": "answer"}
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [ModelStreamEvent.text_delta("child done"), ModelStreamEvent.completed({})],
+                [ModelStreamEvent.text_delta("parent done"), ModelStreamEvent.completed({})],
+            ]
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="scripted"),
+            tools=[SubagentTool(app, agents={"child": SubagentSpec(agent_name="child")})],
+        )
+        app.register_agent(AgentSpec(name="child", model="scripted"))
+        with default_run_deadline(ExecutionDeadline.after(60, source="task_worker")):
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="parent",
+                        session_id="parent",
+                        messages=[Message.text("user", "delegate")],
+                        execution_deadline=boundary,
+                    )
+                )
+            ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        children = (
+            await app.session_store.list_sessions(SessionQuery(parent_session_id="parent"))
+        ).sessions
+        assert len(children) == 1
+        assert children[0].execution_deadline.expires_at == boundary.expires_at
+
+        class AnchorWorkflow(WorkflowBase):
+            spec = WorkflowSpec(name="anchor")
+
+            async def run(self, session_id):
+                ctx = self.context(session_id)
+                yield await ctx.start()
+                yield await ctx.completed({"done": True})
+
+        with default_run_deadline(ExecutionDeadline.after(60, source="task_worker")):
+            events = [
+                event
+                async for event in AnchorWorkflow(app).execute(
+                    "anchor", execution_deadline=boundary
+                )
+            ]
+        anchor = await app.session_store.load("anchor")
+        assert anchor.execution_deadline.expires_at == boundary.expires_at
+        await app.aclose()
+
+    asyncio.run(scenario())

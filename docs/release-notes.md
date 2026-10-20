@@ -23,6 +23,15 @@ None.
   runner workspace in one guest operation instead of listing it and reading
   every file. File hashes are taken from the files' own bytes, as in direct
   observations of the same workspace.
+- `run_task_worker` takes `execution_timeout_s` to bound the runs each handler
+  call starts. A hung run ends `session.interrupted` with `limit_reached`, an
+  attached task fails with `ExecutionDeadlineExceeded` instead of staying
+  `claimed`, and a retry in the same call is refused. A `RunRequest` with its
+  own `execution_deadline` keeps it, and resumed sessions keep their stored
+  deadline. The default stays `None` because the deadline also counts time
+  paused for a person. `cayu.deadlines.default_run_deadline(...)` applies the
+  same default to runs started outside the worker. The long-running guide and
+  the generated timer worker now set a limit.
 - Run untrusted code locally in a hardened container with allowlisted egress:
   `DockerEgressAdapter(workload_restrictions=DockerWorkloadRestrictions())` with
   `VirtualEgressEnvironmentFactory`. `DockerRunner.create` now accepts

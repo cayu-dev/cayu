@@ -1034,7 +1034,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         }
     )
     copied_fields_set = set(copied.model_fields_set)
-    for field_name in ("max_steps", "limits", "thinking", "tool_completion"):
+    for field_name in ("max_steps", "limits", "thinking", "tool_completion", "execution_deadline"):
         if field_name not in request.model_fields_set:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)

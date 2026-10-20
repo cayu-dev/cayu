@@ -157,6 +157,39 @@ def current_execution_deadline() -> ExecutionDeadline:
     return _CURRENT.get() or ExecutionDeadline()
 
 
+_DEFAULT_RUN: ContextVar[ExecutionDeadline | None] = ContextVar(
+    "cayu_default_run_deadline", default=None
+)
+
+
+def new_run_execution_deadline() -> ExecutionDeadline:
+    """Select a new top-level run's default at admission, not deserialization."""
+    current = _CURRENT.get()
+    return current if current is not None else _DEFAULT_RUN.get() or ExecutionDeadline()
+
+
+@contextmanager
+def default_run_deadline(deadline: ExecutionDeadline) -> Iterator[None]:
+    """Bound new runs that set no ``execution_deadline`` of their own.
+
+    Unlike ``execution_deadline_scope``, this is only a default: an explicit
+    ``RunRequest.execution_deadline`` replaces it, and resuming or continuing an
+    existing session keeps that session's stored deadline. It is selected when
+    the run starts; constructing or deserializing a request does not apply it. Nested defaults keep
+    the earlier expiry. ``run_task_worker(execution_timeout_s=...)`` uses this
+    around each handler call.
+    """
+    if type(deadline) is not ExecutionDeadline:
+        raise TypeError("default_run_deadline requires an ExecutionDeadline.")
+    token = _DEFAULT_RUN.set(
+        effective_deadline(_DEFAULT_RUN.get() or ExecutionDeadline(), deadline)
+    )
+    try:
+        yield
+    finally:
+        _DEFAULT_RUN.reset(token)
+
+
 def deadline_from_metadata(metadata: Mapping[str, Any]) -> ExecutionDeadline:
     raw = metadata.get(EXECUTION_DEADLINE_METADATA_KEY)
     if EXECUTION_DEADLINE_METADATA_KEY not in metadata:
@@ -232,9 +265,13 @@ async def deadline_stream(
     iterator = aiter(stream)
     try:
         if deadline.expires_at is None and current_execution_deadline().expires_at is None:
-            async for item in iterator:
+            while True:
+                with bind_execution_deadline(deadline):
+                    try:
+                        item = await anext(iterator)
+                    except StopAsyncIteration:
+                        return
                 yield item
-            return
         while True:
             async with execution_deadline_scope(deadline):
                 try:
@@ -260,7 +297,8 @@ async def deadline_stream(
     finally:
         close = getattr(iterator, "aclose", None)
         if close is not None:
-            await close()
+            with bind_execution_deadline(deadline):
+                await close()
 
 
 def resumed_execution_deadline(stored: ExecutionDeadline) -> ExecutionDeadline:

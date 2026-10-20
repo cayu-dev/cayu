@@ -48,6 +48,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.deadlines import ExecutionDeadline, default_run_deadline
 from cayu.events import (
     Event,
     EventType,
@@ -464,6 +465,7 @@ async def run_task_worker(
     stop: asyncio.Event | None = None,
     max_tasks: int | None = None,
     concurrency: int = 1,
+    execution_timeout_s: float | None = None,
 ) -> int:
     """Claim and handle durable tasks until stopped; return the number handled.
 
@@ -514,12 +516,24 @@ async def run_task_worker(
       stops new claims and drains active handlers; cancelling this coroutine
       applies the existing cancellation/settlement rules to every active slot.
       Infrastructure errors stop and drain the group before propagating.
+    - ``execution_timeout_s`` bounds the runs each handler call starts. The
+      deadline is fixed when the handler starts and becomes the default
+      ``execution_deadline`` of every ``RunRequest`` it builds, so retries in
+      one call share it. A hung run then ends ``session.interrupted`` with
+      ``limit_reached``, and a task-attached run fails its task with
+      ``ExecutionDeadlineExceeded``; a later run in that call is refused with the
+      same error. An explicit ``RunRequest.execution_deadline`` replaces it, and
+      resuming an existing session keeps that session's own deadline. ``None``
+      (the default) leaves runs unbounded. Handler code outside runs is not
+      timed. See :func:`cayu.deadlines.default_run_deadline` to apply the same
+      default without this worker.
     """
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive int.")
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
     validate_worker_interval(poll_interval_s, "poll_interval_s")
+    ExecutionDeadline.after(execution_timeout_s, source="task_worker")
     if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
         raise TypeError("metrics must be a DurableWorkerMetrics instance.")
     demand_policy = DurableWorkerDemandPolicy(
@@ -709,6 +723,7 @@ async def run_task_worker(
                     after=continuation_after,
                     max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
                     stop=slot_stop,
+                    execution_timeout_s=execution_timeout_s,
                 )
                 continuation_scan_scanned += continuation_page.scanned_candidates
                 continuation_scan_rejected += continuation_page.rejected_candidates
@@ -876,7 +891,13 @@ async def run_task_worker(
             poller.metrics.handler_started()
             try:
                 await _handle_with_heartbeat(
-                    app, task_store, task, handler, worker_id, lease_seconds
+                    app,
+                    task_store,
+                    task,
+                    handler,
+                    worker_id,
+                    lease_seconds,
+                    execution_timeout_s=execution_timeout_s,
                 )
             finally:
                 poller.metrics.handler_finished()
@@ -986,6 +1007,7 @@ async def _handle_with_heartbeat(
     lease_seconds: int,
     *,
     recover_interrupted_authority_loss: bool = False,
+    execution_timeout_s: float | None = None,
 ) -> None:
     settlement = TaskExecutionSettlement(task_store, app._secret_redactor)
     primary: BaseException | None = None
@@ -999,6 +1021,7 @@ async def _handle_with_heartbeat(
             lease_seconds,
             settlement=settlement,
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
+            execution_timeout_s=execution_timeout_s,
         )
         # This worker owns the settlement it created. A write that outlives one
         # observation window is slow, not failed: keep joining it for up to one
@@ -1031,6 +1054,7 @@ async def _handle_with_heartbeat_owned(
     *,
     settlement: TaskExecutionSettlement,
     recover_interrupted_authority_loss: bool,
+    execution_timeout_s: float | None,
 ) -> None:
     (
         task,
@@ -1098,6 +1122,7 @@ async def _handle_with_heartbeat_owned(
                     stop_heartbeat=stop_heartbeat,
                     lease_authority=lease_authority,
                     settlement=settlement,
+                    execution_timeout_s=execution_timeout_s,
                 )
             except _TaskRetryElapsed as exc:
                 retry_elapsed = True
@@ -1465,6 +1490,7 @@ async def _await_task_handler(
     stop_heartbeat: asyncio.Event,
     lease_authority: _TaskLeaseAuthority,
     settlement: TaskExecutionSettlement,
+    execution_timeout_s: float | None,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
     # The callback may mutate its view. Settlement must remain bound to the
     # exact execution entered by this worker, not callback-authored authority.
@@ -1484,7 +1510,11 @@ async def _await_task_handler(
             task.invocation.access_labels,
             kind="tasks",
         ):
-            result = await handler(app, handler_view, worker_id)
+            # Fixed at handler start, so retries within this call share it.
+            with default_run_deadline(
+                ExecutionDeadline.after(execution_timeout_s, source="task_worker")
+            ):
+                result = await handler(app, handler_view, worker_id)
         settlement.observe(settlement_authority, result)
         # Storage acknowledgement is not part of the callback outcome. Ordinary
         # settlement failures stay owned until after result disposition.
@@ -3425,6 +3455,7 @@ async def _run_recovered_interrupted_task_handler(
     after: tuple[datetime, str] | None,
     max_unproductive_handoffs: int | None = None,
     stop: asyncio.Event | None = None,
+    execution_timeout_s: float | None = None,
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
 
@@ -3489,6 +3520,7 @@ async def _run_recovered_interrupted_task_handler(
         worker_id,
         lease_seconds,
         recover_interrupted_authority_loss=True,
+        execution_timeout_s=execution_timeout_s,
     )
     return page
 
