@@ -775,9 +775,11 @@ def test_dashboard_eject_refuses_to_clean_replaced_staging_tree(
     os.name == "nt",
     reason="exercises descriptor-relative POSIX cleanup",
 )
+@pytest.mark.parametrize("package_first", [True, False])
 def test_dashboard_eject_refuses_cleanup_replacement_after_directory_is_pinned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    package_first: bool,
 ) -> None:
     destination = tmp_path / "control-plane"
     owned_cleanup = tmp_path / "owned-cleanup"
@@ -785,6 +787,15 @@ def test_dashboard_eject_refuses_cleanup_replacement_after_directory_is_pinned(
     write_staging_tree = dashboard_cli._write_staging_tree
     remove_directory_contents_from_fd = publication_cli._remove_directory_contents_from_fd
     replaced_cleanup_root = False
+    cleanup_entry_names = publication_cli._bounded_cleanup_entry_names
+
+    def ordered_cleanup_entries(*args: Any, **kwargs: Any) -> list[str]:
+        # Filesystem enumeration order must not decide whether cleanup deletes
+        # package.json before noticing that its pinned directory was displaced.
+        names = cleanup_entry_names(*args, **kwargs)
+        return sorted(names, key=lambda name: (name != "package.json") == package_first)
+
+    monkeypatch.setattr(publication_cli, "_bounded_cleanup_entry_names", ordered_cleanup_entries)
 
     def fail_after_writing(
         staging: Path,

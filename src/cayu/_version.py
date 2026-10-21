@@ -9,7 +9,7 @@ def package_version() -> str:
     try:
         return version("cayu")
     except PackageNotFoundError:
-        return "0.12.1"
+        return "0.13.0"
 
 
 __version__ = package_version()

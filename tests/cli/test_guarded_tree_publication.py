@@ -990,14 +990,18 @@ def test_posix_cleanup_stops_at_first_entry_outside_durable_authority(
     }
     monkeypatch.setattr(publication.os, "scandir", changed_entries)
 
-    with pytest.raises(GuardedTreePublicationError) as exc_info:
-        publication._remove_directory_contents_from_fd(
-            1,
-            path=tmp_path,
-            flags=0,
-            authority=authority,
-            linux_mount_points=frozenset(),
-        )
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(GuardedTreePublicationError) as exc_info:
+            publication._remove_directory_contents_from_fd(
+                descriptor,
+                path=tmp_path,
+                flags=0,
+                authority=authority,
+                linux_mount_points=frozenset(),
+            )
+    finally:
+        os.close(descriptor)
 
     assert exc_info.value.code == "cleanup_conflict"
     assert exc_info.value.paths == ("injected",)

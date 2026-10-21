@@ -365,8 +365,8 @@ def test_cancellation_while_draining_retains_settlement_retry_handle(monkeypatch
         pending = TaskExecutionSettlementPending(TaskExecutionSettlement(store))
         original = worker_module._handle_with_heartbeat
 
-        async def pending_ack(app, task_store, task, handler, worker_id, lease_seconds):
-            await original(app, task_store, task, handler, worker_id, lease_seconds)
+        async def pending_ack(app, task_store, task, handler, worker_id, lease_seconds, **kwargs):
+            await original(app, task_store, task, handler, worker_id, lease_seconds, **kwargs)
             if task.id == tasks[0].id:
                 failed.set()
                 raise pending
@@ -392,10 +392,25 @@ def test_cancellation_while_draining_retains_settlement_retry_handle(monkeypatch
                 poll_interval_s=0.01,
             )
         )
+
+        async def wait_for_signal(signal):
+            waiter = asyncio.create_task(signal.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (waiter, worker), timeout=5, return_when=asyncio.FIRST_COMPLETED
+                )
+                if worker in done:
+                    await worker  # Surface worker failures instead of a misleading timeout.
+                    pytest.fail("worker exited before the expected signal")
+                assert waiter in done, "worker did not reach the expected signal"
+            finally:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
         try:
-            await asyncio.wait_for(ready.wait(), 5)
+            await wait_for_signal(ready)
             release_first.set()
-            await asyncio.wait_for(failed.wait(), 5)
+            await wait_for_signal(failed)
             worker.cancel()
             release_second.set()
             with pytest.raises(asyncio.CancelledError) as caught:

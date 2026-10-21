@@ -972,17 +972,19 @@ async def test_subscription_deadline_uses_execution_provider_identity() -> None:
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
     session_id = "subscription-deadline-execution-provider"
-    with pytest.raises(ModelStreamDeadlineError):
-        [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id=session_id,
-                    messages=[Message.text("user", "Say hello")],
-                )
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "Say hello")],
             )
-        ]
+        )
+    ]
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert failed.payload["provider_effect_outcome"] == "unknown"
+    assert any(event.type is EventType.INTERACTION_FAILED for event in events)
 
     durable_events = await app.session_store.load_events(session_id)
     model_error = next(event for event in durable_events if event.type is EventType.MODEL_ERROR)

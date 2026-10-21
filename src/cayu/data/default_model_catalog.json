@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-10-12",
-  "generated_at": "2026-10-12",
+  "catalog_version": "2026-10-21",
+  "generated_at": "2026-10-21",
   "models": [
     {
       "aliases": [],
@@ -578,7 +578,7 @@
       "model": "global.anthropic.claude-sonnet-4-6",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-20",
+        "as_of": "2026-10-21",
         "source": "official",
         "url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html"
       },

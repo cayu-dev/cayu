@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import mimetypes
@@ -24,7 +23,7 @@ from cayu import _application_task_creation as task_creation
 from cayu._application_agent_registry import ApplicationAgentRegistry
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
 from cayu._application_provider_registry import ApplicationProviderRegistry
-from cayu._application_registration import _validate_runtime_hooks
+from cayu._application_registration import _registration_site, _validate_runtime_hooks
 from cayu._event_schema import private_event_linkage_value
 from cayu._task_wait import collect_failures, combine_drain_results, wait_until_idle
 from cayu._validation import (
@@ -9954,23 +9953,6 @@ def _validate_workflow_event_batch(
             )
         if not allow_cayu_internal and event_type.startswith("custom."):
             validate_public_custom_event_type(event_type)
-
-
-def _registration_site() -> tuple[str | None, str | None]:
-    """Capture the public call site without retaining a frame or live object."""
-
-    frame = inspect.currentframe()
-    caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
-    try:
-        if caller is None:
-            return None, None
-        module = caller.f_globals.get("__name__")
-        symbol = caller.f_code.co_qualname
-        qualified = f"{module}:{symbol}" if isinstance(module, str) else symbol
-        return caller.f_code.co_filename, qualified
-    finally:
-        del frame
-        del caller
 
 
 def _validate_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:

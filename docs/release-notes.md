@@ -1,6 +1,6 @@
 # Release notes
 
-## Unreleased
+## v0.13.0
 
 Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 (`cayu lambda-microvm sidecar export`). `LambdaMicroVMRunner` now requires sidecar
@@ -26,6 +26,11 @@ Check the breaking change below if you catch `ModelStreamDeadlineError` from
   written.
 
 ### Changes
+
+- Dashboard ejection cleanup checks that a pinned directory still occupies its
+  claimed path before deleting its contents. If the directory is displaced,
+  cleanup stops and preserves the recoverable tree regardless of filesystem
+  enumeration order.
 
 - The Lambda MicroVM command sidecar closes each command's pipes and releases
   its process as soon as the command finishes, instead of holding them until

@@ -107,6 +107,13 @@ def _terminate_parent_during_publication(
     time.sleep(30)
 
 
+def _slow_staging_reconciliation(path: str, temporary_name: str) -> None:
+    # Deterministically exceed the default five-second cleanup budget, as
+    # interpreter startup can do on a loaded worker.
+    time.sleep(DEFAULT_SUPPORT_BUNDLE_LIMITS.reconciliation_timeout_seconds + 1)
+    doctor_cli._doctor_staging_reconciliation_entry(path, temporary_name)
+
+
 def _leave_staging_then_fail(path: str, payload: bytes, temporary_name: str) -> None:
     del payload
     staging = Path(path).absolute().parent / temporary_name
@@ -672,7 +679,10 @@ def build_app():
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal delivery contract")
-def test_parent_sigterm_reaps_publisher_and_cleans_exact_staging(tmp_path: Path) -> None:
+@pytest.mark.parametrize("slow_reconciliation", [False, True], ids=["normal", "slow"])
+def test_parent_sigterm_reaps_publisher_and_cleans_exact_staging(
+    tmp_path: Path, slow_reconciliation: bool
+) -> None:
     payload = encode_support_bundle(
         minimal_support_bundle_report(
             outcome=SupportBundleOutcome.BOOT_FAILED,
@@ -681,17 +691,24 @@ def test_parent_sigterm_reaps_publisher_and_cleans_exact_staging(tmp_path: Path)
     )
     bundle = tmp_path / "support.zip"
 
+    existing_children = {child.pid for child in multiprocessing.active_children()}
     with pytest.raises(SystemExit) as terminated:
         doctor_cli._run_bounded_publisher(
             bundle,
             payload,
-            publication_timeout_seconds=10,
+            # This covers signal cleanup and reaping, not elapsed-time limits.
+            # The bounded-publication/reconciliation tests cover those limits.
+            publication_timeout_seconds=30,
+            _reconciliation_timeout_seconds=30,
             _publisher_entry=_terminate_parent_during_publication,
+            _reconciliation_entry=(_slow_staging_reconciliation if slow_reconciliation else None),
         )
 
     assert terminated.value.code == 128 + signal.SIGTERM
     assert not bundle.exists()
     assert list(tmp_path.glob(".support.zip.cayu-doctor-*.tmp")) == []
+
+    assert {child.pid for child in multiprocessing.active_children()} <= existing_children
 
 
 def test_staging_reconciliation_is_bounded_when_cleanup_blocks(

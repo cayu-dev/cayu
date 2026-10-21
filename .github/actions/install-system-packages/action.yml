@@ -12,6 +12,12 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Allow bounded waits for background package updates
+      shell: bash
+      run: |
+        # Fresh runners can still be running unattended-upgrades. Persist this
+        # setting so later apt users, including Playwright, also wait for dpkg.
+        echo 'DPkg::Lock::Timeout "120";' | sudo tee /etc/apt/apt.conf.d/99-cayu-lock-timeout >/dev/null
     - name: Use Ubuntu's primary archive
       shell: bash
       run: |

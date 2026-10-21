@@ -1611,8 +1611,10 @@ async def test_http_sse_bounds_active_never_ending_identity_error_body() -> None
             protocol_error=OpenAIProtocolError,
             error_response_text=lambda response: response.text,
         )
+        # The provider's millisecond deadlines enforce the body bound. This
+        # watchdog only detects a hang; it must allow scheduling and cleanup.
         with pytest.raises(OpenAIAPIError) as captured:
-            await asyncio.wait_for(events.__anext__(), timeout=0.5)
+            await asyncio.wait_for(events.__anext__(), timeout=10)
 
     error = captured.value
     assert error.status_code == 500
@@ -1651,8 +1653,10 @@ async def test_http_sse_bounds_stalled_identity_error_body_by_idle_timeout() -> 
             protocol_error=OpenAIProtocolError,
             error_response_text=lambda response: response.text,
         )
+        # The provider's millisecond deadlines enforce the body bound. This
+        # watchdog only detects a hang; it must allow scheduling and cleanup.
         with pytest.raises(OpenAIAPIError) as captured:
-            await asyncio.wait_for(events.__anext__(), timeout=0.5)
+            await asyncio.wait_for(events.__anext__(), timeout=10)
 
     error = captured.value
     assert error.status_code == 503

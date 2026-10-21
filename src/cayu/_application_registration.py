@@ -364,3 +364,20 @@ def _snapshot_context_behavior_execution_profile_identities(
     if context_overflow_policy is not None:
         visit(context_overflow_policy, field_name="context_overflow_policy")
     return MappingProxyType(snapshots)
+
+
+def _registration_site() -> tuple[str | None, str | None]:
+    """Capture the public call site without retaining a frame or live object."""
+
+    frame = inspect.currentframe()
+    caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
+    try:
+        if caller is None:
+            return None, None
+        module = caller.f_globals.get("__name__")
+        symbol = caller.f_code.co_qualname
+        qualified = f"{module}:{symbol}" if isinstance(module, str) else symbol
+        return caller.f_code.co_filename, qualified
+    finally:
+        del frame
+        del caller

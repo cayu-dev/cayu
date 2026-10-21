@@ -1,7 +1,7 @@
 {
   "contextual_pricing_requirements": [],
-  "generated_at": "2026-10-12",
-  "price_book_version": "2026-10-12",
+  "generated_at": "2026-10-21",
+  "price_book_version": "2026-10-21",
   "prices": [
     {
       "aliases": [],
@@ -942,7 +942,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-20",
+            "as_of": "2026-10-21",
             "source": "official",
             "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/index.json"
           }

@@ -916,23 +916,29 @@ class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
     terminal_interaction_publication_version = 1
 
-    async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
-        result = await super().publish_checkpoint_and_events(session_id, **kwargs)
-        if any(
-            event.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED for event in kwargs["events"]
-        ):
-            await asyncio.sleep(0.03)
-        return result
+    def __init__(self) -> None:
+        super().__init__()
+        self.resolution_committed = asyncio.Event()
+        self.heartbeat_observed_release = asyncio.Event()
 
     async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
-        result = await super().publish_checkpoint_and_events_with_store_time(
-            session_id,
-            **kwargs,
-        )
+        try:
+            result = await super().publish_checkpoint_and_events_with_store_time(
+                session_id,
+                **kwargs,
+            )
+        except cancellation_owner._ProviderOperationCancellationClaimReleaseObserved:
+            assert self.resolution_committed.is_set()
+            assert not kwargs["events"]
+            self.heartbeat_observed_release.set()
+            raise
         if any(
             event.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED for event in kwargs["events"]
         ):
-            await asyncio.sleep(0.03)
+            self.resolution_committed.set()
+            # Hold the acknowledgement until a real heartbeat observes the
+            # intentional release, regardless of how the event loop is scheduled.
+            await asyncio.wait_for(self.heartbeat_observed_release.wait(), timeout=5)
         return result
 
 
@@ -7726,11 +7732,6 @@ def test_successful_claim_release_does_not_trigger_heartbeat_ownership_loss(
 ) -> None:
     monkeypatch.setattr(
         cancellation_owner,
-        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
-        timedelta(milliseconds=500),
-    )
-    monkeypatch.setattr(
-        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         0.005,
     )
@@ -7754,6 +7755,7 @@ def test_successful_claim_release_does_not_trigger_heartbeat_ownership_loss(
             )
         ]
 
+        assert store.heartbeat_observed_release.is_set()
         assert [event.type for event in events] == [
             EventType.INTERACTION_PAUSED,
             EventType.SESSION_INTERRUPTED,

@@ -5741,6 +5741,24 @@ def _require_cleanup_source_absent(
         )
 
 
+def _require_pinned_cleanup_directory(descriptor: int, path: Path) -> None:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise GuardedTreePublicationError(
+            "cleanup_conflict",
+            "owned cleanup directory disappeared or became inaccessible",
+            paths=(path.name,),
+        ) from exc
+    # The descriptor keeps the inode alive, so it cannot be reused while pinned.
+    if not os.path.samestat(current, os.fstat(descriptor)):
+        raise GuardedTreePublicationError(
+            "cleanup_conflict",
+            "owned cleanup directory changed while pinned",
+            paths=(path.name,),
+        )
+
+
 def _remove_directory_contents_from_fd(
     descriptor: int,
     *,
@@ -5750,6 +5768,7 @@ def _remove_directory_contents_from_fd(
     prefix: PurePosixPath | None = None,
     linux_mount_points: frozenset[str] | None = None,
 ) -> None:
+    _require_pinned_cleanup_directory(descriptor, path)
     if prefix is None:
         prefix = PurePosixPath()
     if linux_mount_points is None:
@@ -5761,6 +5780,7 @@ def _remove_directory_contents_from_fd(
             prefix=prefix,
         )
     for name in names:
+        _require_pinned_cleanup_directory(descriptor, path)
         child_path = path / name
         relative = prefix / name
         try:
