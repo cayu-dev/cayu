@@ -96,8 +96,11 @@ What the container can and cannot do:
   into a virtual environment under `/workspace`. Change the sizes, limits and
   mounts with `DockerWorkloadRestrictions` fields.
 - Its only network is an internal Docker network whose one exit is Cayu's
-  broker. Requests to allowlisted hosts go through the `HTTPS_PROXY` Cayu sets;
-  everything else, including direct IP connections and cloud metadata, fails.
+  broker. Requests to allowlisted hosts go through the `HTTPS_PROXY` Cayu sets.
+  Everything else fails: direct IP connections, cloud metadata, the network's
+  gateway address and any other address of the Docker host, so services that
+  listen on all of the host's interfaces are out of reach. The network gives
+  the host no address, and the guest has no route off it and no IPv6 address.
   Trust the per-session CA at `/etc/cayu/ca.pem` (`SSL_CERT_FILE`,
   `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` already point to it).
 - Host files are not mounted unless you pass `host_workspace_path`.
@@ -105,7 +108,12 @@ What the container can and cannot do:
   packages into the image.
 
 Before the runner is returned, Cayu inspects the live container and fails
-closed, removing it, if any declared control is missing. Admission evidence for
+closed, removing it, if any declared control is missing. It also checks that
+the egress network gives the host no address and probes from the guest's
+network namespace that the host does not answer, and fails the same way if it
+does. That needs a Docker engine that honors the bridge network option
+`com.docker.network.bridge.inhibit_ipv4` (Docker Engine on Linux and Docker
+Desktop do). Admission evidence for
 the environment then reports `guest_privilege_containment` and
 `unprivileged_guest` as available, `deny_by_default_network` and
 `brokered_egress` from the egress adapter, and `untrusted_code_isolation` as

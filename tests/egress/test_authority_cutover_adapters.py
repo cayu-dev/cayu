@@ -95,6 +95,9 @@ class _AuthorityOwnership:
 
 
 class _FakeDockerRunner(Runner):
+    workload_restrictions = None
+    container_id = "a" * 64
+
     def __init__(self, calls: list[str] | None = None) -> None:
         self.name = "exact-container"
         self.image = "python:3.12-slim"
@@ -249,6 +252,108 @@ def test_docker_cutover_keeps_container_and_closes_old_path_before_preflight(
         assert calls.index("old-path-closed") < calls.index("preflight")
         assert calls.index("docker:pause exact-container") < calls.index(
             "docker:unpause exact-container"
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("probe", [(0, "isolated\n"), (3, "host_reachable\n")])
+def test_docker_cutover_verifies_a_hardened_guest_cannot_reach_the_host(
+    monkeypatch: pytest.MonkeyPatch, probe: tuple[int, str]
+) -> None:
+    import json
+
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    async def exercise() -> None:
+        calls: list[str] = []
+        guest_id = "a" * 64
+
+        async def docker_exec(argv):
+            calls.append("docker:" + " ".join(argv))
+            return 0, ""
+
+        async def docker_run(argv):
+            calls.append("docker-read:" + " ".join(argv))
+            if argv[:2] == ["network", "inspect"]:
+                return 0, json.dumps(
+                    {
+                        "Internal": True,
+                        "Options": {"com.docker.network.bridge.inhibit_ipv4": "true"},
+                        "IPAM": {"Config": [{"Subnet": "10.213.43.0/24"}]},
+                        "Containers": {
+                            "e" * 64: {"IPv4Address": "10.213.43.1/24"},
+                            guest_id: {"IPv4Address": "10.213.43.2/24"},
+                        },
+                    }
+                )
+            if argv[:1] == ["run"]:
+                return probe
+            return 0, guest_id
+
+        class _HardenedRunner(_FakeDockerRunner):
+            workload_restrictions = DockerWorkloadRestrictions()
+
+        expected = _authority("docker", 1, allow_post=False)
+        target = _authority("docker", 2, allow_post=True)
+        old, new, _ownership = _bindings("docker", calls)
+        old.bind_authority(expected)
+        broker, grant = _broker_and_grant("session-1")
+        adapter = DockerEgressAdapter(
+            docker_exec=docker_exec,
+            docker_run=docker_run,
+            proxy_host="127.0.0.1",
+        )
+
+        async def prepare(**kwargs):
+            del kwargs
+            return new
+
+        async def preflight(*args, **kwargs):
+            del args, kwargs
+            return datetime.now(UTC)
+
+        async def revoke_current_authority() -> bool:
+            return False
+
+        monkeypatch.setattr(adapter, "_prepare", prepare)
+        monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", _HardenedRunner)
+        monkeypatch.setattr("cayu.egress.docker_adapter.run_enforcement_preflight", preflight)
+        request = EgressAuthorityCutoverRequest(
+            session_id="session-1",
+            environment_name="egress",
+            owner_fingerprint="b" * 64,
+            environment_fingerprint=_docker_environment_fingerprint(guest_id),
+            runner=_HardenedRunner(calls),
+            current_binding=old,
+            expected_authority=expected,
+            target_authority=target,
+            target_broker=broker,
+            target_grants=(grant,),
+            target_env_overlay={"HTTPS_PROXY": "http://new-sidecar:8080"},
+            target_egress_destinations=("api.example.com",),
+            revoke_current_authority=revoke_current_authority,
+            ca_cert_host_path="/tmp/ca.pem",
+            guest_ca_path="/etc/cayu/ca.pem",
+            invocation_quiescent=True,
+        )
+        if probe[0] == 0:
+            result = await adapter.cutover_authority(request)
+            assert result.binding is new
+        else:
+            with pytest.raises(EgressAuthorityCutoverNeedsAttention) as raised:
+                await adapter.cutover_authority(request)
+            assert "host_reachable" in str(raised.value.__cause__)
+            # The container stays paused rather than resuming on the new path.
+            assert calls[-1] == "docker:pause exact-container"
+        # The replacement network is the one inspected and probed.
+        assert any(
+            call.startswith("docker-read:network inspect") and "new-network" in call
+            for call in calls
+        )
+        assert any(
+            call.startswith("docker-read:run") and f"--network container:{guest_id}" in call
+            for call in calls
         )
 
     asyncio.run(exercise())

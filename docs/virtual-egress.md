@@ -158,8 +158,13 @@ and precedes the separate sequence if both are supplied.
 In the explicitly selected Docker topology shown above, direct egress is blocked
 by construction: the container joins an `--internal`
 Docker network with no route to the internet, so the only reachable egress is a
-dual-homed sidecar that forwards to the in-process broker. This network control
-does not turn the container into a secure sandbox boundary.
+dual-homed sidecar that forwards to the in-process broker. The network is
+created with `com.docker.network.bridge.inhibit_ipv4=true` and without IPv6, so
+the Docker host has no address on it and the container cannot reach host
+services through a gateway address. With `workload_restrictions`, the adapter
+also verifies that from the container's network namespace before it returns
+the runner. This network control does not turn the container into a secure
+sandbox boundary.
 
 ### Streamed responses
 

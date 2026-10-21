@@ -25,6 +25,16 @@ None.
   conversation content. The cursor is a position in the store's event sequence,
   so a reader continues across restarts without a gap.
   `cayu.cloud_reporting.read_cloud_activity` reads the same pages in process.
+- Fix: a Docker egress container could reach the Docker host through its
+  internal network's gateway address, so a host service listening on all
+  interfaces was reachable from a hardened guest. `DockerEgressAdapter` now
+  creates its networks with `com.docker.network.bridge.inhibit_ipv4=true` and
+  without IPv6, so the host has no address on them. With
+  `workload_restrictions`, the adapter also checks the live network and probes
+  from the guest's network namespace, at creation and after an authority
+  cutover, and refuses the runner if the host may be reachable. The check needs
+  a Docker engine that honors that option; Docker Engine on Linux and Docker
+  Desktop do. Allowlisted hosts still work through the broker.
 - `OpenAIProvider` accepts a `base_url` that ends in `/v1`, the form the
   OpenAI SDK's `OPENAI_BASE_URL` uses. It used to add its own `/v1` on top and
   send requests to `.../v1/v1/responses`; now `https://host` and

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -420,7 +421,18 @@ def test_prepare_builds_internal_network_and_sidecar() -> None:
     assert network.startswith("cayu-egress-net-") and network != "cayu-egress-net-sess_1"
     label = "cayu.egress.session=sess_1"
     # Internal network (no internet route) is what makes egress fail-closed.
-    assert ["network", "create", "--internal", "--label", label, network] in docker.calls
+    # The host gets no address on it, so the guest cannot reach host services.
+    assert [
+        "network",
+        "create",
+        "--internal",
+        "--opt",
+        "com.docker.network.bridge.inhibit_ipv4=true",
+        "--ipv6=false",
+        "--label",
+        label,
+        network,
+    ] in docker.calls
     # Sidecar attaches to the internal network after starting.
     assert ["network", "connect", network, sidecar] in docker.calls
     readiness = next(argv for argv in docker.calls if argv[:2] == ["exec", sidecar])
@@ -949,12 +961,64 @@ def test_packaged_browser_seccomp_matches_maintained_profile():
     )
 
 
-def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch) -> None:
-    from cayu.runners.docker import DockerRunner
-    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+_GUEST_ID = "d" * 64
+_SIDECAR_ID = "e" * 64
 
-    restrictions = DockerWorkloadRestrictions(pids_limit=256)
-    observed: dict[str, object] = {}
+
+def _isolated_network(**overrides: object) -> dict[str, object]:
+    network: dict[str, object] = {
+        "Name": "internal",
+        "Internal": True,
+        "EnableIPv6": False,
+        "Options": {"com.docker.network.bridge.inhibit_ipv4": "true"},
+        "IPAM": {"Config": [{"Subnet": "10.213.42.0/24"}]},
+        "Containers": {
+            _SIDECAR_ID: {"IPv4Address": "10.213.42.1/24"},
+            _GUEST_ID: {"IPv4Address": "10.213.42.2/24"},
+        },
+    }
+    network.update(overrides)
+    return network
+
+
+class _HostIsolationDocker:
+    """Answers the network inspection and the in-namespace host probe."""
+
+    def __init__(self, network: dict[str, object], probe: tuple[int, str]) -> None:
+        self.network = network
+        self.probe = probe
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
+        self.calls.append(list(argv))
+        if argv[:2] == ["network", "inspect"]:
+            return 0, json.dumps(self.network)
+        if argv[:1] == ["run"]:
+            return self.probe
+        raise AssertionError(argv)
+
+
+def _hardened_runner_request() -> VirtualEgressRunnerRequest:
+    return VirtualEgressRunnerRequest(
+        name="hardened-tests",
+        runner_kind="docker",
+        image="python:3.12-slim",
+        binding=EgressBinding(
+            runner_kind="docker",
+            network="internal",
+            proxy_port=41000,
+            metadata={"proxy_bind_host": "172.17.0.1"},
+        ),
+        env_overlay={},
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path=GUEST_CA_PATH,
+        setup_commands=(),
+        egress_destinations=(),
+    )
+
+
+def _fake_hardened_runner_type(observed: dict[str, object], closed: list[str]):
+    from cayu.runners.docker import DockerRunner
 
     class FakeDockerRunner(DockerRunner):
         @classmethod
@@ -963,27 +1027,33 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
             return cls(
                 name,
                 docker_path="/usr/bin/docker",
-                _container_id="d" * 64,
+                _container_id=_GUEST_ID,
                 _workload_restrictions=kwargs["workload_restrictions"],
             )
 
-    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", FakeDockerRunner)
+        async def close(self) -> None:
+            closed.append(self.container_reference)
+
+    return FakeDockerRunner
+
+
+def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch) -> None:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    restrictions = DockerWorkloadRestrictions(pids_limit=256)
+    observed: dict[str, object] = {}
+    closed: list[str] = []
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner", _fake_hardened_runner_type(observed, closed)
+    )
+    docker_run = _HostIsolationDocker(_isolated_network(), (0, "isolated\n"))
     adapter = DockerEgressAdapter(
         docker_exec=_FakeDocker(),
+        docker_run=docker_run,
         proxy_host="127.0.0.1",
         workload_restrictions=restrictions,
     )
-    request = VirtualEgressRunnerRequest(
-        name="hardened-tests",
-        runner_kind="docker",
-        image="python:3.12-slim",
-        binding=EgressBinding(runner_kind="docker", network="internal"),
-        env_overlay={},
-        ca_cert_host_path="/tmp/ca.pem",
-        guest_ca_path=GUEST_CA_PATH,
-        setup_commands=(),
-        egress_destinations=(),
-    )
+    request = _hardened_runner_request()
 
     declared = adapter.execution_capability_evidence()
     runner = asyncio.run(adapter.create_runner(request))
@@ -991,6 +1061,15 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
 
     assert observed["workload_restrictions"] == restrictions
     assert observed["network"] == "internal"
+    assert closed == []
+    # The probe runs in the guest's own network namespace, restricted, and
+    # targets the broker's host address; the first address is the sidecar's.
+    probe = docker_run.calls[-1]
+    assert probe[probe.index("--network") + 1] == f"container:{_GUEST_ID}"
+    assert probe[probe.index("--user") + 1] == "65534:65534"
+    assert probe[probe.index("--cap-drop") + 1] == "ALL"
+    assert probe[-1] == "172.17.0.1:41000"
+    assert "10.213.42.1:41000" not in probe
     assert declared.state_for("unprivileged_guest") == "declared"
     for capability in ("guest_privilege_containment", "unprivileged_guest"):
         assert evidence.state_for(capability) == "available"
@@ -1014,6 +1093,98 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
     assert other.execution_capability_evidence(runner).state_for("unprivileged_guest") == (
         "unsupported"
     )
+
+
+@pytest.mark.parametrize(
+    ("network", "probe", "reason"),
+    [
+        # The bug: Docker gave the host the gateway address on the internal network.
+        (
+            _isolated_network(
+                IPAM={"Config": [{"Subnet": "10.213.42.0/24", "Gateway": "10.213.42.1"}]}
+            ),
+            (0, "isolated\n"),
+            "not an internal network without a host address",
+        ),
+        (
+            _isolated_network(Options={}),
+            (0, "isolated\n"),
+            "not an internal network without a host address",
+        ),
+        (
+            _isolated_network(EnableIPv6=True),
+            (0, "isolated\n"),
+            "not an internal network without a host address",
+        ),
+        (
+            _isolated_network(Containers={_SIDECAR_ID: {"IPv4Address": "10.213.42.1/24"}}),
+            (0, "isolated\n"),
+            "not an internal network without a host address",
+        ),
+        (_isolated_network(), (3, "host_reachable\n"), r"\(host_reachable\)"),
+        (_isolated_network(), (3, "routed_path_present\n"), r"\(routed_path_present\)"),
+        (_isolated_network(), (3, "ipv6_address_present\n"), r"\(ipv6_address_present\)"),
+        (_isolated_network(), (125, "unexpected\n"), r"\(probe_failed\)"),
+        (_isolated_network(), (0, ""), r"\(probe_failed\)"),
+    ],
+)
+def test_create_runner_refuses_a_hardened_guest_that_may_reach_the_host(
+    monkeypatch, network, probe, reason
+) -> None:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    closed: list[str] = []
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner", _fake_hardened_runner_type({}, closed)
+    )
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        docker_run=_HostIsolationDocker(network, probe),
+        proxy_host="127.0.0.1",
+        workload_restrictions=DockerWorkloadRestrictions(),
+    )
+
+    with pytest.raises(UnsupportedEgressError, match=reason):
+        asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    # The runner is never handed out; its container is removed.
+    assert closed == [_GUEST_ID]
+
+
+def test_host_probe_targets_a_free_gateway_address(monkeypatch) -> None:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner", _fake_hardened_runner_type({}, [])
+    )
+    docker_run = _HostIsolationDocker(
+        _isolated_network(Containers={_GUEST_ID: {"IPv4Address": "10.213.42.2/24"}}),
+        (0, "isolated\n"),
+    )
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        docker_run=docker_run,
+        proxy_host="127.0.0.1",
+        workload_restrictions=DockerWorkloadRestrictions(),
+    )
+    asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    probe = docker_run.calls[-1]
+    assert probe[-2:] == ["10.213.42.1:41000", "172.17.0.1:41000"]
+
+
+def test_plain_egress_runner_skips_the_hardened_host_probe(monkeypatch) -> None:
+    closed: list[str] = []
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner", _fake_hardened_runner_type(observed, closed)
+    )
+    docker_run = _HostIsolationDocker(_isolated_network(), (3, "host_reachable\n"))
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(), docker_run=docker_run, proxy_host="127.0.0.1"
+    )
+    asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    assert observed["workload_restrictions"] is None
+    assert docker_run.calls == []
+    assert closed == []
 
 
 def test_hardened_egress_refuses_reconnect_and_untyped_restrictions(tmp_path) -> None:

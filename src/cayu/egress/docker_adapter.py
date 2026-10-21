@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from hashlib import sha256
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +84,46 @@ _SIDECAR_READY_SCRIPT = (
     "attempts=$((attempts + 1)); sleep 0.05; "
     "done; "
     'test "$(cat /proc/1/comm 2>/dev/null)" = socat'
+)
+# Without this option the bridge driver gives the engine's host an address on
+# every network, so an internal network still reaches host services through
+# its gateway. With it, the network has no gateway and the host no address.
+_HOST_ADDRESS_INHIBIT_OPTION = "com.docker.network.bridge.inhibit_ipv4"
+_HOST_ISOLATION_PROBE_TIMEOUT_S = 30.0
+# Runs from the sidecar image in the guest's network namespace, so it sees the
+# guest's interfaces and routes whatever tools the guest image has. A TCP
+# connect that succeeds or is refused means the host answered.
+_HOST_ISOLATION_PROBE_SCRIPT = """
+for target do
+  output="$(timeout 5 socat -u OPEN:/dev/null "TCP:${target},connect-timeout=2" 2>&1)"
+  code=$?
+  if [ "$code" -eq 0 ]; then echo host_reachable; exit 3; fi
+  [ "$code" -eq 124 ] || [ "$code" -eq 143 ] && continue
+  case "$output" in
+    *refused*) echo host_reachable; exit 3 ;;
+    *nreachable*|*"No route to host"*|*"timed out"*) ;;
+    *) echo host_reachability_unverified; exit 3 ;;
+  esac
+done
+if [ ! -r /proc/net/route ]; then echo route_table_unreadable; exit 3; fi
+if awk 'NR > 1 && ($2 == "00000000" || $3 != "00000000") { found = 1 } END { exit !found }' \\
+  /proc/net/route; then
+  echo routed_path_present; exit 3
+fi
+if [ -r /proc/net/if_inet6 ] && awk '$6 != "lo" { found = 1 } END { exit !found }' \\
+  /proc/net/if_inet6; then
+  echo ipv6_address_present; exit 3
+fi
+echo isolated
+"""
+_HOST_ISOLATION_PROBE_FAILURES = frozenset(
+    {
+        "host_reachable",
+        "host_reachability_unverified",
+        "route_table_unreadable",
+        "routed_path_present",
+        "ipv6_address_present",
+    }
 )
 
 # A docker executor returns (exit_code, stderr) so orchestration can be faked in
@@ -268,19 +308,20 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     """Enforced egress for the Docker runner.
 
     Egress enforcement is fail-closed by construction: the container joins an
-    ``--internal`` Docker network with no route to the internet, so the *only*
-    reachable egress is a dual-homed sidecar that forwards to the in-process
-    broker. Direct provider calls cannot leave the container. This egress
-    topology does not make the container a secure sandbox boundary. Returns the
-    network/env the runner must use; ``teardown`` removes the sidecar and network
-    and revokes the grants.
+    ``--internal`` Docker network with no route to the internet and no address
+    for the engine's host, so the *only* reachable egress is a dual-homed sidecar
+    that forwards to the in-process broker. Direct provider calls cannot leave
+    the container. This egress topology does not make the container a secure
+    sandbox boundary. Returns the network/env the runner must use; ``teardown``
+    removes the sidecar and network and revokes the grants.
 
     ``workload_restrictions`` optionally hardens each guest container (non-root
     user, read-only root, no-new-privileges, dropped capabilities, pid, memory
     and CPU limits) on the same egress network. Cayu verifies those controls on
-    the live container, and the adapter then reports the guest privilege claims
-    as available. The container still shares the host kernel, so untrusted-code
-    isolation stays unsupported.
+    the live container and checks that the guest cannot reach the engine's host;
+    the adapter then reports the guest privilege claims as available. The
+    container still shares the host kernel, so untrusted-code isolation stays
+    unsupported.
     """
 
     runner_kind = "docker"
@@ -637,6 +678,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                         "network",
                         "create",
                         "--internal",
+                        "--opt",
+                        f"{_HOST_ADDRESS_INHIBIT_OPTION}=true",
+                        "--ipv6=false",
                         "--label",
                         label,
                         *ownership_label,
@@ -878,7 +922,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 "Docker egress adapter did not return a network; refusing to start "
                 "a virtual-egress container without enforced routing."
             )
-        return await DockerRunner.create(
+        runner = await DockerRunner.create(
             request.name,
             image=request.image,
             close_action="remove",
@@ -892,6 +936,136 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             setup_commands=request.setup_commands,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
             workload_restrictions=self._workload_restrictions,
+        )
+        if self._workload_restrictions is None:
+            return runner
+        try:
+            await self._verify_guest_host_isolation(runner, request.binding)
+        except BaseException:
+            await runner.close()
+            raise
+        return runner
+
+    async def _verify_guest_host_isolation(
+        self, runner: DockerRunner, binding: EgressBinding
+    ) -> None:
+        """Prove a hardened guest cannot reach the engine's host.
+
+        The network must carry no host address, and a probe in the guest's
+        network namespace must find no answer from the address the host would
+        hold, no routed path off the network and no IPv6 address.
+        """
+
+        container_id = runner.container_id
+        if binding.network is None or container_id is None:
+            raise UnsupportedEgressError(
+                "egress_host_isolation_unverified: the hardened guest has no exact "
+                "container or egress network to verify."
+            )
+        targets = await self._host_isolation_targets(binding, container_id)
+        await self._probe_host_isolation(container_id, targets)
+
+    async def _host_isolation_targets(
+        self, binding: EgressBinding, container_id: str
+    ) -> tuple[str, ...]:
+        assert binding.network is not None
+        code, output = await self._docker_run(
+            ["network", "inspect", "--format", "{{json .}}", binding.network]
+        )
+        try:
+            network = json.loads(output) if code == 0 else None
+        except ValueError:
+            network = None
+        if not isinstance(network, dict):
+            raise UnsupportedEgressError(
+                "egress_host_isolation_unverified: the egress network could not be inspected."
+            )
+        options = network.get("Options")
+        ipam = network.get("IPAM")
+        configs = (ipam.get("Config") or []) if isinstance(ipam, dict) else None
+        endpoints = network.get("Containers")
+        if (
+            network.get("Internal") is not True
+            or not isinstance(options, dict)
+            or options.get(_HOST_ADDRESS_INHIBIT_OPTION) != "true"
+            or network.get("EnableIPv6") is True
+            or not isinstance(configs, list)
+            or any(not isinstance(config, dict) or config.get("Gateway") for config in configs)
+            or not isinstance(endpoints, dict)
+            or container_id not in endpoints
+        ):
+            raise UnsupportedEgressError(
+                "egress_host_reachable: the egress network is not an internal network "
+                "without a host address; the Docker engine must honor the bridge option "
+                f"{_HOST_ADDRESS_INHIBIT_OPTION}."
+            )
+        held: set[IPv4Address] = set()
+        for endpoint in endpoints.values():
+            with contextlib.suppress(AttributeError, TypeError, ValueError):
+                held.add(IPv4Interface(endpoint.get("IPv4Address")).ip)
+        port = binding.proxy_port or 443
+        targets: list[str] = []
+        for config in configs:
+            with contextlib.suppress(TypeError, ValueError):
+                first = IPv4Network(config.get("Subnet")).network_address + 1
+                # Where the bridge driver puts the host when it reserves a
+                # gateway. A container holding it proves the host does not.
+                if first not in held:
+                    targets.append(f"{first}:{port}")
+        # The rest of the host: the address the broker listens on (Docker's
+        # default bridge gateway on Linux) must have no route from the guest.
+        with contextlib.suppress(TypeError, ValueError):
+            broker_host = IPv4Address(binding.metadata.get("proxy_bind_host"))
+            if not (broker_host.is_loopback or broker_host.is_unspecified):
+                targets.append(f"{broker_host}:{port}")
+        return tuple(targets)
+
+    async def _probe_host_isolation(self, container_id: str, targets: Sequence[str]) -> None:
+        """Run the host isolation probe in the exact container's network namespace."""
+
+        name = f"cayu-egress-probe-{secrets.token_hex(6)}"
+        argv = [
+            "run",
+            "--rm",
+            "--name",
+            name,
+            "--network",
+            f"container:{container_id}",
+            "--user",
+            "65534:65534",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+            "--entrypoint",
+            "sh",
+            self._sidecar_image,
+            "-c",
+            _HOST_ISOLATION_PROBE_SCRIPT,
+            "cayu-host-isolation-probe",
+            *targets,
+        ]
+        settled = False
+        reason = "probe_timed_out"
+        try:
+            async with asyncio.timeout(_HOST_ISOLATION_PROBE_TIMEOUT_S):
+                code, output = await self._docker_run(argv)
+            settled = True
+            lines = output.strip().splitlines()
+            result = lines[-1].strip() if lines else ""
+            if code == 0 and result == "isolated":
+                return
+            reason = result if result in _HOST_ISOLATION_PROBE_FAILURES else "probe_failed"
+        except TimeoutError:
+            pass
+        finally:
+            if not settled:
+                # The CLI may be gone while its probe container still runs.
+                with contextlib.suppress(Exception):
+                    await self._docker_exec(["rm", "-f", name])
+        raise UnsupportedEgressError(
+            f"egress_host_reachable: a hardened guest may reach the Docker host ({reason})."
         )
 
     async def egress_environment_fingerprint(self, runner: Runner) -> str:
@@ -1045,6 +1219,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 probe_metadata=False,
             )
             del observed_at
+            if request.runner.workload_restrictions is not None:
+                await self._verify_guest_host_isolation(request.runner, replacement)
             if await self._container_id(request.runner.name) != container_id:
                 raise RuntimeError("Docker container identity changed during egress cutover.")
             receipt = _build_adapter_verified_egress_authority_cutover_receipt(

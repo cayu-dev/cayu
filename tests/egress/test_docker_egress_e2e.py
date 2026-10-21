@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import http.server
+import json
 import os
 import secrets
 import shutil
@@ -553,7 +554,97 @@ def test_credentialless_factory_crosses_real_docker_boundary_without_fake_secret
             assert event.payload["authorization_kind"] == "credentialless"
 
 
-async def _drive_hardened_factory() -> dict[str, object]:
+_HTTP_REACH_SCRIPT = """
+import socket, sys, time
+host, port = sys.argv[1].rsplit(":", 1)
+deadline = time.monotonic() + 20
+while True:
+    try:
+        with socket.create_connection((host, int(port)), timeout=3) as connection:
+            connection.sendall(b"GET / HTTP/1.0\\r\\n\\r\\n")
+            print("reachable" if connection.recv(12).startswith(b"HTTP/1.0 200") else "other")
+            break
+    except OSError:
+        if time.monotonic() > deadline:
+            print("unreachable")
+            break
+        time.sleep(0.5)
+"""
+
+
+@contextlib.contextmanager
+def _engine_host_listener():
+    """Serve HTTP on all interfaces of the Docker engine's host, like a host service.
+
+    Yields the port and the default bridge gateway, through which an ordinary
+    container does reach the listener.
+    """
+
+    name = f"cayu-test-host-listener-{secrets.token_hex(6)}"
+    port = 20000 + secrets.randbelow(20000)
+    started = subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "--network",
+            "host",
+            CONTAINER_IMAGE,
+            "python3",
+            "-m",
+            "http.server",
+            str(port),
+            "--bind",
+            "0.0.0.0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert started.returncode == 0, started.stderr
+    try:
+        gateway = subprocess.run(
+            [
+                "docker",
+                "network",
+                "inspect",
+                "bridge",
+                "--format",
+                "{{range .IPAM.Config}}{{.Gateway}} {{end}}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout.split()[0]
+        control = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "bridge",
+                CONTAINER_IMAGE,
+                "python3",
+                "-c",
+                _HTTP_REACH_SCRIPT,
+                f"{gateway}:{port}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        # Without this control a blocked result would prove nothing.
+        assert control.stdout.strip() == "reachable", (control.stdout, control.stderr)
+        yield port, gateway
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+
+
+async def _drive_hardened_factory(host_port: int, bridge_gateway: str) -> dict[str, object]:
     from cayu.egress.runtime import VirtualEgressEnvironmentFactory
     from cayu.environments import EnvironmentFactoryRequest
     from cayu.runners.docker_workload import DockerWorkloadRestrictions
@@ -625,18 +716,53 @@ async def _drive_hardened_factory() -> dict[str, object]:
         "    print('direct-ip-denied', False)\n"
         "except OSError:\n"
         "    print('direct-ip-denied', True)\n"
+        # The address Docker gives the host on a network (its gateway, the
+        # first address of the subnet) and the default bridge gateway.
+        "import ipaddress, struct\n"
+        "targets = []\n"
+        "for line in open('/proc/net/route').read().splitlines()[1:]:\n"
+        "    fields = line.split()\n"
+        "    if fields[1] == '00000000':\n"
+        "        print('default-route', fields[0])\n"
+        "        continue\n"
+        "    address, mask = (struct.pack('<L', int(value, 16)) for value in (fields[1], fields[7]))\n"
+        "    subnet = ipaddress.IPv4Network((ipaddress.IPv4Address(address), "
+        "bin(int.from_bytes(mask, 'big')).count('1')))\n"
+        "    targets.append(str(subnet.network_address + 1))\n"
+        f"targets += [{bridge_gateway!r}, 'host.docker.internal']\n"
+        "for target in targets:\n"
+        "    try:\n"
+        f"        connection = socket.create_connection((target, {host_port}), timeout=3)\n"
+        "        connection.sendall(b'GET / HTTP/1.0\\r\\n\\r\\n')\n"
+        "        reached = connection.recv(12).startswith(b'HTTP/1.0 200')\n"
+        "        connection.close()\n"
+        "    except OSError:\n"
+        "        reached = False\n"
+        "    print('host-denied', target, not reached)\n"
     )
     try:
-        call = await runner.exec(ExecCommand.process("python3", "-c", script), timeout_s=60)
+        call = await runner.exec(ExecCommand.process("python3", "-c", script), timeout_s=90)
         evidence = runner.execution_admission_candidate().evidence
+        network_name = runner._egress_binding.network
+        assert network_name is not None
+        network = json.loads(
+            subprocess.run(
+                ["docker", "network", "inspect", "--format", "{{json .}}", network_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            ).stdout
+        )
     finally:
         bound = await binding.bind(None, runner, session_id="e2e-hardened")
         await binding.finalize(bound, outcome="completed")
-    return {"call": call, "evidence": evidence}
+    return {"call": call, "evidence": evidence, "network": network}
 
 
 def test_hardened_container_reaches_only_allowlisted_hosts() -> None:
-    results = asyncio.run(_drive_hardened_factory())
+    with _engine_host_listener() as (host_port, bridge_gateway):
+        results = asyncio.run(_drive_hardened_factory(host_port, bridge_gateway))
     call = results["call"]
     assert call.exit_code == 0, call.stderr
     stdout = call.stdout
@@ -647,6 +773,52 @@ def test_hardened_container_reaches_only_allowlisted_hosts() -> None:
     assert "index-ok" in stdout
     assert "denied 403" in stdout
     assert "direct-ip-denied True" in stdout
+    # A host service listening on every interface is out of reach: the network
+    # has no gateway, so the host has no address the guest can route to.
+    assert "default-route" not in stdout
+    host_lines = [line for line in stdout.splitlines() if line.startswith("host-denied ")]
+    assert len(host_lines) >= 3, stdout
+    assert all(line.endswith(" True") for line in host_lines), stdout
+    network = results["network"]
+    assert network["Internal"] is True
+    assert all(not config.get("Gateway") for config in network["IPAM"]["Config"])
     evidence = results["evidence"]
     assert evidence.state_for("unprivileged_guest") == "available"
     assert evidence.state_for("untrusted_code_isolation") == "unsupported"
+
+
+@pytest.mark.parametrize("listening", [True, False])
+def test_host_isolation_probe_detects_a_reachable_host(listening) -> None:
+    from cayu.egress import UnsupportedEgressError
+
+    name = f"cayu-test-host-probe-guest-{secrets.token_hex(6)}"
+    with _engine_host_listener() as (host_port, bridge_gateway):
+        started = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--network",
+                "bridge",
+                "--entrypoint",
+                "sleep",
+                "alpine/socat",
+                "120",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert started.returncode == 0, started.stderr
+        try:
+            # A container on the default bridge reaches the host through its
+            # gateway, whether or not the port has a listener.
+            target = f"{bridge_gateway}:{host_port if listening else 1}"
+            with pytest.raises(UnsupportedEgressError, match=r"\(host_reachable\)"):
+                asyncio.run(
+                    DockerEgressAdapter()._probe_host_isolation(started.stdout.strip(), [target])
+                )
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
