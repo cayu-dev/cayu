@@ -2,8 +2,8 @@
 
 Each sandbox's ``/workspace`` is a host directory. Commands run there as real
 processes with a scrubbed environment, so Runtime code runs unchanged against
-the fake. Arguments naming ``/workspace`` are mapped to that directory, as the
-guest's mount would.
+the fake. Arguments naming ``/workspace`` are mapped to that directory, and the
+directory in a command's output back to ``/workspace``, as the guest's mount would.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ ARCHIVE_LIMIT = 8 * 1024 * 1024
 @dataclass
 class FakeCommand:
     body: dict[str, Any]
+    root: Path
     status: str = "running"
     exit_code: int | None = None
     stdout: bytes = b""
@@ -313,7 +314,7 @@ class FakeBroker:
         ]
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(sandbox.root)}
         env.update(body.get("env") or {})
-        command = FakeCommand(body=body)
+        command = FakeCommand(body=body, root=sandbox.root)
         command.process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=sandbox.root / body.get("cwd", "."),
@@ -339,7 +340,8 @@ class FakeBroker:
             await self._kill(command, "timed_out")
             return
         if command.status == "running":
-            command.stdout, command.stderr = stdout, stderr
+            command.stdout = _as_guest(stdout, command.root)
+            command.stderr = _as_guest(stderr, command.root)
             command.status = "exited"
             command.exit_code = process.returncode
 
@@ -376,6 +378,15 @@ class FakeBroker:
         if missing:
             headers["X-Cayu-Missing-Paths"] = ",".join(quote(item, safe="") for item in missing)
         return httpx.Response(200, content=data, headers=headers)
+
+
+def _as_guest(output: bytes, root: Path) -> bytes:
+    """Name the sandbox's directory as the guest does, ``/workspace``."""
+
+    # The longer name first: one may end with the other (/private/var and /var).
+    for host in sorted({str(root.resolve()), str(root)}, key=len, reverse=True):
+        output = output.replace(host.encode(), b"/workspace")
+    return output
 
 
 def _json_capped(raw: bytes, limit: int) -> tuple[str, bool]:

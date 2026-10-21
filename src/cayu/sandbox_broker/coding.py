@@ -10,8 +10,9 @@ broker credential.
 
 It composes the same parts as the direct factory: ``SyncBinding`` for
 copy-in and revision-aware copy-back, and a ``RunnerWorkspace`` (here
-``BrokeredSandboxWorkspace``) over the sandbox. The broker client, lease
-keeper and runner are each usable on their own.
+``BrokeredSandboxWorkspace``) over the sandbox. Like Docker's coding binding,
+it commits each copy-in to an ephemeral Git baseline in the sandbox. The broker
+client, lease keeper and runner are each usable on their own.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from cayu.environments import (
     EnvironmentFactoryResult,
     EnvironmentSpec,
 )
+from cayu.environments._ephemeral_git import initialize_ephemeral_git_baseline
 from cayu.environments._sync_staging import SyncBindingStagingCapacity
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -48,6 +50,7 @@ from cayu.environments.bindings import (
     SyncBinding,
     SyncBindingContext,
     SyncTargetWorkspacePlan,
+    SyncTargetWorkspaceProvisioner,
     WorkspaceSnapshot,
 )
 from cayu.runners import ExecCommand
@@ -67,7 +70,7 @@ from cayu.sandbox_broker.runner import (
     BrokeredSandboxWorkspace,
     sandbox_capability_claims,
 )
-from cayu.workspaces import LocalWorkspace, Workspace
+from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
 
 __all__ = [
     "BROKERED_SANDBOX_EGRESS_ENV",
@@ -98,10 +101,80 @@ _SETUP_COMMAND_TIMEOUT_SECONDS = 600
 class BrokeredSandboxCodingBinding(SyncBinding):
     """``SyncBinding`` that destroys the brokered sandbox once finalization succeeds.
 
+    With ``git_baseline`` (the default), each copy-in is committed to an
+    ephemeral local Git repository in the sandbox, as Docker's coding binding
+    does, so ``git_changes`` and the guest's own ``git`` see what the session
+    changed. The repository is made in the target's directory and replaces
+    any ``.git`` there, so with it the binding requires, before copying
+    anything, a ``LocalWorkspace`` source and a ``RunnerWorkspace`` target on
+    the bound sandbox runner, both excluding ``.git``. The source's repository
+    never enters the sandbox, and the sandbox's never reaches the source.
+
     When copy-back fails, for example on a source conflict, the binding keeps
     the sandbox for a retry but stops renewing its lease, so the broker
     destroys it when the lease lapses if no retry comes.
     """
+
+    def __init__(self, *, git_baseline: bool = True, **options: Any) -> None:
+        if type(git_baseline) is not bool:
+            raise TypeError("git_baseline must be a bool.")
+        super().__init__(**options)
+        self._git_baseline = git_baseline
+
+    async def bind(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BoundWorkspace:
+        if self._git_baseline and not (
+            isinstance(workspace, LocalWorkspace) and ".git" in workspace.excluded_directory_names
+        ):
+            raise ValueError(
+                "A brokered coding Git baseline requires a source LocalWorkspace "
+                "that excludes .git."
+            )
+        bound = await super().bind(
+            workspace,
+            runner,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            metadata=metadata,
+        )
+        if not self._git_baseline:
+            return bound
+        try:
+            target = bound.workspace
+            if not isinstance(target, RunnerWorkspace) or not isinstance(
+                bound.runner, BrokeredSandboxRunner
+            ):
+                raise RuntimeError("Brokered coding binding lost its sandbox target.")
+            await initialize_ephemeral_git_baseline(bound.runner, cwd=target.runner_cwd)
+        except BaseException:
+            self.abandon(bound)
+            raise
+        return bound
+
+    async def _target_workspace(
+        self, context: SyncBindingContext
+    ) -> tuple[Workspace, SyncTargetWorkspaceProvisioner | None]:
+        target, provision = await super()._target_workspace(context)
+        if self._git_baseline and not (
+            isinstance(context.runner, BrokeredSandboxRunner)
+            and isinstance(target, RunnerWorkspace)
+            and target.is_bound_to_runner(context.runner)
+            and ".git" in target.excluded_directory_names
+        ):
+            raise ValueError(
+                "A brokered coding Git baseline requires a target RunnerWorkspace "
+                "on the bound sandbox runner that excludes .git."
+            )
+        return target, provision
 
     async def finalize(
         self,
@@ -173,6 +246,12 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     revision-aware: a source file changed outside the sandbox after copy-in
     fails finalization with a conflict.
 
+    With ``git_baseline`` (the default) the sandbox's copy is committed to an
+    ephemeral local Git repository right after copy-in, as with
+    ``DockerCodingEnvironmentFactory``, so ``git_changes`` works in the
+    sandbox. The image then needs ``git``; ``git_baseline=False`` drops the
+    baseline for an image without it.
+
     The network is the broker's: ``egress="none"`` gives the sandbox no
     outbound network, ``egress="public_web"`` the open internet through Cloud's
     logging proxy. No credential ever enters the sandbox. The choice is
@@ -208,6 +287,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         staging_capacity: SyncBindingStagingCapacity | None = None,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_SECONDS,
         renew_every_s: float | None = None,
+        git_baseline: bool = True,
     ) -> None:
         if not isinstance(broker, SandboxBrokerClient):
             raise TypeError("broker must be a SandboxBrokerClient.")
@@ -232,6 +312,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             )
         if type(ready_timeout_s) not in {int, float} or ready_timeout_s <= 0:
             raise ValueError("ready_timeout_s must be positive.")
+        if type(git_baseline) is not bool:
+            raise TypeError("git_baseline must be a bool.")
         self.broker = broker
         self.source_workspace = source_workspace
         self.egress: SandboxEgressMode = egress
@@ -254,6 +336,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.staging_capacity = staging_capacity
         self.ready_timeout_s = float(ready_timeout_s)
         self.renew_every_s = renew_every_s
+        self.git_baseline = git_baseline
         names = {
             name.casefold(): name
             for name in (
@@ -488,4 +571,5 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             source_conflict_policy="require_revision",
             preserve_git_modes=True,
             staging_capacity=self.staging_capacity,
+            git_baseline=self.git_baseline,
         )

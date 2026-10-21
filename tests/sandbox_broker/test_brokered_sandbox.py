@@ -20,11 +20,13 @@ from tests.sandbox_broker.fake_broker import API_URL, APPLICATION, TOKEN, FakeBr
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.environments import EnvironmentFactoryRequest, EnvironmentSpec
+from cayu.environments._ephemeral_git import initialize_ephemeral_git_baseline
 from cayu.environments.admission import ExecutionRequirements, evaluate_execution_admission
 from cayu.runners import ExecCommand
 from cayu.runners.base import runner_workspace_mutation_settlement
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sandbox_broker import (
+    BrokeredSandboxCodingBinding,
     BrokeredSandboxCodingEnvironmentFactory,
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
@@ -39,7 +41,9 @@ from cayu.sandbox_broker import (
     SandboxQuotaExceededError,
 )
 from cayu.sandbox_broker import runner as runner_module
+from cayu.sandbox_broker.client import MAX_COMMAND_OUTPUT_BYTES
 from cayu.storage import SQLiteSessionStore
+from cayu.tools import GitChangesTool
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workspaces import LocalWorkspace
 
@@ -276,6 +280,196 @@ def test_completion_recovery_never_copies_back_from_a_replacement(tmp_path: Path
     asyncio.run(scenario())
     assert sorted(path.name for path in source.iterdir()) == ["calc.py", "run.sh"]
     assert len(broker.sandboxes) == 2 and broker.live() == []
+
+
+async def _bind(result):
+    return await result.environment.binding.bind(
+        result.environment.workspace,
+        result.environment.runner,
+        session_id="coding",
+        agent_name="coder",
+        environment_name="sandbox",
+    )
+
+
+def test_git_changes_sees_what_the_session_changed_since_copy_in(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        result = await _factory(broker, source).create(_request())
+        bound = await _bind(result)
+        context = ToolContext(session_id="coding", runner=bound.runner)
+        before = await GitChangesTool().run(context, {"mode": "status"})
+        await bound.workspace.create_bytes("calc_fixed.py", b"def add(a, b):\n    return a + b\n")
+        after = await GitChangesTool().run(context, {"mode": "status"})
+        await result.environment.binding.finalize(bound, outcome="completed")
+        return before, after
+
+    before, after = asyncio.run(scenario())
+    # The copy-in is the baseline, so only the session's own change shows.
+    assert not before.is_error and before.structured["changes"] == []
+    assert not after.is_error
+    assert [change["path"] for change in after.structured["changes"]] == ["calc_fixed.py"]
+    # The change reached the source; the sandbox's repository didn't.
+    assert (source / "calc_fixed.py").read_bytes() == b"def add(a, b):\n    return a + b\n"
+    assert not (source / ".git").exists()
+    assert broker.live() == []
+
+
+def test_the_baseline_fits_an_index_larger_than_one_command_output(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    # `git ls-files --stage -z` lists each of these files in 57 bytes, so the
+    # index outgrows what one broker command returns.
+    files = MAX_COMMAND_OUTPUT_BYTES // 57 + 1
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        (sandbox,) = broker.sandboxes.values()
+        for index in range(files):
+            (sandbox.root / f"f{index:05}").write_bytes(b"")
+        await initialize_ephemeral_git_baseline(runner)
+        listed = await runner.exec(
+            ExecCommand.process("git", "ls-files", "--stage", "-z"),
+            output_limit_bytes=MAX_COMMAND_OUTPUT_BYTES,
+        )
+        (sandbox.root / "f00000").write_bytes(b"changed\n")
+        changed = await GitChangesTool().run(
+            ToolContext(session_id="coding", runner=runner), {"mode": "status"}
+        )
+        await runner.close()
+        return listed, changed
+
+    listed, changed = asyncio.run(scenario())
+    assert listed.exit_code == 0 and listed.stdout_truncated
+    assert not changed.is_error
+    assert [change["path"] for change in changed.structured["changes"]] == ["f00000"]
+
+
+def test_a_git_baseline_requires_source_and_target_to_exclude_git(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    (source / ".git").mkdir()
+    (source / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        other = await _ready_runner(broker)
+        protected = (".git",)
+        views = (
+            (
+                LocalWorkspace(source),
+                BrokeredSandboxWorkspace(runner, excluded_directory_names=protected),
+                "source",
+            ),
+            (
+                LocalWorkspace(source, excluded_directory_names=protected),
+                BrokeredSandboxWorkspace(runner),
+                "target",
+            ),
+            (
+                LocalWorkspace(source, excluded_directory_names=protected),
+                BrokeredSandboxWorkspace(other, excluded_directory_names=protected),
+                "target",
+            ),
+        )
+        for source_view, target, role in views:
+            binding = BrokeredSandboxCodingBinding(
+                target_workspace=target, max_file_bytes=1024 * 1024
+            )
+            with pytest.raises(ValueError, match=f"requires a {role} .* that excludes .git"):
+                await binding.bind(source_view, runner, session_id="coding")
+        await runner.close()
+        await other.close()
+
+    asyncio.run(scenario())
+    # Refused before copy-in: the source's repository never entered a sandbox.
+    assert all(list(sandbox.root.iterdir()) == [] for sandbox in broker.sandboxes.values())
+    assert (source / ".git" / "HEAD").read_bytes() == b"ref: refs/heads/main\n"
+
+
+def test_a_subdirectory_target_gets_its_own_baseline(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        (sandbox,) = broker.sandboxes.values()
+        (sandbox.root / "project").mkdir()
+        protected = (".git",)
+        binding = BrokeredSandboxCodingBinding(
+            target_workspace=BrokeredSandboxWorkspace(
+                runner, cwd="project", excluded_directory_names=protected
+            ),
+        )
+        bound = await binding.bind(
+            LocalWorkspace(source, excluded_directory_names=protected),
+            runner,
+            session_id="coding",
+        )
+        await bound.workspace.create_bytes("calc_fixed.py", b"def add(a, b):\n    return a + b\n")
+        changed = await GitChangesTool().run(
+            ToolContext(session_id="coding", runner=runner, workspace=bound.workspace),
+            {"mode": "status"},
+        )
+        await binding.finalize(bound, outcome="completed")
+        return changed
+
+    changed = asyncio.run(scenario())
+    assert not changed.is_error
+    assert [change["path"] for change in changed.structured["changes"]] == ["calc_fixed.py"]
+    # The repository is the target's own, not the sandbox root's.
+    (sandbox,) = broker.sandboxes.values()
+    assert (sandbox.root / "project" / ".git").is_dir()
+    assert not (sandbox.root / ".git").exists()
+    assert (source / "calc_fixed.py").read_bytes() == b"def add(a, b):\n    return a + b\n"
+    assert not (source / ".git").exists()
+    assert broker.live() == []
+
+
+def test_without_a_git_baseline_the_sandbox_runs_no_git(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        result = await _factory(broker, source, git_baseline=False).create(_request())
+        bound = await _bind(result)
+        await result.environment.binding.finalize(bound, outcome="completed")
+
+    asyncio.run(scenario())
+    (sandbox,) = broker.sandboxes.values()
+    assert not (sandbox.root / ".git").exists()
+    assert not any(argv[0] == "git" for argv in broker.started)
+    assert broker.live() == []
+
+
+def test_a_baseline_that_fails_fails_the_bind(tmp_path: Path, monkeypatch) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    start = broker._start
+
+    async def without_git(sandbox, body):
+        # An image without git: every git command exits nonzero.
+        if body["argv"][0] == "git":
+            body = {**body, "argv": ["false"]}
+        return await start(sandbox, body)
+
+    monkeypatch.setattr(broker, "_start", without_git)
+
+    async def scenario():
+        result = await _factory(broker, source).create(_request())
+        with pytest.raises(RuntimeError, match="could not establish its ephemeral Git baseline"):
+            await _bind(result)
+        # Binding never adopted the sandbox, so the factory's release destroys it.
+        await result.release(None)
+
+    asyncio.run(scenario())
+    assert broker.live() == []
+
+
+def test_git_baseline_must_be_a_bool(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="git_baseline must be a bool"):
+        _factory(FakeBroker(tmp_path / "cloud"), _project(tmp_path), git_baseline="yes")
 
 
 def test_a_resumed_session_gets_a_fresh_sandbox_each_turn(tmp_path: Path) -> None:

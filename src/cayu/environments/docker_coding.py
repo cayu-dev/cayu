@@ -33,6 +33,13 @@ from cayu._validation import (
 )
 from cayu.artifacts.base import ArtifactStore
 from cayu.credentials import CredentialMode
+from cayu.environments._ephemeral_git import (
+    GIT_ENV_REMOVE,
+    EphemeralGitBaseline,
+    ephemeral_git_baseline,
+    git_filter_configuration_is_safe,
+    initialize_ephemeral_git_baseline,
+)
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -107,27 +114,6 @@ _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")
 _GIT_HASH_PATH_CHUNK_BYTES = 24 * 1024
 _GIT_HASH_PATH_CHUNK_COUNT = 512
 _GIT_HASH_OUTPUT_BYTES = 64 * 1024
-_GIT_ENV_REMOVE = (
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_DIR",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_INDEX_FILE",
-    "GIT_NAMESPACE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_WORK_TREE",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _EphemeralGitBaseline:
-    head_revision: str
-    staged_entries_sha256: str
-    tracked_flags_sha256: str
-    configuration_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +121,7 @@ class _DockerCodingBindAuthority:
     session_id: str
     source: CodingProductSourceCopyAuthority | None
     workspace_baseline: WorkspaceRevisionObservation | None
-    git: _EphemeralGitBaseline | None
+    git: EphemeralGitBaseline | None
     git_transformed_baseline_paths: frozenset[str]
 
 
@@ -517,9 +503,10 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                     raise RuntimeError(
                         "Docker coding copy-in conflicts with the admitted source revision."
                     )
-            git_baseline = (
-                await _initialize_ephemeral_git_baseline(runner) if self._git_baseline else None
-            )
+            git_baseline: EphemeralGitBaseline | None = None
+            if self._git_baseline:
+                await initialize_ephemeral_git_baseline(runner)
+                git_baseline = await ephemeral_git_baseline(runner)
             transformed_baseline_paths = frozenset()
             if copied is not None:
                 transformed = await _git_paths_with_transformed_bytes(
@@ -679,7 +666,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             ):
                 raise RuntimeError("Docker coding recovery baseline conflicts with its authority.")
         raw_git = authority_state.get("git")
-        git: _EphemeralGitBaseline | None = None
+        git: EphemeralGitBaseline | None = None
         if not self._git_baseline:
             if raw_git is not None:
                 raise ValueError("Docker coding recovery has Git authority without a baseline.")
@@ -691,7 +678,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         }:
             raise ValueError("Docker coding recovery Git authority is malformed.")
         else:
-            git = _EphemeralGitBaseline(
+            git = EphemeralGitBaseline(
                 head_revision=require_durable_clean_nonblank(
                     raw_git.get("head_revision"),
                     "Docker coding recovery Git head",
@@ -2245,107 +2232,6 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         return ExecutionAdmissionCandidate(candidate="docker", evidence=evidence)
 
 
-async def _initialize_ephemeral_git_baseline(
-    runner: DockerRunner,
-) -> _EphemeralGitBaseline:
-    environment = {
-        "GIT_ATTR_NOSYSTEM": "1",
-        "GIT_ASKPASS": "/bin/false",
-        "GIT_CONFIG_COUNT": "0",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_SYSTEM": "/dev/null",
-        "GIT_PAGER": "cat",
-        "GIT_TERMINAL_PROMPT": "0",
-        "PAGER": "cat",
-    }
-    commands = (
-        ExecCommand.process("rm", "-rf", "--", ".git"),
-        ExecCommand.process("git", "init", "-q"),
-        ExecCommand.process("git", "config", "--local", "core.hooksPath", "/dev/null"),
-        ExecCommand.process("git", "config", "--local", "core.fsmonitor", "false"),
-        ExecCommand.process("git", "config", "--local", "core.pager", "cat"),
-        ExecCommand.process("git", "config", "--local", "pager.branch", "false"),
-        ExecCommand.process("git", "config", "--local", "pager.diff", "false"),
-        ExecCommand.process("git", "config", "--local", "pager.status", "false"),
-        ExecCommand.process("git", "config", "--local", "credential.helper", "/bin/false"),
-        ExecCommand.process("git", "config", "--local", "credential.interactive", "never"),
-        ExecCommand.process("git", "config", "--local", "commit.gpgSign", "false"),
-        ExecCommand.process("git", "config", "--local", "tag.gpgSign", "false"),
-        ExecCommand.process("git", "config", "--local", "protocol.allow", "never"),
-        ExecCommand.process("git", "add", "-A", "--", "."),
-        ExecCommand.process(
-            "git",
-            "-c",
-            "user.name=Cayu Runtime",
-            "-c",
-            "user.email=runtime@cayu.invalid",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "--no-gpg-sign",
-            "--no-verify",
-            "-m",
-            "Cayu workspace baseline",
-        ),
-    )
-    for command in commands:
-        result = await runner.exec_system(
-            command,
-            env=environment,
-            env_remove=_GIT_ENV_REMOVE,
-            timeout_s=60,
-            output_limit_bytes=64 * 1024,
-        )
-        if result.exit_code != 0 or result.timed_out:
-            raise RuntimeError("Docker coding could not establish its ephemeral Git baseline.")
-    if not await _git_filter_configuration_is_safe(runner):
-        raise RuntimeError("Docker coding ephemeral Git configuration is unsafe.")
-    return await _ephemeral_git_baseline(runner)
-
-
-async def _ephemeral_git_baseline(runner: DockerRunner) -> _EphemeralGitBaseline:
-    async def capture(*argv: str, output_limit_bytes: int = 16 * 1024 * 1024) -> str:
-        result = await runner.exec_system(
-            ExecCommand.process("git", *argv),
-            env={
-                "GIT_ATTR_NOSYSTEM": "1",
-                "GIT_CONFIG_COUNT": "0",
-                "GIT_CONFIG_GLOBAL": "/dev/null",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_OPTIONAL_LOCKS": "0",
-                "LC_ALL": "C",
-            },
-            env_remove=_GIT_ENV_REMOVE,
-            timeout_s=60,
-            output_limit_bytes=output_limit_bytes,
-        )
-        if (
-            result.exit_code != 0
-            or result.timed_out
-            or result.cancelled
-            or result.stdout_truncated
-            or result.stderr_truncated
-        ):
-            raise RuntimeError("Docker coding could not verify its ephemeral Git baseline.")
-        return result.stdout
-
-    head_revision = (
-        await capture("rev-parse", "--verify", "HEAD", output_limit_bytes=1024)
-    ).strip()
-    staged_entries = await capture("ls-files", "--stage", "-z", "--")
-    tracked_flags = await capture("ls-files", "-v", "-z", "--")
-    configuration = await capture("config", "--includes", "--null", "--list")
-    return _EphemeralGitBaseline(
-        head_revision=head_revision,
-        staged_entries_sha256="sha256:" + sha256(staged_entries.encode("utf-8")).hexdigest(),
-        tracked_flags_sha256="sha256:" + sha256(tracked_flags.encode("utf-8")).hexdigest(),
-        configuration_sha256="sha256:" + sha256(configuration.encode("utf-8")).hexdigest(),
-    )
-
-
 async def _capture_final_git_evidence(
     bound: BoundWorkspace,
     authority: _DockerCodingBindAuthority,
@@ -2366,7 +2252,7 @@ async def _capture_final_git_evidence(
         or source is None
     ):
         raise TypeError("Docker coding final Git capture lost its admitted authority.")
-    before_identity = await _ephemeral_git_baseline(runner)
+    before_identity = await ephemeral_git_baseline(runner)
     if before_identity != authority.git:
         raise RuntimeError("Docker coding ephemeral Git authority changed during execution.")
     before = await observe_deterministic_workspace(
@@ -2432,7 +2318,7 @@ async def _capture_final_git_evidence(
         observer="cayu-coding-product-source",
         limits=source.observation_limits,
     )
-    after_identity = await _ephemeral_git_baseline(runner)
+    after_identity = await ephemeral_git_baseline(runner)
     if after != before or after_identity != authority.git:
         raise RuntimeError("Docker coding workspace changed during final Git capture.")
     return {
@@ -2604,7 +2490,7 @@ async def _git_paths_with_transformed_bytes(
 ) -> frozenset[str] | None:
     if not paths:
         return frozenset()
-    if not await _git_filter_configuration_is_safe(runner):
+    if not await git_filter_configuration_is_safe(runner):
         return None
     transformed: set[str] = set()
     for chunk in _git_hash_path_chunks(paths):
@@ -2623,40 +2509,6 @@ async def _git_paths_with_transformed_bytes(
             if raw_object != filtered_object
         )
     return frozenset(transformed)
-
-
-async def _git_filter_configuration_is_safe(runner: DockerRunner) -> bool:
-    configured_filters = await runner.exec_system(
-        ExecCommand.process(
-            "git",
-            "config",
-            "--includes",
-            "--null",
-            "--name-only",
-            "--get-regexp",
-            r"^(include([iI][fF])?\..*|filter\..*\.(clean|smudge|process))$",
-        ),
-        env={
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "0",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "LC_ALL": "C",
-        },
-        env_remove=_GIT_ENV_REMOVE,
-        timeout_s=60,
-        output_limit_bytes=_GIT_HASH_OUTPUT_BYTES,
-    )
-    return not (
-        configured_filters.exit_code not in {0, 1}
-        or configured_filters.timed_out
-        or configured_filters.cancelled
-        or configured_filters.stdout_truncated
-        or configured_filters.stderr_truncated
-        or bool(configured_filters.stdout)
-        or configured_filters.exit_code == 0
-    )
 
 
 async def _git_hash_paths(
@@ -2681,7 +2533,7 @@ async def _git_hash_paths(
             "GIT_OPTIONAL_LOCKS": "0",
             "LC_ALL": "C",
         },
-        env_remove=_GIT_ENV_REMOVE,
+        env_remove=GIT_ENV_REMOVE,
         timeout_s=60,
         output_limit_bytes=_GIT_HASH_OUTPUT_BYTES,
     )
@@ -2742,7 +2594,7 @@ async def _require_no_publishable_ignored_paths(bound: BoundWorkspace) -> None:
             "GIT_OPTIONAL_LOCKS": "0",
             "LC_ALL": "C",
         },
-        env_remove=_GIT_ENV_REMOVE,
+        env_remove=GIT_ENV_REMOVE,
         timeout_s=60,
         output_limit_bytes=1024 * 1024,
     )

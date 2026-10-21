@@ -485,6 +485,19 @@ workspace. Completion recovery after a crash is refused, because it would run
 against an empty replacement and copy that emptiness back as deletions. The
 source keeps its last published state.
 
+Like Docker's coding factory, the sandbox commits each copy-in to an ephemeral
+local Git repository (`git_baseline=True`, the default), with Docker's inert
+configuration: no hooks, filters, pager, credentials, signing or transport.
+So `git_changes` and the guest's own `git` see what the turn changed since its
+sandbox was filled. `.git` is protected, so the repository never reaches the
+source; `BrokeredSandboxCodingBinding` used on its own refuses, before copying
+anything, a source or target that doesn't exclude `.git` or a target on another
+runner, and makes the repository in its target's directory. The baseline reads
+back no output that grows with the workspace, so the broker's 2 MiB cap on a
+command's output doesn't limit the tree. The image needs `git` (`coding-python`
+has it); a sandbox whose baseline fails isn't bound. `git_baseline=False` drops
+the baseline, for an image without `git`.
+
 Each command starts under a fresh command id and is polled until it finishes:
 
 - Its timeout is bounded only by the sandbox's remaining lifetime (eight hours
