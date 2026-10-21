@@ -1599,6 +1599,9 @@ class SearchToolsTool(Tool):
         input_schema=search_tools_spec()["input_schema"],
         parallel_safe=False,
         effect=ToolEffect.IDEMPOTENT,
+        # The structured result is capped at TOOL_DISCOVERY_MAX_RESULT_BYTES and
+        # the content is the same JSON as text, so escaping at most doubles it.
+        max_terminal_payload_bytes=4 * TOOL_DISCOVERY_MAX_RESULT_BYTES,
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
             name="cayu:search-tools",
             behavior_version="1",

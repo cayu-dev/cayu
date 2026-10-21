@@ -30,6 +30,14 @@ from cayu.tools._redaction import (
     active_secret_redactor_snapshot,
     record_ambiguous_secret_output,
 )
+from cayu.tools._terminal_bounds import (
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    TERMINAL_PAYLOAD_FIT_MARGIN_BYTES,
+    bounded_terminal_result,
+    json_string_body_bytes,
+    spec_with_terminal_payload_bound,
+    tool_result_fits,
+)
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
@@ -70,6 +78,9 @@ MAX_PATCH_ARTIFACT_BYTES = 3 * 1024 * 1024
 MAX_PATCH_PROJECTED_PATH_BYTES = 512
 MAX_PATCH_PROJECTED_REVISION_BYTES = 256
 MAX_PATCH_RESULT_BYTES = 1024 * 1024
+# ToolResult keys beside content and structured, and the content's summary line.
+_PATCH_ENVELOPE_BYTES = 1024
+_PATCH_SUMMARY_BYTES = 1024
 PATCH_RESULT_VERSION = 2
 DEFAULT_PATCH_PROTECTED_ENTRY_NAMES = (".cayu", ".git", ".runtime")
 _PATCH_JOURNAL_RECORD_TYPE = "cayu.apply_patch.journal"
@@ -314,6 +325,7 @@ class ApplyPatchTool(Tool):
         max_artifact_bytes: int = MAX_PATCH_ARTIFACT_BYTES,
         protected_entry_names: Iterable[str] = DEFAULT_PATCH_PROTECTED_ENTRY_NAMES,
         spec: ToolSpec | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         self.max_operations = _configuration_int(
             max_operations,
@@ -362,8 +374,15 @@ class ApplyPatchTool(Tool):
         )
         self.protected_entry_names = _validate_protected_entry_names(protected_entry_names)
         super().__init__(
-            spec=(
-                _apply_patch_tool_spec(max_operations=self.max_operations) if spec is None else spec
+            spec=spec_with_terminal_payload_bound(
+                (
+                    _apply_patch_tool_spec(max_operations=self.max_operations)
+                    if spec is None
+                    else spec
+                ),
+                max_terminal_payload_bytes,
+                # Structured patch evidence alone may use 1 MiB beside its diff preview.
+                default=MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
             )
         )
         self.behavior_profile_id = _behavior_profile_id(self._execution_profile_material())
@@ -398,6 +417,7 @@ class ApplyPatchTool(Tool):
             "cross_file_atomic": False,
         }
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         initial_snapshot = active_secret_redactor_snapshot(ctx)
@@ -490,7 +510,7 @@ class ApplyPatchTool(Tool):
         record = await load_operation(storage_key)
         if record is None:
             return None
-        return await _recover_patch_journal_result(
+        evidence = await _recover_patch_journal_result(
             record,
             behavior_profile_id=self.behavior_profile_id,
             parent_session_id=parent_session_id,
@@ -510,6 +530,7 @@ class ApplyPatchTool(Tool):
             max_file_bytes=self.max_file_bytes,
             protected_entry_names=self.protected_entry_names,
         )
+        return _fit_recovered_patch_evidence(evidence, self.spec.max_terminal_payload_bytes)
 
     async def _preflight(
         self,
@@ -881,12 +902,33 @@ class ApplyPatchTool(Tool):
         )
         changed_paths = _changed_path_manifest(safe_operations)
         full_changed_paths = _changed_path_manifest(full_safe_operations)
-        diff_preview, diff_truncated, truncation_reasons = _bounded_diff_preview(
-            safe_diff,
-            prepared.operations,
-            redactor=current.redactor,
-            max_file_bytes=self.max_file_diff_preview_bytes,
-            max_total_bytes=self.max_diff_preview_bytes,
+        # The whole result fits the declared terminal bound here, before the
+        # journal seals its secret scope: the preview appears twice (content and
+        # structured), so it may use a quarter of the room, and structured
+        # evidence uses what the content leaves.
+        result_limit = MAX_PATCH_RESULT_BYTES
+        terminal_bound = self.spec.max_terminal_payload_bytes
+        if terminal_bound is not None:
+            result_limit = (
+                terminal_bound - TERMINAL_PAYLOAD_FIT_MARGIN_BYTES - _PATCH_ENVELOPE_BYTES
+            )
+        preview_limit = self.max_diff_preview_bytes
+        while True:
+            diff_preview, diff_truncated, truncation_reasons = _bounded_diff_preview(
+                safe_diff,
+                prepared.operations,
+                redactor=current.redactor,
+                max_file_bytes=min(self.max_file_diff_preview_bytes, preview_limit),
+                max_total_bytes=preview_limit,
+            )
+            if json_string_body_bytes(diff_preview) <= result_limit // 4 or preview_limit <= 1024:
+                break
+            preview_limit //= 2
+        if preview_limit < self.max_diff_preview_bytes and diff_truncated:
+            truncation_reasons = sorted({*truncation_reasons, "terminal_payload_bytes"})
+        structured_limit = min(
+            MAX_PATCH_RESULT_BYTES,
+            result_limit - _PATCH_SUMMARY_BYTES - json_string_body_bytes(diff_preview),
         )
         record_ambiguous_secret_output(ctx, current)
         artifact_status = "not_needed"
@@ -933,7 +975,7 @@ class ApplyPatchTool(Tool):
             "artifact": artifact_reference,
             "requires_fresh_read": outcome in {"partial", "ambiguous", "cancelled"},
         }
-        if len(_canonical_json_bytes(structured)) > MAX_PATCH_RESULT_BYTES:
+        if len(_canonical_json_bytes(structured)) > structured_limit:
             if artifact_status == "not_needed":
                 artifact_projection_snapshot = _seal_patch_artifact_projection(ctx, current)
                 if artifact_projection_snapshot is None:
@@ -963,7 +1005,11 @@ class ApplyPatchTool(Tool):
             structured["manifest_truncation_reasons"] = sorted(
                 {*manifest_truncation_reasons, "result_bytes"}
             )
-        if len(_canonical_json_bytes(structured)) > MAX_PATCH_RESULT_BYTES:
+        if len(_canonical_json_bytes(structured)) > structured_limit:
+            # A small terminal bound lists the leading operations it holds; the
+            # artifact, when stored, keeps the complete manifest.
+            structured = _leading_manifest_within(structured, structured_limit)
+        if len(_canonical_json_bytes(structured)) > structured_limit:
             return ToolResult(
                 content=(
                     "Patch outcome publication exceeded its fail-closed result bound. "
@@ -993,6 +1039,80 @@ class ApplyPatchTool(Tool):
             structured=structured,
             is_error=outcome != "applied",
         )
+
+
+def _leading_manifest_within(structured: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Keep the longest prefix of the operation and path manifests within ``limit``."""
+
+    operations = structured["operations"]
+    changed_paths = structured["changed_paths"]
+
+    def listing(count: int) -> dict[str, Any]:
+        kept = operations[:count]
+        indexes = {operation["index"] for operation in kept}
+        return {
+            **structured,
+            "operations": kept,
+            "changed_paths": [
+                path for path in changed_paths if path.get("operation_index") in indexes
+            ],
+            "manifest_truncated": True,
+            "manifest_truncation_reasons": sorted(
+                {*structured["manifest_truncation_reasons"], "terminal_payload_bytes"}
+            ),
+        }
+
+    low, high = 0, len(operations)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(_canonical_json_bytes(listing(middle))) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return listing(low)
+
+
+def _fit_recovered_patch_evidence(
+    evidence: DurableToolRecoveryEvidence,
+    max_bytes: int | None,
+) -> DurableToolRecoveryEvidence:
+    """List as many recovered operations as the terminal bound holds, in order.
+
+    The journal keeps every operation; the result says how many it lists.
+    """
+
+    result = evidence.result
+    if tool_result_fits(result, max_bytes) or result.structured is None:
+        return evidence
+    structured = result.model_dump(mode="json")["structured"]
+    operations = structured.get("operations")
+    if type(operations) is not list:
+        return evidence
+
+    def listing(count: int) -> ToolResult:
+        return result.model_copy(
+            update={
+                "content": (
+                    f"{result.content} Only the first {count} of {len(operations)} "
+                    "operations are listed; the durable journal holds them all."
+                ),
+                "structured": {
+                    **structured,
+                    "operations": list(operations[:count]),
+                    "operation_count": len(operations),
+                    "operations_truncated": True,
+                },
+            }
+        )
+
+    low, high = 0, len(operations)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if tool_result_fits(listing(middle), max_bytes):
+            low = middle
+        else:
+            high = middle - 1
+    return DurableToolRecoveryEvidence(evidence.disposition, listing(low))
 
 
 def _seal_patch_artifact_projection(

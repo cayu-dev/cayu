@@ -1152,3 +1152,120 @@ def test_patch_non_object_operation_is_bounded(tmp_path, item):
     assert result.structured["operation_index"] == 0
     assert result.structured["mutated"] is False
     assert "private" not in result.content
+
+
+def test_apply_patch_fits_its_diff_preview_to_its_terminal_bound(tmp_path: Path) -> None:
+    (tmp_path / "workspace").mkdir()
+    ctx = _context(tmp_path)
+    tool = ApplyPatchTool(max_terminal_payload_bytes=64 * 1024)
+
+    result = asyncio.run(
+        tool.run(
+            ctx,
+            {
+                "operations": [
+                    {"type": "create", "path": "big.txt", "content": 'line \\ "x"\n' * 4_000}
+                ]
+            },
+        )
+    )
+
+    structured = result.structured
+    assert structured is not None
+    assert structured["outcome"] == "applied"
+    assert len(result.model_dump_json().encode("utf-8")) <= 64 * 1024
+    # Fitted before the journal seals its secret scope, not cut afterwards.
+    assert "terminal_payload_truncated" not in structured
+    assert structured["diff_truncated"] is True
+    assert "terminal_payload_bytes" in structured["diff_truncation_reasons"]
+
+
+def test_apply_patch_recovery_lists_the_operations_its_bound_holds(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    workspace = LocalWorkspace(root, workspace_id="workspace")
+    arguments = {
+        "operations": [
+            {"type": "create", "path": f"created-{index:03d}.txt", "content": "x\n"}
+            for index in range(100)
+        ]
+    }
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        assert records.get(storage_key) == expected
+        records[storage_key] = desired
+        return desired
+
+    ctx = ToolContext(
+        session_id="session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id="workspace",
+        idempotency_key="tool-invocation",
+        workspace=workspace,
+        metadata={"tool_call_id": "call"},
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=3,
+        model_step_id="mstep_00000000000000000000000000000000",
+        model_attempt_id="mattempt_00000000000000000000000000000000",
+        tool_round_id="tround_00000000000000000000000000000000",
+        tool_call_id="call",
+        tool_name="apply_patch",
+        idempotency_key="tool-invocation",
+        effective_arguments=arguments,
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+    bound = 64 * 1024
+    tool = ApplyPatchTool(max_terminal_payload_bytes=bound)
+    applied = asyncio.run(tool.run(ctx, arguments))
+    assert applied.structured["outcome"] == "applied"
+    assert len(applied.model_dump_json().encode("utf-8")) <= bound
+
+    recovered = asyncio.run(
+        tool.reconcile_durable_tool_call(
+            parent_session_id="session",
+            parent_run_epoch=3,
+            execution_profile_fingerprint="profile",
+            environment_name="coding",
+            environment_allocation_fingerprint="allocation",
+            model_step_id="mstep_00000000000000000000000000000000",
+            model_attempt_id="mattempt_00000000000000000000000000000000",
+            tool_round_id="tround_00000000000000000000000000000000",
+            tool_call_id="call",
+            idempotency_key="tool-invocation",
+            arguments=arguments,
+            started=True,
+            load_operation=load_operation,
+            recovery_authority=DurableToolRecoveryAuthority(
+                agent_name="agent",
+                environment_name="coding",
+                workspace=workspace,
+                artifact_reader=None,
+                compare_and_set_operation=compare_and_set_operation,
+            ),
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.disposition == "confirmed"
+    result = recovered.result
+    assert len(result.model_dump_json().encode("utf-8")) <= bound
+    assert result.structured["outcome"] == "applied"
+    assert result.structured["operations_truncated"] is True
+    assert result.structured["operation_count"] == 100
+    listed = result.structured["operations"]
+    assert 0 < len(listed) < 100
+    assert [operation["index"] for operation in listed] == list(range(len(listed)))
+    assert f"Only the first {len(listed)} of 100 operations" in result.content

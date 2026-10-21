@@ -22,6 +22,12 @@ from cayu.tools._errors import (
     tool_argument_validation,
 )
 from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    TERMINAL_PAYLOAD_FIT_MARGIN_BYTES,
+    bounded_terminal_result,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import (
     Tool,
     ToolContext,
@@ -236,6 +242,7 @@ class SearchTextTool(Tool):
         exclude_directories: Iterable[str] = DEFAULT_SEARCH_EXCLUDE_DIRECTORIES,
         protected_entry_names: Iterable[str] = (),
         spec: ToolSpec | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         self.default_limit = _configuration_int(
             default_limit,
@@ -285,13 +292,29 @@ class SearchTextTool(Tool):
             default_limit=self.default_limit,
             max_limit=self.max_limit,
         )
-        super().__init__(
+        spec = spec_with_terminal_payload_bound(
             with_intrinsic_execution_requirements(
                 default_spec if spec is None else spec,
                 default_spec.execution_requirements,
-            )
+            ),
+            max_terminal_payload_bytes,
+            default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
         )
+        # Pages are sized to the terminal bound before their continuation is
+        # computed; content and matches each use up to max_result_bytes, and
+        # the echoed arguments take the rest.
+        terminal_bound = spec.max_terminal_payload_bytes
+        if terminal_bound is not None:
+            self.max_result_bytes = max(
+                self.max_preview_bytes + 64,
+                min(
+                    self.max_result_bytes,
+                    (terminal_bound - TERMINAL_PAYLOAD_FIT_MARGIN_BYTES) // 4,
+                ),
+            )
+        super().__init__(spec)
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():

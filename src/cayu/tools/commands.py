@@ -4,7 +4,8 @@ import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from inspect import isawaitable
 from typing import Protocol, runtime_checkable
@@ -31,7 +32,17 @@ from cayu.tools._operation_boundary import (
     await_invocation_cancellation_checkpoint,
     await_invocation_operation,
 )
+from cayu.tools._redaction import active_secret_redactor_snapshot, record_ambiguous_secret_output
 from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    bounded_terminal_result,
+    cut_text_to_json_bytes,
+    json_string_body_bytes,
+    prefix_within_json_bytes,
+    spec_with_terminal_payload_bound,
+    tool_result_fits,
+)
 from cayu.tools.base import (
     _COMMAND_POLICY_DENIAL_SOURCE,
     _POLICY_DENIAL_TEXT_MAX_BYTES,
@@ -240,6 +251,7 @@ class ExecCommandTool(Tool):
         *,
         policy: CommandPolicy | None = None,
         default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if (
             isinstance(default_timeout_seconds, bool)
@@ -277,7 +289,13 @@ class ExecCommandTool(Tool):
                 "Effective process policy capabilities (unpublished names and cwd paths are withheld): "
                 + capabilities.model_dump_json()
             )
-        super().__init__(base_spec.model_copy(update={"input_schema": schema}))
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                base_spec.model_copy(update={"input_schema": schema}),
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
         self._policy = policy
         self._default_timeout_seconds = default_timeout_seconds
 
@@ -287,6 +305,7 @@ class ExecCommandTool(Tool):
 
         return self._policy
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         runner = _require_runner(ctx)
@@ -328,6 +347,7 @@ class ExecCommandTool(Tool):
             max_output_bytes=max_output_bytes,
             policy_source=self,
             include_runner_evidence=False,
+            max_result_bytes=self.spec.max_terminal_payload_bytes,
         )
 
     async def _execute_resolved_command(
@@ -343,6 +363,7 @@ class ExecCommandTool(Tool):
         max_output_bytes: int,
         policy_source: object,
         include_runner_evidence: bool,
+        max_result_bytes: int | None = None,
     ) -> ToolResult:
         """Execute one owned request through the canonical command boundary.
 
@@ -414,49 +435,84 @@ class ExecCommandTool(Tool):
         mutation_settlement = runner_workspace_mutation_settlement(result=result, error=None)
         stdout, stdout_encoding = _portable_command_output(result.stdout)
         stderr, stderr_encoding = _portable_command_output(result.stderr)
-        content = _command_content(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=result.exit_code,
-            timed_out=result.timed_out,
-            cancelled=result.cancelled,
-            timeout_s=timeout_s,
-            stdout_truncated=result.stdout_truncated,
-            stderr_truncated=result.stderr_truncated,
-        )
-        encoded_streams = [
-            stream
-            for stream, encoding in (("stdout", stdout_encoding), ("stderr", stderr_encoding))
-            if encoding == "json-string"
-        ]
-        if encoded_streams:
-            content = f"[JSON string encoding: {', '.join(encoded_streams)}]\n{content}"
-        structured = {
-            "stdout": stdout,
-            "stderr": stderr,
-            "stdout_encoding": stdout_encoding,
-            "stderr_encoding": stderr_encoding,
-            "stdout_bytes": result.stdout_bytes,
-            "stderr_bytes": result.stderr_bytes,
-            "stdout_truncated": result.stdout_truncated,
-            "stderr_truncated": result.stderr_truncated,
-            "exit_code": result.exit_code,
-            "timed_out": result.timed_out,
-            "cancelled": result.cancelled,
-            "artifacts": copy_json_value(result.artifacts, "artifacts"),
-        }
-        if include_runner_evidence:
-            structured.update(
-                {
-                    "workspace_mutation_settlement": mutation_settlement,
-                }
+        exec_result = result
+
+        def build(streams: dict[str, _CommandStream]) -> ToolResult:
+            out, err = streams["stdout"], streams["stderr"]
+            content = _command_content(
+                stdout=out.text,
+                stderr=err.text,
+                exit_code=exec_result.exit_code,
+                timed_out=exec_result.timed_out,
+                cancelled=exec_result.cancelled,
+                timeout_s=timeout_s,
+                stdout_truncated=out.truncated,
+                stderr_truncated=err.truncated,
             )
-        return ToolResult(
-            content=content,
-            structured=structured,
-            artifacts=result.artifacts,
-            is_error=result.timed_out or result.cancelled,
-        )
+            encoded_streams = [
+                name
+                for name, stream in streams.items()
+                if stream.encoding in ("json-string", "json-string-preview")
+            ]
+            if encoded_streams:
+                content = f"[JSON string encoding: {', '.join(encoded_streams)}]\n{content}"
+            structured = {
+                "stdout": out.text,
+                "stderr": err.text,
+                "stdout_encoding": out.encoding,
+                "stderr_encoding": err.encoding,
+                "stdout_bytes": exec_result.stdout_bytes,
+                "stderr_bytes": exec_result.stderr_bytes,
+                "stdout_truncated": out.truncated,
+                "stderr_truncated": err.truncated,
+                "exit_code": exec_result.exit_code,
+                "timed_out": exec_result.timed_out,
+                "cancelled": exec_result.cancelled,
+                "artifacts": copy_json_value(exec_result.artifacts, "artifacts"),
+            }
+            if include_runner_evidence:
+                structured.update(
+                    {
+                        "workspace_mutation_settlement": mutation_settlement,
+                    }
+                )
+            return ToolResult(
+                content=content,
+                structured=structured,
+                artifacts=exec_result.artifacts,
+                is_error=exec_result.timed_out or exec_result.cancelled,
+            )
+
+        streams = {
+            "stdout": _CommandStream(stdout, stdout_encoding, result.stdout_truncated),
+            "stderr": _CommandStream(stderr, stderr_encoding, result.stderr_truncated),
+        }
+        built = build(streams)
+        if max_result_bytes is None:
+            return built
+        # Judge and cut only text redacted with the current registry: the
+        # runtime redacts before enforcing the bound, a placeholder can be
+        # longer than its secret, and a cut must never split a secret.
+        snapshot = active_secret_redactor_snapshot(ctx)
+        if snapshot.redactor.has_values:
+            streams = {
+                name: _CommandStream(
+                    snapshot.redactor.redact_text(stream.text),
+                    stream.encoding,
+                    stream.truncated,
+                )
+                for name, stream in streams.items()
+            }
+            if tool_result_fits(build(streams), max_result_bytes):
+                # The runtime redacts the published result itself.
+                return built
+        elif tool_result_fits(built, max_result_bytes):
+            return built
+        fitted = _fit_command_streams(build, streams, max_result_bytes)
+        if fitted is None:
+            return built
+        record_ambiguous_secret_output(ctx, snapshot)
+        return fitted
 
 
 def _process_diagnostic_content(prefix: str, diagnostic: ProcessCommandDiagnostic) -> str:
@@ -798,6 +854,50 @@ def _runner_unavailable_result(exc: RunnerUnavailableError) -> ToolResult:
         artifacts=exc.artifacts,
         is_error=True,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandStream:
+    text: str
+    encoding: str
+    truncated: bool
+
+
+def _cut_command_stream(stream: _CommandStream, max_bytes: int) -> _CommandStream:
+    """Shorten one captured stream to ``max_bytes`` of escaped JSON text.
+
+    Text keeps its start and end around a marker. A JSON string literal keeps
+    its start, marked as a preview, so it is never mistaken for a complete one.
+    """
+
+    if json_string_body_bytes(stream.text) <= max_bytes:
+        return stream
+    if stream.encoding == "text":
+        return _CommandStream(cut_text_to_json_bytes(stream.text, max_bytes), "text", True)
+    return _CommandStream(
+        prefix_within_json_bytes(stream.text, max_bytes),
+        _command_output_preview_encoding("json-string", True),
+        True,
+    )
+
+
+def _fit_command_streams(
+    build: Callable[[dict[str, _CommandStream]], ToolResult],
+    streams: dict[str, _CommandStream],
+    max_bytes: int,
+) -> ToolResult | None:
+    """Cut stdout and stderr to the largest common size whose result fits ``max_bytes``."""
+
+    low, high = 0, max(json_string_body_bytes(stream.text) for stream in streams.values())
+    fitted: ToolResult | None = None
+    while low <= high:
+        cap = (low + high) // 2
+        candidate = build({name: _cut_command_stream(s, cap) for name, s in streams.items()})
+        if tool_result_fits(candidate, max_bytes):
+            fitted, low = candidate, cap + 1
+        else:
+            high = cap - 1
+    return fitted
 
 
 def _require_exec_result(result: object) -> ExecResult:

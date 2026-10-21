@@ -31,6 +31,13 @@ from cayu.runtime.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    bounded_terminal_result,
+    json_payload_bytes,
+    spec_with_terminal_payload_bound,
+    tool_result_fits,
+)
 from cayu.tools.base import (
     DurableToolRecovery,
     DurableToolRecoveryAuthority,
@@ -78,6 +85,10 @@ if TYPE_CHECKING:
 NAMED_CHECK_DECLARATION_BEHAVIOR_VERSION = "1"
 RUN_CHECK_RESULT_PROJECTION_VERSION = "5"
 DEFAULT_CHECK_MODEL_OUTPUT_BYTES = 16_000
+# Room for the timing fields a completed result gains after projection, and for
+# the command identities a journaled toolchain result gains.
+_RUN_CHECK_COMPLETION_BYTES = 1024
+_RUN_CHECK_JOURNAL_FIELD_BYTES = 4096
 MAX_CHECK_MODEL_OUTPUT_BYTES = 50_000
 MAX_NAMED_CHECKS = 128
 MAX_NAMED_CHECK_NAME_BYTES = 128
@@ -211,7 +222,13 @@ class _RunCheckRecoveryCommandTool(RunCommandTool):
             toolchain_profile.model_dump(mode="python", by_alias=True)
         )
         self._authorities = {item.selector: item for item in self._profile.named_check_authorities}
-        self.spec = self.spec.model_copy(update={"name": "run_check"})
+        # Journaled and recovered results fit the owning run_check's bound.
+        self.spec = self.spec.model_copy(
+            update={
+                "name": "run_check",
+                "max_terminal_payload_bytes": owner.spec.max_terminal_payload_bytes,
+            }
+        )
         self._owner = owner
         Tool.__init__(self, self.spec)
 
@@ -273,6 +290,7 @@ class RunCheckTool(Tool, DurableToolRecovery):
         max_model_output_bytes: int = DEFAULT_CHECK_MODEL_OUTPUT_BYTES,
         toolchain_profile: DockerCodingToolchainProfile | None = None,
         workspace_observation_limits: WorkspaceRevisionObservationLimits | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if isinstance(checks, str | bytes):
             raise TypeError("checks must be an iterable of NamedCheck declarations.")
@@ -346,8 +364,12 @@ class RunCheckTool(Tool, DurableToolRecovery):
             )
         )
         super().__init__(
-            type(self).spec.model_copy(
-                update={"input_schema": schema, "execution_requirements": requirements}
+            spec_with_terminal_payload_bound(
+                type(self).spec.model_copy(
+                    update={"input_schema": schema, "execution_requirements": requirements}
+                ),
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
             )
         )
         self._checks = ordered_checks
@@ -453,6 +475,7 @@ class RunCheckTool(Tool, DurableToolRecovery):
             material["toolchain_profile_fingerprint"] = self._toolchain_profile.fingerprint
         return material
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -688,6 +711,14 @@ class RunCheckTool(Tool, DurableToolRecovery):
                 raw_result=raw_result,
                 workspace_observation=workspace_observation,
             )
+            # Fitted before journaling, so a recovered result fits as the live one does.
+            projected = await self._fit_projected_result(
+                ctx,
+                check=check,
+                raw_result=raw_result,
+                workspace_observation=workspace_observation,
+                projected=projected,
+            )
             if (
                 dependency_sensitive
                 and self._toolchain_profile is not None
@@ -771,6 +802,51 @@ class RunCheckTool(Tool, DurableToolRecovery):
             }
         )
 
+    async def _fit_projected_result(
+        self,
+        ctx: ToolContext,
+        *,
+        check: NamedCheck,
+        raw_result: ToolResult,
+        workspace_observation: WorkspaceRevisionObservation | None,
+        projected: ToolResult,
+    ) -> ToolResult:
+        """Shorten the output previews until the result fits the terminal bound.
+
+        The previews are cut like ``max_model_output_bytes`` cuts them, so the
+        encoding and truncation fields stay accurate and the complete output
+        stays in the output artifact.
+        """
+
+        bound = self.spec.max_terminal_payload_bytes
+        if bound is None:
+            return projected
+        # Room for the timing, toolchain and journal evidence added afterwards.
+        bound -= _RUN_CHECK_COMPLETION_BYTES
+        if self._toolchain_profile is not None:
+            bound -= _RUN_CHECK_JOURNAL_FIELD_BYTES + json_payload_bytes(
+                self._toolchain_profile.evidence()
+            )
+        structured = projected.structured
+        if tool_result_fits(projected, bound) or structured is None or "stdout" not in structured:
+            return projected
+        stored_output: dict[str, Any] = {}
+        limit = self._max_model_output_bytes
+        minimum = len(_OUTPUT_TRUNCATION_MARKER.encode("utf-8")) + 1
+        while limit > minimum:
+            limit = max(minimum, limit // 2)
+            projected = await self._project_result(
+                ctx,
+                check=check,
+                raw_result=raw_result,
+                workspace_observation=workspace_observation,
+                preview_limit=limit,
+                stored_output=stored_output,
+            )
+            if tool_result_fits(projected, bound):
+                break
+        return projected
+
     async def _project_result(
         self,
         ctx: ToolContext,
@@ -778,7 +854,11 @@ class RunCheckTool(Tool, DurableToolRecovery):
         check: NamedCheck,
         raw_result: ToolResult,
         workspace_observation: WorkspaceRevisionObservation | None,
+        preview_limit: int | None = None,
+        stored_output: dict[str, Any] | None = None,
     ) -> ToolResult:
+        if preview_limit is None:
+            preview_limit = self._max_model_output_bytes
         structured = raw_result.structured
         error = None if structured is None else structured.get("error")
         if error == "command_denied":
@@ -794,11 +874,11 @@ class RunCheckTool(Tool, DurableToolRecovery):
         stderr_encoding = _command_output_encoding(structured, "stderr")
         stdout_preview, stdout_projection_truncated = _truncate_utf8(
             stdout,
-            maximum=self._max_model_output_bytes,
+            maximum=preview_limit,
         )
         stderr_preview, stderr_projection_truncated = _truncate_utf8(
             stderr,
-            maximum=self._max_model_output_bytes,
+            maximum=preview_limit,
         )
         stdout_runner_truncated = _required_result_bool(structured, "stdout_truncated")
         stderr_runner_truncated = _required_result_bool(structured, "stderr_truncated")
@@ -824,12 +904,19 @@ class RunCheckTool(Tool, DurableToolRecovery):
         output_artifact: dict[str, object] | None = None
         artifact_status = "not_needed"
         if stdout_projection_truncated or stderr_projection_truncated:
-            artifact_status, output_artifact = await _store_output_artifact(
-                ctx,
-                check=check,
-                content=output_record,
-                content_sha256=output_sha256,
-            )
+            if stored_output is not None and "status" in stored_output:
+                # A refit reuses the artifact an earlier projection stored.
+                artifact_status = stored_output["status"]
+                output_artifact = stored_output["artifact"]
+            else:
+                artifact_status, output_artifact = await _store_output_artifact(
+                    ctx,
+                    check=check,
+                    content=output_record,
+                    content_sha256=output_sha256,
+                )
+                if stored_output is not None:
+                    stored_output.update(status=artifact_status, artifact=output_artifact)
         artifacts = list(runner_artifacts)
         if output_artifact is not None:
             artifacts.append(output_artifact)

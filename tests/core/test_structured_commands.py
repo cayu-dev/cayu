@@ -1470,3 +1470,20 @@ def test_command_timing_separates_slow_captures_from_process(tmp_path):
     assert value["post_capture"]["duration_ms"] >= 25
     assert value["pre_capture"]["finished_at"] <= value["started_at"]
     assert value["finished_at"] <= value["post_capture"]["started_at"]
+
+
+def test_structured_command_publication_ceiling_fits_the_terminal_bound() -> None:
+    profile = DockerCodingToolchainProfile.model_validate(
+        {
+            **_profile().model_dump(mode="python", by_alias=True),
+            "result_publication_max_bytes": 200_000,
+        }
+    )
+
+    default = RunCommandTool(toolchain_profile=profile)
+    tightened = RunCommandTool(toolchain_profile=profile, max_terminal_payload_bytes=64 * 1024)
+
+    # Live and journaled results use the same ceiling, so a result recovered
+    # after a restart fits the declared bound exactly as the live one did.
+    assert default._result_publication_ceiling == 200_000
+    assert tightened._result_publication_ceiling == 64 * 1024 - 4 * 1024

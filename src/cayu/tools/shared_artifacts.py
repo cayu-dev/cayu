@@ -47,6 +47,10 @@ from cayu.tools._redaction import (
     active_secret_redactor_snapshot,
     await_revision_stable_secret_output,
 )
+from cayu.tools._terminal_bounds import (
+    DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+    tool_terminal_payload_bound,
+)
 from cayu.tools.base import (
     DurableToolOperationConflict,
     DurableToolRecoveryAuthority,
@@ -819,6 +823,7 @@ class PublishWorkspaceArtifactTool(Tool):
         policy: SharedArtifactPolicy,
         *,
         clock: Callable[[], datetime] | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         self.policy = SharedArtifactPolicy.model_validate(
             policy.model_dump(mode="python", exclude={"fingerprint"})
@@ -829,6 +834,11 @@ class PublishWorkspaceArtifactTool(Tool):
         super().__init__(
             ToolSpec(
                 name=PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME,
+                # Receipts and references only; attested, so never cut.
+                max_terminal_payload_bytes=tool_terminal_payload_bound(
+                    max_terminal_payload_bytes,
+                    default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+                ),
                 description=(
                     "Publish one policy-approved workspace file and return an opaque reference "
                     "that only an authorized descendant fork or subagent can materialize."
@@ -981,6 +991,7 @@ class MaterializeSharedArtifactTool(Tool):
         policy: SharedArtifactPolicy,
         *,
         clock: Callable[[], datetime] | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         self.policy = SharedArtifactPolicy.model_validate(
             policy.model_dump(mode="python", exclude={"fingerprint"})
@@ -991,6 +1002,11 @@ class MaterializeSharedArtifactTool(Tool):
         super().__init__(
             ToolSpec(
                 name=MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME,
+                # Receipts and references only; attested, so never cut.
+                max_terminal_payload_bytes=tool_terminal_payload_bound(
+                    max_terminal_payload_bytes,
+                    default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+                ),
                 description=(
                     "Materialize an explicitly passed shared-artifact reference after Runtime "
                     "validates its grant and supported descendant lineage."

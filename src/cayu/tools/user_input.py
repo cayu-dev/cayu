@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from cayu.tools._terminal_bounds import (
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 ASK_USER_TOOL_NAME = "ask_user"
@@ -51,6 +55,22 @@ class UserInputTool(Tool):
             "required": ["question"],
         },
     )
+
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        # The result is the person's answer, which the runtime publishes as given;
+        # the default is the largest result Cayu can store.
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
 
     def _execution_profile_material(self) -> dict[str, object]:
         return {}

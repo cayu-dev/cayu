@@ -104,6 +104,12 @@ from cayu.tools._redaction import (
     record_ambiguous_secret_output,
     unstable_secret_redaction_result,
 )
+from cayu.tools._terminal_bounds import (
+    DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    bounded_terminal_result,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 
@@ -494,8 +500,15 @@ class SearchKnowledgeTool(Tool):
         allow_score_override: bool = False,
         auto_min_score: float | None = DEFAULT_AUTO_SEMANTIC_MIN_SCORE,
         default_namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
-        super().__init__(spec=spec)
+        super().__init__(
+            spec=spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
         self._default_namespace = require_clean_nonblank(default_namespace, "default_namespace")
         schema = self.spec.input_schema
         namespace_schema = schema.get("properties", {}).get("namespace")
@@ -515,6 +528,7 @@ class SearchKnowledgeTool(Tool):
             self.spec = self.spec.model_copy(update={"input_schema": schema})
             self._validate_spec()
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
@@ -726,8 +740,15 @@ class RememberKnowledgeTool(Tool):
         max_text_bytes: int = DEFAULT_REMEMBER_KNOWLEDGE_MAX_BYTES,
         chunk_target_bytes: int = DEFAULT_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES,
         max_chunks: int = DEFAULT_REMEMBER_KNOWLEDGE_MAX_CHUNKS,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
-        super().__init__(spec=spec)
+        super().__init__(
+            spec=spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
         self._policy = (
             RememberKnowledgePolicy() if policy is None else _copy_remember_knowledge_policy(policy)
         )
@@ -798,6 +819,7 @@ class RememberKnowledgeTool(Tool):
     def retain_arguments_for_model(self) -> bool:
         return True
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
@@ -2177,6 +2199,21 @@ class ListKnowledgeTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {}
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
+
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
@@ -2347,6 +2384,21 @@ class ReadKnowledgeTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {}
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
+
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(

@@ -69,8 +69,22 @@ from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.store import TaskStore
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._redaction import (
+    InvocationRedactorSnapshot,
+    active_secret_redactor_snapshot,
+    record_ambiguous_secret_output,
+)
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    bounded_terminal_result,
+    json_payload_bytes,
+    prefix_within_json_bytes,
+    tool_result_fits,
+    tool_terminal_payload_bound,
+)
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import metadata_with_taint_labels, taint_labels_from_metadata
+from cayu.vaults import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.tasks.dispatch import DispatchHandle
@@ -81,6 +95,11 @@ DEFAULT_SUBAGENT_RESULT_MAX_CHARS = 12_000
 MAX_SUBAGENT_RESULT_MAX_CHARS = 200_000
 DEFAULT_SUBAGENT_RESULT_WAIT_TIMEOUT_S = 30.0
 MAX_SUBAGENT_RESULT_WAIT_TIMEOUT_S = 600.0
+# subagent_result all=true keeps this much of its bound for the header, the
+# continuation notice and the ids of children it did not return.
+_ALL_RESULTS_RESERVED_BYTES = 32 * 1024
+_MAX_LISTED_REMAINING_CHILDREN = 100
+_MAX_OFFSET = 1_000_000
 SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S = 10.0
 # Poll for terminal status with exponential backoff instead of a fixed tight
 # interval: a background subagent may run for many seconds, and reloading every
@@ -347,6 +366,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         background_registry: BackgroundSubagentTaskRegistry | None = None,
         session_store: SessionStore | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if background_registry is not None and not isinstance(
             background_registry, BackgroundSubagentTaskRegistry
@@ -381,6 +401,9 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                 effect=ToolEffect.EXTERNAL,
                 description=tool_description,
                 execution_profile_identity=execution_profile_identity,
+                max_terminal_payload_bytes=_subagent_terminal_payload_bound(
+                    max_terminal_payload_bytes, self._agents
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -410,6 +433,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         """Existing process-local owner; default registries may span applications."""
         return self._background_registry
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():
@@ -809,7 +833,12 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             # The pending-child lifecycle is handled separately from terminal
             # projection. Never manufacture a successful result for live work.
             return None
-        return await self._foreground_result_from_child(child, agent_alias=agent_alias, spec=spec)
+        # Outside run there is no invocation registry to redact with, so the
+        # projection is fitted by omitting whole parts, never by cutting text.
+        return _omit_to_fit_foreground_tool_result(
+            await self._foreground_result_from_child(child, agent_alias=agent_alias, spec=spec),
+            self.spec.max_terminal_payload_bytes,
+        )
 
     async def _foreground_result_from_child(
         self, child: Session, *, agent_alias: str, spec: SubagentSpec
@@ -837,7 +866,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             raise RuntimeError("Foreground child lacks consistent terminal evidence.")
         if await store.load(child.id) != child:
             raise RuntimeError("Foreground child changed during result projection.")
-        return _foreground_tool_result(
+        projected = _foreground_tool_result(
             _SubagentResult(
                 text=text,
                 text_truncated=truncated,
@@ -853,6 +882,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                 causal_budget_id=child.causal_budget_id,
             ),
         )
+        return projected
 
     def matches_recoverable_child(
         self,
@@ -1014,6 +1044,7 @@ class SubagentResultTool(Tool):
         background_registry: BackgroundSubagentTaskRegistry | None = None,
         task_store: TaskStore | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if not isinstance(session_store, SessionStore):
             raise TypeError("SubagentResultTool requires a SessionStore.")
@@ -1046,9 +1077,14 @@ class SubagentResultTool(Tool):
                 or (
                     "Fetch results from background or durable Cayu subagents. Use "
                     "child_session_id for one child, or all=true to wait for every "
-                    "asynchronous subagent started by the current session."
+                    "asynchronous subagent started by the current session. When all=true "
+                    "returns only some children, call again with offset=next_offset."
                 ),
                 execution_profile_identity=execution_profile_identity,
+                max_terminal_payload_bytes=tool_terminal_payload_bound(
+                    max_terminal_payload_bytes,
+                    default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -1060,6 +1096,16 @@ class SubagentResultTool(Tool):
                             "type": "boolean",
                             "description": "When true, fetch all asynchronous subagents for this session.",
                             "default": False,
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": _MAX_OFFSET,
+                            "description": (
+                                "With all=true, skip this many asynchronous subagents, in the "
+                                "order they started. Use next_offset from the previous result."
+                            ),
+                            "default": 0,
                         },
                         "wait": {
                             "type": "boolean",
@@ -1086,6 +1132,7 @@ class SubagentResultTool(Tool):
             )
         )
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():
@@ -1103,10 +1150,13 @@ class SubagentResultTool(Tool):
                 minimum=1,
                 maximum=MAX_SUBAGENT_RESULT_MAX_CHARS,
             )
+            offset = _int_argument(args, "offset", default=0, minimum=0, maximum=_MAX_OFFSET)
             child_session_id = args.get("child_session_id")
             if all_children:
                 if child_session_id is not None:
                     raise ValueError("Use either child_session_id or all=true, not both.")
+            elif offset:
+                raise ValueError("offset is only valid with all=true.")
             else:
                 if type(child_session_id) is not str:
                     raise ValueError("subagent_result requires child_session_id unless all=true.")
@@ -1124,6 +1174,7 @@ class SubagentResultTool(Tool):
                 wait=wait,
                 timeout_s=timeout_s,
                 max_chars=max_chars,
+                offset=offset,
             )
         assert isinstance(child_session_id, str)
         return await self._run_one(
@@ -1169,6 +1220,7 @@ class SubagentResultTool(Tool):
         wait: bool,
         timeout_s: float,
         max_chars: int,
+        offset: int,
     ) -> ToolResult:
         children = await _list_background_subagent_children(
             self._session_store,
@@ -1183,6 +1235,23 @@ class SubagentResultTool(Tool):
                     "retrieval_status": "empty",
                 },
             )
+        total = len(children)
+        children = children[offset:]
+        if not children:
+            return ToolResult(
+                content=(
+                    f"This session started {total} asynchronous subagents; none remain "
+                    f"after offset {offset}."
+                ),
+                structured={
+                    "parent_session_id": ctx.session_id,
+                    "children": [],
+                    "retrieval_status": "empty",
+                    "offset": offset,
+                    "total_children": total,
+                    "next_offset": None,
+                },
+            )
         if wait:
             children = await _wait_for_all_subagents_terminal(
                 self._session_store,
@@ -1190,52 +1259,75 @@ class SubagentResultTool(Tool):
                 task_store=self._task_store,
                 timeout_s=timeout_s,
             )
-        summaries = [
-            await _summarize_child_session(
+        # Return children in order while their results fit the declared bound,
+        # and name where the rest begin instead of failing the whole call.
+        budget = (
+            DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES
+            if self.spec.max_terminal_payload_bytes is None
+            else self.spec.max_terminal_payload_bytes
+        ) - _ALL_RESULTS_RESERVED_BYTES
+        lines = ["Asynchronous subagent results:"]
+        summaries: list[dict[str, Any]] = []
+        used = 0
+        has_error = False
+        shrunk_with: InvocationRedactorSnapshot | None = None
+        # Pages are measured as published: the runtime redacts them before it
+        # enforces the bound, and a placeholder can outgrow its secret.
+        snapshot = active_secret_redactor_snapshot(ctx)
+        redactor = snapshot.redactor
+        for child in children:
+            summary = await _summarize_child_session(
                 self._session_store,
                 child,
                 max_chars=max_chars,
                 background_failure=self._background_registry.failure(child.id),
                 task_store=self._task_store,
             )
-            for child in children
-        ]
-        lines = ["Asynchronous subagent results:"]
-        has_error = False
-        for summary in summaries:
-            status = summary["status"]
-            child_id = summary["child_session_id"]
-            agent = summary.get("agent") or summary.get("agent_name") or "subagent"
-            if "task_authority_status" not in summary:
-                if summary["retrieval_status"] == "ready":
-                    text = summary["result_text"] or f"Subagent ended with status {status}."
-                    lines.append(f"- {agent} ({child_id}, {status}): {text}")
-                elif summary.get("background_failure") is not None:
-                    failure = summary["background_failure"]
-                    lines.append(
-                        f"- {agent} ({child_id}, {status}): background failure: {failure['error']}"
-                    )
-                    has_error = True
-                else:
-                    lines.append(f"- {agent} ({child_id}, {status}): still running")
-                rendered_is_error = summary.get("is_error") is True
-            else:
-                rendered = _tool_result_from_child_summary(summary)
-                lines.append(f"- {agent} ({child_id}, {status}): {rendered.content}")
-                rendered_is_error = rendered.is_error
-            if rendered_is_error:
-                has_error = True
-        return ToolResult(
-            content="\n".join(lines),
-            structured={
-                "parent_session_id": ctx.session_id,
-                "retrieval_status": "ready"
-                if all(summary["retrieval_status"] == "ready" for summary in summaries)
-                else "not_ready",
-                "children": summaries,
-            },
-            is_error=has_error,
-        )
+            line, rendered_is_error = _subagent_result_line(summary)
+            cost = _published_bytes(redactor, summary, line)
+            if used + cost > budget:
+                if summaries:
+                    break
+                # Cut only text redacted with the current registry, so a cut
+                # never splits a registered secret.
+                shrunk_with = snapshot
+                if redactor.has_values:
+                    summary = redactor.redact_json(summary)
+                summary = _shrunk_child_summary(summary, budget)
+                line, rendered_is_error = _subagent_result_line(summary)
+                cost = _published_bytes(redactor, summary, line)
+            summaries.append(summary)
+            lines.append(line)
+            used += cost
+            has_error = has_error or rendered_is_error
+        if shrunk_with is not None:
+            record_ambiguous_secret_output(ctx, shrunk_with)
+        returned = offset + len(summaries)
+        next_offset = returned if returned < total else None
+        structured: dict[str, Any] = {
+            "parent_session_id": ctx.session_id,
+            "retrieval_status": "ready"
+            if all(summary["retrieval_status"] == "ready" for summary in summaries)
+            else "not_ready",
+            "children": summaries,
+        }
+        if offset or next_offset is not None:
+            remaining = [child.id for child in children[len(summaries) :]]
+            structured.update(
+                {
+                    "offset": offset,
+                    "total_children": total,
+                    "next_offset": next_offset,
+                    "remaining_child_session_ids": remaining[:_MAX_LISTED_REMAINING_CHILDREN],
+                }
+            )
+            if next_offset is not None:
+                lines.append(
+                    f"{len(remaining)} more asynchronous subagents did not fit in this result. "
+                    f"Call subagent_result with all=true and offset={next_offset} for the next "
+                    "ones, or with child_session_id for one child."
+                )
+        return ToolResult(content="\n".join(lines), structured=structured, is_error=has_error)
 
     async def _load_authorized_subagent_child(
         self,
@@ -1265,6 +1357,26 @@ class SubagentResultTool(Tool):
                 is_error=True,
             )
         return child
+
+
+def _subagent_terminal_payload_bound(
+    value: int | None, agents: Mapping[str, SubagentSpec]
+) -> int | None:
+    """The bound ``subagent`` declares, or ``None`` while a foreground child may need it.
+
+    A foreground child's rounds run inside the parent's round. While the parent
+    round holds an exclusive lease, a child round with a tool that declares no
+    bound is always admitted; under a bounded parent it fails whenever another
+    session holds capacity. So ``subagent`` declares a bound by default only when
+    every child is asynchronous, and an application that knows every tool its
+    foreground children call declares one sets it explicitly.
+    """
+
+    if value is not None:
+        return tool_terminal_payload_bound(value, default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES)
+    if any(spec.mode is SubagentExecutionMode.FOREGROUND for spec in agents.values()):
+        return None
+    return DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES
 
 
 def _copy_subagent_specs(
@@ -1492,10 +1604,44 @@ class _SubagentResult(BaseModel):
     terminal: Event | None
 
 
+def _omit_to_fit_foreground_tool_result(projected: ToolResult, max_bytes: int | None) -> ToolResult:
+    """Fit a recovered foreground child's result without cutting any text.
+
+    Recovery and a resumed child wait project the result outside ``run``, with
+    no invocation registry to redact with first, and a cut could leave part of a
+    secret that the runtime's later redaction no longer matches. A failed
+    child's terminal payload is omitted first; if the text still does not fit,
+    it is omitted too, and the child session keeps it.
+    """
+
+    if tool_result_fits(projected, max_bytes):
+        return projected
+    structured = dict(projected.structured or {})
+    if "terminal_payload" in structured:
+        structured["terminal_payload"] = None
+        structured["terminal_payload_omitted"] = True
+        projected = projected.model_copy(update={"structured": structured})
+        if tool_result_fits(projected, max_bytes):
+            return projected
+    child_session_id = structured.get("child_session_id")
+    structured["result_omitted"] = True
+    structured["result_truncated"] = True
+    return projected.model_copy(
+        update={
+            "content": (
+                f"The subagent's result is larger than this tool returns ({max_bytes} bytes) "
+                f"and was omitted. Child session {child_session_id} holds it."
+            ),
+            "structured": structured,
+        }
+    )
+
+
 def _foreground_tool_result(
     result: _SubagentResult, *, agent_alias: str, structured: dict[str, Any]
 ) -> ToolResult:
     """One model-facing contract for live and durably reconstructed foreground work."""
+
     structured = {
         **structured,
         "status": None if result.terminal is None else str(result.terminal.type),
@@ -2048,6 +2194,56 @@ async def _load_last_assistant_text(
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars], True
+
+
+def _published_bytes(redactor: SecretRedactor, summary: dict[str, Any], line: str) -> int:
+    """Bytes one child adds to subagent_result all=true once the runtime redacts it."""
+
+    if redactor.has_values:
+        summary = redactor.redact_json(summary)
+        line = redactor.redact_text(line)
+    return json_payload_bytes(summary) + json_payload_bytes(line)
+
+
+def _subagent_result_line(summary: dict[str, Any]) -> tuple[str, bool]:
+    """Render one child for subagent_result all=true; return the line and its error flag."""
+
+    status = summary["status"]
+    child_id = summary["child_session_id"]
+    agent = summary.get("agent") or summary.get("agent_name") or "subagent"
+    if "task_authority_status" in summary:
+        rendered = _tool_result_from_child_summary(summary)
+        return f"- {agent} ({child_id}, {status}): {rendered.content}", rendered.is_error
+    is_error = summary.get("is_error") is True
+    if summary["retrieval_status"] == "ready":
+        text = summary["result_text"] or f"Subagent ended with status {status}."
+        return f"- {agent} ({child_id}, {status}): {text}", is_error
+    if summary.get("background_failure") is not None:
+        failure = summary["background_failure"]
+        return (
+            f"- {agent} ({child_id}, {status}): background failure: {failure['error']}",
+            True,
+        )
+    return f"- {agent} ({child_id}, {status}): still running", is_error
+
+
+def _shrunk_child_summary(summary: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """Cut one child's summary so it and its rendered line fit in ``max_bytes``."""
+
+    shrunk = dict(summary)
+    if shrunk.get("terminal_payload") is not None:
+        shrunk["terminal_payload"] = None
+        shrunk["terminal_payload_omitted"] = True
+    text = shrunk.get("result_text")
+    if type(text) is str and text:
+        shrunk["result_text"] = ""
+        base = json_payload_bytes(shrunk) + json_payload_bytes(_subagent_result_line(shrunk)[0])
+        # The text appears twice: in the summary and in the rendered line.
+        kept = prefix_within_json_bytes(text, max(0, (max_bytes - base) // 2 - 64))
+        shrunk["result_text"] = kept
+        if kept != text:
+            shrunk["result_truncated"] = True
+    return shrunk
 
 
 def _tool_result_from_child_summary(summary: dict[str, Any]) -> ToolResult:

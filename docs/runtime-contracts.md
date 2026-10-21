@@ -3318,6 +3318,9 @@ lease. The lease remains owned until every durable staged terminal has been
 published. This whole-round admission prevents sibling results from deadlocking
 after their effects have executed.
 
+Every built-in tool declares a bound and keeps its results inside it; see
+[Built-in terminal payload bounds](#built-in-terminal-payload-bounds).
+
 Related rounds use the same capacity family, identified from their durable
 invocation root after validating the current session incarnation and run epoch.
 An inline subagent therefore does not wait behind its parent's exclusive lease.
@@ -12531,7 +12534,7 @@ The first built-in tools are:
   arguments admitted by its closed flag/path grammar; executable, image, environment,
   stdin, network, mounts, runtime user, and upper bounds are not model input
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, background mode returns after in-process startup, and durable mode returns after child-first task-queue publication
-- `subagent_result`: fetch one background or durable subagent result by `child_session_id`, or wait for all asynchronous subagents started by the current parent session; a configured task store adds verified durable queue status
+- `subagent_result`: fetch one background or durable subagent result by `child_session_id`, or wait for all asynchronous subagents started by the current parent session; a configured task store adds verified durable queue status. With `all=true` it returns children, in the order they started, while their results fit its terminal bound. When some do not fit, the result names `next_offset`, `total_children` and up to 100 `remaining_child_session_ids`, and the content tells the model to call again with `all=true` and `offset=next_offset`. A single child larger than the bound is returned alone with its `result_text` cut (`result_truncated=true`) and its `terminal_payload` replaced by `terminal_payload_omitted=true`.
 - `list_knowledge`: discover active knowledge entries and facets without requiring a lexical search term
 - `search_knowledge`: search the active knowledge store with bounded previews and optional filters
 - `read_knowledge`: expand bounded chunks from a returned knowledge entry
@@ -12576,6 +12579,92 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `search_knowledge`: 10 hits by default, 25 maximum per call; 320 bytes of preview text per hit by default, 4 KB maximum per hit, and 20 KB total preview text by default, 128 KB maximum per call
 - `read_knowledge`: 5 chunks by default, 50 maximum per call; 20 KB chunk text by default, 128 KB maximum per call
 - `remember_knowledge`: 64 KB app-configured accepted text by default, 512 KB maximum for a registered tool instance; internal indexing defaults to 4 KB target chunks and 100 chunks maximum for the built-in tool instance; writes that would exceed the configured text or chunk capacity are rejected before persistence
+
+### Built-in terminal payload bounds
+
+Every built-in tool declares `ToolSpec.max_terminal_payload_bytes`, so a
+deferred round of built-ins shares terminal-publication capacity instead of
+taking the exclusive lease an undeclared tool takes (see
+[Tool terminal publication capacity](#tool-terminal-publication-capacity)). A
+bound must be between 64 KiB and 1,984 KiB: the durable event limit of 2 MiB
+less the 64 KiB runtime envelope that travels with every terminal result.
+
+Each built-in's constructor takes `max_terminal_payload_bytes=` to set or
+tighten its bound, for example `ExecCommandTool(policy=policy,
+max_terminal_payload_bytes=256 * 1024)`. Leaving it out keeps the default
+below, or the bound an explicitly passed `spec` already declares. A value
+outside the range, or not an integer, is refused at construction.
+
+| Default | Tools | When a result would exceed it |
+| --- | --- | --- |
+| 1 MiB | `exec_command`, `run_check`, `edit_file`, `list_artifacts`, `git_changes`, `search_text`, `search_knowledge`, `list_knowledge`, `read_knowledge`, `web_fetch`, `web_search`, `subagent_result`, `child_session_result`, and `subagent` when every child is asynchronous | fitted by the tool |
+| 256 KiB | `write_file`, `delete_file`, `list_files`, `remember_knowledge`, `run_command` | fitted by the tool |
+| 1,984 KiB | `apply_patch` (its structured evidence alone may use 1 MiB), `read_file` (so a file Cayu can publish whole can be read whole for its revision) | fitted by the tool |
+| none unless set | `subagent` with a foreground child | fitted when set |
+| 256 KiB | `publish_workspace_artifact`, `materialize_shared_artifact`, `screenshot_page` | never cut |
+| 1,984 KiB | `browser_session`, the routed `web_fetch` (`WebAccessRoutingTool`), `ask_user` | never cut |
+| 1 MiB, fixed | `search_tools`, registered by Cayu for tool discovery | never cut |
+
+A fitted tool keeps whatever its result is within the bound unchanged. A larger
+result is cut, never failed: the longest strings, in `content` and inside
+`structured` alike, are cut to one common length, each keeping its start and
+end around `[... N bytes truncated ...]`, so every field, identifier, status and
+digest stays in place. Only when that cannot fit, such as a listing with too
+many entries, is `structured` reduced to its short scalar fields. `is_error` is
+kept, `content` ends with `[Result truncated: the complete result was N bytes
+and this tool returns at most M bytes.]`, and `structured` gains
+`terminal_payload_truncated` with `original_bytes`, `max_bytes` and, when
+anything was dropped, `structured_fields_omitted` or `artifacts_omitted`.
+A result's size is judged as the runtime will publish it, after the
+invocation's registered secrets are redacted, since a placeholder can be longer
+than the secret it replaces. A result that fits is returned unchanged. Before
+cutting, the tool redacts those secrets, so a cut
+never splits a secret that the runtime would otherwise redact, and a cut result
+is bound to the secret registry revision it was redacted with, like any other
+bounded capture.
+
+Some tools fit their own way so their fields stay accurate. `exec_command` cuts
+stdout and stderr to a common size and sets `stdout_truncated` or
+`stderr_truncated`. Text keeps its start and end around the marker. A stream
+carried as a JSON string literal keeps its start and becomes
+`json-string-preview`. `run_command`, and `run_check` with a toolchain profile,
+tighten their profile's publication ceiling to the bound, so live and recovered
+results are fitted the same way. `run_check` shortens its output previews, as
+`max_model_output_bytes` would, before it journals a result, so the encoding
+and truncation fields stay accurate, the full output stays in its output
+artifact, and a recovered result fits like the live one. `apply_patch` shrinks
+its diff preview and fits its evidence to the bound before its journal seals,
+adding `terminal_payload_bytes` to `diff_truncation_reasons`; when even its
+compact manifest does not fit, it lists the leading operations
+(`manifest_truncated`). A recovered patch lists the leading operations the
+bound holds, with `operation_count` and `operations_truncated`. `list_files`, `git_changes` and `search_text` size
+their pages to the bound before computing their continuation, so following
+`next_offset` never skips entries; `list_files` measures paths as published,
+after redaction. `subagent` fits a foreground child's result
+in `run` like any fitted tool. Recovery and a resumed child wait project the
+result outside `run`, with no invocation registry to redact with, so they never
+cut text: a failed child's `terminal_payload` is omitted
+(`terminal_payload_omitted=true`), and if the text still does not fit it is
+omitted too (`result_omitted=true`), with the content naming the child session
+that holds it. `read_file` never asks for more text than its
+bound can hold. When escaped text still outgrows the bound, it reads a smaller
+page, so `bytes`, `truncated` and `next_offset` stay exact. When the bound
+limits a line-range read that cuts a line, the continuation hint points to
+byte paging, because a larger `max_bytes` cannot help.
+
+`subagent` with a foreground child declares no bound unless the application
+sets one. The child's rounds run inside the parent's round: while that round
+holds the exclusive lease, a child round with a tool that declares no bound is
+always admitted, but under a bounded parent such a round fails whenever another
+session holds capacity. Set `max_terminal_payload_bytes` on `SubagentTool` when
+every tool its foreground children can call declares a bound.
+
+Tools marked "never cut" return attested evidence or text a person supplied.
+Their results are naturally within the default, and the default for those
+without a natural limit is the largest result Cayu can store, so a result that
+would exceed it gets the same bounded runtime failure as any result too large
+to store. An application's own tools, MCP tools and process-isolated tools
+declare their bounds themselves.
 
 ### Workspace search progression
 

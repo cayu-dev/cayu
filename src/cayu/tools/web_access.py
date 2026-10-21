@@ -21,6 +21,10 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
+from cayu.tools._terminal_bounds import (
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import (
     Tool,
     ToolContext,
@@ -382,6 +386,7 @@ class WebAccessRoutingTool(Tool):
         *,
         routes: Sequence[WebBridgeRoute],
         policy: WebAccessRoutePolicy,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if isinstance(routes, (str, bytes)) or not isinstance(routes, Sequence):
             raise TypeError("routes must be a sequence of WebBridgeRoute values.")
@@ -417,7 +422,15 @@ class WebAccessRoutingTool(Tool):
             policy,
             self._route_identities,
         )
-        super().__init__(self.spec)
+        # Each route tool fits its own result; the routing evidence beside it is
+        # attested, so this tool declares the storable ceiling and never cuts it.
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                self.spec,
+                max_terminal_payload_bytes,
+                default=MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
 
     def _execution_profile_material(self) -> dict[str, Any] | None:
         route_material: list[dict[str, Any]] = []

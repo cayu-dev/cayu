@@ -36,6 +36,7 @@ from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     ToolContext,
     ToolEffect,
+    ToolResult,
     _bind_runtime_tool_invocation_authority,
 )
 from cayu.tools.command_policy import ProcessCommandPolicy
@@ -442,6 +443,130 @@ def test_run_check_persists_and_reconciles_durable_dispatch_evidence(
     assert recovered.disposition == "confirmed"
     assert recovered.result.structured["status"] == "passed"
     assert recovered.result.structured["recovered"] is True
+
+
+def test_toolchain_run_check_journals_and_recovers_a_result_within_its_bound(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = "print('x' * 45000)"
+    command = ExecCommand.process(sys.executable, "-c", script)
+    authority = DockerCodingCommandAuthority(
+        selector="test",
+        revision="1",
+        description="Run the named test check.",
+        exposure="named_check",
+        executable=sys.executable,
+        fixed_arguments=("-c", script),
+        max_arguments=0,
+        dependency_sensitive=False,
+    )
+    profile = DockerCodingToolchainProfile(
+        profile_id="test-profile",
+        revision="1",
+        image_identity=DockerImageIdentity(
+            reference="test-image@sha256:" + ("a" * 64),
+        ),
+        platform_architecture="arm64",
+        command_authorities=(authority,),
+    )
+    workspace = LocalWorkspace(tmp_path, workspace_id="durable-check-workspace")
+    runner = LocalRunner(tmp_path, inherit_env=False)
+
+    async def admitted(_runner, **_kwargs):
+        return None
+
+    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        assert records.get(storage_key) == expected
+        assert secondary == {}
+        records[storage_key] = desired
+        return desired
+
+    ctx = ToolContext(
+        session_id="durable-check-session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id=workspace.id,
+        idempotency_key="durable-check-invocation",
+        workspace=workspace,
+        runner=runner,
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=1,
+        model_step_id="mstep_20000000000000000000000000000000",
+        model_attempt_id="mattempt_20000000000000000000000000000000",
+        tool_round_id="tround_20000000000000000000000000000000",
+        tool_call_id="check-call",
+        tool_name="run_check",
+        idempotency_key="durable-check-invocation",
+        effective_arguments={"check": "test"},
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+    tool = RunCheckTool(
+        checks=[_check(command=command)],
+        command_policy=ProcessCommandPolicy(
+            allowed_executables=(sys.executable,),
+            allowed_cwds=(str(tmp_path),),
+        ),
+        toolchain_profile=profile,
+        max_model_output_bytes=50_000,
+        max_terminal_payload_bytes=64 * 1024,
+    )
+    result = asyncio.run(tool.run(ctx, {"check": "test"}))
+
+    bound = 64 * 1024
+    assert result.structured["status"] == "passed"
+    assert len(result.model_dump_json().encode("utf-8")) <= bound
+    assert "terminal_payload_truncated" not in result.structured
+    assert result.structured["stdout_truncated"] is True
+    assert result.structured["stdout_projection_truncated"] is True
+    journal = next(iter(records.values()))
+    assert journal["state"] == "terminal"
+    journaled = ToolResult.model_validate(journal["terminal_result"])
+    assert len(journaled.model_dump_json().encode("utf-8")) <= bound
+
+    recovery_authority = DurableToolRecoveryAuthority(
+        agent_name="agent",
+        environment_name="coding",
+        workspace=workspace,
+        artifact_reader=None,
+        compare_and_set_operation=compare_and_set_operation,
+    )
+    recovered = asyncio.run(
+        tool.reconcile_durable_tool_call(
+            parent_session_id=ctx.session_id,
+            parent_run_epoch=1,
+            execution_profile_fingerprint="profile",
+            environment_name="coding",
+            environment_allocation_fingerprint="allocation",
+            model_step_id="mstep_20000000000000000000000000000000",
+            model_attempt_id="mattempt_20000000000000000000000000000000",
+            tool_round_id="tround_20000000000000000000000000000000",
+            tool_call_id="check-call",
+            idempotency_key="durable-check-invocation",
+            arguments={"check": "test"},
+            started=True,
+            load_operation=load_operation,
+            recovery_authority=recovery_authority,
+        )
+    )
+    assert recovered is not None
+    assert recovered.disposition == "confirmed"
+    assert recovered.result.structured["status"] == "passed"
+    assert len(recovered.result.model_dump_json().encode("utf-8")) <= bound
 
 
 def test_run_check_binds_a_pass_to_the_complete_post_check_workspace_revision(
@@ -1053,3 +1178,26 @@ def test_resume_rejects_changed_named_check_profile_before_provider_work(tmp_pat
 
 def test_command_policy_decision_names_remain_distinct_from_durable_approval() -> None:
     assert CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL.value == "require_command_approval"
+
+
+def test_run_check_shortens_previews_to_fit_its_terminal_bound() -> None:
+    # NUL output is carried as a JSON string literal, whose escapes outgrow
+    # the raw byte count, so the complete preview exceeds a small bound.
+    runner = RecordingRunner(ExecResult(stdout="\0" * 7_500, exit_code=0, stdout_bytes=7_500))
+    tool = RunCheckTool(
+        checks=[_check()],
+        command_policy=_policy(),
+        max_model_output_bytes=50_000,
+        max_terminal_payload_bytes=64 * 1024,
+    )
+
+    result = _run(tool, runner)
+
+    structured = result.structured
+    assert structured is not None
+    assert len(result.model_dump_json().encode("utf-8")) <= 64 * 1024
+    assert "terminal_payload_truncated" not in structured
+    assert structured["stdout_encoding"] == "json-string-preview"
+    assert structured["stdout_truncated"] is True
+    assert structured["stdout_projection_truncated"] is True
+    assert structured["stdout"].startswith('"\\u0000')

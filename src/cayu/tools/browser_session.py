@@ -64,6 +64,10 @@ from cayu.tools._redaction import (
     active_secret_redactor_snapshot,
     await_revision_stable_secret_output,
 )
+from cayu.tools._terminal_bounds import (
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
@@ -2094,6 +2098,7 @@ class BrowserSessionTool(Tool):
         recording: BrowserRecordingConfig | None = None,
         spec: ToolSpec | None = None,
         _backend: BrowserSessionBackend | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         self.recording = recording
         if recording is not None and type(recording) is not BrowserRecordingConfig:
@@ -2468,7 +2473,15 @@ class BrowserSessionTool(Tool):
                 type(self).spec if spec is None else spec,
                 _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
             )
-        super().__init__(spec)
+        # Observations are attested evidence, so they are never cut; a snapshot
+        # that would not fit fails like any result too large to store.
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
 
     def _page_set_limits(self) -> _BrowserPageSetLimits:
         return _BrowserPageSetLimits(

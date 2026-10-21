@@ -18,6 +18,11 @@ from cayu.sessions.child_results import (
 )
 from cayu.sessions.store import SessionStore
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    bounded_terminal_result,
+    tool_terminal_payload_bound,
+)
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
@@ -31,6 +36,7 @@ class ChildSessionResultTool(Tool):
         name: str = "child_session_result",
         description: str | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if not isinstance(session_store, SessionStore):
             raise TypeError("ChildSessionResultTool requires a SessionStore.")
@@ -46,6 +52,10 @@ class ChildSessionResultTool(Tool):
                     "sibling to read the child."
                 ),
                 execution_profile_identity=execution_profile_identity,
+                max_terminal_payload_bytes=tool_terminal_payload_bound(
+                    max_terminal_payload_bytes,
+                    default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -97,6 +107,7 @@ class ChildSessionResultTool(Tool):
             )
         )
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():

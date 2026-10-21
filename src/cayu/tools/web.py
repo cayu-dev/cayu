@@ -21,6 +21,11 @@ from cayu.egress._resolution import (
     validated_resolved_address,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    bounded_terminal_result,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.web_access import (
     WebAccessEvidenceSource,
@@ -417,6 +422,7 @@ class WebFetchTool(Tool):
         max_redirects: int = DEFAULT_WEB_FETCH_MAX_REDIRECTS,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         spec: ToolSpec | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if spec is not None and execution_profile_identity is not None:
             raise ValueError("spec and execution_profile_identity cannot be combined.")
@@ -463,8 +469,15 @@ class WebFetchTool(Tool):
                 effective_spec = adapter._tool_spec_with_execution_requirements(
                     type(self).spec if effective_spec is None else effective_spec
                 )
-        super().__init__(effective_spec)
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if effective_spec is None else effective_spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
 
+    @bounded_terminal_result
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         try:
             requested_url = _canonical_public_https_url(args)
@@ -775,6 +788,7 @@ class WebSearchTool(Tool):
         restrictions: WebSearchRestrictions | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         spec: ToolSpec | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         if spec is not None and execution_profile_identity is not None:
             raise ValueError("spec and execution_profile_identity cannot be combined.")
@@ -826,8 +840,15 @@ class WebSearchTool(Tool):
             effective_spec = effective_spec.model_copy(
                 update={"execution_profile_identity": execution_profile_identity}
             )
-        super().__init__(effective_spec)
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                effective_spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
 
+    @bounded_terminal_result
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         try:
             query, max_results = _web_search_arguments(

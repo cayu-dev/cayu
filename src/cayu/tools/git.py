@@ -16,6 +16,12 @@ from cayu.tools._errors import (
 )
 from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
 from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools._terminal_bounds import (
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    TERMINAL_PAYLOAD_FIT_MARGIN_BYTES,
+    bounded_terminal_result,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import (
     Tool,
     ToolContext,
@@ -64,11 +70,20 @@ class _StatusPage:
 class GitChangesTool(Tool):
     """Inspect bounded Git changes without exposing an unrestricted shell."""
 
-    def __init__(self, spec: ToolSpec | None = None) -> None:
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
         super().__init__(
-            with_intrinsic_execution_requirements(
-                self.spec if spec is None else spec,
-                GitChangesTool.spec.execution_requirements,
+            spec_with_terminal_payload_bound(
+                with_intrinsic_execution_requirements(
+                    self.spec if spec is None else spec,
+                    GitChangesTool.spec.execution_requirements,
+                ),
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
             )
         )
 
@@ -132,6 +147,7 @@ class GitChangesTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {"result_projection_version": "2"}
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():
@@ -170,6 +186,15 @@ class GitChangesTool(Tool):
                 default=DEFAULT_GIT_CHANGES_RESULT_BYTES,
                 minimum=1024,
                 maximum=MAX_GIT_CHANGES_RESULT_BYTES,
+            )
+        # A page is sized to the terminal bound before its continuation is
+        # computed; status, summaries and diffs use at most about three times
+        # max_result_bytes once escaped and listed in structured data.
+        terminal_bound = self.spec.max_terminal_payload_bytes
+        if terminal_bound is not None:
+            max_result_bytes = max(
+                1024,
+                min(max_result_bytes, (terminal_bound - TERMINAL_PAYLOAD_FIT_MARGIN_BYTES) // 4),
             )
 
         cwd_or_error = _workspace_cwd(ctx)

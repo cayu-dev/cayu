@@ -27,6 +27,12 @@ from cayu.runners.base import (
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._terminal_bounds import (
+    DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+    TERMINAL_PAYLOAD_FIT_MARGIN_BYTES,
+    bounded_terminal_result,
+    tool_terminal_payload_bound,
+)
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
@@ -475,9 +481,20 @@ class RunCommandTool(Tool):
         },
     )
 
-    def __init__(self, *, toolchain_profile: DockerCodingToolchainProfile) -> None:
+    def __init__(
+        self,
+        *,
+        toolchain_profile: DockerCodingToolchainProfile,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
         if type(toolchain_profile) is not DockerCodingToolchainProfile:
             raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
+        # The profile's own publication ceiling is at most 200,000 bytes, so the
+        # default bound only applies when an application sets a smaller one.
+        terminal_bound = tool_terminal_payload_bound(
+            max_terminal_payload_bytes,
+            default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+        )
         owned_profile = DockerCodingToolchainProfile.model_validate(
             toolchain_profile.model_dump(mode="python", by_alias=True)
         )
@@ -540,6 +557,7 @@ class RunCommandTool(Tool):
                 update={
                     "input_schema": schema,
                     "description": description,
+                    "max_terminal_payload_bytes": terminal_bound,
                     "execution_requirements": tuple(
                         sorted(
                             (
@@ -578,6 +596,20 @@ class RunCommandTool(Tool):
         )
 
     @property
+    def _result_publication_ceiling(self) -> int:
+        """The profile's publication ceiling, tightened to fit this tool's terminal bound.
+
+        Live results and journaled results both use it, so a result recovered
+        after a restart fits the declared bound exactly as the live one did.
+        """
+
+        ceiling = self._profile.result_publication_max_bytes
+        bound = self.spec.max_terminal_payload_bytes
+        if bound is None:
+            return ceiling
+        return min(ceiling, bound - TERMINAL_PAYLOAD_FIT_MARGIN_BYTES)
+
+    @property
     def selectors(self) -> tuple[DockerCodingCommandAuthority, ...]:
         return self._profile.structured_command_authorities
 
@@ -600,6 +632,7 @@ class RunCommandTool(Tool):
             ],
         }
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -868,7 +901,7 @@ class RunCommandTool(Tool):
                 authority=authority,
                 stdout=structured["stdout"],
                 stderr=structured["stderr"],
-                maximum=self._profile.result_publication_max_bytes,
+                maximum=self._result_publication_ceiling,
             )
         try:
             await journal.terminal(result)
@@ -900,7 +933,7 @@ class RunCommandTool(Tool):
                     authority=authority,
                     stdout=structured["stdout"],
                     stderr=structured["stderr"],
-                    maximum=self._profile.result_publication_max_bytes,
+                    maximum=self._result_publication_ceiling,
                 )
             return unsettled
         return result
@@ -1207,7 +1240,7 @@ class RunCommandTool(Tool):
                 or not cleanup_complete
             ),
         )
-        publication_ceiling = self._profile.result_publication_max_bytes
+        publication_ceiling = self._result_publication_ceiling
         if _tool_result_publication_bytes(result) > publication_ceiling and not store_output:
             artifact_status, output_artifact = await _store_output_artifact(
                 ctx,
@@ -1279,11 +1312,11 @@ class RunCommandTool(Tool):
             artifacts=list(artifacts),
             is_error=True,
         )
-        if _tool_result_publication_bytes(result) <= self._profile.result_publication_max_bytes:
+        if _tool_result_publication_bytes(result) <= self._result_publication_ceiling:
             return result
         return _minimal_publication_ceiling_result(
             authority,
-            maximum=self._profile.result_publication_max_bytes,
+            maximum=self._result_publication_ceiling,
         )
 
 
@@ -1720,6 +1753,7 @@ async def _recover_command_journal_result(
             record,
             authority=authority,
             profile=tool._profile,
+            maximum=tool._result_publication_ceiling,
         )
         return terminal.disposition == "confirmed" if inspection_only else terminal
     if state == "prepared":
@@ -2086,7 +2120,7 @@ async def _recover_runner_terminal_command_result(
         authority=authority,
         stdout=_required_text(raw_structured, "stdout"),
         stderr=_required_text(raw_structured, "stderr"),
-        maximum=tool._profile.result_publication_max_bytes,
+        maximum=tool._result_publication_ceiling,
     )
     desired = _copy_command_journal_record(record)
     desired.update(
@@ -2117,6 +2151,7 @@ def _recover_terminal_command_result(
     *,
     authority: DockerCodingCommandAuthority,
     profile: DockerCodingToolchainProfile,
+    maximum: int,
 ) -> DurableToolRecoveryEvidence:
     raw_result = record.get("terminal_result")
     try:
@@ -2148,7 +2183,7 @@ def _recover_terminal_command_result(
             authority=authority,
             stdout=structured["stdout"],
             stderr=structured["stderr"],
-            maximum=profile.result_publication_max_bytes,
+            maximum=maximum,
         )
     return _command_terminal_recovery_evidence(recovered)
 

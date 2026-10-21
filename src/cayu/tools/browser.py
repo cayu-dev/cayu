@@ -50,6 +50,10 @@ from cayu.runners.base import (
     RunnerWorkloadAuthority,
 )
 from cayu.runners.workloads import PINNED_BROWSER_FETCH_WORKLOAD
+from cayu.tools._terminal_bounds import (
+    DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+    spec_with_terminal_payload_bound,
+)
 from cayu.tools.base import (
     Tool,
     ToolContext,
@@ -483,6 +487,7 @@ class ScreenshotPageTool(Tool):
         expected_workload_authority: RunnerWorkloadAuthority | None = None,
         expected_artifact_store_id: str | None = None,
         spec: ToolSpec | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         self._worker_command = _browser_worker_command(worker_command)
         self.max_response_bytes = _bounded_int_configuration(
@@ -545,8 +550,13 @@ class ScreenshotPageTool(Tool):
         self.expected_workload_authority = _expected_workload_authority(expected_workload_authority)
         self.expected_artifact_store_id = _expected_artifact_store_id(expected_artifact_store_id)
         super().__init__(
-            _browser_worker_tool_spec(
-                type(self).spec if spec is None else spec, self._worker_command
+            spec_with_terminal_payload_bound(
+                _browser_worker_tool_spec(
+                    type(self).spec if spec is None else spec, self._worker_command
+                ),
+                max_terminal_payload_bytes,
+                # The PNG is an artifact reference; the result holds bounded page metadata.
+                default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
             )
         )
 

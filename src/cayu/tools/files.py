@@ -52,7 +52,17 @@ from cayu.tools._redaction import (
     record_ambiguous_secret_output,
     unstable_secret_redaction_result,
 )
+from cayu.tools._terminal_bounds import (
+    DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+    DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    TERMINAL_PAYLOAD_FIT_MARGIN_BYTES,
+    bounded_terminal_result,
+    spec_with_terminal_payload_bound,
+    tool_result_fits,
+)
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.vaults import SecretRedactor
 from cayu.workspaces.base import (
     Workspace,
     WorkspaceReadOffsetError,
@@ -84,6 +94,14 @@ MAX_LIST_OFFSET = 1_000_000
 DEFAULT_LIST_SCAN_LIMIT = 100_000
 MAX_LIST_SCAN_LIMIT = 1_000_000
 MAX_READ_FILES = 20
+# Room in a read_file result for its metadata header and structured fields.
+_READ_RESULT_FRAMING_BYTES = 64 * 1024
+_MIN_REFITTED_READ_BYTES = 4 * 1024
+_LINE_CUT_RETRY_HINT = "Retry next_start_line with a larger max_bytes to read the complete line."
+_LINE_CUT_PAGE_HINT = (
+    "This line is longer than read_file can return in one result. Read it in byte "
+    "pages instead: omit start_line and follow offset=next_offset."
+)
 _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
 _ARTIFACT_PAGE_METADATA_MAX_BYTES = 192
 
@@ -231,12 +249,11 @@ def _read_file_tool_spec(
 ) -> ToolSpec:
     return ToolSpec(
         name="read_file",
-        # Text is capped by MAX_READ_LIMIT_BYTES. Native attachments are
-        # represented by bounded metadata, but reserve their configured source
-        # ceiling plus framing/structured-result headroom conservatively.
-        max_terminal_payload_bytes=(
-            max(MAX_READ_LIMIT_BYTES, max_attachment_limit_bytes) + 1024 * 1024
-        ),
+        # Attachments are references to stored artifacts, not inline bytes. A
+        # text page that would not fit is read again with a smaller max_bytes.
+        # The default is the largest storable result, so any file Cayu can
+        # publish whole can still be read whole for its revision.
+        max_terminal_payload_bytes=MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
         # Workspace image/PDF snapshots and derived attachments use content-addressed
         # artifact ids, so replaying a read returns the same artifacts.
         effect=ToolEffect.IDEMPOTENT,
@@ -396,6 +413,7 @@ class ReadFileTool(Tool):
         default_attachment_limit_bytes: int = DEFAULT_ATTACHMENT_LIMIT_BYTES,
         max_attachment_limit_bytes: int = DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES,
         spec: ToolSpec | None = None,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
         default_attachment_limit_bytes = _validate_positive_int(
             default_attachment_limit_bytes,
@@ -415,7 +433,13 @@ class ReadFileTool(Tool):
                 default_attachment_limit_bytes=default_attachment_limit_bytes,
                 max_attachment_limit_bytes=max_attachment_limit_bytes,
             )
-        super().__init__(spec=spec)
+        super().__init__(
+            spec=spec_with_terminal_payload_bound(
+                spec,
+                max_terminal_payload_bytes,
+                default=MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
         self.default_attachment_limit_bytes = default_attachment_limit_bytes
         self.max_attachment_limit_bytes = max_attachment_limit_bytes
         if artifact_readers is not None and extra_artifact_readers is not None:
@@ -434,6 +458,7 @@ class ReadFileTool(Tool):
                 *default_artifact_readers(),
             ]
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -492,6 +517,10 @@ class ReadFileTool(Tool):
 
             if path is not None:
                 path = _validate_workspace_path_argument(path)
+
+        requested_max_bytes = max_bytes
+
+        async def read(max_bytes: int) -> ToolResult:
             options = ReadFileOptions(
                 max_bytes=max_bytes,
                 max_attachment_bytes=max_attachment_bytes,
@@ -500,26 +529,49 @@ class ReadFileTool(Tool):
                 image_region=region,
                 offset=offset,
             )
-        if entries is not None:
-            return await _read_workspace_files(ctx, entries=entries, max_bytes=max_bytes)
-        if path is not None:
-            return await _read_workspace_file(
-                ctx,
-                path=path,
-                artifact_readers=self.artifact_readers,
-                offset=offset,
-                options=options,
-                line_range=line_range,
-            )
-        if artifact_id is not None:
-            return await _read_artifact(
-                ctx,
-                artifact_id=artifact_id,
-                artifact_readers=self.artifact_readers,
-                options=options,
-                missing_as_result=True,
-            )
-        raise AssertionError("unreachable")
+            if entries is not None:
+                return await _read_workspace_files(ctx, entries=entries, max_bytes=max_bytes)
+            if path is not None:
+                return await _read_workspace_file(
+                    ctx,
+                    path=path,
+                    artifact_readers=self.artifact_readers,
+                    offset=offset,
+                    options=options,
+                    line_range=line_range,
+                    # A larger max_bytes cannot help once the bound limits it.
+                    line_cut_hint=(
+                        _LINE_CUT_PAGE_HINT
+                        if max_bytes < requested_max_bytes
+                        else _LINE_CUT_RETRY_HINT
+                    ),
+                )
+            if artifact_id is not None:
+                return await _read_artifact(
+                    ctx,
+                    artifact_id=artifact_id,
+                    artifact_readers=self.artifact_readers,
+                    options=options,
+                    missing_as_result=True,
+                )
+            raise AssertionError("unreachable")
+
+        # A page never asks for more text than the result may hold. Escaped
+        # text can still outgrow it, so read a smaller page until the result
+        # fits; its next_offset and truncated fields then stay accurate.
+        terminal_bound = self.spec.max_terminal_payload_bytes
+        if terminal_bound is not None:
+            framing = min(_READ_RESULT_FRAMING_BYTES, terminal_bound // 4)
+            max_bytes = min(max_bytes, terminal_bound - framing)
+        result = await read(max_bytes)
+        while (
+            not tool_result_fits(result, terminal_bound)
+            and max_bytes > _MIN_REFITTED_READ_BYTES
+            and not result.is_error
+        ):
+            max_bytes = max(_MIN_REFITTED_READ_BYTES, max_bytes // 2)
+            result = await read(max_bytes)
+        return result
 
 
 class _WorkspaceFileNotFoundError(RuntimeError):
@@ -559,6 +611,7 @@ async def _read_workspace_file(
     offset: int,
     options: ReadFileOptions,
     line_range: _LineRange | None = None,
+    line_cut_hint: str = _LINE_CUT_RETRY_HINT,
 ) -> ToolResult:
     workspace = _require_workspace(ctx)
     if workspace is None:
@@ -601,6 +654,7 @@ async def _read_workspace_file(
         offset=offset,
         line_range=line_range,
         options=options,
+        line_cut_hint=line_cut_hint,
     )
     if isinstance(read, ToolResult):
         return read
@@ -816,6 +870,7 @@ async def _read_workspace_lines(
     content_type: str,
     line_range: _LineRange,
     options: ReadFileOptions,
+    line_cut_hint: str = _LINE_CUT_RETRY_HINT,
 ) -> _WorkspaceText | ToolResult:
     """Select whole lines from the redacted text of the file's first read window."""
 
@@ -893,9 +948,7 @@ async def _read_workspace_lines(
     }
     if line_cut:
         structured["line_truncated"] = True
-        structured["continuation_hint"] = (
-            "Retry next_start_line with a larger max_bytes to read the complete line."
-        )
+        structured["continuation_hint"] = line_cut_hint
     if not whole_file:
         record_ambiguous_secret_output(ctx, read.capture_snapshot)
     return _WorkspaceText(text=text, structured=structured, capture_snapshot=read.capture_snapshot)
@@ -998,6 +1051,7 @@ async def _read_workspace_window(
     offset: int,
     line_range: _LineRange | None,
     options: ReadFileOptions,
+    line_cut_hint: str = _LINE_CUT_RETRY_HINT,
 ) -> _WorkspaceText | ToolResult:
     if line_range is None:
         return await _read_workspace_text(
@@ -1015,6 +1069,7 @@ async def _read_workspace_window(
         content_type=content_type,
         line_range=line_range,
         options=options,
+        line_cut_hint=line_cut_hint,
     )
 
 
@@ -2292,6 +2347,21 @@ class EditFileTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {}
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
+
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -2531,6 +2601,21 @@ class DeleteFileTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {}
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
+
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -2647,6 +2732,21 @@ class WriteFileTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {}
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
+
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -2767,7 +2867,15 @@ class ListFilesTool(Tool):
         *,
         exclude_directories: Iterable[str] = (),
         max_scan_entries: int = DEFAULT_LIST_SCAN_LIMIT,
+        max_terminal_payload_bytes: int | None = None,
     ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
         self.exclude_directories = _validate_list_exclude_directories(exclude_directories)
         if type(max_scan_entries) is not int or not 1 <= max_scan_entries <= MAX_LIST_SCAN_LIMIT:
             raise ValueError(f"max_scan_entries must be from 1 through {MAX_LIST_SCAN_LIMIT}.")
@@ -2779,6 +2887,7 @@ class ListFilesTool(Tool):
             "max_scan_entries": self.max_scan_entries,
         }
 
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -2816,6 +2925,13 @@ class ListFilesTool(Tool):
             )
             if max_result_bytes < 4_096:
                 raise ValueError("Tool argument `max_result_bytes` must be at least 4096.")
+            # Pages are fitted before next_offset is computed, so the declared
+            # terminal bound limits the page rather than cutting it afterwards.
+            terminal_bound = self.spec.max_terminal_payload_bytes
+            if terminal_bound is not None:
+                max_result_bytes = min(
+                    max_result_bytes, terminal_bound - TERMINAL_PAYLOAD_FIT_MARGIN_BYTES - 1024
+                )
             if offset >= self.max_scan_entries:
                 raise ValueError(
                     "Tool argument `offset` must be smaller than the configured scan limit."
@@ -2856,6 +2972,9 @@ class ListFilesTool(Tool):
             total_files=total_files,
             source_has_more=source_has_more,
             max_result_bytes=max_result_bytes,
+            # Measured as published: a redaction placeholder can be longer
+            # than the secret it replaces in a path.
+            redactor=active_secret_redactor(ctx),
         )
         next_offset = offset + len(selected)
         truncated_by_limit = len(candidates) == limit and source_has_more
@@ -2941,13 +3060,19 @@ def _fit_list_file_result(
     total_files: int | None,
     source_has_more: bool,
     max_result_bytes: int,
+    redactor: SecretRedactor | None = None,
 ) -> tuple[str, ...]:
+    if redactor is not None and redactor.has_values:
+        measured_pattern = redactor.redact_text(pattern)
+        measured_candidates = tuple(redactor.redact_text(path) for path in candidates)
+    else:
+        measured_pattern, measured_candidates = pattern, candidates
     selected: list[str] = []
-    for path in candidates:
-        proposed = (*selected, path)
+    for path, measured_path in zip(candidates, measured_candidates, strict=True):
+        proposed = (*measured_candidates[: len(selected)], measured_path)
         has_more = source_has_more or len(proposed) < len(candidates)
         worst_case = {
-            "pattern": pattern,
+            "pattern": measured_pattern,
             "files": list(proposed),
             "offset": offset,
             "next_offset": offset + len(proposed) if has_more else None,
@@ -3038,6 +3163,21 @@ class ListArtifactsTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         return {}
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        max_terminal_payload_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_with_terminal_payload_bound(
+                type(self).spec if spec is None else spec,
+                max_terminal_payload_bytes,
+                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            )
+        )
+
+    @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
