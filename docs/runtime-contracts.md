@@ -2913,6 +2913,23 @@ event or later admission event was never written. A runner created or replaced
 by binding is checked only after that binding becomes the exact lifecycle
 owner; a factory-returned runner is checked again after all binding/setup work.
 
+`EnvironmentFactoryResult.allocation_fingerprint` is the typed backend
+allocation identity, a lowercase SHA-256 digest that carries no provider data.
+Cayu checkpoints it in the same write as the reconnect metadata and removes it
+with that metadata. Without it, a recoverable allocation's identity is derived
+from its published allocation receipt. The identity a binding recorded stays
+in the disposal tombstone when Cayu retires a disposed allocation, so settling
+a lost model call and resuming the session work after the container is gone,
+whatever shape the factory gives `reconnect_metadata`. A factory composed from
+another factory keeps that behavior by passing the inner result's
+`allocation_fingerprint` through. A reconnect keeps the identity its
+allocation was checkpointed with: one that publishes a different identity fails
+before the result is adopted, and an allocation checkpointed without a
+published identity does not gain one from the typed field on reconnect. For
+checkpoints and tombstones written by earlier releases, Cayu reads the identity
+from a top-level `reconnect_metadata["allocation_fingerprint"]`; a result that
+sets both must make them equal.
+
 The runtime emits the established `environment.factory.*` and
 `environment.binding.*` events plus typed
 `environment.lifecycle.transition` records for selection, preflight,

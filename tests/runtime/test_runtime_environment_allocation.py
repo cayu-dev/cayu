@@ -1820,6 +1820,81 @@ def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(t
     }
 
 
+def test_reconnect_keeps_the_allocation_identity_it_was_checkpointed_with(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "dynamic"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="dynamic-workspace"),
+            ),
+            reconnect_metadata={"envelope": {"sandbox_id": "sandbox_1"}},
+        )
+        turns = [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+            for _ in range(4)
+        ]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider(turns), default=True)
+        app.register_environment_factory(EnvironmentSpec(name="dynamic"), factory, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def resume(session_id: str) -> list:
+            return [
+                event
+                async for event in app.resume(
+                    ResumeRequest(session_id=session_id, messages=[Message.text("user", "go")])
+                )
+            ]
+
+        async def identities(session_id: str):
+            checkpoint = await store.load_checkpoint(session_id)
+            return (checkpoint or {}).get("environment_factory_allocation_identity")
+
+        # Published through the typed field, beside metadata that does not carry it.
+        factory.allocation_fingerprint = "a" * 64
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_identity",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        assert await identities("sess_identity") == {"dynamic": "a" * 64}
+        await resume("sess_identity")
+        assert (await store.load("sess_identity")).status is SessionStatus.COMPLETED
+        factory.allocation_fingerprint = "b" * 64
+        changed = await resume("sess_identity")
+        assert any(event.type is EventType.ENVIRONMENT_FACTORY_FAILED for event in changed)
+        assert await identities("sess_identity") == {"dynamic": "a" * 64}
+
+        # An allocation checkpointed without an identity does not gain one later.
+        factory.allocation_fingerprint = None
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_no_identity",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        factory.allocation_fingerprint = "c" * 64
+        await resume("sess_no_identity")
+        assert (await store.load("sess_no_identity")).status is SessionStatus.COMPLETED
+        assert await identities("sess_no_identity") is None
+        return changed
+
+    changed = asyncio.run(run())
+    failed = next(event for event in changed if event.type is EventType.ENVIRONMENT_FACTORY_FAILED)
+    assert "changed its allocation fingerprint" in str(failed.payload)
+
+
 def test_cayu_app_environment_factory_reconnect_metadata_survives_context_checkpoint(
     tmp_path,
 ):

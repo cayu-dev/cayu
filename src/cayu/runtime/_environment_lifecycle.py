@@ -164,6 +164,7 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
 from cayu.runtime._environment_allocation import (
+    ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
@@ -174,6 +175,7 @@ from cayu.runtime._environment_allocation import (
     EnvironmentAllocationRecord,
     environment_allocation_parent_session_id,
     environment_allocation_source_owner_session_id,
+    set_checkpoint_allocation_identity,
 )
 from cayu.runtime._environment_allocation import (
     environment_factory_checkpoint_may_be_committed as _environment_factory_checkpoint_may_be_committed,
@@ -498,12 +500,7 @@ def _live_allocation_fingerprint(
     ).hexdigest()
 
 
-def _reconnect_allocation_fingerprint(reconnect_metadata: dict[str, Any]) -> str | None:
-    """Read one factory-published backend identity without exposing provider data."""
-
-    value = reconnect_metadata.get("allocation_fingerprint")
-    if value is None:
-        return None
+def _validated_allocation_fingerprint(value: object) -> str:
     if (
         type(value) is not str
         or len(value) != 64
@@ -513,6 +510,72 @@ def _reconnect_allocation_fingerprint(reconnect_metadata: dict[str, Any]) -> str
             "Environment factory allocation fingerprint must be a lowercase SHA-256 digest."
         )
     return value
+
+
+def _reconnect_allocation_fingerprint(reconnect_metadata: dict[str, Any]) -> str | None:
+    """Read the legacy top-level identity some factories put in reconnect metadata."""
+
+    value = reconnect_metadata.get("allocation_fingerprint")
+    if value is None:
+        return None
+    return _validated_allocation_fingerprint(value)
+
+
+def _published_allocation_fingerprint(
+    result: EnvironmentFactoryResult,
+    reconnect_metadata: dict[str, Any],
+) -> str | None:
+    """Return the backend identity a factory result publishes, typed field first."""
+
+    legacy = _reconnect_allocation_fingerprint(reconnect_metadata)
+    published = result.allocation_fingerprint
+    if published is None:
+        return legacy
+    published = _validated_allocation_fingerprint(published)
+    if legacy is not None and legacy != published:
+        raise ValueError(
+            "Environment factory allocation fingerprint conflicts with its reconnect metadata."
+        )
+    return published
+
+
+def _checkpoint_allocation_fingerprint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    environment_name: str,
+    reconnect_metadata: dict[str, Any],
+) -> str | None:
+    """Return the checkpointed factory-published identity of one live allocation.
+
+    Checkpoints written before the identity had its own record carry it only as
+    a top-level key of the reconnect metadata.
+    """
+
+    legacy = _reconnect_allocation_fingerprint(reconnect_metadata)
+    identities = (checkpoint or {}).get(ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY)
+    if identities is None:
+        return legacy
+    if type(identities) is not dict:
+        raise ValueError("Environment factory allocation identities must be an object.")
+    value = identities.get(environment_name)
+    if value is None:
+        return legacy
+    value = _validated_allocation_fingerprint(value)
+    if legacy is not None and legacy != value:
+        raise ValueError(
+            "Environment factory allocation identity conflicts with its reconnect metadata."
+        )
+    return value
+
+
+def _retired_allocation_fingerprint(retired: dict[str, Any]) -> str | None:
+    """Return the allocation identity a disposal tombstone retired."""
+
+    value = retired.get("allocation_fingerprint")
+    if value is not None:
+        return _validated_allocation_fingerprint(value)
+    # Tombstones written before the identity was recorded beside them.
+    return _reconnect_allocation_fingerprint(retired["reconnect_metadata"])
 
 
 class EnvironmentCapacityError(RuntimeError):
@@ -1086,7 +1149,7 @@ class EnvironmentLifecycle:
             is not None
         ):
             return False
-        return _reconnect_allocation_fingerprint(retired["reconnect_metadata"]) == allocation
+        return _retired_allocation_fingerprint(retired) == allocation
 
     async def checkpoint_terminal_binding_finalization(
         self,
@@ -3436,7 +3499,9 @@ class EnvironmentLifecycle:
                     "secret and cannot be checkpointed without changing reconnect semantics."
                 )
             _require_bounded_reconnect_metadata(reconnect_metadata)
-            reconnect_allocation_fingerprint = _reconnect_allocation_fingerprint(reconnect_metadata)
+            reconnect_allocation_fingerprint = _published_allocation_fingerprint(
+                result, reconnect_metadata
+            )
             if (
                 effective_operation is EnvironmentFactoryOperation.RECONNECT
                 and allocation_receipt is not None
@@ -3446,12 +3511,31 @@ class EnvironmentLifecycle:
                     "Recoverable environment factory changed its immutable reconnect "
                     "identity during reconnect."
                 )
+            if effective_operation is EnvironmentFactoryOperation.RECONNECT:
+                # A reconnect keeps the identity its allocation was checkpointed
+                # with, since bindings already recorded it. An allocation
+                # checkpointed without a published identity does not gain one
+                # from the typed field now.
+                durable_allocation_fingerprint = _checkpoint_allocation_fingerprint(
+                    checkpoint,
+                    environment_name=environment_name,
+                    reconnect_metadata=request.reconnect_metadata,
+                )
+                if durable_allocation_fingerprint is None:
+                    reconnect_allocation_fingerprint = _reconnect_allocation_fingerprint(
+                        reconnect_metadata
+                    )
+                elif reconnect_allocation_fingerprint != durable_allocation_fingerprint:
+                    raise RuntimeError(
+                        "Environment factory changed its allocation fingerprint during reconnect."
+                    )
             try:
                 if allocation_context is None:
                     await self._checkpoint_factory_reconnect_metadata(
                         session_id=session.id,
                         environment_name=environment_name,
                         reconnect_metadata=reconnect_metadata,
+                        allocation_fingerprint=reconnect_allocation_fingerprint,
                     )
                 else:
                     if allocation_context.state is not EnvironmentAllocationState.ACKNOWLEDGED:
@@ -3464,7 +3548,9 @@ class EnvironmentLifecycle:
                             "Recoverable environment factory result changed the acknowledged "
                             "reconnect identity."
                         )
-                    await allocation_context.publish()
+                    await allocation_context.publish(
+                        allocation_fingerprint=reconnect_allocation_fingerprint
+                    )
             except BaseException as exc:
                 # The checkpoint helper reconciles any failure after the
                 # transactional write begins. Only a durable read proving the
@@ -3875,6 +3961,7 @@ class EnvironmentLifecycle:
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
             ):
                 values = copied.get(key, {})
                 values.pop(environment_name, None)
@@ -3900,7 +3987,14 @@ class EnvironmentLifecycle:
                 raise SessionRunFenced("Allocation disposal lost its session generation.")
             copied = copy_durable_record(current or {}, "checkpoint")
             retired = copied.get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})
-            if retired.get(environment_name) == expected:
+            existing = retired.get(environment_name)
+            if (
+                type(existing) is dict
+                and {
+                    key: value for key, value in existing.items() if key != "allocation_fingerprint"
+                }
+                == expected
+            ):
                 # Read back an exact retirement whose commit acknowledgement was lost.
                 return copied
             pending = copied.get(_PENDING_ALLOCATION_DISPOSAL_KEY, {})
@@ -3930,12 +4024,25 @@ class EnvironmentLifecycle:
                 or receipt.reconnect_metadata != reconnect
             ):
                 raise RuntimeError("Allocation disposal conflicts with its receipt.")
-            copied.setdefault(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})[environment_name] = expected
+            # Keep the identity this allocation's bindings recorded. Once the
+            # identity record and receipt are gone, the reconnect metadata may
+            # not carry it, for example when a wrapping factory nests it.
+            allocation_fingerprint = _checkpoint_allocation_fingerprint(
+                copied,
+                environment_name=environment_name,
+                reconnect_metadata=reconnect,
+            ) or _live_allocation_fingerprint(None, receipt)
+            copied.setdefault(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})[environment_name] = (
+                expected
+                if allocation_fingerprint is None
+                else {**expected, "allocation_fingerprint": allocation_fingerprint}
+            )
             for key in (
                 _PENDING_ALLOCATION_DISPOSAL_KEY,
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
             ):
                 values = copied.get(key, {})
                 values.pop(environment_name, None)
@@ -4466,6 +4573,7 @@ class EnvironmentLifecycle:
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
             completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
         )
 
@@ -4951,6 +5059,11 @@ class EnvironmentLifecycle:
             "reason": "admission_refusal",
             "reconnect_metadata": expected_reconnect,
         }
+        refused_allocation_fingerprint = _published_allocation_fingerprint(
+            result, expected_reconnect
+        )
+        if refused_allocation_fingerprint is not None:
+            retired_marker["allocation_fingerprint"] = refused_allocation_fingerprint
 
         def retire(
             current_session: Session,
@@ -4999,6 +5112,7 @@ class EnvironmentLifecycle:
             for key in (
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
             ):
                 values = copied.get(key, {})
                 if type(values) is not dict:
@@ -7466,18 +7580,6 @@ class EnvironmentLifecycle:
             unique_failures,
         ) from (abandon_error or cleanup_error)
 
-    async def _load_factory_reconnect_state(
-        self,
-        *,
-        session_id: str,
-        environment_name: str,
-    ) -> tuple[dict[str, Any], str | None]:
-        checkpoint = await self._session_store.load_checkpoint(session_id)
-        return _factory_reconnect_state_from_checkpoint(
-            checkpoint,
-            environment_name=environment_name,
-        )
-
     async def require_live_allocation_fingerprint(
         self,
         *,
@@ -7486,15 +7588,20 @@ class EnvironmentLifecycle:
     ) -> str:
         """Load the session-owned pre-cutover backend identity from durable state."""
 
-        reconnect_metadata, allocation_owner = await self._load_factory_reconnect_state(
-            session_id=session_id,
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
+            checkpoint,
             environment_name=environment_name,
         )
         if allocation_owner != session_id:
             raise RuntimeError(
                 "Egress authority adoption has no session-owned environment allocation."
             )
-        fingerprint = _reconnect_allocation_fingerprint(reconnect_metadata)
+        fingerprint = _checkpoint_allocation_fingerprint(
+            checkpoint,
+            environment_name=environment_name,
+            reconnect_metadata=reconnect_metadata,
+        )
         if fingerprint is None:
             raise RuntimeError(
                 "Egress authority adoption has no durable pre-cutover allocation identity."
@@ -7538,8 +7645,10 @@ class EnvironmentLifecycle:
             raise RuntimeError(
                 "Environment allocation receipt conflicts with durable reconnect state."
             )
-        return _reconnect_allocation_fingerprint(
-            reconnect_metadata
+        return _checkpoint_allocation_fingerprint(
+            checkpoint,
+            environment_name=environment_name,
+            reconnect_metadata=reconnect_metadata,
         ) or _live_allocation_fingerprint(None, allocation_receipt)
 
     async def _checkpoint_factory_reconnect_metadata(
@@ -7548,6 +7657,7 @@ class EnvironmentLifecycle:
         session_id: str,
         environment_name: str,
         reconnect_metadata: dict[str, Any],
+        allocation_fingerprint: str | None,
     ) -> None:
         checkpoint = await self._session_store.load_checkpoint(session_id)
         copied_checkpoint = (
@@ -7571,6 +7681,11 @@ class EnvironmentLifecycle:
             owners = copy_durable_record(owners, "environment_factory_allocation_owner")
         owners[environment_name] = session_id
         copied_checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY] = owners
+        set_checkpoint_allocation_identity(
+            copied_checkpoint,
+            environment_name=environment_name,
+            allocation_fingerprint=allocation_fingerprint,
+        )
         try:
             await self._session_store.transform_checkpoint(
                 session_id,
@@ -7591,6 +7706,7 @@ class EnvironmentLifecycle:
                         session_id=session_id,
                         environment_name=environment_name,
                         reconnect_metadata=reconnect_metadata,
+                        allocation_fingerprint=allocation_fingerprint,
                     )
                 ),
                 cancellation=caller_cancellation,
@@ -7631,12 +7747,22 @@ class EnvironmentLifecycle:
         session_id: str,
         environment_name: str,
         reconnect_metadata: dict[str, Any],
+        allocation_fingerprint: str | None,
     ) -> bool:
-        persisted_metadata, allocation_owner = await self._load_factory_reconnect_state(
-            session_id=session_id,
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        persisted_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
+            checkpoint,
             environment_name=environment_name,
         )
-        return allocation_owner == session_id and persisted_metadata == reconnect_metadata
+        identities = (checkpoint or {}).get(ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY)
+        persisted_fingerprint = (
+            identities.get(environment_name) if type(identities) is dict else None
+        )
+        return (
+            allocation_owner == session_id
+            and persisted_metadata == reconnect_metadata
+            and persisted_fingerprint == allocation_fingerprint
+        )
 
 
 def render_initial_system_prompt(

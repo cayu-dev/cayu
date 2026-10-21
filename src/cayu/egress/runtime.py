@@ -1550,6 +1550,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 metadata=result_metadata,
                 reconnect_metadata=reconnect_metadata,
                 release=release,
+                allocation_fingerprint=reconnect_metadata.get("allocation_fingerprint"),
             )
         except BaseException as original:
             factory_settlement_tasks: list[asyncio.Task[None]] = []

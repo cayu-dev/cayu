@@ -40,6 +40,10 @@ ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY = "environment_factory_allocation_owner"
 ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY = "environment_factory_allocation_intents"
 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY = "environment_factory_allocation_receipts"
+# Factory-published allocation identity, kept beside the reconnect metadata it
+# describes and removed with it. Older checkpoints carry it only as a top-level
+# ``allocation_fingerprint`` inside the reconnect metadata.
+ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY = "environment_factory_allocation_identity"
 ENVIRONMENT_FACTORY_ALLOCATION_RECORD_SCHEMA_VERSION = 1
 ENVIRONMENT_FACTORY_RECONNECT_METADATA_MAX_BYTES = 32 * 1024
 _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
@@ -679,6 +683,7 @@ class EnvironmentAllocationCoordinator:
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
             ):
                 values = checkpoint_object_map(checkpoint, key)
                 values.pop(name, None)
@@ -719,6 +724,7 @@ class EnvironmentAllocationCoordinator:
         session_id: str,
         environment_name: str,
         expected_record: EnvironmentAllocationRecord,
+        allocation_fingerprint: str | None = None,
     ) -> None:
         if (
             expected_record.intent.session_id != session_id
@@ -785,6 +791,11 @@ class EnvironmentAllocationCoordinator:
             checkpoint[ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = reconnect_state
             checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY] = owner_state
             checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY] = receipts
+            set_checkpoint_allocation_identity(
+                checkpoint,
+                environment_name=environment_name,
+                allocation_fingerprint=allocation_fingerprint,
+            )
             if records:
                 checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY] = records
             else:
@@ -797,11 +808,17 @@ class EnvironmentAllocationCoordinator:
                 raise RuntimeError(
                     "Environment allocation publication unexpectedly deleted the checkpoint."
                 )
-            if not _publication_payload_matches(
-                transformed,
-                environment_name=environment_name,
-                session_id=session_id,
-                receipt=receipt,
+            if (
+                not _publication_payload_matches(
+                    transformed,
+                    environment_name=environment_name,
+                    session_id=session_id,
+                    receipt=receipt,
+                )
+                or checkpoint_object_map(
+                    transformed, ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY
+                ).get(environment_name)
+                != allocation_fingerprint
             ):
                 raise RuntimeError(
                     "Environment allocation publication was removed by the checkpoint transform."
@@ -1146,7 +1163,7 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
         self._adopt_record(persisted)
         return True
 
-    async def publish(self) -> None:
+    async def publish(self, *, allocation_fingerprint: str | None = None) -> None:
         record = self._record
         if record is None:
             raise RuntimeError(
@@ -1157,12 +1174,34 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
             session_id=self._intent.session_id,
             environment_name=self._intent.environment_name,
             expected_record=record,
+            allocation_fingerprint=allocation_fingerprint,
         )
 
     def _adopt_record(self, record: EnvironmentAllocationRecord) -> None:
         self._record = record
         self._intent = EnvironmentAllocationIntent.from_payload(record.intent.to_payload())
         self._state = record.state
+
+
+def set_checkpoint_allocation_identity(
+    checkpoint: dict[str, Any],
+    *,
+    environment_name: str,
+    allocation_fingerprint: str | None,
+) -> None:
+    """Record or clear one environment's factory-published allocation identity."""
+
+    identities = checkpoint_object_map(
+        checkpoint, ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY
+    )
+    if allocation_fingerprint is None:
+        identities.pop(environment_name, None)
+    else:
+        identities[environment_name] = allocation_fingerprint
+    if identities:
+        checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY] = identities
+    else:
+        checkpoint.pop(ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY, None)
 
 
 def checkpoint_object_map(

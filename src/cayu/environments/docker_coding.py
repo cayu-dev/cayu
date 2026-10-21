@@ -1665,6 +1665,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 metadata=metadata,
                 reconnect_metadata=reconnect_metadata,
                 release=release,
+                allocation_fingerprint=reconnect_metadata["allocation_fingerprint"],
             )
         except BaseException as original:
             if (
@@ -2063,6 +2064,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             metadata=metadata,
             reconnect_metadata=reconnect_metadata,
             release=release,
+            allocation_fingerprint=reconnect_metadata["allocation_fingerprint"],
         )
 
     async def _materialize_deferred(

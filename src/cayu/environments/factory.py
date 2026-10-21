@@ -660,6 +660,16 @@ class EnvironmentFactoryResult:
 
     ``release`` owns factory-created resources until workspace binding succeeds.
     After successful binding, the binding owns the adopted environment lifecycle.
+
+    ``allocation_fingerprint`` is the content-free identity of the backend
+    allocation this result attaches to, as a lowercase SHA-256 digest. Cayu
+    checkpoints it beside ``reconnect_metadata`` and, after the allocation is
+    disposed, uses it to prove that the disposal released exactly the allocation
+    a binding used. A factory that wraps another factory passes the inner
+    result's value through unchanged, whatever shape it gives its own
+    ``reconnect_metadata``. When this field is unset, Cayu still reads a
+    top-level ``reconnect_metadata["allocation_fingerprint"]``; when both are
+    present they must be equal.
     """
 
     environment: Environment
@@ -667,10 +677,19 @@ class EnvironmentFactoryResult:
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
     release: EnvironmentFactoryRelease | None = None
     release_timeout_s: float = DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS
+    allocation_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.environment, Environment):
             raise TypeError("EnvironmentFactoryResult.environment must be an Environment.")
+        if self.allocation_fingerprint is not None and (
+            type(self.allocation_fingerprint) is not str
+            or len(self.allocation_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in self.allocation_fingerprint)
+        ):
+            raise ValueError(
+                "EnvironmentFactoryResult.allocation_fingerprint must be a lowercase SHA-256 digest."
+            )
         if self.release is not None and not callable(self.release):
             raise TypeError("EnvironmentFactoryResult.release must be callable or None.")
         if type(self.release_timeout_s) not in {int, float}:
@@ -691,6 +710,16 @@ class EnvironmentFactoryResult:
             "reconnect_metadata",
             copy_durable_metadata(self.reconnect_metadata, "reconnect_metadata"),
         )
+        published = self.reconnect_metadata.get("allocation_fingerprint")
+        if (
+            self.allocation_fingerprint is not None
+            and published is not None
+            and published != self.allocation_fingerprint
+        ):
+            raise ValueError(
+                "EnvironmentFactoryResult.allocation_fingerprint conflicts with "
+                "reconnect_metadata['allocation_fingerprint']."
+            )
 
 
 class EnvironmentFactory(ABC):
@@ -917,6 +946,7 @@ def copy_environment_factory_result(result: EnvironmentFactoryResult) -> Environ
         reconnect_metadata=result.reconnect_metadata,
         release=result.release,
         release_timeout_s=result.release_timeout_s,
+        allocation_fingerprint=result.allocation_fingerprint,
     )
 
 

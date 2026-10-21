@@ -151,6 +151,7 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         release: Any = None,
         release_timeout_s: float = 15.0,
         create_error: BaseException | None = None,
+        allocation_fingerprint: str | None = None,
     ) -> None:
         self.environment = environment
         self.fail_create = fail_create
@@ -159,6 +160,7 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         self.release = release
         self.release_timeout_s = release_timeout_s
         self.create_error = create_error
+        self.allocation_fingerprint = allocation_fingerprint
         self.requests: list[EnvironmentFactoryRequest] = []
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
@@ -173,6 +175,7 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
             reconnect_metadata=self.reconnect_metadata,
             release=self.release,
             release_timeout_s=self.release_timeout_s,
+            allocation_fingerprint=self.allocation_fingerprint,
         )
 
 

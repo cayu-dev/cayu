@@ -268,6 +268,17 @@ Notes:
   A reconnectable fresh-path virtual-egress adapter must also preserve Cayu's
   backend allocation fingerprint in that metadata; a reconnect without that
   positive identity proof fails closed before adapter preparation.
+- `EnvironmentFactoryResult.allocation_fingerprint` is the content-free identity
+  of the backend allocation, a lowercase SHA-256 digest. Cayu checkpoints it
+  next to `reconnect_metadata` and uses it to match a disposed allocation to the
+  bindings that used it, so a session whose container was already disposed can
+  still be settled and resumed. Cayu's Docker coding and virtual-egress
+  factories set it. A factory that wraps another factory passes the inner
+  result's `allocation_fingerprint` through, even when it nests the inner
+  `reconnect_metadata` under its own keys. A reconnect must publish the
+  identity its allocation was checkpointed with. A top-level `reconnect_metadata["allocation_fingerprint"]`
+  is still read when the field is unset, and must equal the field when both
+  are set.
 - A result that owns live resources represented by `reconnect_metadata` should
   provide `EnvironmentFactoryResult.release`. The runtime calls it with
   `DISCARD` when a new allocation fails before the durable checkpoint and

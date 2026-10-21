@@ -3,11 +3,15 @@
 Only the Docker transport is substituted: each container is a local directory
 whose commands run on the host. The Docker coding factory, binding, disposal
 retirement, model-completion settlement and recovery are the shipped owners.
+Some scenarios compose that factory inside an application factory that nests
+its reconnect metadata, the way an application wraps Cayu's parts.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +20,16 @@ import pytest
 
 import cayu.environments.docker_coding as docker_coding
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, SessionStatus
-from cayu.environments import DockerCodingEnvironmentFactory, EnvironmentSpec
+from cayu.environments import (
+    DockerCodingEnvironmentFactory,
+    Environment,
+    EnvironmentAllocationContext,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+    copy_environment_factory_result,
+)
 from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
 from cayu.providers import (
     ModelProvider,
@@ -145,7 +158,151 @@ class _LosesFirstCall(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-def _app(root: Path, monkeypatch, tasks):
+def _nest(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    return {"envelope": "application", "inner": dict(metadata)}
+
+
+def _unnest(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    assert metadata["envelope"] == "application"
+    return dict(metadata["inner"])
+
+
+class _NestingAllocation(EnvironmentAllocationContext):
+    """Shows the inner factory its own metadata; Cayu stores the envelope."""
+
+    def __init__(self, outer: EnvironmentAllocationContext) -> None:
+        self._outer = outer
+
+    @property
+    def intent(self):
+        return self._outer.intent
+
+    @property
+    def state(self):
+        return self._outer.state
+
+    @property
+    def dispatch_precluded(self) -> bool:
+        return self._outer.dispatch_precluded
+
+    @property
+    def acknowledged_reconnect_metadata(self):
+        acknowledged = self._outer.acknowledged_reconnect_metadata
+        return None if acknowledged is None else _unnest(acknowledged)
+
+    async def prepare(self, provider_metadata):
+        return await self._outer.prepare(provider_metadata)
+
+    async def mark_dispatched(self) -> None:
+        await self._outer.mark_dispatched()
+
+    async def acknowledge(self, reconnect_metadata) -> None:
+        await self._outer.acknowledge(_nest(reconnect_metadata))
+
+    async def mark_reaping(self) -> bool:
+        return await self._outer.mark_reaping()
+
+    async def mark_reaped(self) -> None:
+        await self._outer.mark_reaped()
+
+
+class _NestingFactory(EnvironmentFactory):
+    """An application factory that composes the Docker coding factory.
+
+    It keeps the inner reconnect metadata under its own key, so no allocation
+    identity sits at the top level of what Cayu checkpoints.
+    """
+
+    def __init__(
+        self,
+        inner: DockerCodingEnvironmentFactory,
+        *,
+        recoverable: bool,
+        pass_identity: bool,
+    ) -> None:
+        self.inner = inner
+        self.recoverable = recoverable
+        self.pass_identity = pass_identity
+        self.published: list[dict[str, Any]] = []
+
+    def _inner_request(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryRequest:
+        if not request.reconnect_metadata:
+            return request
+        return replace(request, reconnect_metadata=_unnest(request.reconnect_metadata))
+
+    def _wrap(self, result: EnvironmentFactoryResult) -> EnvironmentFactoryResult:
+        nested = _nest(result.reconnect_metadata)
+        self.published.append(nested)
+        return replace(
+            result,
+            reconnect_metadata=nested,
+            allocation_fingerprint=(result.allocation_fingerprint if self.pass_identity else None),
+        )
+
+    @property
+    def secret_resolution_scope(self):
+        return self.inner.secret_resolution_scope
+
+    @property
+    def execution_profile_identity(self):
+        return self.inner.execution_profile_identity
+
+    def execution_admission_candidate(self, request):
+        return self.inner.execution_admission_candidate(self._inner_request(request))
+
+    def construction_admission_candidate(self):
+        return self.inner.construction_admission_candidate()
+
+    def execution_environment_authority(self):
+        return self.inner.execution_environment_authority()
+
+    def workload_authority(self, name):
+        return self.inner.workload_authority(name)
+
+    @property
+    def configured_artifact_store(self):
+        return self.inner.configured_artifact_store
+
+    def allocation_scope(self, request):
+        if not self.recoverable:
+            return None
+        return self.inner.allocation_scope(self._inner_request(request))
+
+    async def create_recoverable(self, request, allocation):
+        return self._wrap(
+            await self.inner.create_recoverable(
+                self._inner_request(request), _NestingAllocation(allocation)
+            )
+        )
+
+    async def reap_allocation(self, request, allocation):
+        await self.inner.reap_allocation(
+            self._inner_request(request), _NestingAllocation(allocation)
+        )
+
+    async def recover_finalization_disposal(self, request, state):
+        await self.inner.recover_finalization_disposal(self._inner_request(request), state)
+
+    async def is_allocation_disposed(self, request):
+        return await self.inner.is_allocation_disposed(self._inner_request(request))
+
+    async def release_idle_resources(self) -> None:
+        await self.inner.release_idle_resources()
+
+    async def close_idle_resources(self) -> None:
+        await self.inner.close_idle_resources()
+
+    async def create(self, request):
+        return self._wrap(await self.inner.create(self._inner_request(request)))
+
+
+def _app(
+    root: Path,
+    monkeypatch,
+    tasks,
+    *,
+    wrap: Callable[[DockerCodingEnvironmentFactory], EnvironmentFactory] | None = None,
+):
     # Stand in for a process lost after model.error, before the live run
     # could settle the deadline, which leaves the dispatched call fenced.
     async def keep_fenced(self, context, exc):
@@ -185,7 +342,7 @@ def _app(root: Path, monkeypatch, tasks):
     app.register_agent(AgentSpec(name="builder", model="test-model"))
     app.register_environment_factory(
         EnvironmentSpec(name="coding", execution_profile_identity=_identity("tests:lost-call")),
-        factory,
+        factory if wrap is None else wrap(factory),
         default=True,
     )
     return app, store, provider, containers
@@ -286,7 +443,110 @@ def test_manual_settlement_resumes_session_after_run_disposed_its_container(
     asyncio.run(asyncio.wait_for(scenario(), timeout=60))
 
 
-def test_settlement_refuses_a_retired_disposal_of_another_allocation(tmp_path, monkeypatch):
+async def _lose_call_settle_and_resume(store, app, provider, containers, *, before_recovery=None):
+    with pytest.raises(ModelStreamDeadlineError):
+        await _drain(
+            app.run(
+                RunRequest(
+                    agent_name="builder",
+                    session_id="build-session",
+                    messages=[Message.text("user", "build it")],
+                )
+            )
+        )
+    session = await store.load("build-session")
+    [container] = containers
+    assert container.container_removed
+    checkpoint = await store.load_checkpoint("build-session")
+    assert "environment_factory_allocation_owner" not in checkpoint
+    assert "environment_factory_allocation_identity" not in checkpoint
+    if before_recovery is not None:
+        await store.transform_checkpoint("build-session", before_recovery)
+    active = await store.load_active_model_completion_stage("build-session")
+    await app.recover_model_completion_stage(
+        ModelCompletionManualRecoveryRequest(
+            session_id="build-session",
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=session.run_epoch,
+            terminal_status=SessionStatus.INTERRUPTED,
+        )
+    )
+    recovered = await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(session_id="build-session")
+    )
+    assert recovered.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
+    await _drain(
+        app.resume(
+            ResumeRequest(
+                session_id="build-session",
+                messages=[Message.text("user", "Redo the lost step.")],
+            )
+        )
+    )
+    assert (await store.load("build-session")).status is SessionStatus.COMPLETED
+    assert provider.requests == 2
+    assert len(containers) == 2 and all(item.container_removed for item in containers)
+
+
+@pytest.mark.parametrize(
+    ("recoverable", "pass_identity"),
+    [(True, True), (True, False), (False, True)],
+    ids=["recoverable-passes-identity", "recoverable-nests-only", "non-recoverable"],
+)
+def test_wrapping_factory_with_nested_metadata_recovers_after_disposal(
+    tmp_path, monkeypatch, recoverable, pass_identity
+):
+    wrappers: list[_NestingFactory] = []
+
+    def wrap(inner):
+        wrappers.append(
+            _NestingFactory(inner, recoverable=recoverable, pass_identity=pass_identity)
+        )
+        return wrappers[-1]
+
+    async def scenario():
+        app, store, provider, containers = _app(tmp_path, monkeypatch, None, wrap=wrap)
+        try:
+            await _lose_call_settle_and_resume(store, app, provider, containers)
+            # Cayu checkpointed only the envelope; no identity sat at its top level.
+            [wrapper] = wrappers
+            assert wrapper.published
+            assert all("allocation_fingerprint" not in item for item in wrapper.published)
+        finally:
+            await app.drain_environment_cleanups(timeout_s=10)
+            await store.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=60))
+
+
+def test_tombstone_without_identity_from_older_release_still_recovers(tmp_path, monkeypatch):
+    # Older releases recorded the allocation identity only inside the retired
+    # reconnect metadata, never beside it in the disposal tombstone.
+    def strip_tombstone_identity(_session, checkpoint):
+        retired = checkpoint["environment_factory_retired_disposals"]["coding"]
+        assert (
+            retired.pop("allocation_fingerprint")
+            == (retired["reconnect_metadata"]["allocation_fingerprint"])
+        )
+        return checkpoint
+
+    async def scenario():
+        app, store, provider, containers = _app(tmp_path, monkeypatch, None)
+        try:
+            await _lose_call_settle_and_resume(
+                store, app, provider, containers, before_recovery=strip_tombstone_identity
+            )
+        finally:
+            await app.drain_environment_cleanups(timeout_s=10)
+            await store.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=60))
+
+
+@pytest.mark.parametrize("tombstone", ["current", "legacy"])
+def test_settlement_refuses_a_retired_disposal_of_another_allocation(
+    tmp_path, monkeypatch, tombstone
+):
     async def scenario():
         app, store, _provider, _containers = _app(tmp_path, monkeypatch, None)
         try:
@@ -313,7 +573,11 @@ def test_settlement_refuses_a_retired_disposal_of_another_allocation(tmp_path, m
 
             def foreign(_session, checkpoint):
                 retired = checkpoint["environment_factory_retired_disposals"]["coding"]
-                retired["reconnect_metadata"]["allocation_fingerprint"] = "f" * 64
+                if tombstone == "current":
+                    retired["allocation_fingerprint"] = "f" * 64
+                else:
+                    del retired["allocation_fingerprint"]
+                    retired["reconnect_metadata"]["allocation_fingerprint"] = "f" * 64
                 return checkpoint
 
             await store.transform_checkpoint("build-session", foreign)
@@ -377,3 +641,79 @@ def test_abandoned_sweep_settles_a_task_bound_call_without_taking_the_task(tmp_p
             await store.close()
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=60))
+
+
+def test_live_identity_reads_its_record_or_an_older_top_level_key(tmp_path, monkeypatch):
+    async def scenario():
+        app, store, _provider, _containers = _app(tmp_path, monkeypatch, None)
+        try:
+            with pytest.raises(ModelStreamDeadlineError):
+                await _drain(
+                    app.run(
+                        RunRequest(
+                            agent_name="builder",
+                            session_id="build-session",
+                            messages=[Message.text("user", "build it")],
+                        )
+                    )
+                )
+
+            def live(reconnect, identities):
+                def transform(_session, checkpoint):
+                    checkpoint["environment_factory_reconnect"] = {"coding": reconnect}
+                    checkpoint["environment_factory_allocation_owner"] = {"coding": "build-session"}
+                    if identities is None:
+                        checkpoint.pop("environment_factory_allocation_identity", None)
+                    else:
+                        checkpoint["environment_factory_allocation_identity"] = identities
+                    return checkpoint
+
+                return transform
+
+            async def identity():
+                return await app._environment_lifecycle.durable_live_allocation_fingerprint(
+                    session_id="build-session", environment_name="coding"
+                )
+
+            # A checkpoint from an older release: the identity is only top level.
+            await store.transform_checkpoint(
+                "build-session", live({"handle": "h", "allocation_fingerprint": "a" * 64}, None)
+            )
+            assert await identity() == "a" * 64
+            # Nested metadata whose identity was published through the typed field.
+            await store.transform_checkpoint(
+                "build-session", live(_nest({"handle": "h"}), {"coding": "b" * 64})
+            )
+            assert await identity() == "b" * 64
+            await store.transform_checkpoint(
+                "build-session",
+                live({"handle": "h", "allocation_fingerprint": "a" * 64}, {"coding": "b" * 64}),
+            )
+            with pytest.raises(ValueError, match="identity conflicts"):
+                await identity()
+        finally:
+            await app.drain_environment_cleanups(timeout_s=10)
+            await store.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=60))
+
+
+def test_factory_result_rejects_a_malformed_or_conflicting_identity(tmp_path):
+    environment = Environment(
+        EnvironmentSpec(name="coding"),
+        workspace=LocalWorkspace(tmp_path, workspace_id="source"),
+    )
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        EnvironmentFactoryResult(environment=environment, allocation_fingerprint="A" * 64)
+    with pytest.raises(ValueError, match="conflicts"):
+        EnvironmentFactoryResult(
+            environment=environment,
+            reconnect_metadata={"allocation_fingerprint": "a" * 64},
+            allocation_fingerprint="b" * 64,
+        )
+    agreeing = EnvironmentFactoryResult(
+        environment=environment,
+        reconnect_metadata={"allocation_fingerprint": "a" * 64},
+        allocation_fingerprint="a" * 64,
+    )
+    assert copy_environment_factory_result(agreeing).allocation_fingerprint == "a" * 64
