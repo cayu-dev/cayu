@@ -938,7 +938,12 @@ same schema, environment fingerprint, immutable-image fingerprint, toolchain
 profile fingerprint, candidate, environment authority, and binding generation.
 It cannot allocate or select a replacement or mint authorization itself.
 Unsupported renewal, failed inspection, identity drift, and evidence that is
-still stale fail closed. A renewal implementation must settle every dispatched
+still stale fail closed. A runner whose `lifecycle_state` is `closed` or
+`poisoned`, for example after timeout or cancellation cleanup removed its
+sandbox, is refused before tool-dependent or expired-evidence dispatch without
+a renewal attempt, even while its retained evidence is unexpired. The refusal
+is `missing_final_evidence` with reason code `runner_closed` or
+`runner_poisoned`. A renewal implementation must settle every dispatched
 probe or transfer an authenticated settlement owner on every return and raise
 path; the runtime fences later dispatch and final binding cleanup behind that
 owner.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, SupportsIndex
+from typing import TYPE_CHECKING, Any, Literal, SupportsIndex
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu.environments.admission import (
@@ -365,6 +365,24 @@ class _RunnerAdmissionSnapshot:
     authority: object | None
     authority_failed: bool
     settlement_tasks: tuple[asyncio.Task[None], ...]
+    terminal_runner_state: Literal["closed", "poisoned"] | None = None
+
+
+def _terminal_runner_state(runner: Any) -> Literal["closed", "poisoned"] | None:
+    """Return a runner state from which no later probe or command can succeed."""
+
+    if runner is None:
+        return None
+    try:
+        state = runner.lifecycle_state
+    except Exception:
+        # Unreadable state grants nothing; the evidence checks still decide.
+        return None
+    if state == "closed":
+        return "closed"
+    if state == "poisoned":
+        return "poisoned"
+    return None
 
 
 async def _runner_admission_snapshot(
@@ -375,6 +393,20 @@ async def _runner_admission_snapshot(
     runner = exposure.runner
 
     async def snapshot() -> _RunnerAdmissionSnapshot:
+        # Retained evidence can outlive its runner, for example after timeout
+        # cleanup removed the sandbox. It must not admit dispatch while fresh,
+        # and renewal cannot re-probe it once expired, so refuse with the
+        # runner's state instead of a misleading evidence-age code.
+        terminal_runner_state = _terminal_runner_state(runner)
+        if terminal_runner_state is not None:
+            return _RunnerAdmissionSnapshot(
+                candidate=None,
+                candidate_supplied=False,
+                authority=None,
+                authority_failed=False,
+                settlement_tasks=(),
+                terminal_runner_state=terminal_runner_state,
+            )
         candidate: ExecutionAdmissionCandidate | None = None
         candidate_supplied = False
         authority: object | None = None
@@ -434,6 +466,14 @@ def _snapshot_decision(
     exposure: _EnvironmentExposure,
     snapshot: _RunnerAdmissionSnapshot,
 ) -> ExecutionAdmissionDecision:
+    if snapshot.terminal_runner_state is not None:
+        return _structured_execution_refusal(
+            candidate=exposure.candidate,
+            requirements=exposure.decision.requirements,
+            evidence=None,
+            code="missing_final_evidence",
+            reason_code=f"runner_{snapshot.terminal_runner_state}",
+        )
     candidate = snapshot.candidate
     if candidate is None:
         return _structured_execution_refusal(

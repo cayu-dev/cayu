@@ -117,6 +117,26 @@ def test_deferred_binary_stream_requires_materialized_capability(tmp_path, suppo
     asyncio.run(scenario())
 
 
+def test_deferred_runner_reports_its_materialized_runner_lifecycle(tmp_path) -> None:
+    concrete = LocalRunner(tmp_path)
+
+    async def materialize(mode):
+        return concrete, None
+
+    deferred = DeferredMaterialization(materialize, default_cwd=str(tmp_path))
+
+    async def scenario():
+        assert deferred.runner.lifecycle_state == "reusable"
+        await deferred.materialize()
+        assert deferred.runner.lifecycle_state == "reusable"
+        # Command cleanup can remove the materialized sandbox directly, so the
+        # wrapper must not keep reporting the exact runner as reusable.
+        await concrete.close()
+        assert deferred.runner.lifecycle_state == "closed"
+
+    asyncio.run(scenario())
+
+
 class DeferredLocalFactory(EnvironmentFactory):
     """Deferred factory over local directories: a stand-in for a container."""
 

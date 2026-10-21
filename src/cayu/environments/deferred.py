@@ -25,6 +25,7 @@ from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, Runner
 from cayu.runners.base import (
     RunnerBinaryStreamCapability,
     RunnerExecutionAdmissionObserver,
+    RunnerLifecycleState,
     RunnerUnavailableError,
 )
 from cayu.workspaces.revisions import WorkspaceIdentity, WorkspaceRevisionObservation
@@ -433,6 +434,20 @@ class DeferredRunner(Runner):
 
     def _live(self) -> Runner | None:
         return self._deferred.materialized_runner
+
+    @property
+    def lifecycle_state(self) -> RunnerLifecycleState:
+        """Include the materialized runner's execution eligibility."""
+
+        outer = super().lifecycle_state
+        live = self._live()
+        if live is None:
+            return outer
+        inner = live.lifecycle_state
+        for state in ("closed", "poisoned", "closing", "fenced"):
+            if state in (outer, inner):
+                return state
+        return "reusable"
 
     async def _target(self) -> Runner:
         self._ensure_exec_open()

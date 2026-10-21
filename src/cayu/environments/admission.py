@@ -633,8 +633,12 @@ def _structured_execution_refusal(
     evidence: ExecutionCapabilityEvidence | None,
     code: ExecutionAdmissionRefusalCode,
     stage: ExecutionAdmissionStage = "pre_exposure",
+    reason_code: str | None = None,
 ) -> ExecutionAdmissionDecision:
-    """Build one bounded refusal without retaining extension-owned diagnostics."""
+    """Build one bounded refusal without retaining extension-owned diagnostics.
+
+    ``reason_code`` is a runtime-owned identity, never extension text.
+    """
 
     return ExecutionAdmissionDecision(
         status="refused",
@@ -647,6 +651,7 @@ def _structured_execution_refusal(
             ExecutionAdmissionRefusal(
                 code=code,
                 observed_state="mismatched",
+                reason_code=reason_code,
             ),
         ),
     )
@@ -685,6 +690,8 @@ class ExecutionAdmissionError(RuntimeError):
                 reason = f"executable:{refusal.executable}"
             else:
                 reason = "admission evidence"
+                if refusal.reason_code is not None:
+                    reason += f" ({refusal.reason_code})"
             reason += f" [{refusal.code}]"
             if reason not in seen:
                 seen.add(reason)

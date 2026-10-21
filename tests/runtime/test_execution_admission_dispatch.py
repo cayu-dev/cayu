@@ -2813,6 +2813,115 @@ def test_search_text_renews_stale_executable_with_missing_native_alternative(
         )
 
 
+@pytest.mark.parametrize("evidence_age", ["fresh", "expired"])
+def test_runner_closed_by_command_cleanup_is_refused_by_state_not_evidence_age(
+    evidence_clock: type[_EvidenceClock],
+    evidence_age: str,
+) -> None:
+    """A sandbox removed by command cleanup is refused as closed, never re-probed."""
+
+    class SearchRunner(_RenewingEvidenceRunner):
+        def _live_candidate(self, *, valid_for_seconds, drift_field=None):
+            candidate = super()._live_candidate(
+                valid_for_seconds=valid_for_seconds, drift_field=drift_field
+            )
+            evidence = candidate.evidence
+            assert evidence is not None
+            now = datetime.now(UTC)
+            executable = admission_module.ExecutionExecutableEvidence(
+                executable="rg",
+                state="live_verified",
+                observed_at=now,
+                valid_until=now + timedelta(seconds=valid_for_seconds),
+                requirement_fingerprint=ToolExecutableRequirement(executable="rg").fingerprint,
+            )
+            return candidate.model_copy(
+                update={
+                    "evidence": evidence.model_copy(
+                        update={
+                            "tool_requirements": admission_module.ExecutionToolRequirementEvidence(
+                                environment_fingerprint=evidence.environment_fingerprint,
+                                image_fingerprint=evidence.image_fingerprint,
+                                executables=(executable,),
+                            )
+                        }
+                    )
+                }
+            )
+
+        async def refresh_execution_admission(self) -> None:
+            # Like live adapters, a renewal probe cannot run on a closed runner.
+            self.refresh_calls += 1
+            self._ensure_exec_open()
+            await super().refresh_execution_admission()
+            self.refresh_calls -= 1
+
+    class CloseSandboxTool(Tool):
+        spec = ToolSpec(
+            name="close_sandbox",
+            description="Stand in for a command whose timeout cleanup removed the sandbox.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self, runner: Runner) -> None:
+            super().__init__()
+            self.runner = runner
+
+        async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx, args
+            await self.runner.close()
+            if evidence_age == "expired":
+                evidence_clock.advance(seconds=61)
+            return ToolResult(content="Command timed out.", is_error=True)
+
+    class ToolProvider(ModelProvider):
+        name = "closing-tool-provider"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_close", name="close_sandbox", arguments={}
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> tuple[list[Event], ToolProvider, SearchRunner]:
+        provider = ToolProvider()
+        runner = SearchRunner()
+        runner.current_candidate = runner._live_candidate(valid_for_seconds=60)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool(), CloseSandboxTool(runner)],
+        )
+        events = await _run(app, f"sess_closed_runner_{evidence_age}")
+        return events, provider, runner
+
+    events, provider, runner = asyncio.run(run())
+
+    assert runner.lifecycle_state == "closed"
+    assert len(provider.requests) == 1
+    assert runner.refresh_calls == 0
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert failed.payload["error_type"] == "ExecutionAdmissionError"
+    assert (
+        "admission evidence (runner_closed) [missing_final_evidence]" in (failed.payload["error"])
+    )
+    refusals = failed.payload["execution_admission"]["refusals"]
+    assert [(refusal["code"], refusal["reason_code"]) for refusal in refusals] == [
+        ("missing_final_evidence", "runner_closed")
+    ]
+
+
 @pytest.mark.parametrize("mismatch", ["runner", "requirements", "type"])
 def test_public_admission_rejects_mismatched_observer_before_provider(mismatch):
     class MismatchedRunner(_EvidenceRunner):
