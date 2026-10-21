@@ -11567,8 +11567,14 @@ wire-level limits.
 `ChatCompletionsProvider` targets OpenAI-compatible
 `/v1/chat/completions` services rather than the Responses API. Its `base_url`
 includes the version path and the adapter appends `/chat/completions` without
-disturbing query parameters or fragments. When `api_version` is configured, it
-replaces any URL-provided `api-version` values and is emitted exactly once.
+disturbing query parameters or fragments. It never adds a version path itself,
+except that a bare `api.openai.com` host (or a regional `*.api.openai.com` host)
+is read as that host's `/v1`. `OpenAIProvider` instead takes the API root and
+adds `/v1/...` to every request; a `base_url` ending in `/v1` has that suffix
+removed, so `https://host` and `https://host/v1` reach the same
+`https://host/v1/...` URLs and the same execution-profile identity. When
+`api_version` is configured, it replaces any URL-provided `api-version` values
+and is emitted exactly once.
 `document_encoding="file"` uses the OpenAI/Azure file content part, while
 `document_encoding="image_url"` supports compatible services such as Gemini
 that carry PDFs through an image URL part. Vendor-specific authentication,

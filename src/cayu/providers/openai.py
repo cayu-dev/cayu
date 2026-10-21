@@ -9,7 +9,7 @@ from functools import cache
 from hashlib import sha256
 from itertools import islice
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -179,6 +179,9 @@ from cayu.vaults.redaction import REDACTED_SECRET
 if TYPE_CHECKING:
     import httpx
 
+# base_url is the API root without the version path: requests go to
+# f"{base_url}/v1/...". A base that already ends in "/v1", as OPENAI_BASE_URL
+# does for the OpenAI SDK, is accepted and the suffix is dropped.
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
 OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN = 6
@@ -1196,7 +1199,12 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
 
 
 class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
-    """OpenAI Responses API adapter for Cayu's provider-neutral runtime."""
+    """OpenAI Responses API adapter for Cayu's provider-neutral runtime.
+
+    ``base_url`` is the API root, such as ``https://api.openai.com``; requests
+    go to ``{base_url}/v1/...``. A base ending in ``/v1``, the form the OpenAI
+    SDK's ``OPENAI_BASE_URL`` uses, is also accepted and reaches the same URLs.
+    """
 
     name = "openai"
     usage_dialect = UsageDialect.OPENAI
@@ -7634,9 +7642,16 @@ def _copy_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
 
 
 def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:
-    return validate_base_url(
+    validated = validate_base_url(
         base_url, provider_label="OpenAI", allow_http=allow_http, allow_http_hint=True
     )
+    # Request paths already start with "/v1", so drop one trailing "/v1" rather
+    # than sending ".../v1/v1/responses".
+    parts = urlsplit(validated)
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1"):
+        return urlunsplit(parts._replace(path=path.removesuffix("/v1")))
+    return validated
 
 
 def _validate_url(url: str, field_name: str, *, allow_http: bool = False) -> str:

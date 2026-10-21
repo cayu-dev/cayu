@@ -25,6 +25,14 @@ None.
   conversation content. The cursor is a position in the store's event sequence,
   so a reader continues across restarts without a gap.
   `cayu.cloud_reporting.read_cloud_activity` reads the same pages in process.
+- `OpenAIProvider` accepts a `base_url` that ends in `/v1`, the form the
+  OpenAI SDK's `OPENAI_BASE_URL` uses. It used to add its own `/v1` on top and
+  send requests to `.../v1/v1/responses`; now `https://host` and
+  `https://host/v1` both reach `https://host/v1/...`. `ChatCompletionsProvider`
+  still takes the base with its version path (`https://host/v1`), and now reads
+  a bare `https://api.openai.com` as `https://api.openai.com/v1` instead of
+  posting to a path OpenAI doesn't serve. The providers guide says which form
+  each one expects.
 
 ## v0.13.0
 

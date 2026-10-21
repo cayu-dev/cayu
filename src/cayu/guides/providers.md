@@ -25,6 +25,15 @@ Google AI Studio automatically uses Gemini usage accounting. For Gemini through
 another OpenAI-compatible Vertex or gateway endpoint, pass
 `usage_dialect=UsageDialect.GEMINI` explicitly.
 
+`OpenAIProvider` and `ChatCompletionsProvider` read `base_url` differently.
+`OpenAIProvider` takes the API root, such as `https://api.openai.com`, and adds
+`/v1/responses` itself. It also accepts a base ending in `/v1`, so you can pass
+`OPENAI_BASE_URL` as the OpenAI SDK uses it. `ChatCompletionsProvider` takes
+the base including its version path, such as `https://host/v1`, and adds only
+`/chat/completions`. It doesn't add `/v1` for you, because compatible services
+put the version in different places; the one exception is a bare
+`https://api.openai.com`, which it treats as `https://api.openai.com/v1`.
+
 ## Prompt caching
 
 Prompt caching is on by default where the provider needs explicit markers.

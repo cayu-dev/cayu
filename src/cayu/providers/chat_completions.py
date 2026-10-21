@@ -427,6 +427,11 @@ class ChatCompletionsProvider(ModelProvider):
     that shared format so those providers work through Cayu's provider-neutral
     runtime. ``OpenAIProvider`` remains the adapter for OpenAI's Responses API.
 
+    ``base_url`` includes the version path, as with the OpenAI SDK, and the
+    adapter appends only ``/chat/completions``: pass ``https://host/v1``. A bare
+    ``https://api.openai.com`` is treated as ``https://api.openai.com/v1``;
+    any other base is used exactly as given.
+
     The model is resolved from the agent's ``AgentSpec`` (and ``ModelRequest``),
     not from this provider, matching ``OpenAIProvider``/``AnthropicProvider``.
     """
@@ -2245,7 +2250,20 @@ def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:
         allow_http_hint=True,
     )
     parts = urlsplit(validated)
-    return urlunsplit(parts._replace(path=parts.path.rstrip("/")))
+    path = parts.path.rstrip("/")
+    # Compatible services put the version path in different places (Gemini uses
+    # "/v1beta/openai", some serve "/chat/completions" at the root), so "/v1" is
+    # never added in general. OpenAI's own API has nothing at the root, so its
+    # bare host means "/v1", the same as OpenAIProvider's default.
+    if not path and _is_openai_api_host(parts.hostname):
+        path = "/v1"
+    return urlunsplit(parts._replace(path=path))
+
+
+def _is_openai_api_host(hostname: str | None) -> bool:
+    return hostname is not None and (
+        hostname == "api.openai.com" or hostname.endswith(".api.openai.com")
+    )
 
 
 def _validate_url(url: str, field_name: str, *, allow_http: bool = False) -> str:

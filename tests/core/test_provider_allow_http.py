@@ -14,7 +14,8 @@ from cayu.providers.anthropic import (
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
 from cayu.providers.openai import _execution_profile_material as openai_profile_material
 
-_LOCAL = "http://127.0.0.1:8080/v1"
+# Both providers add "/v1" to request paths themselves.
+_LOCAL = "http://127.0.0.1:8080"
 
 
 @pytest.mark.parametrize(
@@ -62,7 +63,7 @@ def test_allow_http_is_part_of_execution_profile_material_only_when_set() -> Non
 
 def test_https_endpoints_work_with_allow_http_set() -> None:
     provider = OpenAIProvider(
-        api_key="test-key", base_url="https://gateway.example/v1", allow_http=True
+        api_key="test-key", base_url="https://gateway.example", allow_http=True
     )
 
-    assert provider.base_url == "https://gateway.example/v1"
+    assert provider.base_url == "https://gateway.example"
