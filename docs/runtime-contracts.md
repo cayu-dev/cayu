@@ -4406,6 +4406,11 @@ command whose own receipt and release reserve cannot fit even after history
 compaction fails in the store transaction before changing the session; release
 consumes the reserve, and exact replay of an already retained command remains
 available.
+Every read walks the ledger under these bounds before anything else. A ledger
+whose exact JSON value has already passed full validation in this process
+reuses that result instead of validating every receipt again; readers always
+receive private copies. A ledger that differs in any value or number type is
+validated in full.
 Receipt validation binds each result to the independently loaded session's
 immutable identity and baseline profile authority instead of trusting a
 self-consistent embedded snapshot. Pre-v5 active-profile state cannot substitute for

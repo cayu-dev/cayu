@@ -151,7 +151,16 @@ from cayu.sessions._invocation_lifecycle import (
     _require_released_invocation_command_receipt as _require_released_invocation_command_receipt,
 )
 from cayu.sessions._invocation_lifecycle import (
+    _shared_receipt_ledger_from_checkpoint as _shared_receipt_ledger_from_checkpoint,
+)
+from cayu.sessions._invocation_lifecycle import (
     _validate_invocation_binding as _validate_invocation_binding,
+)
+from cayu.sessions._invocation_lifecycle import (
+    _validate_receipt_ledger as _validate_receipt_ledger,
+)
+from cayu.sessions._invocation_lifecycle import (
+    _validated_receipt_ledger as _validated_receipt_ledger,
 )
 from cayu.sessions._invocation_lifecycle import (
     copy_invocation_lifecycle_command as copy_invocation_lifecycle_command,

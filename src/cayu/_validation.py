@@ -933,6 +933,7 @@ def _walk_bounded_durable_json(
     canonical_numbers: bool,
     allow_tuples: bool = False,
     allow_models: bool = False,
+    fractional_floats: list[float] | None = None,
 ) -> Any:
     if type(max_bytes) is not int or max_bytes < 0:
         raise ValueError("max_bytes must be a non-negative integer.")
@@ -1116,7 +1117,10 @@ def _walk_bounded_durable_json(
                         field_name,
                         path=path_now(),
                     )
-                copied = int(current) if current.is_integer() else current
+                if current.is_integer():
+                    copied = int(current)
+                elif fractional_floats is not None:
+                    fractional_floats.append(current)
                 rendered = (
                     _canonical_durable_json_text(copied)
                     if canonical_numbers
@@ -1280,14 +1284,14 @@ def canonical_bounded_durable_json_bytes(
 ) -> bytes:
     """Return canonical bytes only after iterative size and nesting preflight."""
 
-    owned = copy_bounded_durable_json_value(
+    encoded = _canonical_walked_durable_json_bytes(
         value,
         field_name,
         max_bytes=max_bytes,
         max_nodes=max_nodes,
         max_nesting=max_nesting,
+        canonical_numbers=True,
     )
-    encoded = _canonical_durable_json_text(owned).encode("utf-8")
     if len(encoded) > max_bytes:  # pragma: no cover - counter/encoder invariant
         raise AssertionError("Bounded durable JSON counter underestimated canonical encoding.")
     return encoded
@@ -1516,17 +1520,15 @@ def canonical_durable_json_bytes(
     value semantics instead of hashing Python's input spelling.
     """
 
-    copied = (
-        copy_durable_json_value(value, field_name)
-        if max_bytes is None and max_nodes is None
-        else copy_bounded_durable_json_value(
-            value,
-            field_name,
-            max_bytes=(max_bytes if max_bytes is not None else DURABLE_DOCUMENT_LIMITS.max_bytes),
-            max_nodes=(max_nodes if max_nodes is not None else DURABLE_DOCUMENT_LIMITS.max_nodes),
-        )
+    return _canonical_walked_durable_json_bytes(
+        value,
+        field_name,
+        max_bytes=(max_bytes if max_bytes is not None else DURABLE_DOCUMENT_LIMITS.max_bytes),
+        max_nodes=(max_nodes if max_nodes is not None else DURABLE_DOCUMENT_LIMITS.max_nodes),
+        max_nesting=MAX_DURABLE_JSON_NESTING,
+        # An unbounded call keeps the document policy's plain number sizing.
+        canonical_numbers=max_bytes is not None or max_nodes is not None,
     )
-    return _canonical_durable_json_text(copied).encode("utf-8")
 
 
 def copy_json_value(value: Any, field_name: str) -> Any:
@@ -1576,6 +1578,47 @@ def collision_safe_json_object(
     if preserve_input_order:
         assigned.sort(key=lambda item: item[0])
     return {key: value for _, key, value in assigned}
+
+
+def _canonical_walked_durable_json_bytes(
+    value: Any,
+    field_name: str,
+    *,
+    max_bytes: int,
+    max_nodes: int,
+    max_nesting: int,
+    canonical_numbers: bool,
+) -> bytes:
+    """Copy one value under its bounds, then encode the copy canonically.
+
+    The walk rejects every non-JSON type, non-finite number and unpaired
+    surrogate, and rewrites integral floats as ints. Only a remaining fractional
+    float has a canonical spelling that differs from Python's; without one the
+    canonical text is exactly sorted compact JSON, which C encodes.
+    """
+
+    fractional_floats: list[float] = []
+    owned = _walk_bounded_durable_json(
+        value,
+        field_name,
+        max_bytes=max_bytes,
+        max_nodes=max_nodes,
+        max_nesting=max_nesting,
+        max_object_entries=None,
+        max_array_entries=None,
+        detach=True,
+        canonical_numbers=canonical_numbers,
+        fractional_floats=fractional_floats,
+    )
+    if fractional_floats:
+        return _canonical_durable_json_text(owned).encode("utf-8")
+    return json.dumps(
+        owned,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def _canonical_durable_json_text(value: Any) -> str:

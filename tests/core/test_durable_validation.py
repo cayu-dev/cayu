@@ -15,11 +15,14 @@ from hypothesis import strategies as st
 from pydantic import BaseModel, Field
 
 from cayu._validation import (
+    DURABLE_DOCUMENT_LIMITS,
     MAX_DURABLE_JSON_INTEGER,
     MAX_DURABLE_JSON_NESTING,
     MIN_DURABLE_JSON_INTEGER,
     DurableValueError,
     JsonUtf8SizeCounter,
+    _canonical_durable_json_text,
+    canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
     copy_bounded_durable_json_value,
     copy_durable_json_value,
@@ -277,6 +280,33 @@ def test_durable_values_round_trip_portably_and_are_defensively_copied(value: An
     elif type(source) is dict:
         source["mutation_probe"] = "mutated"
         assert copied != source
+
+
+@settings(max_examples=500, deadline=None)
+@given(_DURABLE_VALUES)
+def test_canonical_bytes_match_the_reference_encoder(value: Any) -> None:
+    # Values without a fractional float take the C encoder; the rest keep the
+    # Python encoder. Both must produce exactly the reference spelling.
+    expected = _canonical_durable_json_text(copy_durable_json_value(value, "record")).encode()
+    assert canonical_durable_json_bytes(value, "record") == expected
+    assert (
+        canonical_bounded_durable_json_bytes(
+            value,
+            "record",
+            max_bytes=DURABLE_DOCUMENT_LIMITS.max_bytes,
+            max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
+        )
+        == expected
+    )
+    assert canonical_durable_json_bytes(value, "record", max_nodes=1000) == expected
+
+
+def test_canonical_bytes_sort_keys_and_respell_numbers_like_the_reference():
+    value = {"b": [1.0, -0.0, 2.5e-7, '\u00e9\n"'], "a": {"z": True, "y": None}, "\u00e9": 10**15}
+    expected = _canonical_durable_json_text(copy_durable_json_value(value, "record")).encode()
+    assert canonical_durable_json_bytes(value, "record") == expected
+    integral = {"b": [1.0, -0.0, 3], "a": "\u00e9"}
+    assert canonical_durable_json_bytes(integral, "record") == b'{"a":"\xc3\xa9","b":[1,0,3]}'
 
 
 @settings(max_examples=250, deadline=None)

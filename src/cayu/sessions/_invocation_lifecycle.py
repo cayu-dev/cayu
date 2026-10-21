@@ -6,6 +6,9 @@ These components use session values and preserve the native stores' atomic bound
 
 from __future__ import annotations
 
+import json
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import StrEnum
@@ -29,6 +32,7 @@ from cayu._validation import (
     canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    inspect_bounded_durable_json,
     require_durable_clean_nonblank,
 )
 from cayu.build_provenance import (
@@ -1404,9 +1408,70 @@ def _invocation_lifecycle_command_receipt(
     )
 
 
-def _invocation_lifecycle_receipt_ledger_from_checkpoint(
+# Every lifecycle command appends a receipt, and one turn reads the same ledger
+# many times (admission, dispatch, settlement, release). Full validation of an
+# unchanged ledger is deterministic in its exact JSON value, so reads reuse it.
+# The source is still walked under the ledger bounds before it is hashed, and
+# callers only ever receive private copies of a cached ledger.
+_VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024
+_VALIDATED_LEDGER_CACHE_MAX_ENTRIES = 128
+_validated_ledgers: OrderedDict[bytes, tuple[_InvocationLifecycleReceiptLedger, int]] = (
+    OrderedDict()
+)
+_validated_ledger_source_bytes = 0
+_validated_ledger_lock = threading.Lock()
+
+
+def _validate_receipt_ledger(raw: dict[str, Any]) -> _InvocationLifecycleReceiptLedger:
+    return _InvocationLifecycleReceiptLedger.model_validate(raw)
+
+
+def _validated_receipt_ledger(raw: dict[str, Any]) -> _InvocationLifecycleReceiptLedger:
+    """Return a shared validated ledger. Callers must copy anything they hand out."""
+
+    global _validated_ledger_source_bytes
+    inspect_bounded_durable_json(
+        raw,
+        "invocation lifecycle receipt ledger",
+        max_bytes=INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES,
+        max_nodes=_INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_NODES,
+    )
+    try:
+        # After the bounded walk this is plain JSON, so the text identifies the
+        # value exactly, including number types and key order. Frozen JSON
+        # containers have no such text and are validated without caching.
+        text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except TypeError:
+        return _validate_receipt_ledger(raw)
+    source = text.encode("utf-8")
+    key = sha256(source).digest()
+    with _validated_ledger_lock:
+        cached = _validated_ledgers.get(key)
+        if cached is not None:
+            _validated_ledgers.move_to_end(key)
+            return cached[0]
+    ledger = _validate_receipt_ledger(raw)
+    size = len(source)
+    if size > _VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES:
+        return ledger
+    with _validated_ledger_lock:
+        if key not in _validated_ledgers:
+            _validated_ledgers[key] = (ledger, size)
+            _validated_ledger_source_bytes += size
+        while (
+            _validated_ledger_source_bytes > _VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES
+            or len(_validated_ledgers) > _VALIDATED_LEDGER_CACHE_MAX_ENTRIES
+        ):
+            _, (_, evicted_size) = _validated_ledgers.popitem(last=False)
+            _validated_ledger_source_bytes -= evicted_size
+    return ledger
+
+
+def _shared_receipt_ledger_from_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> _InvocationLifecycleReceiptLedger:
+    """Validate the checkpoint's ledger and return the shared, never-exposed result."""
+
     if checkpoint is None:
         return _InvocationLifecycleReceiptLedger()
     raw = checkpoint.get(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
@@ -1434,15 +1499,15 @@ def _invocation_lifecycle_receipt_ledger_from_checkpoint(
     ):
         raise RuntimeError("Durable invocation lifecycle receipt ledger is incomplete.")
     try:
-        canonical_bounded_durable_json_bytes(
-            raw,
-            "invocation lifecycle receipt ledger",
-            max_bytes=INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES,
-            max_nodes=_INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_NODES,
-        )
-        return _InvocationLifecycleReceiptLedger.model_validate(raw)
+        return _validated_receipt_ledger(raw)
     except (DurableValueError, TypeError, ValueError) as exc:
         raise RuntimeError("Durable invocation lifecycle receipt ledger is malformed.") from exc
+
+
+def _invocation_lifecycle_receipt_ledger_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> _InvocationLifecycleReceiptLedger:
+    return _shared_receipt_ledger_from_checkpoint(checkpoint).model_copy(deep=True)
 
 
 def invocation_lifecycle_receipt_history_present(
@@ -1452,7 +1517,7 @@ def invocation_lifecycle_receipt_history_present(
 
     if checkpoint is None or INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY not in checkpoint:
         return False
-    _invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
+    _shared_receipt_ledger_from_checkpoint(checkpoint)
     return True
 
 
@@ -1490,11 +1555,12 @@ def _invocation_lifecycle_receipt_from_checkpoint(
     *,
     command_identity: str,
 ) -> _InvocationLifecycleCommandReceipt | None:
-    ledger = _invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
-    return next(
+    ledger = _shared_receipt_ledger_from_checkpoint(checkpoint)
+    receipt = next(
         (item for item in ledger.receipts if item.command_identity == command_identity),
         None,
     )
+    return None if receipt is None else receipt.model_copy(deep=True)
 
 
 def _receipt_ledger_material(
