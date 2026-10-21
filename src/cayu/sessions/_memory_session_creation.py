@@ -23,6 +23,7 @@ from cayu.sessions import creation_fence
 from cayu.sessions import forks as session_fork_rules
 from cayu.sessions._access_rules import _RECIPIENT_PROVENANCE_CAPABILITY
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY, run_lineage_for_creation
 from cayu.sessions._runtime_publication import (
     SessionOperationInitializer,
     _prepare_initial_session_operation_records,
@@ -717,6 +718,7 @@ async def create_fork(
             expected_source_run_epoch=expected_source_run_epoch,
             profile_relationship=profile_relationship,
         )
+        fork.metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
         if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in state.session_operation_records.get(
             source_session_id, {}
         ):

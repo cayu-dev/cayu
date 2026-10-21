@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
+from tests.core._run_lineage_support import assert_root_run_lineage
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
 from tests.core.session_store_time_conformance import (
     assert_session_store_time_conformance,
@@ -2782,10 +2783,11 @@ def test_session_stores_release_run_ownership_after_terminal_status(
 
         await asyncio.create_task(second_run())
         updated = await store.update_metadata("sess_sequential_runs", {"runs": 2})
+        assert_root_run_lineage(updated)
         assert {
             key: value
             for key, value in updated.metadata.items()
-            if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+            if key not in {RUNTIME_BUILD_PROVENANCE_METADATA_KEY, "cayu:run_lineage"}
         } == {"runs": 2}
         assert updated.runtime_build_provenance.fingerprint is None
         await _close_store(store)
@@ -3018,10 +3020,11 @@ def test_session_stores_update_metadata_replaces(store_factory, tmp_path):
         before_edit = await store.load("sess_meta")
         assert before_edit is not None
         updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
+        assert_root_run_lineage(updated)
         assert {
             key: value
             for key, value in updated.metadata.items()
-            if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+            if key not in {RUNTIME_BUILD_PROVENANCE_METADATA_KEY, "cayu:run_lineage"}
         } == {
             "b": [1, 2],
             "subagent": {"mode": "background"},

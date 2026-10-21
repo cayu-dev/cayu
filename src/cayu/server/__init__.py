@@ -297,9 +297,14 @@ def create_server(
             )
         if tool_authorization_grants.service.app is not app:
             raise ValueError("Tool authorization grant routes must use this server's CayuApp.")
-    # A disabled API serves no fork-controller routes either.
+    # A disabled API serves no fork-controller or Cayu Cloud reader routes either.
     fork_controller_router = (
         _environment_fork_controller_router(app, resolved_config.api.path)
+        if resolved_config.api.enabled
+        else None
+    )
+    cloud_reporting_router = (
+        _environment_cloud_reporting_router(app, resolved_config.api.path)
         if resolved_config.api.enabled
         else None
     )
@@ -516,6 +521,8 @@ def create_server(
             )
     if fork_controller_router is not None:
         server.include_router(fork_controller_router)
+    if cloud_reporting_router is not None:
+        server.include_router(cloud_reporting_router)
 
     if resolved_config.dashboard.enabled:
         dashboard_mounted = mount_dashboard(
@@ -751,6 +758,7 @@ def mount_cayu(
     )
     client_router = browser_client_router(base_path=mount_path, auth=auth)
     fork_controller_router = _environment_fork_controller_router(app, api_path)
+    cloud_reporting_router = _environment_cloud_reporting_router(app, api_path)
 
     # All caller-controlled values and route construction are validated before
     # changing the host application. A rejected mount must leave it reusable.
@@ -777,6 +785,8 @@ def mount_cayu(
     server.include_router(client_router)
     if fork_controller_router is not None:
         server.include_router(fork_controller_router)
+    if cloud_reporting_router is not None:
+        server.include_router(cloud_reporting_router)
     if prepared_dashboard is not None:
         prepared_mount_path, dashboard_app = prepared_dashboard
         _attach_dashboard_mount(
@@ -1441,6 +1451,18 @@ def _environment_fork_controller_router(app: CayuApp, api_path: str) -> Any:
     return environment_fork_controller_router(
         app, prefix=_join_public_paths(api_path, "fork-controller")
     )
+
+
+def _environment_cloud_reporting_router(app: CayuApp, api_path: str) -> Any:
+    """The Cayu Cloud reader's router when the process environment names its token digests.
+
+    It is served at ``{api_path}/cloud`` with its own bearer authentication,
+    never the operator's. ``None`` without that configuration.
+    """
+
+    from cayu.server.cloud_reporting import environment_cloud_reporting_router
+
+    return environment_cloud_reporting_router(app, prefix=_join_public_paths(api_path, "cloud"))
 
 
 def _join_public_paths(base: str, child: str) -> str:

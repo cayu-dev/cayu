@@ -1737,6 +1737,56 @@ def test_lifecycle_receipt_metadata_trust_fails_closed_per_receipt() -> None:
                 redactor=SecretRedactor(authenticated_identity),
             )
 
+            # Only a validated lineage inside a completely authenticated ledger
+            # earns structural exemptions; copied identity text never does.
+            lineage_key = "cayu:run_lineage"
+            assert not durable_value_contains_secret(
+                checkpoint, redactor=SecretRedactor([lineage_key, "parent_session_id", "is_root"])
+            )
+
+            def with_lineage(marker):
+                material = copy.deepcopy(raw_receipt)
+                material["result_session"]["metadata"][lineage_key] = marker
+                material["record_sha256"] = ""
+                receipt = _InvocationLifecycleCommandReceipt.model_validate(material)
+                result = copy.deepcopy(checkpoint)
+                result[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = (
+                    _InvocationLifecycleReceiptLedger(
+                        receipts=(receipt,),
+                        release_capacity_command_identity=receipt.command_identity,
+                    ).model_dump(mode="json")
+                )
+                return result
+
+            copied_parent_secret = "copied-parent-secret-canary"
+            child_marker = {
+                "is_root": False,
+                "root_run_id": "run_" + "1" * 64,
+                "parent_run_id": "run_" + "2" * 64,
+                "parent_session_id": copied_parent_secret,
+            }
+            child_checkpoint = with_lineage(child_marker)
+            assert not durable_value_contains_secret(
+                child_checkpoint, redactor=SecretRedactor("run_")
+            )
+            assert durable_value_contains_secret(
+                child_checkpoint, redactor=SecretRedactor(copied_parent_secret)
+            )
+            for malformed in (
+                {**child_marker, "extra": "unexpected"},
+                {**child_marker, "parent_run_id": "forged-identity"},
+                {**child_marker, "is_root": True},
+                {**child_marker, "is_root": 0},
+            ):
+                assert durable_value_contains_secret(
+                    with_lineage(malformed), redactor=SecretRedactor(lineage_key)
+                )
+            forged_ledger = copy.deepcopy(checkpoint)
+            forged_ledger[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY]["record_sha256"] = ""
+            assert durable_value_contains_secret(
+                forged_ledger, redactor=SecretRedactor(lineage_key)
+            )
+
             runtime_snapshot_receipt = copy.deepcopy(raw_receipt)
             runtime_snapshot_receipt["result_session"]["metadata"]["cayu:fork_source_snapshot"] = {
                 "source_session_id": "fork-source-secret",

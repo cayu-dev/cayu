@@ -27,6 +27,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     execution_profile_session_metadata,
 )
+from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY, run_lineage_for_creation
 from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, fork_lineage_for_child
 from cayu.sessions.forks import FORK_EXECUTION_PROFILE_METADATA_KEY
 from cayu.sessions.invocation import (
@@ -149,6 +150,9 @@ def session_metadata_for_creation(
         )
     if FORK_LINEAGE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned fork-lineage authority.")
+    if RUN_LINEAGE_METADATA_KEY in copied:
+        raise ValueError("Session metadata contains runtime-owned run-lineage authority.")
+    copied[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(parent_session)
     # Preserve both forked and known unforked lineage at the create boundary,
     # so later parent deletion or detachment cannot change the child's status.
     lineage = None if parent_session is None else fork_lineage_for_child(parent_session)

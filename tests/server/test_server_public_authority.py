@@ -310,6 +310,36 @@ def test_control_plane_preserves_secret_free_opaque_custom_store_cursor() -> Non
     assert response.json()["next_cursor"] == "custom-store:opaque-page-2"
 
 
+def test_control_plane_hides_private_run_lineage_for_root_and_child() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def seed():
+        for session_id, parent in (("root", None), ("child", "root")):
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    parent_session_id=parent,
+                    messages=[],
+                    metadata={"note": "visible"},
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+        child = await app.session_store.load("child")
+        assert child.metadata["cayu:run_lineage"]["parent_session_id"] == "root"
+
+    asyncio.run(seed())
+    with TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)) as client:
+        for session_id in ("root", "child"):
+            response = client.get(f"/api/sessions/{session_id}")
+            assert response.status_code == 200
+            expected_metadata = {"note": "visible"}
+            if session_id == "child":
+                expected_metadata["cayu:fork_lineage"] = {"controller": None, "forked": False}
+            assert response.json()["metadata"] == expected_metadata
+            assert "cayu:run_lineage" not in response.text
+
+
 def test_control_plane_short_secret_preserves_typed_response_envelopes() -> None:
     secret = "a"
     task_store = InMemoryTaskStore()

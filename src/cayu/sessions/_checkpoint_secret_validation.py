@@ -12,6 +12,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY, validated_run_lineage_metadata
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
@@ -1124,6 +1125,20 @@ def _invocation_lifecycle_receipt_metadata_authority(
             "result_session",
             "metadata",
         )
+        try:
+            lineage = validated_run_lineage_metadata(raw_metadata)
+        except (TypeError, ValueError):
+            return frozenset(), frozenset()
+        if lineage is not None:
+            lineage_path = (*profile_path, RUN_LINEAGE_METADATA_KEY)
+            trusted_keys.add((profile_path, RUN_LINEAGE_METADATA_KEY))
+            for key in lineage:
+                trusted_keys.add((lineage_path, key))
+            # These are runtime-generated hashes in an authenticated receipt.
+            # The copied parent session ID remains subject to secret rejection.
+            for key in ("root_run_id", "parent_run_id"):
+                if (identity := lineage[key]) is not None:
+                    trusted_values.add(((*lineage_path, key), identity))
         raw_provenance = raw_metadata.get(RUNTIME_BUILD_PROVENANCE_METADATA_KEY)
         if raw_provenance is not None:
             try:

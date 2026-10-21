@@ -11,6 +11,7 @@ from tests.core._execution_profile_fixtures import (
     profiled_session_identity,
     run_request_with_registered_tool_ceiling,
 )
+from tests.core._run_lineage_support import assert_root_run_lineage
 from tests.runtime.runtime_provider_support import FakeProvider
 from tests.runtime.runtime_session_support import collect_events, collect_fork_events
 
@@ -814,10 +815,11 @@ def test_in_memory_session_store_isolates_request_metadata():
     session = asyncio.run(store.load("sess_metadata_isolation"))
 
     assert session is not None
+    assert_root_run_lineage(session)
     assert {
         key: value
         for key, value in session.metadata.items()
-        if key != "cayu:runtime_build_provenance"
+        if key not in {"cayu:runtime_build_provenance", "cayu:run_lineage"}
     } == {"nested": {"value": "original"}}
     assert session.runtime_build_provenance == identity.runtime_build_provenance
 

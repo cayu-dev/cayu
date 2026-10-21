@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import SecretStr, ValidationError
+from tests.core._run_lineage_support import assert_root_run_lineage
 from tests.core.checkpoint_schema_conformance import (
     assert_assistant_publication_checkpoint_conformance,
     assert_current_checkpoint_publication_upgrade_conformance,
@@ -1943,10 +1944,11 @@ def test_postgres_session_store_persists_sessions_events_and_checkpoints(postgre
         assert loaded.agent_name == "assistant"
         assert loaded.environment_name == "local-dev"
         assert loaded.status == SessionStatus.RUNNING
+        assert_root_run_lineage(loaded)
         assert {
             key: value
             for key, value in loaded.metadata.items()
-            if key != "cayu:runtime_build_provenance"
+            if key not in {"cayu:runtime_build_provenance", "cayu:run_lineage"}
         } == {"project_id": 123}
         assert loaded.runtime_build_provenance.fingerprint is None
         assert [event.type for event in events] == [
@@ -4075,10 +4077,11 @@ def test_postgres_session_store_update_metadata_replaces(postgres_dsn):
         before_edit = await store.load("sess_meta")
         assert before_edit is not None
         updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
+        assert_root_run_lineage(updated)
         assert {
             key: value
             for key, value in updated.metadata.items()
-            if key != "cayu:runtime_build_provenance"
+            if key not in {"cayu:runtime_build_provenance", "cayu:run_lineage"}
         } == {
             "b": [1, 2],
             "subagent": {"mode": "background"},

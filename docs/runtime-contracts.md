@@ -19340,3 +19340,169 @@ profile-adoption replay binds the caller's request before configuration inherita
 while candidate-profile verification still checks the resolved execution controls.
 Writing the first complete foreground configuration cannot change that request's
 idempotency identity on a later replay.
+
+## Cayu Cloud agent contract
+
+`cayu.cloud-agent` is the read Cayu Cloud uses to show an agent's runs and the
+decisions people made on them without reading its conversations. Version 1
+carries run summaries and settled human touches.
+`cayu.cloud_reporting.read_cloud_activity(app, cursor=..., limit=...)` reads one
+page in process; the server serves the same pages to Cayu Cloud's reader.
+
+When `CAYU_CLOUD_READER_TOKEN_SHA256` is set, `cayu serve` and `mount_cayu`
+serve the contract at `{api}/cloud` with its own bearer authentication, never
+the operator's. The variable holds comma-separated lowercase hex SHA-256
+digests of the reader's bearer tokens, at most 8 (two while rotating), so the
+token itself never reaches the process. A malformed value stops the server from
+starting, and errors never include digests. The reader's token answers 401 on
+every other route, and the operator login answers 401 here. A server with its
+API disabled serves neither. `cayu.server.cloud_reporting.create_cloud_reporting_router(app,
+authenticate=...)` serves the same routes behind a host's own authentication.
+
+| Route | Response |
+| --- | --- |
+| `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str}` |
+| `GET {api}/cloud/v1/activity?cursor=&limit=` | `{"contract": "cayu.cloud-agent/v1", "runs": [run, ...], "touches": [touch, ...], "next_cursor": str, "has_more": bool}` |
+
+Responses carry `Cache-Control: private, no-store`. A missing or wrong token
+answers 401 with `WWW-Authenticate: Bearer`, a cursor the contract did not issue
+or a `limit` outside 1 to 200 answers 422, and a session store without the reads
+the feed needs answers 501. A Runtime that predates the contract answers 404, or
+a page that is not this JSON where a dashboard serves unknown paths; a reader
+treats both as a Runtime too old for the contract.
+
+### Activity feed
+
+`cursor` is opaque; omit it to read from the beginning. `limit` defaults to 100.
+A page holds, in event sequence order, the current summary of each session with
+a run-changing event after the cursor and the touches anchored in the same
+range. A run waiting on a subagent reports what the subagent waits on, so a
+change in a session also reports every session above it, up to eight levels, on
+the same page; a fork's source is not above its fork. A page holds at most
+`limit` touches, and at most `limit` runs unless its first change alone affects
+more. Continue from `next_cursor` while `has_more` is true. When it is false,
+read again later from the same `next_cursor`; it equals the cursor read when
+nothing changed.
+
+Legacy sessions without retained run lineage still refresh their dependent
+ancestors when a foreground-child wait proves both the parent's and child's
+exact incarnations. This dependency evidence does not fill in unknown
+historical `root_run_id` or `parent_run_id` links. A missing or mismatched wait
+cannot attach a legacy run to a reused session alias.
+
+The cursor is a position in the store's global event sequence. A cross-session
+read never moves past a lower sequence that a concurrent writer has not
+committed yet (on PostgreSQL, the cross-session commit cutoff), and stores never
+reuse a sequence, so a reader that persists `next_cursor` continues after its
+own restart or the agent's without a gap. A run's summary is read after the
+page has read every event up to `next_cursor`, so it is at least as new as the
+cursor, and any later change arrives on a later page with the run again; keep
+the latest per `run_id`. A session ID can be deleted and reused; a replacement
+has a different `run_id` and must not overwrite the previous run or its cost.
+Each touch is anchored at exactly one event and
+arrives on the page that covers it; a reader that reads a range again receives
+the same `touch_id` and keeps one. A cursor belongs to one session store: when
+an agent's database is replaced, read again from the beginning. A session
+deleted after its summary was read is not reported again. Retain its previously
+ingested summary and touches. Deletion before ingestion can remove evidence;
+the feed does not reconstruct deleted history.
+If a session disappears or is replaced during accounting or outcome reads,
+its old incarnation is omitted from that page; other runs still arrive.
+Unrelated store errors are not treated as deletions.
+
+Run-changing events are `session.started`, `session.forked`, `session.resumed`,
+`session.completed`, `session.failed`, `session.interrupted`,
+`session.awaiting_user_input`, `session.delegated_action.updated`,
+`tool.call.approval_requested`, the cost-bearing `model.completed`,
+`model.hosted_tool_call` and `model.auxiliary.attempt_settled`, and every event
+that can anchor a touch. A tool call that starts between them is counted in
+`tool_calls` at the session's next one. One page reads at most 2,000 of these
+events.
+
+### Run summaries
+
+A run summary describes one incarnation of a session. Every session is summarized from the event
+that starts or forks it, including subagents and forks. A fork that has not run
+carries its source's status, no `ended_at`, and only its own counts and cost.
+
+| Field | Meaning |
+| --- | --- |
+| `run_id` | Stable opaque identity of this session incarnation. Persist it within the agent's session-store generation; it survives restarts and changes when a deleted session ID is reused. |
+| `root_run_id`, `parent_run_id` | Original root and immediate parent incarnation identities, recorded at creation or fork. A known root has `root_run_id == run_id` and `parent_run_id == null`. Links survive ancestor deletion and never point at a replacement incarnation. Unknown linkage is `null`. |
+| `session_id`, `root_session_id`, `parent_session_id` | Public lookup/display aliases, the ones the Developer dashboard uses. These IDs can be reused: never use them as persistence keys or to join runs, costs or touches. `root_session_id` is the historical session its invocation started from; `parent_session_id` retains the original parent alias when recorded. A live dashboard lookup may resolve a replacement session. |
+| `source` | How the session was created: `http_run`, `sdk_run`, `task`, `workflow_step`, `subagent` or `fork`. |
+| `forked`, `fork_controller` | Whether the session is a fork or was created under one, and the enrolled [fork controller](fork-overlays.md) whose lineage it is, such as `compass`. `fork_controller` is `null` for the host's own work and when the lineage cannot be resolved. |
+| `agent_name` | The registered agent. |
+| `status` | `running`, `waiting_approval`, `waiting_input`, `needs_recovery`, `completed`, `failed` or `interrupted`. A pending action decides a waiting status, manual recovery before approval before input. A delegated action is followed through each subagent's current pending actions, up to eight levels, rather than the kind its parent recorded when it began waiting; a session whose subagent waits on no person is `running`. Otherwise the session status decides; pending, running and interrupting sessions are `running`. |
+| `reason` | The Runtime's outcome code: `completed`, `failed`, the interruption type such as `tool_approval_required`, `user_input_required`, `operator_requested` or `limit_reached`, or the session status while it runs. |
+| `started_by` | `{"subject", "trust"}` from the session's invocation origin, `trust` being `server_verified` or `host_asserted`; `null` when the origin is unattributed. |
+| `started_at`, `ended_at` | When the session was created, and, while the status is `completed`, `failed` or `interrupted`, the time of its latest terminal event; otherwise `ended_at` is `null`. A session that continues clears `ended_at` until it settles again. |
+| `release_id` | The [Release](#release-identity) the session's latest event that begins work recorded, or `null`. |
+| `model_steps`, `tool_calls` | The session's own counts, as usage accounting reports them. |
+| `cost` | `{"amount", "currency", "complete"}`: the session's own estimated cost with Cayu's bundled price book, as `get_session_cost` computes it. `amount` is a decimal string. `complete` is false when a model step or auxiliary attempt could not be priced, so the amount is low. |
+| `waiting_for` | The session's pending actions: `{"kind", "attention_id", "tool_name", "requested_at", "child_session_id", "child_run_id"}`, `kind` being `tool_approval`, `user_input`, `manual_recovery` or `delegated_action`. `attention_id` is the identity pending-action reads, `get_human_attention_state` and touches use. A delegated action has none and names in `child_session_id` the child whose own item a person settles. `child_run_id` is set only when the retained wait proves that exact child incarnation; a missing or replacement child is not followed. |
+
+Runtime records incarnation lineage in runtime-owned session metadata at the
+atomic create boundary and in the fenced fork snapshot. No storage-schema
+migration is needed. Earlier rows without this evidence still have a `run_id`,
+but their root and parent links are `null`; a detached child must not be guessed
+to be a root. New descendants of such rows retain the known immediate parent
+identity while their root remains unknown. Consumers keep these rows as
+unattributed activity and report reduced coverage; they must not infer ancestry
+from matching aliases or from `parent_session_id == null`.
+
+The private `cayu:run_lineage` record is omitted from session-detail metadata;
+public summaries expose only the typed run links above. Checkpoint secret
+validation recognizes its closed structural fields and generated run hashes
+only inside an authenticated invocation-lifecycle receipt ledger. Copied parent
+session identifiers remain subject to secret validation, and malformed lineage
+or receipt evidence grants no exemption.
+
+### Touches
+
+A touch is one supervision event (see `SessionStore.query_supervision_events`)
+without content.
+
+| Field | Meaning |
+| --- | --- |
+| `touch_id` | The touch's stable `supervision_id`. |
+| `run_id`, `root_run_id`, `parent_run_id` | The exact session incarnation and its retained ancestry, with the same identity and unknown-link rules as run summaries. Join touches by these IDs, never by `session_id`. |
+| `session_id`, `agent_name`, `tool_name` | Where it happened. |
+| `kind`, `outcome` | `approve`, `edit`, `deny`, `expire`, `answer`, `recover`, `interrupt` or `steer`, and its settled outcome. |
+| `stepped_in` | Whether a person did it: false for `expire`, for an actor whose source is `system` and for a `steer` message another session or a peer sent; true otherwise. |
+| `by` | `{"subject", "source"}` of the recorded resolution actor, or `null`. |
+| `reason` | The reason given with the decision, or `null`. |
+| `attention_id` | The waiting item it settled, or `null` for steering. |
+| `requested_at`, `settled_at` | When the settled request was made, when known, and when it settled. |
+| `release_id` | The Release of the work the touch belongs to. |
+
+Text fields pass through the application's secret redaction and session ids
+through its public session aliases, as on the control plane. Nothing in a page
+carries messages, tool arguments, questions, answers, results or error text.
+
+### Measures
+
+The four measures Cayu Cloud charts per agent are computable from the feed. Take
+the agent's runs to be its positively identified root incarnations
+(`root_run_id == run_id`) that are not `forked`, attribute each session's `cost`
+and touches only through its verified `root_run_id`, and count a run as finished
+when its status is `completed`, `failed` or `interrupted`. Unknown roots and
+links to a root not yet ingested are excluded from these measures and reported
+as incomplete coverage, rather than joined to a reused session alias:
+
+- correctness: finished runs that completed with no `edit` or `deny` touch, over
+  finished runs;
+- cost per task: the summed `cost.amount` of the finished runs' sessions, over
+  finished runs;
+- time per task: the mean of `ended_at - started_at` over finished runs, which
+  includes time spent waiting for people;
+- people stepped in: finished runs with a `stepped_in` touch, over finished runs.
+
+### Versioning
+
+`cayu.cloud-agent` is a versioned contract under the
+[stability policy](stability.md#versioned-contracts). Within a version, fields
+and values are only added, so a reader ignores fields and values it does not
+know; the `cayu.cloud_reporting` models ignore unknown fields for that reason.
+`status` gains a value only in a new version. A new version ships in a minor
+release, under its own `{api}/cloud/v{N}` routes, listed in `versions`.

@@ -134,6 +134,7 @@ from cayu.sessions._execution_profile_rules import (
     session_model_projection_cursor,
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
+from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY, run_lineage_for_creation
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.fork_overlays import (
@@ -1939,6 +1940,7 @@ class SessionFork:
                 controller_subject=verified_controller.subject,
             ).model_dump(mode="json")
         fork_lineage = fork_lineage_for_fork(source_lineage, controller=fork_owner)
+        fork_metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
         if fork_lineage is not None:
             fork_metadata[FORK_LINEAGE_METADATA_KEY] = fork_lineage
         prompt_workflow.attach_receipt(

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import SecretStr
 from tests.core._event_projection_support import private_events_for_public_events
+from tests.core._run_lineage_support import assert_root_run_lineage
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.agents import AgentSpec
@@ -1260,10 +1261,11 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
         assert session.agent_name == "assistant"
         assert session.environment_name == "local-dev"
         assert session.status == SessionStatus.RUNNING
+        assert_root_run_lineage(session)
         assert {
             key: value
             for key, value in session.metadata.items()
-            if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+            if key not in {RUNTIME_BUILD_PROVENANCE_METADATA_KEY, "cayu:run_lineage"}
         } == {"project_id": 123}
         assert session.runtime_build_provenance.fingerprint is None
         assert [event.type for event in events] == [

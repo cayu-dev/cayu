@@ -80,7 +80,7 @@ _ADMITTED_PROFILE_DECISIONS = frozenset(
 )
 _TOOL_TERMINAL_TYPES = (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED)
 # The events that begin a process's work on a session, and so record its Release.
-_RELEASE_MARKER_TYPES = (
+RELEASE_MARKER_EVENT_TYPES = (
     EventType.SESSION_STARTED,
     EventType.SESSION_RESUMED,
     EventType.MODEL_STARTED,
@@ -102,6 +102,10 @@ _ANCHOR_TYPES = {
     SupervisionEventKind.INTERRUPT: (EventType.SESSION_INTERRUPTED,),
     SupervisionEventKind.STEER: tuple(_MESSAGE_OUTCOMES),
 }
+# Every event type that can anchor a settled touch.
+SUPERVISION_ANCHOR_EVENT_TYPES = tuple(
+    dict.fromkeys(event_type for types in _ANCHOR_TYPES.values() for event_type in types)
+)
 
 
 class _SessionEvidence:
@@ -357,6 +361,48 @@ async def supervision_page_with_anchors(
             "Supervision event page exceeds max_bytes; request a smaller limit."
         )
     return page, anchors
+
+
+async def classify_supervision_anchors(
+    store: SessionStore, records: Iterable[EventRecord]
+) -> list[tuple[Session, SupervisionEvent]]:
+    """Classify scanned anchor records into touches without content, in record order.
+
+    A record that settles no touch, such as the resume that follows an approval
+    decision, yields nothing, and so does a record of a deleted session. Each
+    touch has exactly one anchor, so a reader that passes every anchor of a
+    range of the store's sequence once sees each touch in that range once.
+    """
+
+    events: list[tuple[Session, SupervisionEvent]] = []
+    for record in records:
+        evidence = _SessionEvidence(store)
+        session = await evidence.session(record.event.session_id)
+        if session is None:
+            continue
+        # The scan can race deletion and reuse of a session ID. The anchor
+        # must still belong to the incarnation we just loaded, not its old row.
+        retained = await store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_id=record.event.id,
+                after_sequence=record.sequence - 1,
+                limit=1,
+            )
+        )
+        if not retained or retained[0].sequence != record.sequence:
+            continue
+        event = await _classify(
+            record,
+            session=session,
+            forked=await evidence.forked(session.id),
+            evidence=evidence,
+            content=False,
+        )
+        current = await store.load(session.id)
+        if event is not None and current is not None and current.instance_id == session.instance_id:
+            events.append((session, event))
+    return events
 
 
 def _cursor_audience(origin_tenant: str | None) -> str | None:
@@ -1015,7 +1061,7 @@ async def _in_force_release(
 ) -> ReleaseIdentity | None:
     """Return the Release recorded by the last event before ``position`` that begins work."""
 
-    marker = await evidence.nearest_before(session_id, _RELEASE_MARKER_TYPES, position)
+    marker = await evidence.nearest_before(session_id, RELEASE_MARKER_EVENT_TYPES, position)
     return None if marker is None else recorded_release_identity(marker.event.payload)
 
 

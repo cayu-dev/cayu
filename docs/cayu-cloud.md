@@ -676,6 +676,47 @@ category `operator_credentials_unsupported`. To use a different login, set the s
 with `cayu cloud env set` (the password as a `--secret`); Agent values win over Cloud's.
 The older environment-wide `AUTH_USER`/`AUTH_PASS` pair Cloud also injects is deprecated.
 
+## Runs and human touches
+
+An Agent reports its runs and the decisions people made on them to Cayu Cloud
+through the versioned `cayu.cloud-agent` contract, which Cloud reads with a
+bearer token of its own. When the Agent's environment has
+`CAYU_CLOUD_READER_TOKEN_SHA256`, the SHA-256 digest of that token, its web
+process serves the contract at `{api}/cloud`: `/cayu/api/cloud` when the
+application mounts the control plane with `mount_cayu`, `/api/cloud` under
+`cayu serve`. The Agent holds only the digest.
+
+The token is not the operator login. It reads two routes and nothing else:
+
+- `GET {api}/cloud/contract` names the contract and the versions the Agent
+  serves.
+- `GET {api}/cloud/v1/activity?cursor=...` returns the summaries of the runs that
+  changed after the cursor and the human touches that settled in the same range.
+
+A run summary has the run's status, including what it waits on, when it started
+and ended, its estimated cost, the Release it ran on, the agent and who started
+it. A touch is an approval, edit, denial, expiry, answer, recovery, interruption
+or steering message, with who made it, the reason they gave and whether a person
+stepped in. Neither carries conversation content: no messages, tool arguments,
+questions or answers. The conversation stays in the Agent and opens in its
+Developer dashboard.
+
+A reader stores the cursor of each page it accepted and continues from it, so
+neither its own restart nor the Agent's leaves a gap, and it keeps the latest
+summary per run and one record per touch. A Runtime older than the contract
+answers 404 there, which a reader reports as too old for the contract. The wire
+format, the cursor rules and how Cloud's four measures are computed are in the
+[runtime contracts](runtime-contracts.md#cayu-cloud-agent-contract).
+
+To read it from a local server:
+
+```bash
+token=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+export CAYU_CLOUD_READER_TOKEN_SHA256=$(printf %s "$token" | shasum -a 256 | cut -d' ' -f1)
+cayu serve
+curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/cloud/v1/activity
+```
+
 ## Local deploy check
 
 Cayu Cloud starts a public service (a project with `[tool.cayu] service_factory`) with

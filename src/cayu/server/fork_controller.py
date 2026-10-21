@@ -10,11 +10,9 @@ controller's read limit to every read.
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import os
-import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
@@ -45,6 +43,12 @@ from cayu.fork_controllers import (
     ForkControllerMode,
 )
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionRejected
+from cayu.server._bearer_digests import (
+    BEARER_CREDENTIAL,
+    TOKEN_SHA256_HEX,
+    presented_bearer_digest,
+    token_digest,
+)
 from cayu.server.auth import AuthConfigurationError
 from cayu.server.contracts import (
     ApiEventRecord,
@@ -83,13 +87,6 @@ FORK_CONTROLLER_EVENT_QUERY_MAX_REQUEST_BYTES = 64 * 1024
 FORK_CONTROLLER_TOKENS_VARIABLE = "CAYU_FORK_CONTROLLER_TOKENS"
 FORK_CONTROLLER_TOKEN_MIN_CHARS = 32
 FORK_CONTROLLER_MAX_TOKENS = 64
-# RFC 6750 b64token: the only credential syntax a bearer header may carry.
-_BEARER_CREDENTIAL = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-
-
-def _token_digest(token: str) -> bytes:
-    return hashlib.sha256(token.encode("ascii")).digest()
 
 
 class ForkControllerBearerAuth:
@@ -114,13 +111,13 @@ class ForkControllerBearerAuth:
             if (
                 type(token) is not str
                 or len(token) < FORK_CONTROLLER_TOKEN_MIN_CHARS
-                or _BEARER_CREDENTIAL.fullmatch(token) is None
+                or BEARER_CREDENTIAL.fullmatch(token) is None
             ):
                 raise AuthConfigurationError(
                     f"Fork-controller bearer token {index} must be a bearer credential of at "
                     f"least {FORK_CONTROLLER_TOKEN_MIN_CHARS} characters."
                 )
-            entries.append((_token_digest(token), _entry_subject(subject, index)))
+            entries.append((token_digest(token), _entry_subject(subject, index)))
         self._entries = tuple(entries)
 
     @classmethod
@@ -138,7 +135,7 @@ class ForkControllerBearerAuth:
         _require_token_count(len(digests))
         entries: list[tuple[bytes, str]] = []
         for index, (digest, subject) in enumerate(digests.items()):
-            if type(digest) is not str or _SHA256_HEX.fullmatch(digest) is None:
+            if type(digest) is not str or TOKEN_SHA256_HEX.fullmatch(digest) is None:
                 raise AuthConfigurationError(
                     f"Fork-controller token digest {index} must be a lowercase hex SHA-256 digest."
                 )
@@ -181,17 +178,9 @@ class ForkControllerBearerAuth:
         return cls(_token_mapping(raw, "The fork-controller token file"))
 
     async def __call__(self, request: Request) -> str:
-        headers = request.headers.getlist("authorization")
-        if len(headers) != 1:
+        presented = presented_bearer_digest(request)
+        if presented is None:
             return ""
-        scheme, separator, credential = headers[0].partition(" ")
-        if (
-            separator != " "
-            or scheme.lower() != "bearer"
-            or _BEARER_CREDENTIAL.fullmatch(credential) is None
-        ):
-            return ""
-        presented = _token_digest(credential)
         subject = ""
         # Compare with every entry, without an early exit, so timing does not
         # reveal which entry matched.

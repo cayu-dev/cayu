@@ -1,5 +1,31 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: nothing to do; an Agent reports to Cayu Cloud once
+`CAYU_CLOUD_READER_TOKEN_SHA256` is set in its environment. Storage revision 124,
+compatibility floor 124, server contract 49 and manifest schema 17 are all
+unchanged.
+
+### Breaking changes
+
+None.
+
+### Changes
+
+- Report run summaries and human touches to Cayu Cloud through the versioned
+  `cayu.cloud-agent` contract. With `CAYU_CLOUD_READER_TOKEN_SHA256` set to the
+  digest of Cloud's reader token, `cayu serve` and `mount_cayu` serve
+  `GET {api}/cloud/contract` and `GET {api}/cloud/v1/activity`. The token is not
+  the operator login and reads nothing else. Each page holds the current summary
+  of every session that changed after a cursor (status and what it waits on,
+  start and end, estimated cost, Release, agent and counts) and the touches that
+  settled in the same range (approve, edit, deny, expire, answer, recover,
+  interrupt and steer, with who, why and whether a person stepped in), without
+  conversation content. The cursor is a position in the store's event sequence,
+  so a reader continues across restarts without a gap.
+  `cayu.cloud_reporting.read_cloud_activity` reads the same pages in process.
+
 ## v0.13.0
 
 Upgrade: rebuild Lambda MicroVM images from this release's sidecar

@@ -299,6 +299,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles,
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
+from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY
 from cayu.sessions._supervision_projection import supervision_page_with_anchors
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
 from cayu.sessions.event_delivery import PersistedEventSideEffectPage, PersistedEventSideEffectQuery
@@ -2702,7 +2703,7 @@ def _serialize_session(cayu_app: Any, session: Session) -> dict[str, Any]:
     public_metadata = {
         key: value
         for key, value in session.metadata.items()
-        if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+        if key not in {RUNTIME_BUILD_PROVENANCE_METADATA_KEY, RUN_LINEAGE_METADATA_KEY}
     }
     return {
         **_serialize_session_base(cayu_app, session),

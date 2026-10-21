@@ -25,6 +25,7 @@ from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions._interaction_transitions import _copy_optional_interaction_admission
 from cayu.sessions._invocation_scope import _activate_session_run_fence
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY, run_lineage_for_creation
 from cayu.sessions._runtime_publication import (
     SessionOperationInitializer,
     _prepare_initial_session_operation_records,
@@ -525,6 +526,7 @@ async def create_fork(
                     expected_source_run_epoch=expected_source_run_epoch,
                     profile_relationship=profile_relationship,
                 )
+                fork.metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
                 await cur.execute(
                     "SELECT 1 FROM cayu_session_operations "
                     "WHERE session_id = %s AND idempotency_key = %s",
