@@ -2,14 +2,23 @@
 
 ## Unreleased
 
-Upgrade: nothing to do; an Agent reports to Cayu Cloud once
+Upgrade: brokered coding sandbox images now need `git`, or their factory must
+set `git_baseline=False`. Direct binding users must also check the workspace
+requirements below. An Agent reports to Cayu Cloud once
 `CAYU_CLOUD_READER_TOKEN_SHA256` is set in its environment. Storage revision 124,
 compatibility floor 124, server contract 49 and manifest schema 17 are all
 unchanged.
 
 ### Breaking changes
 
-None.
+- `BrokeredSandboxCodingEnvironmentFactory` and `BrokeredSandboxCodingBinding`
+  now enable `git_baseline=True` by default. Existing sandbox images without
+  `git` fail at environment binding: install Git in the image or explicitly
+  pass `git_baseline=False` to keep the previous behavior. Direct binding
+  users must supply a `LocalWorkspace` source and a `RunnerWorkspace` target
+  on the bound sandbox runner, both excluding `.git`, or opt out of the
+  baseline. Invalid workspaces are refused before copying; a failed baseline
+  abandons the sandbox binding.
 
 ### Changes
 
@@ -43,6 +52,39 @@ None.
   a bare `https://api.openai.com` as `https://api.openai.com/v1` instead of
   posting to a path OpenAI doesn't serve. The providers guide says which form
   each one expects.
+- Settle approvals, questions and knowledge proposals from one inbox, and see
+  recovery items there. Recovery items must be settled in the Developer
+  dashboard. A decision made in Cayu Cloud, the agent's own app or the Developer
+  dashboard shows as settled in the other two and names the person.
+  `GET {api}/inbox` lists what the agent is waiting on a person for, with a
+  cursor; `GET {api}/inbox/{item_id}` reads one item's state wherever it was
+  settled; `POST {api}/inbox/{item_id}/settle` approves (optionally with changed
+  arguments), denies, answers, keeps or drops as the authenticated caller.
+  `client.js` gains `listInbox`, `getInboxItem`, `settleInboxItem` and
+  `watchInbox`, and `create_server` and `mount_cayu` take an optional
+  `inbox_access` rule that decides who may see and settle each item.
+- Every built-in tool declares a terminal payload bound, between 64 KiB and
+  1,984 KiB, and its constructor takes `max_terminal_payload_bytes=` to set or
+  tighten it. A deferred round no longer takes the process-wide exclusive lease
+  because a built-in had no bound, so one long `exec_command` round can't hold
+  every other session's rounds. A larger result is cut to fit, keeping every
+  field and a visible notice (`terminal_payload_truncated`), instead of failing.
+- `BrokeredSandboxCodingEnvironmentFactory` commits each copy-in to an
+  ephemeral local Git repository in the sandbox, as the Docker coding factory
+  does, so coding agents see their changes as a diff. Pass `git_baseline=False`
+  for an image without `git`.
+- Fix: a closed or poisoned runner was admitted at the next pre-exposure check
+  while its evidence was still fresh, and then failed every tool call; once the
+  evidence expired the session failed as `stale_evidence`. The check now reads
+  the runner's lifecycle first and refuses it as closed.
+- Fix: a factory that wrapped Cayu's Docker coding factory and nested its
+  metadata lost the allocation identity, so recovering a lost model call
+  failed. `EnvironmentFactoryResult.allocation_fingerprint` now carries it as a
+  typed field that wrappers pass through.
+- A long conversation uses about a third less CPU per turn: a validated
+  invocation receipt ledger is reused instead of validated again on every read,
+  and canonical JSON is encoded in C. Durable formats and recovery are
+  unchanged.
 
 ## v0.13.0
 
