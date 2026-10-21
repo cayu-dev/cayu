@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 from uuid import uuid4
 
 from cayu import _application_accounting as accounting
+from cayu import _application_attention as attention
 from cayu import _application_context_views as context_views
 from cayu import _application_task_creation as task_creation
 from cayu._application_agent_registry import ApplicationAgentRegistry
@@ -1001,6 +1002,7 @@ class CayuApp:
         context_counting: ContextCountingConfig | None = None,
         request_footprint: RequestFootprintConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
+        human_attention_handoff: attention.HumanAttentionHandoff | None = None,
         enable_logging: bool = True,
         runtime_timing: RuntimeTimingConfig | None = None,
         timing_sinks: Iterable[RuntimeTimingSink] | None = None,
@@ -1191,6 +1193,9 @@ class CayuApp:
         for sink in sinks:
             if not isinstance(sink, EventSink):
                 raise TypeError("event_sinks must contain EventSink instances.")
+        self.human_attention_handoff = attention.attach_handoff(
+            self, human_attention_handoff, sinks
+        )
         if enable_logging:
             from cayu.observability.logging import LoggingEventSink
 
@@ -2094,6 +2099,8 @@ class CayuApp:
             common_root_enabled=self.enable_common_root_budget_binding,
             append_peer=self.append_peer_content,
         )
+        # Last: an application whose construction failed never holds the handoff.
+        attention.bind_handoff(self, self.human_attention_handoff)
 
     @asynccontextmanager
     async def _acquire_peer_exposure_for_model_attempt(

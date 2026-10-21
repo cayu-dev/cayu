@@ -5,7 +5,9 @@
 Upgrade: brokered coding sandbox images now need `git`, or their factory must
 set `git_baseline=False`. Direct binding users must also check the workspace
 requirements below. An Agent reports to Cayu Cloud once
-`CAYU_CLOUD_READER_TOKEN_SHA256` is set in its environment. Storage revision 124,
+`CAYU_CLOUD_READER_TOKEN_SHA256` is set in its environment, and hands human
+attention to it once `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`
+are both set. Set both handoff variables or neither. Storage revision 124,
 compatibility floor 124, server contract 49 and manifest schema 17 are all
 unchanged.
 
@@ -52,6 +54,21 @@ unchanged.
   a bare `https://api.openai.com` as `https://api.openai.com/v1` instead of
   posting to a path OpenAI doesn't serve. The providers guide says which form
   each one expects.
+- `CayuApp` wires `cayu.human_attention_handoff` by itself when
+  `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN` are set, as Cayu Cloud
+  sets them for every Agent: every approval, question and recovery item is handed to
+  the receiver with no application code, and the server runs its repair loop. Pass
+  `CayuApp(human_attention_handoff=...)` to configure it in code, and read the handoff an
+  application owns from `app.human_attention_handoff`; an application that already puts the
+  handoff's sink in `event_sinks` keeps owning it, and passing both is refused. Without either variable nothing changes. Pass a disabled
+  `HumanAttentionHandoff(None)` to opt an application out; Runtime does this for internal
+  judge and replay apps. Leave the variables out of separate evaluation processes and
+  coding workspaces.
+- `CayuApp()` now fails at construction when only one of `CAYU_ATTENTION_HANDOFF_URL` and
+  `CAYU_ATTENTION_HANDOFF_TOKEN` is set, instead of starting without the handoff. Set both or
+  neither.
+- `HumanAttentionHandoff.bind` refuses a second, different `CayuApp`: one handoff reports one
+  application's sessions.
 - Settle approvals, questions and knowledge proposals from one inbox, and see
   recovery items there. Recovery items must be settled in the Developer
   dashboard. A decision made in Cayu Cloud, the agent's own app or the Developer

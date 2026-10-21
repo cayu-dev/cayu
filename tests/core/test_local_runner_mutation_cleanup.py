@@ -77,9 +77,12 @@ def test_native_local_runner_cleanup_preserves_mutation_authority(tmp_path, mode
         if mode in {"uncertain_tree", "uncertain_tree_exit"}:
             monkeypatch.setattr(subprocess_module, "_DRAIN_AFTER_KILL_S", 0.1)
 
+        # The PID file is the readiness signal: cancellation must not see it
+        # between creation and writing the PID.
         child_code = (
             "import os,time; from pathlib import Path; "
-            "Path('child.pid').write_text(str(os.getpid())); "
+            "Path('child.pid.tmp').write_text(str(os.getpid())); "
+            "Path('child.pid.tmp').replace('child.pid'); "
         )
         if mode in {"uncertain_tree", "uncertain_tree_exit"}:
             child_code += (

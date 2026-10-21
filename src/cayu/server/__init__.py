@@ -387,6 +387,7 @@ def create_server(
         _require_open_app(app)
         side_effect_recovery_task: asyncio.Task[None] | None = None
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
+        attention_repair_task: asyncio.Task[None] | None = None
         try:
             # aclose() owns stopping it, within the shutdown deadline.
             await app.start_model_policy()
@@ -400,16 +401,16 @@ def create_server(
             side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
                 app, side_effect_health
             )
+            attention_repair_task = _start_human_attention_repair(app)
             yield
         finally:
             try:
                 try:
                     # Stop the server's own loops before the app seals, so
                     # neither starts new work against a closing application.
-                    await _stop_incomplete_session_startup_recovery(
-                        incomplete_session_recovery_task
-                    )
-                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    await _cancel_background_task(incomplete_session_recovery_task)
+                    await _cancel_background_task(attention_repair_task)
+                    await _cancel_background_task(side_effect_recovery_task)
                 finally:
                     await drain_server_work()
             finally:
@@ -1364,7 +1365,7 @@ def _start_incomplete_session_startup_recovery(
     )
 
 
-async def _stop_incomplete_session_startup_recovery(
+async def _cancel_background_task(
     task: asyncio.Task[None] | None,
 ) -> None:
     if task is None:
@@ -1384,14 +1385,13 @@ def _start_persisted_event_side_effect_recovery(
     )
 
 
-async def _stop_persisted_event_side_effect_recovery(
-    task: asyncio.Task[None] | None,
-) -> None:
-    if task is None:
-        return
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+def _start_human_attention_repair(app: CayuApp) -> asyncio.Task[None] | None:
+    """Run the repair loop of the human-attention handoff the application owns, if any."""
+
+    handoff = app.human_attention_handoff
+    if handoff is None:
+        return None
+    return asyncio.create_task(handoff.run(), name="cayu-human-attention-repair")
 
 
 def _compose_interruption_drain_lifespan(
@@ -1416,6 +1416,7 @@ def _compose_interruption_drain_lifespan(
         _require_open_app(app)
         async with existing_lifespan(server_app) as state:
             side_effect_recovery_task: asyncio.Task[None] | None = None
+            attention_repair_task: asyncio.Task[None] | None = None
             try:
                 # aclose() owns stopping it, within the shutdown deadline.
                 await app.start_model_policy()
@@ -1430,11 +1431,13 @@ def _compose_interruption_drain_lifespan(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
                     app, side_effect_health
                 )
+                attention_repair_task = _start_human_attention_repair(app)
                 yield state
             finally:
                 try:
                     try:
-                        await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                        await _cancel_background_task(attention_repair_task)
+                        await _cancel_background_task(side_effect_recovery_task)
                     finally:
                         await _shutdown_cayu_app(
                             app, timeout_s=timeout_s + knowledge_publication_timeout_s

@@ -187,18 +187,34 @@ integration, packaged: an `EventSink` plus a bounded reconciler that speak the v
 `cayu.human-attention-handoff/v1` receiver protocol (`docs/runtime-contracts.md`). Any
 service can implement the receiver; Runtime names none.
 
+It needs no code. `CayuApp` reads `CAYU_ATTENTION_HANDOFF_URL` and
+`CAYU_ATTENTION_HANDOFF_TOKEN` and, when both are set, adds the sink and binds it; the
+server preset (`create_server`, `cayu serve`) runs the repair loop for the lifetime of
+the server. Cayu Cloud sets both for every Agent it deploys, so every approval,
+question and recovery item reaches Cloud. Without them nothing is handed off, so the
+same code runs locally.
+
+To change the options, configure it in code:
+
 ```python
 from cayu.human_attention_handoff import HumanAttentionHandoff
 
-handoff = HumanAttentionHandoff.from_environment(requester_label="requester")
-app = CayuApp(session_store=store, event_sinks=handoff.event_sinks())
-handoff.bind(app)
-repair = asyncio.create_task(handoff.run())  # web lifespan or a worker
+handoff = HumanAttentionHandoff.from_environment(requester_label="customer")
+app = CayuApp(session_store=store, human_attention_handoff=handoff)
 ```
 
-`from_environment` reads `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`;
-without them the handoff is inert, so the same code runs locally. Pass
-`HumanAttentionReceiver(url=..., token=...)` directly to configure it in code.
+Applications inherit both variables by default. To disable the handoff for a private
+application in the same process, pass
+`CayuApp(human_attention_handoff=HumanAttentionHandoff(None))`. Runtime does this for its
+internal judge and replay apps, so their sessions never reach the receiver. Leave the
+variables out of separate evaluation processes and coding workspaces. Only one of them
+set is a configuration error for an app using the environment default.
+
+`app.human_attention_handoff` is the handoff the application owns, or `None`. An
+application that puts `handoff.event_sinks()` in `event_sinks` itself (the form before
+the handoff was automatic) keeps owning it: it calls `handoff.bind(app)` and runs
+`handoff.run()` in its web lifespan or a worker. Configuring it both ways is refused.
+Pass `HumanAttentionReceiver(url=..., token=...)` to name a receiver in code.
 
 - The sink synchronizes a session on attention lifecycle events and returns only after
   the receiver answered 2xx, so Runtime's persisted delivery retries anything else.

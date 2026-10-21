@@ -55,6 +55,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     changed_execution_profile_components,
 )
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.messages import (
     Message,
     MessageRole,
@@ -1458,6 +1459,7 @@ def _isolated_app(
 ) -> CayuApp:
     store = InMemorySessionStore(public_authority_alias_codec=app._public_authority_alias_codec)
     isolated = CayuApp(
+        human_attention_handoff=HumanAttentionHandoff(None),
         config=app.config,
         session_store=store,
         budget_policy=app.budget_policy,

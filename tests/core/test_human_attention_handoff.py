@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +24,7 @@ from cayu.human_attention_handoff import (
 )
 from cayu.providers import ModelStreamEvent
 from cayu.runtime.human_attention import HumanAttentionReference
+from cayu.server import DashboardConfig, ServerConfig, create_server
 from cayu.sessions import InterruptSessionRequest, PendingActionKind, PendingActionQuery
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
@@ -554,3 +557,111 @@ def test_rejected_scan_cursor_restarts_with_one_page_budget(sqlite_resources):
             assert receiver.reports[-1]["issues"] == []
 
     asyncio.run(run())
+
+
+def _cloud_environment(monkeypatch: pytest.MonkeyPatch, receiver: ReferenceReceiver) -> None:
+    """What Cayu Cloud injects into every Agent, reaching the in-memory receiver."""
+
+    monkeypatch.setenv("CAYU_ATTENTION_HANDOFF_URL", "https://cloud.test/v1/agent-attention")
+    monkeypatch.setenv("CAYU_ATTENTION_HANDOFF_TOKEN", TOKEN)
+    monkeypatch.setattr(
+        HumanAttentionReceiver,
+        "__init__",
+        functools.partialmethod(
+            HumanAttentionReceiver.__init__, transport=httpx.MockTransport(receiver.handle)
+        ),
+    )
+
+
+def test_an_agent_with_no_attention_code_hands_off_once_across_a_restart(
+    sqlite_resources, monkeypatch
+):
+    async def run():
+        async with sqlite_resources as resources:
+            receiver = ReferenceReceiver()
+            _cloud_environment(monkeypatch, receiver)
+            path = resources.path()
+            question = Agent(resources.own(SQLiteSessionStore(path)), None)
+            assert question.app.human_attention_handoff is not None
+            await question.start("question", requester="customer-42")
+            approval = Agent(resources.own(SQLiteSessionStore(path)), None, _pause("tool_approval"))
+            # Cloud commits the approval but its acknowledgement is lost: Runtime keeps the
+            # delivery for retry, and the run itself carries on.
+            receiver.lose_acknowledgements = 1
+            await approval.start("approval")
+
+            restarted = Agent(resources.own(SQLiteSessionStore(path)), None)
+            await restarted.app.recover_persisted_event_side_effects(limit=200)
+            await restarted.app.human_attention_handoff.reconcile_once()
+            assert sorted(item["reference"]["kind"] for item in receiver.requests.values()) == [
+                "tool_approval",
+                "user_input",
+            ]
+            assert _states(receiver) == ["active", "active"]
+            assert receiver.reports[-1]["scan_complete"] is True
+            assert "Which environment?" not in "".join(receiver.bodies)
+
+    asyncio.run(run())
+
+
+def test_the_handoff_is_configured_once(monkeypatch):
+    receiver = ReferenceReceiver()
+    _cloud_environment(monkeypatch, receiver)
+    composed = HumanAttentionHandoff.from_environment()
+    app = CayuApp(event_sinks=composed.event_sinks(), enable_logging=False)
+    # An application composing the sink keeps owning the handoff and its repair loop.
+    assert app.human_attention_handoff is None
+    with pytest.raises(ValueError, match="once"):
+        CayuApp(
+            event_sinks=composed.event_sinks(),
+            human_attention_handoff=_handoff(receiver),
+            enable_logging=False,
+        )
+    explicit = _handoff(receiver)
+    assert CayuApp(human_attention_handoff=explicit).human_attention_handoff is explicit
+    monkeypatch.delenv("CAYU_ATTENTION_HANDOFF_URL")
+    monkeypatch.delenv("CAYU_ATTENTION_HANDOFF_TOKEN")
+    assert CayuApp().human_attention_handoff is None
+
+
+def test_the_server_runs_the_repair_loop_of_the_handoff_it_owns():
+    receiver = ReferenceReceiver()
+    app = CayuApp(human_attention_handoff=_handoff(receiver), enable_logging=False)
+    server = create_server(
+        app, config=ServerConfig.local_development(dashboard=DashboardConfig(enabled=False))
+    )
+    from fastapi.testclient import TestClient
+
+    with TestClient(server):
+        deadline = time.monotonic() + 5
+        while not receiver.reports and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert receiver.reports and receiver.reports[0]["scan_complete"] is True
+
+
+def test_a_handoff_reports_one_application_and_a_half_set_environment_is_refused(monkeypatch):
+    receiver = ReferenceReceiver()
+    handoff = _handoff(receiver)
+    first = CayuApp(human_attention_handoff=handoff, enable_logging=False)
+    handoff.bind(first)
+    with pytest.raises(ValueError, match="already bound"):
+        CayuApp(human_attention_handoff=handoff, enable_logging=False)
+    monkeypatch.setenv("CAYU_ATTENTION_HANDOFF_URL", "https://cloud.test/v1/agent-attention")
+    monkeypatch.delenv("CAYU_ATTENTION_HANDOFF_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="set together"):
+        CayuApp(enable_logging=False)
+
+
+def test_an_application_that_failed_to_construct_never_holds_the_handoff(monkeypatch):
+    receiver = ReferenceReceiver()
+    handoff = _handoff(receiver)
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("a later part of construction failed")
+
+    monkeypatch.setattr("cayu.applications.ClarificationCoordinator", refuse)
+    with pytest.raises(RuntimeError, match="later part"):
+        CayuApp(human_attention_handoff=handoff, enable_logging=False)
+    monkeypatch.undo()
+    app = CayuApp(human_attention_handoff=handoff, enable_logging=False)
+    assert app.human_attention_handoff is handoff

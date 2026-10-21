@@ -258,6 +258,12 @@ reporting methods and lifecycle tracking. HTTP usage responses compose the same
 snapshot and projection functions, retaining generation/sequence evidence for
 ETags without calling private application reporting helpers.
 
+`_application_attention.py` decides which human-attention handoff a `CayuApp` owns:
+one passed in code, else one configured by `CAYU_ATTENTION_HANDOFF_URL` and
+`CAYU_ATTENTION_HANDOFF_TOKEN`, unless the application composes the handoff's sink
+itself. `CayuApp` binds it as the last step of construction and exposes it as
+`human_attention_handoff`; the server runs its repair loop.
+
 ```text
 CayuApp
   -> RuntimeEventWriter

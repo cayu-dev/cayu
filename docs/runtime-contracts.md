@@ -1717,7 +1717,9 @@ the exact pending action and session incarnation, while resolution stays in Runt
 implements `cayu.human-attention-handoff/v1`. Paths are relative to the configured base
 URL (`CAYU_ATTENTION_HANDOFF_URL`); every call carries `Authorization: Bearer <token>`
 (`CAYU_ATTENTION_HANDOFF_TOKEN`). Bodies that the producer sends carry
-`"protocol": "cayu.human-attention-handoff/v1"` and `"runtime_version"`.
+`"protocol": "cayu.human-attention-handoff/v1"` and `"runtime_version"`. A `CayuApp`
+started with both variables set hands off by itself, and the server preset runs the
+repair loop; `CayuApp(human_attention_handoff=...)` configures it in code instead.
 
 | Call | Request | Response |
 | --- | --- | --- |

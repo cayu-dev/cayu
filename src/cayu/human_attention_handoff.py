@@ -278,7 +278,16 @@ class HumanAttentionHandoff:
 
         return [HumanAttentionHandoffSink(self)] if self.enabled else []
 
+    def require_bindable(self, app: CayuApp) -> None:
+        """Refuse an application other than the one this handoff already reports."""
+
+        if self._app is not None and self._app is not app:
+            raise ValueError("This human-attention handoff is already bound to another CayuApp.")
+
     def bind(self, app: CayuApp) -> None:
+        """Bind to the one application whose sessions this handoff reports."""
+
+        self.require_bindable(app)
         self._app = app
 
     def may_be_open(self, session_id: str) -> bool:

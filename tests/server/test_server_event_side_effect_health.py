@@ -106,7 +106,7 @@ def test_loop_failure_success_saturation_and_cancellation(monkeypatch):
         assert status.last_delivered_count == 2
         assert status.consecutive_failures == 0
         failures = status.sweep_failures
-        await module._stop_persisted_event_side_effect_recovery(task)
+        await module._cancel_background_task(task)
         assert status.state == "stopped"
         assert status.sweep_failures == failures
 

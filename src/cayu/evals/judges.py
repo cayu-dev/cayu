@@ -30,6 +30,7 @@ from cayu.evals.corpus import (
 from cayu.evals.models import EvalAssertionResult, EvalContext
 from cayu.evals.runner import final_output_text
 from cayu.events import Event, EventType
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.messages import Message, MessageRole
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
@@ -606,6 +607,7 @@ def _isolated_structured_judge_app(app: CayuApp, agent_name: str) -> CayuApp:
         raise ValueError("Structured judge agents must resolve exactly one provider.")
     provider = app.get_provider(manifest_agent.resolved_provider)
     isolated = CayuApp(
+        human_attention_handoff=HumanAttentionHandoff(None),
         session_store=InMemorySessionStore(),
         enable_logging=False,
     )

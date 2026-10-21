@@ -35,6 +35,7 @@ from cayu.evals.execution_profiles import (
     prepare_eval_execution_profile,
 )
 from cayu.evals.store import EvalRunInvocation, EvalStore
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.project_control_plane import ProjectEvalJudgeConfiguration
 from cayu.server.config import (
     DEFAULT_EVAL_LEASE_SECONDS,
@@ -673,7 +674,7 @@ def _generated_project_model_judges(
     if app.redact_json(public_route) != public_route:
         raise ValueError("Project default judge route contains a workload secret.")
     provider = app.get_provider(configuration.provider_name)
-    judge_app = CayuApp(enable_logging=False)
+    judge_app = CayuApp(enable_logging=False, human_attention_handoff=HumanAttentionHandoff(None))
     judge_app.register_provider(provider, default=True)
     judge_app.register_agent(
         AgentSpec(
