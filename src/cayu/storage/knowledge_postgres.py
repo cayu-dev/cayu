@@ -235,6 +235,7 @@ from cayu.knowledge.search import (
     KnowledgeSearchResult,
     copy_knowledge_list_query,
     copy_knowledge_query,
+    decode_knowledge_list_cursor,
 )
 from cayu.storage import migrations as schema
 from cayu.storage._knowledge_closure import (
@@ -6752,7 +6753,7 @@ def _postgres_knowledge_frontier_filter_sql(
 def _postgres_knowledge_list_filter_sql(
     query: KnowledgeListQuery,
 ) -> tuple[str, list[object]]:
-    return _postgres_knowledge_metadata_filter_sql(
+    where_sql, params = _postgres_knowledge_metadata_filter_sql(
         namespace=query.namespace,
         labels=query.labels,
         kinds=query.kinds,
@@ -6765,6 +6766,15 @@ def _postgres_knowledge_list_filter_sql(
         source_id=query.source_id,
         include_expired=query.include_expired,
     )
+    if query.cursor is not None:
+        importance, updated_at, entry_id = decode_knowledge_list_cursor(query.cursor)
+        where_sql += """
+            AND (COALESCE(e.importance, 0.0) < %s
+                 OR (COALESCE(e.importance, 0.0) = %s AND e.updated_at < %s)
+                 OR (COALESCE(e.importance, 0.0) = %s AND e.updated_at = %s AND e.id > %s))
+        """
+        params.extend([importance, importance, updated_at, importance, updated_at, entry_id])
+    return where_sql, params
 
 
 def _postgres_knowledge_access_scope_filter_sql(

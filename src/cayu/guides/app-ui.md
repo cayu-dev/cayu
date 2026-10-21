@@ -38,6 +38,9 @@ It provides:
 - `watchSessions(filter, { onChange, onError, onStop, intervalMs, signal })`
   returns a function that stops the watch.
 - `getSessionUsage(sessionId)` reads `GET /api/sessions/{id}/usage`.
+- `watchInbox({ onChange, onError, onStop, intervalMs, signal })`,
+  `listInbox`, `getInboxItem` and `settleInboxItem` read and settle the agent's
+  inbox; see [Show the agent's inbox](#show-the-agents-inbox).
 
 What the client guarantees, so your code does not have to:
 
@@ -65,7 +68,7 @@ What the client guarantees, so your code does not have to:
   `followSession` also rejects `done` with that error.
 
 `interrupted` includes pauses for tool approval or user input. After the UI
-answers one, call `followSession` again with
+answers one with `settleInboxItem`, call `followSession` again with
 `afterSequence: follow.lastSequence`. Likewise, call `watchSessions` again after
 starting new work if the previous watch stopped as idle.
 
@@ -225,6 +228,56 @@ After an owner is lost, use the existing recovery plan and fenced claim; inspect
 showing the state never reserves recovery. An expired token cannot renew or
 replace a successor's owner row. During orderly completion, retained cleanup
 keeps its heartbeat until physical cleanup finishes.
+
+## Show the agent's inbox
+
+An agent's app can show what the agent is waiting on a person for, and let the
+person decide there: approve or deny a tool call, answer a question, keep or drop a
+knowledge proposal. These are the same records Cayu Cloud and the Developer
+dashboard show, so a decision made in any of them shows as settled in the others,
+with the person who made it. [The agent's inbox](../../../docs/inbox.md) describes
+the routes, item states and conflicts.
+
+```js
+import { connect } from "/cayu/client.js"
+
+const cayu = await connect({ headers: { Authorization: `Bearer ${await signInToken()}` } })
+
+const stop = cayu.watchInbox({
+  onChange: ({ items }) => renderInbox(items),
+})
+
+async function decide(item, decision) {
+  // decision is the settle body, for example { decision: "approve", reason: "Checked." }
+  const result = await cayu.settleInboxItem(item.id, decision)
+  if (result.settled) return renderSettled(result.item)
+  // Someone else decided first, or the item was replaced or expired.
+  renderSettled(result.item, result.message)
+}
+```
+
+`signInToken`, `renderInbox` and `renderSettled` are the app's own. The rules the
+client follows for you:
+
+- **Cadence.** `watchInbox` reads the whole inbox (following `next_cursor`) no more
+  often than every 15 seconds, doubles the interval while nothing changes, and pauses
+  while the tab is hidden. Something can start waiting at any time, so it never stops
+  as idle; call the function it returns when the inbox unmounts.
+- **Identity.** The person is whoever the request authenticates as. Send the person's
+  own credential, never a shared one, or every decision records the shared identity.
+- **Conflicts are answers.** `settleInboxItem` resolves with `settled: false`, a
+  `code` and the item's current state when the item was already settled, replaced or
+  expired, so the UI can show who decided instead of an error.
+- **Retries are safe.** Repeating the same decision resolves with `replayed: true`;
+  nothing runs twice.
+
+Render one card per item with its `decisions` as the actions: `approve` and `deny`
+(with an optional reason, and approve-with-changes when the app can edit the tool's
+arguments), an answer field for a `question` with its `options` as choices, and
+`keep` and `drop` for `knowledge`. A `recovery` item has no decisions; link it to the
+session in the Developer dashboard. A settled item shows its
+`settlement.decision`, `decided_by.subject` and `decided_at`. Render every text field
+as escaped text.
 
 ## Keep GET handlers read-only
 

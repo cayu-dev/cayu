@@ -37,6 +37,7 @@ from cayu.knowledge.records import (
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeEvidenceResult,
+    KnowledgeRevisionConflict,
     KnowledgeStatus,
     KnowledgeVisibility,
 )
@@ -195,6 +196,7 @@ class KnowledgeReviewWorkflow:
         source_type: str | None = None,
         source_id: str | None = None,
         include_expired: bool = False,
+        cursor: str | None = None,
         limit: int | None = None,
         max_bytes: int | None = None,
     ) -> KnowledgeListResult:
@@ -210,6 +212,7 @@ class KnowledgeReviewWorkflow:
             source_type=source_type,
             source_id=source_id,
             include_expired=include_expired,
+            cursor=cursor,
             limit=self.default_limit if limit is None else limit,
             max_bytes=self.default_max_bytes if max_bytes is None else max_bytes,
         )
@@ -220,6 +223,29 @@ class KnowledgeReviewWorkflow:
 
         return await self._require_pending_entry(entry_id)
 
+    async def get_entry(
+        self, entry_id: str, *, revision: int | None = None
+    ) -> KnowledgeEntry | None:
+        """Load one entry, or one exact revision of it, in the workflow scope."""
+
+        entry = await self.store.get_entry(
+            require_clean_nonblank(entry_id, "entry_id"),
+            revision=revision,
+            access_scope=self.access_scope,
+        )
+        if entry is not None:
+            self._require_entry_in_scope(entry)
+        return entry
+
+    async def load_review_approval(self, operation_id: str) -> KnowledgeActivationReceipt | None:
+        """Load the activation receipt one reviewed approval operation recorded."""
+
+        raw = await self.store.load_activation_receipt(
+            require_clean_nonblank(operation_id, "operation_id"),
+            access_scope=self.access_scope,
+        )
+        return None if raw is None else copy_knowledge_activation_receipt(raw)
+
     async def approve(
         self,
         entry_id: str,
@@ -229,8 +255,13 @@ class KnowledgeReviewWorkflow:
         reviewer_version: str,
         code: str = "approved",
         annotations: dict[str, object] | None = None,
+        expected_revision: int | None = None,
     ) -> KnowledgeReviewApproval:
-        """Approve one exact pending revision with durable reviewer attribution."""
+        """Approve one exact pending revision with durable reviewer attribution.
+
+        ``expected_revision`` refuses the approval with ``KnowledgeRevisionConflict``
+        when the entry has moved on from the revision the reviewer saw.
+        """
 
         from cayu.knowledge.governance import reviewed_approval_authority
 
@@ -245,6 +276,10 @@ class KnowledgeReviewWorkflow:
                 prior_request = prior.authority.request
                 if (
                     prior.entry_id != clean_entry_id
+                    or (
+                        expected_revision is not None
+                        and prior_request.candidate_entry.revision != expected_revision
+                    )
                     or prior_request.mode is not KnowledgeGovernanceMode.REVIEWED
                     or prior_request.source is not KnowledgeActivationSource.REVIEW_APPROVAL
                     or prior_request.forbidden_authority_identities
@@ -264,7 +299,9 @@ class KnowledgeReviewWorkflow:
             if replay_authority != prior.authority:
                 raise KnowledgeActivationConflict("operation_mismatch")
             return await self._approve_with_exact_authority(replay_authority)
-        entry = await self._require_pending_entry(clean_entry_id)
+        entry = await self._require_pending_entry(
+            clean_entry_id, expected_revision=expected_revision
+        )
         chunks = await self.store.read_chunks(
             entry.id,
             revision=entry.revision,
@@ -360,10 +397,19 @@ class KnowledgeReviewWorkflow:
             raise KnowledgeActivationConflict("operation_mismatch")
         return approval
 
-    async def reject(self, entry_id: str) -> KnowledgeEntry:
-        """Reject one pending entry while retaining it for audit."""
+    async def reject(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> KnowledgeEntry:
+        """Reject one pending entry while retaining it for audit.
 
-        entry = await self._require_pending_entry(entry_id)
+        ``expected_revision`` refuses the rejection with ``KnowledgeRevisionConflict``
+        when the entry has moved on from the revision the reviewer saw.
+        """
+
+        entry = await self._require_pending_entry(entry_id, expected_revision=expected_revision)
         return await self.store.transition_entry_status(
             entry.id,
             expected_revision=entry.revision,
@@ -406,7 +452,12 @@ class KnowledgeReviewWorkflow:
             access_scope=self.access_scope,
         )
 
-    async def _require_pending_entry(self, entry_id: str) -> KnowledgeEntry:
+    async def _require_pending_entry(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> KnowledgeEntry:
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         entry = await self.store.get_entry(clean_id, access_scope=self.access_scope)
         if entry is None:
@@ -415,6 +466,12 @@ class KnowledgeReviewWorkflow:
         if entry.status is not KnowledgeStatus.PENDING:
             raise ValueError(
                 f"Knowledge entry {clean_id!r} is {entry.status.value!r}, not 'pending'."
+            )
+        if expected_revision is not None and entry.revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=entry.revision,
             )
         return entry
 

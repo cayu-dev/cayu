@@ -183,6 +183,8 @@ from cayu.server._http_json import (
     _parse_json_without_duplicate_keys,
     _PreparsedPrivateJsonBody,
 )
+from cayu.server._inbox_access import InboxAccessGate
+from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._request_timing import RequestTimingRecorder
@@ -276,6 +278,7 @@ from cayu.server.evals_registry import (
     resolved_evals_runtime,
 )
 from cayu.server.evals_worker import EvalRunCoordinator
+from cayu.server.inbox import InboxAccess, InboxItemKind
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_OBSERVER_MAX_BYTES,
@@ -333,6 +336,7 @@ from cayu.sessions.messaging import (
     SessionMessageSource,
 )
 from cayu.sessions.pending_action_contracts import (
+    PendingActionListResult,
     PendingActionQuery,
     PendingActionRecord,
     PendingActionResultTooLarge,
@@ -369,6 +373,7 @@ from cayu.sessions.summaries import SessionOutcome
 from cayu.sessions.supervision_events import (
     SupervisionEvent,
     SupervisionEventCursorInvalid,
+    SupervisionEventKind,
     SupervisionEventQuery,
     SupervisionEventResultTooLarge,
 )
@@ -1040,6 +1045,19 @@ MutationIdHeader = Annotated[
 ]
 ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
 HumanAttentionIdPath = Annotated[str, StringConstraints(pattern=r"^attention_[0-9a-f]{64}$")]
+_ATTENTION_INBOX_KINDS: dict[str, InboxItemKind] = {
+    "tool_approval": "approval",
+    "user_input": "question",
+    "manual_recovery": "recovery",
+}
+_SUPERVISION_INBOX_KINDS: dict[SupervisionEventKind, InboxItemKind] = {
+    SupervisionEventKind.APPROVE: "approval",
+    SupervisionEventKind.EDIT: "approval",
+    SupervisionEventKind.DENY: "approval",
+    SupervisionEventKind.EXPIRE: "approval",
+    SupervisionEventKind.ANSWER: "question",
+    SupervisionEventKind.RECOVER: "recovery",
+}
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
@@ -1290,6 +1308,69 @@ async def _accepted_event_stream_response(
     Advancing the runtime here also makes a new session's store insert the atomic
     identity claim before route-owned task creation or an HTTP 200 response.
     """
+    accepted = await _start_accepted_mutation(
+        event_stream,
+        cayu_app=cayu_app,
+        session_id=session_id,
+        after_accept=after_accept,
+        acceptance_callbacks=acceptance_callbacks,
+        conflict_error_types=conflict_error_types,
+    )
+    return accepted.response
+
+
+async def _accepted_detached_mutation(
+    event_stream: AsyncIterator[Event],
+    *,
+    cayu_app: Any,
+    session_id: str,
+    until: Callable[[Event], bool],
+    conflict_error_types: tuple[type[Exception], ...] = (ValueError,),
+) -> None:
+    """Run a mutation without an SSE observer until the event ``until`` selects.
+
+    The detached driver finishes the runtime work in the background, exactly as
+    it does after an SSE client disconnects. Rejections before the first event
+    map to the same HTTP errors as the streaming routes. The call returns once
+    the selected event was produced or the runtime work ended without it.
+    """
+    reached: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def observe(event: Event) -> None:
+        if not reached.done() and until(event):
+            reached.set_result(None)
+
+    accepted = await _start_accepted_mutation(
+        event_stream,
+        cayu_app=cayu_app,
+        session_id=session_id,
+        conflict_error_types=conflict_error_types,
+        on_event=observe,
+    )
+    accepted.abandon_observer()
+    try:
+        await asyncio.wait({reached, accepted.pump_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        reached.cancel()
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedMutation:
+    response: EventSourceResponse
+    pump_task: asyncio.Task[None]
+    abandon_observer: Callable[[], None]
+
+
+async def _start_accepted_mutation(
+    event_stream: AsyncIterator[Event],
+    *,
+    cayu_app: Any,
+    session_id: str,
+    after_accept: Callable[[Event], Awaitable[None]] | None = None,
+    acceptance_callbacks: _MutationAcceptanceCallbacks | None = None,
+    conflict_error_types: tuple[type[Exception], ...] = (ValueError,),
+    on_event: Callable[[Event], None] | None = None,
+) -> _AcceptedMutation:
     if after_accept is not None and acceptance_callbacks is not None:
         raise TypeError("after_accept and acceptance_callbacks are mutually exclusive.")
     first_event_callback = (
@@ -1313,6 +1394,7 @@ async def _accepted_event_stream_response(
             else None
         ),
         observer_started=observer_started,
+        on_event=on_event,
     )
     try:
         acceptance_error, stage = await asyncio.shield(acceptance)
@@ -1329,7 +1411,7 @@ async def _accepted_event_stream_response(
         raise
 
     if acceptance_error is None:
-        return response
+        return _AcceptedMutation(response, pump_task, abandon_observer)
 
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await pump_task
@@ -1434,6 +1516,7 @@ def _start_detached_event_stream_response(
         Callable[[TerminalEventPublicationUncertain], Awaitable[None]] | None
     ) = None,
     observer_started: asyncio.Event | None = None,
+    on_event: Callable[[Event], None] | None = None,
 ) -> tuple[EventSourceResponse, asyncio.Task[None], Callable[[], None]]:
     """Run ``event_stream`` to completion in a detached task; stream it as an observer.
 
@@ -1680,6 +1763,8 @@ def _start_detached_event_stream_response(
                     else:
                         resolve_acceptance(None, "accepted")
 
+                if on_event is not None:
+                    on_event(event)
                 await publish_without_losing_cancellation(event)
 
                 if (
@@ -4007,6 +4092,19 @@ def _serialize_knowledge_entry_base(entry: KnowledgeEntry) -> dict[str, Any]:
     }
 
 
+def _knowledge_reviewer_attribution(
+    auth_context: AuthContext | None,
+) -> tuple[str, dict[str, object]]:
+    """Return the reviewer a knowledge approval records for this caller."""
+
+    if auth_context is None:
+        return "cayu:trusted-local-development", {
+            "channel": "trusted-local-http",
+            "identity_source": "local_development",
+        }
+    return _authenticated_knowledge_reviewer_attribution(auth_context)
+
+
 def _authenticated_knowledge_reviewer_attribution(
     auth_context: AuthContext,
 ) -> tuple[str, dict[str, object]]:
@@ -4158,6 +4256,8 @@ def create_router(
     continuation_loop_policy_provider: (
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
+    inbox_access: InboxAccess | None = None,
+    inbox_cursor_key: bytes | None = None,
     _project_context: ResolvedProjectControlPlaneContext | None = None,
     _system_diagnostics_snapshot_sink: (Callable[[SystemDiagnosticsSnapshot], None] | None) = None,
     _browser_client_base_path: str | None = None,
@@ -4219,12 +4319,21 @@ def create_router(
             resolver used by an embedding application for resume, approval,
             user-input, and tool-recovery continuations. The returned policies
             remain process-local and are never accepted from HTTP payloads.
+        inbox_access: Optional ``cayu.server.inbox.InboxAccess`` rule deciding
+            which authenticated callers may see and settle each approval, question,
+            recovery item and knowledge proposal. It applies on every route that lists
+            or settles them, not only the inbox routes. Without it, every caller the
+            auth dependency admits may. It requires an auth dependency.
+        inbox_cursor_key: Deployment-owned 32-byte key shared by all workers for
+            encrypted knowledge inbox pagination. No ephemeral key is generated.
     """
 
     if continuation_loop_policy_provider is not None and not callable(
         continuation_loop_policy_provider
     ):
         raise TypeError("continuation_loop_policy_provider must be callable or None.")
+    if inbox_access is not None and (not callable(inbox_access) or auth is None):
+        raise ValueError("An inbox access rule must be callable and requires authenticated access.")
     if _system_diagnostics_snapshot_sink is not None and not callable(
         _system_diagnostics_snapshot_sink
     ):
@@ -4525,6 +4634,40 @@ def create_router(
             await continuation_loop_policy_provider(session_id),
             field_name="continuation_loop_policies",
         )
+
+    # One decision point for who may see and settle approvals, questions, recovery
+    # items and knowledge proposals, on every route that lists or settles them.
+    inbox_gate = InboxAccessGate(cayu_app, cayu_app._runtime_session_store, inbox_access)
+
+    async def _require_settle_access(
+        auth_context: AuthContext | None,
+        *,
+        session_id: str,
+        kinds: tuple[InboxItemKind, ...],
+        approval_id: str | None = None,
+        input_id: str | None = None,
+        round_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
+        """Authorize the exact durable item before any replay or mutation."""
+
+        if not inbox_gate.applies(auth_context):
+            return
+        private_session_id = await _resolve_public_session_id(session_id)
+        identity = {}
+        for field, value in (
+            ("approval_id", approval_id),
+            ("input_id", input_id),
+            ("round_id", round_id),
+            ("tool_call_id", tool_call_id),
+        ):
+            if value is not None:
+                identity[field] = await _resolve_public_linkage(
+                    session_id=private_session_id,
+                    value=value,
+                    field_name="tool_round_id" if field == "round_id" else field,
+                )
+        await inbox_gate.require_item(auth_context, private_session_id, kinds, **identity)
 
     async def _resolve_session_query_authority_filters(
         *,
@@ -5112,11 +5255,23 @@ def create_router(
                 detail="Supervision events exceed the byte limit; request a smaller page.",
                 headers=no_store,
             ) from exc
+        sessions: dict[str, Session | None] = {}
         return SupervisionEventsResponse.model_validate(
             {
                 "events": [
                     _serialize_supervision_event(cayu_app, event, anchors[event.sequence])
                     for event in page.events
+                    # A touch that settled an inbox item is shown only to callers the
+                    # inbox access rule lets see that item. Interrupts and steering
+                    # settle no item.
+                    if event.kind not in _SUPERVISION_INBOX_KINDS
+                    or await inbox_gate.permits_attention(
+                        auth_context,
+                        event.session_id,
+                        _SUPERVISION_INBOX_KINDS[event.kind],
+                        event.attention_id,
+                        sessions,
+                    )
                 ],
                 "next_cursor": page.next_cursor,
                 "has_more": page.has_more,
@@ -6084,6 +6239,13 @@ def create_router(
             raise HTTPException(
                 status_code=403, detail="Human-review access is not authorized."
             ) from None
+        if view.kind is not None and not await inbox_gate.permits_item(
+            auth_context,
+            await _resolve_public_session_id(session_id),
+            ("approval", "recovery") if view.kind == "tool_approval" else ("question", "recovery"),
+            **{"approval_id" if view.kind == "tool_approval" else "input_id": view.interaction_id},
+        ):
+            raise HTTPException(status_code=403, detail="Human-review access is not authorized.")
         return JSONResponse(
             view.model_dump(mode="json"),
             headers={
@@ -6128,6 +6290,12 @@ def create_router(
             raise HTTPException(
                 status_code=403, detail="Human-review decision is not authorized."
             ) from None
+        await _require_settle_access(
+            auth_context,
+            session_id=body.session_id,
+            kinds=("approval",),
+            approval_id=body.approval_id,
+        )
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -6215,6 +6383,14 @@ def create_router(
             raise HTTPException(
                 status_code=403, detail="Human-review decision is not authorized."
             ) from None
+        await _require_settle_access(
+            auth_context,
+            session_id=body.session_id,
+            kinds=("recovery",),
+            approval_id=body.approval_id,
+            round_id=body.tool_round_id,
+            tool_call_id=body.tool_call_id,
+        )
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -6288,6 +6464,13 @@ def create_router(
         auth_context: AuthContext | None = optional_auth_context,
         mutation_id: MutationIdHeader = None,
     ):
+        await _require_settle_access(
+            auth_context,
+            session_id=body.session_id,
+            kinds=("recovery",),
+            round_id=body.round_id,
+            tool_call_id=body.tool_call_id,
+        )
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -6379,6 +6562,12 @@ def create_router(
             raise HTTPException(
                 status_code=403, detail="Human-review decision is not authorized."
             ) from None
+        await _require_settle_access(
+            auth_context,
+            session_id=body.session_id,
+            kinds=("question",),
+            input_id=body.input_id,
+        )
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -6456,6 +6645,13 @@ def create_router(
             raise HTTPException(
                 status_code=403, detail="Human-review decision is not authorized."
             ) from None
+        await _require_settle_access(
+            auth_context,
+            session_id=body.session_id,
+            kinds=("recovery",),
+            input_id=body.input_id,
+            tool_call_id=body.tool_call_id,
+        )
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -6887,7 +7083,13 @@ def create_router(
         "/pending-actions",
         response_model=PendingActionsResponse,
         responses=PENDING_ACTION_ENDPOINT_RESPONSES,
-        dependencies=protected,
+        description=(
+            "List the durable actions blocking sessions. With an inbox access rule, a "
+            "caller sees only the actions the rule lets it see and settle: delegated parent "
+            "rows and issues are left out, the cursor continues after the caller's own "
+            "actions, `total_count` is null and `has_more` without a cursor means the scan "
+            "stopped among actions the caller may not see."
+        ),
     )
     async def list_pending_actions(
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -6898,6 +7100,7 @@ def create_router(
         environment_name: Annotated[str | None, Query()] = None,
         cursor: Annotated[str | None, Query()] = None,
         include: Annotated[list[Literal["execution_profile"]] | None, Query()] = None,
+        auth_context: AuthContext | None = optional_auth_context,
     ):
         requested_session_id = _clean_optional_query_value(session_id, "session_id")
         if requested_session_id is not None:
@@ -6913,18 +7116,27 @@ def create_router(
                 decode_session_cursor(requested_cursor)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+        query = PendingActionQuery(
+            session_id=requested_session_id,
+            kind=kind,
+            agent_name=requested_agent_name,
+            environment_name=requested_environment_name,
+            q=search,
+            cursor=requested_cursor,
+            limit=limit,
+        )
         try:
-            result = await cayu_app._runtime_session_store.query_pending_actions(
-                PendingActionQuery(
-                    session_id=requested_session_id,
-                    kind=kind,
-                    agent_name=requested_agent_name,
-                    environment_name=requested_environment_name,
-                    q=search,
-                    cursor=requested_cursor,
-                    limit=limit,
+            if inbox_gate.applies(auth_context):
+                permitted = await inbox_gate.scan_pending(auth_context, query)
+                result = PendingActionListResult(
+                    actions=permitted.actions,
+                    next_cursor=permitted.next_cursor,
+                    has_more=permitted.next_cursor is not None or permitted.truncated,
+                    total_count=None,
+                    inspected_candidate_count=len(permitted.actions),
                 )
-            )
+            else:
+                result = await cayu_app._runtime_session_store.query_pending_actions(query)
         except CheckpointCompatibilityError as exc:
             raise HTTPException(
                 status_code=409,
@@ -7025,6 +7237,14 @@ def create_router(
                 return unavailable("store_unavailable")
             if session is None or session.invocation.origin.tenant != tenant:
                 return unavailable("session_unavailable")
+        if not await inbox_gate.permits_attention(
+            auth_context,
+            private_session_id,
+            _ATTENTION_INBOX_KINDS[kind],
+            reference.attention_id,
+            {},
+        ):
+            return unavailable("session_unavailable")
         return await cayu_app.get_human_attention_state(reference)
 
     @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)
@@ -8622,6 +8842,20 @@ def create_router(
             default_limit=50,
         )
 
+    async def _require_knowledge_access(
+        auth_context: AuthContext | None, workflow: KnowledgeReviewWorkflow, entry_id: str
+    ) -> None:
+        """Refuse reviewing a proposal the inbox access rule hides, as if it were absent."""
+
+        if not inbox_gate.applies(auth_context):
+            return
+        try:
+            entry = await workflow.get_entry(entry_id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if entry is not None:
+            await inbox_gate.require_knowledge(auth_context, entry)
+
     async def _apply_knowledge_review_action(action, entry_id: str):
         try:
             result = await action(entry_id)
@@ -8641,7 +8875,6 @@ def create_router(
     @router.get(
         "/knowledge/pending",
         response_model=PendingKnowledgeListResponse,
-        dependencies=protected,
     )
     async def list_pending_knowledge(
         namespace: str | None = None,
@@ -8653,6 +8886,7 @@ def create_router(
         source_id: str | None = None,
         limit: int = 50,
         max_bytes: int = 20_000,
+        auth_context: AuthContext | None = optional_auth_context,
     ):
         workflow = _knowledge_review_workflow()
         try:
@@ -8669,18 +8903,25 @@ def create_router(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        entries = [
+            _serialize_knowledge_list_item(item)
+            for item in result.entries
+            if await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(item.entry))
+        ]
         return {
-            "entries": [_serialize_knowledge_list_item(item) for item in result.entries],
+            "entries": entries,
             "truncated": result.truncated,
             "limit": result.limit,
             "max_bytes": result.max_bytes,
-            "total_entries_known": result.total_entries_known,
+            # The store's count would include proposals the inbox access rule hides.
+            "total_entries_known": (
+                len(entries) if inbox_gate.applies(auth_context) else result.total_entries_known
+            ),
         }
 
     @router.get(
         "/knowledge/pending/{entry_id}",
         response_model=PendingKnowledgeDetailResponse,
-        dependencies=protected,
     )
     async def get_pending_knowledge(
         entry_id: NonBlankString,
@@ -8692,6 +8933,7 @@ def create_router(
             int,
             Query(ge=1, le=_KNOWLEDGE_PENDING_DETAIL_MAX_BYTES),
         ] = _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES,
+        auth_context: AuthContext | None = optional_auth_context,
     ):
         workflow = _knowledge_review_workflow()
         assert knowledge_store is not None
@@ -8703,6 +8945,7 @@ def create_router(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await inbox_gate.require_knowledge(auth_context, entry)
         try:
             chunks = await knowledge_store.read_chunks(
                 entry.id,
@@ -8733,18 +8976,9 @@ def create_router(
         auth_context: AuthContext | None = optional_auth_context,
     ):
         workflow = _knowledge_review_workflow()
+        await _require_knowledge_access(auth_context, workflow, entry_id)
         operation_id = idempotency_key or f"server-knowledge-review-{uuid4().hex}"
-        reviewer_annotations: dict[str, object]
-        if auth_context is None:
-            reviewer_identity = "cayu:trusted-local-development"
-            reviewer_annotations = {
-                "channel": "trusted-local-http",
-                "identity_source": "local_development",
-            }
-        else:
-            reviewer_identity, reviewer_annotations = _authenticated_knowledge_reviewer_attribution(
-                auth_context
-            )
+        reviewer_identity, reviewer_annotations = _knowledge_reviewer_attribution(auth_context)
         return await _apply_knowledge_review_action(
             lambda item_id: workflow.approve(
                 item_id,
@@ -8758,12 +8992,29 @@ def create_router(
 
     @router.post(
         "/knowledge/{entry_id}/reject",
-        dependencies=protected,
         response_model=ApiReviewedKnowledgeEntry,
     )
-    async def reject_knowledge(entry_id: NonBlankString):
+    async def reject_knowledge(
+        entry_id: NonBlankString,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
         workflow = _knowledge_review_workflow()
+        await _require_knowledge_access(auth_context, workflow, entry_id)
         return await _apply_knowledge_review_action(workflow.reject, entry_id)
+
+    register_inbox_routes(
+        router,
+        bounded_control_plane_router,
+        cayu_app=cayu_app,
+        session_store=cayu_app._runtime_session_store,
+        knowledge_review_workflow=(
+            _knowledge_review_workflow if knowledge_store is not None else None
+        ),
+        continuation_loop_policies=_continuation_loop_policies,
+        optional_auth_context=optional_auth_context,
+        inbox_gate=inbox_gate,
+        inbox_cursor_key=inbox_cursor_key,
+    )
 
     @router.get("/health", response_model=HealthResponse)
     async def health():

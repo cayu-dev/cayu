@@ -37,8 +37,10 @@ from cayu.approvals.authorization_grants import (
     ToolAuthorizationGrantUseCursor,
 )
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.server._inbox_access import InboxAccessGate
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.contracts import BOUNDED_STREAMING_ENDPOINT_RESPONSES
+from cayu.server.inbox import InboxAccess
 
 GrantReadAccess = Callable[[AuthContext, ToolAuthorizationGrant], Awaitable[bool]]
 
@@ -174,18 +176,36 @@ class ToolAuthorizationGrantServer:
             raise HTTPException(status_code=404, detail="Grant or approval was not found.")
         return ToolAuthorizationGrantView.from_grant(grant, now=self.service.now())
 
-    def router(self, *, auth: AuthDependency) -> APIRouter:
+    def router(self, *, auth: AuthDependency, inbox_access: InboxAccess | None = None) -> APIRouter:
+        """Build the grant routes.
+
+        ``inbox_access`` is the server's inbox access rule: approving with a grant
+        settles an approval, so a caller the rule hides that approval from is refused.
+        """
+
         from cayu.server.routes import _accepted_event_stream_response
 
         router = APIRouter(prefix="/tool-authorization-grants", tags=["tool-authorization-grants"])
         authenticated = server_auth_dependency(auth)
         Principal = Annotated[AuthContext, Depends(authenticated)]
         service = self.service
+        inbox_gate = InboxAccessGate(service.app, service.app._runtime_session_store, inbox_access)
 
         @router.post("/approve", responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES)
         async def approve_with_grant(body: ToolAuthorizationGrantApproveBody, principal: Principal):
             """Remember and approve: idempotent by approval identity; streams the resolution."""
 
+            if inbox_gate.applies(principal):
+                try:
+                    session_id = await service.app._resolve_public_session_id(body.session_id)
+                    approval_id = await service.app._resolve_public_action_linkage(
+                        session_id=session_id, value=body.approval_id, field_name="approval_id"
+                    )
+                except ValueError:
+                    raise _http_error(KeyError(body.approval_id)) from None
+                await inbox_gate.require_item(
+                    principal, session_id, ("approval",), approval_id=approval_id
+                )
             try:
                 approval = ToolApprovalRequest(
                     session_id=body.session_id,

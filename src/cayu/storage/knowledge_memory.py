@@ -182,6 +182,7 @@ from cayu.knowledge.search import (
     _query_terms_have_positive_terms,
     copy_knowledge_list_query,
     copy_knowledge_query,
+    decode_knowledge_list_cursor,
 )
 from cayu.storage._knowledge_closure import (
     KnowledgeClosureInventory,
@@ -3377,6 +3378,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 entry.id,
             )
         )
+        if knowledge_query.cursor is not None:
+            importance, updated_at, entry_id = decode_knowledge_list_cursor(knowledge_query.cursor)
+            position = (-importance, -updated_at.timestamp(), entry_id)
+            entries = [
+                entry
+                for entry in entries
+                if (-(entry.importance or 0.0), -entry.updated_at.timestamp(), entry.id) > position
+            ]
         facets, facets_truncated = _knowledge_facets(
             entries,
             knowledge_query.group_by,

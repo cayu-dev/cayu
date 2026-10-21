@@ -8341,6 +8341,16 @@
           "evaluation_promotion": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "inbox": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "pricing": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -20334,6 +20344,592 @@
           "session_id"
         ],
         "title": "HumanReviewView",
+        "type": "object"
+      },
+      "InboxConflict": {
+        "additionalProperties": false,
+        "description": "Why a settle was refused, with the item's current state when it is known.",
+        "properties": {
+          "code": {
+            "enum": [
+              "already_settled",
+              "superseded",
+              "expired",
+              "unavailable",
+              "not_settleable",
+              "conflict"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InboxItemState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "InboxConflict",
+        "type": "object"
+      },
+      "InboxConflictResponse": {
+        "additionalProperties": false,
+        "description": "The 409 body of a refused settle.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/InboxConflict"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "InboxConflictResponse",
+        "type": "object"
+      },
+      "InboxDecider": {
+        "additionalProperties": false,
+        "description": "Who settled an item, as the Runtime recorded it.",
+        "properties": {
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResolutionActorSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          },
+          "tenant": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "title": "InboxDecider",
+        "type": "object"
+      },
+      "InboxIssue": {
+        "additionalProperties": false,
+        "description": "Something the inbox could not list; review it in the Developer dashboard.\n\nA caller who sees the whole store gets the pending-action issues of sessions\ntoo large or invalid to list. A caller limited by tenant or access rule gets\nonly ``inbox_truncated``, when other people's items fill its scan.",
+        "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "code": {
+            "enum": [
+              "source_too_large",
+              "source_too_complex",
+              "source_invalid",
+              "knowledge_truncated",
+              "inbox_truncated"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          }
+        },
+        "required": [
+          "code",
+          "detail"
+        ],
+        "title": "InboxIssue",
+        "type": "object"
+      },
+      "InboxItem": {
+        "additionalProperties": false,
+        "description": "One thing waiting on a person.\n\nText fields are untrusted, already redacted for known secrets, and must be\nrendered as escaped text. ``id`` names this exact pause or proposal\nrevision: a new question or a revised proposal is a new item.",
+        "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "attention_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-attention identity of an approval, question or recovery item, as pending-action reads, supervision events and the attention handoff name it.",
+            "title": "Attention Id"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "decisions": {
+            "description": "What this item accepts; empty when it is settled elsewhere.",
+            "items": {
+              "enum": [
+                "approve",
+                "deny",
+                "answer",
+                "keep",
+                "drop"
+              ],
+              "type": "string"
+            },
+            "title": "Decisions",
+            "type": "array"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "approval",
+              "question",
+              "recovery",
+              "knowledge"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "knowledge": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InboxKnowledgeEntry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "question": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Question"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Name"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "created_at",
+          "title",
+          "decisions"
+        ],
+        "title": "InboxItem",
+        "type": "object"
+      },
+      "InboxItemState": {
+        "additionalProperties": false,
+        "description": "The current state of one item: the item while pending, its settlement after.",
+        "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InboxItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "enum": [
+              "approval",
+              "question",
+              "recovery",
+              "knowledge"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "settlement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InboxSettlement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "settled",
+              "superseded",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "status"
+        ],
+        "title": "InboxItemState",
+        "type": "object"
+      },
+      "InboxKnowledgeEntry": {
+        "additionalProperties": false,
+        "description": "The exact knowledge revision a knowledge proposal asks a person to keep or drop.",
+        "properties": {
+          "entry_id": {
+            "title": "Entry Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "entry_id",
+          "revision",
+          "kind"
+        ],
+        "title": "InboxKnowledgeEntry",
+        "type": "object"
+      },
+      "InboxPage": {
+        "additionalProperties": false,
+        "description": "One page of the inbox. Filtering can leave a page with fewer than ``limit`` items.",
+        "properties": {
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/InboxIssue"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/InboxItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more"
+        ],
+        "title": "InboxPage",
+        "type": "object"
+      },
+      "InboxSettleRequest": {
+        "additionalProperties": false,
+        "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval, with an optional ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge\nproposal. ``review_reference`` is required when the application configures\na human-review policy; read it from ``GET /api/sessions/{id}/human-review``.\nWorker-owned approvals and questions require the same ``task_worker_id`` and\n``task_handoff_id`` continuation authority as the ordinary resolve routes.",
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "maxLength": 16384,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "approval_revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalRevision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments"
+          },
+          "decision": {
+            "enum": [
+              "approve",
+              "deny",
+              "answer",
+              "keep",
+              "drop"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "review_reference": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HumanReviewReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "task_handoff_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Handoff Id"
+          },
+          "task_worker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Worker Id"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "InboxSettleRequest",
+        "type": "object"
+      },
+      "InboxSettleResponse": {
+        "additionalProperties": false,
+        "description": "The settled item. ``replayed`` is true when this exact decision was already recorded.",
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/InboxItemState"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "replayed",
+          "item"
+        ],
+        "title": "InboxSettleResponse",
+        "type": "object"
+      },
+      "InboxSettlement": {
+        "additionalProperties": false,
+        "description": "How an item was settled.\n\n``decided_by`` is ``None`` when the Runtime has no record of the person: a\nknowledge proposal dropped or kept outside the inbox, or a request settled\nunder open local access.",
+        "properties": {
+          "decided_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "decided_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InboxDecider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "decision": {
+            "enum": [
+              "approve",
+              "deny",
+              "expire",
+              "answer",
+              "recover",
+              "keep",
+              "drop"
+            ],
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "InboxSettlement",
         "type": "object"
       },
       "InteractionStatus": {
@@ -43694,6 +44290,229 @@
         "summary": "Get Human Attention State"
       }
     },
+    "/api/inbox": {
+      "get": {
+        "description": "List what is waiting on a person: approvals, questions and recovery items from this agent's sessions, then knowledge proposals on their own pages. A configured inbox access rule hides items the caller may not see and settle, here and on every other route that lists or settles them. Follow `next_cursor` until it is null.",
+        "operationId": "list_inbox_api_inbox_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 8192,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboxPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        },
+        "summary": "List Inbox"
+      }
+    },
+    "/api/inbox/{item_id}": {
+      "get": {
+        "description": "Read one item's current state: the item while it is pending, and who settled it, how and when once it is settled, wherever that happened.",
+        "operationId": "get_inbox_item_api_inbox__item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "pattern": "^inbox_[A-Za-z0-9_-]{1,8192}$",
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboxItemState"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Inbox Item"
+      }
+    },
+    "/api/inbox/{item_id}/settle": {
+      "post": {
+        "description": "Settle one item as the authenticated caller: approve (optionally with changed arguments) or deny an approval, answer a question, keep or drop a knowledge proposal. Returns once the Runtime durably accepted the decision; the agent carries on in the background. Repeating the exact decision returns the recorded settlement with `replayed: true`. Any other settle of a settled, replaced or expired item gets 409 with the item's current state.",
+        "operationId": "settle_inbox_item_api_inbox__item_id__settle_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "pattern": "^inbox_[A-Za-z0-9_-]{1,8192}$",
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InboxSettleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboxSettleResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboxConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Settle Inbox Item"
+      }
+    },
     "/api/knowledge/pending": {
       "get": {
         "operationId": "list_pending_knowledge_api_knowledge_pending_get",
@@ -44081,6 +44900,7 @@
     },
     "/api/pending-actions": {
       "get": {
+        "description": "List the durable actions blocking sessions. With an inbox access rule, a caller sees only the actions the rule lets it see and settle: delegated parent rows and issues are left out, the cursor continues after the caller's own actions, `total_count` is null and `has_more` without a cursor means the scan stopped among actions the caller may not see.",
         "operationId": "list_pending_actions_api_pending_actions_get",
         "parameters": [
           {

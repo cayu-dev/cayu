@@ -4105,6 +4105,7 @@ export type ControlPlaneSurfaceCapabilities = {
     dashboard: OptionalSurfaceCapability;
     evals: OptionalSurfaceCapability;
     evaluation_promotion: OptionalSurfaceCapability;
+    inbox?: OptionalSurfaceCapability | null;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     session_follow?: OptionalSurfaceCapability | null;
@@ -10033,6 +10034,295 @@ export type HumanReviewView = {
      * Tool Round Id
      */
     tool_round_id?: string | null;
+};
+
+/**
+ * InboxConflict
+ *
+ * Why a settle was refused, with the item's current state when it is known.
+ */
+export type InboxConflict = {
+    /**
+     * Code
+     */
+    code: 'already_settled' | 'superseded' | 'expired' | 'unavailable' | 'not_settleable' | 'conflict';
+    item?: InboxItemState | null;
+    /**
+     * Message
+     */
+    message: string;
+};
+
+/**
+ * InboxConflictResponse
+ *
+ * The 409 body of a refused settle.
+ */
+export type InboxConflictResponse = {
+    detail: InboxConflict;
+};
+
+/**
+ * InboxDecider
+ *
+ * Who settled an item, as the Runtime recorded it.
+ */
+export type InboxDecider = {
+    source?: ResolutionActorSource | null;
+    /**
+     * Subject
+     */
+    subject: string;
+    /**
+     * Tenant
+     */
+    tenant?: string | null;
+};
+
+/**
+ * InboxIssue
+ *
+ * Something the inbox could not list; review it in the Developer dashboard.
+ *
+ * A caller who sees the whole store gets the pending-action issues of sessions
+ * too large or invalid to list. A caller limited by tenant or access rule gets
+ * only ``inbox_truncated``, when other people's items fill its scan.
+ */
+export type InboxIssue = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Code
+     */
+    code: 'source_too_large' | 'source_too_complex' | 'source_invalid' | 'knowledge_truncated' | 'inbox_truncated';
+    /**
+     * Detail
+     */
+    detail: string;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+};
+
+/**
+ * InboxItem
+ *
+ * One thing waiting on a person.
+ *
+ * Text fields are untrusted, already redacted for known secrets, and must be
+ * rendered as escaped text. ``id`` names this exact pause or proposal
+ * revision: a new question or a revised proposal is a new item.
+ */
+export type InboxItem = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Attention Id
+     *
+     * Human-attention identity of an approval, question or recovery item, as pending-action reads, supervision events and the attention handoff name it.
+     */
+    attention_id?: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Decisions
+     *
+     * What this item accepts; empty when it is settled elsewhere.
+     */
+    decisions: Array<'approve' | 'deny' | 'answer' | 'keep' | 'drop'>;
+    /**
+     * Detail
+     */
+    detail?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind: 'approval' | 'question' | 'recovery' | 'knowledge';
+    knowledge?: InboxKnowledgeEntry | null;
+    /**
+     * Options
+     */
+    options?: Array<string>;
+    /**
+     * Question
+     */
+    question?: string | null;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    /**
+     * Title
+     */
+    title: string;
+    /**
+     * Tool Name
+     */
+    tool_name?: string | null;
+};
+
+/**
+ * InboxItemState
+ *
+ * The current state of one item: the item while pending, its settlement after.
+ */
+export type InboxItemState = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    item?: InboxItem | null;
+    /**
+     * Kind
+     */
+    kind: 'approval' | 'question' | 'recovery' | 'knowledge';
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    settlement?: InboxSettlement | null;
+    /**
+     * Status
+     */
+    status: 'pending' | 'settled' | 'superseded' | 'unavailable';
+};
+
+/**
+ * InboxKnowledgeEntry
+ *
+ * The exact knowledge revision a knowledge proposal asks a person to keep or drop.
+ */
+export type InboxKnowledgeEntry = {
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Revision
+     */
+    revision: number;
+};
+
+/**
+ * InboxPage
+ *
+ * One page of the inbox. Filtering can leave a page with fewer than ``limit`` items.
+ */
+export type InboxPage = {
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Issues
+     */
+    issues?: Array<InboxIssue>;
+    /**
+     * Items
+     */
+    items: Array<InboxItem>;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+};
+
+/**
+ * InboxSettleRequest
+ *
+ * A person's decision on one inbox item.
+ *
+ * ``approve`` and ``deny`` settle an approval, with an optional ``reason``.
+ * ``approve`` can carry the changed ``arguments`` the tool runs with, or an
+ * ``approval_revision`` naming an edit the application stored itself.
+ * ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
+ * proposal. ``review_reference`` is required when the application configures
+ * a human-review policy; read it from ``GET /api/sessions/{id}/human-review``.
+ * Worker-owned approvals and questions require the same ``task_worker_id`` and
+ * ``task_handoff_id`` continuation authority as the ordinary resolve routes.
+ */
+export type InboxSettleRequest = {
+    /**
+     * Answer
+     */
+    answer?: string | null;
+    approval_revision?: ApprovalRevision | null;
+    /**
+     * Arguments
+     */
+    arguments?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Decision
+     */
+    decision: 'approve' | 'deny' | 'answer' | 'keep' | 'drop';
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    review_reference?: HumanReviewReference | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
+};
+
+/**
+ * InboxSettleResponse
+ *
+ * The settled item. ``replayed`` is true when this exact decision was already recorded.
+ */
+export type InboxSettleResponse = {
+    item: InboxItemState;
+    /**
+     * Replayed
+     */
+    replayed: boolean;
+};
+
+/**
+ * InboxSettlement
+ *
+ * How an item was settled.
+ *
+ * ``decided_by`` is ``None`` when the Runtime has no record of the person: a
+ * knowledge proposal dropped or kept outside the inbox, or a request settled
+ * under open local access.
+ */
+export type InboxSettlement = {
+    /**
+     * Decided At
+     */
+    decided_at?: string | null;
+    decided_by?: InboxDecider | null;
+    /**
+     * Decision
+     */
+    decision: 'approve' | 'deny' | 'expire' | 'answer' | 'recover' | 'keep' | 'drop';
 };
 
 /**
@@ -23011,6 +23301,128 @@ export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponses = {
 };
 
 export type GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponse = GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponses[keyof GetHumanAttentionStateApiHumanAttentionAttentionIdGetResponses];
+
+export type ListInboxApiInboxGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+    };
+    url: '/api/inbox';
+};
+
+export type ListInboxApiInboxGetErrors = {
+    /**
+     * Conflict
+     */
+    409: ApiErrorResponse;
+    /**
+     * Request Entity Too Large
+     */
+    413: ApiErrorResponse;
+    /**
+     * Unprocessable Entity
+     */
+    422: ApiErrorResponse;
+};
+
+export type ListInboxApiInboxGetError = ListInboxApiInboxGetErrors[keyof ListInboxApiInboxGetErrors];
+
+export type ListInboxApiInboxGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: InboxPage;
+};
+
+export type ListInboxApiInboxGetResponse = ListInboxApiInboxGetResponses[keyof ListInboxApiInboxGetResponses];
+
+export type GetInboxItemApiInboxItemIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Item Id
+         */
+        item_id: string;
+    };
+    query?: never;
+    url: '/api/inbox/{item_id}';
+};
+
+export type GetInboxItemApiInboxItemIdGetErrors = {
+    /**
+     * Not Found
+     */
+    404: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetInboxItemApiInboxItemIdGetError = GetInboxItemApiInboxItemIdGetErrors[keyof GetInboxItemApiInboxItemIdGetErrors];
+
+export type GetInboxItemApiInboxItemIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: InboxItemState;
+};
+
+export type GetInboxItemApiInboxItemIdGetResponse = GetInboxItemApiInboxItemIdGetResponses[keyof GetInboxItemApiInboxItemIdGetResponses];
+
+export type SettleInboxItemApiInboxItemIdSettlePostData = {
+    body: InboxSettleRequest;
+    path: {
+        /**
+         * Item Id
+         */
+        item_id: string;
+    };
+    query?: never;
+    url: '/api/inbox/{item_id}/settle';
+};
+
+export type SettleInboxItemApiInboxItemIdSettlePostErrors = {
+    /**
+     * Bad Request
+     */
+    400: ApiErrorResponse;
+    /**
+     * Forbidden
+     */
+    403: ApiErrorResponse;
+    /**
+     * Not Found
+     */
+    404: ApiErrorResponse;
+    /**
+     * Conflict
+     */
+    409: InboxConflictResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SettleInboxItemApiInboxItemIdSettlePostError = SettleInboxItemApiInboxItemIdSettlePostErrors[keyof SettleInboxItemApiInboxItemIdSettlePostErrors];
+
+export type SettleInboxItemApiInboxItemIdSettlePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: InboxSettleResponse;
+};
+
+export type SettleInboxItemApiInboxItemIdSettlePostResponse = SettleInboxItemApiInboxItemIdSettlePostResponses[keyof SettleInboxItemApiInboxItemIdSettlePostResponses];
 
 export type ListPendingKnowledgeApiKnowledgePendingGetData = {
     body?: never;

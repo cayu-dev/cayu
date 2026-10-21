@@ -48,6 +48,7 @@ function makeContract({
   stream = false,
   follow = sessionFollowContract(),
   usage = true,
+  inbox = true,
   contractVersion = CONTRACT_VERSION,
   clientVersion = CLIENT_VERSION,
 } = {}) {
@@ -57,6 +58,7 @@ function makeContract({
       ? enabled()
       : { configured: false, read: { enabled: false, unavailable_reason: "not_configured" } },
   }
+  if (inbox) surfaces.inbox = enabled()
   if (stream) {
     sse.session_follow = follow
     surfaces.session_follow = enabled()
@@ -155,6 +157,8 @@ class FakeServer {
     this.sessions = []
     this.usage = { session_id: "s1", total_tokens: "12" }
     this.usageEtag = '"usage-1"'
+    // Inbox pages by cursor; the first page has the null cursor.
+    this.inboxPages = new Map([[null, { items: [], issues: [], next_cursor: null }]])
   }
 
   /** Answer the next request whose path ends with `suffix` with `respond()`. */
@@ -187,6 +191,12 @@ class FakeServer {
         return new Response(null, { status: 304, headers: { ETag: this.usageEtag } })
       }
       return json(this.usage, { headers: { ETag: this.usageEtag } })
+    }
+    if (path === "/inbox") {
+      const page = this.inboxPages.get(request.query.get("cursor"))
+      return page
+        ? json({ has_more: page.next_cursor !== null, ...page })
+        : json({}, { status: 422 })
     }
     if (path === "/sessions") {
       const status = request.query.get("status")
@@ -887,4 +897,168 @@ test("getSessionUsage does not request a surface the contract reports unavailabl
 
   await assert.rejects(client.getSessionUsage("s1"), (error) => error.kind === "unavailable")
   assert.equal(server.requestsTo("/usage").length, 0)
+})
+
+function inboxItem(id, kind = "approval") {
+  return {
+    id,
+    kind,
+    attention_id: `attention_${id}`,
+    session_id: "s1",
+    agent_name: "assistant",
+    created_at: "2026-09-01T00:00:00+00:00",
+    title: "Tool approval required",
+    detail: "Approve the September correction package.",
+    tool_name: "record",
+    question: null,
+    options: [],
+    knowledge: null,
+    decisions: ["approve", "deny"],
+  }
+}
+
+function settledState(id, subject = "priya") {
+  return {
+    id,
+    kind: "approval",
+    status: "settled",
+    session_id: "s1",
+    agent_name: "assistant",
+    item: null,
+    settlement: {
+      decision: "approve",
+      decided_by: { subject, tenant: null, source: "http_auth" },
+      decided_at: "2026-09-01T00:01:00+00:00",
+    },
+  }
+}
+
+test("settleInboxItem posts the decision and answers a conflict with the item's state", async () => {
+  const server = new FakeServer()
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const id = "inbox_abc-_1"
+  server.once(`/inbox/${id}/settle`, () => json({ replayed: false, item: settledState(id) }))
+  server.once(`/inbox/${id}/settle`, () =>
+    json(
+      { detail: { code: "already_settled", message: "Already settled.", item: settledState(id) } },
+      { status: 409 },
+    ),
+  )
+  server.once(`/inbox/${id}`, () => json(settledState(id)))
+
+  const decision = { decision: "approve", reason: "Checked it." }
+  assert.deepEqual(await client.settleInboxItem(id, decision), {
+    settled: true,
+    replayed: false,
+    item: settledState(id),
+  })
+  const [post] = server.requestsTo("/settle")
+  assert.equal(post.init.method, "POST")
+  assert.equal(post.headers.get("Content-Type"), "application/json")
+  assert.deepEqual(JSON.parse(post.init.body), decision)
+
+  assert.deepEqual(await client.settleInboxItem(id, { decision: "deny" }), {
+    settled: false,
+    code: "already_settled",
+    message: "Already settled.",
+    item: settledState(id),
+  })
+  assert.deepEqual(await client.getInboxItem(id), settledState(id))
+})
+
+test("the inbox methods refuse a server that has no inbox without a request", async () => {
+  const server = new FakeServer(makeContract({ inbox: false }))
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+
+  assert.equal(client.inboxAvailable, false)
+  await assert.rejects(client.listInbox(), (error) => error.kind === "unavailable")
+  await assert.rejects(
+    client.settleInboxItem("inbox_a", { decision: "approve" }),
+    (error) => error.kind === "unavailable",
+  )
+  assert.throws(
+    () => client.watchInbox(),
+    (error) => error.kind === "unavailable",
+  )
+  assert.equal(server.requests.length, 1)
+})
+
+test("watchInbox reads every page, backs off while unchanged and never stops as idle", async () => {
+  const server = new FakeServer()
+  server.inboxPages = new Map([
+    [null, { items: [inboxItem("a")], issues: [], next_cursor: "next" }],
+    ["next", { items: [inboxItem("b", "question")], issues: [], next_cursor: null }],
+  ])
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const changes = []
+  const stops = []
+  const stop = client.watchInbox({
+    intervalMs: 1_000,
+    onChange: (inbox) => changes.push([inbox.items.map((item) => item.id), inbox.complete]),
+    onStop: (reason) => stops.push(reason),
+  })
+  await flush()
+  assert.deepEqual(changes, [[["a", "b"], true]])
+  assert.deepEqual(
+    server.requestsTo("/inbox").map((request) => request.query.get("cursor")),
+    [null, "next"],
+  )
+
+  await advance(240_000, 1_000)
+  const firstPages = server.requestsTo("/inbox").filter((r) => r.query.get("cursor") === null)
+  const gaps = firstPages.slice(1).map((request, index) => request.at - firstPages[index].at)
+  assert.deepEqual(gaps, [15_000, 30_000, 60_000, 120_000])
+
+  // Settled elsewhere: the item leaves, and the interval resets to 15 s.
+  server.inboxPages = new Map([
+    [null, { items: [inboxItem("b", "question")], issues: [], next_cursor: null }],
+  ])
+  await advance(105_000, 1_000)
+  assert.deepEqual(changes.at(-1), [["b"], true])
+  const count = server.requestsTo("/inbox").length
+  await advance(15_000, 1_000)
+  assert.equal(server.requestsTo("/inbox").length, count + 1)
+  assert.deepEqual(stops, [])
+  stop()
+  assert.deepEqual(stops, [])
+  await assertQuiet(server)
+  assert.deepEqual(stops, ["stopped"])
+})
+
+test("watchInbox reports an inbox with a truncation issue as incomplete", async () => {
+  const server = new FakeServer()
+  const issue = { code: "knowledge_truncated", detail: "More are waiting." }
+  server.inboxPages = new Map([
+    [null, { items: [inboxItem("k", "knowledge")], issues: [issue], next_cursor: null }],
+  ])
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const snapshots = []
+  const stop = client.watchInbox({ onChange: (inbox) => snapshots.push(inbox) })
+  await flush()
+
+  assert.equal(snapshots.length, 1)
+  assert.equal(snapshots[0].complete, false)
+  assert.deepEqual(snapshots[0].issues, [issue])
+  stop()
+})
+
+test("watchInbox sends nothing while hidden and stops on authorization failures", async () => {
+  const server = new FakeServer()
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  document.setHidden(true)
+  const errors = []
+  const stops = []
+  client.watchInbox({
+    onError: (error) => errors.push(error),
+    onStop: (reason) => stops.push(reason),
+  })
+  await assertQuiet(server, 5 * 60_000)
+
+  server.once("/inbox", () => json({ detail: "Forbidden" }, { status: 403 }))
+  document.setHidden(false)
+  await flush()
+  assert.equal(server.requestsTo("/inbox").length, 1)
+  assert.equal(errors[0].kind, "auth")
+  assert.deepEqual(stops, ["error"])
+  await assertQuiet(server)
 })

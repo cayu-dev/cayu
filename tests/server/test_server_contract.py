@@ -239,6 +239,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": True, "unavailable_reason": None},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
+        "inbox": {
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
+            "mutate": {"enabled": True, "unavailable_reason": None},
+        },
         "tasks": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},

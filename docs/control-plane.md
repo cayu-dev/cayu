@@ -205,6 +205,11 @@ visible and the session is pending, running, or interrupting, and stop at a term
 state with a `304` and no body. Concurrent follow streams are capped per caller and per
 session; a `429` carries `Retry-After`.
 
+To show what the agent is waiting on a person for, and let the person decide in the
+app, use [the agent's inbox](inbox.md) through `client.js`: `watchInbox` lists
+approvals, questions and knowledge proposals, and `settleInboxItem` settles one as the
+signed-in person.
+
 Show tokens and cost with the accounting endpoints that the contract lists under
 `accounting.usage` and `accounting.cost`, each with its `path` and a `supported` flag:
 

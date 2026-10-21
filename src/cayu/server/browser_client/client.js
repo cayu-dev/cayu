@@ -3,8 +3,9 @@
  * Cayu browser client.
  *
  * A dependency-free ES module served by `mount_cayu` at `{path}/client.js`.
- * It follows sessions and watches session lists with bounded, visibility-aware
- * request behavior so custom UIs do not have to hand-write polling loops.
+ * It follows sessions, watches session lists and the agent's inbox with
+ * bounded, visibility-aware request behavior so custom UIs do not have to
+ * hand-write polling loops, and settles inbox items.
  * `cayu guide app-ui` describes the rules this module implements.
  */
 
@@ -15,6 +16,7 @@ export const CONTRACT_VERSION = "49"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"])
 const ACTIVE_STATUSES = new Set(["pending", "running", "interrupting"])
+const TRUNCATION_ISSUES = new Set(["inbox_truncated", "knowledge_truncated"])
 const TERMINAL_EVENT_TYPES = new Set(["session.completed", "session.failed", "session.interrupted"])
 const LIFECYCLE_EVENT_TYPES = new Set([
   ...TERMINAL_EVENT_TYPES,
@@ -38,6 +40,8 @@ const DEFAULTS = Object.freeze({
   jitterRatio: 0.2,
   eventPageLimit: 200,
   watchPageLimit: 100,
+  inboxPageLimit: 100,
+  inboxMaxPages: 10,
   maxStreamFailures: 3,
 })
 
@@ -126,6 +130,62 @@ class CayuClient {
 
   watchSessions(filter = {}, options = {}) {
     return watchSessions(this.#context, filter ?? {}, options)
+  }
+
+  /** Whether the server serves the agent's inbox. */
+  get inboxAvailable() {
+    return inboxAvailable(this.#context.contract)
+  }
+
+  async listInbox(options = {}) {
+    requireInbox(this.#context.contract)
+    return readInboxPage(this.#context, options.cursor ?? null, options.limit, options.signal)
+  }
+
+  async getInboxItem(itemId, options = {}) {
+    requireInbox(this.#context.contract)
+    return requestJson(this.#context, inboxItemPath(itemId), { signal: options.signal })
+  }
+
+  /**
+   * Settle one inbox item as the signed-in person. A 409 is an answer, not an
+   * error: the item was settled, replaced or expired, and `item` says how.
+   */
+  async settleInboxItem(itemId, decision, options = {}) {
+    requireInbox(this.#context.contract)
+    if (decision === null || typeof decision !== "object") {
+      throw new TypeError("decision must be the settle request body.")
+    }
+    const response = await send(this.#context, `${inboxItemPath(itemId)}/settle`, {
+      method: "POST",
+      body: decision,
+      signal: options.signal,
+    })
+    if (response.status === 409) {
+      const detail = (await readJson(response))?.detail
+      if (!detail || typeof detail.code !== "string") {
+        throw new CayuClientError("contract", "The server returned an invalid inbox conflict.", {
+          status: 409,
+        })
+      }
+      return {
+        settled: false,
+        code: detail.code,
+        message: String(detail.message ?? ""),
+        item: detail.item ?? null,
+      }
+    }
+    if (!response.ok) throw await httpError(response)
+    const body = await readJson(response)
+    if (!body || typeof body.item !== "object") {
+      throw new CayuClientError("contract", "The server returned an invalid settlement.")
+    }
+    return { settled: true, replayed: body.replayed === true, item: body.item }
+  }
+
+  watchInbox(options = {}) {
+    requireInbox(this.#context.contract)
+    return watchInbox(this.#context, options)
   }
 
   async getSessionUsage(sessionId, options = {}) {
@@ -444,25 +504,12 @@ function followSession(context, sessionId, options) {
 }
 
 function watchSessions(context, filter, options) {
-  const base = Math.max(
-    MIN_WATCH_INTERVAL_MS,
-    positive(options.intervalMs, DEFAULTS.watchIntervalMs),
-  )
-  const maxInterval = Math.max(base, positive(options.maxIntervalMs, DEFAULTS.watchMaxIntervalMs))
   const statuses =
     filter.status === undefined || filter.status === null
       ? [null]
       : [...new Set(Array.isArray(filter.status) ? filter.status : [filter.status])]
-  const runner = new Runner(options.signal)
-  let stopReason = null
 
-  const stop = (reason = "stopped") => {
-    if (runner.stopped) return
-    stopReason = reason
-    runner.stop()
-  }
-
-  const refresh = async () => {
+  return startWatch(options, async (runner) => {
     const byId = new Map()
     for (const status of statuses) {
       const params = new URLSearchParams({
@@ -481,9 +528,58 @@ function watchSessions(context, filter, options) {
       }
       for (const session of page.sessions) byId.set(session.id, session)
     }
-    return [...byId.values()].sort((left, right) =>
+    const sessions = [...byId.values()].sort((left, right) =>
       String(right.updated_at).localeCompare(String(left.updated_at)),
     )
+    return {
+      value: sessions,
+      key: JSON.stringify(sessions.map((s) => [s.id, s.status, s.updated_at])),
+      idle: !sessions.some((session) => ACTIVE_STATUSES.has(session.status)),
+    }
+  })
+}
+
+function watchInbox(context, options) {
+  // Something can start waiting on a person at any time, so the inbox watch never
+  // stops as idle; it backs off while nothing changes and pauses while hidden.
+  return startWatch(options, async (runner) => {
+    const inbox = { items: [], issues: [], complete: false }
+    let cursor = null
+    for (let page = 0; page < DEFAULTS.inboxMaxPages; page += 1) {
+      const body = await runner.run((signal) => readInboxPage(context, cursor, undefined, signal))
+      inbox.items.push(...body.items)
+      inbox.issues.push(...body.issues)
+      if (typeof body.next_cursor !== "string") {
+        // A truncation issue means items were waiting that no page lists.
+        inbox.complete = !inbox.issues.some((issue) => TRUNCATION_ISSUES.has(issue.code))
+        break
+      }
+      cursor = body.next_cursor
+    }
+    // An item id names one exact pause or proposal revision, so ids alone say
+    // whether anything changed.
+    const key = JSON.stringify([inbox.items.map((item) => item.id), inbox.issues, inbox.complete])
+    return { value: inbox, key, idle: false }
+  })
+}
+
+/**
+ * Refresh on a 15 s floor, doubling the interval while `read` reports no change,
+ * and stop when it reports idle, on a non-retryable error, or when stopped.
+ */
+function startWatch(options, read) {
+  const base = Math.max(
+    MIN_WATCH_INTERVAL_MS,
+    positive(options.intervalMs, DEFAULTS.watchIntervalMs),
+  )
+  const maxInterval = Math.max(base, positive(options.maxIntervalMs, DEFAULTS.watchMaxIntervalMs))
+  const runner = new Runner(options.signal)
+  let stopReason = null
+
+  const stop = (reason = "stopped") => {
+    if (runner.stopped) return
+    stopReason = reason
+    runner.stop()
   }
 
   void (async () => {
@@ -495,17 +591,16 @@ function watchSessions(context, filter, options) {
       if (!(await runner.waitUntil(() => dueAt))) break
       const startedAt = Date.now()
       try {
-        const sessions = await refresh()
+        const { value, key, idle } = await read(runner)
         attempt = 0
-        const next = JSON.stringify(sessions.map((s) => [s.id, s.status, s.updated_at]))
-        if (next !== fingerprint) {
-          fingerprint = next
+        if (key !== fingerprint) {
+          fingerprint = key
           interval = base
-          invoke(options.onChange, sessions)
+          invoke(options.onChange, value)
         } else {
           interval = Math.min(maxInterval, interval * 2)
         }
-        if (!sessions.some((session) => ACTIVE_STATUSES.has(session.status))) {
+        if (idle) {
           stop("idle")
           break
         }
@@ -531,6 +626,37 @@ function watchSessions(context, filter, options) {
   })()
 
   return () => stop("stopped")
+}
+
+async function readInboxPage(context, cursor, limit, signal) {
+  const params = new URLSearchParams({ limit: String(positive(limit, DEFAULTS.inboxPageLimit)) })
+  if (cursor !== null) params.set("cursor", cursor)
+  const page = await requestJson(context, `/inbox?${params}`, { signal })
+  if (!page || !Array.isArray(page.items) || !Array.isArray(page.issues)) {
+    throw new CayuClientError("contract", "The server returned an invalid inbox page.")
+  }
+  return page
+}
+
+function inboxAvailable(contract) {
+  const inbox = contract?.capabilities?.surfaces?.inbox
+  return inbox?.read?.enabled === true
+}
+
+function requireInbox(contract) {
+  if (!inboxAvailable(contract)) {
+    throw new CayuClientError(
+      "unavailable",
+      "This server has no inbox. It needs a Cayu release that serves /api/inbox.",
+    )
+  }
+}
+
+function inboxItemPath(itemId) {
+  if (typeof itemId !== "string" || itemId.trim() === "") {
+    throw new TypeError("itemId must be a non-empty string.")
+  }
+  return `/inbox/${encodeURIComponent(itemId)}`
 }
 
 /**
@@ -690,14 +816,19 @@ function sessionFollowStreamPath(contract) {
   return "/sessions/{session_id}/events/stream"
 }
 
-async function send(context, path, { signal, headers = {} } = {}) {
+async function send(context, path, { signal, headers = {}, method = "GET", body } = {}) {
+  const init = {
+    method,
+    credentials: context.credentials,
+    headers: { Accept: "application/json", ...context.headers, ...headers },
+    signal,
+  }
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json"
+    init.body = JSON.stringify(body)
+  }
   try {
-    return await context.fetch(`${context.apiBase}${path}`, {
-      method: "GET",
-      credentials: context.credentials,
-      headers: { Accept: "application/json", ...context.headers, ...headers },
-      signal,
-    })
+    return await context.fetch(`${context.apiBase}${path}`, init)
   } catch (error) {
     if (isAbortError(error)) throw error
     throw new CayuClientError("network", "The request did not reach the server.", {

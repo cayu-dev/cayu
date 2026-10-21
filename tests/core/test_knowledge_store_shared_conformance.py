@@ -38,6 +38,7 @@ from tests.core.knowledge_store_conformance import (
     verify_access_scope,
 )
 
+from cayu.knowledge.search import encode_knowledge_list_cursor
 from cayu.storage import (
     MAX_KNOWLEDGE_CHANGE_LIMIT,
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
@@ -2270,6 +2271,60 @@ def test_knowledge_store_revision_exhaustion_fails_before_lifecycle_mutation(
 
             assert await store.get_entry(current.id) == current
             assert await store.get_entry(current.id, revision=1) == original
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_list_keyset_continues_after_reviewed_entries(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        now = datetime.now(UTC)
+        try:
+            # Exercise all three sort keys, including ties and null importance.
+            for entry_id, importance, updated_at in (
+                ("priority", 1.0, now - timedelta(days=1)),
+                ("newest-a", 0.5, now),
+                ("newest-b", 0.5, now),
+                ("older", 0.5, now - timedelta(seconds=1)),
+                ("unranked", None, now),
+            ):
+                await store.create_entry(
+                    KnowledgeEntry(
+                        id=entry_id,
+                        text=entry_id,
+                        importance=importance,
+                        created_at=now - timedelta(days=2),
+                        updated_at=updated_at,
+                        status=KnowledgeStatus.PENDING,
+                    )
+                )
+            cursor = None
+            seen = []
+            for remaining in range(5, 0, -1):
+                page = await store.list_entries(
+                    KnowledgeListQuery(statuses=[KnowledgeStatus.PENDING], limit=1, cursor=cursor)
+                )
+                assert page.total_entries_known == remaining
+                assert len(page.entries) == 1
+                entry = page.entries[0].entry
+                seen.append(entry.id)
+                cursor = encode_knowledge_list_cursor(entry)
+                await store.transition_entry_status(
+                    entry.id,
+                    expected_revision=entry.revision,
+                    from_status=KnowledgeStatus.PENDING,
+                    to_status=KnowledgeStatus.ARCHIVED,
+                )
+            assert seen == ["priority", "newest-a", "newest-b", "older", "unranked"]
+            assert (
+                await store.list_entries(
+                    KnowledgeListQuery(statuses=[KnowledgeStatus.PENDING], cursor=cursor)
+                )
+            ).entries == []
         finally:
             await _close_store(store)
             await _reset_case(knowledge_store_case)

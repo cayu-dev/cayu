@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TypedDict
 
@@ -267,8 +271,16 @@ class KnowledgeListQuery(BaseModel):
     source_id: str | None = None
     include_expired: bool = False
     group_by: KnowledgeListGroup | None = None
+    cursor: str | None = None
     limit: int = DEFAULT_KNOWLEDGE_LIMIT
     max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is not None:
+            decode_knowledge_list_cursor(value)
+        return value
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -324,6 +336,52 @@ class KnowledgeListQuery(BaseModel):
         if not value:
             raise ValueError(f"`{info.field_name}` cannot be empty.")
         return list(dict.fromkeys(value))
+
+
+def encode_knowledge_list_cursor(entry: KnowledgeEntry) -> str:
+    """Name a list position, independent of whether that entry still exists."""
+    raw = json.dumps(
+        [1, entry.importance or 0.0, entry.updated_at.astimezone(UTC).isoformat(), entry.id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    cursor = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    decode_knowledge_list_cursor(cursor)
+    return cursor
+
+
+def decode_knowledge_list_cursor(cursor: str) -> tuple[float, datetime, str]:
+    """Validate a bounded cursor for importance DESC, updated_at DESC, id ASC."""
+    try:
+        if type(cursor) is not str or not cursor or len(cursor) > 4096:
+            raise ValueError
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        values = json.loads(raw)
+        if (
+            type(values) is not list
+            or len(values) != 4
+            or type(values[0]) is not int
+            or values[0] != 1
+        ):
+            raise ValueError
+        _, importance, updated, entry_id = values
+        if (
+            type(importance) not in {int, float}
+            or type(updated) is not str
+            or type(entry_id) is not str
+        ):
+            raise ValueError
+        importance = require_finite(importance, "cursor importance")
+        timestamp = datetime.fromisoformat(updated)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError
+        return (
+            importance,
+            timestamp.astimezone(UTC),
+            require_clean_nonblank(entry_id, "cursor entry"),
+        )
+    except (ValueError, TypeError, binascii.Error, OverflowError, RecursionError):
+        raise ValueError("Invalid knowledge list cursor.") from None
 
 
 class KnowledgeHit(BaseModel):
@@ -657,6 +715,7 @@ def copy_knowledge_list_query(query: KnowledgeListQuery) -> KnowledgeListQuery:
         source_id=query.source_id,
         include_expired=query.include_expired,
         group_by=query.group_by,
+        cursor=query.cursor,
         limit=query.limit,
         max_bytes=query.max_bytes,
     )

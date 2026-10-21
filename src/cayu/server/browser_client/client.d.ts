@@ -193,6 +193,137 @@ export interface WatchSessionsOptions {
   signal?: AbortSignal
 }
 
+export type InboxItemKind = "approval" | "question" | "recovery" | "knowledge"
+export type InboxDecision = "approve" | "deny" | "answer" | "keep" | "drop"
+export type InboxSettledDecision =
+  | "approve"
+  | "deny"
+  | "expire"
+  | "answer"
+  | "recover"
+  | "keep"
+  | "drop"
+
+/**
+ * One thing waiting on a person; see the OpenAPI `InboxItem` schema. Text fields
+ * are untrusted: render them as escaped text. `id` names one exact pause or
+ * proposal revision.
+ */
+export interface InboxItem {
+  id: string
+  kind: InboxItemKind
+  attention_id: string | null
+  session_id: string | null
+  agent_name: string | null
+  created_at: string
+  title: string
+  detail: string | null
+  tool_name: string | null
+  question: string | null
+  options: string[]
+  knowledge: { entry_id: string; revision: number; kind: string } | null
+  /** What the item accepts; empty for recovery items, settled in the Developer dashboard. */
+  decisions: InboxDecision[]
+}
+
+export interface InboxSettlement {
+  decision: InboxSettledDecision
+  /** `null` when the Runtime has no record of the person. */
+  decided_by: { subject: string; tenant: string | null; source: string | null } | null
+  decided_at: string | null
+}
+
+/** One item's current state, wherever it was settled. */
+export interface InboxItemState {
+  id: string
+  kind: InboxItemKind
+  status: "pending" | "settled" | "superseded" | "unavailable"
+  session_id: string | null
+  agent_name: string | null
+  /** Present while pending. */
+  item: InboxItem | null
+  /** Present once settled. */
+  settlement: InboxSettlement | null
+}
+
+export interface InboxIssue {
+  code: string
+  detail: string
+  session_id: string | null
+  agent_name: string | null
+}
+
+export interface InboxPage {
+  items: InboxItem[]
+  next_cursor: string | null
+  has_more: boolean
+  issues: InboxIssue[]
+}
+
+/** The body of `POST /api/inbox/{id}/settle`. */
+export interface InboxSettleRequest {
+  decision: InboxDecision
+  /** For `approve` and `deny`. */
+  reason?: string
+  /** For `approve`: the changed arguments the tool runs with. */
+  arguments?: Record<string, unknown>
+  /** For `approve`: an edit the application stored itself, named by digests. */
+  approval_revision?: { proposed_digest: string; approved_digest: string }
+  /** For `answer`. */
+  answer?: string
+  /** Required when the application configures a human-review policy. */
+  review_reference?: Record<string, unknown>
+  /** Exact task continuation authority for a worker-owned approval or question. */
+  task_worker_id?: string
+  /** An elected interrupted handoff; requires task_worker_id. */
+  task_handoff_id?: string
+}
+
+export type InboxSettleResult =
+  | {
+      settled: true
+      /** True when this exact decision was already recorded. */
+      replayed: boolean
+      item: InboxItemState
+    }
+  | {
+      settled: false
+      code:
+        | "already_settled"
+        | "superseded"
+        | "expired"
+        | "unavailable"
+        | "not_settleable"
+        | "conflict"
+      message: string
+      item: InboxItemState | null
+    }
+
+/** Everything waiting, read page by page up to a bound. */
+export interface InboxSnapshot {
+  items: InboxItem[]
+  issues: InboxIssue[]
+  /**
+   * False when more items were waiting than the watch reads: more pages than it
+   * follows, or an `inbox_truncated` or `knowledge_truncated` issue.
+   */
+  complete: boolean
+}
+
+export interface WatchInboxOptions {
+  /** Called with the whole inbox whenever an item appears or leaves it. */
+  onChange?: (inbox: InboxSnapshot) => void
+  /** Called once with the non-retryable error that stopped the watch. */
+  onError?: (error: CayuClientError) => void
+  /** Called once when the watch stops. */
+  onStop?: (reason: Exclude<WatchStopReason, "idle">) => void
+  /** Refresh interval. Values below 15000 ms are raised to 15000 ms. */
+  intervalMs?: number
+  /** Ceiling for the backoff applied while nothing changes. Defaults to 120000 ms. */
+  maxIntervalMs?: number
+  signal?: AbortSignal
+}
+
 export interface CayuClient {
   readonly contract: CayuContract
   /** Whether the server advertises the session follow stream. */
@@ -201,6 +332,22 @@ export interface CayuClient {
   /** Returns a function that stops the watch. */
   watchSessions(filter?: WatchSessionsFilter, options?: WatchSessionsOptions): () => void
   getSessionUsage(sessionId: string, options?: { signal?: AbortSignal }): Promise<CayuSessionUsage>
+  /** Whether the server serves the agent's inbox. The inbox methods throw `unavailable` otherwise. */
+  readonly inboxAvailable: boolean
+  listInbox(options?: { limit?: number; cursor?: string; signal?: AbortSignal }): Promise<InboxPage>
+  getInboxItem(itemId: string, options?: { signal?: AbortSignal }): Promise<InboxItemState>
+  /**
+   * Settle one item as the signed-in person. Resolves with `settled: false` when
+   * the item was already settled, replaced or expired. Repeating the same
+   * decision is safe: it resolves with `replayed: true`.
+   */
+  settleInboxItem(
+    itemId: string,
+    decision: InboxSettleRequest,
+    options?: { signal?: AbortSignal },
+  ): Promise<InboxSettleResult>
+  /** Returns a function that stops the watch. It never stops as idle. */
+  watchInbox(options?: WatchInboxOptions): () => void
 }
 
 /** Read `/api/contract`, check its version, and return a client. */

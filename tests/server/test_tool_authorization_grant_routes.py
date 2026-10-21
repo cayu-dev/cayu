@@ -81,6 +81,42 @@ def test_grant_routes_require_authentication_and_trusted_actor(tmp_path) -> None
     assert harness.tool.calls == []
 
 
+def test_inbox_access_rule_refuses_approving_with_a_grant(tmp_path) -> None:
+    scopes = []
+
+    async def not_owner(principal: AuthContext, item) -> bool:
+        scopes.append(item)
+        return principal.subject != "owner"
+
+    harness = Harness(tmp_path, turns=_command_turn("call_1", ["ls"]))
+    asyncio.run(harness.run("s1"))
+    pending = asyncio.run(harness.pending("s1"))
+    server = create_server(
+        harness.app,
+        config=ServerConfig.protected(_auth),
+        tool_authorization_grants=ToolAuthorizationGrantServer(
+            harness.service, authorize_read=_owner_reads
+        ),
+        inbox_access=not_owner,
+    )
+
+    refused = TestClient(server).post(
+        "/api/tool-authorization-grants/approve",
+        json=_approve_body(pending),
+        headers={"x-test-subject": "owner"},
+    )
+
+    assert refused.status_code == 404
+    assert len(scopes) == 1
+    [action] = asyncio.run(harness.app.session_store.query_pending_actions()).actions
+    assert scopes[0].attention_id == action.attention_id
+    assert scopes[0].session_id == "s1"
+    assert scopes[0].kind == "approval"
+    assert asyncio.run(harness.service.list_grants()) == ()
+    assert asyncio.run(harness.pending("s1")).approval_id == pending.approval_id
+    assert harness.tool.calls == []
+
+
 def test_grant_lifecycle_over_http(tmp_path) -> None:
     turns = _command_turn("call_1", ["ls"]) + _command_turn("call_2", ["ls"])
     harness = Harness(tmp_path, turns=turns)

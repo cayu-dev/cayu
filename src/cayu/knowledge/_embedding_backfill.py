@@ -115,8 +115,12 @@ def _knowledge_embedding_backfill_fingerprint(
 ) -> str:
     query = copy_knowledge_list_query(query)
     access_scope = copy_knowledge_access_scope(access_scope)
+    if query.cursor is not None:
+        raise ValueError("Embedding backfill uses its own cursor, not a knowledge list cursor.")
     material = {
-        "query": query.model_dump(mode="json"),
+        # Keep existing backfill cursors valid when the optional list-only field
+        # is absent. Backfill continues by chunk, rather than by entry.
+        "query": query.model_dump(mode="json", exclude={"cursor"}),
         "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
         "refresh_existing": refresh_existing,
         "projection_type": KNOWLEDGE_CHUNK_TEXT_PROJECTION,

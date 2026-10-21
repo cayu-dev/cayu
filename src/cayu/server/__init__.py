@@ -106,6 +106,7 @@ try:
         normalize_dashboard_runtime_config,
     )
     from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
+    from cayu.server.inbox import InboxAccess
     from cayu.server.oidc import OidcBearerAuth, OidcSigningKeys, OidcTokenError
     from cayu.server.routes import create_router
     from cayu.server.service import (
@@ -236,6 +237,8 @@ def create_server(
     project_context: ProjectControlPlaneContext | None = None,
     browser_recordings: Any | None = None,
     tool_authorization_grants: Any | None = None,
+    inbox_access: InboxAccess | None = None,
+    inbox_cursor_key: bytes | None = None,
     fastapi_options: Mapping[str, Any] | None = None,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -256,6 +259,14 @@ def create_server(
         tool_authorization_grants: Optional ``ToolAuthorizationGrantServer``
             from ``cayu.server.authorization_grants``. Its authenticated grant
             routes are mounted under the API path; requires authenticated access.
+        inbox_access: Optional ``cayu.server.inbox.InboxAccess`` rule deciding which
+            authenticated callers may see and settle each approval, question, recovery
+            item and knowledge proposal, on every route that lists or settles them,
+            including the tool authorization grant routes. Without it, every
+            authenticated caller may. Requires authenticated access.
+        inbox_cursor_key: Deployment-owned 32-byte key shared by all workers for
+            encrypted knowledge inbox continuation. Required when a knowledge
+            queue needs pagination; no ephemeral key is generated.
         fastapi_options: Optional non-policy FastAPI constructor options. Cayu
             validates the option names and retains ownership of its title,
             documentation routes, and lifespan composition.
@@ -500,6 +511,8 @@ def create_server(
             evaluation_promotion_pricing=evaluation_promotion_pricing,
             generated_evals_pricing=configured_dashboard_price_book,
             evals=resolved_config.evals,
+            inbox_access=inbox_access,
+            inbox_cursor_key=inbox_cursor_key,
             _project_context=resolved_project_context,
             _browser_client_base_path=browser_client_base,
             _request_timing=request_timing,
@@ -517,7 +530,8 @@ def create_server(
             )
         if tool_authorization_grants is not None:
             server.include_router(
-                tool_authorization_grants.router(auth=api_auth), prefix=control_plane_path
+                tool_authorization_grants.router(auth=api_auth, inbox_access=inbox_access),
+                prefix=control_plane_path,
             )
     if fork_controller_router is not None:
         server.include_router(fork_controller_router)
@@ -601,6 +615,8 @@ def mount_cayu(
     continuation_loop_policy_provider: (
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
+    inbox_access: InboxAccess | None = None,
+    inbox_cursor_key: bytes | None = None,
     name: str = "cayu-dashboard",
     request_timing: RequestTimingConfig | bool | None = None,
     observe_host_requests: bool = False,
@@ -648,7 +664,11 @@ def mount_cayu(
     remains disabled unless complete ``evals`` wiring is supplied.
     ``continuation_loop_policy_provider`` lets an embedding boundary attach
     trusted in-process policies to control-plane continuations; HTTP callers
-    cannot supply or serialize those policies.
+    cannot supply or serialize those policies. ``inbox_access`` decides which
+    authenticated callers may see and settle each approval, question, recovery
+    item and knowledge proposal, on every mounted route that lists or settles them;
+    without it every authenticated caller may. ``inbox_cursor_key`` is a 32-byte
+    deployment key shared by all workers, required for knowledge pagination.
 
     ``request_timing`` records per-request cost for the mounted Cayu routes, and
     for every host route as well when ``observe_host_requests`` is true. The
@@ -751,6 +771,8 @@ def mount_cayu(
         ),
         evals=evals,
         continuation_loop_policy_provider=continuation_loop_policy_provider,
+        inbox_access=inbox_access,
+        inbox_cursor_key=inbox_cursor_key,
         _project_context=resolved_project_context,
         _system_diagnostics_snapshot_sink=_system_diagnostics_snapshot_sink,
         _browser_client_base_path=mount_path,

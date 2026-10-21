@@ -13,9 +13,14 @@ import pytest
 
 import cayu
 from cayu.knowledge import _embedding_backfill as rules
-from cayu.knowledge.records import MAX_KNOWLEDGE_CHUNK_INDEX, KnowledgeChunk, KnowledgeStatus
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_CHUNK_INDEX,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeStatus,
+)
 from cayu.knowledge.scopes import KnowledgeAccessScope
-from cayu.knowledge.search import KnowledgeListQuery
+from cayu.knowledge.search import KnowledgeListQuery, encode_knowledge_list_cursor
 
 _NOW = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
 _QUERY = KnowledgeListQuery(namespace="example", labels={"team": "sales"})
@@ -73,6 +78,12 @@ def test_backfill_cursor_preserves_exact_encoding_and_timestamp_precision():
     assert _encode(updated_at=_NOW.astimezone(timezone(timedelta(hours=6)))) == token
     assert _decode(None) is None
     assert _decode(token) is not decoded
+
+
+def test_backfill_refuses_an_entry_list_cursor():
+    cursor = encode_knowledge_list_cursor(KnowledgeEntry(id="entry", text="body"))
+    with pytest.raises(ValueError, match="uses its own cursor"):
+        _fingerprint(_QUERY.model_copy(update={"cursor": cursor}))
 
 
 def test_backfill_cursor_binds_query_scope_and_embedding_configuration():

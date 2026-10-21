@@ -252,7 +252,10 @@ cancel authorized recovery; the resolver owns that decision.
 
 A delivery receipt acknowledges transport only. It cannot resume a session.
 After authenticating and authorizing the person, refresh the current action and
-use the existing exact-action API:
+use the existing exact-action API. Over HTTP, the optional server's
+[inbox](https://github.com/cayu-dev/cayu/blob/main/docs/inbox.md) lists the same
+actions with their `attention_id` and settles an approval or question in one
+non-streaming call, recording the authenticated person:
 
 - Question: `app.resolve_user_input(UserInputResponse(...))` or
   `POST /api/user-input/resolve`.

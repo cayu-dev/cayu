@@ -102,6 +102,10 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.session_supervision_events_supported,
                     mutation_supported=False,
                 ),
+                inbox=_optional_surface(
+                    True,
+                    mutation_supported=True,
+                ),
                 tasks=_optional_surface(
                     self.tasks_configured,
                     mutation_supported=True,

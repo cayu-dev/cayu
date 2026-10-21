@@ -228,6 +228,7 @@ from cayu.knowledge.search import (
     KnowledgeSearchResult,
     copy_knowledge_list_query,
     copy_knowledge_query,
+    decode_knowledge_list_cursor,
 )
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
@@ -5856,7 +5857,7 @@ def _knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
 
 
 def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[object]]:
-    return _knowledge_metadata_filter_sql(
+    where_sql, params = _knowledge_metadata_filter_sql(
         namespace=query.namespace,
         labels=query.labels,
         kinds=query.kinds,
@@ -5869,6 +5870,16 @@ def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[obj
         source_id=query.source_id,
         include_expired=query.include_expired,
     )
+    if query.cursor is not None:
+        importance, updated_at, entry_id = decode_knowledge_list_cursor(query.cursor)
+        timestamp = sqlite_records.format_datetime(updated_at)
+        where_sql += """
+            AND (COALESCE(e.importance, 0.0) < ?
+                 OR (COALESCE(e.importance, 0.0) = ? AND e.updated_at < ?)
+                 OR (COALESCE(e.importance, 0.0) = ? AND e.updated_at = ? AND e.id > ?))
+        """
+        params.extend([importance, importance, timestamp, importance, timestamp, entry_id])
+    return where_sql, params
 
 
 def _knowledge_access_scope_filter_sql(

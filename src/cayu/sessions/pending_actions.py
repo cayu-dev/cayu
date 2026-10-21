@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
@@ -793,6 +794,68 @@ def _object_payload(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+@dataclass(frozen=True, slots=True)
+class ManualRecoveryIdentity:
+    """The exact call a manual-recovery interruption names.
+
+    A sibling call that crashed in an ``ask_user`` round is named by the
+    interruption's own ``tool_call_id``, not the question's.
+    """
+
+    approval_id: str | None
+    input_id: str | None
+    round_id: str | None
+    tool_call_id: str
+
+
+def manual_recovery_identity(payload: dict[str, Any]) -> ManualRecoveryIdentity | None:
+    """Read a ``manual_recovery_required`` interruption as pending-action reads do."""
+
+    approval = _object_payload(payload.get("approval"))
+    user_input = _object_payload(payload.get("user_input"))
+    approval_id = _optional_payload_string(payload, "approval_id") or _optional_payload_string(
+        approval, "approval_id"
+    )
+    input_id = _optional_payload_string(user_input, "input_id")
+    tool_call_id = _optional_payload_string(payload, "tool_call_id") or (
+        _optional_payload_string(user_input, "tool_call_id")
+    )
+    round_id = _optional_payload_string(payload, "tool_round_id")
+    if tool_call_id is None or (approval_id is None and input_id is None and round_id is None):
+        return None
+    return ManualRecoveryIdentity(approval_id, input_id, round_id, tool_call_id)
+
+
+def pending_action_id(
+    session_id: str,
+    record: EventRecord,
+    kind: PendingActionKind,
+    *,
+    approval_id: str | None,
+    input_id: str | None,
+    tool_call_id: str | None,
+) -> str:
+    """The id a pending-action read gives the action its source event opened."""
+
+    discriminator = approval_id or input_id or tool_call_id or record.event.id
+    return f"{session_id}:{record.sequence}:{kind}:{discriminator}"
+
+
+def manual_recovery_action_id(
+    session_id: str, record: EventRecord, identity: ManualRecoveryIdentity
+) -> str:
+    """The attention discriminator of a manual-recovery action: its round, else its id."""
+
+    return identity.round_id or pending_action_id(
+        session_id,
+        record,
+        PendingActionKind.MANUAL_RECOVERY,
+        approval_id=identity.approval_id,
+        input_id=identity.input_id,
+        tool_call_id=identity.tool_call_id,
+    )
+
+
 def _optional_payload_string(payload: dict[str, Any] | None, key: str) -> str | None:
     if payload is None:
         return None
@@ -855,9 +918,15 @@ def _action_from_record(
     # checkpoints retain executable arguments, but no invocation has yet
     # established a complete secret scope for public display.
     arguments = None
-    discriminator = approval_id or input_id or tool_call_id or record.event.id
     return PendingActionRecord(
-        id=f"{session.id}:{record.sequence}:{action_kind}:{discriminator}",
+        id=pending_action_id(
+            session.id,
+            record,
+            action_kind,
+            approval_id=approval_id,
+            input_id=input_id,
+            tool_call_id=tool_call_id,
+        ),
         kind=action_kind,
         session=session,
         event=_pending_action_source_reference(record),
@@ -1222,19 +1291,13 @@ def pending_action_from_records(
 
             if manual_recovery_required:
                 approval = _object_payload(payload.get("approval"))
-                user_input = _object_payload(payload.get("user_input"))
-                approval_id = _optional_payload_string(
-                    payload, "approval_id"
-                ) or _optional_payload_string(approval, "approval_id")
-                input_id = _optional_payload_string(user_input, "input_id")
-                tool_call_id = _optional_payload_string(payload, "tool_call_id") or (
-                    _optional_payload_string(user_input, "tool_call_id")
-                )
-                round_id = _optional_payload_string(payload, "tool_round_id")
-                if tool_call_id is None or (
-                    approval_id is None and input_id is None and round_id is None
-                ):
+                identity = manual_recovery_identity(payload)
+                if identity is None:
                     continue
+                approval_id = identity.approval_id
+                input_id = identity.input_id
+                tool_call_id = identity.tool_call_id
+                round_id = identity.round_id
                 if input_id is not None:
                     checkpoint_call = _pending_user_input_checkpoint_call(
                         checkpoint,
