@@ -378,8 +378,17 @@ async def _exercise_timeout_cleanup(
         )
         assert detached.is_error is True
         assert detached.structured["status"] == "timed_out"
-        assert detached.structured["workspace_mutation_settlement"] == "runner_quiescent"
-        assert int(detached.structured["stdout"].strip()) > 1
+        # The guest supervisor confirmed that the detached descendant exited,
+        # so the container and its workspace stay usable.
+        assert detached.structured["workspace_mutation_settlement"] == "complete"
+        detached_pid = int(detached.structured["stdout"].strip())
+        assert detached_pid > 1
+        assert runner.lifecycle_state == "reusable"
+        settled = await runner.exec(
+            ExecCommand.process("sh", "-c", f"test ! -e /proc/{detached_pid}"),
+            timeout_s=10,
+        )
+        assert settled.exit_code == 0
     finally:
         if created.release is not None:
             await created.release(EnvironmentFactoryReleaseAction.DISCARD)

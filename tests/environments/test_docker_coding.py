@@ -1359,6 +1359,18 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
             == ToolExecutableRequirement(executable="rg").fingerprint
         )
         assert any("rg" in call and any("name=$1" in arg for arg in call) for call in calls)
+        runner = result.environment.runner
+        assert isinstance(runner, DockerRunner)
+        assert runner.timeout_cleanup == "command_or_sandbox"
+        assert runner.cancellation_cleanup == "command_or_sandbox"
+        cancellation = next(
+            claim for claim in evidence["claims"] if claim["capability"] == "confirmed_cancellation"
+        )
+        assert {item["name"]: item["value"] for item in cancellation["adapter_details"]} == {
+            "container_cleanup": True,
+            "command_tree_cleanup": True,
+            "exact_container_owner": True,
+        }
         assert result.environment.binding is not None
         assert result.environment.workspace is factory.source_workspace
         assert result.release is not None
@@ -1393,6 +1405,26 @@ def test_docker_coding_artifact_identity_is_bound_before_allocation(tmp_path: Pa
     with pytest.raises(TypeError, match="artifact_store must be an ArtifactStore"):
         factory(object())
     assert str(tmp_path) not in first.execution_profile_identity.model_dump_json()
+
+
+def test_docker_coding_command_cleanup_is_an_explicit_option(tmp_path: Path) -> None:
+    def factory(**kwargs: Any) -> DockerCodingEnvironmentFactory:
+        return DockerCodingEnvironmentFactory(
+            source_workspace=LocalWorkspace(tmp_path),
+            toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+            **kwargs,
+        )
+
+    default = factory()
+    explicit_default = factory(command_cleanup="command_or_sandbox")
+    container_only = factory(command_cleanup="sandbox")
+
+    assert default.command_cleanup == "command_or_sandbox"
+    assert default.execution_profile_identity == explicit_default.execution_profile_identity
+    assert container_only.command_cleanup == "sandbox"
+    assert default.execution_profile_identity != container_only.execution_profile_identity
+    with pytest.raises(ValueError, match="command_cleanup must be"):
+        factory(command_cleanup="command")
 
 
 def test_docker_coding_factory_reconnects_exact_preserved_container(
@@ -1502,6 +1534,8 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         assert reconnected.reconnect_metadata == created.reconnect_metadata
         assert reconnected.environment.runner is not None
         assert reconnected.environment.runner.container_id == _CONTAINER_ID
+        assert reconnected.environment.runner.timeout_cleanup == "command_or_sandbox"
+        assert reconnected.environment.runner.cancellation_cleanup == "command_or_sandbox"
         assert store.inspect()[0].reference_count == 1
         assert (
             reconnected.environment.runner.execution_capability_evidence()

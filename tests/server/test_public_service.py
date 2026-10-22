@@ -3499,13 +3499,21 @@ def test_execution_stops_before_a_blocked_heartbeat_can_outlive_its_lease(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("duration", [0, 1])
+@pytest.mark.parametrize("duration", [0, 60])
 def test_product_execution_deadline_fails_task_and_operation_without_redispatch(duration):
+    from cayu.deadlines import _TIMERS
+
     settled = []
 
     class StalledProvider(ScriptedModelProvider):
         async def stream(self, request):
             self.requests.append(request)
+            # Expire after admission so busy-host setup cannot bypass this
+            # test's in-flight cancellation and settlement assertions.
+            timers = [timer for timer, _deadline in _TIMERS.get() if timer.when() is not None]
+            assert timers
+            for timer in timers:
+                timer.reschedule(asyncio.get_running_loop().time())
             try:
                 await asyncio.Event().wait()
                 yield ModelStreamEvent.completed()

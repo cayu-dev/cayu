@@ -1248,7 +1248,8 @@ def test_task_worker_execution_timeout_defaults_runs_and_keeps_explicit_deadline
 
 
 @pytest.mark.parametrize("attached", [True, False])
-def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached):
+def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached, clock):
+    from cayu.deadlines import _TIMERS
     from cayu.sessions.outcomes import run_to_completion
     from cayu.tasks import (
         InMemoryTaskStore,
@@ -1263,6 +1264,13 @@ def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached)
 
         class StalledProvider(ScriptedModelProvider):
             async def stream(self, request):
+                # Expire only after provider admission; setup time is host-dependent.
+                clock.wall += timedelta(seconds=3600)
+                clock.mono += 3600
+                timers = [timer for timer, _deadline in _TIMERS.get() if timer.when() is not None]
+                assert timers
+                for timer in timers:
+                    timer.reschedule(asyncio.get_running_loop().time())
                 await asyncio.Event().wait()
                 yield ModelStreamEvent.completed()
 
@@ -1307,7 +1315,7 @@ def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached)
 
         handled = await asyncio.wait_for(
             run_task_worker(
-                app, store, handler, worker_id="w", max_tasks=1, execution_timeout_s=0.3
+                app, store, handler, worker_id="w", max_tasks=1, execution_timeout_s=60
             ),
             15,
         )

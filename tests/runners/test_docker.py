@@ -402,7 +402,7 @@ def test_build_exec_argv_strict_process_uses_fixed_python_supervisor() -> None:
         env_file=None,
         has_stdin=False,
         pid_file="/tmp/cayu-docker-commands/cmd.pid",
-        direct_process_supervisor=True,
+        python_supervisor=True,
     )
 
     assert argv[:6] == [
@@ -413,14 +413,37 @@ def test_build_exec_argv_strict_process_uses_fixed_python_supervisor() -> None:
         "a1",
         "python3",
     ]
-    assert argv[6] == "-c"
-    assert "os.execvp(command[0], command)" in argv[7]
-    assert "PR_SET_CHILD_SUBREAPER = 36" in argv[7]
-    assert "prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)" in argv[7]
-    assert "os.waitpid(-1, 0)" in argv[7]
-    assert 'f"{os.getpid()} 2' in argv[7]
-    assert argv[-3:] == ["/opt/tools/pytest", "-q", "tests/test_unit.py;echo"]
+    assert argv[6:9] == ["-I", "-S", "-c"]
+    assert "os.execvpe(command[0], command, command_env)" in argv[9]
+    assert "PR_SET_CHILD_SUBREAPER = 36" in argv[9]
+    assert "prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)" in argv[9]
+    assert "os.waitpid(-1, 0)" in argv[9]
+    assert 'f"{os.getpid()} 2' in argv[9]
+    assert argv[-4:] == ["tree", "/opt/tools/pytest", "-q", "tests/test_unit.py;echo"]
     assert "sh" not in argv[:6]
+
+
+def test_build_exec_argv_strict_shell_uses_python_supervisor_for_its_direct_child() -> None:
+    argv = _build_docker_exec_argv(
+        "/usr/bin/docker",
+        "a1",
+        ExecCommand.bash("pytest -q & wait"),
+        cwd="/workspace",
+        env_file=None,
+        has_stdin=False,
+        pid_file="/tmp/cayu-docker-commands/cmd.pid",
+        python_supervisor=True,
+    )
+
+    assert argv[5:9] == ["python3", "-I", "-S", "-c"]
+    assert "PR_SET_CHILD_SUBREAPER = 36" in argv[9]
+    assert argv[10:] == [
+        "/tmp/cayu-docker-commands/cmd.pid",
+        "direct",
+        "sh",
+        "-c",
+        "pytest -q & wait",
+    ]
 
 
 def test_python_supervisor_cleanup_requires_descendant_settlement() -> None:

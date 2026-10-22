@@ -16,7 +16,7 @@ from cayu.runners._diagnostics import (
 DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS = 5.0
 RUNNER_COMMAND_KILL_ATTEMPTS = 2
 RUNNER_CLEANUP_ARTIFACT_TYPE = "cayu.runner_cleanup.v1"
-RunnerCleanupPolicy = Literal["command", "sandbox", "none"]
+RunnerCleanupPolicy = Literal["command", "command_or_sandbox", "sandbox", "none"]
 DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
 DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
 _KNOWN_CLEANUP_ACTIONS = frozenset({"kill_command", "kill_sandbox", "close_transports", "none"})
@@ -176,12 +176,38 @@ def validate_cancel_timeout(timeout_s: float | None) -> float:
 def validate_runner_cleanup_policy(
     policy: RunnerCleanupPolicy,
     field_name: str,
+    *,
+    allow_sandbox_fallback: bool = False,
 ) -> RunnerCleanupPolicy:
-    """Accept only ``"command"``, ``"sandbox"``, or ``"none"``."""
+    """Accept ``"command"``, ``"sandbox"``, or ``"none"``.
 
+    ``allow_sandbox_fallback=True`` also accepts ``"command_or_sandbox"``. A
+    runner passes it only when its command handle reports ``kill()`` success
+    solely after confirming that the command's whole process tree has exited.
+    """
+
+    if type(allow_sandbox_fallback) is not bool:
+        raise TypeError("allow_sandbox_fallback must be a bool.")
+    if allow_sandbox_fallback and policy == "command_or_sandbox":
+        return policy
     if policy not in {"command", "sandbox", "none"}:
-        raise ValueError(f"Runner {field_name} must be one of: command, sandbox, none.")
+        accepted = (
+            "command, command_or_sandbox, sandbox, none"
+            if allow_sandbox_fallback
+            else "command, sandbox, none"
+        )
+        raise ValueError(f"Runner {field_name} must be one of: {accepted}.")
     return policy
+
+
+def runner_cleanup_observation_timeout(policy: RunnerCleanupPolicy, timeout_s: float) -> float:
+    """Return the settlement bound for one cleanup under ``policy``.
+
+    ``"command_or_sandbox"`` can run two phases, each bounded by ``timeout_s``,
+    so its observation bound is twice the per-phase bound.
+    """
+
+    return 2 * timeout_s if policy == "command_or_sandbox" else timeout_s
 
 
 async def cleanup_runner_command_with_diagnostic(
@@ -196,14 +222,41 @@ async def cleanup_runner_command_with_diagnostic(
 
     ``"command"`` awaits ``handle.kill()``, ``"sandbox"`` awaits
     ``sandbox.kill()`` (and asks the runner to close), and ``"none"`` records a
-    skipped receipt. A missing handle or ``kill`` method is ``unsupported``,
+    skipped receipt. ``"command_or_sandbox"`` awaits ``handle.kill()`` and
+    keeps the runner open when it completes; otherwise it records that receipt
+    as a preceding artifact and falls back to ``"sandbox"``, each phase bounded
+    by ``timeout_s``. A missing handle or ``kill`` method is ``unsupported``,
     ``kill()`` returning ``False`` or raising is ``failed``, and exceeding
     ``timeout_s`` is ``timeout``; only an awaited, non-``False`` kill is
     ``completed``. Ordinary exceptions from ``kill()`` become evidence rather
     than propagating.
     """
 
-    cleanup_policy = validate_runner_cleanup_policy(policy, "cleanup policy")
+    cleanup_policy = validate_runner_cleanup_policy(
+        policy, "cleanup policy", allow_sandbox_fallback=True
+    )
+    if cleanup_policy == "command_or_sandbox":
+        command = await cleanup_runner_command_with_diagnostic(
+            sandbox,
+            handle=handle,
+            adapter=adapter,
+            timeout_s=timeout_s,
+            policy="command",
+        )
+        if command.artifact["status"] == "completed":
+            return command
+        fallback = await cleanup_runner_command_with_diagnostic(
+            sandbox,
+            handle=None,
+            adapter=adapter,
+            timeout_s=timeout_s,
+            policy="sandbox",
+        )
+        return RunnerCleanupResult(
+            artifact=fallback.artifact,
+            close_runner=True,
+            preceding_artifacts=(command.artifact,),
+        )
     if cleanup_policy == "sandbox":
         artifact = await _call_cleanup_target(
             sandbox,

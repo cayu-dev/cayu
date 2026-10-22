@@ -896,12 +896,18 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     # Worker time limit: the guide's worker ends a hung run and fails its task.
     async def hung_worker() -> None:
+        from cayu.deadlines import _TIMERS
         from cayu.evals.testing import ScriptedModelProvider
         from cayu.sessions.memory import InMemorySessionStore
         from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
 
         class StalledProvider(ScriptedModelProvider):
             async def stream(self, request):
+                # Trigger the deadline after the run starts, independent of setup load.
+                timers = [timer for timer, _deadline in _TIMERS.get() if timer.when() is not None]
+                assert timers
+                for timer in timers:
+                    timer.reschedule(asyncio.get_running_loop().time())
                 await asyncio.Event().wait()
                 yield ModelStreamEvent.completed()
 
@@ -913,7 +919,7 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         task = await app.task_store.create_task(
             TaskCreate(type="invoice-job", input={"request": "Pay INV-9."})
         )
-        namespace["RUN_TIMEOUT_S"] = 0.3
+        namespace["RUN_TIMEOUT_S"] = 60
         stop = asyncio.Event()
         worker = asyncio.create_task(namespace["run_jobs"](app, stop))
         async with asyncio.timeout(15):

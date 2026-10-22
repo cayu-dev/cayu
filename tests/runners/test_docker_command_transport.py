@@ -24,11 +24,13 @@ def _argv(command, *, direct=False):
         env_file=None,
         has_stdin=True,
         pid_file="/tmp/synthetic.pid",
-        direct_process_supervisor=direct,
+        python_supervisor=direct,
     )
 
 
-@pytest.mark.parametrize("direct, shell", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "direct, shell", [(False, False), (True, False), (False, True), (True, True)]
+)
 def test_quote_heavy_command_transport_preserves_execution(tmp_path, direct, shell):
     if direct and sys.platform != "linux":
         pytest.skip("Python process supervisor requires Linux prctl")

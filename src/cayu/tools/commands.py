@@ -21,6 +21,7 @@ from cayu._validation import (
 from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
 from cayu.runners._cleanup import runner_cancellation_failure
 from cayu.runners.base import (
+    RunnerWorkspaceMutationSettlement,
     _clear_preflight_traceback_frames,
     _CommandValidationModel,
     runner_execution_error,
@@ -448,6 +449,7 @@ class ExecCommandTool(Tool):
                 timeout_s=timeout_s,
                 stdout_truncated=out.truncated,
                 stderr_truncated=err.truncated,
+                mutation_settlement=mutation_settlement,
             )
             encoded_streams = [
                 name
@@ -952,14 +954,23 @@ def _command_content(
     timeout_s: int,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    mutation_settlement: RunnerWorkspaceMutationSettlement,
 ) -> str:
     output = stdout.strip()
     error = stderr.strip()
     suffix = ""
     if stdout_truncated or stderr_truncated:
         suffix = "\n\n[output truncated]"
+    # Only positively completed runner cleanup is reported as a stop.
+    stop = {
+        "complete": " The command was stopped.",
+        "runner_quiescent": (
+            " The command was stopped by removing its sandbox, so this environment "
+            "cannot run more commands."
+        ),
+    }.get(mutation_settlement, "")
     if timed_out:
-        reason = f"Command timed out after {timeout_s} seconds."
+        reason = f"Command timed out after {timeout_s} seconds.{stop}"
         if output and error:
             return f"{reason}\n\nstdout:\n{output}\n\nstderr:\n{error}{suffix}"
         if output:
@@ -968,7 +979,7 @@ def _command_content(
             return f"{reason}\n\nstderr:\n{error}{suffix}"
         return f"{reason}{suffix}"
     if cancelled:
-        reason = "Command was cancelled."
+        reason = f"Command was cancelled.{stop}"
         if output and error:
             return f"{reason}\n\nstdout:\n{output}\n\nstderr:\n{error}{suffix}"
         if output:

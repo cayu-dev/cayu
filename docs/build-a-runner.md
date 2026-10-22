@@ -387,9 +387,9 @@ register_runner_adapter_identity(
 
 | Name | Purpose |
 | --- | --- |
-| `cleanup_runner_command_with_diagnostic` | One bounded `kill()` of a command handle (`"command"`) or sandbox (`"sandbox"`), or a skipped receipt (`"none"`); returns a `RunnerCleanupResult` with a `cayu.runner_cleanup.v1` artifact. Only an awaited, non-`False` kill is `completed`. |
-| `RunnerCleanupResult`, `RUNNER_CLEANUP_ARTIFACT_TYPE` | Cleanup receipt container and its artifact type string. |
-| `validate_runner_cleanup_policy`, `validate_cancel_timeout`, `DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS` | Constructor validation for `cancellation_cleanup` / `timeout_cleanup` and `cancel_timeout_s` (default 5 seconds). |
+| `cleanup_runner_command_with_diagnostic` | One bounded `kill()` of a command handle (`"command"`) or sandbox (`"sandbox"`), or a skipped receipt (`"none"`); returns a `RunnerCleanupResult` with a `cayu.runner_cleanup.v1` artifact. Only an awaited, non-`False` kill is `completed`. `"command_or_sandbox"` tries the command handle and, unless that completes, records its artifact in `preceding_artifacts` and kills the sandbox; each phase gets the full timeout. |
+| `RunnerCleanupResult`, `RUNNER_CLEANUP_ARTIFACT_TYPE` | Cleanup receipt container and its artifact type string. Report `result.artifacts`, which includes preceding phases. |
+| `validate_runner_cleanup_policy`, `validate_cancel_timeout`, `DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS` | Constructor validation for `cancellation_cleanup` / `timeout_cleanup` and `cancel_timeout_s` (default 5 seconds). Pass `allow_sandbox_fallback=True` to accept `"command_or_sandbox"`, and only when your handle's `kill()` returns success solely after confirming that the command's whole process tree exited. Bound settlement observation by twice `cancel_timeout_s` for that mode. |
 | `RedactedOutputCapture` | Streams output through a `SecretRedactor` into a bounded head, counting original bytes and reporting truncation. |
 | `redact_completed_exec_result` | Redacts and bounds a complete `ExecResult`. |
 | `validate_timeout`, `validate_output_limit`, `validate_stdin` | The `Runner.exec` argument rules for `timeout_s`, `output_limit_bytes`, and `stdin`. |

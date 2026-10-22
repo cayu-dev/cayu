@@ -893,6 +893,12 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     ``git_baseline=False`` drops the ephemeral guest Git baseline, so the image
     needs no ``git``. Use it for sandboxes that only sync files in and out; keep
     the default for coding products that publish Git changes.
+
+    ``command_cleanup`` selects what a command timeout or cancellation stops.
+    The default ``"command_or_sandbox"`` kills the command's process tree and
+    keeps the container and its workspace once the guest confirms that every
+    descendant exited; it removes the container only when that cannot be
+    confirmed. ``"sandbox"`` always removes the container.
     """
 
     @property
@@ -919,9 +925,15 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         knowledge_access_scope: KnowledgeAccessScope | None = None,
         deferred: bool = False,
         warm_spares: int = 0,
+        command_cleanup: Literal["command_or_sandbox", "sandbox"] = "command_or_sandbox",
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
+        if type(command_cleanup) is not str or command_cleanup not in {
+            "command_or_sandbox",
+            "sandbox",
+        }:
+            raise ValueError("command_cleanup must be 'command_or_sandbox' or 'sandbox'.")
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
         if type(deferred) is not bool:
@@ -964,6 +976,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self.git_baseline = git_baseline
         self.deferred = deferred
         self.warm_spares = warm_spares
+        self.command_cleanup: Literal["command_or_sandbox", "sandbox"] = command_cleanup
         runtime_executables = (
             _DOCKER_CODING_RUNTIME_EXECUTABLES
             if git_baseline
@@ -1014,6 +1027,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             ),
             git_baseline=git_baseline,
             deferred=deferred,
+            command_cleanup=command_cleanup,
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
@@ -1714,8 +1728,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 close_action="remove",
                 docker_path=self.docker_path,
                 replace=False,
-                cancellation_cleanup="sandbox",
-                timeout_cleanup="sandbox",
+                cancellation_cleanup=self.command_cleanup,
+                timeout_cleanup=self.command_cleanup,
                 credential_mode=CredentialMode.TRUSTED_TOOL,
                 allow_raw_secret_env=False,
                 network="none",
@@ -1768,6 +1782,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             executable_probes=requirements.executable_probes(),
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
             immutable_input_mounts=immutable_mounts,
+            cancellation_cleanup=self.command_cleanup,
+            timeout_cleanup=self.command_cleanup,
             _execution_environment_authority=(self._execution_environment_authority),
         )
 
@@ -2673,6 +2689,7 @@ def _docker_coding_configuration_fingerprint(
     immutable_input_runtime_compatibility_fingerprint: str | None,
     git_baseline: bool = True,
     deferred: bool = False,
+    command_cleanup: Literal["command_or_sandbox", "sandbox"] = "command_or_sandbox",
 ) -> str:
     material = {
         "schema": "cayu.docker_coding_environment.v3",
@@ -2705,6 +2722,9 @@ def _docker_coding_configuration_fingerprint(
     if deferred:
         # Eager fingerprints stay byte-for-byte unchanged.
         material["materialization"] = "deferred"
+    if command_cleanup != "command_or_sandbox":
+        # Default fingerprints stay byte-for-byte unchanged.
+        material["command_cleanup"] = command_cleanup
     return (
         "sha256:"
         + sha256(canonical_durable_json_bytes(material, "docker_coding_configuration")).hexdigest()

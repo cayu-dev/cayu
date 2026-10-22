@@ -160,10 +160,25 @@ That test performs an explicit trusted fixture-image build first, resolves each
 result to its content digest, and then starts separate network-disabled runtime
 containers. It proves hostile image entrypoints cannot replace Cayu's command
 path, direct structured commands and independent named checks both settle, a
-detached-session descendant cannot outlive a successful receipt, timeouts quiesce
-the runner, ordinary workspace mutations copy back, and exact profile/image/dependency
+detached-session descendant cannot outlive a successful receipt, a timeout stops
+the command's whole process tree while the container stays usable, ordinary
+workspace mutations copy back, and exact profile/image/dependency
 identities remain in receipts. The test removes its ephemeral containers and image
 tags on settlement.
+
+A command timeout or cancellation stops that command, not the session. By
+default (`command_cleanup="command_or_sandbox"`) the runner kills the command's
+process tree inside the container and keeps the container, its workspace, and
+the runner once the guest supervisor confirms that every descendant exited.
+The tool result reports a completed `kill_command` cleanup and says the command
+was stopped, and the next command runs in the same workspace. The container is
+removed only when that stop cannot be confirmed: the kill helper fails or times
+out, the Docker CLI or a stream fails, or a descendant survives. The result then
+also carries a completed `kill_sandbox` artifact and says the sandbox was
+removed. Pass `command_cleanup="sandbox"` to always remove the container. The
+`confirmed_cancellation` evidence reports `command_tree_cleanup` alongside
+`container_cleanup`; see the Docker cleanup notes in
+[runtime contracts](runtime-contracts.md) for the mechanism.
 
 If timeout or cancellation removes the owned container before workspace
 publication, finalization fails explicitly and the session cannot claim committed

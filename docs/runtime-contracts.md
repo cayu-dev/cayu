@@ -13783,9 +13783,10 @@ dispatch. Trusted execution is not exposed through agent tools or
 
 Remote runner command cleanup is bounded. `DockerRunner`, `E2BRunner`, and `MicrosandboxRunner` expose `cancel_timeout_s`, defaulting to 5 seconds, `cancellation_cleanup`, defaulting to `"command"`, and `timeout_cleanup`, defaulting to `"command"`. Built-in runners re-raise the original `asyncio.CancelledError` with cleanup diagnostics attached so asyncio's cancellation bookkeeping is preserved. E2B delayed-start cleanup may continue briefly in the background after the foreground interruption or timeout cleanup wait; if it cannot resolve the command start, the runner exec path is closed while the sandbox is preserved. Command timeouts return `ExecResult(timed_out=True)`.
 
-Both cleanup fields accept the same three modes:
+Both cleanup fields accept the same modes. `DockerRunner` also accepts `"command_or_sandbox"`; other built-in runners refuse it.
 
 - `"sandbox"`: call the sandbox provider's kill/terminate operation and close the runner. This is the strongest generic cleanup boundary for shells, child processes, and background work.
+- `"command_or_sandbox"`: call the command handle's `kill()` first. A runner accepts this mode only when its handle reports success after confirming that the command's whole process tree has exited; the runner then stays reusable and the result carries one completed `kill_command` artifact. If that kill fails, times out, or is unsupported, Cayu records its artifact and then runs `"sandbox"` cleanup, so the result carries both artifacts. Each phase is bounded by `cancel_timeout_s`, so observation is bounded by twice that value. A completed `kill_sandbox` settles workspace mutation as `runner_quiescent` even after an unconfirmed `kill_command`.
 - `"command"`: call the provider command handle's `kill()` method. Positively completed cleanup leaves the runner reusable. Failed, timed-out, or unsupported cleanup permanently poisons execution on that runner instance, including Docker, E2B, Microsandbox, and Lambda MicroVM. `reopen_exec()` cannot override that uncertainty. E2B may retain a delayed-start cleanup while its execution fence stays closed; only positive completion of its owned cleanup permits reuse. Cayu records cleanup diagnostics without treating cancellation of a local SDK await as proof that a remote command stopped.
 - `"none"`: do not try to stop the command or sandbox. Cayu records a skipped cleanup diagnostic and leaves the runner reusable for ordinary cancellations where command state is already known. If command submission may have succeeded but start acknowledgement never arrived, the runner exec path remains closed because Cayu cannot prove that no late command is still running. This is for callers that own cleanup outside Cayu.
 
@@ -13819,6 +13820,35 @@ execution failure remains available alongside cleanup evidence.
 Docker permits the `none` cleanup opt-out only after positive command-start
 evidence. An ambiguous delayed start permanently poisons execution, including
 `reopen_exec()`, even when cleanup is disabled.
+
+Evidence-bearing Docker creation and `DockerRunner.reconnect_strict()` accept
+`"sandbox"` or `"command_or_sandbox"` for both cleanup fields.
+`DockerCodingEnvironmentFactory` uses `"command_or_sandbox"` by default
+(`command_cleanup="sandbox"` restores container removal). When an
+evidence-bearing runner's admitted executables include `python3`, it runs every
+command, shell or process, in isolated mode (`python3 -I -S`) under a Python
+supervisor that is a child subreaper (`PR_SET_CHILD_SUBREAPER`),
+so every orphaned descendant becomes its child. On timeout or cancellation a
+helper `docker exec` signals the supervisor, which kills its children until
+`/proc` lists none, writes a stop acknowledgement, and removes its state file.
+Only that acknowledgement counts as a confirmed stop: a state file removed by a
+normal exit proves nothing, because a shell command can leave detached
+descendants behind. The supervised command receives the environment the
+supervisor was started with, not Python's locale-coerced copy. This needs no added capability and works with a read-only
+root, a non-root user, all capabilities dropped, `no-new-privileges`, and
+pids and memory limits. The container is removed instead when the helper
+cannot run, the state file is missing or survives the kill, the
+acknowledgement is absent (for example when the command exited normally just
+as cleanup began), a descendant
+survives the bounded kill loop, or the Docker CLI or a stream fails. A runner
+without that supervisor (no runtime evidence or no admitted `python3`) uses
+shell supervisors that cannot see descendants which leave their process group,
+so `"command_or_sandbox"` always removes its container. A durable command
+receipt has no such state file, so its cleanup always removes the container.
+A process command
+returns only after its whole tree exits; a shell command returns when its
+script returns, as before. Confirmation relies on the guest supervisor and
+assumes trusted code; Docker does not claim `untrusted_code_isolation`.
 
 After Docker, E2B or Microsandbox allocation is acknowledged, failed or cancelled initial
 workspace setup rolls back under a retained owner. Docker and E2B bound observation by

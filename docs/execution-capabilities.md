@@ -81,7 +81,7 @@ Fargate's host and privilege restrictions are described in
 
 | Capability | Docker | Lambda MicroVM |
 | --- | --- | --- |
-| Commands (`ExecCommandTool`), cancellation, timeouts, bounded output | Yes. | Yes (runner conformance suite). |
+| Commands (`ExecCommandTool`), cancellation, timeouts, bounded output | Yes. The coding factory stops a timed-out or cancelled command's whole process tree and keeps the container; it removes the container only when that stop cannot be confirmed. | Yes (runner conformance suite). |
 | File tools (read, write, edit, delete, list, `apply_patch`) | Yes. | Yes, through `RunnerWorkspace` inside the MicroVM. |
 | `search_text` | Yes when the image has `rg`. | Yes: the image ships a pinned `ripgrep`. The native `workspace_text_search_v1` capability is not claimed. |
 | `git_changes` | Yes when the image has `git`. | Yes: the image ships `git`. |

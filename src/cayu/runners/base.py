@@ -1058,9 +1058,11 @@ def runner_workspace_mutation_settlement(
         cleanup_results.append((action, status))
     if not cleanup_results:
         return "complete" if completed_result else "uncertain"
-    if cleanup_results and all(status == "completed" for _, status in cleanup_results):
-        if any(action == "kill_sandbox" for action, _ in cleanup_results):
-            return "runner_quiescent"
+    if ("kill_sandbox", "completed") in cleanup_results:
+        # A completed sandbox kill ends every guest process, including after
+        # an earlier command-level kill that could not confirm its tree.
+        return "runner_quiescent"
+    if all(status == "completed" for _, status in cleanup_results):
         return "complete"
     if cleanup_results and all(
         status in {"completed", "deferred"} for _, status in cleanup_results
@@ -1633,6 +1635,7 @@ class Runner(ABC):
                         "adapter": adapter,
                         "action": {
                             "command": "kill_command",
+                            "command_or_sandbox": "kill_sandbox",
                             "sandbox": "kill_sandbox",
                             "none": "none",
                         }[policy],

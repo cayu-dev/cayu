@@ -450,7 +450,7 @@ def test_quote_heavy_transport_on_linux(mode):
         env_file=None,
         has_stdin=True,
         pid_file="/tmp/synthetic.pid",
-        direct_process_supervisor=mode == "direct",
+        python_supervisor=mode == "direct",
     )
     guest = argv[argv.index("synthetic") + 1 :]
     if mode == "no_setsid":

@@ -36,6 +36,7 @@ from cayu.runners._cleanup import (
     RunnerCleanupPolicy,
     RunnerCleanupResult,
     cleanup_runner_command_with_diagnostic,
+    runner_cleanup_observation_timeout,
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
@@ -108,6 +109,10 @@ from cayu.vaults.redaction import SecretRedactor
 DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
 DEFAULT_DOCKER_CWD = "/workspace"
 DOCKER_COMMAND_STATE_DIR = "/tmp/cayu-docker-commands"
+# Evidence-bearing runners must end every interrupted command's guest work:
+# by removing the container, or by a confirmed command-tree kill that falls
+# back to removing the container.
+_STRICT_CLEANUP_POLICIES = frozenset({"sandbox", "command_or_sandbox"})
 _DOCKER_LIFECYCLE_DIAGNOSTIC_MAX_BYTES = 300
 _DOCKER_CONTAINER_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DOCKER_IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -854,7 +859,8 @@ def _build_docker_exec_argv(
     env_file: str | None,
     has_stdin: bool,
     pid_file: str,
-    direct_process_supervisor: bool = False,
+    python_supervisor: bool = False,
+    python_executable: str = "python3",
 ) -> list[str]:
     argv: list[str] = [docker_path, "exec"]
     if has_stdin:
@@ -866,15 +872,29 @@ def _build_docker_exec_argv(
         # model-controlled env could otherwise use to hijack the CLI, e.g. DOCKER_HOST).
         argv += ["--env-file", env_file]
     argv.append(name)
-    if command.kind == "process" and direct_process_supervisor:
-        if command.argv is None:
-            raise ValueError("Process commands require argv.")
+    if python_supervisor:
+        # The Python owner is a child subreaper: every orphaned descendant
+        # becomes its child, so cleanup can confirm that none remain.
+        if command.kind == "process":
+            if command.argv is None:
+                raise ValueError("Process commands require argv.")
+            supervised = ["tree", *command.argv]
+        else:
+            if command.shell is None:
+                raise ValueError("Shell commands require a script.")
+            # A shell command still returns when its script returns; only work
+            # running when cleanup starts belongs to the tree it must settle.
+            supervised = ["direct", "sh", "-c", command.shell]
+        # Isolated mode keeps command-supplied PYTHON* variables and site
+        # packages out of the supervisor that confirms cleanup.
         argv += [
-            "python3",
+            python_executable,
+            "-I",
+            "-S",
             "-c",
             _PYTHON_PROCESS_SUPERVISOR,
             pid_file,
-            *command.argv,
+            *supervised,
         ]
         _validate_docker_exec_argv(argv)
         return argv
@@ -909,8 +929,19 @@ import sys
 import time
 
 state_path = sys.argv[1]
-command = sys.argv[2:]
-if not command:
+stopped_path = state_path + ".stopped"
+wait_mode = sys.argv[2] if len(sys.argv) > 2 else ""
+command = sys.argv[3:]
+if wait_mode not in ("tree", "direct") or not command:
+    raise SystemExit(125)
+# Exec the command with the environment this process received, not os.environ:
+# CPython's C-locale coercion adds LC_CTYPE there, even in isolated mode.
+try:
+    with open("/proc/self/environ", "rb") as handle:
+        command_env = dict(
+            item.split(b"=", 1) for item in handle.read().split(b"\\0") if b"=" in item
+        )
+except OSError:
     raise SystemExit(125)
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
@@ -920,7 +951,8 @@ child = os.fork()
 if child == 0:
     try:
         os.setsid()
-        os.execvp(command[0], command)
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        os.execvpe(command[0], command, command_env)
     except BaseException:
         os._exit(127)
 
@@ -977,7 +1009,14 @@ def terminate_descendants(signum, _frame):
             break
         time.sleep(0.01)
     if complete:
-        unlink_state()
+        # Only this acknowledgement confirms a stop. A normal exit removes the
+        # state file too, but in direct mode it can leave descendants running.
+        try:
+            os.close(os.open(stopped_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except OSError:
+            complete = False
+        else:
+            unlink_state()
     os._exit(128 + signum if complete else 125)
 
 signal.signal(signal.SIGTERM, terminate_descendants)
@@ -1003,6 +1042,8 @@ try:
             pid, status = os.waitpid(-1, 0)
             if pid == child:
                 direct_status = status
+                if wait_mode == "direct":
+                    break
         except ChildProcessError:
             break
         except InterruptedError:
@@ -1114,8 +1155,25 @@ def _supervised_command_body(
     )
 
 
-def _kill_supervised_command_script(pid_file: str) -> str:
+def _kill_supervised_command_script(
+    pid_file: str,
+    *,
+    require_confirmed_tree: bool = False,
+) -> str:
+    """Stop one supervised command; exit 0 only when its stop is confirmed.
+
+    The Python supervisor (state ``2``) writes a ``.stopped`` acknowledgement
+    only after its signal handler sees no remaining child, and then removes
+    the state file. A state file removed without that acknowledgement is a
+    normal exit, which proves nothing about detached descendants. Shell
+    supervisors (``0`` and ``1``) signal a process group or PID and cannot see
+    descendants that left it, so ``require_confirmed_tree`` reports their
+    cleanup as unconfirmed.
+    """
+
     quoted_pid_file = shlex.quote(pid_file)
+    quoted_stopped_file = shlex.quote(pid_file + ".stopped")
+    shell_exit = 1 if require_confirmed_tree else 0
     return (
         "attempts=0; "
         f'while ! test -f {quoted_pid_file} && test "$attempts" -lt 20; do '
@@ -1130,8 +1188,17 @@ def _kill_supervised_command_script(pid_file: str) -> str:
         f'while test -f {quoted_pid_file} && test "$attempts" -lt 20; do '
         "attempts=$((attempts + 1)); sleep 0.1; "
         "done; "
-        f"if ! test -f {quoted_pid_file}; then exit 0; fi; "
+        f"if test -f {quoted_pid_file}; then "
         'kill -KILL "$pid" 2>/dev/null || true; '
+        "exit 1; "
+        "fi; "
+        # A normal exit may have removed the state file while the handler
+        # still settles; let the supervisor finish before reading the result.
+        "attempts=0; "
+        'while kill -0 "$pid" 2>/dev/null && test "$attempts" -lt 20; do '
+        "attempts=$((attempts + 1)); sleep 0.1; "
+        "done; "
+        f"if test -f {quoted_stopped_file}; then rm -f {quoted_stopped_file}; exit 0; fi; "
         "exit 1; "
         "fi; "
         'if test "$process_group" = 1; then '
@@ -1146,7 +1213,7 @@ def _kill_supervised_command_script(pid_file: str) -> str:
         'kill -KILL "$pid" 2>/dev/null || true; '
         "fi; "
         f"rm -f {quoted_pid_file}; "
-        "exit 0"
+        f"exit {shell_exit}"
     )
 
 
@@ -1165,6 +1232,9 @@ class _DockerCommandHandle:
         self.pid_file = pid_file
         self.docker_cli_env_allowlist = tuple(docker_cli_env_allowlist)
         self.user = user
+        # Set per cleanup: the command_or_sandbox policy may reuse the runner
+        # only after the guest supervisor confirms that the whole tree exited.
+        self.require_confirmed_tree = False
 
     def _exec_argv(self, script: str) -> list[str]:
         argv = ["exec"]
@@ -1193,7 +1263,12 @@ class _DockerCommandHandle:
         for _ in range(RUNNER_COMMAND_KILL_ATTEMPTS):
             result = await _run_docker(
                 self.docker_path,
-                self._exec_argv(_kill_supervised_command_script(self.pid_file)),
+                self._exec_argv(
+                    _kill_supervised_command_script(
+                        self.pid_file,
+                        require_confirmed_tree=self.require_confirmed_tree,
+                    )
+                ),
                 docker_cli_env_allowlist=self.docker_cli_env_allowlist,
             )
             if result.exit_code == 0 and not result.timed_out:
@@ -1865,7 +1940,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                     for fingerprint, target in evidence.immutable_input_mounts
                 ],
                 "process_transport": (
-                    "python_subreaper_supervisor_v2"
+                    "python_subreaper_supervisor_v3"
                     if "python3" in evidence.required_executables
                     else "shell_supervisor"
                 ),
@@ -1913,6 +1988,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
+        self._supervisor_python_path: str | None = None
         self._container_removed = False
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
@@ -1991,9 +2067,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         self.docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(docker_cli_env_allowlist)
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
-            cancellation_cleanup, "cancellation_cleanup"
+            cancellation_cleanup, "cancellation_cleanup", allow_sandbox_fallback=True
         )
-        self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.timeout_cleanup = validate_runner_cleanup_policy(
+            timeout_cleanup, "timeout_cleanup", allow_sandbox_fallback=True
+        )
 
     @classmethod
     async def resolve_container_id(
@@ -2226,9 +2304,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             raise TypeError("_env_overlay_secret_values_present must be bool or None.")
         cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
         cancellation_policy = validate_runner_cleanup_policy(
-            cancellation_cleanup, "cancellation_cleanup"
+            cancellation_cleanup, "cancellation_cleanup", allow_sandbox_fallback=True
         )
-        timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        timeout_policy = validate_runner_cleanup_policy(
+            timeout_cleanup, "timeout_cleanup", allow_sandbox_fallback=True
+        )
         docker_cli_allowlist = normalize_docker_cli_env_allowlist(docker_cli_env_allowlist)
         seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
         if default_cwd is None:
@@ -2266,9 +2346,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 )
             if close_action != "remove":
                 raise ValueError("Evidence-bearing Docker creation requires close_action='remove'.")
-            if cancellation_policy != "sandbox" or timeout_policy != "sandbox":
+            if (
+                cancellation_policy not in _STRICT_CLEANUP_POLICIES
+                or timeout_policy not in _STRICT_CLEANUP_POLICIES
+            ):
                 raise ValueError(
-                    "Evidence-bearing Docker creation requires container-level cleanup."
+                    "Evidence-bearing Docker creation requires container-level cleanup "
+                    "or confirmed command cleanup with container fallback."
                 )
             if not _cwd_in_tmpfs(default_cwd, owned_restrictions):
                 raise ValueError(
@@ -2558,11 +2642,27 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         executable_probes: Sequence[ToolExecutableRequirement] = (),
         toolchain_profile_fingerprint: str | None = None,
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
+        cancellation_cleanup: RunnerCleanupPolicy = "sandbox",
+        timeout_cleanup: RunnerCleanupPolicy = "sandbox",
         _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> DockerRunner:
         """Reattach to one exact strict container after re-verifying live evidence."""
 
         name = require_clean_nonblank(name, "name")
+        cancellation_policy = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup", allow_sandbox_fallback=True
+        )
+        timeout_policy = validate_runner_cleanup_policy(
+            timeout_cleanup, "timeout_cleanup", allow_sandbox_fallback=True
+        )
+        if (
+            cancellation_policy not in _STRICT_CLEANUP_POLICIES
+            or timeout_policy not in _STRICT_CLEANUP_POLICIES
+        ):
+            raise ValueError(
+                "Strict Docker reconnect requires container-level cleanup "
+                "or confirmed command cleanup with container fallback."
+            )
         if (
             type(container_id) is not str
             or _DOCKER_CONTAINER_ID_PATTERN.fullmatch(container_id) is None
@@ -2665,8 +2765,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             docker_path=docker,
             credential_mode=CredentialMode.TRUSTED_TOOL,
             allow_raw_secret_env=False,
-            cancellation_cleanup="sandbox",
-            timeout_cleanup="sandbox",
+            cancellation_cleanup=cancellation_policy,
+            timeout_cleanup=timeout_policy,
             _container_id=container_id,
             _runtime_evidence=runtime_evidence,
             _strict_seccomp_profile=seccomp_profile,
@@ -2961,7 +3061,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                     "confirmed_cancellation",
                     observation="supported",
                     details=(
+                        # Container removal is the policy or its fallback.
                         CapabilityDetail(name="container_cleanup", value=True),
+                        CapabilityDetail(
+                            name="command_tree_cleanup",
+                            value=(
+                                self.timeout_cleanup == "command_or_sandbox"
+                                and self.cancellation_cleanup == "command_or_sandbox"
+                                and "python3" in evidence.required_executables
+                            ),
+                        ),
                         CapabilityDetail(name="exact_container_owner", value=True),
                     ),
                 ),
@@ -3069,8 +3178,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             self._runtime_evidence is None
             or not self.container_id
             or "python3" not in self._runtime_evidence.required_executables
-            or self.cancellation_cleanup != "sandbox"
-            or self.timeout_cleanup != "sandbox"
+            or self.cancellation_cleanup not in _STRICT_CLEANUP_POLICIES
+            or self.timeout_cleanup not in _STRICT_CLEANUP_POLICIES
             or self.output_secret_values_present()
             or command.kind != "process"
             or type(output_limit_bytes) is not int
@@ -3451,8 +3560,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 )
                 or self.output_secret_values_present()
                 or self._runtime_evidence is None
-                or self.cancellation_cleanup != "sandbox"
-                or self.timeout_cleanup != "sandbox"
+                or self.cancellation_cleanup not in _STRICT_CLEANUP_POLICIES
+                or self.timeout_cleanup not in _STRICT_CLEANUP_POLICIES
             ):
                 raise ValueError("Durable command conflicts with its prepared authority.")
         env = None
@@ -3478,6 +3587,33 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             pid_file=pid_file,
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
+        python_executable = "python3"
+        if (
+            "PATH" in environment
+            and self._runtime_evidence is not None
+            and "python3" in self._runtime_evidence.required_executables
+        ):
+            # Resolve under the admitted container environment, before the
+            # command's PATH is applied. Keep that PATH intact for its child.
+            if self._supervisor_python_path is None:
+                interpreter = await _run_docker_admission_probe(
+                    self.docker_path,
+                    self.container_reference,
+                    script="command -v python3",
+                    supervise_guest=True,
+                    docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+                )
+                path = interpreter.stdout.strip()
+                if (
+                    interpreter.exit_code != 0
+                    or interpreter.timed_out
+                    or interpreter.cancelled
+                    or not path.startswith("/")
+                    or "\n" in path
+                ):
+                    raise DockerRuntimeConfigurationError("python_supervisor_unavailable")
+                self._supervisor_python_path = path
+            python_executable = self._supervisor_python_path
         with runner_env_file(environment) as env_file:
             environment = {}
             argv = _build_docker_exec_argv(
@@ -3488,10 +3624,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 env_file=env_file,
                 has_stdin=standard_input is not None or binary_input is not None,
                 pid_file=pid_file,
-                direct_process_supervisor=(
+                python_executable=python_executable,
+                python_supervisor=(
                     self._runtime_evidence is not None
                     and "python3" in self._runtime_evidence.required_executables
-                    and owned_command.kind == "process"
                 ),
             )
             if receipt is not None:
@@ -3501,7 +3637,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 argv = [
                     *prefix,
                     self.container_reference,
-                    "python3",
+                    python_executable,
                     "-I",
                     "-S",
                     "-c",
@@ -3556,10 +3692,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 cleanup = await self._cleanup_command(
                     handle=handle,
                     policy=self.cancellation_cleanup,
+                    durable=receipt is not None,
                     cancellation=exc,
                 )
                 self._apply_cleanup_result(cleanup)
-                attach_cancellation_artifacts(exc, [cleanup.artifact])
+                attach_cancellation_artifacts(exc, cleanup.artifacts)
                 raise
             except Exception as exc:
                 # A local Docker CLI transport or binary-stream failure does not
@@ -3570,17 +3707,21 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 cleanup = await self._cleanup_command(
                     handle=handle,
                     policy=self.cancellation_cleanup,
+                    durable=receipt is not None,
                 )
                 self._apply_cleanup_result(cleanup)
-                attach_cancellation_artifacts(exc, [cleanup.artifact])
+                attach_cancellation_artifacts(exc, cleanup.artifacts)
                 raise
         if result.timed_out:
             cleanup = await self._cleanup_command(
                 handle=handle,
                 policy=self.timeout_cleanup,
+                durable=receipt is not None,
             )
             self._apply_cleanup_result(cleanup)
-            result = result.model_copy(update={"artifacts": [*result.artifacts, cleanup.artifact]})
+            result = result.model_copy(
+                update={"artifacts": [*result.artifacts, *cleanup.artifacts]}
+            )
         return redact_exec_result(result, resolved_secrets)
 
     async def _cleanup_command(
@@ -3588,8 +3729,15 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         *,
         handle: _DockerCommandHandle,
         policy: RunnerCleanupPolicy,
+        durable: bool = False,
         cancellation: asyncio.CancelledError | None = None,
     ) -> RunnerCleanupResult:
+        if durable and policy == "command_or_sandbox":
+            # A durable receipt command has its own guest owner and no PID
+            # file; its tree cannot be stopped at command level from here.
+            policy = "sandbox"
+        handle.require_confirmed_tree = policy == "command_or_sandbox"
+
         async def cleanup_owned() -> RunnerCleanupResult:
             if policy == "none" and not await handle.has_started():
                 self._poison_exec()
@@ -3604,7 +3752,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         return await self._settle_command_cleanup(
             cleanup_owned,
             adapter="docker",
-            timeout_s=self.cancel_timeout_s,
+            timeout_s=runner_cleanup_observation_timeout(policy, self.cancel_timeout_s),
             policy=policy,
             cancellation=cancellation,
         )
