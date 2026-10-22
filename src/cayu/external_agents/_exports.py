@@ -21,6 +21,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "recover_external_agent_run": ("cayu.external_agents.recovery", "recover_external_agent_run"),
     "run_external_agent": ("cayu.external_agents.recording", "run_external_agent"),
     "runner_agent_launch": ("cayu.external_agents.environment", "runner_agent_launch"),
+    "runner_port_forward": ("cayu.external_agents.environment", "runner_port_forward"),
 }
 
 PUBLIC_NAMES = [
@@ -44,4 +45,5 @@ PUBLIC_NAMES = [
     "recover_external_agent_run",
     "run_external_agent",
     "runner_agent_launch",
+    "runner_port_forward",
 ]

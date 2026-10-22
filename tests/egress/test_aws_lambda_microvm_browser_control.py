@@ -21,6 +21,7 @@ import pytest
 pytest.importorskip("fcntl")
 
 import examples.aws.lambda_microvm_sidecar.supervisor as supervisor_module
+from examples.aws.lambda_microvm_sidecar.forwards import FORWARD_LISTEN_HOST, FORWARD_PORTS
 from examples.aws.lambda_microvm_sidecar.supervisor import (
     AGENT_CONTROL_HOSTNAME,
     AGENT_CONTROL_RELAY_PORT,
@@ -226,7 +227,7 @@ def test_control_relay_requires_the_agent_network_namespace() -> None:
         _boundary(relays, agent_netns=None).configure_control_relay("10.0.4.7", 8443)
 
 
-def test_entrypoint_admits_only_the_control_port_and_maps_the_control_name() -> None:
+def test_entrypoint_admits_only_relay_ports_and_maps_the_control_name() -> None:
     entrypoint = (SIDECAR_ROOT / "entrypoint.sh").read_text()
 
     assert "iptables -w -I INPUT 1 -i cayu-root -j REJECT" in entrypoint
@@ -236,7 +237,10 @@ def test_entrypoint_admits_only_the_control_port_and_maps_the_control_name() -> 
     assert accepted == [
         "iptables -w -I INPUT 1 -i cayu-root -p tcp --dport 18080 -j ACCEPT",
         f"iptables -w -I INPUT 1 -i cayu-root -p tcp --dport {AGENT_CONTROL_RELAY_PORT} -j ACCEPT",
+        "iptables -w -I INPUT 1 -i cayu-root -p tcp "
+        f"--dport {FORWARD_PORTS.start}:{FORWARD_PORTS.stop - 1} -j ACCEPT",
     ]
+    assert f"ip addr add {FORWARD_LISTEN_HOST}/30 dev cayu-root" in entrypoint
     assert f"192.0.2.1 {AGENT_CONTROL_HOSTNAME}" in entrypoint
     assert "/etc/netns/$CAYU_MICROVM_AGENT_NETNS/hosts" in entrypoint
     assert (AGENT_CONTROL_HOSTNAME, AGENT_CONTROL_RELAY_PORT) == (

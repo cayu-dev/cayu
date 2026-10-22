@@ -284,6 +284,82 @@ class RunnerInteractiveProcessCapability(ABC):
         """
 
 
+class RunnerPortForward(ABC):
+    """A listening address inside the guest whose connections reach a host service.
+
+    Guest processes connect to ``guest_host``:``guest_port``; each connection is
+    carried over the runner's own authenticated control channel to a matching
+    connection the host opens to the forward's target. Bytes pass unchanged in
+    both directions. The caller owns the handle and must ``close`` it.
+    """
+
+    @property
+    @abstractmethod
+    def guest_host(self) -> str:
+        """Address guest processes connect to. It is not reachable from outside the guest."""
+
+    @property
+    @abstractmethod
+    def guest_port(self) -> int:
+        """TCP port guest processes connect to."""
+
+    @property
+    def guest_url(self) -> str:
+        """Plain-HTTP origin of the forward as guest processes see it."""
+
+        return f"http://{self.guest_host}:{self.guest_port}"
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Stop the guest listener and end every relayed connection.
+
+        Returns only once the guest confirmed the listener is closed. When that
+        cannot be confirmed it raises, and the caller may retry it. It is
+        idempotent once it has succeeded.
+        """
+
+
+class RunnerPortForwardCapability(ABC):
+    """Nominal runner capability that relays guest TCP connections to a host service.
+
+    The guest needs no route to the host and the host needs no inbound route to
+    the guest: connections travel over the channel the runner already uses for
+    commands. Like other capabilities it does not own the runner's lifecycle.
+    The relay does not inspect or terminate the bytes, so a plain-HTTP target
+    keeps the hop inside the guest and that channel, and TLS stays end to end
+    when the target speaks it.
+    """
+
+    @staticmethod
+    def retain_failed_open(error: BaseException, forward: RunnerPortForward) -> None:
+        """Retain retryable cleanup on the original failed-open error or cancellation."""
+        if not set_exception_state(error, "_cayu_forward_open_cleanup", forward):
+            raise RuntimeError("Port forward cleanup ownership could not be retained.")
+
+    @staticmethod
+    def failed_open_forward(error: BaseException) -> RunnerPortForward | None:
+        """Recover a failed open's handle and retry close before reporting closure."""
+        forward = exception_state(error, "_cayu_forward_open_cleanup")
+        return forward if isinstance(forward, RunnerPortForward) else None
+
+    @abstractmethod
+    async def open_port_forward(
+        self,
+        *,
+        host: str,
+        port: int,
+        timeout_s: int | None = None,
+    ) -> RunnerPortForward:
+        """Open a guest listener whose connections reach ``host``:``port`` on the host.
+
+        ``timeout_s`` bounds the listener's lifetime in the guest, so a caller
+        that disappears without closing it cannot leave it open forever.
+        If opening fails without confirmed closure, implementations retain the
+        handle on the original error with ``retain_failed_open``. Recover it
+        with ``failed_open_forward`` and retry ``close``.
+        """
+
+
 class RemoteWorkspaceBranchCapability(RunnerWorkspaceCapability):
     """Explicit provider proof for the durable guest branch protocol.
 
@@ -1417,6 +1493,14 @@ class Runner(ABC):
 
         Discovery must not provision a runner or execute commands. Only runners
         that can confirm teardown of a whole guest process tree return one.
+        """
+
+        return None
+
+    def port_forward_capability(self) -> RunnerPortForwardCapability | None:
+        """Return guest-to-host port forwarding when this runner supports it.
+
+        Discovery must not provision a runner or execute commands.
         """
 
         return None

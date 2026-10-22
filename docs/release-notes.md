@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Upgrade: rebuild Lambda MicroVM images from this release's sidecar
+(`cayu lambda-microvm sidecar export`). `LambdaMicroVMRunner` now requires sidecar
+protocol 7 and refuses an image built from an earlier release at readiness.
+
 Upgrade: brokered coding sandbox images now need `git`, or their factory must
 set `git_baseline=False`. Direct binding users must also check the workspace
 requirements below. An Agent reports to Cayu Cloud once
@@ -12,6 +16,9 @@ compatibility floor 124, server contract 49 and manifest schema 17 are all
 unchanged.
 
 ### Breaking changes
+
+- `LambdaMicroVMRunner` requires sidecar protocol 7. An image built from the 0.13.0
+  sidecar fails readiness with a protocol version mismatch until it is rebuilt.
 
 - `BrokeredSandboxCodingEnvironmentFactory` and `BrokeredSandboxCodingBinding`
   now enable `git_baseline=True` by default. Existing sandbox images without
@@ -24,6 +31,21 @@ unchanged.
 
 ### Changes
 
+- A Claude Code or Codex run through `runner_agent_launch` can now reach the model
+  through `ExternalAgentGateway` without a public gateway URL or any route from the
+  guest to the host. `runner_port_forward` opens a listening address in the guest
+  and relays its connections to the gateway on the host's loopback, over the
+  runner's own authenticated channel; grant with `public_base_url=forward.guest_url`.
+  Runners expose this through the new provider-neutral
+  `RunnerPortForwardCapability`, and `LambdaMicroVMRunner` implements it with
+  sidecar protocol 7. `runner_agent_launch` also takes `mcp_servers` and
+  `codex_config_overrides` for settings that name the guest address. The
+  external-agents guide shows the setup and what a leaked run token can and
+  cannot do.
+- The gateway accepts the requests the pinned vendor CLIs send for current models:
+  Claude Code's system-role messages carrying inline text and an effort setting,
+  and Codex's client-tool declarations as an input item with a reasoning context.
+  Provider-hosted tools in either are still refused.
 - Report run summaries and human touches to Cayu Cloud through the versioned
   `cayu.cloud-agent` contract. With `CAYU_CLOUD_READER_TOKEN_SHA256` set to the
   digest of Cloud's reader token, `cayu serve` and `mount_cayu` serve

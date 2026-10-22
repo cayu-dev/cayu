@@ -58,6 +58,8 @@ from cayu.runners.base import (
     RunnerInteractiveProcessCapability as RunnerInteractiveProcessCapability,
 )
 from cayu.runners.base import RunnerLifecycleState as RunnerLifecycleState
+from cayu.runners.base import RunnerPortForward as RunnerPortForward
+from cayu.runners.base import RunnerPortForwardCapability as RunnerPortForwardCapability
 from cayu.runners.base import RunnerSystemExecutionMode as RunnerSystemExecutionMode
 from cayu.runners.base import RunnerUnavailableError as RunnerUnavailableError
 from cayu.runners.base import RunnerWorkloadAuthority as RunnerWorkloadAuthority

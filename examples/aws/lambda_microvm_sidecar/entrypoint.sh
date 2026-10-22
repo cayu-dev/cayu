@@ -15,6 +15,9 @@ configure_agent_network_boundary() {
     # The control relay, configured later by the owner-fenced host, is the
     # agent namespace's only path to the Cayu control server.
     iptables -w -I INPUT 1 -i cayu-root -p tcp --dport 18443 -j ACCEPT
+    # Port forwards the owner opens, which it relays to a host service over the
+    # sidecar endpoint. Keep in sync with forwards.FORWARD_PORTS.
+    iptables -w -I INPUT 1 -i cayu-root -p tcp --dport 18500:18563 -j ACCEPT
     # `ip netns exec` bind-mounts this file over /etc/hosts for agent commands.
     mkdir -p "/etc/netns/$CAYU_MICROVM_AGENT_NETNS"
     printf '127.0.0.1 localhost\n::1 localhost\n192.0.2.1 cayu-control\n' \

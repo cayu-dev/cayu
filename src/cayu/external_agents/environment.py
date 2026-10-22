@@ -15,12 +15,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeVar
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu.external_agents.base import ExternalAgentLaunch
-from cayu.runners.base import ExecCommand, Runner, RunnerInteractiveProcess
+from cayu.runners.base import ExecCommand, Runner, RunnerInteractiveProcess, RunnerPortForward
 from cayu.runners.docker import DockerRunner
 
 _T = TypeVar("_T")
@@ -259,6 +259,8 @@ async def runner_agent_launch(
     cwd: str | None = None,
     timeout_s: int | None = None,
     max_processes: int = 4,
+    mcp_servers: Mapping[str, Any] | None = None,
+    codex_config_overrides: tuple[str, ...] = (),
 ) -> AsyncIterator[ExternalAgentLaunch]:
     """Run the CLI inside any runner that can open interactive processes.
 
@@ -275,6 +277,10 @@ async def runner_agent_launch(
     The yielded ``cwd`` is a host directory, because the SDK starts the stand-in
     there; in the guest the same path is a link to the working directory, so a
     harness that reports or reuses its working directory sees one path.
+
+    ``mcp_servers`` (Claude) and ``codex_config_overrides`` (Codex) carry
+    per-run settings that name guest addresses, such as a gateway reached
+    through ``runner_port_forward``.
     """
     if not Path(cli).is_absolute():
         raise ValueError("The guest CLI path must be absolute.")
@@ -285,7 +291,7 @@ async def runner_agent_launch(
     if capability is None:
         raise ValueError(
             "The runner cannot open interactive processes; use a runner that supports "
-            "them, such as LambdaMicroVMRunner with sidecar protocol 6."
+            "them, such as LambdaMicroVMRunner."
         )
     protect_secret: Callable[[str], None] | None = None
     declared_secrets = tuple(
@@ -443,12 +449,49 @@ async def runner_agent_launch(
                 close,
                 {"PATH": "/usr/bin:/bin", "HOME": directory},
                 declared_secrets,
+                mcp_servers=dict(mcp_servers or {}),
+                codex_config_overrides=tuple(codex_config_overrides),
                 bind_secret_protector=bind_secret_protector,
             )
         finally:
             from cayu.external_agents._cleanup import close_external_guest
 
             await close_external_guest(close)
+
+
+@asynccontextmanager
+async def runner_port_forward(
+    runner: Runner, *, host: str, port: int, timeout_s: int | None = None
+) -> AsyncIterator[RunnerPortForward]:
+    """Give guest processes an address that reaches ``host``:``port`` on this host.
+
+    It makes an ``ExternalAgentGateway`` listening only on this host's loopback
+    reachable from a CLI in the runner: grant with
+    ``public_base_url=forward.guest_url`` and hand the capability's URLs and
+    token to the CLI. The runner is borrowed and needs a
+    ``Runner.port_forward_capability()``. Leaving the block closes the guest
+    listener and every relayed connection; ``timeout_s`` bounds the listener if
+    this host disappears first.
+    """
+    capability = runner.port_forward_capability()
+    if capability is None:
+        raise ValueError(
+            "The runner cannot forward guest ports; use a runner that supports them, "
+            "such as LambdaMicroVMRunner."
+        )
+    from cayu.external_agents._cleanup import close_external_guest
+
+    try:
+        forward = await capability.open_port_forward(host=host, port=port, timeout_s=timeout_s)
+    except BaseException as error:
+        retained = capability.failed_open_forward(error)
+        if retained is not None:
+            await close_external_guest(retained.close)
+        raise
+    try:
+        yield forward
+    finally:
+        await close_external_guest(forward.close)
 
 
 def codex_proxy_overrides(base_url: str) -> tuple[str, ...]:

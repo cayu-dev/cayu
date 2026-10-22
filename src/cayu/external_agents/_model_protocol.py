@@ -107,6 +107,12 @@ def _anthropic_content(value: Any, documents: list[dict[str, Any]], citations: l
                         raise ValueError("Invalid inline document citation configuration.")
 
 
+def _output_config(value: Any) -> None:
+    output = _object(value, {"effort", "format"})
+    if "format" in output:
+        _schema(_object(output["format"], {"type", "schema"}).get("schema"))
+
+
 def _anthropic(body: dict[str, Any]) -> None:
     _object(
         body,
@@ -134,9 +140,21 @@ def _anthropic(body: dict[str, Any]) -> None:
     documents: list[dict[str, Any]] = []
     citations: list[Any] = []
     for message in _array(body.get("messages", [])):
-        message = _object(message, {"role", "content"})
-        if message.get("role") not in {"user", "assistant"}:
-            raise ValueError("Unsupported message role.")
+        if type(message) is dict and message.get("role") == "system":
+            # Claude Code places some instructions in system-role messages
+            # with their own effort setting. Only inline text is accepted.
+            message = _object(message, {"role", "content", "output_config"})
+            content = message.get("content")
+            if not isinstance(content, str) and any(
+                type(block) is not dict or block.get("type") != "text" for block in _array(content)
+            ):
+                raise ValueError("System messages support only inline text.")
+            if "output_config" in message:
+                _output_config(message["output_config"])
+        else:
+            message = _object(message, {"role", "content"})
+            if message.get("role") not in {"user", "assistant"}:
+                raise ValueError("Unsupported message role.")
         _anthropic_content(message.get("content"), documents, citations)
     if "system" in body:
         _anthropic_content(body["system"], documents, citations)
@@ -180,9 +198,7 @@ def _anthropic(body: dict[str, Any]) -> None:
             if edit.get("type") != "clear_thinking_20251015":
                 raise ValueError("Unsupported context management operation.")
     if "output_config" in body:
-        output = _object(body["output_config"], {"effort", "format"})
-        if "format" in output:
-            _schema(_object(output["format"], {"type", "schema"}).get("schema"))
+        _output_config(body["output_config"])
     if "output_format" in body:
         _schema(_object(body["output_format"], {"type", "schema"}).get("schema"))
 
@@ -297,10 +313,16 @@ def _responses(body: dict[str, Any]) -> None:
                 _object(item, {"type", "id", "summary", "content", "encrypted_content", "status"})
                 if "summary" not in item and "encrypted_content" not in item:
                     raise ValueError("Reasoning must be supplied inline.")
+            elif kind == "additional_tools":
+                # Codex declares its client tools in the input as well.
+                _object(item, {"type", "id", "role", "tools"})
+                _response_tools(item.get("tools"))
             else:
                 raise ValueError("Stored references and server-tool inputs are unavailable.")
     if "reasoning" in body:
-        _object(body["reasoning"], {"effort", "summary", "generate_summary"})
+        reasoning = _object(body["reasoning"], {"effort", "summary", "generate_summary", "context"})
+        if reasoning.get("context", "all_turns") not in {"all_turns", "current_turn"}:
+            raise ValueError("Unsupported reasoning context.")
     if "text" in body:
         config = _object(body["text"], {"format", "verbosity"})
         if "format" in config:

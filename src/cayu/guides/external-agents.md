@@ -414,7 +414,7 @@ use `runner_agent_launch` or write your own.
 `runner_agent_launch(runner=..., cli=..., environment=..., cwd=None, timeout_s=None)`
 runs the CLI inside any runner whose `interactive_process_capability()` returns a
 `RunnerInteractiveProcessCapability`. `LambdaMicroVMRunner` provides one through
-sidecar protocol 6. Each CLI process runs in its own PID namespace in the MicroVM,
+its sidecar. Each CLI process runs in its own PID namespace in the MicroVM,
 so closing it confirms that every process the CLI started has exited, including
 processes that left its process group. Another sandbox plugs in by implementing
 the capability on its runner; the launcher and the adapters stay the same.
@@ -429,8 +429,9 @@ runner over a private Unix socket. The launch's `cwd` is a host directory, becau
 the SDK starts the stand-in there; in the guest the same path links to the
 runner's working directory. `timeout_s` bounds each guest process if the service
 disappears without closing it, so derive it from the run's deadline. As with the
-Docker launcher, model keys are refused in `environment`. The runner's network
-must give the CLI a model route that keeps keys outside the guest. The adapters
+Docker launcher, model keys are refused in `environment`. The CLI reaches the
+model through the gateway over a port forward; see
+[Model access from a runner](#model-access-from-a-runner). The adapters
 install a secret protector before starting the CLI; the launcher registers each
 process's newly issued secrets before forwarding output. Direct launcher users
 that publish output must call `prepared.protect_secrets(protector)` first.
@@ -455,6 +456,161 @@ async def launch(context):
 
 adapter = ClaudeAgentAdapter(model=model, launch=launch)
 ```
+
+### Model access from a runner
+
+A CLI in a MicroVM has no route to your service, and you don't need to give it
+one. `runner_port_forward(runner, host=..., port=..., timeout_s=None)` opens a
+listening address inside the guest and relays each connection to `host`:`port` on
+your host, over the same owner-fenced channel the CLI's stdio uses. Serve
+`gateway.router` on this host's loopback only, open a forward to it, and grant
+with `public_base_url=forward.guest_url` so the capability's URLs name the guest
+address. The real model key stays in the gateway; the guest gets only the run's
+token. No public gateway URL, no inbound route to the guest and no extra Lambda
+egress connector are needed.
+
+The forward is a provider-neutral runner capability:
+`Runner.port_forward_capability()` returns a `RunnerPortForwardCapability` whose
+`open_port_forward(host=..., port=..., timeout_s=None)` returns a
+`RunnerPortForward` with `guest_host`, `guest_port`, `guest_url` and `close()`.
+`LambdaMicroVMRunner` provides it through sidecar protocol 7: the guest listens on
+its agent network's gateway address, `192.0.2.1`, at a port from 18500 to 18563,
+reachable only from processes in the MicroVM. Another sandbox plugs in by
+implementing the capability on its runner.
+
+Put the per-run URL in the CLI's configuration. Claude Code takes it from the
+environment. Codex takes it from `codex_config_overrides`, which replaces the
+adapter's `base_url`, and native tools over MCP take `capability.mcp_url` through
+`mcp_servers`:
+
+```python
+import math
+from contextlib import asynccontextmanager
+
+from cayu.external_agents import (
+    ClaudeAgentAdapter,
+    CodexAgentAdapter,
+    codex_proxy_overrides,
+    runner_agent_launch,
+    runner_port_forward,
+)
+
+GATEWAY_PORT = 8766  # uvicorn serves gateway.router on 127.0.0.1:8766 only.
+
+
+def guest_timeout(context):
+    remaining = context.execution_deadline.remaining_seconds()
+    return None if remaining is None else math.ceil(remaining) + 60
+
+
+@asynccontextmanager
+async def claude_launch(context):
+    async with (
+        runner_port_forward(
+            runner, host="127.0.0.1", port=GATEWAY_PORT, timeout_s=guest_timeout(context)
+        ) as forward,
+        gateway.grant(
+            context,
+            route="anthropic",
+            models=frozenset({MODEL}),
+            public_base_url=forward.guest_url,
+        ) as capability,
+        runner_agent_launch(
+            runner=runner,
+            cli="/usr/local/bin/claude",
+            environment={
+                "ANTHROPIC_BASE_URL": capability.model_base_url,
+                "ANTHROPIC_AUTH_TOKEN": capability.token,
+            },
+            timeout_s=guest_timeout(context),
+        ) as prepared,
+    ):
+        yield prepared
+
+
+@asynccontextmanager
+async def codex_launch(context):
+    async with (
+        runner_port_forward(
+            runner, host="127.0.0.1", port=GATEWAY_PORT, timeout_s=guest_timeout(context)
+        ) as forward,
+        gateway.grant(
+            context,
+            route="openai",
+            models=frozenset({CODEX_MODEL}),
+            public_base_url=forward.guest_url,
+        ) as capability,
+        runner_agent_launch(
+            runner=runner,
+            cli="/usr/local/bin/codex",
+            environment={"CAYU_MODEL_PROXY_TOKEN": capability.token},
+            codex_config_overrides=codex_proxy_overrides(capability.model_base_url),
+            timeout_s=guest_timeout(context),
+        ) as prepared,
+    ):
+        yield prepared
+
+
+claude = ClaudeAgentAdapter(model=MODEL, launch=claude_launch)
+# The launch's overrides replace this placeholder base URL for each run.
+codex = CodexAgentAdapter(
+    model=CODEX_MODEL,
+    base_url="http://127.0.0.1/models/openai",
+    launch=codex_launch,
+    sandbox="external",
+)
+```
+
+Leaving the block closes the CLI, revokes the token and closes the guest listener,
+in that order. `timeout_s` bounds the listener if the service disappears first.
+
+What to know about this route:
+
+- **No TLS inside the guest.** The CLI talks plain HTTP to the guest address, the
+  bytes cross to your host inside the runner's authenticated HTTPS channel, and the
+  host connects to the gateway on loopback. The image needs no Cayu CA. The relay
+  passes bytes unchanged, so an HTTPS target would stay end to end.
+- **A leaked token is limited to the run.** Anything in the guest can read the
+  token, because the CLI must. It works only for the granted route and models, only
+  on the Messages or Responses path, only within the run's budget checks, and only
+  until the run's deadline or the end of the grant, whichever comes first. It never
+  reveals the provider key, which the gateway adds upstream. It is also scrubbed
+  from what Cayu stores.
+- **Budgets hold.** The gateway checks the run's budget before every model call, so
+  a call that would go over a reached cap is refused before it is sent.
+- **Streaming.** The relay forwards each chunk as soon as the gateway writes it.
+  Measured with a fake streaming upstream and a simulated 50 ms round trip to the
+  MicroVM endpoint, events reached the guest a median of about 50 ms after the
+  upstream sent them, 80 ms at worst; with no added round trip the median was about
+  1 ms. Expect roughly one endpoint round trip per chunk. The gateway itself buffers each model
+  response until it ends, so it can commit usage before the CLI sees a finished
+  response; the CLI receives the whole stream then.
+- **Claude Code** (2.1.301, the CLI bundled with the pinned `claude-agent-sdk`)
+  uses `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` and sends the token as
+  `Authorization: Bearer`, which the gateway accepts. It may substitute a newer
+  model for a retired name (for example it sent `claude-opus-5-5` when asked for
+  `claude-opus-4-1`), so grant the model name the CLI actually sends.
+- **Codex** (0.163.0, the version the pinned `openai-codex` uses) reads the token
+  from `CAYU_MODEL_PROXY_TOKEN`, as `codex_proxy_overrides` configures, and sends it
+  as `Authorization: Bearer` to the overridden `base_url`. Leave `CODEX_HOME` unset
+  or point it at an existing directory; Codex exits if it is missing.
+- **Proxies.** If the runner's environment sets `HTTP_PROXY`, add the forward's
+  `guest_host` to `NO_PROXY` in `environment` so the CLI connects to it directly.
+
+To check this on real AWS, build a MicroVM image from this release's sidecar with
+the CLIs at the pinned versions, for example by adding
+`RUN python3.11 -m pip install claude-agent-sdk==0.2.168 openai-codex-cli-bin==0.163.0`
+to the exported Dockerfile and linking the bundled `claude` and `codex` binaries
+into `/usr/local/bin`. Then run the quick start with the launches above, a small
+prompt and `BudgetLimit.usd(0.05)`, and confirm that:
+
+- the run completes and `app.get_session_usage` shows the call's tokens;
+- with a cap already reached, the next model call returns HTTP 403 from the
+  gateway and the run fails with `ExternalAgentBudgetExceeded`;
+- the session's events and the guest's environment contain no provider key;
+- after the run, a request with the old token to the gateway returns 401, and
+  `runner.exec(ExecCommand.shell("curl -sS http://192.0.2.1:18500/"))` fails to
+  connect.
 
 ### Write your own launcher
 

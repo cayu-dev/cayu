@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 
 from cayu.deadlines import ExecutionDeadline
+from cayu.external_agents._model_protocol import validate_model_request
 from cayu.external_agents.base import ExternalAgentContext, ExternalAgentError
 from cayu.external_agents.server import ExternalAgentGateway, ExternalModelRoute
 
@@ -155,6 +156,19 @@ def test_gateway_scope_exit_joins_idle_upstream_stream():
                 ]
             },
         ),
+        (
+            "responses",
+            {
+                "input": [
+                    {
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": [{"type": "web_search"}],
+                    }
+                ]
+            },
+        ),
+        ("responses", {"reasoning": {"context": "stored"}}),
         ("responses", {"previous_response_id": "other-response"}),
         ("responses", {"background": True}),
         ("responses", {"input": [{"type": "item_reference", "id": "other-item"}]}),
@@ -199,6 +213,19 @@ def test_gateway_scope_exit_joins_idle_upstream_stream():
             },
         ),
         ("v1/messages", {"container": "previous-container"}),
+        (
+            "v1/messages",
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "data": "AA=="}}
+                        ],
+                    }
+                ]
+            },
+        ),
     ],
 )
 def test_gateway_refuses_provider_execution_fetches_and_stored_references(path, payload):
@@ -618,3 +645,63 @@ def test_mcp_transport_runs_native_tool_and_rejects_revoked_scope():
         await app.aclose()
 
     asyncio.run(scenario())
+
+
+def test_gateway_accepts_the_pinned_cli_request_shapes():
+    # Claude Code adds system-role messages with their own effort setting, and
+    # Codex declares its client tools as an input item.
+    validate_model_request(
+        {
+            "model": "model",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "env", "cache_control": {"type": "ephemeral"}}
+                    ],
+                    "output_config": {"effort": "medium"},
+                },
+            ],
+        },
+        "messages",
+    )
+    validate_model_request(
+        {
+            "model": "model",
+            "reasoning": {"effort": "medium", "context": "all_turns"},
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "id": "at_1",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "description": "",
+                            "tools": [
+                                {
+                                    "type": "custom",
+                                    "name": "exec",
+                                    "format": {
+                                        "type": "grammar",
+                                        "syntax": "lark",
+                                        "definition": "start: /.+/",
+                                    },
+                                },
+                                {"type": "function", "name": "wait", "strict": False},
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            ],
+        },
+        "responses",
+    )

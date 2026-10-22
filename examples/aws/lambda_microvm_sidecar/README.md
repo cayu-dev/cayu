@@ -108,8 +108,8 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `6`. `GET /health` returns
-`{"status":"ok","protocol_version":"6"}` so the host can reject an incompatible image before
+The sidecar implements Cayu Lambda MicroVM command protocol version `7`. `GET /health` returns
+`{"status":"ok","protocol_version":"7"}` so the host can reject an incompatible image before
 sending a command. The host requires the exact version, so an image built from an earlier
 release must be rebuilt. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
@@ -201,6 +201,36 @@ current owner may move it:
 Stderr of an interactive command is drained and discarded, and its terminal result carries no
 output. Stdio requests run on their own thread pool so long polls cannot starve other endpoints.
 
+Version 7 adds port forwards, which let agent commands reach a host service, such as Cayu's
+external-agent model gateway, with no route from the guest to the host. `POST /v1/forwards` with
+the current `owner_claim`, a host-generated `forward_id` and an optional `timeout_s` opens a
+listener on the agent veth gateway, `192.0.2.1`, at the lowest free port from 18500 to 18563, and
+returns `{"forward_id", "host", "port"}`. The entrypoint accepts only that range (besides 18080 and
+18443) from the agent namespace, so nothing outside the MicroVM can connect. The relay carries
+plain TCP: the host opens its own connection to the service for each guest connection and moves
+the bytes over this authenticated endpoint, so the hop inside the guest can be plain HTTP and no
+CA has to be installed in the image. Only the current owner may use a forward:
+
+- `POST /v1/forwards/{forward_id}/accept` with `after` and `wait_s` (up to 20 seconds) long-polls
+  for connections numbered above `after` and reports whether the forward has closed.
+- `POST /v1/forwards/{forward_id}/connections/{connection}/read` with `offset`, `max_bytes` (up to
+  4 MiB) and `wait_s` long-polls the guest's bytes. As with interactive stdout, reading at an
+  offset acknowledges every earlier byte, and reading the same offset again recovers a lost
+  response. Unread bytes are held up to 4 MiB per connection, after which the sidecar stops
+  reading the socket, so a slow host applies TCP backpressure to the guest. The response reports
+  `eof` once the guest closed its side and every byte was read.
+- `POST /v1/forwards/{forward_id}/connections/{connection}/write` with `offset`, `data_base64` (up
+  to 4 MiB) and `eof` sends the service's bytes to the guest. Bytes before the current offset are
+  skipped, so a retried write is idempotent; `eof` closes the guest's read side.
+- `POST /v1/forwards/{forward_id}/connections/{connection}/close` ends one connection.
+- `POST /v1/forwards/{forward_id}/close` closes the listener and every connection. Closing an
+  unknown forward leaves a short-lived tombstone, so an open that arrives after its own cleanup is
+  refused with HTTP 409 instead of leaving a listener behind.
+
+A forward accepts at most 32 connections at a time. A superseding owner claim, the suspend and
+terminate hooks, and the forward's `timeout_s` all close it. Forward requests run on their own
+thread pool, as stdio requests do.
+
 - `GET /health`
 - `POST /v1/owner`
 - `POST /v1/owner/check`
@@ -212,6 +242,12 @@ output. Stdio requests run on their own thread pool so long polls cannot starve 
 - `POST /v1/commands/{command_id}/stdin`
 - `POST /v1/commands/{command_id}/stdout`
 - `POST /v1/control-relay`
+- `POST /v1/forwards`
+- `POST /v1/forwards/{forward_id}/accept`
+- `POST /v1/forwards/{forward_id}/connections/{connection}/read`
+- `POST /v1/forwards/{forward_id}/connections/{connection}/write`
+- `POST /v1/forwards/{forward_id}/connections/{connection}/close`
+- `POST /v1/forwards/{forward_id}/close`
 - `DELETE /v1/commands/{command_id}`
 - AWS lifecycle hooks under `/aws/lambda-microvms/runtime/v1/`
 

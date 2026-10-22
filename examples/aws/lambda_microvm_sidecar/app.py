@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
+from .forwards import PortForwardRegistry
 from .supervisor import (
     CommandConflictError,
     CommandExecutionBoundary,
@@ -22,7 +23,7 @@ from .supervisor import (
 )
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
-PROTOCOL_VERSION = "6"
+PROTOCOL_VERSION = "7"
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
 AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
@@ -33,6 +34,7 @@ EXECUTION_BOUNDARY = CommandExecutionBoundary(
 )
 SUPERVISOR = CommandSupervisor(root=ROOT, execution_boundary=EXECUTION_BOUNDARY)
 OWNER = OwnerFence()
+FORWARDS = PortForwardRegistry()
 # 412 is reserved for a superseded owner and 423 for a lifecycle lease held by
 # the current owner, so the host never parses error bodies.
 OWNER_SUPERSEDED_STATUS = 412
@@ -41,7 +43,15 @@ OWNER_SUPERSEDED_REASON = "owner_superseded"
 # Interactive stdio blocks on pipes and long polls. Its own pool keeps that
 # waiting from starving the default pool that serves every other endpoint.
 INTERACTIVE_IO = ThreadPoolExecutor(max_workers=32, thread_name_prefix="cayu-interactive")
+# Each relayed connection keeps one read long poll open, and each forward one
+# accept long poll, so forwards get their own pool too.
+FORWARD_IO = ThreadPoolExecutor(max_workers=64, thread_name_prefix="cayu-forward")
 app = FastAPI(title="Cayu Lambda MicroVM sidecar", docs_url=None, redoc_url=None)
+
+
+def _close_guest_relays() -> None:
+    EXECUTION_BOUNDARY.close()
+    FORWARDS.close_all()
 
 
 @app.get("/health")
@@ -59,8 +69,9 @@ async def ready_hook() -> dict[str, str]:
 async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
     """Make the caller the only host allowed to start commands.
 
-    A claim that supersedes another resets the agent proxy relay before the new
-    owner can start anything, then cancels every command of earlier owners. The
+    A claim that supersedes another resets the agent proxy relay and closes
+    every port forward before the new owner can start anything, then cancels
+    every command of earlier owners. The
     response is sent only after that cancellation, so a completed takeover
     leaves no earlier owner's command able to run.
     """
@@ -68,7 +79,7 @@ async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
         generation, superseded = await asyncio.to_thread(
             OWNER.claim,
             payload.get("claim_id"),
-            on_supersede=EXECUTION_BOUNDARY.close,
+            on_supersede=_close_guest_relays,
         )
     except CommandRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -182,6 +193,113 @@ async def configure_control_relay(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _open_forward_admitted(payload: dict[str, Any]) -> dict[str, Any]:
+    # Opened while the fence is held, like a command start, so a takeover
+    # either refuses this open or closes the forward it created.
+    with OWNER.admitted(payload.get("owner_claim")) as generation:
+        return FORWARDS.open(
+            payload.get("forward_id"),
+            owner_generation=generation,
+            timeout_s=payload.get("timeout_s"),
+        )
+
+
+@app.post("/v1/forwards")
+async def open_forward(payload: dict[str, Any]) -> dict[str, Any]:
+    """Listen on the agent veth gateway and hold its connections for the owner to relay.
+
+    The owner long-polls for accepted connections and moves their bytes; the
+    guest never gets a route to the host.
+    """
+    return await _forward_call(lambda: _open_forward_admitted(payload), executor=None)
+
+
+@app.post("/v1/forwards/{forward_id}/accept")
+async def accept_forward(forward_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Long-poll for connections accepted after the ``after`` connection number."""
+    return await _owned_forward_call(
+        payload,
+        FORWARDS.accept,
+        forward_id,
+        after=payload.get("after"),
+        wait_s=payload.get("wait_s", 0),
+    )
+
+
+@app.post("/v1/forwards/{forward_id}/connections/{connection}/read")
+async def read_forward(forward_id: str, connection: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """Long-poll a connection's guest bytes from ``offset``, acknowledging earlier ones."""
+    return await _owned_forward_call(
+        payload,
+        FORWARDS.read,
+        forward_id,
+        connection,
+        offset=payload.get("offset"),
+        max_bytes=payload.get("max_bytes"),
+        wait_s=payload.get("wait_s", 0),
+    )
+
+
+@app.post("/v1/forwards/{forward_id}/connections/{connection}/write")
+async def write_forward(
+    forward_id: str, connection: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Send host bytes to a connection; ``offset`` makes a retry idempotent."""
+    return await _owned_forward_call(
+        payload,
+        FORWARDS.write,
+        forward_id,
+        connection,
+        offset=payload.get("offset"),
+        data_base64=payload.get("data_base64", ""),
+        eof=payload.get("eof", False),
+    )
+
+
+@app.post("/v1/forwards/{forward_id}/connections/{connection}/close")
+async def close_forward_connection(
+    forward_id: str, connection: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    return await _owned_forward_call(payload, FORWARDS.close_connection, forward_id, connection)
+
+
+@app.post("/v1/forwards/{forward_id}/close")
+async def close_forward(forward_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Close a forward and its connections; an unknown ID leaves a tombstone."""
+
+    def close() -> dict[str, Any]:
+        OWNER.require(payload.get("owner_claim"))
+        return FORWARDS.close(forward_id)
+
+    return await _forward_call(close, executor=None)
+
+
+async def _owned_forward_call(
+    payload: dict[str, Any], operation: Any, *arguments: Any, **keywords: Any
+) -> dict[str, Any]:
+    # The fence is checked, not held: a takeover closes every forward itself.
+    def call() -> dict[str, Any]:
+        generation = OWNER.require(payload.get("owner_claim"))
+        return operation(*arguments, owner_generation=generation, **keywords)
+
+    return await _forward_call(call, executor=FORWARD_IO)
+
+
+async def _forward_call(call: Any, *, executor: ThreadPoolExecutor | None) -> dict[str, Any]:
+    try:
+        return await asyncio.get_running_loop().run_in_executor(executor, call)
+    except OwnerSupersededError as exc:
+        raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
+    except OwnerLifecycleLeasedError as exc:
+        raise HTTPException(status_code=OWNER_LIFECYCLE_LEASED_STATUS, detail=str(exc)) from exc
+    except CommandNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CommandConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CommandRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/v1/commands/{command_id}")
 async def get_command(command_id: str) -> dict[str, Any]:
     try:
@@ -279,6 +397,7 @@ async def resume_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
 async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     await asyncio.to_thread(SUPERVISOR.cancel_all)
+    await asyncio.to_thread(FORWARDS.close_all)
     # The provider applied the leased suspend, and the owner never retries it.
     OWNER.settle_lifecycle("suspend")
     return {"status": "ok"}
@@ -288,5 +407,6 @@ async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
 async def terminate_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     await asyncio.to_thread(SUPERVISOR.cancel_all)
+    await asyncio.to_thread(FORWARDS.close_all)
     OWNER.settle_lifecycle("terminate")
     return {"status": "ok"}

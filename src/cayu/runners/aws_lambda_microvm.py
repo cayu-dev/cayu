@@ -65,6 +65,8 @@ from cayu.runners.base import (
     RunnerExecutionAdmissionObserver,
     RunnerInteractiveProcess,
     RunnerInteractiveProcessCapability,
+    RunnerPortForward,
+    RunnerPortForwardCapability,
     RunnerSystemExecutionMode,
     RunnerWorkloadAuthority,
     RunnerWorkspaceCapabilityT,
@@ -97,7 +99,7 @@ DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "6"
+LAMBDA_MICROVM_PROTOCOL_VERSION = "7"
 # Sized for the built-in browser worker: a default session response envelope
 # plus a browser-profile checkpoint, and a default upload batch on stdin. Both
 # match the first-party sidecar's own ceilings.
@@ -117,8 +119,19 @@ LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES 
 # for at most this long, well inside one endpoint request timeout.
 LAMBDA_MICROVM_INTERACTIVE_CHUNK_BYTES = 1024 * 1024
 LAMBDA_MICROVM_INTERACTIVE_READ_WAIT_SECONDS = 10.0
+# A forwarded connection moves in chunks no larger than this, so one chunk of
+# model output reaches the guest as soon as the host service sends it.
+LAMBDA_MICROVM_FORWARD_CHUNK_BYTES = 256 * 1024
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
 _LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_LAMBDA_FORWARD_METHODS = (
+    "open_forward",
+    "accept_forward",
+    "read_forward",
+    "write_forward",
+    "close_forward_connection",
+    "close_forward",
+)
 _LAMBDA_OWNER_SUPERSEDED_HTTP_STATUS = 412
 _LAMBDA_OWNER_LIFECYCLE_LEASED_HTTP_STATUS = 423
 _LAMBDA_OWNER_SUPERSEDED_CANCEL_REASON = "owner_superseded"
@@ -589,6 +602,136 @@ class HttpxLambdaMicroVMEndpointTransport:
                 "max_bytes": max_bytes,
                 "wait_s": wait_s,
             },
+            timeout_s=timeout_s,
+        )
+
+    async def open_forward(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        forward_id: str,
+        owner_claim: str,
+        lifetime_s: int | None,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path="/v1/forwards",
+            payload={"forward_id": forward_id, "owner_claim": owner_claim, "timeout_s": lifetime_s},
+            timeout_s=timeout_s,
+        )
+
+    async def accept_forward(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        forward_id: str,
+        owner_claim: str,
+        after: int,
+        wait_s: float,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/forwards/{forward_id}/accept",
+            payload={"owner_claim": owner_claim, "after": after, "wait_s": wait_s},
+            timeout_s=timeout_s,
+        )
+
+    async def read_forward(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        forward_id: str,
+        connection: int,
+        owner_claim: str,
+        offset: int,
+        max_bytes: int,
+        wait_s: float,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/forwards/{forward_id}/connections/{connection}/read",
+            payload={
+                "owner_claim": owner_claim,
+                "offset": offset,
+                "max_bytes": max_bytes,
+                "wait_s": wait_s,
+            },
+            timeout_s=timeout_s,
+        )
+
+    async def write_forward(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        forward_id: str,
+        connection: int,
+        owner_claim: str,
+        offset: int,
+        data_base64: str,
+        eof: bool,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/forwards/{forward_id}/connections/{connection}/write",
+            payload={
+                "owner_claim": owner_claim,
+                "offset": offset,
+                "data_base64": data_base64,
+                "eof": eof,
+            },
+            timeout_s=timeout_s,
+        )
+
+    async def close_forward_connection(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        forward_id: str,
+        connection: int,
+        owner_claim: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/forwards/{forward_id}/connections/{connection}/close",
+            payload={"owner_claim": owner_claim},
+            timeout_s=timeout_s,
+        )
+
+    async def close_forward(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        forward_id: str,
+        owner_claim: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/forwards/{forward_id}/close",
+            payload={"owner_claim": owner_claim},
             timeout_s=timeout_s,
         )
 
@@ -2326,6 +2469,20 @@ class LambdaMicroVMRunner(Runner):
             return None
         return _LambdaInteractiveProcessCapability(self)
 
+    def port_forward_capability(self) -> RunnerPortForwardCapability | None:
+        """Relay guest connections to a host service through sidecar protocol 7.
+
+        The guest listens on its agent network's gateway address; each
+        connection travels over the owner-fenced sidecar endpoint, and the host
+        opens the matching connection to the target. Endpoint transports
+        without the forward methods report no capability.
+        """
+
+        transport = self._endpoint_transport
+        if not all(callable(getattr(transport, name, None)) for name in _LAMBDA_FORWARD_METHODS):
+            return None
+        return _LambdaPortForwardCapability(self)
+
     @property
     def owner_fence_generation(self) -> str | None:
         """Non-secret identity of this runner's current sidecar owner claim.
@@ -2432,6 +2589,21 @@ class LambdaMicroVMRunner(Runner):
 
     async def _endpoint_cancel(self, command_id: str) -> Mapping[str, Any]:
         return await self._endpoint_call("cancel_command", command_id=command_id)
+
+    async def _idempotent_owner_call(self, method_name: str, **kwargs: Any) -> Mapping[str, Any]:
+        for attempt in range(_LAMBDA_POLL_ATTEMPTS):
+            try:
+                return await self._endpoint_call(
+                    method_name, owner_claim=self._owner_claim, **kwargs
+                )
+            except LambdaMicroVMOwnershipSuperseded:
+                self._mark_superseded()
+                raise
+            except LambdaMicroVMEndpointTransientError:
+                if attempt == _LAMBDA_POLL_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(0.05 * (2**attempt))
+        raise AssertionError("unreachable owner-call retry loop")
 
     async def _endpoint_call(
         self, method_name: str, *, deadline: float | None = None, **kwargs: Any
@@ -2739,24 +2911,260 @@ class _LambdaInteractiveProcess(RunnerInteractiveProcess):
         }
 
     async def _stdio_call(self, method_name: str, **kwargs: Any) -> Mapping[str, Any]:
+        return await self._runner._idempotent_owner_call(
+            method_name, command_id=self.command_id, **kwargs
+        )
+
+
+class _LambdaPortForwardCapability(RunnerPortForwardCapability):
+    """Guest listeners in one MicroVM; the runner keeps its own lifecycle."""
+
+    def __init__(self, runner: LambdaMicroVMRunner) -> None:
+        self._runner = runner
+
+    async def open_port_forward(
+        self,
+        *,
+        host: str,
+        port: int,
+        timeout_s: int | None = None,
+    ) -> RunnerPortForward:
         runner = self._runner
-        for attempt in range(_LAMBDA_POLL_ATTEMPTS):
+        target_host = require_clean_nonblank(host, "host")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("Port forward target port must be an integer from 1 to 65535.")
+        lifetime = validate_timeout(timeout_s)
+        runner._ensure_exec_open()
+        if not runner._owner_claimed:
+            # A directly constructed runner claims before its first guest operation.
             try:
-                return await runner._endpoint_call(
-                    method_name,
-                    command_id=self.command_id,
-                    owner_claim=runner._owner_claim,
-                    **kwargs,
-                )
+                await runner._claim_owner()
             except LambdaMicroVMOwnershipSuperseded:
                 runner._mark_superseded()
                 raise
+        forward = _LambdaPortForward(runner, f"fwd-{uuid.uuid4()}", (target_host, port))
+        try:
+            response = await forward._call("open_forward", lifetime_s=lifetime)
+            guest_host = response.get("host")
+            guest_port = response.get("port")
+            if (
+                response.get("forward_id") != forward.forward_id
+                or type(guest_host) is not str
+                or not guest_host
+                or type(guest_port) is not int
+                or not 1 <= guest_port <= 65535
+            ):
+                raise LambdaMicroVMProtocolError("Lambda MicroVM forward response is malformed.")
+        except BaseException as error:
+            # The open may have reached the sidecar. Close it, or leave a
+            # tombstone that refuses a delayed open, before reporting.
+            outcome = await await_shielded_task_outcome(asyncio.ensure_future(forward.close()))
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+            )
+            if outcome.error is not None:
+                self.retain_failed_open(error, forward)
+            raise
+        forward._start(guest_host, guest_port)
+        return forward
+
+
+class _LambdaPortForward(RunnerPortForward):
+    """Host half of one sidecar forward: accepts guest connections and pumps their bytes.
+
+    Each guest connection gets a host connection to the target. Guest bytes are
+    long-polled by offset and host bytes are written by offset, so a request
+    that timed out is retried without duplicating or losing bytes.
+    """
+
+    def __init__(
+        self, runner: LambdaMicroVMRunner, forward_id: str, target: tuple[str, int]
+    ) -> None:
+        self._runner = runner
+        self.forward_id = forward_id
+        self.target = target
+        self._guest_host = ""
+        self._guest_port = 0
+        self._accepting: asyncio.Task[None] | None = None
+        self._connections: set[asyncio.Task[None]] = set()
+        self._closing = False
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+
+    @property
+    def guest_host(self) -> str:
+        return self._guest_host
+
+    @property
+    def guest_port(self) -> int:
+        return self._guest_port
+
+    def _start(self, guest_host: str, guest_port: int) -> None:
+        self._guest_host = guest_host
+        self._guest_port = guest_port
+        self._accepting = asyncio.create_task(self._accept())
+
+    def _wait_s(self) -> float:
+        return min(LAMBDA_MICROVM_INTERACTIVE_READ_WAIT_SECONDS, self._runner.request_timeout_s / 2)
+
+    async def _accept(self) -> None:
+        after = 0
+        while not self._closing:
+            try:
+                response = await self._call("accept_forward", after=after, wait_s=self._wait_s())
+            except LambdaMicroVMOwnershipSuperseded:
+                return
             except LambdaMicroVMEndpointTransientError:
-                # The offset makes the retry idempotent.
-                if attempt == _LAMBDA_POLL_ATTEMPTS - 1:
-                    raise
-            await asyncio.sleep(0.05 * (2**attempt))
-        raise AssertionError("unreachable interactive retry loop")
+                # The cursor makes polling safe to resume after an endpoint outage.
+                await asyncio.sleep(0.5)
+                continue
+            except Exception:
+                _LOGGER.warning("Lambda MicroVM forward stopped accepting connections.")
+                return
+            connections = response.get("connections")
+            if type(connections) is not list or any(
+                type(identifier) is not int for identifier in connections
+            ):
+                _LOGGER.warning("Lambda MicroVM forward accept response is malformed.")
+                return
+            for identifier in connections:
+                if identifier > after:
+                    task = asyncio.create_task(self._relay(identifier))
+                    self._connections.add(task)
+                    task.add_done_callback(self._connections.discard)
+            after = max([after, *connections])
+            if response.get("closed") is True:
+                return
+
+    async def _relay(self, connection: int) -> None:
+        writer: asyncio.StreamWriter | None = None
+        try:
+            try:
+                reader, writer = await asyncio.open_connection(*self.target)
+            except OSError:
+                return
+            guest_to_host = asyncio.create_task(self._guest_to_host(connection, writer))
+            host_to_guest = asyncio.create_task(self._host_to_guest(connection, reader))
+            pending: set[asyncio.Task[None]] = {guest_to_host, host_to_guest}
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    if any(task.exception() is not None for task in done):
+                        break
+            finally:
+                for task in (guest_to_host, host_to_guest):
+                    task.cancel()
+                await asyncio.gather(guest_to_host, host_to_guest, return_exceptions=True)
+        except Exception:
+            _LOGGER.debug("Lambda MicroVM forwarded connection ended with an error.")
+        finally:
+            if writer is not None:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+            await self._close_connection(connection)
+
+    async def _close_connection(self, connection: int) -> None:
+        # Keep the relay task owned until its guest slot is released. Losing
+        # this obligation after an endpoint outage eventually fills the listener.
+        while not self._closing:
+            try:
+                response = await self._call("close_forward_connection", connection=connection)
+                if (
+                    type(response.get("connection")) is not int
+                    or response.get("connection") != connection
+                    or response.get("closed") is not True
+                ):
+                    raise LambdaMicroVMProtocolError(
+                        "Lambda MicroVM did not confirm the forwarded connection closed."
+                    )
+                return
+            except LambdaMicroVMOwnershipSuperseded:
+                # Ownership replacement closes the old owner's entire forward.
+                return
+            except Exception:
+                _LOGGER.debug("Lambda MicroVM forwarded connection cleanup will retry.")
+            await asyncio.sleep(0.5)
+
+    async def _guest_to_host(self, connection: int, writer: asyncio.StreamWriter) -> None:
+        offset = 0
+        while True:
+            response = await self._call(
+                "read_forward",
+                connection=connection,
+                offset=offset,
+                max_bytes=LAMBDA_MICROVM_FORWARD_CHUNK_BYTES,
+                wait_s=self._wait_s(),
+            )
+            encoded = response.get("data_base64")
+            eof = response.get("eof")
+            if (
+                response.get("offset") != offset
+                or type(encoded) is not str
+                or type(eof) is not bool
+                or len(encoded) > 4 * ((LAMBDA_MICROVM_FORWARD_CHUNK_BYTES + 2) // 3)
+            ):
+                raise LambdaMicroVMProtocolError("Lambda MicroVM forward read is malformed.")
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except ValueError:
+                raise LambdaMicroVMProtocolError(
+                    "Lambda MicroVM forward read is malformed."
+                ) from None
+            offset += len(data)
+            if data:
+                writer.write(data)
+                await writer.drain()
+            if eof:
+                if writer.can_write_eof():
+                    writer.write_eof()
+                return
+
+    async def _host_to_guest(self, connection: int, reader: asyncio.StreamReader) -> None:
+        offset = 0
+        while True:
+            data = await reader.read(LAMBDA_MICROVM_FORWARD_CHUNK_BYTES)
+            response = await self._call(
+                "write_forward",
+                connection=connection,
+                offset=offset,
+                data_base64=base64.b64encode(data).decode("ascii"),
+                eof=not data,
+            )
+            closed = response.get("closed")
+            written = response.get("offset")
+            if type(closed) is not bool or type(written) is not int:
+                raise LambdaMicroVMProtocolError("Lambda MicroVM forward write is malformed.")
+            if closed:
+                return
+            if written != offset + len(data):
+                raise LambdaMicroVMProtocolError("Lambda MicroVM forward offset is inconsistent.")
+            offset = written
+            if not data:
+                return
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            tasks = tuple(self._connections)
+            if self._accepting is not None:
+                tasks = (self._accepting, *tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            response = await self._call("close_forward")
+            if response.get("closed") is not True:
+                raise LambdaMicroVMProtocolError(
+                    "Lambda MicroVM did not confirm the forward closed."
+                )
+            self._closed = True
+
+    async def _call(self, method_name: str, **kwargs: Any) -> Mapping[str, Any]:
+        return await self._runner._idempotent_owner_call(
+            method_name, forward_id=self.forward_id, **kwargs
+        )
 
 
 class _LambdaMicroVMCommandHandle:

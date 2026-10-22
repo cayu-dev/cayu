@@ -65,6 +65,22 @@ class _Grant:
     responses: set[Any] = field(default_factory=set)
 
 
+def _require_gateway_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Gateway URLs require a fixed HTTP(S) origin and path without credentials."
+        )
+    return value
+
+
 class ExternalAgentGateway:
     """Application-owned HTTP gateway. The caller owns the HTTP client lifetime.
 
@@ -94,18 +110,7 @@ class ExternalAgentGateway:
             ):
                 raise ValueError("External model routes support only Messages and Responses paths.")
         for value in (public_base_url, *(route.base_url for route in self.routes.values())):
-            parsed = urlsplit(value)
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.netloc
-                or parsed.username
-                or parsed.password
-                or parsed.query
-                or parsed.fragment
-            ):
-                raise ValueError(
-                    "Gateway URLs require a fixed HTTP(S) origin and path without credentials."
-                )
+            _require_gateway_url(value)
         self.router = APIRouter()
         self.router.add_api_route(
             "/models/{route}/{path:path}", self.model_request, methods=["POST"]
@@ -120,9 +125,21 @@ class ExternalAgentGateway:
         route: str,
         models: frozenset[str],
         tools: CallableToolEndpoint | None = None,
+        public_base_url: str | None = None,
     ) -> AsyncIterator[ExternalAgentCapability]:
+        """Issue one run's bearer capability, revoked when the block exits.
+
+        ``public_base_url`` replaces the gateway's base URL in this capability's
+        URLs. Use it when the guest reaches the gateway at a different address,
+        such as ``runner_port_forward(...).guest_url``.
+        """
         if route not in self.routes or not models:
             raise ValueError("A grant requires an existing route and explicit models.")
+        base_url = (
+            self.public_base_url
+            if public_base_url is None
+            else _require_gateway_url(public_base_url).rstrip("/")
+        )
         context.execution_deadline.require_admission("external gateway grant")
         if context.check_budget is not None and context.record_model_usage is None:
             raise ValueError("Budgeted gateway grants require authoritative usage recording.")
@@ -136,9 +153,7 @@ class ExternalAgentGateway:
         )
         self.grants[token] = grant
         try:
-            yield ExternalAgentCapability(
-                token, f"{self.public_base_url}/models/{route}", f"{self.public_base_url}/mcp"
-            )
+            yield ExternalAgentCapability(token, f"{base_url}/models/{route}", f"{base_url}/mcp")
         finally:
             self.grants.pop(token, None)
 
