@@ -52,6 +52,10 @@ _MODEL_CREDENTIAL_KEYS = frozenset(
 def _validated_guest_environment(environment: Mapping[str, str]) -> dict[str, str]:
     if _MODEL_CREDENTIAL_KEYS.intersection(environment):
         raise ValueError("Model credentials must stay in the service proxy.")
+    return _validated_environment(environment)
+
+
+def _validated_environment(environment: Mapping[str, str]) -> dict[str, str]:
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in environment):
         raise ValueError("External environment keys must be portable variable names.")
     if any(type(value) is not str for value in environment.values()):
@@ -494,6 +498,10 @@ async def runner_port_forward(
         await close_external_guest(forward.close)
 
 
+# Applied to every Codex run, with or without a model proxy.
+CODEX_RUN_OVERRIDES = ("project_doc_max_bytes=0", 'web_search="disabled"')
+
+
 def codex_proxy_overrides(base_url: str) -> tuple[str, ...]:
     """A credential-free custom provider, backed by an authenticating service proxy."""
     if not base_url.startswith(("http://", "https://")):
@@ -505,6 +513,5 @@ def codex_proxy_overrides(base_url: str) -> tuple[str, ...]:
         'model_providers.cayu.wire_api="responses"',
         "model_providers.cayu.requires_openai_auth=false",
         'model_providers.cayu.env_key="CAYU_MODEL_PROXY_TOKEN"',
-        "project_doc_max_bytes=0",
-        'web_search="disabled"',
+        *CODEX_RUN_OVERRIDES,
     )

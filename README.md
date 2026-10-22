@@ -14,6 +14,7 @@ before each model call, and multi-agent collaboration.
 | Spend caps | `BudgetLimit` per request and `BudgetPolicy` per app (`cayu.budgets`), checked before each model call |
 | Timers and background work | `TaskStore` workers and `TaskSchedulePolicy` for scheduled follow-ups (`cayu.tasks`) |
 | Multi-agent collaboration | `SubagentTool` (`cayu.tools`), forks, and participants with durable requests (`cayu.collaboration`) |
+| Claude Code or Codex runs | `run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` (`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`), recorded as sessions with usage and deadlines; see `cayu guide external-agents` |
 
 Cayu is Python only and is not a graph DSL: agents, tools and workflows are
 ordinary Python. It is not only a hosted service: run it on your own

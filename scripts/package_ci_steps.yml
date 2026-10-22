@@ -464,6 +464,23 @@ steps:
         OPENROUTER_ROUTER_METADATA
       "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
       "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
+  - name: Check built-wheel external-agent adapter with the newest allowed Claude Agent SDK
+    groups: coding
+    run: |
+      external_root="$(mktemp -d "$RUNNER_TEMP/external-agents.XXXXXX")"
+      uv venv --python 3.11 "$external_root/venv"
+      for wheel_path in dist/first/*.whl; do
+        uv pip install --python "$external_root/venv/bin/python" \
+          "${wheel_path}[claude-agent-sdk]" pytest
+      done
+      cp tests/core/test_external_local_launch.py "$external_root/"
+      cd "$external_root"
+      unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY \
+        CLAUDE_CODE_OAUTH_TOKEN
+      venv/bin/python -c \
+        'import claude_agent_sdk; print("claude-agent-sdk", claude_agent_sdk.__version__)'
+      CAYU_REQUIRE_CLAUDE_AGENT_SDK=1 \
+        venv/bin/python -m pytest -q -p no:cacheprovider test_external_local_launch.py
   - name: Check built-wheel generated Docker coding contract
     groups: docker
     run: |

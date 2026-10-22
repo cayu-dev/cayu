@@ -65,7 +65,7 @@ only when the requested behavior requires it.
 | A task done only when an independent check accepts it | `WorkContract`, `VerifiedTaskWorker`, completion verifier, result resolver | `cayu guide verified-work` |
 | Deterministic orchestration | workflow helpers and runtime hooks | `cayu guide references#workflows-hooks` |
 | Delegated model work | subagent tools and child-session policy | `cayu guide references#subagents` |
-| Run Claude Code or Codex as a whole agent, visible in Cayu | `cayu[claude-agent-sdk]`, `cayu[codex]`, `run_external_agent`, `docker_agent_launch` | `cayu guide external-agents` |
+| Run Claude Code or Codex as a whole agent, visible in Cayu | `cayu[claude-agent-sdk]`, `cayu[codex]`, `run_external_agent`, a launcher such as `local_agent_launch` (no sandbox) or `docker_agent_launch` | `cayu guide external-agents` |
 | Behavioral regression proof | `EvalSuite`, runtime assertions, replay | `cayu guide references#evals` |
 | Usage limits or cost control | usage events, run limits, budgets, pricing | `cayu guide references#cost-control` |
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |

@@ -52,7 +52,7 @@ _GUIDES = {
     ),
     "external-agents": (
         "external-agents.md",
-        "Claude Code and Codex as Cayu sessions: tokens, cost, deadlines, secret scrubbing.",
+        "Run Claude Code or Codex as Cayu sessions; Docker and a gateway are optional.",
     ),
     "human-attention": (
         "human-attention.md",

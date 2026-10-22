@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -960,16 +962,18 @@ def test_external_agents_guide_example_records_a_scrubbed_priced_session(
 
     assert main(["guide", "external-agents"]) == 0
     guide = capsys.readouterr().out
-    quick_start, rest = guide.split("## Launchers", 1)
+    opening, rest = guide.split("## Launchers", 1)
+    local, production = opening.split("## Production setup", 1)
     launchers = rest.split("## Reference", 1)[0]
     for extra in ("cayu[server,claude-agent-sdk]", "cayu[server,codex]"):
-        assert extra in quick_start
-    for name in ("docker_agent_launch", "ExternalAgentLaunch", "Docker"):
+        assert extra in production
+    for name in ("local_agent_launch", "docker_agent_launch", "ExternalAgentLaunch", "Docker"):
         assert name in launchers
-    example, codex = re.findall(r"```python\n(.*?)```", quick_start, re.DOTALL)
+    example, codex = re.findall(r"```python\n(.*?)```", production, re.DOTALL)
+    _, local_codex = re.findall(r"```python\n(.*?)```", local, re.DOTALL)
 
-    # The Codex snippet is not executed, so check its imports.
-    for snippet in (codex,):
+    # The Codex snippets are not executed, so check their imports.
+    for snippet in (codex, local_codex):
         compile(snippet, "external-agents", "exec")
         for module, names in re.findall(r"^from (cayu[\w.]*) import (.+)$", snippet, re.M):
             for name in names.split(","):
@@ -1021,6 +1025,41 @@ def test_external_agents_guide_example_records_a_scrubbed_priced_session(
     for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
         assert main(["guide", reference]) == 0, reference
         capsys.readouterr()
+
+
+def test_external_agents_guide_local_example_runs_without_docker_or_a_gateway(
+    capsys, tmp_path, monkeypatch
+) -> None:
+    """The quick start runs with the installed SDK, a stand-in `claude` and no gateway."""
+    if os.name != "posix":
+        pytest.skip("local_agent_launch is POSIX only")
+    pytest.importorskip("claude_agent_sdk")
+    from tests.core.test_external_local_launch import _FAKE_CLAUDE
+
+    assert main(["guide", "external-agents"]) == 0
+    guide = capsys.readouterr().out
+    needs, local = guide.split("## Production setup", 1)[0].split("## Quick start", 1)
+    assert "Optional:" in needs and "Without the gateway:" in needs
+    assert "not a sandbox" in local
+    example = re.findall(r"```python\n(.*?)```", local, re.DOTALL)[0]
+    assert "Gateway" not in example and "docker" not in example.lower()
+
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    claude = bin_directory / "claude"
+    claude.write_text(f"#!{sys.executable}\n{_FAKE_CLAUDE}", encoding="utf-8")
+    claude.chmod(0o700)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_directory}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.chdir(checkout)
+    namespace: dict[str, Any] = {"__name__": "external_agents_local_guide"}
+    exec(compile(example, "external-agents", "exec"), namespace)
+    asyncio.run(namespace["main"]())
+    printed = capsys.readouterr().out
+    assert "No problems found." in printed
+    assert "120 input and 30 output tokens" in printed
+    assert (checkout / "sessions.db").exists()
 
 
 def test_external_agents_guide_is_indexed_and_its_extras_are_listed(capsys) -> None:

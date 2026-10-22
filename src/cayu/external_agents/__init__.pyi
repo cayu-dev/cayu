@@ -13,6 +13,7 @@ from cayu.external_agents.environment import codex_proxy_overrides as codex_prox
 from cayu.external_agents.environment import docker_agent_launch as docker_agent_launch
 from cayu.external_agents.environment import runner_agent_launch as runner_agent_launch
 from cayu.external_agents.environment import runner_port_forward as runner_port_forward
+from cayu.external_agents.local import local_agent_launch as local_agent_launch
 from cayu.external_agents.recording import ExternalAgentRecorder as ExternalAgentRecorder
 from cayu.external_agents.recording import run_external_agent as run_external_agent
 from cayu.external_agents.recovery import recover_external_agent_run as recover_external_agent_run

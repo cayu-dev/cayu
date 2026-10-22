@@ -19,6 +19,7 @@ from cayu.external_agents.base import (
     ExternalAgentLaunch,
 )
 from cayu.external_agents.environment import (
+    CODEX_RUN_OVERRIDES,
     codex_proxy_overrides,
     join_cleanup,
     scrub_external_environment,
@@ -33,17 +34,23 @@ class CodexAgentAdapter:
         self,
         *,
         model: str,
-        base_url: str,
         launch: Callable[[ExternalAgentContext], AbstractAsyncContextManager[ExternalAgentLaunch]],
+        base_url: str | None = None,
         effort: str | None = None,
         sandbox: str = "read-only",
         config_overrides: tuple[str, ...] = (),
     ) -> None:
+        """``base_url`` routes model calls through a Cayu gateway capability.
+
+        Without it Codex uses its own provider configuration and credentials,
+        for example an existing login with ``local_agent_launch``.
+        """
         self.model = model
         self.launch = launch
         self.effort = effort
         self.sandbox = sandbox
-        self.overrides = (*codex_proxy_overrides(base_url), *config_overrides)
+        provider = CODEX_RUN_OVERRIDES if base_url is None else codex_proxy_overrides(base_url)
+        self.overrides = (*provider, *config_overrides)
 
     async def stream(self, context: ExternalAgentContext) -> AsyncGenerator[ExternalAgentEvent]:
         try:

@@ -123,7 +123,8 @@ _ACT_ONCE_GUIDANCE_MARKERS = {
 # release must keep the summary, classifiers, keywords and links that describe it.
 _PUBLICATION_SUMMARY = (
     "Python runtime for long-running agents: durable sessions that survive restarts, "
-    "human approval before side effects, spend caps, and multi-agent collaboration."
+    "human approval before side effects, spend caps, multi-agent collaboration, "
+    "and Claude Code or Codex runs recorded as sessions."
 )
 _PUBLICATION_CLASSIFIERS = (
     "Framework :: AsyncIO",
@@ -151,6 +152,9 @@ _PUBLICATION_KEYWORDS = (
     "spend-limits",
     "multi-agent",
     "workflow",
+    "claude-code",
+    "codex",
+    "coding-agents",
 )
 _PUBLICATION_PROJECT_URLS = {
     "Homepage": "https://cayu.dev",

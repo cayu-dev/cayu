@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cayu"
 version = "0.13.0"
-description = "Python runtime for long-running agents: durable sessions that survive restarts, human approval before side effects, spend caps, and multi-agent collaboration."
+description = "Python runtime for long-running agents: durable sessions that survive restarts, human approval before side effects, spend caps, multi-agent collaboration, and Claude Code or Codex runs recorded as sessions."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -24,6 +24,9 @@ keywords = [
   "spend-limits",
   "multi-agent",
   "workflow",
+  "claude-code",
+  "codex",
+  "coding-agents",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -53,7 +56,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-claude-agent-sdk = ["claude-agent-sdk==0.2.168"]
+claude-agent-sdk = ["claude-agent-sdk>=0.2.168,<0.3"]
 codex = ["openai-codex==0.163.0"]
 dev = [
   # Exercises the bounded Brotli decoder in egress; not a runtime dependency.

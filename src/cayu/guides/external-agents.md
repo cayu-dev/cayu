@@ -10,7 +10,152 @@ If you want Cayu to run the model loop, tools and recovery itself, build a norma
 Cayu agent instead (`cayu guide authoring`). These adapters are separate from
 `ModelProvider`, which is one model step.
 
-## Quick start
+## What you need
+
+Required:
+
+- The vendor SDK, `cayu[claude-agent-sdk]` or `cayu[codex]`, and the vendor's CLI.
+- A `CayuApp` with a task store. Use SQLite or Postgres stores to inspect runs
+  after the process exits.
+- A finite `execution_deadline` on the `RunRequest`.
+- A launcher. It starts the CLI for one run and, when the run ends, stops it and
+  everything it started. Cayu ships three, and you can [write your
+  own](#write-your-own-launcher):
+
+| Launcher | Where the CLI runs | Needs |
+| --- | --- | --- |
+| `local_agent_launch` | On this host, as the current user. Not a sandbox: use it for trusted code and tests. | Nothing else |
+| `docker_agent_launch` | In a container on an internal Docker network | Docker, an image with the CLI, an internal network |
+| `runner_agent_launch` | In a runner that can open interactive processes, such as `LambdaMicroVMRunner` | That runner |
+
+Optional:
+
+- The credential gateway, `ExternalAgentGateway` in `cayu.external_agents.server`
+  (needs `cayu[server]`). The CLI sends its model calls to the gateway, which adds
+  the service's API key, records each call and refuses calls once a USD cap is
+  reached.
+- A sandbox. The launcher alone decides where the CLI and its built-in tools run.
+
+Without the gateway:
+
+- The CLI uses its own model credentials: its existing login, or an API key you
+  pass in the launcher's `environment`. In a sandbox, the CLI and the tools it
+  runs can read that key.
+- Cayu records the usage the SDK reports. It checks USD caps after each reported
+  model call and before each tool approval, but it can't refuse a model call
+  before the CLI makes it. A call the SDK never reports, for example after a
+  crash, is recorded as unknown usage.
+- The CLI can reach whatever network its launcher allows.
+- Native Cayu tools over MCP (`external_tool_scope`) need the gateway, which
+  serves their MCP endpoint. Approving the CLI's built-in tools through Cayu
+  policies (`CayuToolBridge.authorize`) works without it.
+
+With or without the gateway, every run gets a Cayu session and task, recorded
+events and usage, the deadline, tool authorization through `authorize`, and secret
+scrubbing in what Cayu stores.
+
+## Quick start without Docker or a gateway
+
+This example runs the `claude` CLI on your machine with your Claude Code login and
+records the run in SQLite. `local_agent_launch` is not a sandbox. Claude Code and
+the tools it runs can read and change anything your user can, and reach any
+network. Use it for trusted code, local development and tests. For untrusted
+repositories or production, use a sandboxed launcher, as in the
+[production setup](#production-setup-docker-and-the-gateway).
+
+```bash
+pip install 'cayu[claude-agent-sdk]'
+```
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from cayu import CayuApp, Message, RunRequest
+from cayu.deadlines import ExecutionDeadline
+from cayu.external_agents import ClaudeAgentAdapter, local_agent_launch, run_external_agent
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
+
+CHECKOUT = Path.cwd()  # The directory Claude Code starts in.
+
+
+@asynccontextmanager
+async def launch(context):
+    # Runs the `claude` on PATH as you, with your login. Not a sandbox.
+    async with local_agent_launch(cli="claude", cwd=CHECKOUT) as prepared:
+        yield prepared
+
+
+async def allow_reads(name, arguments, call_id):
+    return name in {"Read", "Grep", "Glob"}  # Without a callback every tool call is denied.
+
+
+async def main():
+    app = CayuApp(
+        session_store=SQLiteSessionStore("sessions.db"),
+        task_store=SQLiteTaskStore("tasks.db"),
+    )
+    prompt = "Review the code in the current directory and list the three riskiest problems."
+    try:
+        result = await run_external_agent(
+            app,
+            RunRequest(
+                agent_name="claude-local",
+                messages=[Message.text("user", prompt)],
+                execution_deadline=ExecutionDeadline.after(600),  # Required. Ten minutes.
+            ),
+            ClaudeAgentAdapter(model="claude-sonnet-5-5", launch=launch),
+            prompt=prompt,
+            authorize=allow_reads,
+        )
+        usage = await app.get_session_usage(result.session_id)
+        print(result.output)
+        print(
+            f"session {result.session_id}: {usage.usage.input_tokens} input and "
+            f"{usage.usage.output_tokens} output tokens"
+        )
+    finally:
+        await app.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+`cayu session usage SESSION_ID --sqlite sessions.db` shows the run's model calls
+after the script exits. Use a `claude` CLI version that the installed
+`claude-agent-sdk` supports.
+
+`local_agent_launch` gives the CLI `PATH`, `HOME` and the locale settings of this
+process, so a CLI that is already logged in keeps using its login. No other host
+variable reaches it. Pass more with `environment=`, for example
+`{"ANTHROPIC_API_KEY": key}`. Values of variables whose names contain `KEY`,
+`TOKEN` or `AUTHORIZATION` are scrubbed from what Cayu stores. When the run ends,
+the launcher kills the CLI's process group and waits until it is empty. A process
+that starts its own session leaves that group and is not stopped.
+
+For Codex, run the `codex` CLI and leave out `base_url`, so Codex uses its own
+login and provider settings:
+
+```python
+from cayu.external_agents import CodexAgentAdapter
+
+
+@asynccontextmanager
+async def launch_codex(context):
+    async with local_agent_launch(cli="codex", cwd=CHECKOUT) as prepared:
+        yield prepared
+
+
+adapter = CodexAgentAdapter(model="gpt-6-sol", launch=launch_codex)
+```
+
+Codex asks `authorize` about `codex_command` and `codex_file_change` requests. Its
+default `sandbox="read-only"` keeps Codex's own sandbox for the commands it runs,
+where the host supports one.
+
+## Production setup: Docker and the gateway
 
 Install Cayu with the server extra and the vendor SDK you use:
 
@@ -19,9 +164,10 @@ pip install 'cayu[server,claude-agent-sdk]'   # Claude Code
 pip install 'cayu[server,codex]'              # Codex
 ```
 
-The example below runs Claude Code on a checkout. Before running it you need:
+The example below runs Claude Code in a container that can reach only the Cayu
+gateway. Before running it you need:
 
-- Docker. The shipped launcher starts the CLI in a container (see
+- Docker. `docker_agent_launch` starts the CLI in a container (see
   [Launchers](#launchers)). The example assumes a Linux host.
 - An internal Docker network, created with
   `docker network create --internal --subnet 172.30.0.0/24 --gateway 172.30.0.1 agent-internal`.
@@ -205,11 +351,13 @@ adapter = CodexAgentAdapter(
 
 ## Launchers
 
-A launcher starts the vendor CLI somewhere isolated and stops it again. It is an
-async context manager that takes the run's `ExternalAgentContext` and yields an
+A launcher starts the vendor CLI for one run and stops it again. It is an async
+context manager that takes the run's `ExternalAgentContext` and yields an
 `ExternalAgentLaunch`. Pass it to either adapter as `launch=`.
 
-Cayu ships `docker_agent_launch` and `runner_agent_launch`. The Docker launcher
+Cayu ships `local_agent_launch`, `docker_agent_launch` and `runner_agent_launch`.
+The local launcher runs the CLI on the host without a sandbox, as in the
+[quick start](#quick-start-without-docker-or-a-gateway). The Docker launcher
 starts one container per run on an existing `--internal` network (it refuses
 `host`, `bridge` and `default`), mounts only the checkout, runs the CLI as the
 checkout's owner, and removes the container when the run ends.
@@ -230,8 +378,8 @@ The rest of this guide is the detailed contract.
 
 `cayu.external_agents` exports a vendor-neutral `ExternalAgentAdapter` protocol,
 `ExternalAgentEvent`, `ExternalAgentRecorder`, `run_external_agent`,
-`ClaudeAgentAdapter`, `CodexAgentAdapter`, the Docker launcher, and the native tool
-bridge. SDK imports happen only when an adapter starts. The HTTP gateway lives in
+`ClaudeAgentAdapter`, `CodexAgentAdapter`, the local, Docker and runner launchers,
+and the native tool bridge. SDK imports happen only when an adapter starts. The HTTP gateway lives in
 `cayu.external_agents.server` and requires the server extra.
 
 ## Sessions, tasks and deadlines
@@ -348,8 +496,9 @@ Limits with
 
 ## Sandbox and credential gateway
 
-The whole CLI must run in a sandbox because its built-in tools run beside it.
-The SDK client stays in the service and talks to the CLI over tunneled stdio.
+To contain the CLI, run the whole CLI in a sandbox, because its built-in tools
+run beside it. `local_agent_launch` does not do this. The SDK client stays in the
+service and talks to the CLI over tunneled stdio.
 For Codex inside an isolated container, select `sandbox="external"` so its
 app-server uses that existing boundary instead of starting a nested bubblewrap
 sandbox. Native approval callbacks still apply. Set `workspace_read_only=True`
@@ -369,8 +518,10 @@ communication. Treat Docker access as privileged service authority.
 The image must contain the exact SDK-compatible CLI at the configured absolute
 path, plus the tools needed by the workload. Do not mount a host home, Docker
 socket, credentials or shared repository mirrors. The launcher's environment is
-explicit, and both adapters blank inherited host variables. Guest API keys and
-subscription tokens are refused. A custom launcher must provide the same isolation
+explicit, and both adapters blank inherited host variables. The Docker and runner
+launchers refuse guest API keys and subscription tokens; `local_agent_launch`
+accepts them, because there is no guest boundary to keep them behind. A custom
+sandbox launcher must provide the same isolation
 and process-tree cleanup contract through `ExternalAgentLaunch.close`.
 
 The gateway forwards only configured paths and models, refuses redirects, adds
@@ -389,8 +540,8 @@ the trusted route configuration. Codex hosted web search is disabled. Guest
 capability values travel through the launcher's environment, not host command
 arguments.
 
-The [quick start](#quick-start) shows the gateway and the Docker launcher wired
-together, including the uvicorn server that mounts `gateway.router` on the
+The [production setup](#production-setup-docker-and-the-gateway) shows the
+gateway and the Docker launcher wired together, including the uvicorn server that mounts `gateway.router` on the
 internal network's host address.
 
 For Codex, pass the fixed capability route base URL to `CodexAgentAdapter` and put
@@ -407,7 +558,8 @@ and [Codex app-server documentation](https://developers.openai.com/codex/app-ser
 A launcher is an async context manager that receives the run's
 `ExternalAgentContext` and yields an `ExternalAgentLaunch`; pass it to an adapter as
 `launch=`. `docker_agent_launch` is one launcher. Where there is no Docker daemon,
-use `runner_agent_launch` or write your own.
+use `runner_agent_launch`, `local_agent_launch` for trusted code and tests, or
+write your own.
 
 ### Run the CLI in a Cayu runner
 

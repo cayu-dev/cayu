@@ -39,6 +39,12 @@ CAYU_CAPABILITIES = (
         "`SubagentTool` (`cayu.tools`), forks, and participants with durable requests "
         "(`cayu.collaboration`)",
     ),
+    (
+        "Claude Code or Codex runs",
+        "`run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` "
+        "(`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`), "
+        "recorded as sessions with usage and deadlines; see `cayu guide external-agents`",
+    ),
 )
 
 CAYU_IS_NOT = (

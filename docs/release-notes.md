@@ -42,6 +42,18 @@ unchanged.
   `codex_config_overrides` for settings that name the guest address. The
   external-agents guide shows the setup and what a leaked run token can and
   cannot do.
+- Run Claude Code or Codex as Cayu sessions without Docker or a credential
+  gateway. `local_agent_launch` (`cayu.external_agents`) starts the vendor CLI
+  on the host as the current user, for trusted code and tests. It is not a
+  sandbox. `CodexAgentAdapter` no longer requires `base_url`; without it, Codex
+  uses its own login and provider settings. The external-agents guide now opens
+  with what a run needs (the SDK, a launcher, a task store and a deadline), what
+  is optional (the gateway and a sandbox), what you give up without the gateway,
+  and a local quick start. `cayu[claude-agent-sdk]` now accepts
+  `claude-agent-sdk>=0.2.168,<0.3` instead of exactly 0.2.168, so the current
+  0.2.170 installs, and package CI runs the adapter against the newest SDK the
+  extra allows. The README, the `cayu guide` index and the package description
+  now point to these runs.
 - The gateway accepts the requests the pinned vendor CLIs send for current models:
   Claude Code's system-role messages carrying inline text and an effort setting,
   and Codex's client-tool declarations as an input item with a reasoning context.
