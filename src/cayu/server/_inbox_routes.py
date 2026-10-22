@@ -33,7 +33,7 @@ from cayu.approvals.user_input import (
 from cayu.events import EventType
 from cayu.knowledge.activation_contracts import KnowledgeActivationConflict
 from cayu.knowledge.records import KnowledgeRevisionConflict, KnowledgeStatus
-from cayu.knowledge.search import encode_knowledge_list_cursor
+from cayu.knowledge.search import decode_knowledge_list_cursor, encode_knowledge_list_cursor
 from cayu.runtime._approval_support import approval_resolution_request_digest
 from cayu.runtime.human_attention import (
     AttentionKind,
@@ -43,7 +43,7 @@ from cayu.runtime.human_attention import (
     observe_human_attention,
 )
 from cayu.server._inbox_access import PENDING_KINDS, InboxAccessGate
-from cayu.server._inbox_cursor import KnowledgeInboxCursor
+from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server.contracts import ApiErrorResponse
 from cayu.server.inbox import (
     INBOX_DECISIONS,
@@ -88,6 +88,7 @@ if TYPE_CHECKING:
 _ITEM_ID_PREFIX = "inbox_"
 _CURSOR_PREFIX = "inboxcursor_"
 _LOCATOR_VERSION = 1
+_SEALED = "sealed"
 _ITEM_ID_PATTERN = r"^inbox_[A-Za-z0-9_-]{1,8192}$"
 _KIND_CODES: dict[InboxItemKind, str] = {
     "approval": "a",
@@ -209,23 +210,40 @@ def _decode_item_id(value: str) -> _SessionLocator | _KnowledgeLocator | None:
     return None
 
 
-def _encode_cursor(phase: Literal["actions", "knowledge"], after: str | None) -> str:
-    return _encode(_CURSOR_PREFIX, [_LOCATOR_VERSION, phase, after])
+_Phase = Literal["actions", "knowledge"]
 
 
-def _decode_cursor(value: str) -> tuple[Literal["actions", "knowledge"], str | None]:
+def _encode_cursor(phase: _Phase, after: str | None, *, sealed: bool = False) -> str:
+    """A plain position, or with ``sealed`` one only this server's key can open."""
+
+    return _encode(
+        _CURSOR_PREFIX, [_LOCATOR_VERSION, phase, after, *((_SEALED,) if sealed else ())]
+    )
+
+
+def _decode_cursor(value: str) -> tuple[_Phase, str | None, bool]:
+    """The phase, its position and whether that position is sealed."""
+
     document = _decode(_CURSOR_PREFIX, value)
-    if document is not None and len(document) == 3:
+    if document is not None and len(document) == 4 and document[3] == _SEALED:
         phase, after = document[1], document[2]
-        if phase == "knowledge" and (after is None or type(after) is str):
-            return "knowledge", after
-        if phase == "actions" and type(after) is str:
-            try:
+        # A decoded document can hold any JSON value, so check the type before
+        # set membership: a list phase is unhashable.
+        if type(phase) is str and phase in {"actions", "knowledge"} and type(after) is str:
+            return cast("_Phase", phase), after, True
+    elif document is not None and len(document) == 3:
+        phase, after = document[1], document[2]
+        try:
+            if phase == "knowledge" and after is None:
+                return "knowledge", None, False
+            if phase == "knowledge" and type(after) is str:
+                decode_knowledge_list_cursor(after)
+                return "knowledge", after, False
+            if phase == "actions" and type(after) is str:
                 decode_session_cursor(after)
-            except ValueError:
-                pass
-            else:
-                return "actions", after
+                return "actions", after, False
+        except ValueError:
+            pass
     raise HTTPException(
         status_code=422,
         detail="Invalid or expired inbox cursor. Restart the inbox listing.",
@@ -400,7 +418,7 @@ def register_inbox_routes(
     continuation_loop_policies: Callable[[str], Awaitable[tuple[LoopPolicy, ...]]],
     optional_auth_context: Depends,
     inbox_gate: InboxAccessGate,
-    inbox_cursor_key: bytes | None = None,
+    inbox_cursor: InboxCursorSeal,
 ) -> None:
     """Register the inbox list, read and settle routes."""
 
@@ -412,7 +430,6 @@ def register_inbox_routes(
     )
 
     inbox_auth_context = cast("AuthContext | None", optional_auth_context)
-    knowledge_cursor = KnowledgeInboxCursor(inbox_cursor_key)
 
     def pending_item(kind: InboxItemKind, action: PendingActionRecord) -> InboxItem:
         assert action.attention_id is not None
@@ -854,17 +871,27 @@ def register_inbox_routes(
 
     # ── Listing ──────────────────────────────────────────────────────────────
 
+    def principal(auth_context: AuthContext | None) -> dict[str, str | None]:
+        return {
+            "subject": None if auth_context is None else auth_context.subject,
+            "tenant": None if auth_context is None else auth_context.tenant,
+        }
+
     async def session_items(
-        auth_context: AuthContext | None, after: str | None, limit: int
-    ) -> tuple[list[InboxItem], list[InboxIssue], str | None, bool]:
-        """One page of session items: items, issues, the next store cursor, and
-        whether the page ended the session items.
+        auth_context: AuthContext | None, after: str | None, sealed: bool, limit: int
+    ) -> tuple[list[InboxItem], list[InboxIssue], str | None]:
+        """One page of session items: items, issues, and the cursor that continues
+        them, ``None`` once the page ended the session items.
 
         A caller the inbox access rule limits gets only items it may see, paged
         from its own items, and none of the store's issues, which name sessions it
-        can't see.
+        can't see. When its scan ends among other people's items, the cursor seals
+        that position, so it can keep paging without learning where they are.
         """
 
+        if sealed:
+            assert after is not None
+            after = inbox_cursor.open("actions", after, principal(auth_context))
         try:
             if inbox_gate.applies(auth_context):
                 permitted = await inbox_gate.scan_pending(
@@ -875,22 +902,21 @@ def register_inbox_routes(
                     for action in permitted.actions
                     if (kind := _listed_kind(action)) is not None
                 ]
-                issues = (
-                    [
-                        InboxIssue(
-                            code="inbox_truncated",
-                            detail=(
-                                "Too many pending items you may not see came first to look "
-                                "further. Settle these, or ask an operator to review the "
-                                "Developer dashboard."
-                            ),
-                        )
-                    ]
-                    if permitted.truncated
-                    else []
-                )
-                done = permitted.next_cursor is None
-                return items, issues, permitted.next_cursor, done
+                if permitted.next_cursor is not None:
+                    next_cursor = _encode_cursor(
+                        "actions", _serialize_session_cursor(cayu_app, permitted.next_cursor)
+                    )
+                elif permitted.hidden_after is not None:
+                    next_cursor = _encode_cursor(
+                        "actions",
+                        inbox_cursor.seal(
+                            "actions", permitted.hidden_after, principal(auth_context)
+                        ),
+                        sealed=True,
+                    )
+                else:
+                    next_cursor = None
+                return items, [], next_cursor
             page = await session_store.query_pending_actions(
                 PendingActionQuery(cursor=after, limit=limit)
             )
@@ -912,18 +938,31 @@ def register_inbox_routes(
             )
             for issue in page.issues
         ]
-        return items, issues, page.next_cursor if page.has_more else None, not page.has_more
+        next_cursor = (
+            _encode_cursor("actions", _serialize_session_cursor(cayu_app, page.next_cursor))
+            if page.has_more and page.next_cursor is not None
+            else None
+        )
+        return items, issues, next_cursor
 
     async def knowledge_items(
-        auth_context: AuthContext | None, limit: int, after: str | None = None
+        auth_context: AuthContext | None,
+        limit: int,
+        after: str | None = None,
+        sealed: bool = False,
     ) -> tuple[list[InboxItem], str | None]:
-        """Scan bounded store pages; encrypt even hidden positions for continuation."""
+        """Scan bounded store pages, continuing after hidden positions too.
+
+        A caller no access rule limits may see every proposal, so its cursor is a
+        plain position. A limited caller's cursor is sealed: it can name a hidden
+        proposal.
+        """
 
         assert knowledge_review_workflow is not None
         workflow = knowledge_review_workflow()
+        limited = inbox_gate.applies(auth_context)
         binding = {
-            "subject": None if auth_context is None else auth_context.subject,
-            "tenant": None if auth_context is None else auth_context.tenant,
+            **principal(auth_context),
             "query": {
                 "status": "pending",
                 "namespace": workflow.namespace,
@@ -931,7 +970,18 @@ def register_inbox_routes(
                 "scope": workflow.access_scope.model_dump(mode="json"),
             },
         }
-        position = None if after is None else knowledge_cursor.decode(after, binding)
+        position = after
+        if sealed:
+            assert after is not None
+            position = inbox_cursor.open("knowledge", after, binding)
+
+        def continuation(position: str) -> str:
+            if not limited:
+                return _encode_cursor("knowledge", position)
+            return _encode_cursor(
+                "knowledge", inbox_cursor.seal("knowledge", position, binding), sealed=True
+            )
+
         items: list[InboxItem] = []
         for _page in range(_KNOWLEDGE_SCAN_PAGES):
             listed = await workflow.list_pending(
@@ -947,10 +997,8 @@ def register_inbox_routes(
                 if await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(entry)):
                     items.append(_knowledge_item(entry, cayu_app))
                 if len(items) == limit:
-                    continuation = more or index + 1 < len(listed.entries)
-                    return items, knowledge_cursor.encode(
-                        position, binding
-                    ) if continuation else None
+                    more = more or index + 1 < len(listed.entries)
+                    return items, continuation(position) if more else None
             if not more:
                 return items, None
             if not listed.entries:
@@ -962,7 +1010,7 @@ def register_inbox_routes(
                     headers=_NO_STORE,
                 )
         assert position is not None
-        return items, knowledge_cursor.encode(position, binding)
+        return items, continuation(position)
 
     # ── Routes ───────────────────────────────────────────────────────────────
 
@@ -1013,32 +1061,23 @@ def register_inbox_routes(
         auth_context: AuthContext | None = inbox_auth_context,
     ) -> InboxPage:
         response.headers.update(_NO_STORE)
-        phase, after = ("actions", None) if cursor is None else _decode_cursor(cursor)
+        phase, after, sealed = (
+            ("actions", None, False) if cursor is None else _decode_cursor(cursor)
+        )
         knowledge = knowledge_review_workflow is not None
         if phase == "knowledge":
             if not knowledge:
                 return InboxPage(items=[], next_cursor=None, has_more=False)
-            items, knowledge_after = await knowledge_items(auth_context, limit, after)
-            next_cursor = (
-                None if knowledge_after is None else _encode_cursor("knowledge", knowledge_after)
-            )
+            items, next_cursor = await knowledge_items(auth_context, limit, after, sealed)
             return InboxPage(items=items, next_cursor=next_cursor, has_more=next_cursor is not None)
-        items, issues, store_after, done = await session_items(auth_context, after, limit)
-        if not done:
-            assert store_after is not None
-            next_cursor = _encode_cursor(
-                "actions", _serialize_session_cursor(cayu_app, store_after)
-            )
-        elif knowledge and items:
-            # Proposals start a page of their own, so each of their pages holds `limit`.
-            next_cursor = _encode_cursor("knowledge", None)
-        else:
-            next_cursor = None
-            if knowledge:
-                proposals, knowledge_after = await knowledge_items(auth_context, limit)
+        items, issues, next_cursor = await session_items(auth_context, after, sealed, limit)
+        if next_cursor is None and knowledge:
+            if items:
+                # Proposals start a page of their own, so each of their pages holds `limit`.
+                next_cursor = _encode_cursor("knowledge", None)
+            else:
+                proposals, next_cursor = await knowledge_items(auth_context, limit)
                 items.extend(proposals)
-                if knowledge_after is not None:
-                    next_cursor = _encode_cursor("knowledge", knowledge_after)
         return InboxPage(
             items=items, next_cursor=next_cursor, has_more=next_cursor is not None, issues=issues
         )

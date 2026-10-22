@@ -17,6 +17,10 @@ export const CONTRACT_VERSION = "49"
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"])
 const ACTIVE_STATUSES = new Set(["pending", "running", "interrupting"])
 const TRUNCATION_ISSUES = new Set(["inbox_truncated", "knowledge_truncated"])
+// Answers to an inbox page cursor that cannot be followed any more.
+const CONTINUATION_REFUSALS = new Set([409, 422])
+// How often one inbox refresh starts over after such a refusal before it fails.
+const INBOX_MAX_RESTARTS = 1
 const TERMINAL_EVENT_TYPES = new Set(["session.completed", "session.failed", "session.interrupted"])
 const LIFECYCLE_EVENT_TYPES = new Set([
   ...TERMINAL_EVENT_TYPES,
@@ -543,10 +547,27 @@ function watchInbox(context, options) {
   // Something can start waiting on a person at any time, so the inbox watch never
   // stops as idle; it backs off while nothing changes and pauses while hidden.
   return startWatch(options, async (runner) => {
-    const inbox = { items: [], issues: [], complete: false }
+    let inbox = { items: [], issues: [], complete: false }
     let cursor = null
+    let restarts = 0
     for (let page = 0; page < DEFAULTS.inboxMaxPages; page += 1) {
-      const body = await runner.run((signal) => readInboxPage(context, cursor, undefined, signal))
+      let body
+      try {
+        body = await runner.run((signal) => readInboxPage(context, cursor, undefined, signal))
+      } catch (error) {
+        // A later page the server can no longer continue (for example it restarted
+        // and its cursor key changed) starts this refresh over from the first page,
+        // dropping what it read so one snapshot never holds an item twice. A second
+        // refusal means the server can't follow its own cursors (such as workers
+        // without a shared inbox_cursor_key), so the watch stops with that error.
+        if (cursor === null || !CONTINUATION_REFUSALS.has(error?.status)) throw error
+        if (restarts >= INBOX_MAX_RESTARTS) throw error
+        restarts += 1
+        inbox = { items: [], issues: [], complete: false }
+        cursor = null
+        page = -1
+        continue
+      }
       inbox.items.push(...body.items)
       inbox.issues.push(...body.issues)
       if (typeof body.next_cursor !== "string") {

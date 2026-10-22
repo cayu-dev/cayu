@@ -185,6 +185,7 @@ from cayu.server._http_json import (
     _PreparsedPrivateJsonBody,
 )
 from cayu.server._inbox_access import InboxAccessGate
+from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._memory_report_routes import register_memory_report_routes
@@ -1060,6 +1061,9 @@ _SUPERVISION_INBOX_KINDS: dict[SupervisionEventKind, InboxItemKind] = {
     SupervisionEventKind.RECOVER: "recovery",
 }
 _EVENT_PAGE_LIMIT_MAX = 1000
+# Marks a pending-actions cursor sealed to a caller an inbox access rule limits.
+# Plain session cursors are base64 JSON, so they never start with it.
+_SEALED_CURSOR_PREFIX = "sealed_"
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
 _ARTIFACT_PAGE_OFFSET_MAX = 10_000
@@ -4325,8 +4329,9 @@ def create_router(
             recovery item and knowledge proposal. It applies on every route that lists
             or settles them, not only the inbox routes. Without it, every caller the
             auth dependency admits may. It requires an auth dependency.
-        inbox_cursor_key: Deployment-owned 32-byte key shared by all workers for
-            encrypted knowledge inbox pagination. No ephemeral key is generated.
+        inbox_cursor_key: Optional deployment-owned 32-byte key, shared by all
+            workers, that seals the inbox and pending-action cursors of callers
+            ``inbox_access`` limits. Without it the router generates its own key.
     """
 
     if continuation_loop_policy_provider is not None and not callable(
@@ -4639,6 +4644,8 @@ def create_router(
     # One decision point for who may see and settle approvals, questions, recovery
     # items and knowledge proposals, on every route that lists or settles them.
     inbox_gate = InboxAccessGate(cayu_app, cayu_app._runtime_session_store, inbox_access)
+    # Seals the scan positions of callers that rule limits; see _inbox_cursor.
+    inbox_cursor = InboxCursorSeal(inbox_cursor_key)
 
     async def _require_settle_access(
         auth_context: AuthContext | None,
@@ -7112,7 +7119,30 @@ def create_router(
             environment_name, "environment_name"
         )
         requested_cursor = _clean_optional_query_value(cursor, "cursor")
-        if requested_cursor is not None:
+        # A limited caller's position among actions it may not see is sealed to
+        # the caller and these filters.
+        sealed_binding = {
+            "subject": None if auth_context is None else auth_context.subject,
+            "tenant": None if auth_context is None else auth_context.tenant,
+            "query": [
+                requested_session_id,
+                None if kind is None else kind.value,
+                requested_agent_name,
+                requested_environment_name,
+                search,
+            ],
+        }
+        if (
+            requested_cursor is not None
+            and requested_cursor.startswith(_SEALED_CURSOR_PREFIX)
+            and inbox_gate.applies(auth_context)
+        ):
+            requested_cursor = inbox_cursor.open(
+                "pending-actions",
+                requested_cursor.removeprefix(_SEALED_CURSOR_PREFIX),
+                sealed_binding,
+            )
+        elif requested_cursor is not None:
             try:
                 decode_session_cursor(requested_cursor)
             except ValueError as exc:
@@ -7126,13 +7156,18 @@ def create_router(
             cursor=requested_cursor,
             limit=limit,
         )
+        sealed_next_cursor: str | None = None
         try:
             if inbox_gate.applies(auth_context):
                 permitted = await inbox_gate.scan_pending(auth_context, query)
+                if permitted.hidden_after is not None:
+                    sealed_next_cursor = _SEALED_CURSOR_PREFIX + inbox_cursor.seal(
+                        "pending-actions", permitted.hidden_after, sealed_binding
+                    )
                 result = PendingActionListResult(
                     actions=permitted.actions,
                     next_cursor=permitted.next_cursor,
-                    has_more=permitted.next_cursor is not None or permitted.truncated,
+                    has_more=permitted.next_cursor is not None or sealed_next_cursor is not None,
                     total_count=None,
                     inspected_candidate_count=len(permitted.actions),
                 )
@@ -7167,7 +7202,8 @@ def create_router(
                 )
                 for issue in result.issues
             ],
-            "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
+            "next_cursor": sealed_next_cursor
+            or _serialize_session_cursor(cayu_app, result.next_cursor),
             "has_more": result.has_more,
             "total_count": result.total_count,
             "inspected_candidate_count": result.inspected_candidate_count,
@@ -9010,7 +9046,7 @@ def create_router(
         continuation_loop_policies=_continuation_loop_policies,
         optional_auth_context=optional_auth_context,
         inbox_gate=inbox_gate,
-        inbox_cursor_key=inbox_cursor_key,
+        inbox_cursor=inbox_cursor,
     )
 
     @router.get("/health", response_model=HealthResponse)

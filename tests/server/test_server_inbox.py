@@ -45,7 +45,7 @@ from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runtime import HumanAttentionReference, HumanAttentionRequest
 from cayu.runtime._event_projection import public_event_linkage_id
 from cayu.server import AuthContext, ServerConfig, create_server
-from cayu.server._inbox_routes import _event_reference
+from cayu.server._inbox_routes import _encode, _event_reference
 from cayu.server.inbox import InboxItemScope
 from cayu.sessions import InvocationOriginClaim, PendingActionQuery
 from cayu.sessions.event_queries import EventQuery
@@ -511,6 +511,20 @@ def test_inbox_requires_auth_and_an_access_rule_hides_items() -> None:
         assert client.get(f"/api/inbox/{forged}", headers=_as("priya")).status_code == 404
         assert client.get("/api/inbox/not-an-item", headers=_as("priya")).status_code == 422
         assert client.get("/api/inbox?cursor=junk", headers=_as("priya")).status_code == 422
+        # A well-formed envelope whose parts have the wrong JSON types is refused
+        # the same way, never a server error.
+        for document in (
+            [1, [], "x", "sealed"],
+            [1, {}, "x", "sealed"],
+            [1, "actions", ["x"], "sealed"],
+            [1, ["knowledge"], None],
+        ):
+            response = client.get(
+                "/api/inbox",
+                params={"cursor": _encode("inboxcursor_", document)},
+                headers=_as("priya"),
+            )
+            assert response.status_code == 422, (document, response.text)
 
     with pytest.raises(ValueError, match="inbox access rule"):
         create_server(
@@ -792,53 +806,193 @@ def test_revised_knowledge_proposal_is_a_new_item() -> None:
 
 
 def _cursor_text(cursor: str) -> str:
-    """Every layer of an inbox cursor, decoded, so a test can see what it reveals."""
+    """Every readable layer of an inbox cursor, so a test can see what it reveals."""
 
     def unwrap(value: str) -> str:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode("utf-8")
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode(
+            "utf-8", errors="replace"
+        )
 
     layers = [unwrap(cursor.removeprefix("inboxcursor_"))]
-    inner = json.loads(layers[0])[2]
+    document = json.loads(layers[0])
+    inner = document[2]
     if inner is not None:
         layers.append(unwrap(inner))
-        layers.append(unwrap(json.loads(layers[1])["session_id_b64"]))
+        if len(document) == 3:
+            layers.append(unwrap(json.loads(layers[1])["session_id_b64"]))
     return "\n".join(layers)
 
 
-def test_scoped_listing_pages_from_the_callers_own_items() -> None:
+def _pages(client: TestClient, path: str, person: str, limit: int = 1) -> list[dict]:
+    """Follow a listing to its end, returning each page."""
+
+    pages = []
+    cursor = None
+    for _page in range(20):
+        params = {"limit": limit} if cursor is None else {"limit": limit, "cursor": cursor}
+        response = client.get(path, params=params, headers=_as(person))
+        assert response.status_code == 200, response.text
+        page = response.json()
+        pages.append(page)
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return pages
+        assert page["has_more"] is True
+    raise AssertionError(f"{path} did not finish paging.")
+
+
+@pytest.mark.parametrize("inbox_cursor_key", [None, b"K" * 32])
+def test_scoped_listing_pages_past_other_peoples_items_to_the_callers_own(
+    inbox_cursor_key,
+) -> None:
+    app = _app()
+    server = create_server(
+        app,
+        config=ServerConfig.protected(_authenticate),
+        inbox_access=_own_tenant_and_not_tom,
+        inbox_cursor_key=inbox_cursor_key,
+    )
+    with TestClient(server) as client:
+        _pause(client, app, "acme-oldest", "approver", tenant="acme")
+        # More than ten store pages of another tenant's items sit between them.
+        for index in range(11):
+            _pause(client, app, f"globex-{index}", "approver", tenant="globex")
+        _pause(client, app, "acme-newest", "asker", tenant="acme")
+
+        pages = _pages(client, "/api/inbox", "acme")
+        seen = [item["session_id"] for page in pages for item in page["items"]]
+        assert seen == ["acme-newest", "acme-oldest"]
+        # One page ends among the other tenant's items, so it has none and its
+        # cursor is sealed: no cursor names their sessions, and no issue stops
+        # the listing short.
+        assert [len(page["items"]) for page in pages] == [1, 0, 1]
+        assert all(page["issues"] == [] for page in pages)
+        for page in pages[:-1]:
+            assert "globex" not in _cursor_text(page["next_cursor"])
+
+        pending = _pages(client, "/api/pending-actions", "acme")
+        assert [action["session"]["id"] for page in pending for action in page["actions"]] == [
+            "acme-newest",
+            "acme-oldest",
+        ]
+        sealed = pending[1]["next_cursor"]
+        assert sealed.startswith("sealed_")
+        raw = base64.urlsafe_b64decode(sealed.removeprefix("sealed_") + "==")
+        assert b"globex" not in raw
+
+        # A sealed cursor names nothing another caller, or another listing, can use.
+        hidden = pages[1]["next_cursor"]
+        for path, cursor, person, params in (
+            ("/api/inbox", hidden, "globex", {}),
+            ("/api/pending-actions", sealed, "globex", {}),
+            ("/api/pending-actions", sealed, "acme", {"agent_name": "approver"}),
+        ):
+            response = client.get(
+                path, params={"limit": 1, "cursor": cursor, **params}, headers=_as(person)
+            )
+            # Refused with or without a configured key, so no reader restarts the
+            # listing without knowing it.
+            assert response.status_code == 422, response.text
+
+
+def test_a_sealed_cursor_from_before_a_restart_is_refused() -> None:
+    """Without a configured key, each server seals with a key of its own.
+
+    A cursor that key can't open gets 422, so a reader restarts the listing
+    knowingly instead of collecting its first items twice in one listing.
+    """
+
+    from cayu.server._inbox_cursor import InboxCursorSeal
+    from cayu.server._inbox_routes import _encode_cursor
+    from cayu.sessions.queries import SessionOrder, encode_session_cursor
+
     app = _app()
     server = create_server(
         app, config=ServerConfig.protected(_authenticate), inbox_access=_own_tenant_and_not_tom
     )
     with TestClient(server) as client:
-        _pause(client, app, "acme-oldest", "approver", tenant="acme")
-        for index in range(11):
-            _pause(client, app, f"globex-{index}", "approver", tenant="globex")
-        _pause(client, app, "acme-newest", "asker", tenant="acme")
-
-        # Pages for a tenant continue after its own items and never point into
-        # another tenant's sessions.
-        seen: list[str] = []
-        cursor = None
-        for _page in range(5):
-            params = {"limit": 1} if cursor is None else {"limit": 1, "cursor": cursor}
-            page = client.get("/api/inbox", params=params, headers=_as("acme")).json()
-            seen.extend(item["session_id"] for item in page["items"])
-            cursor = page["next_cursor"]
-            if cursor is None:
-                break
-            assert "globex" not in _cursor_text(cursor)
-        assert seen == ["acme-newest"]
-        # Ten pages of other people's items end the scan with an issue, not a
-        # position among them; a bigger page reaches the older item.
-        assert [issue["code"] for issue in page["issues"]] == ["inbox_truncated"]
-        assert page["next_cursor"] is None
-        wide = client.get("/api/inbox", params={"limit": 20}, headers=_as("acme")).json()
-        assert [item["session_id"] for item in wide["items"]] == ["acme-newest", "acme-oldest"]
-        assert wide["issues"] == []
+        _pause(client, app, "acme-run", "approver", tenant="acme")
+        [action] = (
+            _portal(client).call(app.session_store.query_pending_actions, PendingActionQuery())
+        ).actions
+        position = encode_session_cursor(action.session, SessionOrder.UPDATED_AT_DESC)
+        principal = {"subject": "acme-controller", "tenant": "acme"}
+        # What the server sealed before it restarted, with the key it had then.
+        before_restart = InboxCursorSeal(None)
+        cursor = _encode_cursor(
+            "actions", before_restart.seal("actions", position, principal), sealed=True
+        )
+        response = client.get("/api/inbox", params={"cursor": cursor}, headers=_as("acme"))
+        assert response.status_code == 422, response.text
+        assert "same configured inbox_cursor_key" in response.json()["detail"]
+        response = client.get("/api/inbox", headers=_as("acme"))
+        assert response.status_code == 200, response.text
+        assert [item["session_id"] for item in response.json()["items"]] == ["acme-run"]
 
 
-def test_knowledge_proposals_page_after_the_session_items() -> None:
+@pytest.mark.parametrize(
+    "serve,limited",
+    [
+        ("cayu serve", False),
+        ("cayu serve --dev", False),
+        ("mount_cayu", False),
+        # An access rule needs authenticated access, so `--dev` can't carry one.
+        ("cayu serve", True),
+        ("mount_cayu", True),
+    ],
+    ids=["cayu serve", "cayu serve --dev", "mount_cayu", "access rule", "mount access rule"],
+)
+def test_more_than_a_page_of_proposals_pages_without_configuration(serve, limited) -> None:
+    """`cayu serve` passes no cursor key; knowledge proposals still page to the end."""
+
+    from fastapi import FastAPI
+
+    from cayu.server import AuthenticatedAccess, mount_cayu
+
+    async def anyone(person: AuthContext, item: InboxItemScope) -> bool:
+        return True
+
+    scope = KnowledgeAccessScope.privileged()
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id=f"proposal-{index:03}",
+                text=f"Proposal {index}",
+                status=KnowledgeStatus.PENDING,
+            )
+            for index in range(250)
+        ],
+        access_scope=scope,
+    )
+    app = _app(knowledge_store=store, knowledge_access_scope=scope)
+    inbox_access = anyone if limited else None
+    if serve == "mount_cayu":
+        server = FastAPI()
+        mount_cayu(
+            server,
+            app,
+            dashboard=False,
+            access=AuthenticatedAccess(dependency=_authenticate),
+            inbox_access=inbox_access,
+        )
+    else:
+        config = (
+            ServerConfig.local_development()
+            if serve == "cayu serve --dev"
+            else ServerConfig.protected(_authenticate)
+        )
+        server = create_server(app, config=config, inbox_access=inbox_access)
+    path = "/cayu/api/inbox" if serve == "mount_cayu" else "/api/inbox"
+    with TestClient(server) as client:
+        # The browser client's watch reads pages of 100 items.
+        pages = _pages(client, path, "priya", limit=100)
+        assert [len(page["items"]) for page in pages] == [100, 100, 50]
+        ids = [item["knowledge"]["entry_id"] for page in pages for item in page["items"]]
+        assert sorted(ids) == [f"proposal-{index:03}" for index in range(250)]
+
+
+@pytest.mark.parametrize("inbox_cursor_key", [None, b"K" * 32])
+def test_knowledge_proposals_page_after_the_session_items(inbox_cursor_key) -> None:
     async def anyone(person: AuthContext, item: InboxItemScope) -> bool:
         return True
 
@@ -863,7 +1017,7 @@ def test_knowledge_proposals_page_after_the_session_items() -> None:
             app,
             config=ServerConfig.protected(_authenticate),
             inbox_access=inbox_access,
-            inbox_cursor_key=b"K" * 32,
+            inbox_cursor_key=inbox_cursor_key,
         )
         with TestClient(server) as client:
             _pause(client, app, "close", "approver")
@@ -968,9 +1122,7 @@ def test_knowledge_pages_advance_past_hidden_entries_without_exposing_them(monke
         assert sorted(seen) == ["visible-0", "visible-1", "visible-2"]
 
 
-def test_knowledge_cursor_requires_configured_key_and_binds_query_identity_and_lifetime(
-    monkeypatch,
-) -> None:
+def test_sealed_cursors_bind_query_identity_and_lifetime(monkeypatch) -> None:
     import cayu.server._inbox_cursor as cursor_module
     from cayu.knowledge.search import encode_knowledge_list_cursor
 
@@ -979,17 +1131,17 @@ def test_knowledge_cursor_requires_configured_key_and_binds_query_identity_and_l
     clock = 1000
     monkeypatch.setattr(cursor_module.time, "time", lambda: clock)
     key = b"K" * 32
-    codec = cursor_module.KnowledgeInboxCursor(key)
-    token = codec.encode(position, binding)
-    assert cursor_module.KnowledgeInboxCursor(key).decode(token, binding) == position
+    codec = cursor_module.InboxCursorSeal(key)
+    token = codec.seal("knowledge", position, binding)
+    assert cursor_module.InboxCursorSeal(key).open("knowledge", token, binding) == position
     # The next page can reach another host whose clock trails the issuer.
-    other_worker = cursor_module.KnowledgeInboxCursor(key)
+    other_worker = cursor_module.InboxCursorSeal(key)
     for skew in (0.05, 1, 60):
         clock = 1000 - skew
-        assert other_worker.decode(token, binding) == position
+        assert other_worker.open("knowledge", token, binding) == position
     clock = 1000 - 60.001
     with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
-        other_worker.decode(token, binding)
+        other_worker.open("knowledge", token, binding)
     clock = 1000
     for changed in (
         {**binding, "subject": "another-person"},
@@ -997,20 +1149,41 @@ def test_knowledge_cursor_requires_configured_key_and_binds_query_identity_and_l
         {**binding, "query": {"namespace": "two"}},
     ):
         with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
-            codec.decode(token, changed)
+            codec.open("knowledge", token, changed)
+    # A position sealed for one listing never opens in another.
+    with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
+        codec.open("actions", token, binding)
     for bad in ("malformed", token[:-2] + "AA"):
         with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
-            codec.decode(bad, binding)
-    for rotated in (None, b"R" * 32):
-        with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
-            cursor_module.KnowledgeInboxCursor(rotated).decode(token, binding)
+            codec.open("knowledge", bad, binding)
+    with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
+        cursor_module.InboxCursorSeal(b"R" * 32).open("knowledge", token, binding)
     clock += 900
-    assert other_worker.decode(token, binding) == position
+    assert other_worker.open("knowledge", token, binding) == position
     clock += 0.001
     with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
-        codec.decode(token, binding)
-    with pytest.raises(HTTPException, match="configured inbox_cursor_key"):
-        cursor_module.KnowledgeInboxCursor(None).encode(position, binding)
+        codec.open("knowledge", token, binding)
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        cursor_module.InboxCursorSeal(b"short")
+
+    # Without a configured key a server seals with its own, and refuses a cursor
+    # it can't open (from before a restart, another worker, expired or malformed).
+    clock = 1000
+    generated = cursor_module.InboxCursorSeal(None)
+    assert generated.configured is False
+    sealed = generated.seal("knowledge", position, binding)
+    assert generated.open("knowledge", sealed, binding) == position
+    for opener, value, bound in (
+        (cursor_module.InboxCursorSeal(None), sealed, binding),
+        (generated, sealed, {**binding, "subject": "other"}),
+        (generated, token, binding),
+        (generated, "malformed", binding),
+    ):
+        with pytest.raises(HTTPException, match="same configured inbox_cursor_key"):
+            opener.open("knowledge", value, bound)
+    clock += 900.001
+    with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
+        generated.open("knowledge", sealed, binding)
 
 
 def test_settled_sibling_recovery_keeps_the_crashed_call() -> None:

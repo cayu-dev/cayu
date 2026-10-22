@@ -262,7 +262,12 @@ client follows for you:
 - **Cadence.** `watchInbox` reads the whole inbox (following `next_cursor`) no more
   often than every 15 seconds, doubles the interval while nothing changes, and pauses
   while the tab is hidden. Something can start waiting at any time, so it never stops
-  as idle; call the function it returns when the inbox unmounts.
+  as idle; call the function it returns when the inbox unmounts. If the server
+  refuses a later page's cursor (409 or 422, for example after it restarted), that
+  refresh drops what it read and starts over from the first page once. If that is
+  refused too (workers without a shared `inbox_cursor_key`), the watch stops and
+  calls `onError` with the server's answer. With `listInbox`, restart from no cursor
+  after such a refusal.
 - **Identity.** The person is whoever the request authenticates as. Send the person's
   own credential, never a shared one, or every decision records the shared identity.
 - **Conflicts are answers.** `settleInboxItem` resolves with `settled: false`, a

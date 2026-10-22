@@ -313,7 +313,10 @@ export interface InboxSnapshot {
 export interface WatchInboxOptions {
   /** Called with the whole inbox whenever an item appears or leaves it. */
   onChange?: (inbox: InboxSnapshot) => void
-  /** Called once with the non-retryable error that stopped the watch. */
+  /**
+   * Called once with the non-retryable error that stopped the watch, including a
+   * later page's cursor refused (409 or 422) again after the refresh started over.
+   */
   onError?: (error: CayuClientError) => void
   /** Called once when the watch stops. */
   onStop?: (reason: Exclude<WatchStopReason, "idle">) => void

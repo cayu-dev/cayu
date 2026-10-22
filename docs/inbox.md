@@ -52,26 +52,47 @@ each reviewer may see.
 The list is paged. Follow `next_cursor` until it is `null`, including when a page
 has no items. Knowledge proposals come after the session items, starting pages of
 their own. Each request scans at most ten knowledge store pages of 200 proposals,
-applying the inbox access rule before returning up to `limit` items. An encrypted
-cursor continues after the last scanned proposal, including hidden proposals, so
-those proposals cannot block later permitted ones. Settling or deleting preceding
+applying the inbox access rule before returning up to `limit` items. The cursor
+continues after the last scanned proposal, including hidden proposals, so those
+proposals cannot block later permitted ones. Settling or deleting preceding
 proposals does not shift this keyset position. The queue is live: a proposal whose
 priority or update time changes can move before the position; refresh to see it.
 `issues` names sessions too large or invalid to list.
 
-Knowledge continuation requires `inbox_cursor_key`, a deployment-owned 32-byte key
-passed to `create_server`, `mount_cayu` or `create_router`. Keep it in the install's
-secret store and supply the same key to every worker serving that inbox. No key is
-generated implicitly. Without a key, a list that needs knowledge continuation
-returns 409 with a configuration error. Small complete queues remain readable.
-The cursor is encrypted and authenticated with AES-256-GCM, bound to the verified
-subject, tenant and knowledge review scope/query, and expires after 15 minutes.
-Decoding permits an issuing worker's clock to be up to 60 seconds ahead; it does
-not extend the 15-minute expiry measured from the authenticated issuance time.
-Every page rechecks current authorization. Keys are specific to one inbox
-deployment; do not share them between applications. Restarting with the same key
-preserves unexpired cursors. Rotation invalidates existing cursors. Invalid,
-expired or wrongly scoped cursors return the same 422 response; restart the list.
+Paging needs no configuration: `cayu serve`, `create_server`, `mount_cayu` and
+`create_router` page every inbox to its end. A caller no
+[inbox access rule](#who-decides-and-who-may) limits may see every item, so its
+cursor holds a plain keyset position. A caller the rule limits gets pages of its own
+session items only: each session page continues after the last item the caller can
+see, so a cursor never names other people's sessions, and the store's issues, which
+name those sessions, are left out. A page can therefore hold fewer than `limit`
+items, or finish a session's items past it. Each request reads at most ten store
+pages of `limit` actions; when they hold only items the caller may not see, the page
+is empty and its cursor seals the position the scan reached, so the caller keeps
+paging to its own items behind them. A limited caller's knowledge cursor is always
+sealed, since it can name a hidden proposal. `GET /api/pending-actions` pages a
+limited caller the same way: a sealed cursor starts with `sealed_`, and `has_more`
+always comes with a cursor.
+
+A sealed cursor is encrypted and authenticated with AES-256-GCM, bound to the
+verified subject and tenant and to the listing (the knowledge review scope and
+query, or the pending-action filters), and expires after 15 minutes. Decoding
+permits an issuing worker's clock to be up to 60 seconds ahead; it does not extend
+the 15-minute expiry measured from the authenticated issuance time. Every page
+rechecks current authorization.
+
+The key is `inbox_cursor_key`, an optional 32-byte key passed to `create_server`,
+`mount_cayu` or `create_router`. Without one, each server generates a key of its
+own when it starts, so its sealed cursors stop working when it restarts and don't
+work on another worker. When several workers serve an inbox with an access rule,
+give them the same key, kept in the install's secret store, so a cursor works on
+any of them; keys are specific to one inbox deployment, so don't share them between
+applications. With a configured key, restarting preserves unexpired cursors and
+rotation invalidates them. Either way, a malformed, expired or wrongly scoped
+cursor, or a sealed cursor the key can't open, returns 422; restart the list from
+no cursor. `client.watchInbox` does this once within the same refresh, dropping
+the pages it read, and stops with the 422 as its error if the restarted listing is
+refused too.
 
 The key is a trusted server construction argument, not an HTTP field or a
 serialized `ServerConfig` value. The host must load it from its secret source.
@@ -93,16 +114,7 @@ server = create_server(
 
 This environment name is an example host convention; Runtime does not read it
 automatically. Hosts using `mount_cayu` or `create_router` pass the same decoded
-bytes to that function instead. Provision and wire the shared key before enabling
-paged knowledge inboxes. Neither this code nor Runtime creates or prints a key.
-
-A caller an [inbox access rule](#who-decides-and-who-may) limits gets pages of its
-own session items only: each session page continues after the last item the caller can see, so a
-cursor never points among other people's sessions, and the store's issues, which
-name those sessions, are left out. A page can therefore hold fewer than `limit`
-items, or finish a session's items past it. When hidden items fill the scan behind
-one page (ten store pages of `limit` items), the page ends with the issue
-`inbox_truncated` and no cursor; a larger `limit` scans further.
+bytes to that function instead. Neither this code nor Runtime prints a key.
 
 ## Item state
 
@@ -252,9 +264,10 @@ settles an item, not only on the inbox routes.
 Because the store pages and counts across every session, a caller the rule limits
 gets pages of its own items: `GET /api/pending-actions` and `GET /api/inbox` leave
 out delegated parent rows and the store's issues, which name other sessions,
-continue session pages after the caller's last visible item, and report no store-wide
-count (`total_count` is null, and `total_entries_known` counts only what was
-returned).
+continue session pages after the caller's last visible item (or from a sealed
+position past other people's items, as [paging](#items) describes), and report no
+store-wide count (`total_count` is null, and `total_entries_known` counts only what
+was returned).
 
 The rule governs the items. Session reads and session operations (events,
 transcripts, state, the follow stream, messages and interrupts) stay the operator

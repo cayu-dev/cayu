@@ -1784,9 +1784,12 @@ person, returning once the Runtime durably accepted the decision.
 Worker-owned approvals and questions accept the same exact `task_worker_id` and
 `task_handoff_id` authority as the ordinary resolve routes; the inbox never elects
 a worker. Knowledge title and text previews pass through the application's secret
-redactor before truncation. Knowledge inbox scans are bounded and continue with
-principal- and query-bound encrypted keysets, requiring the deployment's shared
-`inbox_cursor_key` whenever continuation is needed; see [inbox pagination](inbox.md).
+redactor before truncation. Inbox and pending-action scans are bounded per request
+and always continue: a caller no inbox access rule limits gets plain keyset cursors,
+and a limited caller's position among items it may not see is sealed, encrypted and
+bound to the principal and listing, with the deployment's `inbox_cursor_key` or,
+without one, a key the server generates (a cursor the key can't open is refused
+with 422, so the reader restarts the listing); see [inbox pagination](inbox.md).
 `KnowledgeListQuery.cursor` and `KnowledgeReviewWorkflow.list_pending(cursor=...)`
 use the built-in stores' order of importance descending, update time descending,
 then entry ID ascending. `encode_knowledge_list_cursor(entry)` names the last

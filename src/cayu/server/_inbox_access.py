@@ -61,14 +61,15 @@ class PermittedPendingPage:
     """The pending actions a limited caller may see, paged from its own actions.
 
     ``next_cursor`` continues right after the last permitted action's session, so it
-    never names a hidden session. ``truncated`` means the scan budget ran out among
-    hidden actions before finding one the caller may see, so there is no position to
-    continue from.
+    never names a hidden session. ``hidden_after`` is set instead when the scan budget
+    ran out among hidden actions before finding one the caller may see: the store
+    position the scan reached, which names a hidden session, so a route seals it
+    before handing it to the caller. Both are ``None`` once the store is exhausted.
     """
 
     actions: list[PendingActionRecord]
     next_cursor: str | None
-    truncated: bool
+    hidden_after: str | None = None
 
 
 class InboxAccessGate:
@@ -305,8 +306,10 @@ class InboxAccessGate:
         """Page the pending actions this caller may see, up to ``query.limit`` of them.
 
         The store pages across every session, so its cursor and issues name sessions
-        a limited caller can't see; this page carries neither. A session's actions
-        are kept together, so a page can end slightly past ``query.limit``.
+        a limited caller can't see; this page carries neither, and a position among
+        hidden actions comes back only as ``hidden_after`` for the route to seal. A
+        session's actions are kept together, so a page can end slightly past
+        ``query.limit``. Each call reads at most ten store pages.
         """
 
         permitted: list[PendingActionRecord] = []
@@ -323,16 +326,18 @@ class InboxAccessGate:
                     and last is not None
                     and (action.session.id != last.id)
                 ):
-                    return PermittedPendingPage(permitted, _cursor_after(last), False)
+                    return PermittedPendingPage(permitted, _cursor_after(last))
                 if await self.permits_pending(person, action, sessions):
                     permitted.append(action)
                     last = action.session
             if not page.has_more:
-                return PermittedPendingPage(permitted, None, False)
+                return PermittedPendingPage(permitted, None)
             cursor = page.next_cursor
         if last is not None:
-            return PermittedPendingPage(permitted, _cursor_after(last), False)
-        return PermittedPendingPage(permitted, None, True)
+            return PermittedPendingPage(permitted, _cursor_after(last))
+        # Only hidden actions so far: continue from where the scan stopped, so a
+        # caller whose items sit behind many of other people's still reaches them.
+        return PermittedPendingPage(permitted, None, cursor)
 
 
 def _cursor_after(session: PendingActionSession) -> str:

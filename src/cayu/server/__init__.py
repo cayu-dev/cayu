@@ -264,9 +264,11 @@ def create_server(
             item and knowledge proposal, on every route that lists or settles them,
             including the tool authorization grant routes. Without it, every
             authenticated caller may. Requires authenticated access.
-        inbox_cursor_key: Deployment-owned 32-byte key shared by all workers for
-            encrypted knowledge inbox continuation. Required when a knowledge
-            queue needs pagination; no ephemeral key is generated.
+        inbox_cursor_key: Optional deployment-owned 32-byte key, shared by all
+            workers, that seals the inbox cursors of callers ``inbox_access``
+            limits. Without it the server generates its own key, so its sealed
+            cursors get 422 after a restart or on another worker. Pass one when
+            several workers serve an inbox with an access rule.
         fastapi_options: Optional non-policy FastAPI constructor options. Cayu
             validates the option names and retains ownership of its title,
             documentation routes, and lifespan composition.
@@ -668,8 +670,9 @@ def mount_cayu(
     cannot supply or serialize those policies. ``inbox_access`` decides which
     authenticated callers may see and settle each approval, question, recovery
     item and knowledge proposal, on every mounted route that lists or settles them;
-    without it every authenticated caller may. ``inbox_cursor_key`` is a 32-byte
-    deployment key shared by all workers, required for knowledge pagination.
+    without it every authenticated caller may. ``inbox_cursor_key`` is an optional
+    32-byte deployment key, shared by all workers, that seals the inbox cursors
+    of callers the rule limits; without it the server generates its own.
 
     ``request_timing`` records per-request cost for the mounted Cayu routes, and
     for every host route as well when ``observe_host_requests`` is true. The

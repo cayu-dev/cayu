@@ -1042,6 +1042,65 @@ test("watchInbox reports an inbox with a truncation issue as incomplete", async 
   stop()
 })
 
+test("watchInbox starts a refresh over when a later page's cursor is refused", async () => {
+  const server = new FakeServer()
+  server.inboxPages = new Map([
+    [null, { items: [inboxItem("a")], issues: [], next_cursor: "next" }],
+    ["next", { items: [inboxItem("b")], issues: [], next_cursor: null }],
+  ])
+  // The server restarted between the first two pages, so it refuses the cursor
+  // the first page gave.
+  server.once("/inbox", () =>
+    json({ items: [inboxItem("a")], issues: [], has_more: true, next_cursor: "stale" }),
+  )
+  server.once("/inbox", () => json({ detail: "Restart the inbox listing." }, { status: 409 }))
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const snapshots = []
+  const stops = []
+  const stop = client.watchInbox({
+    onChange: (inbox) => snapshots.push([inbox.items.map((item) => item.id), inbox.complete]),
+    onStop: (reason) => stops.push(reason),
+  })
+  await flush()
+
+  // The refresh drops the page it read before the refusal, so "a" appears once.
+  assert.deepEqual(snapshots, [[["a", "b"], true]])
+  assert.deepEqual(
+    server.requestsTo("/inbox").map((request) => request.query.get("cursor")),
+    [null, "stale", null, "next"],
+  )
+  assert.deepEqual(stops, [])
+  stop()
+})
+
+test("watchInbox stops with the error when the restarted refresh is refused too", async () => {
+  const server = new FakeServer()
+  // Every later page is refused, as when workers lack a shared inbox_cursor_key.
+  server.inboxPages = new Map([
+    [null, { items: [inboxItem("a")], issues: [], next_cursor: "elsewhere" }],
+  ])
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const snapshots = []
+  const errors = []
+  const stops = []
+  client.watchInbox({
+    onChange: (inbox) => snapshots.push(inbox),
+    onError: (error) => errors.push(error),
+    onStop: (reason) => stops.push(reason),
+  })
+  await flush()
+
+  assert.deepEqual(snapshots, [])
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0].status, 422)
+  assert.deepEqual(stops, ["error"])
+  assert.deepEqual(
+    server.requestsTo("/inbox").map((request) => request.query.get("cursor")),
+    [null, "elsewhere", null, "elsewhere"],
+  )
+  await assertQuiet(server)
+})
+
 test("watchInbox sends nothing while hidden and stops on authorization failures", async () => {
   const server = new FakeServer()
   const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
