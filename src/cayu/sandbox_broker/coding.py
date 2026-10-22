@@ -66,6 +66,7 @@ from cayu.sandbox_broker.lease import SandboxLeaseKeeper
 from cayu.sandbox_broker.runner import (
     BROKERED_SANDBOX_CANDIDATE,
     MAX_TRANSFER_FILE_BYTES,
+    STAGED_FILE_OVERHEAD_BYTES,
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
     sandbox_capability_claims,
@@ -304,12 +305,6 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             transfer_limits = SandboxWorkspaceTransferLimits(max_file_bytes=MAX_TRANSFER_FILE_BYTES)
         elif type(transfer_limits) is not SandboxWorkspaceTransferLimits:
             raise TypeError("transfer_limits must be SandboxWorkspaceTransferLimits.")
-        if transfer_limits.max_file_bytes > MAX_TRANSFER_FILE_BYTES:
-            # Larger trees are split across archives, but one file must fit in one.
-            raise ValueError(
-                "transfer_limits.max_file_bytes cannot exceed "
-                f"{MAX_TRANSFER_FILE_BYTES} bytes, the largest file one broker archive carries."
-            )
         if type(ready_timeout_s) not in {int, float} or ready_timeout_s <= 0:
             raise ValueError("ready_timeout_s must be positive.")
         if type(git_baseline) is not bool:
@@ -462,6 +457,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 renew_every_s=self.renew_every_s,
             ).start()
             runner = BrokeredSandboxRunner(self.broker, sandbox, lease_keeper=keeper)
+            self._require_transfer_capacity(sandbox)
             for command in self.setup_commands:
                 result = await runner.exec(
                     ExecCommand.bash(command), timeout_s=_SETUP_COMMAND_TIMEOUT_SECONDS
@@ -496,6 +492,25 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             },
             release=release,
         )
+
+    def _require_transfer_capacity(self, sandbox: SandboxRecord) -> None:
+        """Refuse a sandbox that can't move the largest file the limits allow.
+
+        One archive carries a file of up to ``MAX_TRANSFER_FILE_BYTES``; a larger
+        one moves only as a staged copy, which the install must offer and size.
+        """
+
+        limits = self.transfer_limits
+        if limits.max_file_bytes <= MAX_TRANSFER_FILE_BYTES:
+            return
+        staged = sandbox.staged_copies
+        needed = limits.max_file_bytes + STAGED_FILE_OVERHEAD_BYTES
+        if staged is None or staged.max_bytes < needed:
+            raise RuntimeError(
+                f"transfer_limits.max_file_bytes={limits.max_file_bytes} needs staged copies of "
+                f"at least {needed} bytes, which this sandbox broker doesn't offer; one broker "
+                f"archive carries files of at most {MAX_TRANSFER_FILE_BYTES} bytes."
+            )
 
     async def _allocate(self, request: EnvironmentFactoryRequest) -> SandboxRecord:
         scope = sha256(f"{request.session_id}\0{request.environment_name}".encode()).hexdigest()[

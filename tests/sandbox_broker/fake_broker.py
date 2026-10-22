@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -35,6 +36,7 @@ GUARANTEES_V1 = (
     "egress_only_via_broker",
 )
 ARCHIVE_LIMIT = 8 * 1024 * 1024
+STORAGE_URL = "https://storage.example.test"
 
 
 @dataclass
@@ -79,6 +81,8 @@ class FakeSandbox:
     destroy_reason: str | None = None
     failure: dict[str, str] | None = None
     commands: dict[str, FakeCommand] = field(default_factory=dict)
+    copies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    staged_copies: dict[str, int] | None = None
 
     def record(self) -> dict[str, Any]:
         return {
@@ -100,6 +104,7 @@ class FakeSandbox:
             else self.max_expires_at.isoformat(),
             "destroyed_at": None,
             "destroy_reason": self.destroy_reason,
+            "staged_copies": self.staged_copies,
             "guarantees": {"version": 1, "items": list(self.guarantees)},
         }
 
@@ -128,6 +133,11 @@ class FakeBroker:
         self.archive_gets = 0
         self.guarantees = GUARANTEES_V1
         self.catalog = {"coding-python"}
+        # What new sandboxes offer for staged copies; None offers none.
+        self.staged_copies: dict[str, int] | None = None
+        # Staged objects by key, and every request the storage received.
+        self.objects: dict[str, bytes] = {}
+        self.storage_requests: list[httpx.Request] = []
 
     def client(self, **settings: Any) -> SandboxBrokerClient:
         return SandboxBrokerClient(
@@ -172,6 +182,8 @@ class FakeBroker:
         return response
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host == "storage.example.test":
+            return self._storage(request)
         self.requests.append(request)
         if request.headers.get("authorization") != f"Bearer {TOKEN}":
             return httpx.Response(401, json={"error": {"code": "x", "message": "", "detail": {}}})
@@ -268,6 +280,8 @@ class FakeBroker:
         if action == ["archive"] and request.method == "GET":
             self.archive_gets += 1
             return self._read_archive(sandbox, request)
+        if action[:1] == ["copies"]:
+            return self._copy(sandbox, request, action[1:])
         return httpx.Response(404, json={"error": {"code": "x", "message": "", "detail": {}}})
 
     def _create(self, body: dict[str, Any]) -> httpx.Response:
@@ -286,7 +300,13 @@ class FakeBroker:
         sandbox_id = f"sbx_{len(self.sandboxes) + 1:04d}"
         root = self.base / sandbox_id
         root.mkdir(parents=True)
-        sandbox = FakeSandbox(id=sandbox_id, body=body, root=root, guarantees=self.guarantees)
+        sandbox = FakeSandbox(
+            id=sandbox_id,
+            body=body,
+            root=root,
+            guarantees=self.guarantees,
+            staged_copies=self.staged_copies,
+        )
         self.sandboxes[sandbox_id] = sandbox
         self.by_key[key] = sandbox_id
         return httpx.Response(202, json=sandbox.record())
@@ -378,6 +398,99 @@ class FakeBroker:
         if missing:
             headers["X-Cayu-Missing-Paths"] = ",".join(quote(item, safe="") for item in missing)
         return httpx.Response(200, content=data, headers=headers)
+
+    def _storage(self, request: httpx.Request) -> httpx.Response:
+        self.storage_requests.append(request)
+        key = request.url.path.lstrip("/")
+        if request.method == "PUT":
+            if request.headers.get("content-length") != str(len(request.content)):
+                return httpx.Response(400)
+            self.objects[key] = request.content
+            return httpx.Response(200)
+        if key not in self.objects:
+            return httpx.Response(404)
+        return httpx.Response(200, content=self.objects[key])
+
+    def _copy(
+        self, sandbox: FakeSandbox, request: httpx.Request, action: list[str]
+    ) -> httpx.Response:
+        if sandbox.staged_copies is None:
+            return _error(503, "copies_unavailable")
+        if not action and request.method == "POST":
+            body = json.loads(request.content)
+            existing = sandbox.copies.get(body["copy_id"])
+            if existing is not None:
+                return httpx.Response(200, json=_copy_view(existing))
+            key = f"{sandbox.id}/{body['copy_id']}.tar"
+            copy = {**body, "key": key, "status": "awaiting_upload", "missing": []}
+            if body["direction"] == "in" and body["bytes"] > sandbox.staged_copies["max_bytes"]:
+                return _error(413, "copy_too_large", {"bytes": body["bytes"]})
+            sandbox.copies[body["copy_id"]] = copy
+            if body["direction"] == "out":
+                self._copy_out(sandbox, copy)
+            return httpx.Response(202, json=_copy_view(copy))
+        copy = sandbox.copies.get(action[0]) if action else None
+        if copy is None:
+            return httpx.Response(404, json={"error": {"code": "x", "message": "", "detail": {}}})
+        if action[1:] == ["commit"] and copy["status"] == "awaiting_upload":
+            self._copy_in(sandbox, copy)
+        return httpx.Response(200, json=_copy_view(copy))
+
+    def _copy_in(self, sandbox: FakeSandbox, copy: dict[str, Any]) -> None:
+        data = self.objects.pop(copy["key"], None)
+        if data is None:
+            copy.update(status="failed", error={"code": "copy_upload_missing", "message": ""})
+            return
+        if len(data) != copy["bytes"] or hashlib.sha256(data).hexdigest() != copy["sha256"]:
+            copy.update(status="failed", error={"code": "copy_digest_mismatch", "message": ""})
+            return
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+            members = archive.getmembers()
+            archive.extractall(sandbox.root / copy.get("path", "."), filter="data")
+        copy.update(status="done", files=len(members))
+
+    def _copy_out(self, sandbox: FakeSandbox, copy: dict[str, Any]) -> None:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:") as archive:
+            for path in copy["paths"] or ["."]:
+                source = sandbox.root / path
+                if not source.exists():
+                    copy["missing"].append(path)
+                    continue
+                archive.add(source, arcname=path)
+        data = buffer.getvalue()
+        copy["bytes"] = len(data)
+        assert sandbox.staged_copies is not None
+        if len(data) > sandbox.staged_copies["max_bytes"]:
+            copy.update(status="failed", error={"code": "copy_too_large", "message": ""})
+            return
+        self.objects[copy["key"]] = data
+        copy.update(status="done", sha256=hashlib.sha256(data).hexdigest())
+
+
+def _copy_view(copy: dict[str, Any]) -> dict[str, Any]:
+    signed = {"url": f"{STORAGE_URL}/{copy['key']}", "expires_at": "2026-10-18T12:15:00Z"}
+    view = {
+        "copy_id": copy["copy_id"],
+        "direction": copy["direction"],
+        "status": copy["status"],
+        "bytes": copy.get("bytes"),
+        "sha256": copy.get("sha256"),
+        "missing": copy["missing"],
+        "files": copy.get("files"),
+        "error": copy.get("error"),
+        "upload": None,
+        "download": None,
+    }
+    if copy["status"] == "awaiting_upload":
+        view["upload"] = {
+            **signed,
+            "method": "PUT",
+            "headers": {"Content-Type": "application/x-tar", "Content-Length": str(copy["bytes"])},
+        }
+    if copy["status"] == "done" and copy["direction"] == "out":
+        view["download"] = {**signed, "method": "GET", "headers": {}}
+    return view
 
 
 def _as_guest(output: bytes, root: Path) -> bytes:

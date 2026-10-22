@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import os
 import subprocess
@@ -19,7 +20,12 @@ from tests.core.test_workspace_mutation_receipts import _SingleToolProvider
 from tests.sandbox_broker.fake_broker import API_URL, APPLICATION, TOKEN, FakeBroker
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
-from cayu.environments import EnvironmentFactoryRequest, EnvironmentSpec
+from cayu.egress.sandbox_coding import SandboxWorkspaceTransferLimits
+from cayu.environments import (
+    EnvironmentFactoryReleaseAction,
+    EnvironmentFactoryRequest,
+    EnvironmentSpec,
+)
 from cayu.environments._ephemeral_git import initialize_ephemeral_git_baseline
 from cayu.environments.admission import ExecutionRequirements, evaluate_execution_admission
 from cayu.runners import ExecCommand
@@ -31,15 +37,18 @@ from cayu.sandbox_broker import (
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
     SandboxAllocationFailedError,
+    SandboxArchiveTooLargeError,
     SandboxBrokerClient,
     SandboxBrokerRefusedError,
     SandboxBrokerSettings,
     SandboxBrokerUnavailableError,
+    SandboxCopyFailedError,
     SandboxLeaseKeeper,
     SandboxLeaseLostError,
     SandboxNotFoundError,
     SandboxQuotaExceededError,
 )
+from cayu.sandbox_broker import client as client_module
 from cayu.sandbox_broker import runner as runner_module
 from cayu.sandbox_broker.client import MAX_COMMAND_OUTPUT_BYTES
 from cayu.storage import SQLiteSessionStore
@@ -621,6 +630,139 @@ def test_copy_back_enforces_the_limits_before_buffering(tmp_path: Path, monkeypa
     asyncio.run(scenario())
 
 
+def _tar(files: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def test_large_trees_and_files_move_as_staged_copies(tmp_path: Path, monkeypatch) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    broker.staged_copies = {"max_bytes": 8 * 1024 * 1024, "sandbox_max_bytes": 32 * 1024 * 1024}
+    big = os.urandom(3 * limit)
+    files = {"repo/README.md": b"# repo\n", "repo/objects/pack.bin": big}
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        assert runner.staged_copies is not None
+        workspace = BrokeredSandboxWorkspace(runner)
+        data = _tar(files)
+        await workspace.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        root = broker.sandboxes[runner.sandbox_id].root
+        assert (root / "repo/objects/pack.bin").read_bytes() == big
+        # One staged copy, no archive uploads, and the storage never saw the broker credential.
+        assert [call for call in broker.calls if call[0] == "PUT"] == []
+        assert [call[1].split("/")[2:] for call in broker.calls if call[0] == "POST"][-2:] == [
+            ["copies"],
+            ["copies", next(iter(broker.sandboxes[runner.sandbox_id].copies)), "commit"],
+        ]
+        (upload,) = [request for request in broker.storage_requests if request.method == "PUT"]
+        assert "authorization" not in upload.headers
+        assert upload.content == data
+        # A file too large for one archive comes back as one staged copy.
+        sink = io.BytesIO()
+        await workspace.read_tar_stream(["repo/objects/pack.bin"], sink, max_file_bytes=len(big))
+        with tarfile.open(fileobj=io.BytesIO(sink.getvalue()), mode="r:") as archive:
+            assert archive.extractfile("repo/objects/pack.bin").read() == big
+        (download,) = [request for request in broker.storage_requests if request.method == "GET"]
+        assert "authorization" not in download.headers
+        with pytest.raises(RuntimeError, match=f"max_file_bytes={limit}"):
+            await workspace.read_tar_stream(
+                ["repo/objects/pack.bin"], io.BytesIO(), max_file_bytes=limit
+            )
+        # Members are checked before anything is sent.
+        escaping = _tar({"../outside": big})
+        with pytest.raises(ValueError, match="relative files"):
+            await workspace.write_tar_stream(io.BytesIO(escaping), archive_bytes=len(escaping))
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_client_moves_staged_copies_and_reports_failures(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 4 * 1024 * 1024}
+
+    async def scenario():
+        client = broker.client()
+        runner = await _ready_runner(broker)
+        data = _tar({"a.txt": b"a", ".git/HEAD": b"ref: refs/heads/main\n"})
+        digest = hashlib.sha256(data).hexdigest()
+        done = await client.copy_in(
+            runner.sandbox_id, io.BytesIO(data), size=len(data), sha256=digest, path="repo"
+        )
+        assert (done.status, done.files) == ("done", 2)
+        root = broker.sandboxes[runner.sandbox_id].root
+        assert (root / "repo/.git/HEAD").read_bytes() == b"ref: refs/heads/main\n"
+        sink = io.BytesIO()
+        out = await client.copy_out(
+            runner.sandbox_id, sink, max_bytes=1024 * 1024, paths=["repo", "gone"]
+        )
+        assert out.missing == ("gone",) and out.size == len(sink.getvalue())
+        with tarfile.open(fileobj=io.BytesIO(sink.getvalue()), mode="r:") as archive:
+            assert archive.extractfile("repo/a.txt").read() == b"a"
+        with pytest.raises(SandboxArchiveTooLargeError) as too_large:
+            await client.copy_out(runner.sandbox_id, io.BytesIO(), max_bytes=100, paths=["repo"])
+        assert too_large.value.bytes == out.size
+        with pytest.raises(SandboxCopyFailedError) as mismatch:
+            await client.copy_in(
+                runner.sandbox_id, io.BytesIO(data), size=len(data), sha256="0" * 64
+            )
+        assert mismatch.value.code == "copy_digest_mismatch"
+        with pytest.raises(SandboxArchiveTooLargeError):
+            await client.start_copy_in(
+                runner.sandbox_id, "huge", size=2 * 1024 * 1024, sha256=digest
+            )
+        await runner.close()
+        broker.staged_copies = None
+        plain = await _ready_runner(broker)
+        assert plain.staged_copies is None
+        with pytest.raises(SandboxBrokerRefusedError) as unavailable:
+            await client.start_copy_out(plain.sandbox_id, "c")
+        assert unavailable.value.code == "copies_unavailable"
+        await plain.close()
+        await client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_staged_urls_must_be_https_without_credentials() -> None:
+    assert client_module._staged_url("https://bucket.s3.amazonaws.com/k?X-Amz-Signature=x")
+    assert client_module._staged_url("http://127.0.0.1:9000/bucket/k")
+    for url in (
+        "http://storage.example.test/k",
+        "https://user:pass@storage.example.test/k",
+        "file:///etc/passwd",
+    ):
+        with pytest.raises(client_module.SandboxBrokerError):
+            client_module._staged_url(url)
+
+
+def test_files_larger_than_one_archive_need_staged_copies(tmp_path: Path) -> None:
+    limits = SandboxWorkspaceTransferLimits(max_file_bytes=16 * 1024 * 1024)
+    broker = FakeBroker(tmp_path / "cloud")
+    factory = _factory(broker, _project(tmp_path), transfer_limits=limits)
+    with pytest.raises(RuntimeError, match="needs staged copies"):
+        asyncio.run(factory.create(_request()))
+    (sandbox,) = broker.sandboxes.values()
+    assert sandbox.status == "destroyed"
+    broker.staged_copies = {"max_bytes": 32 * 1024 * 1024, "sandbox_max_bytes": 64 * 1024 * 1024}
+
+    async def scenario():
+        result = await factory.create(_request("offered"))
+        assert result.release is not None
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(scenario())
+
+
 def test_paths_keep_their_whitespace(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
 
@@ -1187,3 +1329,181 @@ def test_the_agent_needs_no_cloud_provider_credential(tmp_path: Path, monkeypatc
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     )
     assert probe.stdout.strip() == "[]", probe.stdout
+
+
+@pytest.mark.parametrize("above_staged_cap", [False, True])
+def test_staged_selection_preserves_archive_boundaries(tmp_path, above_staged_cap):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 16 * 1024 * 1024, "sandbox_max_bytes": 64 * 1024 * 1024}
+    files = (
+        {f"file{i}": b"x" * (1024 * 1024) for i in range(20)}
+        if above_staged_cap
+        else {"near-limit": b"x" * (8 * 1024 * 1024 - 4096)}
+    )
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        archive = _tar(files)
+        await BrokeredSandboxWorkspace(runner).write_tar_stream(
+            io.BytesIO(archive), archive_bytes=len(archive)
+        )
+        root = broker.sandboxes[runner.sandbox_id].root
+        for name, content in files.items():
+            assert (root / name).read_bytes() == content
+        uploads = [request for request in broker.storage_requests if request.method == "PUT"]
+        assert len(uploads) == (0 if above_staged_cap else 1)
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_staged_copy_size_uses_archive_too_large_error(tmp_path):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 64 * 1024, "sandbox_max_bytes": 1024 * 1024}
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        (broker.sandboxes[runner.sandbox_id].root / "large").write_bytes(b"x" * (200 * 1024))
+        with pytest.raises(client_module.SandboxArchiveTooLargeError) as caught:
+            await runner.copy_out(io.BytesIO(), paths=["large"], max_bytes=64 * 1024)
+        assert caught.value.code == "copy_too_large"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("separator", [b"\0" * 512, b"corrupt" + b"\0" * 505])
+def test_staged_archive_rejects_unparsed_trailing_members(tmp_path, separator):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
+    # Retain just the first file header and padded payload, then hide a member
+    # behind a terminator or a malformed header. GNU tar can recover it.
+    first = _tar({"ok.txt": b"ok"})[:1024]
+    link = tarfile.TarInfo("link")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "/etc"
+    raw = first + separator + link.tobuf() + b"\0" * 1024
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        workspace = BrokeredSandboxWorkspace(runner)
+        with pytest.raises(ValueError, match="unvalidated trailing"):
+            await workspace._write_staged(io.BytesIO(raw), len(raw), runner.staged_copies)
+        assert not broker.storage_requests
+        assert not (broker.sandboxes[runner.sandbox_id].root / "link").exists()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["cancel", "poll", "timeout"])
+def test_abandoned_staged_extraction_fences_runner(tmp_path, monkeypatch, failure):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
+    monkeypatch.setattr(broker, "_copy_in", lambda sandbox, copy: copy.update(status="running"))
+    data = _tar({"result": b"new"})
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        polling = asyncio.Event()
+
+        async def get_copy(*args, **kwargs):
+            polling.set()
+            if failure == "poll":
+                raise SandboxBrokerUnavailableError("poll unavailable")
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(runner.broker, "get_copy", get_copy)
+        if failure == "timeout":
+            monkeypatch.setattr(client_module, "_COPY_TIMEOUT_FLOOR_SECONDS", -1000)
+        copying = asyncio.create_task(
+            runner.copy_in(
+                io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
+            )
+        )
+        if failure == "cancel":
+            await polling.wait()
+            copying.cancel()
+        with pytest.raises((asyncio.CancelledError, SandboxBrokerUnavailableError)):
+            await copying
+        assert runner.lifecycle_state == "poisoned"
+        with pytest.raises(RuntimeError):
+            await runner.exec(ExecCommand.process("echo", "unsafe"))
+        with pytest.raises(RuntimeError):
+            await runner.copy_in(
+                io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
+            )
+        assert not broker.started
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["upload", "terminal"])
+def test_settled_or_undispatched_copy_failure_keeps_runner_reusable(tmp_path, monkeypatch, phase):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
+    data = _tar({"result": b"new"})
+    if phase == "terminal":
+        monkeypatch.setattr(
+            broker,
+            "_copy_in",
+            lambda sandbox, copy: copy.update(
+                status="failed", error={"code": "copy_digest_mismatch", "message": ""}
+            ),
+        )
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        if phase == "upload":
+
+            async def failed_upload(*args, **kwargs):
+                raise SandboxBrokerUnavailableError("upload unavailable")
+
+            monkeypatch.setattr(runner.broker, "upload_staged", failed_upload)
+        with pytest.raises(client_module.SandboxBrokerError):
+            await runner.copy_in(
+                io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
+            )
+        result = await runner.exec(ExecCommand.process("echo", "safe"))
+        assert result.stdout == "safe\n"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("lost_first_response", [False, True])
+def test_refused_copy_commit_only_fences_previously_uncertain_mutation(
+    tmp_path, monkeypatch, lost_first_response
+):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
+    data = _tar({"result": b"new"})
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        attempts = 0
+
+        async def refused_commit(*args, **kwargs):
+            nonlocal attempts
+            assert kwargs["retry"] is False
+            attempts += 1
+            if lost_first_response and attempts == 1:
+                raise SandboxBrokerUnavailableError("response lost", outcome_unknown=True)
+            raise SandboxBrokerRefusedError("copies unavailable", code="copies_unavailable")
+
+        monkeypatch.setattr(runner.broker, "commit_copy", refused_commit)
+        monkeypatch.setattr(client_module, "_RETRY_DELAYS_SECONDS", (0.0,))
+        with pytest.raises(SandboxBrokerRefusedError):
+            await runner.copy_in(
+                io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
+            )
+        if lost_first_response:
+            assert runner.lifecycle_state == "poisoned"
+            with pytest.raises(RuntimeError):
+                await runner.exec(ExecCommand.process("echo", "unsafe"))
+        else:
+            assert (await runner.exec(ExecCommand.process("echo", "safe"))).stdout == "safe\n"
+        await runner.close()
+
+    asyncio.run(scenario())

@@ -5,7 +5,8 @@ The parts compose but each works alone:
 - ``SandboxBrokerClient`` speaks the ``cayu.cloud.sandbox`` v1 wire contract.
 - ``SandboxLeaseKeeper`` renews one sandbox's lease.
 - ``BrokeredSandboxRunner`` is a ``Runner`` over one sandbox.
-- ``BrokeredSandboxWorkspace`` is a ``RunnerWorkspace`` whose bulk copies use the broker's archives.
+- ``BrokeredSandboxWorkspace`` is a ``RunnerWorkspace`` whose bulk copies use the broker's
+  archives, and its staged copies for trees and files larger than one archive.
 - ``BrokeredSandboxCodingEnvironmentFactory`` assembles them into per-session coding sandboxes.
 
 See "Coding in a sandbox brokered by Cayu Cloud" in ``docs/environment-factories.md``.
@@ -26,6 +27,8 @@ from cayu.sandbox_broker.client import (
     SandboxBrokerUnavailableError,
     SandboxBusyError,
     SandboxCommand,
+    SandboxCopy,
+    SandboxCopyFailedError,
     SandboxEgressMode,
     SandboxFailure,
     SandboxGuarantees,
@@ -35,6 +38,8 @@ from cayu.sandbox_broker.client import (
     SandboxNotReadyError,
     SandboxQuotaExceededError,
     SandboxRecord,
+    SandboxSignedTransfer,
+    SandboxStagedCopies,
 )
 from cayu.sandbox_broker.coding import (
     BROKERED_SANDBOX_EGRESS_ENV,
@@ -72,6 +77,8 @@ __all__ = [
     "SandboxBrokerUnavailableError",
     "SandboxBusyError",
     "SandboxCommand",
+    "SandboxCopy",
+    "SandboxCopyFailedError",
     "SandboxEgressMode",
     "SandboxFailure",
     "SandboxGuarantees",
@@ -82,5 +89,7 @@ __all__ = [
     "SandboxNotReadyError",
     "SandboxQuotaExceededError",
     "SandboxRecord",
+    "SandboxSignedTransfer",
+    "SandboxStagedCopies",
     "sandbox_capability_claims",
 ]

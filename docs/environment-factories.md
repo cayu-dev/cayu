@@ -474,9 +474,27 @@ to 330 seconds for the sandbox, since Cloud fails one still provisioning after
 five minutes. Copy-in and copy-back use the broker's archive routes. Copy-in
 uploads the tree in archives of at most 8 MiB. Copy-back reads the changed
 files by name, in batches, splitting any batch the broker reports as too
-large. So a tree of any size moves, but one file must fit in one archive
-(`transfer_limits.max_file_bytes` is capped just under 8 MiB). File tools and
-commands run as broker commands. The sandbox is destroyed when the session's
+large. So a tree of any size moves, but without staged copies one file must
+fit in one archive (just under 8 MiB).
+
+Where the install offers staged copies (the sandbox record's
+`staged_copies`), a tree larger than one archive goes in as one staged copy:
+the factory checks every member, uploads the tar straight to a signed URL for
+one object in the install's storage, and the broker extracts it after
+checking its size and SHA-256. A changed file too large for one archive comes
+back the same way. The storage URL gets only the archive and the headers the
+broker signed, never the sandbox credential, and nothing in the sandbox sees
+it. `transfer_limits.max_file_bytes` may then exceed 8 MiB; a sandbox that
+can't carry a file that large through staged copies is refused at setup and
+destroyed. File tools and commands run as broker commands.
+
+The parts work on their own too. An Agent that clones a private repository
+itself can hand the sandbox the checkout, `.git` included, without the
+repository credential: `BrokeredSandboxRunner.copy_in(source, size=...,
+sha256=..., path="repo")` (or `SandboxBrokerClient.copy_in`) moves a tar of
+any size the install allows, and `copy_out(sink, max_bytes=..., paths=[...])`
+reads one back and checks its digest. A failed copy raises
+`SandboxCopyFailedError` with the broker's error code. The sandbox is destroyed when the session's
 binding finalizes, or when setup fails. If copy-back fails, the factory keeps
 the sandbox for a retry but stops renewing it. If the Agent process dies,
 nothing renews the lease, and Cloud destroys the sandbox once the lease lapses.

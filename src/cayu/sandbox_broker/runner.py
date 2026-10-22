@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import logging
 import posixpath
 import secrets
 import tarfile
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -58,11 +60,15 @@ from cayu.sandbox_broker.client import (
     SandboxBrokerUnavailableError,
     SandboxBusyError,
     SandboxCommand,
+    SandboxCopy,
+    SandboxCopyFailedError,
     SandboxGuarantees,
     SandboxLeaseLostError,
     SandboxNotFoundError,
     SandboxNotReadyError,
     SandboxRecord,
+    SandboxStagedCopies,
+    _CopyInDispatch,
     validate_command_shape,
 )
 from cayu.sandbox_broker.lease import SandboxLeaseKeeper
@@ -92,6 +98,8 @@ _ARCHIVE_END_BYTES = 1024
 _ARCHIVE_QUERY_BUDGET = 6 * 1024
 #: The largest file the brokered workspace can move in one archive.
 MAX_TRANSFER_FILE_BYTES = MAX_ARCHIVE_BYTES - 64 * 1024
+#: What a staged copy of one file may take beyond the file: its tar headers and padding.
+STAGED_FILE_OVERHEAD_BYTES = 64 * 1024
 
 
 def sandbox_capability_claims(
@@ -356,6 +364,57 @@ class BrokeredSandboxRunner(Runner):
         except (SandboxNotReadyError, SandboxNotFoundError) as error:
             raise self._lease_lost(error) from None
 
+    @property
+    def staged_copies(self) -> SandboxStagedCopies | None:
+        """What the sandbox offers for staged copies, or None when only archives work."""
+
+        return self.sandbox.staged_copies
+
+    async def copy_in(
+        self, source: BinaryIO, *, size: int, sha256: str, path: str | None = None
+    ) -> SandboxCopy:
+        """Extract a tar of any size the sandbox's staged copies take, through storage."""
+
+        self._ensure_exec_open()
+        self._require_lease()
+        dispatch = _CopyInDispatch()
+        try:
+            return await self._client.copy_in(
+                self.sandbox.id, source, size=size, sha256=sha256, path=path, _dispatch=dispatch
+            )
+        except (SandboxNotReadyError, SandboxNotFoundError) as error:
+            raise self._lease_lost(error) from None
+        except SandboxCopyFailedError as error:
+            if error.code == "sandbox_not_ready":
+                raise self._lease_lost(error) from None
+            raise
+        finally:
+            if dispatch.mutation_possible and not dispatch.settled:
+                self._poison_exec("the broker did not confirm staged workspace extraction stopped")
+
+    async def copy_out(
+        self,
+        sink: BinaryIO,
+        *,
+        max_bytes: int,
+        paths: Sequence[str] = (),
+        excludes: Sequence[str] = (),
+    ) -> SandboxCopy:
+        """Write a tar of ``paths`` to ``sink`` through storage; see ``SandboxBrokerClient``."""
+
+        self._ensure_exec_open()
+        self._require_lease()
+        try:
+            return await self._client.copy_out(
+                self.sandbox.id, sink, max_bytes=max_bytes, paths=paths, excludes=excludes
+            )
+        except (SandboxNotReadyError, SandboxNotFoundError) as error:
+            raise self._lease_lost(error) from None
+        except SandboxCopyFailedError as error:
+            if error.code == "sandbox_not_ready":
+                raise self._lease_lost(error) from None
+            raise
+
     async def refresh(self) -> SandboxRecord:
         self.sandbox = await self._client.get(self.sandbox.id)
         return self.sandbox
@@ -556,7 +615,10 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
     uploads the tree in archives of at most ``MAX_ARCHIVE_BYTES`` each, after
     checking every member against the workspace's exclusions; copy-back reads
     the named files in batches with the selective archive read, splitting a
-    batch the broker reports as too large. One file must fit in one archive.
+    batch the broker reports as too large. Where the sandbox offers staged
+    copies, a tree larger than one archive goes in as one staged copy, and a
+    file too large for one archive comes back as one; otherwise one file must
+    fit in one archive.
     """
 
     def __init__(self, runner: BrokeredSandboxRunner, **kwargs: Any) -> None:
@@ -578,6 +640,16 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             raise TypeError("BrokeredSandboxWorkspace tar source must be a binary stream.")
         if type(archive_bytes) is not int or archive_bytes < 0:
             raise ValueError("BrokeredSandboxWorkspace archive_bytes must be a non-negative int.")
+        staged = self._brokered_runner.staged_copies
+        # Include the splitter's conservative per-member allowance when selecting
+        # staging. Preserve split uploads when the tree exceeds the staged cap.
+        if (
+            staged is not None
+            and archive_bytes <= staged.max_bytes
+            and _sealed_size(archive_bytes + _ARCHIVE_MEMBER_OVERHEAD) > MAX_ARCHIVE_BYTES
+        ):
+            await self._write_staged(source, archive_bytes, staged)
+            return
         chunks = await asyncio.to_thread(self._split_archive, source, archive_bytes)
         for chunk in chunks:
             await self._brokered_runner.put_archive(chunk, path=self.cwd)
@@ -635,21 +707,60 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             # they arrive, and tar framing makes the reported size no measure
             # of file content.
             if len(batch) == 1:
-                raise RuntimeError(
-                    f"Workspace file is larger than one broker archive: {batch[0]}"
-                ) from None
+                staged = self._brokered_runner.staged_copies
+                if staged is None:
+                    raise RuntimeError(
+                        f"Workspace file is larger than one broker archive: {batch[0]}"
+                    ) from None
+                await self._stream_staged(batch[0], destination, budget, staged)
+                return
             middle = len(batch) // 2
             await self._stream_batch(batch[:middle], destination, budget)
             await self._stream_batch(batch[middle:], destination, budget)
             return
-        if result.missing_paths:
+        self._absorb(io.BytesIO(result.data), result.missing_paths, batch, destination, budget)
+
+    async def _stream_staged(
+        self,
+        path: str,
+        destination: tarfile.TarFile,
+        budget: _CopyBackBudget,
+        staged: SandboxStagedCopies,
+    ) -> None:
+        """Copy back one file too large for an archive as a staged copy, within the limits."""
+
+        prefix = "" if self.cwd is None else self.cwd.rstrip("/") + "/"
+        limit = min(staged.max_bytes, budget.per_file + STAGED_FILE_OVERHEAD_BYTES)
+        with tempfile.TemporaryFile() as spool:
+            try:
+                copy = await self._brokered_runner.copy_out(
+                    spool, max_bytes=limit, paths=[prefix + path]
+                )
+            except SandboxArchiveTooLargeError:
+                raise RuntimeError(
+                    f"Workspace file exceeds max_file_bytes={budget.per_file}: {path}"
+                ) from None
+            spool.seek(0)
+            self._absorb(spool, copy.missing, (path,), destination, budget)
+
+    def _absorb(
+        self,
+        source: BinaryIO,
+        missing: Sequence[str],
+        batch: tuple[str, ...],
+        destination: tarfile.TarFile,
+        budget: _CopyBackBudget,
+    ) -> None:
+        """Move the batch's files from one broker archive into ``destination``."""
+
+        prefix = "" if self.cwd is None else self.cwd.rstrip("/") + "/"
+        if missing:
             raise FileNotFoundError(
-                "Workspace files disappeared before copy-back: "
-                + ", ".join(sorted(result.missing_paths))[:500]
+                "Workspace files disappeared before copy-back: " + ", ".join(sorted(missing))[:500]
             )
         wanted = set(batch)
         found: set[str] = set()
-        with tarfile.open(fileobj=io.BytesIO(result.data), mode="r:") as archive:
+        with tarfile.open(fileobj=source, mode="r:") as archive:
             for member in archive:
                 name = posixpath.normpath(member.name)
                 if prefix and name.startswith(prefix):
@@ -672,6 +783,55 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
                 found.add(name)
         if found != wanted:
             raise RuntimeError("Broker archive did not return every requested file.")
+
+    async def _write_staged(
+        self, source: BinaryIO, archive_bytes: int, staged: SandboxStagedCopies
+    ) -> None:
+        """Copy the tree in as one staged copy, after checking every member."""
+
+        if archive_bytes > staged.max_bytes:
+            raise RuntimeError(
+                f"Workspace archive of {archive_bytes} bytes exceeds the broker's staged copy "
+                f"limit of {staged.max_bytes} bytes."
+            )
+        with tempfile.TemporaryFile() as spool:
+            digest = await asyncio.to_thread(self._spool_checked, source, archive_bytes, spool)
+            spool.seek(0)
+            await self._brokered_runner.copy_in(
+                spool, size=archive_bytes, sha256=digest, path=self.cwd
+            )
+
+    def _spool_checked(self, source: BinaryIO, archive_bytes: int, spool: BinaryIO) -> str:
+        """Write the archive to ``spool`` as it is read, checking its members as the split
+        path does; returns its SHA-256."""
+
+        limited = _LimitedReader(source, archive_bytes)
+        tee = _TeeReader(limited, spool)
+        with tarfile.open(fileobj=tee, mode="r|") as incoming:
+            for member in incoming:
+                name = posixpath.normpath(member.name)
+                if (
+                    posixpath.isabs(member.name)
+                    or name == ".."
+                    or name.startswith("../")
+                    or not (member.isreg() or member.isdir())
+                ):
+                    raise ValueError("Workspace archive members must be relative files.")
+                if member.isreg():
+                    self._require_path_allowed(name)
+            parsed_bytes = incoming.offset
+            while tee.read(1 << 16):
+                pass
+        # tarfile can stop at a zero block or corrupt header without raising.
+        # Readahead may already have copied later headers into the spool, so
+        # inspect from the last parsed member boundary rather than the reader.
+        spool.seek(parsed_bytes)
+        while trailing := spool.read(1 << 16):
+            if any(trailing):
+                raise ValueError("Workspace archive has unvalidated trailing content.")
+        if limited.read_bytes != archive_bytes:
+            raise RuntimeError("Workspace archive stream did not match its declared size.")
+        return tee.hexdigest()
 
     def _split_archive(self, source: BinaryIO, archive_bytes: int) -> list[bytes]:
         chunks: list[bytes] = []
@@ -762,6 +922,33 @@ class _LimitedReader(io.RawIOBase):
         data = self.read(len(buffer))
         buffer[: len(data)] = data
         return len(data)
+
+
+class _TeeReader(io.RawIOBase):
+    """Reads through ``source``, copying and hashing every byte into ``sink``."""
+
+    def __init__(self, source: io.RawIOBase, sink: BinaryIO) -> None:
+        self._source = source
+        self._sink = sink
+        self._digest = hashlib.sha256()
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._source.read(size)
+        if data:
+            self._sink.write(data)
+            self._digest.update(data)
+        return data
+
+    def readinto(self, buffer) -> int:
+        data = self.read(len(buffer))
+        buffer[: len(data)] = data
+        return len(data)
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
 
 
 class _CountingWriter(io.RawIOBase):

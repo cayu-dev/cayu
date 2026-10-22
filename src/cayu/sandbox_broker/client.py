@@ -2,23 +2,27 @@
 
 The client knows only the wire contract: it creates a sandbox from a catalog
 image, polls it, renews its lease, starts, polls and cancels commands, copies
-archives in and out, and destroys it. It holds a broker credential (the
-Agent's sandbox token or an Organization API key), never a cloud-provider
-credential, endpoint or image identity, and it imports no provider SDK.
+archives in and out, moves larger trees as staged copies, and destroys it. It
+holds a broker credential (the Agent's sandbox token or an Organization API
+key), never a cloud-provider credential, endpoint or image identity, and it
+imports no provider SDK. A staged copy's signed storage URL is sent only the
+archive and the headers the broker signed, never the broker credential.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import secrets
 import ssl
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import certifi
@@ -50,6 +54,8 @@ __all__ = [
     "SandboxBrokerUnavailableError",
     "SandboxBusyError",
     "SandboxCommand",
+    "SandboxCopy",
+    "SandboxCopyFailedError",
     "SandboxEgressMode",
     "SandboxFailure",
     "SandboxGuarantees",
@@ -59,6 +65,8 @@ __all__ = [
     "SandboxNotReadyError",
     "SandboxQuotaExceededError",
     "SandboxRecord",
+    "SandboxSignedTransfer",
+    "SandboxStagedCopies",
 ]
 
 #: Base URL of the Cloud API, for example ``https://cloud.cayu.dev``. Cloud injects it.
@@ -115,12 +123,21 @@ _KNOWN_CODES = frozenset(
         "sandbox_busy",
         "command_id_conflict",
         "archive_too_large",
+        "copy_id_conflict",
+        "copy_too_large",
+        "copies_unavailable",
     }
 )
 
 SandboxEgressMode = Literal["none", "public_web"]
 SandboxStatus = Literal["provisioning", "ready", "destroying", "destroyed", "failed"]
 CommandStatus = Literal["running", "exited", "timed_out", "cancelled", "failed"]
+CopyStatus = Literal["awaiting_upload", "pending", "running", "done", "failed", "expired"]
+_STAGED_CHUNK_BYTES = 1024 * 1024
+#: A staged copy waits at least this long, plus a second per MiB, to finish.
+_COPY_TIMEOUT_FLOOR_SECONDS = 600.0
+_COPY_BYTES_PER_SECOND = 1024 * 1024
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class SandboxBrokerError(RuntimeError):
@@ -191,6 +208,14 @@ class SandboxBrokerUnavailableError(SandboxBrokerError):
         self.outcome_unknown = outcome_unknown
 
 
+class SandboxCopyFailedError(SandboxBrokerError):
+    """A staged copy finished ``failed``; ``code`` is the copy's error code."""
+
+    def __init__(self, message: str, *, copy: SandboxCopy, **kwargs: Any) -> None:
+        super().__init__(message, **kwargs)
+        self.copy = copy
+
+
 class SandboxAllocationFailedError(SandboxBrokerError):
     """The broker reported the sandbox ``failed`` before it became ready."""
 
@@ -225,6 +250,15 @@ class SandboxGuarantees(BaseModel):
         return self.version >= 1 and item in self.items
 
 
+class SandboxStagedCopies(BaseModel):
+    """What the install offers for staged copies: one copy's bytes and a sandbox's."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    max_bytes: int
+    sandbox_max_bytes: int
+
+
 class SandboxRecord(BaseModel):
     """The broker's sandbox record. ``provider`` is informational only."""
 
@@ -244,6 +278,7 @@ class SandboxRecord(BaseModel):
     max_expires_at: datetime | None = None
     destroyed_at: datetime | None = None
     destroy_reason: str | None = None
+    staged_copies: SandboxStagedCopies | None = None
     guarantees: SandboxGuarantees | None = None
 
 
@@ -275,6 +310,52 @@ class SandboxCommand(BaseModel):
     @property
     def finished(self) -> bool:
         return self.status != "running"
+
+
+class SandboxSignedTransfer(BaseModel):
+    """One request to the install's storage, signed by the broker for one staged object."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    url: str = Field(repr=False)
+    method: Literal["PUT", "GET"]
+    headers: dict[str, str] = Field(default_factory=dict)
+    expires_at: datetime | None = None
+
+
+class SandboxCopyError(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    code: str
+    message: str = ""
+
+
+class SandboxCopy(BaseModel):
+    """One staged copy. ``size`` is the wire's ``bytes``."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    copy_id: str
+    direction: Literal["in", "out"]
+    status: CopyStatus
+    size: int | None = Field(default=None, alias="bytes")
+    sha256: str | None = None
+    path: str | None = None
+    files: int | None = None
+    unpacked_bytes: int | None = None
+    paths: tuple[str, ...] | None = None
+    excludes: tuple[str, ...] | None = None
+    missing: tuple[str, ...] = ()
+    upload: SandboxSignedTransfer | None = None
+    download: SandboxSignedTransfer | None = None
+    error: SandboxCopyError | None = None
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    expires_at: datetime | None = None
+
+    @property
+    def finished(self) -> bool:
+        return self.status in {"done", "failed", "expired"}
 
 
 @dataclass(frozen=True)
@@ -420,6 +501,12 @@ def relative_workspace_path(path: str | None) -> str | None:
     if any(part in {"", ".", ".."} for part in normalized.split("/")):
         raise ValueError("Sandbox workspace paths must be relative and stay inside /workspace.")
     return normalized
+
+
+@dataclass
+class _CopyInDispatch:
+    mutation_possible: bool = False
+    settled: bool = False
 
 
 class SandboxBrokerClient:
@@ -720,6 +807,301 @@ class SandboxBrokerClient:
         )
         return SandboxArchive(data=data, missing_paths=missing)
 
+    # Staged copies --------------------------------------------------------
+
+    async def start_copy_in(
+        self,
+        sandbox_id: str,
+        copy_id: str,
+        *,
+        size: int,
+        sha256: str,
+        path: str | None = None,
+    ) -> SandboxCopy:
+        """Start a copy in of a tar of ``size`` bytes; the copy carries its upload request."""
+
+        if type(size) is not int or size < 1:
+            raise ValueError("Staged copy size must be a positive integer.")
+        if type(sha256) is not str or _SHA256.fullmatch(sha256) is None:
+            raise ValueError("Staged copy sha256 must be 64 lowercase hex digits.")
+        payload: dict[str, Any] = {
+            "copy_id": _copy_id(copy_id),
+            "direction": "in",
+            "bytes": size,
+            "sha256": sha256,
+        }
+        relative = relative_workspace_path(path)
+        if relative is not None:
+            payload["path"] = relative
+        body, _ = await self._json(
+            "POST", self._sandbox_url(sandbox_id) + "/copies", payload=payload
+        )
+        return self._model(SandboxCopy, body)
+
+    async def start_copy_out(
+        self,
+        sandbox_id: str,
+        copy_id: str,
+        *,
+        paths: Sequence[str] = (),
+        excludes: Sequence[str] = (),
+    ) -> SandboxCopy:
+        """Start a copy out of ``paths`` (default the whole workspace)."""
+
+        if len(paths) > MAX_ARCHIVE_PATHS:
+            raise ValueError(f"Staged copies name at most {MAX_ARCHIVE_PATHS} paths.")
+        if len(excludes) > MAX_ARCHIVE_EXCLUDES:
+            raise ValueError(f"Staged copies exclude at most {MAX_ARCHIVE_EXCLUDES} names.")
+        for name in excludes:
+            if type(name) is not str or not name or "/" in name:
+                raise ValueError("Staged copy excludes must be directory names.")
+        payload = {
+            "copy_id": _copy_id(copy_id),
+            "direction": "out",
+            "paths": [relative_workspace_path(path) or "." for path in paths],
+            "excludes": list(excludes),
+        }
+        body, _ = await self._json(
+            "POST", self._sandbox_url(sandbox_id) + "/copies", payload=payload
+        )
+        return self._model(SandboxCopy, body)
+
+    async def commit_copy(
+        self, sandbox_id: str, copy_id: str, *, retry: bool = True
+    ) -> SandboxCopy:
+        """Hand an uploaded copy in to the broker; disable retries to track each attempt."""
+
+        body, _ = await self._json(
+            "POST", self._copy_url(sandbox_id, copy_id) + "/commit", retry=retry
+        )
+        return self._model(SandboxCopy, body)
+
+    async def get_copy(
+        self, sandbox_id: str, copy_id: str, *, wait_seconds: int = 0
+    ) -> SandboxCopy:
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= MAX_WAIT_SECONDS:
+            raise ValueError(f"wait_seconds must be from 0 to {MAX_WAIT_SECONDS}.")
+        body, _ = await self._json(
+            "GET",
+            self._copy_url(sandbox_id, copy_id),
+            params={"wait_seconds": str(wait_seconds)},
+            timeout_s=self.settings.request_timeout_s + wait_seconds,
+        )
+        return self._model(SandboxCopy, body)
+
+    async def upload_staged(
+        self, transfer: SandboxSignedTransfer, source: BinaryIO, *, size: int
+    ) -> None:
+        """Send ``size`` bytes of ``source`` with the signed upload request.
+
+        The request carries only the headers the broker signed. A seekable
+        source is resent from its start after a transport error.
+        """
+
+        if transfer.method != "PUT":
+            raise SandboxBrokerError("A staged upload must be a PUT.")
+        url = _staged_url(transfer.url)
+        start = source.tell() if source.seekable() else None
+        attempts = 1 + len(_RETRY_DELAYS_SECONDS) if start is not None else 1
+        for attempt in range(attempts):
+            if start is not None:
+                source.seek(start)
+            try:
+                response = await self._http().request(
+                    "PUT",
+                    url,
+                    content=_read_chunks(source, size),
+                    headers={**transfer.headers, "Content-Length": str(size)},
+                    timeout=self.settings.request_timeout_s,
+                )
+            except httpx.TransportError as exc:
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
+                    continue
+                raise SandboxBrokerUnavailableError(
+                    f"Staged upload failed: {type(exc).__name__}.", outcome_unknown=True
+                ) from None
+            if response.status_code < 300:
+                return
+            raise SandboxBrokerError(
+                f"Staged upload answered HTTP {response.status_code}.",
+                status=response.status_code,
+            )
+
+    async def download_staged(
+        self, transfer: SandboxSignedTransfer, sink: BinaryIO, *, size: int, sha256: str
+    ) -> None:
+        """Write the staged object to ``sink``, checking it is ``size`` bytes of ``sha256``."""
+
+        if transfer.method != "GET":
+            raise SandboxBrokerError("A staged download must be a GET.")
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            async with self._http().stream(
+                "GET",
+                _staged_url(transfer.url),
+                headers=transfer.headers,
+                timeout=self.settings.request_timeout_s,
+            ) as response:
+                if response.status_code >= 300:
+                    raise SandboxBrokerError(
+                        f"Staged download answered HTTP {response.status_code}.",
+                        status=response.status_code,
+                    )
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received > size:
+                        raise SandboxBrokerError("The staged copy is larger than reported.")
+                    digest.update(chunk)
+                    sink.write(chunk)
+        except httpx.TransportError as exc:
+            raise SandboxBrokerUnavailableError(
+                f"Staged download failed: {type(exc).__name__}."
+            ) from None
+        if received != size or digest.hexdigest() != sha256:
+            raise SandboxBrokerError("The staged copy doesn't match its size and digest.")
+
+    async def copy_in(
+        self,
+        sandbox_id: str,
+        source: BinaryIO,
+        *,
+        size: int,
+        sha256: str,
+        path: str | None = None,
+        copy_id: str | None = None,
+        timeout_s: float | None = None,
+        _dispatch: _CopyInDispatch | None = None,
+    ) -> SandboxCopy:
+        """Upload a tar and extract it under ``/workspace/<path>``; returns the done copy.
+
+        ``source`` holds the archive (``size`` bytes, SHA-256 ``sha256``). A
+        failed copy raises ``SandboxCopyFailedError``.
+        """
+
+        dispatch = _CopyInDispatch() if _dispatch is None else _dispatch
+        copy_id = copy_id or f"cayu-{secrets.token_hex(16)}"
+        origin = source.tell() if source.seekable() else None
+        copy = await self.start_copy_in(sandbox_id, copy_id, size=size, sha256=sha256, path=path)
+        dispatch.mutation_possible = copy.status in {"pending", "running"}
+        if copy.status == "awaiting_upload":
+            if copy.upload is None:
+                raise SandboxBrokerError("The broker returned a copy without its upload.")
+            try:
+                await self.upload_staged(copy.upload, source, size=size)
+            except SandboxBrokerError as error:
+                if error.status != 403 or origin is None:
+                    raise
+                # The signed URL lapsed while the archive was sent; a read signs a fresh one.
+                source.seek(origin)
+                fresh = await self.get_copy(sandbox_id, copy_id)
+                if fresh.upload is None:
+                    raise
+                await self.upload_staged(fresh.upload, source, size=size)
+            copy = await self._commit_uploaded_copy(sandbox_id, copy_id, dispatch)
+        dispatch.settled = copy.status not in {"pending", "running", "awaiting_upload"}
+        return await self._finished_copy(
+            sandbox_id, copy, size=size, timeout_s=timeout_s, _dispatch=dispatch
+        )
+
+    async def _commit_uploaded_copy(
+        self, sandbox_id: str, copy_id: str, dispatch: _CopyInDispatch
+    ) -> SandboxCopy:
+        outcome_unknown = False
+        for attempt in range(1 + len(_RETRY_DELAYS_SECONDS)):
+            # Cancellation while a request is in flight must fence reuse.
+            dispatch.mutation_possible = True
+            try:
+                return await self.commit_copy(sandbox_id, copy_id, retry=False)
+            except SandboxBrokerRefusedError:
+                # A refusal settles only this attempt, not an earlier lost answer.
+                dispatch.settled = not outcome_unknown
+                raise
+            except SandboxBrokerUnavailableError as error:
+                outcome_unknown = outcome_unknown or error.outcome_unknown
+                dispatch.mutation_possible = outcome_unknown
+                if attempt == len(_RETRY_DELAYS_SECONDS):
+                    raise
+                await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
+        raise AssertionError("unreachable copy commit retry loop")
+
+    async def copy_out(
+        self,
+        sandbox_id: str,
+        sink: BinaryIO,
+        *,
+        max_bytes: int,
+        paths: Sequence[str] = (),
+        excludes: Sequence[str] = (),
+        copy_id: str | None = None,
+        timeout_s: float | None = None,
+    ) -> SandboxCopy:
+        """Write a tar of ``paths`` to ``sink``; returns the done copy (with ``missing``).
+
+        A tar over ``max_bytes`` raises ``SandboxArchiveTooLargeError`` with its
+        size before anything is downloaded.
+        """
+
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("Staged copy max_bytes must be a positive integer.")
+        copy_id = copy_id or f"cayu-{secrets.token_hex(16)}"
+        copy = await self.start_copy_out(sandbox_id, copy_id, paths=paths, excludes=excludes)
+        copy = await self._finished_copy(sandbox_id, copy, size=max_bytes, timeout_s=timeout_s)
+        if copy.size is None or copy.sha256 is None:
+            raise SandboxBrokerError("The broker returned a copy without its size and digest.")
+        if copy.size > max_bytes:
+            raise SandboxArchiveTooLargeError(
+                f"The staged copy is {copy.size} bytes, over {max_bytes}.",
+                code="archive_too_large",
+                detail={"bytes": copy.size},
+            )
+        if copy.download is None:
+            raise SandboxBrokerError("The staged copy's download is no longer available.")
+        await self.download_staged(copy.download, sink, size=copy.size, sha256=copy.sha256)
+        return copy
+
+    async def _finished_copy(
+        self,
+        sandbox_id: str,
+        copy: SandboxCopy,
+        *,
+        size: int,
+        timeout_s: float | None,
+        _dispatch: _CopyInDispatch | None = None,
+    ) -> SandboxCopy:
+        loop = asyncio.get_running_loop()
+        limit = (
+            _COPY_TIMEOUT_FLOOR_SECONDS + size / _COPY_BYTES_PER_SECOND
+            if timeout_s is None
+            else timeout_s
+        )
+        deadline = loop.time() + limit
+        while copy.status in {"pending", "running"}:
+            if loop.time() >= deadline:
+                raise SandboxBrokerUnavailableError(
+                    f"Staged copy {copy.copy_id} did not finish within {limit:g} seconds."
+                )
+            copy = await self.get_copy(sandbox_id, copy.copy_id, wait_seconds=MAX_WAIT_SECONDS)
+        if _dispatch is not None:
+            _dispatch.settled = True
+        if copy.status != "done":
+            error = copy.error
+            code = None if error is None else error.code
+            if code == "copy_too_large":
+                raise SandboxArchiveTooLargeError(
+                    f"Staged copy {copy.copy_id} failed: {code}.",
+                    code=code,
+                    detail={} if copy.size is None else {"bytes": copy.size},
+                )
+            raise SandboxCopyFailedError(
+                f"Staged copy {copy.copy_id} {copy.status}" + (f": {code}" if code else "."),
+                copy=copy,
+                code=code,
+                detail={} if copy.size is None else {"bytes": copy.size},
+            )
+        return copy
+
     # Transport ------------------------------------------------------------
 
     def _sandbox_url(self, sandbox_id: str) -> str:
@@ -731,6 +1113,9 @@ class SandboxBrokerClient:
         if type(command_id) is not str or _COMMAND_ID.fullmatch(command_id) is None:
             raise ValueError("Sandbox command_id must be 1 to 128 of [A-Za-z0-9._:-].")
         return f"{self._sandbox_url(sandbox_id)}/commands/{quote(command_id, safe='')}"
+
+    def _copy_url(self, sandbox_id: str, copy_id: str) -> str:
+        return f"{self._sandbox_url(sandbox_id)}/copies/{quote(_copy_id(copy_id), safe='')}"
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -821,6 +1206,35 @@ class SandboxBrokerClient:
         raise AssertionError("unreachable broker retry loop")
 
 
+def _copy_id(copy_id: str) -> str:
+    if type(copy_id) is not str or _COMMAND_ID.fullmatch(copy_id) is None:
+        raise ValueError("Sandbox copy_id must be 1 to 128 of [A-Za-z0-9._:-].")
+    return copy_id
+
+
+def _staged_url(url: str) -> str:
+    """A signed storage URL: HTTPS, or HTTP on a loopback host, with no credentials in it."""
+
+    parts = urlsplit(url)
+    if parts.scheme not in {"https", "http"} or not parts.hostname:
+        raise SandboxBrokerError("The broker returned a staged URL that isn't an HTTPS URL.")
+    if parts.scheme == "http" and parts.hostname not in _LOCAL_HOSTS:
+        raise SandboxBrokerError("The broker returned a staged URL that isn't an HTTPS URL.")
+    if parts.username or parts.password:
+        raise SandboxBrokerError("The broker returned a staged URL carrying credentials.")
+    return url
+
+
+async def _read_chunks(source: BinaryIO, size: int) -> AsyncIterator[bytes]:
+    remaining = size
+    while remaining > 0:
+        chunk = await asyncio.to_thread(source.read, min(_STAGED_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise SandboxBrokerError("The staged archive is shorter than its size.")
+        remaining -= len(chunk)
+        yield chunk
+
+
 def _broker_error(status: int, body: bytes) -> SandboxBrokerError:
     code: str | None = None
     message = ""
@@ -858,6 +1272,7 @@ def _broker_error(status: int, body: bytes) -> SandboxBrokerError:
     error_type = {
         "sandbox_quota_exceeded": SandboxQuotaExceededError,
         "archive_too_large": SandboxArchiveTooLargeError,
+        "copy_too_large": SandboxArchiveTooLargeError,
         "sandbox_not_ready": SandboxNotReadyError,
         "sandbox_busy": SandboxBusyError,
     }.get(code, SandboxBrokerRefusedError)
