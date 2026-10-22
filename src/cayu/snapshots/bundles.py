@@ -18,7 +18,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -54,6 +54,12 @@ from cayu.snapshots._filesystem_publication import (
 )
 from cayu.snapshots._filesystem_publication import (
     prepare_directory as _prepare_cas_directory,
+)
+from cayu.snapshots._filesystem_publication import (
+    reopen_child as _reopen_snapshot_child,
+)
+from cayu.snapshots._filesystem_publication import (
+    reopen_directory as _reopen_snapshot_directory,
 )
 from cayu.snapshots._filesystem_publication import (
     require_named_directory as _require_named_cas_directory,
@@ -1634,6 +1640,89 @@ def _object_ref(
     )
 
 
+_MATERIALIZATION_RECEIPT_NAME = ".cayu-materialization.json"
+
+
+def _require_materialization_publication_guards() -> None:
+    if (
+        not _cas_descriptor_guards_available()
+        or os.listdir not in os.supports_fd
+        or not hasattr(os, "fchmod")
+    ):
+        raise AgentBundleError("materialization_durability_unavailable")
+
+
+def _materialized_entry_state(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+@dataclass(frozen=True)
+class _MaterializationParent:
+    root: Path
+    root_fd: int
+    scope: str
+    scope_fd: int
+
+    def require_current(self) -> None:
+        if _directory_identity(self.root.stat()) != _directory_identity(os.fstat(self.root_fd)):
+            raise AgentBundleError("materialization_directory_changed")
+        _require_named_cas_directory(self.root_fd, self.scope, self.scope_fd)
+
+    def sync(self, name: str, tree_fd: int) -> None:
+        for descriptor in (self.scope_fd, self.root_fd):
+            self.require_current()
+            _require_named_cas_directory(self.scope_fd, name, tree_fd)
+            os.fsync(descriptor)
+        self.require_current()
+        _require_named_cas_directory(self.scope_fd, name, tree_fd)
+
+
+@contextmanager
+def _open_materialization_parent(
+    root: Path, scope: str, kind: str, *, create: bool
+) -> Iterator[_MaterializationParent]:
+    _require_materialization_publication_guards()
+    prepared_identity = _prepare_cas_directory(root) if create else None
+    with (
+        cooperative_path_lock(
+            root,
+            f"{scope}/{kind}",
+            lock_directory_name="cayu-agent-snapshot-materialization-locks",
+        ),
+        ExitStack() as opened,
+    ):
+        try:
+            root_fd = _reopen_snapshot_directory(root, allow_alias=create)
+            opened.callback(os.close, root_fd)
+            if (
+                prepared_identity is not None
+                and _directory_identity(os.fstat(root_fd)) != prepared_identity
+            ):
+                raise AgentBundleError("materialization_directory_changed")
+            scope_fd = (
+                _prepare_cas_child(root_fd, scope)
+                if create
+                else _reopen_snapshot_child(root_fd, scope)
+            )
+            opened.callback(os.close, scope_fd)
+        except FileNotFoundError as error:
+            raise AgentBundleError("materialization_recovery_destination_missing") from error
+        except OSError as error:
+            if error.errno in _CAS_PATH_ERROR_NUMBERS:
+                raise AgentBundleError("materialization_path_not_regular") from error
+            raise
+        parent = _MaterializationParent(root, root_fd, scope, scope_fd)
+        parent.require_current()
+        yield parent
+
+
 class PortableAgentSnapshotComponentProvider(AgentSnapshotComponentProvider):
     """Production adapter for immutable provider-owned component packages.
 
@@ -1848,22 +1937,30 @@ class PortableAgentSnapshotComponentProvider(AgentSnapshotComponentProvider):
         )
         return materialized
 
+    def _require_materializable_package(self) -> None:
+        for file in self.package.files:
+            if PurePosixPath(file.path).parts[0].casefold() == _MATERIALIZATION_RECEIPT_NAME:
+                raise AgentBundleError("materialization_reserved_path")
+
     def _recover_sync(
         self,
         component: AgentSnapshotComponentRef,
         state_scope_id: str,
         operation_id: str,
     ) -> None:
+        self._require_materializable_package()
+        _require_materialization_publication_guards()
         if self.materialization_root.is_symlink() or not self.materialization_root.is_dir():
             raise AgentBundleError("materialization_recovery_destination_missing")
-        with cooperative_path_lock(
+        with _open_materialization_parent(
             self.materialization_root,
-            f"{state_scope_id}/{self.kind.value}",
-            lock_directory_name="cayu-agent-snapshot-materialization-locks",
-        ):
-            destination = self.materialization_root / state_scope_id / self.kind.value
-            self._verify_materialized_destination(
-                destination,
+            state_scope_id,
+            self.kind.value,
+            create=False,
+        ) as parent:
+            self._settle_materialized_destination(
+                parent,
+                self.kind.value,
                 component=component,
                 state_scope_id=state_scope_id,
                 operation_id=operation_id,
@@ -1890,30 +1987,33 @@ class PortableAgentSnapshotComponentProvider(AgentSnapshotComponentProvider):
         request: AgentSnapshotMaterializationRequest,
         operation: AgentSnapshotMaterializationOperation,
     ) -> AgentSnapshotMaterializedComponent:
-        self.materialization_root.mkdir(parents=True, exist_ok=True)
-        with cooperative_path_lock(
+        self._require_materializable_package()
+        with _open_materialization_parent(
             self.materialization_root,
-            f"{request.state_scope_id}/{self.kind.value}",
-            lock_directory_name="cayu-agent-snapshot-materialization-locks",
-        ):
-            return self._materialize_locked(component, request, operation)
+            request.state_scope_id,
+            self.kind.value,
+            create=True,
+        ) as parent:
+            return self._materialize_locked(component, request, operation, parent)
 
     def _materialize_locked(
         self,
         component: AgentSnapshotComponentRef,
         request: AgentSnapshotMaterializationRequest,
         operation: AgentSnapshotMaterializationOperation,
+        parent: _MaterializationParent,
     ) -> AgentSnapshotMaterializedComponent:
         destination = self.materialization_root / request.state_scope_id / self.kind.value
-        receipt_path = destination / ".cayu-materialization.json"
+        receipt_path = destination / _MATERIALIZATION_RECEIPT_NAME
         expected = {
             "operation_id": operation.operation_id,
             "component_digest": component.logical.fingerprint,
             "state_scope_id": request.state_scope_id,
         }
         if receipt_path.exists():
-            self._verify_materialized_destination(
-                destination,
+            self._settle_materialized_destination(
+                parent,
+                self.kind.value,
                 component=component,
                 state_scope_id=request.state_scope_id,
                 operation_id=operation.operation_id,
@@ -1925,10 +2025,16 @@ class PortableAgentSnapshotComponentProvider(AgentSnapshotComponentProvider):
         if temporary.exists():
             if temporary.is_symlink() or not temporary.is_dir():
                 raise AgentBundleError("materialization_staging_conflict")
-            shutil.rmtree(temporary)
-        temporary.mkdir(parents=True)
+            shutil.rmtree(temporary.name, dir_fd=parent.scope_fd)
+        parent.require_current()
+        os.mkdir(temporary.name, dir_fd=parent.scope_fd)
+        staged = os.open(temporary.name, _CAS_DIRECTORY_FLAGS, dir_fd=parent.scope_fd)
+        staged_identity: tuple[int, int] | None = None
         try:
+            staged_identity = _directory_identity(os.fstat(staged))
             for file in self.package.files:
+                parent.require_current()
+                _require_named_cas_directory(parent.scope_fd, temporary.name, staged)
                 target = temporary.joinpath(*PurePosixPath(file.path).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 content = self.blobs.get(file.digest)
@@ -1938,10 +2044,13 @@ class PortableAgentSnapshotComponentProvider(AgentSnapshotComponentProvider):
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                         0o700 if file.executable else 0o600,
                     )
-                    with os.fdopen(descriptor, "wb") as stream:
-                        stream.write(content)
-                        stream.flush()
-                        os.fsync(stream.fileno())
+                    try:
+                        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                            stream.write(content)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    finally:
+                        os.close(descriptor)
                 else:
                     reference = AgentBundleObjectRef(
                         digest=file.digest,
@@ -1950,62 +2059,205 @@ class PortableAgentSnapshotComponentProvider(AgentSnapshotComponentProvider):
                         byte_count=file.byte_count,
                     )
                     asyncio.run(self.object_store.copy_to(reference, target))
-                    target.chmod(0o700 if file.executable else 0o600)
+                    descriptor = os.open(target, _CAS_FILE_FLAGS)
+                    try:
+                        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                            raise AgentBundleError("materialization_path_not_regular")
+                        os.fchmod(descriptor, 0o700 if file.executable else 0o600)
+                    finally:
+                        os.close(descriptor)
             receipt = temporary / receipt_path.name
             receipt.write_bytes(canonical_durable_json_bytes(expected, "materialization_receipt"))
-            os.replace(temporary, destination)
+            self._settle_materialized_destination(
+                parent,
+                temporary.name,
+                component=component,
+                state_scope_id=request.state_scope_id,
+                operation_id=operation.operation_id,
+                publish_as=destination.name,
+                staged_identity=staged_identity,
+            )
         except BaseException:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+            try:
+                current = os.stat(temporary.name, dir_fd=parent.scope_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if staged_identity is not None and _directory_identity(current) == staged_identity:
+                    shutil.rmtree(temporary.name, dir_fd=parent.scope_fd)
             raise
+        finally:
+            os.close(staged)
         return self._materialized_component(component, request, destination)
 
-    def _verify_materialized_destination(
+    def _settle_materialized_destination(
         self,
-        destination: Path,
+        parent: _MaterializationParent,
+        name: str,
         *,
         component: AgentSnapshotComponentRef,
         state_scope_id: str,
         operation_id: str,
+        publish_as: str | None = None,
+        staged_identity: tuple[int, int] | None = None,
     ) -> None:
-        if destination.is_symlink() or not destination.is_dir():
-            raise AgentBundleError("materialization_recovery_destination_missing")
-        receipt_name = ".cayu-materialization.json"
-        expected_paths = {file.path for file in self.package.files} | {receipt_name}
+        parent.require_current()
+        try:
+            tree = os.open(name, _CAS_DIRECTORY_FLAGS, dir_fd=parent.scope_fd)
+        except FileNotFoundError as error:
+            raise AgentBundleError("materialization_recovery_destination_missing") from error
+        except OSError as error:
+            if error.errno in _CAS_PATH_ERROR_NUMBERS:
+                raise AgentBundleError("materialization_path_not_regular") from error
+            raise
+        try:
+            if (
+                staged_identity is not None
+                and _directory_identity(os.fstat(tree)) != staged_identity
+            ):
+                raise AgentBundleError("materialization_directory_changed")
+            _require_named_cas_directory(parent.scope_fd, name, tree)
+            states = self._verify_materialized_destination(
+                tree,
+                component=component,
+                state_scope_id=state_scope_id,
+                operation_id=operation_id,
+                synchronize=True,
+            )
+            parent.require_current()
+            _require_named_cas_directory(parent.scope_fd, name, tree)
+            if publish_as is not None:
+                os.rename(name, publish_as, src_dir_fd=parent.scope_fd, dst_dir_fd=parent.scope_fd)
+                name = publish_as
+                published = _materialized_entry_state(os.fstat(tree))
+                if published[:-1] != states[""][:-1]:
+                    raise AgentBundleError("materialization_changed_during_publication")
+                # Rename may update the directory ctime, but no content or mode.
+                states[""] = published
+            parent.sync(name, tree)
+            self._verify_materialized_destination(
+                tree,
+                component=component,
+                state_scope_id=state_scope_id,
+                operation_id=operation_id,
+                previous=states,
+            )
+            parent.require_current()
+            _require_named_cas_directory(parent.scope_fd, name, tree)
+        finally:
+            os.close(tree)
+
+    def _verify_materialized_destination(
+        self,
+        directory_fd: int,
+        *,
+        component: AgentSnapshotComponentRef,
+        state_scope_id: str,
+        operation_id: str,
+        synchronize: bool = False,
+        previous: dict[str, tuple[int, ...]] | None = None,
+    ) -> dict[str, tuple[int, ...]]:
+        receipt_name = _MATERIALIZATION_RECEIPT_NAME
+        expected_files = {file.path: file for file in self.package.files}
+        expected_paths = set(expected_files) | {receipt_name}
         observed_paths: set[str] = set()
-        for current, directories, filenames in os.walk(destination, followlinks=False):
-            current_path = Path(current)
-            for directory in directories:
-                child = current_path / directory
-                if child.is_symlink() or not child.is_dir():
-                    raise AgentBundleError("materialization_path_not_regular")
-            for filename in filenames:
-                child = current_path / filename
-                if child.is_symlink() or not child.is_file():
-                    raise AgentBundleError("materialization_path_not_regular")
-                observed_paths.add(child.relative_to(destination).as_posix())
-        if observed_paths != expected_paths:
-            raise AgentBundleError("materialization_closure_mismatch")
         expected_receipt = {
             "operation_id": operation_id,
             "component_digest": component.logical.fingerprint,
             "state_scope_id": state_scope_id,
         }
-        receipt_path = destination / receipt_name
-        try:
-            durable = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except Exception as error:
-            raise AgentBundleError("materialization_receipt_invalid") from error
-        if durable != expected_receipt:
-            raise AgentBundleError("materialization_operation_conflict")
-        for file in self.package.files:
-            path = destination.joinpath(*PurePosixPath(file.path).parts)
-            digest, byte_count = _file_digest_and_size(path, max_bytes=file.byte_count)
-            if digest != file.digest or byte_count != file.byte_count:
-                raise AgentBundleError("materialization_file_integrity_mismatch")
-            is_executable = bool(path.stat().st_mode & stat.S_IXUSR)
-            if is_executable != file.executable:
-                raise AgentBundleError("materialization_file_mode_mismatch")
+        states: dict[str, tuple[int, ...]] = {}
+
+        def remember(path: str, info: os.stat_result) -> None:
+            state = _materialized_entry_state(info)
+            if previous is not None and previous.get(path) != state:
+                raise AgentBundleError("materialization_changed_during_publication")
+            states[path] = state
+
+        def visit(current: int, prefix: str) -> None:
+            before = os.fstat(current)
+            for name in sorted(os.listdir(current)):
+                path = f"{prefix}/{name}" if prefix else name
+                info = os.stat(name, dir_fd=current, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, _CAS_DIRECTORY_FLAGS, dir_fd=current)
+                    try:
+                        _require_named_cas_directory(current, name, child)
+                        visit(child, path)
+                        _require_named_cas_directory(current, name, child)
+                    finally:
+                        os.close(child)
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise AgentBundleError("materialization_path_not_regular")
+                if path not in expected_paths:
+                    raise AgentBundleError("materialization_closure_mismatch")
+                observed_paths.add(path)
+                descriptor = os.open(name, _CAS_FILE_FLAGS, dir_fd=current)
+                try:
+                    opened = os.fstat(descriptor)
+                    if not stat.S_ISREG(opened.st_mode):
+                        raise AgentBundleError("materialization_path_not_regular")
+                    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                        if _materialized_entry_state(opened) != _materialized_entry_state(info):
+                            raise AgentBundleError("materialization_changed_during_publication")
+                        if previous is None:
+                            if path == receipt_name:
+                                try:
+                                    durable = json.loads(
+                                        stream.read(AGENT_BUNDLE_MAX_INDEX_BYTES + 1).decode(
+                                            "utf-8"
+                                        )
+                                    )
+                                except Exception as error:
+                                    raise AgentBundleError(
+                                        "materialization_receipt_invalid"
+                                    ) from error
+                                if opened.st_size > AGENT_BUNDLE_MAX_INDEX_BYTES:
+                                    raise AgentBundleError("materialization_receipt_invalid")
+                                if durable != expected_receipt:
+                                    raise AgentBundleError("materialization_operation_conflict")
+                            else:
+                                file = expected_files[path]
+                                digest = sha256()
+                                count = 0
+                                while chunk := stream.read(
+                                    min(1024 * 1024, file.byte_count - count + 1)
+                                ):
+                                    count += len(chunk)
+                                    if count > file.byte_count:
+                                        raise AgentBundleError(
+                                            "materialization_file_integrity_mismatch"
+                                        )
+                                    digest.update(chunk)
+                                if digest.hexdigest() != file.digest or count != file.byte_count:
+                                    raise AgentBundleError(
+                                        "materialization_file_integrity_mismatch"
+                                    )
+                                if bool(opened.st_mode & stat.S_IXUSR) != file.executable:
+                                    raise AgentBundleError("materialization_file_mode_mismatch")
+                        if synchronize:
+                            os.fsync(stream.fileno())
+                        after = os.fstat(stream.fileno())
+                        named = os.stat(name, dir_fd=current, follow_symlinks=False)
+                        if _materialized_entry_state(after) != _materialized_entry_state(
+                            opened
+                        ) or _materialized_entry_state(named) != _materialized_entry_state(after):
+                            raise AgentBundleError("materialization_changed_during_publication")
+                        remember(path, after)
+                finally:
+                    os.close(descriptor)
+            if synchronize:
+                os.fsync(current)
+            after = os.fstat(current)
+            if _materialized_entry_state(before) != _materialized_entry_state(after):
+                raise AgentBundleError("materialization_changed_during_publication")
+            remember(prefix, after)
+
+        visit(directory_fd, "")
+        if observed_paths != expected_paths or (previous is not None and states != previous):
+            raise AgentBundleError("materialization_closure_mismatch")
+        return states
 
     def _materialized_component(
         self,
@@ -3535,6 +3787,7 @@ class AgentBundleCoordinator:
         authority = self.materialization_authority
         if authority is None:
             raise AgentBundleError("materialization_authority_unavailable")
+        _require_materialization_publication_guards()
         snapshot = await self.snapshot_store.get_snapshot(validated.access)
         if snapshot.ref != validated.bundle.snapshot_ref:
             raise AgentBundleError("materialization_snapshot_mismatch")

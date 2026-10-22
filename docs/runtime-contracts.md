@@ -17759,6 +17759,55 @@ bundle export destinations, `copy_to()` destinations, or component materializati
 directories. They do not establish a recoverable snapshot when required objects
 or a higher-level root reference are missing.
 
+`PortableAgentSnapshotComponentProvider` also fences component materialization
+publication and recovery on supported filesystems. It prepares only the parent
+materialization root and state-scope directory with the snapshot-owned directory
+protocol above. Component and staging trees contain only declared files,
+ordinary directories, and their existing native materialization receipt; private
+directory-publication metadata never enters their exact closure.
+The root `.cayu-materialization.json` path is reserved for that receipt. Packages
+that declare it, a descendant beneath it, or a case-folded alias refuse with
+`materialization_reserved_path` before filesystem effects on fresh publication,
+retry, and either recovery entrance. Package capture, export, and read-only
+verification remain available; they do not confer materialization compatibility.
+
+A fresh component flushes every regular file after its final mode is set, its
+receipt, and nested directories bottom-up before the atomic component rename.
+It then flushes the scope and materialization-root directory entries and
+rechecks the named tree and files before returning. Exact materialization
+retries, active-operation recovery, and completed-record recovery all verify
+and resynchronize the retained result through the same fence. They preserve
+receipt bytes, file modes, operation identities, and mutable overlay identities;
+they do not replace valid retained state merely because a prior acknowledgement
+was lost. Failed barriers refuse success. A caller cancellation does not prove
+that its dispatched filesystem thread stopped: recovery serializes with that
+writer under the existing cooperative lock before settling the exact outcome.
+
+Completed-record recovery opens only existing parents and the existing result.
+Missing parents, component, or receipt are not reconstructed from the logical
+record. Changed declared content, executable bits, conflicting receipts, extra
+files, and nonregular entries retain their existing refusal semantics; recovery
+does not repair or reset mutable data. Permitted other permission bits and empty
+ordinary directories remain untouched. Traversal failures propagate, and live
+named inode checks reject detached outcomes. These checks bound open files per
+traversal depth rather than retaining one descriptor per component file; they
+are not isolation from arbitrary external writers or proof of physical
+power-loss safety.
+
+**Portable filesystem compatibility:** provider construction and read-only
+package verification remain available independently of materialization support.
+Materialization and both recovery entrances now deliberately refuse with
+`AgentBundleError("materialization_durability_unavailable")` before local effects
+when the required POSIX descriptor-relative identity and directory operations
+are unavailable, including the current Windows backend. Portable bundle
+materialization checks this before allocating fresh authority. This replaces
+previous best-effort materialization on such platforms; there is no weakening
+flag. A supported platform whose filesystem rejects a flush also refuses
+acknowledgement, but may have retained an outcome for exact recovery. Existing
+unmarked external parents still require durable provisioning. This contract
+does not add a Windows durability backend, establish relocation recovery, or
+change export and standalone object-copy publication semantics.
+
 `AgentBundleCoordinator.export()` installs an `exporting` root protection,
 enumerates the authorized snapshot closure, verifies every portable component
 and blob, writes an ordinary filesystem directory through a private staging

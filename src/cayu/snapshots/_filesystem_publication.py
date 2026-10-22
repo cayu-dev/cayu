@@ -1,4 +1,4 @@
-"""Recoverable publication of directories owned by the filesystem snapshot CAS."""
+"""Recoverable publication of directories owned by snapshot filesystem adapters."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _require_owned_file(descriptor: int) -> None:
 def _recover_child(parent_fd: int, name: str, descriptor: int) -> None:
     if not _has_pending(descriptor):
         return
-    # This module is called only behind the existing POSIX CAS capability guard.
+    # This module is called only behind the snapshot filesystem capability guards.
     # Keep the optional module out of import-time paths on Windows.
     import fcntl
 
@@ -206,3 +206,34 @@ def prepare_directory(path: Path) -> tuple[int, int]:
         return result
     finally:
         os.close(descriptor)
+
+
+def reopen_directory(path: Path, *, allow_alias: bool = False) -> int:
+    """Reopen retained state and finish only an existing pending publication."""
+    resolved = path.resolve(strict=True) if allow_alias else path
+    descriptor = os.open(resolved, _DIRECTORY_FLAGS)
+    try:
+        if _has_pending(descriptor):
+            parent = os.open(resolved.parent.resolve(strict=True), _DIRECTORY_FLAGS)
+            try:
+                _recover_child(parent, resolved.name, descriptor)
+            finally:
+                os.close(parent)
+        if identity(path.stat()) != identity(os.fstat(descriptor)):
+            raise OSError(errno.ESTALE, "Snapshot storage root changed during recovery.")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def reopen_child(parent_fd: int, name: str) -> int:
+    """Reopen a named child without creating a missing outcome."""
+    descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        _recover_child(parent_fd, name, descriptor)
+        require_named_directory(parent_fd, name, descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
