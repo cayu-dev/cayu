@@ -20,6 +20,13 @@ from cayu.server.auth import server_auth_dependency
 if TYPE_CHECKING:
     from cayu.server.auth import AuthDependency
 
+_BROWSER_CLIENT_ENDPOINT = object()
+
+
+def is_browser_client_endpoint(endpoint: object) -> bool:
+    return getattr(endpoint, "_cayu_browser_client", None) is _BROWSER_CLIENT_ENDPOINT
+
+
 BROWSER_CLIENT_MODULE = "client.js"
 BROWSER_CLIENT_TYPES = "client.d.ts"
 
@@ -94,6 +101,7 @@ def _static_endpoint(content: bytes, media_type: str):
             response.headers["Content-Length"] = str(len(content))
         return response
 
+    setattr(endpoint, "_cayu_browser_client", _BROWSER_CLIENT_ENDPOINT)  # noqa: B010
     return endpoint
 
 

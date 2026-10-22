@@ -16,7 +16,8 @@ If you set `run_task_worker(execution_timeout_s=...)`, it now bounds the whole
 handler call: check that delivery and retry work fits within it plus
 `execution_grace_s` (see the breaking change below). Storage revision 124,
 compatibility floor 124, server contract 49 and manifest schema 17 are all
-unchanged.
+unchanged. The Agent also trusts a sign-in proxy identity header when the
+`CAYU_PROXY_IDENTITY_*` variables are set.
 
 ### Breaking changes
 
@@ -81,6 +82,26 @@ unchanged.
   conversation content. The cursor is a position in the store's event sequence,
   so a reader continues across restarts without a gap.
   `cayu.cloud_reporting.read_cloud_activity` reads the same pages in process.
+- A server can trust a sign-in proxy in front of it to say who is calling.
+  `cayu.server.ProxyIdentityAuth` verifies the short-lived JWT the proxy adds to
+  each request as `X-Cayu-Identity` (ES256, `typ` `cayu-proxy-identity+jwt`, at
+  most 120 seconds, with a `jti`) against the proxy's JWKS, and returns an
+  `AuthContext` with the person (`sub`), their Organization (`org`, as `tenant`)
+  and their `role`, `name` and `email`. A request with the header must verify or
+  gets 401; one without it goes to a fallback, such as the operator login. On the
+  control plane `admin` and `developer` use every route and `member` may only read
+  and decide: approvals, questions, inbox items and knowledge proposals, plus the
+  read and query routes and the Developer dashboard. `ControlPlaneRoles` holds
+  that rule, and `product_dependency(roles=...)` gives a product the person and
+  limits it to some roles. `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`
+  builds it, with the operator login as the fallback, when
+  `CAYU_PROXY_IDENTITY_ISSUER`, `CAYU_PROXY_IDENTITY_AUDIENCE` and
+  `CAYU_PROXY_IDENTITY_JWKS_URL` are set (optionally
+  `CAYU_PROXY_IDENTITY_HEADER`); setting only some of them stops the server at
+  startup. Cayu Cloud uses it to sign people in to an Agent's app and Developer
+  dashboard with their Cloud login. The `server` and `server-settings` extras now
+  include PyJWT. See
+  [trusted proxy identity](runtime-contracts.md#trusted-proxy-identity).
 - Fix: a Docker egress container could reach the Docker host through its
   internal network's gateway address, so a host service listening on all
   interfaces was reachable from a hardened guest. `DockerEgressAdapter` now

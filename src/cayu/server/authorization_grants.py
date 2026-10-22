@@ -38,7 +38,12 @@ from cayu.approvals.authorization_grants import (
 )
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.server._inbox_access import InboxAccessGate
-from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
+from cayu.server.auth import (
+    AuthContext,
+    AuthDependency,
+    _resolution_actor_claims,
+    server_auth_dependency,
+)
 from cayu.server.contracts import BOUNDED_STREAMING_ENDPOINT_RESPONSES
 from cayu.server.inbox import InboxAccess
 
@@ -137,7 +142,7 @@ def _actor(auth: AuthContext) -> ResolutionActor:
             subject=auth.subject,
             tenant=auth.tenant,
             source=ResolutionActorSource.HTTP_AUTH,
-            claims=auth.claims,
+            claims=_resolution_actor_claims(auth),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

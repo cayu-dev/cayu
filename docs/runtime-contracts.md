@@ -19814,3 +19814,114 @@ and values are only added, so a reader ignores fields and values it does not
 know; the `cayu.cloud_reporting` models ignore unknown fields for that reason.
 `status` gains a value only in a new version. A new version ships in a minor
 release, under its own `{api}/cloud/v{N}` routes, listed in `versions`.
+
+## Trusted proxy identity
+
+`cayu.proxy-identity` v1 is how a sign-in proxy in front of a Cayu server tells
+it who is calling. The proxy signs the person in itself (Cayu Cloud's router
+does, with the person's Cloud login), then adds one request header to every
+request it forwards for them, on HTTP, SSE and WebSocket routes alike:
+
+```text
+X-Cayu-Identity: <compact JWS>
+```
+
+`cayu.server.ProxyIdentityAuth` verifies it. Every part is configuration: the
+issuer, audience, JWKS URL, header name, accepted `typ`, signing algorithms,
+role claim and roles. The defaults are the v1 values below.
+
+| Part | v1 value |
+| --- | --- |
+| JWS header | `alg` `ES256`, `kid` naming a key in the proxy's JWKS, `typ` `cayu-proxy-identity+jwt` |
+| `iss` | the proxy's issuer URL, exactly |
+| `aud` | the server's audience (Cayu Cloud uses `cayu-agent:<application id>`) |
+| `sub` | the person's stable id; becomes `AuthContext.subject` |
+| `org` | the person's Organization id; becomes `AuthContext.tenant` |
+| `role` | one of `admin`, `developer`, `member`: the person's role for this server |
+| `name`, `email` | optional strings |
+| `iat`, `exp` | required; `exp` at most 120 seconds after `iat` |
+| `nbf` | checked when present |
+| `jti` | required, at most 256 characters |
+| `origin` | optional: the origin the browser sees, such as `https://close.agents.example`; scheme, host and optional port only |
+
+Time checks allow 30 seconds of clock skew. The proxy may reuse one token for
+several requests while it is valid, so the server does not track `jti`; it is
+there for audit. Keys come from the JWKS URL through `OidcSigningKeys`, with its
+caching, unknown-`kid` refetch and rotation rules; the JWKS and issuer URLs must
+use HTTPS.
+
+The server's answer:
+
+- A request with the header must carry exactly one token that verifies. Anything
+  else (a wrong signature, `kid`, `typ`, issuer, audience or role, an expired or
+  too-long-lived token, a missing `jti`, `iat`, `sub` or `org`, or two headers)
+  gets 401 `{"detail": "Invalid sign-in."}` with
+  `WWW-Authenticate: ProxyIdentity realm="Cayu", error="invalid_token"`. It is
+  never passed on to another kind of authentication. While no signing keys can
+  be fetched, it gets 503 with `Retry-After: 5`.
+- A request without the header goes to the configured fallback, an ordinary auth
+  dependency such as the operator's Basic login, which then acts as `admin`.
+  Without a fallback it gets 401.
+- A write with the header (any method but `GET`, `HEAD` and `OPTIONS`, and every
+  WebSocket) whose `Sec-Fetch-Site` is neither `same-origin` nor `none` gets 403.
+  `Origin`, or `Referer` when Origin is absent, must match the token's `origin`
+  claim when it has one, and otherwise the request's scheme, host and effective
+  port. Opaque, malformed or duplicate browser headers are refused. This also
+  protects browsers that omit Fetch Metadata. Non-browser callers may omit all
+  three headers. A proxy that serves the browser on another scheme or host than
+  the server sees, such as HTTPS in front of plain HTTP, names the public origin
+  in the signed `origin` claim; Runtime never trusts unsigned forwarded headers
+  for this. A token whose `origin` is not a valid origin gets 401. The proxy adds the
+  identity to everything the person's browser sends, so a page on another origin
+  must not act for them.
+
+The verified `AuthContext.claims` holds `role`, `name` and `email` when sent,
+`origin` when sent, `iss`, `aud`, `sub`, `org`, `iat`, `exp`, `jti` and
+`auth: "proxy-identity"`.
+Server decision actors omit token timestamps and `jti` from their claims, so
+refreshing a proxy token does not change an identical decision retry. The full
+verified claims remain available in `AuthContext`.
+`tenant` is actor provenance only, as everywhere else; it does not scope Cayu
+data.
+
+On the control plane, `ControlPlaneRoles` applies the role. `admin` and
+`developer` use every route. `member` reads and decides: it may load the
+Developer dashboard and browser client, read agents, environments, sessions and
+their events, transcripts, interactions, messages, state, summaries, usage and
+human review, tasks, artifacts, pending actions, human attention, knowledge and
+the inbox, run the query and rollup routes, resolve tool approvals and questions,
+settle inbox items and approve or reject knowledge proposals. These decisions cannot
+replace arguments, select an approval revision, or override execution configuration. Every other
+control-plane route answers 403 `{"code": "role_forbidden"}`, as do WebSocket
+routes and any role the rule doesn't name. Routes are matched on their template
+relative to the API path, which `create_server` and `mount_cayu` give the rule.
+
+A product reads the person from the same `AuthContext`, or uses
+`ProxyIdentityAuth.product_dependency(roles=...)` for `AuthenticatedProductAccess`:
+`org` is the tenant and `sub` the subject, a request without the header gets 401
+(the fallback is for the control plane), and a role outside `roles` gets 403.
+
+The proxy must remove any `X-Cayu-Identity` a client sent before adding its own,
+and must not forward its own session cookie. The server's checks hold whether or
+not it does: stripping is defence in depth, not the only check.
+
+`cayu.server.environment_auth:OPERATOR_BASIC_AUTH` builds proxy identity, with
+the operator login as its fallback, when these are set:
+
+| Variable | Value |
+| --- | --- |
+| `CAYU_PROXY_IDENTITY_ISSUER` | the issuer URL |
+| `CAYU_PROXY_IDENTITY_AUDIENCE` | the audience |
+| `CAYU_PROXY_IDENTITY_JWKS_URL` | the JWKS URL, reachable from the server |
+| `CAYU_PROXY_IDENTITY_HEADER` | optional; the header name, `X-Cayu-Identity` by default |
+
+Set the first three or none of them. Setting only some, or only the header name,
+stops the server at startup with an error naming the missing variables and never
+their values.
+
+### Versioning
+
+Within v1 the proxy only adds claims, and the server ignores claims it doesn't
+use. A change a v1 server would misread, such as a new meaning for a role, uses a
+new `typ`, so a server that predates it refuses the token instead of misreading
+it.

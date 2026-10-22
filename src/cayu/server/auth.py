@@ -13,6 +13,9 @@ from typing import Any, Self, cast
 
 from fastapi import Request  # noqa: TC002 - FastAPI inspects this annotation at runtime.
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.requests import (
+    HTTPConnection,  # noqa: TC002 - Auth annotations are inspected at runtime.
+)
 
 from cayu._operator_credentials import (
     OPERATOR_PASSWORD_VARIABLE,
@@ -80,6 +83,17 @@ class AuthContext(BaseModel):
         return copied
 
 
+def _resolution_actor_claims(context: AuthContext) -> dict[str, Any]:
+    """Keep proxy token refresh metadata out of immutable decision identity."""
+    if context.claims.get("auth") != "proxy-identity":
+        return context.claims
+    return {
+        name: value
+        for name, value in context.claims.items()
+        if name not in {"iat", "exp", "nbf", "jti"}
+    }
+
+
 AuthDependencyResult = AuthContext | Mapping[str, Any]
 AuthDependency = Callable[[Any], AuthDependencyResult | Awaitable[AuthDependencyResult]]
 _AUTH_CONTEXT_SCOPE_KEY = "cayu.auth_context.v1"
@@ -105,7 +119,7 @@ def server_auth_dependency(auth: AuthDependency) -> Callable[[Request], Awaitabl
     return dependency
 
 
-async def resolve_auth_context(auth: AuthDependency, request: Request) -> AuthContext:
+async def resolve_auth_context(auth: AuthDependency, request: HTTPConnection) -> AuthContext:
     """Resolve and validate a server auth dependency outside FastAPI injection."""
 
     result = auth(request)

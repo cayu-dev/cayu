@@ -128,6 +128,8 @@ vertex = [
 ]
 server = [
   "fastapi>=0.115,<0.137",
+  # Verifies a sign-in proxy's identity header (ProxyIdentityAuth).
+  "pyjwt[crypto]>=2.15.0,<3",
   "uvicorn>=0.30",
   "websockets>=17.0.1,<17.1",
   "sse-starlette>=2.0",
@@ -135,12 +137,13 @@ server = [
 server-settings = [
   "fastapi>=0.115,<0.137",
   "pydantic-settings>=2.7,<3",
+  "pyjwt[crypto]>=2.15.0,<3",
   "sse-starlette>=2.0",
   "uvicorn>=0.30",
   "websockets>=17.0.1,<17.1",
 ]
 oidc = [
-  # Server extra plus JWT verification for OidcBearerAuth.
+  # The server extra, which verifies JWTs too; kept so `cayu[oidc]` installs keep working.
   "fastapi>=0.115,<0.137",
   "pyjwt[crypto]>=2.15.0,<3",
   "sse-starlette>=2.0",

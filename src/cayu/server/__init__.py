@@ -108,6 +108,7 @@ try:
     from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
     from cayu.server.inbox import InboxAccess
     from cayu.server.oidc import OidcBearerAuth, OidcSigningKeys, OidcTokenError
+    from cayu.server.proxy_identity import ControlPlaneRoles, ProxyIdentityAuth
     from cayu.server.routes import create_router
     from cayu.server.service import (
         AuthenticatedProductAccess,
@@ -158,6 +159,7 @@ __all__ = [
     "BasicAuth",
     "BrowserControlServerConfig",
     "CayuService",
+    "ControlPlaneRoles",
     "CorsConfig",
     "DashboardConfig",
     "DashboardStaticFiles",
@@ -185,6 +187,7 @@ __all__ = [
     "ProductResultReceipt",
     "ProductResultReceiptConflict",
     "ProjectControlPlaneContext",
+    "ProxyIdentityAuth",
     "PublicServiceManifest",
     "RequestTimingConfig",
     "RuntimeStoreDurability",
@@ -322,6 +325,7 @@ def create_server(
         else None
     )
     dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
+    _bind_control_plane_roles(resolved_config.api.path, api_auth, dashboard_auth)
     lifecycle = resolved_config.lifecycle
     resolved_fastapi_options = _validate_fastapi_options(FastAPI, fastapi_options)
     if resolved_config.dashboard.enabled:
@@ -807,6 +811,7 @@ def mount_cayu(
     server.state.cayu_project_control_plane_summary = (
         None if resolved_project_context is None else resolved_project_context.safe_summary()
     )
+    _bind_control_plane_roles(api_path, auth)
     server.include_router(router)
     server.include_router(client_router)
     if fork_controller_router is not None:
@@ -821,6 +826,15 @@ def mount_cayu(
             dashboard_app=dashboard_app,
             name=name,
         )
+
+
+def _bind_control_plane_roles(api_path: str, *dependencies: Any) -> None:
+    """Tell each auth dependency's ``ControlPlaneRoles`` where the API is served."""
+
+    for dependency in dependencies:
+        roles = getattr(dependency, "control_plane_roles", None)
+        if isinstance(roles, ControlPlaneRoles):
+            roles.add_api_path(api_path)
 
 
 def _resolve_mount_request_timing(

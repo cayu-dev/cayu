@@ -5673,7 +5673,6 @@ class CayuApp:
         loop = asyncio.get_running_loop()
         registrations = tuple(self._environment_registry.registrations.items())
         if not any(registration.factory is not None for _, registration in registrations):
-            # Nothing holds idle resources, so nothing is left to release.
             return True
         if deadline - loop.time() <= 0:
             return False

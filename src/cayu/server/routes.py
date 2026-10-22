@@ -196,7 +196,12 @@ from cayu.server._scenario_routes import (
 )
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
-from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
+from cayu.server.auth import (
+    AuthContext,
+    AuthDependency,
+    _resolution_actor_claims,
+    server_auth_dependency,
+)
 from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
 from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
@@ -2424,7 +2429,7 @@ def _request_actor(
                 subject=auth_context.subject,
                 tenant=auth_context.tenant,
                 source=ResolutionActorSource.HTTP_AUTH,
-                claims=auth_context.claims,
+                claims=_resolution_actor_claims(auth_context),
             )
         except ValueError as exc:
             # AuthContext.subject is unconstrained, so an auth backend can hand

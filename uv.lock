@@ -298,6 +298,7 @@ recording = [
 ]
 server = [
     { name = "fastapi" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "sse-starlette" },
     { name = "uvicorn" },
     { name = "websockets" },
@@ -305,6 +306,7 @@ server = [
 server-settings = [
     { name = "fastapi" },
     { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "sse-starlette" },
     { name = "uvicorn" },
     { name = "websockets" },
@@ -375,6 +377,8 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'all'", specifier = ">=2.15.0,<3" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'dev'", specifier = ">=2.15.0,<3" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'oidc'", specifier = ">=2.15.0,<3" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'server'", specifier = ">=2.15.0,<3" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'server-settings'", specifier = ">=2.15.0,<3" },
     { name = "pypdf", marker = "extra == 'all'", specifier = ">=6.19.0" },
     { name = "pypdf", marker = "extra == 'dev'", specifier = ">=6.19.0" },
     { name = "pypdf", marker = "extra == 'files'", specifier = ">=6.19.0" },

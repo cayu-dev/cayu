@@ -682,6 +682,80 @@ category `operator_credentials_unsupported`. To use a different login, set the s
 with `cayu cloud env set` (the password as a `--secret`); Agent values win over Cloud's.
 The older environment-wide `AUTH_USER`/`AUTH_PASS` pair Cloud also injects is deprecated.
 
+## Signing in to an Agent
+
+`ProxyIdentityAuth` lets an Agent trust a sign-in proxy that authenticates people
+and supplies a signed identity header. Declare Cloud sign-in and public paths in
+[`cayu-cloud.toml`](#sign-in-and-home-page). The deployment proxy applies those
+settings; Runtime verifies the identity supplied to it.
+
+For Cloud sign-in, the router must authenticate the person and add an
+`X-Cayu-Identity` header to protected requests over HTTP, SSE and WebSocket. The
+header is a JWT of at most two minutes, signed by Cloud, naming the person (`sub`),
+their Organization (`org`), their role for this Agent (`role`: `admin`, `developer`
+or `member`), their `name` and `email`, and the Agent's public `origin`, which
+the Agent compares with the browser's `Origin` on writes. The router must remove any
+`X-Cayu-Identity` a client supplied. Public routes must not receive a signed
+identity; their access policy belongs to the Agent and proxy configuration.
+
+Cloud sets these on every Agent that uses Cloud sign-in, and an Agent can't override
+them:
+
+| Variable | Value |
+| --- | --- |
+| `CAYU_PROXY_IDENTITY_ISSUER` | Cloud's sign-in issuer |
+| `CAYU_PROXY_IDENTITY_AUDIENCE` | `cayu-agent:<application id>` |
+| `CAYU_PROXY_IDENTITY_JWKS_URL` | Cloud's published sign-in keys, reachable from the Agent |
+
+With them set, `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`, the
+`[tool.cayu.serve].auth` target `cayu new` and `cayu cloud init` write, is a
+`ProxyIdentityAuth` that verifies the header and falls back to the
+[operator login](#agent-operator-credentials) when there is none. So the
+operator login, webhooks, scripts and Cloud's own reader keep working, and a
+header that doesn't verify is refused rather than ignored.
+
+On the Developer dashboard, `admin` and `developer` can do everything. A `member`
+can read sessions, tasks, artifacts and the inbox, and decide: approve, deny or
+answer approvals and questions, and settle inbox items. Everything else answers
+403.
+
+Members decide the existing proposal: approval and question decisions cannot carry
+replacement arguments, an approval revision, or execution overrides (`max_steps`,
+`limits`, `budget_limits`, `retry_policy`, `structured_output`, or `thinking`).
+Admin and developer access may still supply these fields. Protected host routes
+outside the control plane require their own product policy; only the packaged
+browser client and dashboard receive the built-in read exception.
+
+The Agent's own app can get the person too. Build the same dependency from the
+environment, read the person with `authenticate`, or limit a route to some roles
+with `product_dependency`, which also serves `AuthenticatedProductAccess`:
+
+```python
+from typing import Annotated
+
+from fastapi import Depends
+
+from cayu.server import AuthContext, BasicAuth, ProductPrincipal, ProxyIdentityAuth
+
+auth = ProxyIdentityAuth.from_environment(fallback=BasicAuth.from_environment())
+
+
+@app.get("/me")
+async def me(person: Annotated[AuthContext, Depends(auth.authenticate)]) -> dict:
+    return {"id": person.subject, "role": person.claims["role"]}
+
+
+admins = auth.product_dependency(roles=("admin",))
+
+
+@app.post("/close-month")
+async def close_month(principal: Annotated[ProductPrincipal, Depends(admins)]) -> None: ...
+```
+
+An app with a login of its own needs no change: it never reads the header. The
+header's format and the server's checks are in the
+[runtime contracts](runtime-contracts.md#trusted-proxy-identity).
+
 ## Runs and human touches
 
 An Agent reports its runs and the decisions people made on them to Cayu Cloud

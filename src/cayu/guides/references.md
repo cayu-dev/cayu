@@ -362,7 +362,13 @@ deployment.
 `OidcBearerAuth` from `cayu[oidc]` verifies JWT bearer tokens from an OpenID
 Connect provider (Cognito, Auth0, Okta, Entra ID, Google, Workday) for either
 Developer dashboard access or, through `product_dependency()`, product access. It does not
-provide browser sign-in.
+provide browser sign-in. `ProxyIdentityAuth` trusts a sign-in proxy that does
+(Cayu Cloud's router): it verifies the signed `X-Cayu-Identity` header the proxy
+adds, refuses an invalid one with 401, and sends requests without it to a
+fallback such as the Developer dashboard login. `environment_auth:OPERATOR_BASIC_AUTH` turns
+it on when `CAYU_PROXY_IDENTITY_ISSUER`, `CAYU_PROXY_IDENTITY_AUDIENCE` and
+`CAYU_PROXY_IDENTITY_JWKS_URL` are set; on the Developer dashboard a `member` may only
+read and decide.
 
 ## advanced-runtime
 

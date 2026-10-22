@@ -55,6 +55,7 @@ These are the parts every application and generated project touches.
 | Server HTTP contract | `SERVER_CONTRACT_VERSION` in `src/cayu/_server_contract_version.py` | Bumps only in minor releases and is listed under `Breaking changes` when older clients must not use the new server. The bundled dashboard always matches. |
 | App manifest and generator schema | `APP_MANIFEST_SCHEMA_VERSION` in `cayu.runtime.manifest` | Same rule as the server contract. |
 | Cayu Cloud agent contract | `CLOUD_AGENT_CONTRACT_VERSIONS` in `cayu.cloud_reporting`, served at `{api}/cloud/contract` | Within a version, fields and values are only added and readers ignore those they don't know. A new version ships only in a minor release, under its own `{api}/cloud/v{N}` routes, and stopping an older one is listed under `Breaking changes`. See [the contract](runtime-contracts.md#cayu-cloud-agent-contract). |
+| Trusted proxy identity | `PROXY_IDENTITY_TOKEN_TYPE` in `cayu.server.proxy_identity`, the token's JWS `typ` | Within v1, claims are only added and servers ignore those they don't use. A change a v1 server would misread uses a new `typ`. See [the contract](runtime-contracts.md#trusted-proxy-identity). |
 
 ### Provisional
 

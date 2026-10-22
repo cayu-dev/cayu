@@ -133,8 +133,8 @@ Host and port always reach uvicorn as concrete values.
 
 `OidcBearerAuth` checks JWT bearer tokens issued by an OpenID Connect provider
 such as Amazon Cognito, Auth0, Okta, Microsoft Entra ID, Google, or Workday.
-Install it with `pip install "cayu[oidc]"`, which adds PyJWT to the server
-extra. Build the target from the environment:
+It needs PyJWT, which the `server` extra includes (`cayu[oidc]` still works
+too). Build the target from the environment:
 
 ```python
 # operator_auth.py
@@ -227,6 +227,40 @@ the `AuthContext`. `claims_mapper=` chooses what goes into
 discovery and key cache and can be shared by verifiers with different
 requirements. Pass `http_client=` (an `httpx.AsyncClient`) to send key fetches
 through your own proxy or transport.
+
+### Trust a sign-in proxy
+
+When a sign-in proxy in front of the server signs people in (Cayu Cloud's router
+does), `ProxyIdentityAuth` trusts the short-lived signed identity it adds to each
+request as `X-Cayu-Identity`, and falls back to another dependency for requests
+without one. The ready-made `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`
+target turns it on, with the operator login as the fallback, when
+`CAYU_PROXY_IDENTITY_ISSUER`, `CAYU_PROXY_IDENTITY_AUDIENCE` and
+`CAYU_PROXY_IDENTITY_JWKS_URL` are set (and optionally
+`CAYU_PROXY_IDENTITY_HEADER`); set all three or none. To build it yourself:
+
+```python
+# operator_auth.py
+from cayu.server import BasicAuth, ProxyIdentityAuth
+
+AUTH = ProxyIdentityAuth(
+    issuer="https://sign-in.example.com",
+    audience="my-agent",
+    jwks_url="https://sign-in.example.com/jwks",
+    fallback=BasicAuth.from_environment(),
+)
+```
+
+A request with the header must verify (ES256, the right `typ`, issuer and
+audience, at most two minutes old, with a `jti`) or it gets 401; it never falls
+through to the fallback. The person's id is `AuthContext.subject`, their
+Organization is `tenant`, and `claims` holds their `role`, `name` and `email`. On
+the control plane `admin` and `developer` use every route, and `member` may only
+read and decide (approvals, questions, inbox items and knowledge proposals);
+pass `control_plane_roles=ControlPlaneRoles(...)` to change which roles do which.
+The fallback acts as `admin`. `auth.product_dependency(roles=...)` gives a
+product the person as a `ProductPrincipal`. The header format and every check
+are in the [runtime contracts](runtime-contracts.md#trusted-proxy-identity).
 
 The command also assembles project identity, release identity, and durable
 Evals storage before it constructs the server. It reads `[project].name`,
