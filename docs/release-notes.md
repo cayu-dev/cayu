@@ -11,7 +11,10 @@ set `git_baseline=False`. Direct binding users must also check the workspace
 requirements below. An Agent reports to Cayu Cloud once
 `CAYU_CLOUD_READER_TOKEN_SHA256` is set in its environment, and hands human
 attention to it once `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`
-are both set. Set both handoff variables or neither. Storage revision 124,
+are both set. Set both handoff variables or neither.
+If you set `run_task_worker(execution_timeout_s=...)`, it now bounds the whole
+handler call: check that delivery and retry work fits within it plus
+`execution_grace_s` (see the breaking change below). Storage revision 124,
 compatibility floor 124, server contract 49 and manifest schema 17 are all
 unchanged.
 
@@ -28,6 +31,14 @@ unchanged.
   on the bound sandbox runner, both excluding `.git`, or opt out of the
   baseline. Invalid workspaces are refused before copying; a failed baseline
   abandons the sandbox binding.
+- `run_task_worker(execution_timeout_s=...)` is now the longest one handler call
+  may take, not only a default deadline for the runs it starts. Once it passes,
+  new runs in the call are refused, including ones with their own
+  `execution_deadline`. `execution_grace_s` later (new, 30 seconds by default)
+  the handler is cancelled, and a task it did not settle fails with
+  `ExecutionDeadlineExceeded` (`scope` `task_handler`). A handler that delivers
+  or retries after its runs end now has to fit in the limit plus the grace
+  period. The default is still `None`.
 
 ### Changes
 
@@ -127,6 +138,21 @@ unchanged.
   `client.js` gains `listInbox`, `getInboxItem`, `settleInboxItem` and
   `watchInbox`, and `create_server` and `mount_cayu` take an optional
   `inbox_access` rule that decides who may see and settle each item.
+- A task handled by `run_task_worker` no longer stays `claimed` forever when its
+  handler catches failures and retries runs that are not attached to the task.
+  With `execution_timeout_s` set, the worker refuses new runs at the limit,
+  cancels the handler after `execution_grace_s`, and fails the task with the IDs
+  of the sessions the call started. A task with a `TaskRetryPolicy` records a
+  retryable failed attempt instead, a pending cancellation still settles as
+  cancelled, and a restartable task is not requeued. A handler that ignores the
+  cancellation keeps its lease, and its task shows a cancellation request with
+  code `task_handler_timeout`. The limit also ends the drain after an operator
+  cancels the task or the worker is cancelled, which used to wait for such a
+  handler forever. `cayu.deadlines.HandlerTimeLimit` is the same limit for a
+  hand-written worker, and `current_handler_time_limit()` lets a handler see
+  that it has passed. The long-running guide's "Time limit for worker runs"
+  section now shows the shape most handlers use (unattached runs, deliver, then
+  complete) and says which limit ends what.
 - Every built-in tool declares a terminal payload bound, between 64 KiB and
   1,984 KiB, and its constructor takes `max_terminal_payload_bytes=` to set or
   tighten it. A deferred round no longer takes the process-wide exclusive lease

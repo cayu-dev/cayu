@@ -847,7 +847,7 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
-    assert len(guide.splitlines()) <= 195
+    assert len(guide.splitlines()) <= 230
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
     assert len(snippets) == 6
     namespace: dict[str, Any] = {}
@@ -896,9 +896,59 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     asyncio.run(scenario())
 
-    # Worker time limit: the guide's worker ends a hung run and fails its task.
+    # A worker pause retains one session and hands continuation to its owner.
+    async def paused_worker(tool_name, arguments):
+        from cayu.evals.testing import ScriptedModelProvider
+        from cayu.sessions.memory import InMemorySessionStore
+        from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, run_task_worker
+
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(name=tool_name, arguments=arguments),
+                    ModelStreamEvent.completed(),
+                ],
+            ]
+        )
+        app = namespace["build_app"](
+            provider=provider,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        task = await app.task_store.create_task(
+            TaskCreate(type="invoice-job", input={"request": "Pay INV-10."})
+        )
+        await asyncio.wait_for(
+            run_task_worker(
+                app,
+                app.task_store,
+                namespace["handle_job"],
+                worker_id="pause-worker",
+                max_tasks=1,
+                execution_timeout_s=60,
+                execution_grace_s=1,
+            ),
+            15,
+        )
+        settled = await app.task_store.load_task(task.id)
+        assert settled.status is TaskStatus.COMPLETED
+        session_id = settled.result["paused_session"]
+        session = await app.session_store.load(session_id)
+        assert session.status.value == "interrupted"
+        assert task.id not in namespace["DELIVERED"]
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id=session_id)
+        )
+        assert len(pending.actions) == 1
+
+    from cayu.sessions import PendingActionQuery
+
+    asyncio.run(paused_worker("pay_invoice", {"invoice_id": "INV-10"}))
+    asyncio.run(paused_worker("ask_user", {"question": "Amount?"}))
+
+    # Worker time limit: the guide's retrying worker ends a hung job and fails it.
     async def hung_worker() -> None:
-        from cayu.deadlines import _TIMERS
+        from cayu.deadlines import ExecutionDeadline, current_handler_time_limit
         from cayu.evals.testing import ScriptedModelProvider
         from cayu.sessions.memory import InMemorySessionStore
         from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
@@ -906,10 +956,11 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         class StalledProvider(ScriptedModelProvider):
             async def stream(self, request):
                 # Trigger the deadline after the run starts, independent of setup load.
-                timers = [timer for timer, _deadline in _TIMERS.get() if timer.when() is not None]
-                assert timers
-                for timer in timers:
-                    timer.reschedule(asyncio.get_running_loop().time())
+                limit = current_handler_time_limit()
+                assert limit is not None and limit._timer is not None
+                limit._deadline = ExecutionDeadline.after(0, scope="task_handler")
+                limit._cancelled.set()
+                limit._timer.reschedule(asyncio.get_running_loop().time())
                 await asyncio.Event().wait()
                 yield ModelStreamEvent.completed()
 
@@ -921,7 +972,8 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         task = await app.task_store.create_task(
             TaskCreate(type="invoice-job", input={"request": "Pay INV-9."})
         )
-        namespace["RUN_TIMEOUT_S"] = 60
+        namespace["JOB_TIMEOUT_S"] = 60
+        namespace["JOB_GRACE_S"] = 0.2
         stop = asyncio.Event()
         worker = asyncio.create_task(namespace["run_jobs"](app, stop))
         async with asyncio.timeout(15):
@@ -931,9 +983,12 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         await worker
         failed = await app.task_store.load_task(task.id)
         assert failed.error["error"] == "ExecutionDeadlineExceeded"
-        events = await app.session_store.load_events(failed.session_id)
-        interrupted = [e for e in events if e.type.value == "session.interrupted"]
-        assert interrupted[-1].payload["reason"] == "limit_reached"
+        assert failed.error["scope"] == "task_handler"
+        assert failed.error["handler_cancelled"] is True
+        assert namespace["DELIVERED"] == {}
+        [session_id] = failed.error["session_ids"]
+        events = await app.session_store.load_events(session_id)
+        assert events[-1].type.value == "session.interrupted"
 
     asyncio.run(hung_worker())
 

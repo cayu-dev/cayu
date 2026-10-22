@@ -1339,10 +1339,14 @@ def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached,
             assert retries == []
             assert final.error["error"] == "ExecutionDeadlineExceeded"
         else:
-            # The deadline is shared by the call, so each retry is refused at once.
+            # The limit has passed, so each retry is refused at once, and the
+            # task fails with the handler's time limit.
             assert [outcome.status for outcome in retries] == [SessionStatus.FAILED] * 2
             assert all("ExecutionDeadlineExceeded" in outcome.error for outcome in retries)
-            assert "ExecutionDeadlineExceeded" in final.error["message"]
+            assert final.error["error"] == "ExecutionDeadlineExceeded"
+            assert final.error["scope"] == "task_handler"
+            assert final.error["session_ids"] == ["hung-0"]
+            assert final.error["handler_failure"]["error"] == "RuntimeError"
 
     asyncio.run(scenario())
 

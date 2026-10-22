@@ -270,6 +270,7 @@ from cayu.context.footprints import (
 )
 from cayu.deadlines import (
     ExecutionDeadline,
+    admit_handler_run,
     current_execution_deadline,
     deadline_stream,
     effective_deadline,
@@ -7008,6 +7009,7 @@ class CayuApp:
             parent.execution_deadline if parent is not None else ExecutionDeadline(),
         )
         boundary.require_admission("child_run" if parent is not None else "run")
+        handler_limit = admit_handler_run() if parent is None else None
         request = request.model_copy(update={"execution_deadline": boundary})
         if request.session_id is None:
             request = run_request_with_runtime_generated_authority(
@@ -7035,7 +7037,7 @@ class CayuApp:
                     ),
                 }
             )
-        admission = DeadlineOutcomeAdmission()
+        admission = DeadlineOutcomeAdmission(handler_limit=handler_limit)
         stream = self._session_engine.run(
             request=request,
             expected_execution_profile=expected_execution_profile,

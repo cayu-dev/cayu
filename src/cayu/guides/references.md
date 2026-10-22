@@ -229,11 +229,11 @@ store before adding embeddings or remote infrastructure.
 Event watchers react to persisted events with delivery identity and retries.
 Keep enqueue, claim, execution, result recording, and recovery distinct so a
 process crash does not silently duplicate work.
-Pass `run_task_worker(..., execution_timeout_s=...)` so a hung run ends with
-`limit_reached` and fails its task instead of holding the claim; without
-`run_task_worker`, wrap the code that starts runs in
-`with default_run_deadline(ExecutionDeadline.after(seconds)):`
-(both from `cayu.deadlines`). See `cayu guide long-running#time-limit-for-worker-runs`.
+Pass `run_task_worker(..., execution_timeout_s=...)` so a handler call that
+hangs or retries forever is cancelled and fails its task instead of holding the
+claim, whether or not its runs are attached; without `run_task_worker`, wrap
+the handler in `async with HandlerTimeLimit(seconds):` from `cayu.deadlines`.
+See `cayu guide long-running#time-limit-for-worker-runs`.
 
 ## workflows-hooks
 

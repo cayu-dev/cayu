@@ -48,7 +48,12 @@ from cayu._task_wait import (
 )
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
-from cayu.deadlines import ExecutionDeadline, default_run_deadline
+from cayu.deadlines import (
+    ExecutionDeadline,
+    ExecutionDeadlineExceeded,
+    HandlerTimeLimit,
+    default_run_deadline,
+)
 from cayu.events import (
     Event,
     EventType,
@@ -193,6 +198,11 @@ RecoveredInterruptedTaskHandler = Callable[
 # output stay readable; truncation is marked instead of silent.
 _MAX_TASK_FAILURE_MESSAGE_BYTES = 4 * 1024
 _TASK_FAILURE_TRUNCATION_MARKER = "\u2026[truncated]"
+_DEFAULT_EXECUTION_GRACE_SECONDS = 30.0
+# A cancelled handler that is still running this long after the grace period
+# (never less than this floor) gets a durable cancellation request.
+_HANDLER_STOP_WAIT_FLOOR_SECONDS = 1.0
+_HANDLER_TIME_LIMIT_FENCE_CODE = "task_handler_timeout"
 _INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
 _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
@@ -466,6 +476,7 @@ async def run_task_worker(
     max_tasks: int | None = None,
     concurrency: int = 1,
     execution_timeout_s: float | None = None,
+    execution_grace_s: float = _DEFAULT_EXECUTION_GRACE_SECONDS,
 ) -> int:
     """Claim and handle durable tasks until stopped; return the number handled.
 
@@ -516,24 +527,33 @@ async def run_task_worker(
       stops new claims and drains active handlers; cancelling this coroutine
       applies the existing cancellation/settlement rules to every active slot.
       Infrastructure errors stop and drain the group before propagating.
-    - ``execution_timeout_s`` bounds the runs each handler call starts. The
-      deadline is fixed when the handler starts and becomes the default
-      ``execution_deadline`` of every ``RunRequest`` it builds, so retries in
-      one call share it. A hung run then ends ``session.interrupted`` with
-      ``limit_reached``, and a task-attached run fails its task with
-      ``ExecutionDeadlineExceeded``; a later run in that call is refused with the
-      same error. An explicit ``RunRequest.execution_deadline`` replaces it, and
-      resuming an existing session keeps that session's own deadline. ``None``
-      (the default) leaves runs unbounded. Handler code outside runs is not
-      timed. See :func:`cayu.deadlines.default_run_deadline` to apply the same
-      default without this worker.
+    - ``execution_timeout_s`` is the longest one handler call may take,
+      counted from handler start, whether or not its runs are attached to the
+      task. ``None`` (the default) sets no limit. Runs the handler starts without
+      their own ``execution_deadline`` get it as their default, so a hung run
+      ends ``session.interrupted`` with ``limit_reached``. When it passes, a new
+      top-level run in that call is refused with ``ExecutionDeadlineExceeded``,
+      and :func:`cayu.deadlines.current_handler_time_limit` reports it expired.
+      ``execution_grace_s`` later (30 seconds by default) the handler is
+      cancelled; a run still in flight ends ``session.interrupted``. Once the
+      handler has stopped, a task it did not settle fails with
+      ``ExecutionDeadlineExceeded`` (scope ``task_handler``, with the IDs of the
+      sessions it started); a task with a retry policy records a retryable
+      failed attempt instead, and a pending cancellation still wins. A
+      restartable task is not requeued. A handler that keeps running after it is
+      cancelled keeps its lease, and its task gets a durable cancellation
+      request (code ``task_handler_timeout``) that settles when it returns. The
+      limit is :class:`cayu.deadlines.HandlerTimeLimit`, which a hand-written
+      worker can use on its own.
     """
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive int.")
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
     validate_worker_interval(poll_interval_s, "poll_interval_s")
-    ExecutionDeadline.after(execution_timeout_s, source="task_worker")
+    HandlerTimeLimit(  # Validates both settings before any claim.
+        0 if execution_timeout_s is None else execution_timeout_s, grace_s=execution_grace_s
+    )
     if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
         raise TypeError("metrics must be a DurableWorkerMetrics instance.")
     demand_policy = DurableWorkerDemandPolicy(
@@ -724,6 +744,7 @@ async def run_task_worker(
                     max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
                     stop=slot_stop,
                     execution_timeout_s=execution_timeout_s,
+                    execution_grace_s=execution_grace_s,
                 )
                 continuation_scan_scanned += continuation_page.scanned_candidates
                 continuation_scan_rejected += continuation_page.rejected_candidates
@@ -898,6 +919,7 @@ async def run_task_worker(
                     worker_id,
                     lease_seconds,
                     execution_timeout_s=execution_timeout_s,
+                    execution_grace_s=execution_grace_s,
                 )
             finally:
                 poller.metrics.handler_finished()
@@ -1008,6 +1030,7 @@ async def _handle_with_heartbeat(
     *,
     recover_interrupted_authority_loss: bool = False,
     execution_timeout_s: float | None = None,
+    execution_grace_s: float = _DEFAULT_EXECUTION_GRACE_SECONDS,
 ) -> None:
     settlement = TaskExecutionSettlement(task_store, app._secret_redactor)
     primary: BaseException | None = None
@@ -1022,6 +1045,7 @@ async def _handle_with_heartbeat(
             settlement=settlement,
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
             execution_timeout_s=execution_timeout_s,
+            execution_grace_s=execution_grace_s,
         )
         # This worker owns the settlement it created. A write that outlives one
         # observation window is slow, not failed: keep joining it for up to one
@@ -1055,6 +1079,7 @@ async def _handle_with_heartbeat_owned(
     settlement: TaskExecutionSettlement,
     recover_interrupted_authority_loss: bool,
     execution_timeout_s: float | None,
+    execution_grace_s: float,
 ) -> None:
     (
         task,
@@ -1095,6 +1120,12 @@ async def _handle_with_heartbeat_owned(
             ),
         )
     )
+    # Fixed when the handler starts; one per handler call.
+    time_limit = (
+        None
+        if execution_timeout_s is None
+        else HandlerTimeLimit(execution_timeout_s, grace_s=execution_grace_s, source="task_worker")
+    )
     handler_error: Exception | None = None
     pending_runtime_task_failure: RuntimeTaskFailureTerminalizationPending | None = None
     handler_outcome: TaskHandlerOutcome | TaskRetryAttemptReport | None = None
@@ -1122,7 +1153,7 @@ async def _handle_with_heartbeat_owned(
                     stop_heartbeat=stop_heartbeat,
                     lease_authority=lease_authority,
                     settlement=settlement,
-                    execution_timeout_s=execution_timeout_s,
+                    time_limit=time_limit,
                 )
             except _TaskRetryElapsed as exc:
                 retry_elapsed = True
@@ -1269,6 +1300,22 @@ async def _handle_with_heartbeat_owned(
                     )
                     handler_error = None
                     return
+                if time_limit is not None and time_limit.expired:
+                    failure_payload = _handler_time_limit_failure_payload(
+                        app, time_limit, handler_error
+                    )
+                    handler_error = None
+                    await _safe_fail_payload(
+                        task_store,
+                        task.id,
+                        worker_id,
+                        failure_payload,
+                        lease_expires_at=lease_authority.lease_expires_at,
+                        lease_authority=lease_authority,
+                        retryable=True,
+                        handoff_id=task.interrupted_handoff_id,
+                    )
+                    return
                 failure_payload = _task_failure_payload(app, handler_error)
                 handler_error = None
                 await _safe_fail_payload(
@@ -1276,6 +1323,7 @@ async def _handle_with_heartbeat_owned(
                     task.id,
                     worker_id,
                     failure_payload,
+                    handoff_id=task.interrupted_handoff_id,
                     lease_expires_at=lease_authority.lease_expires_at,
                     lease_authority=lease_authority,
                 )
@@ -1300,6 +1348,18 @@ async def _handle_with_heartbeat_owned(
                     )
             elif handler_outcome is TaskHandlerOutcome.SESSION_INTERRUPTED:
                 await _handoff_interrupted_session(app, task_store, task.id, worker_id)
+            elif handler_outcome is None and time_limit is not None and time_limit.expired:
+                # Returning after the limit without settling is still a timeout.
+                await _safe_fail_payload(
+                    task_store,
+                    task.id,
+                    worker_id,
+                    _handler_time_limit_failure_payload(app, time_limit, None),
+                    lease_expires_at=lease_authority.lease_expires_at,
+                    lease_authority=lease_authority,
+                    retryable=True,
+                    handoff_id=task.interrupted_handoff_id,
+                )
             elif handler_outcome is not None:
                 await _safe_fail(
                     app,
@@ -1490,14 +1550,16 @@ async def _await_task_handler(
     stop_heartbeat: asyncio.Event,
     lease_authority: _TaskLeaseAuthority,
     settlement: TaskExecutionSettlement,
-    execution_timeout_s: float | None,
+    time_limit: HandlerTimeLimit | None,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
     # The callback may mutate its view. Settlement must remain bound to the
     # exact execution entered by this worker, not callback-authored authority.
     handler_view = copy_task(task)
     settlement_authority = copy_task(task)
 
-    async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+    callback_done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def invoke_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
         from cayu.resource_access import execution_access
 
         if task.invocation.access_labels and task.invocation.resource_access is None:
@@ -1512,9 +1574,20 @@ async def _await_task_handler(
         ):
             # Fixed at handler start, so retries within this call share it.
             with default_run_deadline(
-                ExecutionDeadline.after(execution_timeout_s, source="task_worker")
+                ExecutionDeadline.after(
+                    None if time_limit is None else time_limit.timeout_s,
+                    source="task_worker",
+                )
             ):
-                result = await handler(app, handler_view, worker_id)
+                async with contextlib.nullcontext() if time_limit is None else time_limit:
+                    result = await handler(app, handler_view, worker_id)
+        return result
+
+    async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+        try:
+            result = await invoke_handler()
+        finally:
+            callback_done.set_result(None)
         settlement.observe(settlement_authority, result)
         # Storage acknowledgement is not part of the callback outcome. Ordinary
         # settlement failures stay owned until after result disposition.
@@ -1523,6 +1596,24 @@ async def _await_task_handler(
 
     with bind_task_lease_authority(lease_authority):
         handler_task = asyncio.ensure_future(owned_handler())
+    if time_limit is not None:
+        # A task cancelled before its coroutine starts never enters the finally block.
+        handler_task.add_done_callback(
+            lambda _: callback_done.done() or callback_done.set_result(None)
+        )
+        _retain_handler_time_limit_watcher(
+            asyncio.create_task(
+                _fence_handler_that_outlives_its_time_limit(
+                    app,
+                    task_store,
+                    task,
+                    worker_id,
+                    callback_done,
+                    time_limit,
+                    lease_authority=lease_authority,
+                )
+            )
+        )
     try:
         completed, _pending = await asyncio.wait(
             (handler_task, heartbeat_task),
@@ -1788,6 +1879,72 @@ async def _await_task_handler(
             owner_cancellation=owner_cancellation,
         )
         raise owner_cancellation from exception_cause(owner_cancellation)
+
+
+_HANDLER_TIME_LIMIT_WATCHERS: set[asyncio.Task[None]] = set()
+
+
+def _retain_handler_time_limit_watcher(watcher: asyncio.Task[None]) -> None:
+    _HANDLER_TIME_LIMIT_WATCHERS.add(watcher)
+    watcher.add_done_callback(_HANDLER_TIME_LIMIT_WATCHERS.discard)
+
+
+async def _fence_handler_that_outlives_its_time_limit(
+    app: CayuApp,
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    callback_done: asyncio.Future[None],
+    time_limit: HandlerTimeLimit,
+    *,
+    lease_authority: _TaskLeaseAuthority,
+) -> None:
+    """Make a handler that ignores its time-limit cancellation durably visible.
+
+    The worker keeps renewing the lease while the handler runs, so no other
+    worker can take the task. The cancellation request shows why it is still
+    claimed and settles the task as cancelled once the handler returns.
+    """
+
+    cancelled = asyncio.ensure_future(time_limit.wait_cancelled())
+    try:
+        await asyncio.wait((callback_done, cancelled), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        cancelled.cancel()
+    if callback_done.done():
+        return
+    await asyncio.wait(
+        (callback_done,),
+        timeout=max(time_limit.grace_s, _HANDLER_STOP_WAIT_FLOOR_SECONDS),
+    )
+    if callback_done.done():
+        return
+    logger.warning(
+        "Task handler kept running after its time limit cancelled it; requesting "
+        "cancellation and keeping the lease until it returns: task_id=%s",
+        app.redact_json(task.id),
+    )
+    try:
+        await _request_task_cancellation_fence(
+            task_store,
+            task,
+            worker_id,
+            app.redact_json(
+                {
+                    "code": _HANDLER_TIME_LIMIT_FENCE_CODE,
+                    "error": "ExecutionDeadlineExceeded",
+                    "message": "The task handler kept running after its time limit cancelled it.",
+                    "session_ids": list(time_limit.session_ids),
+                }
+            ),
+            lease_authority=lease_authority,
+        )
+    except Exception:
+        logger.exception(
+            "Could not record the time-limit cancellation request; the worker keeps the "
+            "lease while the handler runs: task_id=%s",
+            app.redact_json(task.id),
+        )
 
 
 def _heartbeat_during_quiescence(
@@ -3456,6 +3613,7 @@ async def _run_recovered_interrupted_task_handler(
     max_unproductive_handoffs: int | None = None,
     stop: asyncio.Event | None = None,
     execution_timeout_s: float | None = None,
+    execution_grace_s: float = _DEFAULT_EXECUTION_GRACE_SECONDS,
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
 
@@ -3521,6 +3679,7 @@ async def _run_recovered_interrupted_task_handler(
         lease_seconds,
         recover_interrupted_authority_loss=True,
         execution_timeout_s=execution_timeout_s,
+        execution_grace_s=execution_grace_s,
     )
     return page
 
@@ -4369,6 +4528,39 @@ def _task_failure_payload(app: CayuApp, exc: Exception) -> dict[str, Any]:
     }
 
 
+def _handler_time_limit_failure_payload(
+    app: CayuApp,
+    time_limit: HandlerTimeLimit,
+    handler_error: Exception | None,
+) -> dict[str, Any]:
+    """Describe a handler call that outlived its time limit, before a store await."""
+
+    action = (
+        "was cancelled after its grace period"
+        if time_limit.cancelled
+        else "stopped during its grace period without settling the task"
+    )
+    payload: dict[str, Any] = {
+        "error": "ExecutionDeadlineExceeded",
+        "message": (
+            f"The task handler did not finish within its {time_limit.timeout_s:g}s time "
+            f"limit and {action}. Anything it was doing then may or may not have taken "
+            "effect."
+        ),
+        "scope": "task_handler",
+        **time_limit.inspection(),
+    }
+    if handler_error is not None and not (
+        isinstance(handler_error, ExecutionDeadlineExceeded)
+        and handler_error.diagnostics.get("scope") == "task_handler"
+    ):
+        payload["handler_failure"] = _task_failure_payload(app, handler_error)
+    redacted = app.redact_json(payload)
+    if type(redacted) is not dict:
+        raise AssertionError("Task failure payload redaction returned a non-object.")
+    return redacted
+
+
 def _redact_and_bound_task_failure_text(app: CayuApp, value: str) -> str:
     redacted_value = app.redact_json(value)
     if type(redacted_value) is not str:
@@ -4389,6 +4581,7 @@ async def _safe_fail_payload(
     lease_expires_at: datetime | None = None,
     lease_authority: _TaskLeaseAuthority | None = None,
     handoff_id: str | None = None,
+    retryable: bool = False,
 ) -> None:
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
@@ -4399,7 +4592,11 @@ async def _safe_fail_payload(
             worker_id=worker_id,
             lease_expires_at=lease_expires_at,
             causal_budget_id=task.retry_series.causal_budget_id,
-            disposition=TaskRetryAttemptDisposition.NON_RETRYABLE_FAILURE,
+            disposition=(
+                TaskRetryAttemptDisposition.RETRYABLE_FAILURE
+                if retryable
+                else TaskRetryAttemptDisposition.NON_RETRYABLE_FAILURE
+            ),
             error=payload,
             idempotency_key=_worker_failure_terminalization_key(
                 task_id,

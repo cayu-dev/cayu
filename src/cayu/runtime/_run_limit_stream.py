@@ -9,6 +9,7 @@ from typing import cast
 from cayu.deadlines import (
     ExecutionDeadline,
     ExecutionDeadlineExceeded,
+    HandlerTimeLimit,
     deadline_stream,
     resumed_execution_deadline,
 )
@@ -26,11 +27,14 @@ class DeadlineOutcomeAdmission:
     session_id: str | None = None
     session_instance_id: str | None = None
     run_epoch: int | None = None
+    handler_limit: HandlerTimeLimit | None = None
 
     def observe(self, session: Session) -> None:
         self.session_id = session.id
         self.session_instance_id = session.instance_id
         self.run_epoch = session.run_epoch
+        if self.handler_limit is not None:
+            self.handler_limit._record_session(session.id)
 
 
 def continuation_deadline_outcome(

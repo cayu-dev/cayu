@@ -135,19 +135,29 @@ await run_task_worker(app, task_store, handle, worker_id="worker-1",
                       execution_timeout_s=600)
 ```
 
-`execution_timeout_s` bounds the runs each handler call starts. The deadline is
-fixed when the handler starts and becomes the default `execution_deadline` of
-every `RunRequest` the handler builds, so retries in one call share it. A hung
-tool or model stream then ends the run with `session.interrupted`
-(`limit_reached`), the runtime fails the attached task with
-`ExecutionDeadlineExceeded`, and a later run in the same call is refused with
-that error. A `RunRequest` that sets its own `execution_deadline` keeps it, and
-resuming an existing session keeps the deadline that session started with. The
-deadline is wall-clock time and includes time paused for a person. It defaults
-to `None` (no limit). Code outside `app.run` is not timed, so a handler that
-catches every error and retries forever still holds its task. To give runs the
-same default without `run_task_worker`, wrap the code that builds them in
-`with default_run_deadline(ExecutionDeadline.after(600)):` from `cayu.deadlines`.
+`execution_timeout_s` is the longest one handler call may take, counted from
+handler start, whether or not its runs are attached to the task. It defaults to
+`None` (no limit). Runs the handler builds without their own
+`execution_deadline` get it as their default, so a hung tool or model stream
+ends the run with `session.interrupted` (`limit_reached`) and an attached task
+fails with `ExecutionDeadlineExceeded`. Once the limit passes, a new top-level
+run in the call is refused with that error, and
+`cayu.deadlines.current_handler_time_limit().expired` is true, so a retry loop
+can stop. `execution_grace_s` later (30 seconds by default) the handler is
+cancelled and a run still in flight ends `session.interrupted`. When the
+handler has stopped, a task it did not settle fails with
+`ExecutionDeadlineExceeded` (`scope` `task_handler`); the failure lists the IDs
+of the sessions the call started and whether it had to be cancelled. A task
+with a `TaskRetryPolicy` records a retryable failed attempt instead, a pending
+cancellation still settles as cancelled, and a restartable task is not
+requeued. A handler that keeps running after it is cancelled keeps its lease,
+and its task gets a durable cancellation request with code
+`task_handler_timeout` that settles when the handler returns. The limit also
+bounds the drain when the worker itself is cancelled. It does not change the
+deadline stored on sessions, so a session paused for a person keeps its own.
+Without `run_task_worker`, wrap a handler in
+`async with HandlerTimeLimit(600, grace_s=30):` from `cayu.deadlines`; it
+raises `ExecutionDeadlineExceeded` when it cancels the block.
 
 `concurrency` defaults to one. `max_tasks`, when set, is a total for the whole
 call, not a per-slot quota; recovered continuations and contracted-task parking

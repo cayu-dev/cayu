@@ -71,7 +71,7 @@ def test_long_running_project_passes_its_own_tests_eval_and_check(tmp_path: Path
     # The example composes library parts rather than reimplementing them.
     assert "AlwaysRequireApprovalToolPolicy" in (project / "policies/tools.py").read_text()
     assert "TaskSchedulePolicy" in (project / "operations/timers.py").read_text()
-    assert "execution_timeout_s=" in (project / "operations/timers.py").read_text()
+    assert "execution_timeout_s=None" in (project / "operations/timers.py").read_text()
     assert "default_price_book" in (project / "policies/budgets.py").read_text()
     assert "RestartHarness" in (project / "tests/test_restart.py").read_text()
 
