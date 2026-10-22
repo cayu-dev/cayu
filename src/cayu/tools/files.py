@@ -120,16 +120,6 @@ _READ_FILE_ARGUMENTS = frozenset(
     }
 )
 _READ_FILE_ENTRY_ARGUMENTS = frozenset({"path", "offset", "start_line", "end_line"})
-_SINGLE_READ_ARGUMENTS = (
-    "path",
-    "artifact_id",
-    "offset",
-    "start_line",
-    "end_line",
-    "max_attachment_bytes",
-    "pages",
-    "image_region",
-)
 _EDIT_FILE_ARGUMENTS = frozenset(
     {"path", "expected_revision", "edits", "max_bytes", "max_diff_bytes"}
 )
@@ -205,6 +195,7 @@ class _ReadFileEntry:
     offset: int
     line_range: _LineRange | None
     path_error: str | None
+    has_explicit_range: bool
 
 
 @dataclass(frozen=True)
@@ -278,14 +269,18 @@ def _read_file_tool_spec(
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative file path to read.",
+                    "description": (
+                        "Workspace-relative file path to read. Leave it out when you use `files`."
+                    ),
                 },
+                # Provider schemas can't say "one of", so empty `files` and a
+                # `path` repeated in it reach the tool, which accepts them.
                 "files": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": MAX_READ_FILES,
                     "description": (
                         "Several workspace text files to read in one call, instead of `path`. "
+                        "Put each file's range in its own entry. "
                         "max_bytes bounds the whole result: files are read in order and each "
                         "may use an equal share of what earlier files left unused. A file that "
                         "can't be read reports its own error without failing the others. "
@@ -463,16 +458,17 @@ class ReadFileTool(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
             reject_unknown_tool_arguments(args, allowed=_READ_FILE_ARGUMENTS)
+            # Models often fill in every field, so an empty string or an empty
+            # `files` counts as left out rather than as a second target.
+            path = _given_arg_string(args, "path")
+            artifact_id = _given_arg_string(args, "artifact_id")
+            files = args.get("files")
             entries = None
-            if args.get("files") is not None:
-                conflicting = [key for key in _SINGLE_READ_ARGUMENTS if args.get(key) is not None]
-                if conflicting:
-                    raise ValueError(
-                        f"Tool argument `files` cannot be combined with `{conflicting[0]}`."
-                    )
-                entries = _read_file_entries(args["files"])
-            path = _optional_arg_string(args, "path")
-            artifact_id = _optional_arg_string(args, "artifact_id")
+            if files is not None and files != []:
+                entries = _read_file_entries(files)
+            elif path is None and artifact_id is None:
+                # A blank path is the only target here; say so.
+                _optional_arg_string(args, "path")
             if entries is None and (path is None) == (artifact_id is None):
                 raise ValueError(
                     "Tool arguments must include exactly one of `path`, `files` or `artifact_id`."
@@ -486,7 +482,7 @@ class ReadFileTool(Tool):
             offset = _optional_nonnegative_int(args, "offset", default=0)
             line_range = _optional_line_range(args)
             if line_range is not None:
-                if artifact_id is not None:
+                if artifact_id is not None and entries is None:
                     raise ValueError(
                         "Tool arguments `start_line` and `end_line` are only valid with `path`."
                     )
@@ -494,14 +490,24 @@ class ReadFileTool(Tool):
                     raise ValueError(
                         "Tool argument `offset` cannot be combined with `start_line` or `end_line`."
                     )
+            if entries is not None:
+                entries = _batch_with_single_read_fields(
+                    entries,
+                    path=path,
+                    artifact_id=artifact_id,
+                    offset=offset,
+                    line_range=line_range,
+                )
+                path = None
             max_attachment_bytes = _optional_int(
                 args,
                 "max_attachment_bytes",
                 default=self.default_attachment_limit_bytes,
                 maximum=self.max_attachment_limit_bytes,
             )
-            pages = _optional_arg_string(args, "pages")
-            region = args.get("image_region")
+            # Batches read text only, so the image and PDF options don't apply.
+            pages = None if entries is not None else _given_arg_string(args, "pages")
+            region = None if entries is not None else args.get("image_region")
             if region is not None:
                 if (
                     not isinstance(region, list)
@@ -3438,6 +3444,15 @@ def _optional_arg_string(args: dict, key: str) -> str | None:
     return require_unicode_scalar_text(require_nonblank(value, key), key)
 
 
+def _given_arg_string(args: dict, key: str) -> str | None:
+    """Return an optional string argument, treating a blank string as left out."""
+
+    value = args.get(key)
+    if type(value) is str and not value.strip():
+        return None
+    return _optional_arg_string(args, key)
+
+
 def _require_sha256(args: dict, key: str) -> str:
     value = _require_arg_string(args, key)
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
@@ -3525,8 +3540,6 @@ def _optional_line_range(args: dict) -> _LineRange | None:
 def _read_file_entries(value: object) -> tuple[_ReadFileEntry, ...]:
     if not isinstance(value, list):
         raise ValueError("Tool argument `files` must be an array.")
-    if not value:
-        raise ValueError("Tool argument `files` cannot be empty.")
     if len(value) > MAX_READ_FILES:
         raise ValueError(f"Tool argument `files` must contain at most {MAX_READ_FILES} items.")
     entries: list[_ReadFileEntry] = []
@@ -3552,9 +3565,63 @@ def _read_file_entries(value: object) -> tuple[_ReadFileEntry, ...]:
         except ValueError as exc:
             path_error = str(exc)
         entries.append(
-            _ReadFileEntry(path=path, offset=offset, line_range=line_range, path_error=path_error)
+            _ReadFileEntry(
+                path=path,
+                offset=offset,
+                line_range=line_range,
+                path_error=path_error,
+                has_explicit_range=any(key in item for key in ("offset", "start_line", "end_line")),
+            )
         )
     return tuple(entries)
+
+
+def _batch_with_single_read_fields(
+    entries: tuple[_ReadFileEntry, ...],
+    *,
+    path: str | None,
+    artifact_id: str | None,
+    offset: int,
+    line_range: _LineRange | None,
+) -> tuple[_ReadFileEntry, ...]:
+    """Apply single-read fields sent next to `files`, rejecting only real conflicts.
+
+    Models that fill in every field repeat a `files` entry in `path` and copy
+    its range to the top level. Policy saw each entry's own path, so `path` is
+    accepted only when it names one of them. A top-level range applies to
+    entries without their own and must match those that have one.
+    """
+
+    if artifact_id is not None:
+        raise ValueError(
+            "Tool argument `artifact_id` cannot be combined with `files`. Read the artifact "
+            "in a separate call."
+        )
+    if path is not None and not any(_same_workspace_path(path, entry.path) for entry in entries):
+        raise ValueError(
+            "Tool argument `path` is not one of the `files` entries. List every file to read "
+            "in `files` and leave `path` out."
+        )
+    if offset == 0 and line_range is None:
+        return entries
+    resolved: list[_ReadFileEntry] = []
+    for entry in entries:
+        # Authorization sees explicit entry fields override top-level fields,
+        # including offset zero. Never reinterpret them as absent after policy.
+        if not entry.has_explicit_range:
+            entry = replace(entry, offset=offset, line_range=line_range)
+        elif (entry.offset, entry.line_range) != (offset, line_range):
+            raise ValueError(
+                "Top-level `offset`, `start_line` or `end_line` differs from a `files` entry's "
+                "own range. Set the range inside each `files` entry and leave the top-level "
+                "fields out."
+            )
+        resolved.append(entry)
+    return tuple(resolved)
+
+
+def _same_workspace_path(left: str, right: str) -> bool:
+    return posixpath.normpath(left) == posixpath.normpath(right)
 
 
 def _truncate_utf8_text(value: str, maximum: int, *, marker: str) -> tuple[str, bool]:

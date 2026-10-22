@@ -145,15 +145,16 @@ def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
             "type": "object",
             "additionalProperties": False,
             "properties": {
+                # Provider schemas can't say "one of", so a blank `pattern`, an
+                # empty `patterns` or a repeated pattern reach the tool, which
+                # accepts them.
                 "pattern": {
                     "type": "string",
-                    "minLength": 1,
                     "maxLength": MAX_SEARCH_ARGUMENT_BYTES,
-                    "pattern": r"\S",
+                    "description": "One regex. To search for several, use `patterns` instead.",
                 },
                 "patterns": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": MAX_SEARCH_PATTERNS,
                     "items": {
                         "type": "string",
@@ -161,7 +162,10 @@ def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
                         "maxLength": MAX_SEARCH_ARGUMENT_BYTES,
                         "pattern": r"\S",
                     },
-                    "description": "Several regexes instead of `pattern`; lines matching any.",
+                    "description": (
+                        "Several regexes instead of `pattern`; lines matching any. "
+                        "Send `pattern` or `patterns`, not both."
+                    ),
                 },
                 "path": {
                     "type": "string",
@@ -593,18 +597,31 @@ class SearchTextTool(Tool):
 
 
 def _search_patterns(args: dict[str, Any]) -> list[str]:
-    if (args.get("pattern") is None) == (args.get("patterns") is None):
-        raise ValueError("Tool arguments must include exactly one of `pattern` or `patterns`.")
-    if args.get("pattern") is not None:
+    # Models that fill in every field send both forms. A blank `pattern`, an
+    # empty `patterns`, or a `pattern` repeated in `patterns` is not a conflict.
+    # Policy checks every entry of `patterns`, so `pattern` must be among them.
+    values = args.get("patterns")
+    if values is not None and type(values) is not list:
+        raise ValueError("Tool argument `patterns` must be an array.")
+    pattern = args.get("pattern")
+    if not values:
+        if pattern is None:
+            raise ValueError("Tool arguments must include `pattern` or `patterns`.")
         return [_required_text(args, "pattern")]
-    values = args["patterns"]
-    if type(values) is not list or not values:
-        raise ValueError("Tool argument `patterns` must be a non-empty array.")
     if len(values) > MAX_SEARCH_PATTERNS:
         raise ValueError(
             f"Tool argument `patterns` must contain at most {MAX_SEARCH_PATTERNS} items."
         )
-    return [_required_text({"patterns": value}, "patterns") for value in values]
+    patterns = [_required_text({"patterns": value}, "patterns") for value in values]
+    if pattern is not None:
+        if type(pattern) is not str:
+            raise ValueError("Tool argument `pattern` must be a string.")
+        if pattern.strip() and pattern not in patterns:
+            raise ValueError(
+                "Tool argument `pattern` is not one of `patterns`. Send one regex in "
+                "`pattern`, or every regex in `patterns` and leave `pattern` out."
+            )
+    return patterns
 
 
 def _required_text(args: dict[str, Any], key: str) -> str:

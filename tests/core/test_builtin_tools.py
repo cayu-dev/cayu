@@ -1419,9 +1419,14 @@ def test_read_file_batch_is_an_error_only_when_every_file_fails(tmp_path):
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        ({"files": [{"path": "a.txt"}], "path": "a.txt"}, "cannot be combined with `path`"),
-        ({"files": [{"path": "a.txt"}], "offset": 1}, "cannot be combined with `offset`"),
-        ({"files": []}, "cannot be empty"),
+        ({"files": [{"path": "a.txt"}], "path": "b.txt"}, "leave `path` out"),
+        ({"files": [{"path": "a.txt"}], "artifact_id": "art_1"}, "in a separate call"),
+        ({"files": [{"path": "a.txt", "offset": 2}], "offset": 1}, "differs from a `files` entry"),
+        (
+            {"files": [{"path": "a.txt", "start_line": 1}], "start_line": 2},
+            "differs from a `files` entry",
+        ),
+        ({"files": []}, "exactly one of `path`, `files` or `artifact_id`"),
         ({"files": [{"path": "a.txt"}] * 21}, "at most 20 items"),
         ({"files": [{"path": "a.txt", "extra": 1}]}, "unknown fields"),
         ({"files": [{}]}, "Missing fields: path"),
@@ -1437,6 +1442,139 @@ def test_read_file_rejects_invalid_batches(tmp_path, args, message):
     assert result.is_error is True
     assert result.structured["error"] == "invalid_arguments"
     assert message in result.content
+
+
+# Recorded from gpt-6-astra through ChatCompletionsProvider on 0.13.0, which
+# fills in every schema field. The log was cut after `start_line`; the other
+# values are the schema-valid fillers such a model sends.
+_RECORDED_READ_CALL = {
+    "path": "inventory.txt",
+    "files": [{"path": "inventory.txt", "start_line": 1, "end_line": 1000, "offset": 0}],
+    "start_line": 1,
+    "end_line": 1000,
+    "offset": 0,
+    "max_bytes": 20000,
+    "artifact_id": "",
+    "pages": "",
+    "image_region": [0, 0, 0, 0],
+    "max_attachment_bytes": 1000,
+}
+_RECORDED_TWO_FILE_ENTRIES = [
+    {"path": "inventory.txt", "start_line": 1, "end_line": 1000, "offset": 0},
+    {"path": "sub/notes.md", "start_line": 1, "end_line": 1000, "offset": 0},
+]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        _RECORDED_READ_CALL,
+        {**_RECORDED_READ_CALL, "files": _RECORDED_TWO_FILE_ENTRIES},
+        {**_RECORDED_READ_CALL, "path": "", "files": _RECORDED_TWO_FILE_ENTRIES},
+        {**_RECORDED_READ_CALL, "path": "./inventory.txt"},
+    ],
+)
+def test_read_file_accepts_recorded_calls_that_repeat_the_batch(tmp_path, args):
+    (tmp_path / "inventory.txt").write_text("Marker: alpha\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "notes.md").write_text("Marker: beta\n")
+
+    result = asyncio.run(ReadFileTool().run(_workspace_read_ctx(tmp_path), args))
+
+    assert result.is_error is False
+    files = result.structured["files"]
+    assert [item["path"] for item in files] == [entry["path"] for entry in args["files"]]
+    assert all("error" not in item and item["start_line"] == 1 for item in files)
+    assert "Marker: alpha" in result.content
+    assert ("Marker: beta" in result.content) is (len(files) == 2)
+
+
+@pytest.mark.parametrize("entry_range", [{"offset": 0}, {"start_line": None}, {"end_line": None}])
+def test_read_file_batch_never_replaces_an_explicit_default_range(tmp_path, entry_range):
+    (tmp_path / "record.txt").write_text("PUBLIC\nHIDDEN")
+    tool = ReadFileTool()
+    args = {
+        "files": [{"path": "record.txt", **entry_range}],
+        "offset": 7,
+        "max_bytes": 6,
+    }
+    [policy_view] = tool._policy_argument_sets(args)
+    assert all(policy_view[key] == value for key, value in entry_range.items())
+
+    result = asyncio.run(tool.run(_workspace_read_ctx(tmp_path), args))
+
+    assert result.is_error is True
+    assert result.structured["error"] == "invalid_arguments"
+    assert "HIDDEN" not in result.content
+
+
+def test_read_file_batch_inherits_only_an_absent_offset(tmp_path):
+    (tmp_path / "record.txt").write_text("PUBLIC\nHIDDEN")
+    tool = ReadFileTool()
+    args = {"files": [{"path": "record.txt"}], "offset": 7, "max_bytes": 6}
+    [policy_view] = tool._policy_argument_sets(args)
+    assert policy_view["offset"] == 7
+
+    result = asyncio.run(tool.run(_workspace_read_ctx(tmp_path), args))
+
+    assert result.is_error is False
+    assert result.structured["files"][0]["offset"] == policy_view["offset"]
+    assert "HIDDEN" in result.content
+
+
+def test_read_file_batch_applies_a_top_level_range_to_entries_without_one(tmp_path):
+    (tmp_path / "a.txt").write_text("a1\na2\na3\n")
+    (tmp_path / "b.txt").write_text("b1\nb2\nb3\n")
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            _workspace_read_ctx(tmp_path),
+            {
+                "files": [{"path": "a.txt"}, {"path": "b.txt", "start_line": 3}],
+                "start_line": 2,
+                "end_line": 2,
+            },
+        )
+    )
+
+    assert result.is_error is True
+    assert "differs from a `files` entry" in result.content
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            _workspace_read_ctx(tmp_path),
+            {
+                "files": [{"path": "a.txt"}, {"path": "b.txt", "start_line": 2, "end_line": 2}],
+                "start_line": 2,
+                "end_line": 2,
+            },
+        )
+    )
+
+    assert result.is_error is False
+    assert [(item["start_line"], item["end_line"]) for item in result.structured["files"]] == [
+        (2, 2),
+        (2, 2),
+    ]
+    assert "a2" in result.content and "b2" in result.content
+    assert "a1" not in result.content and "b3" not in result.content
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"path": "a.txt", "artifact_id": ""},
+        {"path": "a.txt", "pages": "", "artifact_id": "  "},
+        {"path": "a.txt", "files": []},
+    ],
+)
+def test_read_file_treats_empty_unused_fields_as_left_out(tmp_path, args):
+    (tmp_path / "a.txt").write_text("alpha")
+
+    result = asyncio.run(ReadFileTool().run(_workspace_read_ctx(tmp_path), args))
+
+    assert result.is_error is False
+    assert _read_text(result) == "alpha"
 
 
 def test_read_file_pages_text_with_workspace_bounded_read_limit(tmp_path):
@@ -7028,6 +7166,69 @@ def test_read_file_batch_authorizes_every_path_before_reading(tmp_path, mode, re
         assert "private-file-canary" not in repr([e.model_dump() for e in events])
         if mode == "approval":
             assert any("approval" in e.type.value for e in events)
+
+
+@pytest.mark.parametrize("path", ["safe.txt", ""])
+def test_recorded_read_call_passes_schema_and_policy_checks(tmp_path, path):
+    from cayu.tools.files import ReadFileTool
+    from cayu.tools.policy import (
+        DenyPatternRule,
+        ParameterConstrainedToolPolicy,
+        ToolPolicyDecision,
+    )
+
+    (tmp_path / "safe.txt").write_text("public")
+    (tmp_path / ".env").write_text("private-file-canary")
+    reads = []
+
+    class ObservedWorkspace(LocalWorkspace):
+        async def read_bytes(self, path, **kwargs):
+            reads.append(path)
+            return await super().read_bytes(path, **kwargs)
+
+    calls = [
+        {**_RECORDED_READ_CALL, "path": path, "files": [{"path": "safe.txt"}]},
+        {**_RECORDED_READ_CALL, "path": path, "files": [{"path": "safe.txt"}, {"path": ".env"}]},
+    ]
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id=f"read_{index}", name="read_file", arguments=call)
+                for index, call in enumerate(calls)
+            ]
+            + [ModelStreamEvent.completed({"finish_reason": "tool_calls"})],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="files"),
+            workspace=ObservedWorkspace(tmp_path, workspace_id="local"),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake"),
+        tools=[ReadFileTool()],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"read_file": [DenyPatternRule("path", patterns=[r"^\.env$"])]},
+            decision=ToolPolicyDecision.DENY,
+        ),
+    )
+    events = asyncio.run(
+        collect_events(
+            app, RunRequest(agent_name="assistant", messages=[Message.text("user", "read")])
+        )
+    )
+
+    completed = [e for e in events if e.type == EventType.TOOL_CALL_COMPLETED]
+    assert len(completed) == 1
+    assert "public" in completed[0].payload["result"]["content"]
+    assert len([e for e in events if e.type == EventType.TOOL_CALL_BLOCKED]) == 1
+    assert ".env" not in reads
+    assert "private-file-canary" not in repr([e.model_dump() for e in events])
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])

@@ -428,6 +428,118 @@ def test_search_text_passes_each_pattern_to_ripgrep() -> None:
     assert argv[-6:] == ["--regexp", "-v", "--regexp", "needle", "--", "."]
 
 
+# Recorded from gpt-6-astra through ChatCompletionsProvider on 0.13.0, which
+# fills in every schema field and so sends `pattern` and `patterns` together.
+_RECORDED_SEARCH_CALL = {
+    "pattern": "^Marker:",
+    "patterns": ["^Marker:"],
+    "path": ".",
+    "glob": "**/*",
+    "mode": "content",
+    "limit": 500,
+    "offset": 0,
+    "case_sensitive": True,
+    "context_lines": 0,
+}
+
+
+@pytest.mark.parametrize(
+    ("args", "regexes"),
+    [
+        (_RECORDED_SEARCH_CALL, ["^Marker:"]),
+        ({**_RECORDED_SEARCH_CALL, "mode": "files"}, ["^Marker:"]),
+        ({"pattern": "", "patterns": ["a", "b"]}, ["a", "b"]),
+        ({"pattern": "b", "patterns": ["a", "b"]}, ["a", "b"]),
+        ({"pattern": "a", "patterns": []}, ["a"]),
+    ],
+)
+def test_search_text_accepts_a_pattern_repeated_or_left_empty_next_to_patterns(
+    args: dict, regexes: list[str]
+) -> None:
+    runner = _ResultRunner(ExecResult(exit_code=1))
+
+    result = asyncio.run(SearchTextTool().run(ToolContext(session_id="s", runner=runner), args))
+
+    assert result.is_error is False
+    assert runner.command is not None
+    argv = list(runner.command.argv)
+    if len(regexes) == 1:
+        assert argv[-3:] == ["--", regexes[0], "."]
+    else:
+        assert argv[-6:] == ["--regexp", regexes[0], "--regexp", regexes[1], "--", "."]
+
+
+def test_search_text_names_the_fix_for_a_pattern_missing_from_patterns() -> None:
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(session_id="s", runner=_ResultRunner(ExecResult())),
+            {"pattern": "needle", "patterns": ["other"]},
+        )
+    )
+
+    assert result.is_error is True
+    assert "leave `pattern` out" in result.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+@pytest.mark.parametrize("pattern", ["secret", ""])
+def test_recorded_search_call_passes_schema_and_policy_checks(tmp_path, pattern) -> None:
+    from cayu.tools.policy import (
+        DenyPatternRule,
+        ParameterConstrainedToolPolicy,
+        ToolPolicyDecision,
+    )
+
+    (tmp_path / "inventory.txt").write_text("Marker: public\nsecret\n")
+    calls = [
+        _RECORDED_SEARCH_CALL,
+        {**_RECORDED_SEARCH_CALL, "pattern": pattern, "patterns": ["^Marker:", "secret"]},
+    ]
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id=f"search_{index}", name="search_text", arguments=call)
+                for index, call in enumerate(calls)
+            ]
+            + [ModelStreamEvent.completed({"finish_reason": "tool_calls"})],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="search"),
+            runner=LocalRunner(tmp_path),
+            workspace=LocalWorkspace(tmp_path),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="a", model="scripted"),
+        tools=[SearchTextTool()],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"search_text": [DenyPatternRule("pattern", patterns=["secret"])]},
+            decision=ToolPolicyDecision.DENY,
+        ),
+    )
+
+    async def scenario():
+        return [
+            event
+            async for event in app.run(
+                RunRequest(agent_name="a", messages=[Message.text("user", "search")])
+            )
+        ]
+
+    events = asyncio.run(scenario())
+    completed = [e for e in events if e.type == EventType.TOOL_CALL_COMPLETED]
+    assert len(completed) == 1
+    assert "inventory.txt:1:Marker: public" in completed[0].payload["result"]["content"]
+    blocked = [e for e in events if e.type == EventType.TOOL_CALL_BLOCKED]
+    assert len(blocked) == 1
+
+
 def test_search_text_reports_an_invalid_pattern_among_several() -> None:
     stderr = "rg: regex parse error:\n    (?:a()|(?:b)\n    ^\nerror: unclosed group"
     runner = _ResultRunner(ExecResult(exit_code=2, stderr=stderr))

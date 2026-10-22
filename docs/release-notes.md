@@ -102,6 +102,25 @@ unchanged.
   invocation receipt ledger is reused instead of validated again on every read,
   and canonical JSON is encoded in C. Durable formats and recovery are
   unchanged.
+- The built-in `search_text` and `read_file` tools accept the calls that models
+  which fill in every schema field send. Release 0.13.0 added batched forms to
+  both tools and its notes left them out: `search_text` takes `patterns` (up to
+  10 regexes; a line matches any of them) next to `pattern`, and `context_lines`
+  in content mode. `read_file` takes `files` (up to 20 text files, each with its
+  own `offset` or `start_line` and `end_line`) next to `path`, and `start_line`
+  and `end_line` for a single file. On 0.13.0 a call that sent both forms failed
+  with `invalid_arguments`, even when both named the same target, so such a
+  model could not search or read any file. Now a `pattern` repeated in
+  `patterns`, a `path` that is empty or names a `files` entry, an empty
+  `artifact_id`, and a top-level range that matches the entries are accepted. A
+  top-level range also applies to entries without their own, and `pages`,
+  `image_region` and `max_attachment_bytes` are ignored for a batch. Forms that
+  name different targets are still rejected, with a message saying what to
+  send, and tool policy still checks every pattern and file before the call
+  runs. The schemas stay flat objects, since Anthropic rejects `oneOf` and
+  `anyOf` at the top of a tool's input schema and OpenAI-compatible backends
+  differ in what they keep. They now allow a blank `pattern` and an empty
+  `patterns` or `files`, which the tools read as left out.
 
 ## v0.13.0
 
