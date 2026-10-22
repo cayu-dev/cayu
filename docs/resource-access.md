@@ -60,7 +60,7 @@ page = await access.sessions.list_sessions()
 ```
 
 `product_memberships` and `verified_subject` are application-owned symbols. The
-same registered agent can serve private users, departments, organization-wide
+same registered specialist can serve private users, departments, organization-wide
 resources, or separate organizations by changing classification and policy. No
 membership tables or `tenant_id` columns are added by Runtime.
 
@@ -108,7 +108,7 @@ The last row includes administrative leases, global reconciliation, schema work,
 closure/pinning journals, provider-disposition commands, collaboration participant
 administration, and unexposed topology/maintenance operations. Adding a product
 endpoint requires an explicit scoped implementation; mounting the existing
-packaged control plane does not make those operations product-safe.
+packaged Developer dashboard does not make those operations product-safe.
 
 Memory, SQLite, and Postgres session/task/knowledge stores implement the native
 contract. Local and S3 artifact stores implement immutable resource classification.
@@ -185,7 +185,7 @@ event export, usage, supervision events, run/resume/fork streams, and configured
 artifact operations.
 Supply `knowledge_scope` to enable knowledge read/search routes. Artifact store
 aliases and environments are host configuration, never client-selected backend
-credentials. Keep the packaged operator server behind separate operator access.
+credentials. Keep the packaged Developer dashboard behind its own separate access policy.
 Application membership/RBAC and HTTP ingress rate limits are separate concerns.
 
 Conformance coverage lives in `test_session_access.py`, `test_task_access.py`,

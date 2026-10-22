@@ -95,7 +95,7 @@ bounds; it does not infer that a disconnected, paused browser is finished.
 
 ## Access and retention
 
-The capture credential is separate from operator login and is sent only through
+The capture credential is separate from Developer dashboard login and is sent only through
 Runtime's private runner transport. Keep it and the recording database outside
 model-accessible workspaces. Never pass either through tool arguments. Recording
 bytes and references are not model attachments, transcripts or ordinary artifacts.

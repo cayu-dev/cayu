@@ -83,7 +83,7 @@ function CapabilityTables({ diagnostics }: { diagnostics: SystemDiagnostics }) {
 
       <DataCard
         title="Mutation families"
-        description="Runtime-owned actions advertised to compatible control-plane clients."
+        description="Runtime-owned actions advertised to compatible Developer dashboard clients."
         contentClassName="p-4"
       >
         <dl>

@@ -966,7 +966,7 @@ def _retrieve_idle_release_outcome(task: asyncio.Task[None]) -> None:
 
 
 class CayuApp:
-    """Application runtime for registered agents, providers, and session state."""
+    """Application runtime for registered specialists, providers, and session state."""
 
     def __init__(
         self,
@@ -5930,7 +5930,7 @@ class CayuApp:
         registered_agent = self._agent_registry.registrations.get(session.agent_name)
         if registered_agent is None:
             raise ToolDiscoveryViewInconsistentError(
-                "The session's registered agent is unavailable."
+                "The session's registered specialist is unavailable."
             )
         if registered_agent.tool_discovery_mode is None:
             raise ToolDiscoveryViewNotEnabledError(
@@ -6598,7 +6598,7 @@ class CayuApp:
         return system_prompt_messages_sha256(messages)
 
     def list_agents(self) -> tuple[str, ...]:
-        """Return the names of all registered agents, sorted."""
+        """Return the names of all registered specialists, sorted."""
         return self._agent_registry.list_agents()
 
     def list_providers(self) -> tuple[str, ...]:

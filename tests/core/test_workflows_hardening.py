@@ -1312,9 +1312,9 @@ def test_workflow_anchor_is_recovery_safe():
 
     # The incomplete-session recovery sweep only accepts non-terminal statuses
     # (PENDING/RUNNING/INTERRUPTING), so a COMPLETED anchor is categorically
-    # outside what it can even query. Pre-fix the anchor was PENDING and this
-    # sweep found it, then raised KeyError on its unregistered agent_name; now it
-    # finds nothing and returns cleanly.
+    # outside what it can even query. A PENDING anchor would be found by this
+    # sweep and raise KeyError on its unregistered agent_name; a COMPLETED one
+    # is never found, so the sweep returns cleanly.
     async def sweep():
         return await app.recover_incomplete_sessions(
             IncompleteSessionsRecoveryRequest(statuses={SessionStatus.PENDING})

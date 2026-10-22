@@ -46,11 +46,11 @@ class _ServeSettings:
 def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "serve",
-        help="Serve a configured Cayu project's control plane.",
+        help="Serve a configured Cayu project's API and Developer dashboard.",
         description=(
-            "Start one process-scoped Cayu control plane. Select --dev explicitly "
-            "for unauthenticated local development or configure authentication "
-            "for deployment."
+            "Start one process-scoped Cayu server and its Developer dashboard. Select --dev explicitly "
+            "--dev explicitly for unauthenticated local development or configure "
+            "authentication for deployment."
         ),
     )
     add_serve_arguments(parser)
@@ -149,8 +149,9 @@ def run_serve(args: argparse.Namespace) -> int:
                 if project.service_target is not None:
                     if args.auth is not None or settings.auth_target is not None:
                         raise ServeError(
-                            "A maintained public service owns its separate product and operator "
-                            "access policies; do not configure [tool.cayu.serve].auth or --auth."
+                            "A maintained public service owns its separate product and Developer "
+                            "dashboard access policies; do not configure "
+                            "[tool.cayu.serve].auth or --auth."
                         )
                     service = build_project_service(
                         project.service_target,
@@ -206,7 +207,7 @@ def run_serve(args: argparse.Namespace) -> int:
                 if project.service_target is None:
                     assert config is not None
                     print(
-                        "Cayu control plane: "
+                        "Cayu Developer dashboard: "
                         f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
                     )
                 else:
@@ -216,7 +217,7 @@ def run_serve(args: argparse.Namespace) -> int:
                         "/operations"
                     )
                     print(
-                        "Cayu operator control plane: "
+                        "Cayu Developer dashboard: "
                         f"{_control_plane_url(args.host, args.port, service.manifest.control_plane_path)}"
                     )
                 uvicorn.run(server, host=args.host, port=args.port)
@@ -243,7 +244,7 @@ def require_loopback_dev_host(host: str) -> None:
         is_loopback = host.casefold() == "localhost"
     if not is_loopback:
         raise ServeError(
-            "Refusing to expose an unauthenticated control plane on a non-loopback host. "
+            "Refusing to expose an unauthenticated Developer dashboard on a non-loopback host. "
             "Use --dev with a loopback host such as 127.0.0.1 or ::1, or configure "
             "authentication before binding publicly."
         )

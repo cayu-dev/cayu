@@ -73,7 +73,7 @@ unchanged.
   `cayu.cloud-agent` contract. With `CAYU_CLOUD_READER_TOKEN_SHA256` set to the
   digest of Cloud's reader token, `cayu serve` and `mount_cayu` serve
   `GET {api}/cloud/contract` and `GET {api}/cloud/v1/activity`. The token is not
-  the operator login and reads nothing else. Each page holds the current summary
+  the Developer dashboard login and reads nothing else. Each page holds the current summary
   of every session that changed after a cursor (status and what it waits on,
   start and end, estimated cost, Release, agent and counts) and the touches that
   settled in the same range (approve, edit, deny, expire, answer, recover,

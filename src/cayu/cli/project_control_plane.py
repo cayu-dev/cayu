@@ -102,7 +102,7 @@ def close_project_control_plane_context(context: ProjectControlPlaneContext | No
             asyncio.run(context.close())
         except Exception as exc:
             raise ProjectError(
-                f"Could not close project Control Plane storage ({type(exc).__name__})."
+                f"Could not close project Developer dashboard storage ({type(exc).__name__})."
             ) from exc
 
 

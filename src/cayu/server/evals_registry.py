@@ -560,7 +560,7 @@ def generated_eval_target_registry(
     price_book: PriceBook | None = None,
     judge_configuration: ProjectEvalJudgeConfiguration | None = None,
 ) -> EvalTargetRegistry | None:
-    """Build one normal-authority target per currently registered agent."""
+    """Build one normal-authority target per currently registered specialist."""
 
     if not isinstance(app, CayuApp):
         raise TypeError("app must be a CayuApp.")
@@ -577,7 +577,9 @@ def generated_eval_target_registry(
     if not agent_names:
         return None
     if len(agent_names) > MAX_EVAL_TARGETS:
-        raise ValueError(f"Automatic Evals supports at most {MAX_EVAL_TARGETS} registered agents.")
+        raise ValueError(
+            f"Automatic Evals supports at most {MAX_EVAL_TARGETS} registered specialists."
+        )
     if (
         judge_configuration is not None
         and type(judge_configuration) is not ProjectEvalJudgeConfiguration

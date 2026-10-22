@@ -78,7 +78,7 @@ boundaries:
 Cayu treats these as runtime contracts. Important actions become structured
 events; tool authority and recovery are explicit; configured durable stores let
 transcripts and checkpoints survive process boundaries; and the same public
-seams support local development, tests, control-plane inspection, and hosted
+seams support local development, tests, Developer dashboard inspection, and hosted
 deployments.
 
 ## What Cayu provides
@@ -98,7 +98,7 @@ deployments.
 | Evals and improvement | Runtime tests, production-session promotion, durable evals, replay, comparison and CI reports |
 | Git and GitHub delivery | Governed repository changes, commits, pull requests and delivery receipts |
 | Development and deployment | Project scaffolding, application factories, process roles and optional Cloud deployment |
-| Operations | FastAPI control plane and a packaged dashboard for sessions, workflows, usage and evals |
+| Operations | FastAPI server API and the packaged Developer dashboard for sessions, workflows, usage and evals |
 
 ### The integrated durable runtime
 
@@ -488,7 +488,7 @@ dispatched write is interrupted, stores distinguish an exact committed artifact,
 positively proved absence, and a typed reconciliation-required orphan candidate;
 the candidate is diagnostic evidence, never a readable artifact reference.
 
-## Application UI and control plane
+## Application UI and Developer dashboard
 
 Your application should own:
 
@@ -499,8 +499,8 @@ Your application should own:
 - decisions about when a run, task, approval, or interruption is allowed.
 
 Cayu owns runtime execution and the operational state recorded by the
-application's configured stores. Its optional dashboard is a control plane for
-developers and operators: inspect sessions,
+application's configured stores. Its optional Developer dashboard is where
+developers inspect sessions,
 events, transcripts, tasks, usage, artifacts, pending actions, and recovery
 state. Your application remains responsible for the product experience.
 
@@ -525,7 +525,7 @@ deployment:
 
 | Extra | Adds |
 | --- | --- |
-| `cayu[server]` | FastAPI control plane and packaged dashboard |
+| `cayu[server]` | FastAPI server API and the packaged Developer dashboard |
 | `cayu[server-settings]` | Server extra plus typed environment and `.env` loading |
 | `cayu[oidc]` | Server extra plus OIDC/JWT bearer-token verification (`OidcBearerAuth`) |
 | `cayu[postgres]` | PostgreSQL session, task, knowledge, and related stores |
@@ -596,9 +596,9 @@ The same agent can run in a local workspace, trusted Docker container, E2B,
 Microsandbox, Lambda MicroVM, or an application-owned runner without changing
 its identity or transcript contract.
 
-## Open and replaceable control plane
+## Open and replaceable Developer dashboard
 
-Cayu ships three equally supported control-plane choices: use the bundled compiled dashboard,
+Cayu ships three equally supported Developer dashboard choices: use the bundled compiled dashboard,
 eject the exact version-matched React/TypeScript source for application-owned customization, or
 provide a completely custom UI over the versioned control-plane API.
 
@@ -614,7 +614,7 @@ Extraction uses package data only—no repository clone, GitHub access, or netwo
 the resulting `dist/` with `DashboardConfig(directory=...)`,
 `mount_cayu(..., dashboard_dir=...)`, or `mount_dashboard(..., dashboard_dir=...)`. Cayu never
 rewrites the extracted application-owned source during upgrades. See [Open and replaceable
-control plane](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) for the complete workflow, compatibility gate, and
+Developer dashboard](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) for the complete workflow, compatibility gate, and
 redistribution obligations.
 
 ## Production boundaries
@@ -646,8 +646,8 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   credentials, and destination controls where consequences require them.
 - SQLite is appropriate for local and single-writer deployments. Use PostgreSQL
   or another conforming shared store for sustained multi-process concurrency.
-- The FastAPI control plane requires an explicit `ServerConfig` access policy.
-  Use `AuthenticatedAccess` for deployed operator surfaces; `OpenAccess` and
+- The FastAPI server requires an explicit `ServerConfig` access policy.
+  Use `AuthenticatedAccess` for a deployed Developer dashboard and API; `OpenAccess` and
   `ServerConfig.local_development()` are deliberate local-only choices.
   Deployment names are descriptive metadata and never relax security policy.
   See [server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md).
@@ -656,7 +656,7 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md).
   Generated API documentation is a separate exposure decision.
 - Public or multi-user product routes need a separate customer authorization
-  boundary; operator authentication does not make the raw Cayu surface
+  boundary; Developer dashboard authentication does not make the raw Cayu surface
   tenant-scoped. Start new services with
   `cayu new NAME --preset service`, then require both
   `cayu check --deploy --fail-on warning --json` and the generated
@@ -711,7 +711,7 @@ Start with the document that matches the job:
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
 | Let an agent search and read bounded public web evidence | [Web fetch and hosted search](https://github.com/cayu-dev/cayu/blob/main/docs/web-fetch.md) |
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
-| Run a first Control Plane evaluation | `cayu guide evals-first` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-first.md)) |
+| Run a first Developer dashboard evaluation | `cayu guide evals-first` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-first.md)) |
 | Add rubric-based AI quality evaluation | `cayu guide evals-ai-quality` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-ai-quality.md)) |
 | Evaluate production sessions, scenarios, tools, and memory | `cayu guide evals-production` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-production.md)) |
 | Look up complete Evals contracts | [Evals reference](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
@@ -720,12 +720,12 @@ Start with the document that matches the job:
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
 | Start a configured server process | [Project server](https://github.com/cayu-dev/cayu/blob/main/docs/project-server.md) |
-| Use, customize, or replace the operator control plane | [Open and replaceable control plane](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) |
+| Use, customize, or replace the Developer dashboard | [Open and replaceable Developer dashboard](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) |
 | Start a named worker process | [Project workers](https://github.com/cayu-dev/cayu/blob/main/docs/project-workers.md) |
 | Configure CLI session-store discovery | [Session-store targets](https://github.com/cayu-dev/cayu/blob/main/docs/session-store-targets.md) |
 | Prune old sessions, evals, artifacts and workspaces | [Storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md) |
 | Inspect durable sessions safely | [Session inspection](https://github.com/cayu-dev/cayu/blob/main/docs/session-inspection.md) |
-| Configure a control-plane server deployment | [Server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md) |
+| Configure a server deployment | [Server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md) |
 | Embed Cayu behind tenant-aware product APIs | [Server authentication and tenant isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md) |
 | Inspect supported model metadata | [Model catalog](https://github.com/cayu-dev/cayu/blob/main/docs/model-catalog.md) |
 | Look up exact runtime behavior | [Runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) |
@@ -745,7 +745,7 @@ and the [Glossary](https://github.com/cayu-dev/cayu/blob/main/docs/glossary.md).
 - [Local environment runtime](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py):
   files and commands.
 - [Server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py):
-  protected API and control plane.
+  protected API and Developer dashboard.
 - [Cloud PR reviewer](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/pr-reviewer.md):
   durable task, isolated workspace,
   QA, and an explicit external effect.

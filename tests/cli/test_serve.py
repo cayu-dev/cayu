@@ -105,7 +105,7 @@ def test_serve_uses_the_maintained_service_factory_for_explicit_local_developmen
     }
     output = capsys.readouterr().out
     assert "Cayu product service: http://127.0.0.1:8123/api/operations" in output
-    assert "Cayu operator control plane: http://127.0.0.1:8123/cayu/" in output
+    assert "Cayu Developer dashboard: http://127.0.0.1:8123/cayu/" in output
 
 
 def test_serve_reports_custom_product_and_control_plane_paths(
@@ -148,7 +148,7 @@ service_factory = "unused:build_service"
     assert launched["host"] == "::1"
     output = capsys.readouterr().out
     assert "Cayu product service: http://[::1]:8124/product/v1/operations" in output
-    assert "Cayu operator control plane: http://[::1]:8124/operators/" in output
+    assert "Cayu Developer dashboard: http://[::1]:8124/operators/" in output
 
 
 def test_serve_refuses_unsafe_production_service_before_starting_listener(
@@ -270,7 +270,7 @@ def build_app():
     assert server.state.cayu_server_config.lifecycle.startup_recovery_statuses is None
     assert (project / "factory-log.txt").read_text(encoding="utf-8") == f"{project}\n"
     assert "serve_project" not in sys.modules
-    assert "Cayu control plane: http://127.0.0.1:9123/cayu/" in capsys.readouterr().out
+    assert "Cayu Developer dashboard: http://127.0.0.1:9123/cayu/" in capsys.readouterr().out
 
 
 def test_serve_rejects_unauthenticated_dev_on_a_non_loopback_host_before_building(
@@ -294,7 +294,7 @@ def test_serve_rejects_unauthenticated_dev_on_a_non_loopback_host_before_buildin
     assert main(["serve", "--dev", "--host", "0.0.0.0"]) == 1
 
     error = capsys.readouterr().err
-    assert "Refusing to expose an unauthenticated control plane" in error
+    assert "Refusing to expose an unauthenticated Developer dashboard" in error
     assert "loopback host" in error
     assert "unsafe dev bind" not in error
     assert "must_not_build" not in sys.modules
@@ -619,3 +619,19 @@ def test_serve_refusal_names_the_ready_made_environment_auth_target(
     error = capsys.readouterr().err
     assert 'auth = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"' in error
     assert "CAYU_OPERATOR_USERNAME and CAYU_OPERATOR_PASSWORD" in error
+
+
+def test_serve_help_names_the_developer_dashboard(capsys) -> None:
+    with pytest.raises(SystemExit) as exited:
+        main(["--help"])
+    assert exited.value.code == 0
+    overview = " ".join(capsys.readouterr().out.split())
+    assert "serve Serve a configured Cayu project's API and Developer dashboard." in overview
+
+    with pytest.raises(SystemExit) as exited:
+        main(["serve", "--help"])
+    assert exited.value.code == 0
+    usage = " ".join(capsys.readouterr().out.split())
+    assert "Start one process-scoped Cayu server and its Developer dashboard." in usage
+    assert "control plane" not in usage
+    assert "operator" not in usage.casefold()

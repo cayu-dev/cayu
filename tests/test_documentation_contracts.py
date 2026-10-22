@@ -204,6 +204,48 @@ def test_internal_markdown_reference_patterns_preserve_generic_pull_syntax() -> 
     )
 
 
+_MARKDOWN_SECTION_LINK = re.compile(r"\]\(([^)\s#]*\.md)?#([^)\s]+)\)")
+_MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*#*\s*$")
+_HTML_ANCHOR = re.compile(r"""<a\s+(?:id|name)=["']([^"']+)["']""")
+
+
+def _markdown_anchors(path: Path) -> set[str]:
+    """Return GitHub-style heading anchors plus explicit HTML anchors."""
+    anchors: set[str] = set()
+    seen: dict[str, int] = {}
+    fenced = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        anchors.update(_HTML_ANCHOR.findall(line))
+        heading = _MARKDOWN_HEADING.match(line)
+        if heading is None:
+            continue
+        slug = re.sub(r"[^\w\- ]", "", heading.group(1).strip().lower()).replace(" ", "-")
+        count = seen.get(slug, 0)
+        seen[slug] = count + 1
+        anchors.add(slug if count == 0 else f"{slug}-{count}")
+    return anchors
+
+
+def test_markdown_section_links_point_at_existing_headings() -> None:
+    sources = [
+        _REPO_ROOT / "README.md",
+        *sorted((_REPO_ROOT / "docs").glob("*.md")),
+        *sorted((_REPO_ROOT / "src" / "cayu" / "guides").glob("*.md")),
+    ]
+    broken = []
+    for source in sources:
+        for match in _MARKDOWN_SECTION_LINK.finditer(source.read_text(encoding="utf-8")):
+            target = source.parent / match.group(1) if match.group(1) else source
+            if target.is_file() and match.group(2) not in _markdown_anchors(target):
+                broken.append(f"{source.relative_to(_REPO_ROOT)}: {match.group(0)}")
+    assert broken == []
+
+
 def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:
     guide = _REPO_ROOT / "src" / "cayu" / "guides" / "application-anatomy.md"
     assert guide.is_file()

@@ -143,7 +143,7 @@ def external_effect_tool_names() -> tuple[str, ...]:
     return ("pay_invoice",)
 '''
 
-_TOOL_POLICY_PY = '''"""Tool exposure and authorization policy for registered agents."""
+_TOOL_POLICY_PY = '''"""Tool exposure and authorization policy for registered specialists."""
 
 from datetime import timedelta
 

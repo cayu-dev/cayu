@@ -3610,6 +3610,7 @@
     "tests/cli/test_serve.py::test_serve_applies_only_explicit_bounded_startup_recovery": 0.49112595900001565,
     "tests/cli/test_serve.py::test_serve_discovers_project_and_runs_one_local_process": 1.182089645000005,
     "tests/cli/test_serve.py::test_serve_fails_closed_before_building_an_unauthenticated_app": 0.04029287199999487,
+    "tests/cli/test_serve.py::test_serve_help_names_the_developer_dashboard": 0.2545436657965183,
     "tests/cli/test_serve.py::test_serve_loads_configured_auth_for_the_control_plane_on_a_public_bind": 0.5085410869999976,
     "tests/cli/test_serve.py::test_serve_missing_project_guidance_matches_supported_cli": 0.6448263309999902,
     "tests/cli/test_serve.py::test_serve_refusal_names_the_ready_made_environment_auth_target": 0.03631314999998381,

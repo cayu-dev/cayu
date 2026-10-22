@@ -213,13 +213,13 @@ export function RunPage() {
     <Page>
       <PageHeader
         title="New Run"
-        description="Start a registered agent directly through the Cayu runtime. Application-specific entrypoints and orchestration are not invoked."
+        description="Start a registered specialist directly through the Cayu runtime. Application-specific entrypoints and orchestration are not invoked."
       />
 
       <DataCard title="Run configuration" headerClassName="pb-3" contentClassName="space-y-4 p-4">
         <div className="space-y-1.5">
           <label htmlFor="run-agent" className="text-sm font-medium">
-            Agent
+            Specialist
           </label>
           <select
             id="run-agent"
@@ -234,8 +234,8 @@ export function RunPage() {
           >
             <option value="">
               {agents.isLoading && agents.data === undefined
-                ? "Loading registered agents..."
-                : "Select an agent"}
+                ? "Loading registered specialists..."
+                : "Select a specialist"}
             </option>
             {registeredAgents.map((agent) => (
               <option key={agent.name} value={agent.name}>
@@ -247,14 +247,16 @@ export function RunPage() {
             {selectedAgent
               ? `${selectedAgent.provider_name ?? "default provider"} · ${selectedAgent.model} · ${formatCount(selectedAgent.tool_count)} ${selectedAgent.tool_count === 1 ? "tool" : "tools"}`
               : registeredAgents.length > 1
-                ? "Choose which registered agent receives this prompt."
-                : "The selected agent identity is sent explicitly with the run request."}
+                ? "Choose which registered specialist receives this prompt."
+                : "The selected specialist identity is sent explicitly with the run request."}
           </p>
         </div>
 
         {agents.isError && agents.data === undefined && (
           <StateMessage tone="danger" className="rounded-md border border-destructive/30 py-4">
-            <div role="alert">Registered agents could not be loaded: {agentInventoryError}</div>
+            <div role="alert">
+              Registered specialists could not be loaded: {agentInventoryError}
+            </div>
             <Button
               type="button"
               variant="outline"
@@ -269,13 +271,13 @@ export function RunPage() {
         )}
         {!agents.isLoading && !agents.isError && registeredAgents.length === 0 && (
           <StateMessage className="rounded-md border border-border py-4">
-            No agents are registered. Register an agent in the Cayu application before starting a
-            control-plane run.
+            No specialists are registered. Register a specialist in the Cayu application before
+            starting a Developer dashboard run.
           </StateMessage>
         )}
         {agents.isError && agents.data !== undefined && (
           <p className="text-sm text-destructive" role="alert">
-            The agent inventory could not be refreshed. The last confirmed selection remains
+            The specialist inventory could not be refreshed. The last confirmed selection remains
             available.
           </p>
         )}
@@ -381,7 +383,7 @@ export function RunPage() {
           </DataCard>
 
           <DataCard
-            title="Agent Output"
+            title="Specialist Output"
             className="min-h-[22rem]"
             contentClassName="min-h-0 flex-1"
           >

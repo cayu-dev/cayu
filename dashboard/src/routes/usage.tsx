@@ -92,7 +92,12 @@ const USAGE_SCALAR_FILTERS: Array<{
   field: UsageScalarFilterField
   placeholder: string
 }> = [
-  { id: "usage-agent-filter", label: "Agent", field: "agentName", placeholder: "agent name" },
+  {
+    id: "usage-agent-filter",
+    label: "Specialist",
+    field: "agentName",
+    placeholder: "specialist name",
+  },
   {
     id: "usage-provider-filter",
     label: "Provider",

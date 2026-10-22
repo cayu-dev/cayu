@@ -32,7 +32,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Cayu Cloud](cayu-cloud.md)
 - [Maintained coding product](coding-product.md)
 - [Console](console.md)
-- [Control plane](control-plane.md)
+- [Developer dashboard](control-plane.md)
 - [Cost optimization](cost-optimization.md)
 - [Common-root budget bindings](common-root-budgets.md)
 - [Docker coding toolchains](docker-coding-toolchains.md)

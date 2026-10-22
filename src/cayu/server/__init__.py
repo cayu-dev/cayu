@@ -247,7 +247,7 @@ def create_server(
     and optional static dashboard serving.
 
     Args:
-        app: The CayuApp instance with registered agents/providers.
+        app: The CayuApp instance with registered specialists/providers.
         config: Fully resolved server identity and policy. Construct it directly
             after resolving any external settings or secrets. An authenticated
             policy's dependency returns ``AuthContext``; its ``tenant`` value is

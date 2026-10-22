@@ -1,8 +1,8 @@
 """HTTP entrance for Cayu Cloud's reader of run summaries and human touches.
 
 Cayu Cloud reads the ``cayu.cloud-agent`` contract with a bearer token of its
-own, never the operator login. The host holds only SHA-256 digests of the
-token, so the token never reaches the process. The credential reads this
+own, never the Developer dashboard login. The host holds only SHA-256 digests of the
+of the token, so the token never reaches the process. The credential reads this
 contract and nothing else: it cannot read conversations, settle a pending
 action or call any other route.
 """

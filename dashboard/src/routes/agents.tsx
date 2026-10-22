@@ -137,7 +137,9 @@ function AgentDetail({
 }) {
   if (agent === null) {
     return (
-      <StateMessage className="py-16">Select an agent to inspect its runtime shape.</StateMessage>
+      <StateMessage className="py-16">
+        Select a specialist to inspect its runtime shape.
+      </StateMessage>
     )
   }
 
@@ -209,7 +211,7 @@ function AgentDetail({
           <div>
             <h3 className="text-sm font-semibold">Related Work</h3>
             <p className="mt-1 text-xs text-muted-foreground">
-              Recent sessions and queued tasks using this agent.
+              Recent sessions and queued tasks using this specialist.
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
@@ -245,7 +247,7 @@ function AgentDetail({
                 ))
               ) : (
                 <StateMessage className="rounded-md border border-border py-6">
-                  No sessions found for this agent.
+                  No sessions found for this specialist.
                 </StateMessage>
               )}
             </div>
@@ -267,7 +269,7 @@ function AgentDetail({
                 relatedTasks?.map((task) => <TaskLink key={task.id} task={task} />)
               ) : (
                 <StateMessage className="rounded-md border border-border py-6">
-                  No tasks assigned to this agent.
+                  No tasks assigned to this specialist.
                 </StateMessage>
               )}
             </div>
@@ -279,7 +281,7 @@ function AgentDetail({
         <div className="border-b border-border px-4 py-3">
           <h3 className="text-sm font-semibold">Tools</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            Registered tool contracts visible to this agent.
+            Registered tool contracts visible to this specialist.
           </p>
         </div>
         <div className="space-y-3 p-4">
@@ -346,14 +348,14 @@ export function AgentsPage() {
   return (
     <Page>
       <PageHeader
-        title="Agents"
-        description="Inspect registered agent models, prompts, tools, and runtime-facing contracts."
+        title="Specialists"
+        description="Inspect registered specialist models, prompts, tools, and runtime-facing contracts."
       />
 
       <div className="grid min-h-[calc(100vh-10rem)] gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(28rem,1.25fr)]">
         <DataCard
-          title="Registered Agents"
-          description={`${formatCount(agents.data?.total_count)} configured agents`}
+          title="Registered Specialists"
+          description={`${formatCount(agents.data?.total_count)} configured specialists`}
         >
           <div className="border-b border-border p-4">
             <div className="flex min-w-0 gap-2">
@@ -362,7 +364,7 @@ export function AgentsPage() {
                 <Input
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search agents, models, providers, tools..."
+                  placeholder="Search specialists, models, providers, tools..."
                   className="pl-8"
                 />
               </div>
@@ -381,17 +383,17 @@ export function AgentsPage() {
             </div>
           </div>
           {agents.isLoading ? (
-            <StateMessage>Loading agents...</StateMessage>
+            <StateMessage>Loading specialists...</StateMessage>
           ) : error ? (
             <StateMessage tone="danger">{error}</StateMessage>
           ) : filteredAgents.length === 0 ? (
-            <StateMessage>No agents match the current search.</StateMessage>
+            <StateMessage>No specialists match the current search.</StateMessage>
           ) : (
             <div className="overflow-auto">
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Agent</TableHead>
+                    <TableHead>Specialist</TableHead>
                     <TableHead>Model</TableHead>
                     <TableHead className="text-right">Tools</TableHead>
                   </TableRow>
@@ -429,7 +431,7 @@ export function AgentsPage() {
           )}
         </DataCard>
 
-        <DataCard title="Agent Detail" description="Read-only runtime contract.">
+        <DataCard title="Specialist Detail" description="Read-only runtime contract.">
           <AgentDetail
             agent={selectedAgent}
             relatedSessions={relatedSessions.data}

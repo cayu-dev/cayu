@@ -54,7 +54,7 @@ port on host loopback. HTTP/WSS clients verify this certificate; the dashboard
 browser pins its public key. The broker port is not published. Production
 applications must provision their own trusted certificate and secret configuration.
 
-`run.py` drives the compiled existing operator UI. It samples a synthetic color
+`run.py` drives the compiled existing Developer dashboard. It samples a synthetic color
 patch only in memory to prove changing frames from the exact admitted browser.
 Browser actions invalidate page epochs, so the harness explicitly rediscovers and
 reauthorizes the changed page. At each pause, the UI clears its canvas and reports

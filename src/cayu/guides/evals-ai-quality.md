@@ -45,7 +45,7 @@ published profile.
 If the declared judge provider and model equal the candidate route,
 `allow_same_model = true` is also required to make that judge selectable for
 the candidate. The user must still deliberately choose **Add same-model AI
-judge** in Control Plane. The result and report retain that label. An
+judge** in the Developer dashboard. The result and report retain that label. An
 independent model is usually a stronger quality signal, while same-model
 judging can be useful for an inexpensive first pass.
 

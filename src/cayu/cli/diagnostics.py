@@ -215,8 +215,8 @@ def fetch_request_cost_summary(
         ):
             if response.status_code in {401, 403}:
                 raise DiagnosticsError(
-                    f"Cayu server returned HTTP {response.status_code}; set the operator "
-                    "Authorization header in the --authorization-env variable."
+                    f"Cayu server returned HTTP {response.status_code}; set the Developer "
+                    "dashboard Authorization header in the --authorization-env variable."
                 )
             if response.status_code == 404:
                 raise DiagnosticsError(

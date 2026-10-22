@@ -69,7 +69,7 @@ only when the requested behavior requires it.
 | Behavioral regression proof | `EvalSuite`, runtime assertions, replay | `cayu guide references#evals` |
 | Usage limits or cost control | usage events, run limits, budgets, pricing | `cayu guide references#cost-control` |
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
-| An HTTP control plane | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
+| An HTTP API and the Developer dashboard | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
 | A public or multi-user agent product | `cayu new NAME --preset service`, maintained tenant-safe service factory | `cayu guide references#server` |
 | A maintained repository-coding starter | `cayu new NAME --preset coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
 | A product API around repository coding | application-owned authentication, durable intake, workers and independent acceptance | `cayu guide authoring#coding-product-host` |
@@ -81,11 +81,11 @@ task queue, environment, approval step, knowledge store, deployed application
 server, or multi-agent topology. The package-shipped `cayu guide references`
 topic is the offline index for optional capabilities.
 
-The local developer/operator control plane is a standard inspection surface,
+The local Developer dashboard is a standard inspection surface,
 not part of the agent's domain behavior. Fresh generated projects install the
 server extra through their `dev` extra; run `uv run cayu serve --dev` and open
 `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag is for trusted local
-use. A deployed control plane still requires configured authentication, and an
+use. A deployed Developer dashboard still requires configured authentication, and an
 application that already owns FastAPI embeds Cayu explicitly with
 `mount_cayu(..., path="/cayu")`. Never use `OpenAccess()` on a public listener.
 Client-IP and forwarded-header checks are not authentication; public or deployed
@@ -151,7 +151,7 @@ tool policy, approval policy, and runtime gates independently authorize calls.
 For a public or multi-user product, start with
 `cayu new NAME --preset service`. That template keeps customer authentication,
 tenant-qualified application storage, public identifiers, allow-listed product
-responses, and the operator-only `/cayu/` mount in one maintained service
+responses, and the separately protected `/cayu/` Developer dashboard in one maintained service
 factory. Its deployment check proves only the declarative factory posture; the
 generated assembled-ASGI security suite proves the product behavior. Arbitrary
 host-owned routes remain outside Cayu's verification boundary.
@@ -169,7 +169,7 @@ policy.
 
 Start with one generated coding project and retain its actual scaffold metadata.
 Do not overlay a second generated service project, relabel its preset, or expose
-the operator control plane as a customer API. Build the product host explicitly
+the Developer dashboard as a customer API. Build the product host explicitly
 using public Cayu APIs and the following existing owners:
 
 | Boundary | Application home and implementation responsibility |
@@ -181,7 +181,7 @@ using public Cayu APIs and the following existing owners:
 | Task handoff | After reserving identity, use `CayuApp.create_task(TaskCreate(...))`. Reservation and task insertion can commit separately: retry the same reservation and task identity, read back an ambiguous insertion, and reject conflicting contents rather than allocating replacement work. |
 | Worker lifetime | A separate `operations/` role uses `run_task_worker` with `TaskQuery` for its phase. Reconstruct the original reservation from the store-owned claim and validate its current ownership before executing. Use `complete_managed_task` after independent acceptance; do not create another lease or retry engine. |
 | Coding result | `workflows/` coordinates the maintained coding product; `domain/` checks the admitted revision, permitted changes, required checks and independent verifier against retained artifact evidence. `CodingProductArtifactRepository` provides request/publication readback. Model text, successful project tests or task completion alone are not independent acceptance. |
-| Operator host | Mount the control plane with `cayu.server.mount_cayu` and explicit `AuthenticatedAccess`. Protect application operator routes separately; customer authentication neither grants operator access nor authorizes another tenant's resources. |
+| Developer dashboard host | Mount the Developer dashboard with `cayu.server.mount_cayu` and explicit `AuthenticatedAccess`. Protect application operator routes separately; customer authentication neither grants dashboard access nor authorizes another tenant's resources. |
 | Delivery | `integrations/` owns separately approved Git/GitHub handoffs. Keep patch readiness, exact reviewed change/destination approval, publication, hosted checks and final delivery distinct. No approval is implied by producing a patch. |
 
 First test the assembled HTTP application with injected providers and stores:

@@ -37,7 +37,7 @@ const navSections = [
     items: [
       {
         to: "/",
-        label: "Dashboard",
+        label: "Overview",
         icon: LayoutDashboard,
         capability: DASHBOARD_ROUTE_REQUIREMENTS["/"],
       },
@@ -76,7 +76,7 @@ const navSections = [
   {
     label: "Runtime",
     items: [
-      { to: "/agents", label: "Agents", icon: Bot },
+      { to: "/agents", label: "Specialists", icon: Bot },
       { to: "/environments", label: "Environments", icon: Boxes },
       {
         to: "/artifacts",
@@ -136,6 +136,7 @@ export function Layout() {
       <nav className="w-56 flex-shrink-0 border-r border-border bg-sidebar-background flex flex-col p-4 gap-1">
         <div className="mb-6 px-3">
           <img src={dashboardAsset("logo.svg")} alt="cayu" className="h-6" />
+          <p className="mt-2 text-xs text-muted-foreground">Developer dashboard</p>
         </div>
         {visibleNavSections.map((section, sectionIndex) => (
           <div
@@ -178,7 +179,7 @@ export function Layout() {
         <div className="p-4 sm:p-6 xl:p-8">
           {contract.isLoading ? (
             <div className="flex items-center gap-3 rounded-md border border-border bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
-              Checking API contract before loading control-plane data...
+              Checking API contract before loading Developer dashboard data...
             </div>
           ) : contractError || incompatibleContract ? (
             <div

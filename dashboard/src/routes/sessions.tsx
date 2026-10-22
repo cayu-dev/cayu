@@ -226,12 +226,12 @@ function AdvancedFilters({
       >
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <label htmlFor="session-agent-filter" className="text-sm text-muted-foreground">
-            Agent
+            Specialist
             <Input
               id="session-agent-filter"
               value={draft.agentName}
               onChange={(event) => setField("agentName", event.target.value)}
-              placeholder="agent name"
+              placeholder="specialist name"
               className={advancedInputClassName}
             />
           </label>
@@ -506,7 +506,7 @@ export function SessionsPage() {
           <TableHeader>
             <TableRow>
               <TableHead>Session ID</TableHead>
-              <TableHead>Agent</TableHead>
+              <TableHead>Specialist</TableHead>
               <TableHead>Environment</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Attention</TableHead>

@@ -339,7 +339,7 @@ deployment verification.
 
 ## server
 
-The server extra provides an HTTP control plane over the same application and
+The server extra provides an HTTP API and the Developer dashboard over the same application and
 durable stores. A generated project's `dev` extra installs it; for trusted local
 inspection run `uv run cayu serve --dev` and open
 `http://127.0.0.1:8000/cayu/`. Without `--dev`, `cayu serve` requires the
@@ -350,7 +350,7 @@ start without them (on Cayu Cloud, `cayu cloud service credentials --application
 APP` shows them). The target may be any request-to-`AuthContext` dependency, such
 as `BasicAuth.from_environment(...)` with other variables or, with
 `cayu[oidc]`, `OidcBearerAuth.from_environment()` for bearer tokens from your
-identity provider; it guards operator access to the control plane,
+identity provider; it guards access to the Developer dashboard,
 not end-user product login, which belongs in the service preset's
 `AuthenticatedProductAccess`. Use `mount_cayu(..., path="/cayu")` when an
 existing FastAPI product owns the host server; that mount requires
@@ -361,7 +361,7 @@ processes from task workers. Test the app factory and auth boundary before
 deployment.
 `OidcBearerAuth` from `cayu[oidc]` verifies JWT bearer tokens from an OpenID
 Connect provider (Cognito, Auth0, Okta, Entra ID, Google, Workday) for either
-operator access or, through `product_dependency()`, product access. It does not
+Developer dashboard access or, through `product_dependency()`, product access. It does not
 provide browser sign-in.
 
 ## advanced-runtime

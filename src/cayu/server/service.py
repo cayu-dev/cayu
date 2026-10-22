@@ -2633,7 +2633,7 @@ def create_agent_service(
         raise TypeError("project_context must be a framework-owned ProjectControlPlaneContext.")
     agent_name = require_durable_clean_nonblank(agent_name, "agent_name")
     if agent_name not in app.list_agents():
-        raise ValueError(f"agent_name must identify a registered agent: {agent_name}")
+        raise ValueError(f"agent_name must identify a registered specialist: {agent_name}")
     mode = ServiceMode(mode)
     if not isinstance(
         product_access,
@@ -2661,7 +2661,7 @@ def create_agent_service(
         or product_api_path.startswith(f"{control_plane_path}/")
         or control_plane_path.startswith(f"{product_api_path}/")
     ):
-        raise ValueError("The product API must be separate from the operator control plane.")
+        raise ValueError("The product API must be separate from the Developer dashboard.")
 
     server = FastAPI(
         title="Cayu public agent service",
@@ -2891,7 +2891,9 @@ async def _placeholder_product_auth(_request: Request) -> ProductPrincipal:
 
 
 async def _placeholder_operator_auth(_request: Request) -> Mapping[str, str]:
-    raise HTTPException(status_code=503, detail="Operator authentication is not configured.")
+    raise HTTPException(
+        status_code=503, detail="Developer dashboard authentication is not configured."
+    )
 
 
 def _runtime_store_durability(store: object) -> RuntimeStoreDurability:

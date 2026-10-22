@@ -1479,8 +1479,8 @@ function SimpleInputEditor({
     return (
       <Card size="sm" data-testid="authored-simple-input">
         <CardContent className="text-sm text-muted-foreground">
-          This case uses runtime-owned opaque external input and cannot be edited in Control Plane
-          suite authoring.
+          This case uses runtime-owned opaque external input and cannot be edited in the Developer
+          dashboard suite authoring.
         </CardContent>
       </Card>
     )

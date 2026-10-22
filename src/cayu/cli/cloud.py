@@ -850,9 +850,9 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         help="Generate cayu-cloud.toml.",
         description=(
             "Generate cayu-cloud.toml from a Python Agent project. For a `cayu serve` web "
-            "process, also add the cayu server extra and the environment operator auth "
-            "target to pyproject.toml when they are missing; an existing auth target is "
-            "never replaced."
+            "process, also add the cayu server extra and the environment Developer "
+            "dashboard auth target to pyproject.toml when they are missing; an existing "
+            "auth target is never replaced."
         ),
     )
     initialize.add_argument("path", nargs="?", default=Path("."), type=Path)
@@ -988,8 +988,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_descriptions = {
         "credentials": (
-            "Show the Agent's own /cayu/ operator username and password. The output is a "
-            "credential: keep it out of logs and shared terminals."
+            "Show the Agent's own Developer dashboard (/cayu/) username and password. The "
+            "output is a credential: keep it out of logs and shared terminals."
         ),
         "destroy": "Remove the Agent services and schedules but retain its releases.",
         "logs": "Read recent infrastructure logs from the Agent service.",
@@ -3113,7 +3113,7 @@ def _operator_credentials(client: CloudApiClient, *, application_id: str) -> dic
         if exc.status_code == 404:
             raise CloudCommandError(
                 "operator_credentials_unsupported",
-                "This Cayu Cloud does not support per-Agent operator credentials yet.",
+                "This Cayu Cloud does not support per-Agent Developer dashboard credentials yet.",
             ) from None
         raise
     username = response.get("username")
@@ -3128,7 +3128,9 @@ def _operator_credentials(client: CloudApiClient, *, application_id: str) -> dic
         or not isinstance(environment.get("username"), str)
         or not isinstance(environment.get("password"), str)
     ):
-        raise CloudApiError("api_response_invalid", "Operator credentials response is invalid.")
+        raise CloudApiError(
+            "api_response_invalid", "Developer dashboard credentials response is invalid."
+        )
     return {
         "env": {"password": environment["password"], "username": environment["username"]},
         "password": password,

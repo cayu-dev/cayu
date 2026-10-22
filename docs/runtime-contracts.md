@@ -430,9 +430,9 @@ Cayu's maintained public-agent service contract. The factory accepts the
 explicit `ServiceMode` selected by serving or deployment inspection and returns
 one `CayuService`: a process-scoped `CayuApp`, the assembled ASGI application,
 and a content-free `PublicServiceManifest`. The maintained assembler owns the
-narrow product routes and separately mounts the raw `/cayu/` control plane. It
+narrow product routes and separately mounts the raw `/cayu/` Developer dashboard. It
 disables product OpenAPI/docs and CORS by default. Production serving fails
-closed unless product access and operator access are separately authenticated
+closed unless product access and Developer dashboard access are separately authenticated
 and the application-owned identity store declares durable state.
 
 Product authorization remains outside Cayu's native stores. The authenticated
@@ -4395,7 +4395,7 @@ Approval, user-input, tool-round, and incomplete-session continuation reload tha
 Every admitted invocation is represented in-process by one frozen
 `InvocationContext`. It carries the exact validated `ExecutionProfileIdentity`,
 the admitted session/interaction/incarnation/epoch binding, and the live
-registered agent, provider, optional environment, hooks, loop policies, budget
+registered specialist, provider, optional environment, hooks, loop policies, budget
 policy, tool-capability ceiling, and targeted grants selected for that
 invocation. Runtime phases pass one authenticated context lineage through
 execution, reconciliation, terminal publication, environment cleanup, and
@@ -4672,7 +4672,7 @@ provenance, so run candidate inspection in the release image with the same
 contains a workload secret cannot be passed back exactly; such a session's
 causal limits are not predicted.
 
-`cayu execution-profile candidates --json` prints each registered agent's
+`cayu execution-profile candidates --json` prints each registered specialist's
 candidate (or `--agent`; `--environment` or `--no-environment`, defaulting to
 the application default environment; `--provider` and `--model` together; and
 `--causal-budget-id`) after building the application from the project factory,
@@ -4982,7 +4982,7 @@ remain pending or running. Applications correlate children through parent lineag
 the exact source snapshot, causal-budget identity, task identity, labels, and
 metadata; application code alone owns joins, evaluation, replacement, and selection.
 
-`ForkSessionRequest` creates a new session branch from an existing `completed`, `failed`, or `interrupted` session without mutating the source. Every child receives one immutable execution-profile baseline. Omitting `execution_profile_selection`, or selecting `INHERIT_PARENT`, copies the parent's effective durable authority exactly, including an explicitly unavailable component: an invocation-bound profile is authoritative while that exact parent invocation remains represented in its checkpoint; otherwise the parent's current expected session profile is authoritative. This selection does not rewrite the parent's immutable creation baseline or its current expected profile. An inherited-prompt partial fork must retain every durable source system message so the copied transcript and inherited baseline cannot diverge. Selecting `CURRENT_CHILD` instead resolves the complete schema-v5 child profile from the current registered agent, provider, environment, policies, hooks, budgets, context controls, tools, model, and prompt body; it requires `ExecutionProfileAdoptionIntent` and an attributable application-policy authorization before any child, transcript, checkpoint, or event mutation. That review is required even when the candidate profile is structurally equal because `CURRENT_CHILD` explicitly chooses current application authority instead of inheriting the parent's frozen authority. The selected child agent may target a different registered provider; every provider change projects the complete portable transcript and calls the target provider's portability preflight even when the model name is unchanged. The provider change and authorization decision are stored atomically with the fork relationship. Agent, model, or environment overrides and `ForkSystemPromptPolicy.CURRENT_AGENT` require this explicit current-child selection. A rejected, malformed, authority-widening, unavailable, or nonportable current-child selection leaves the parent unchanged and creates neither a runnable child nor partial decision evidence. When the caller omits `session_id`, Cayu derives one opaque parent-and-request-scoped child identity from the prepared request so retries and concurrent submissions converge on the same exact fork across key rotation and process restart.
+`ForkSessionRequest` creates a new session branch from an existing `completed`, `failed`, or `interrupted` session without mutating the source. Every child receives one immutable execution-profile baseline. Omitting `execution_profile_selection`, or selecting `INHERIT_PARENT`, copies the parent's effective durable authority exactly, including an explicitly unavailable component: an invocation-bound profile is authoritative while that exact parent invocation remains represented in its checkpoint; otherwise the parent's current expected session profile is authoritative. This selection does not rewrite the parent's immutable creation baseline or its current expected profile. An inherited-prompt partial fork must retain every durable source system message so the copied transcript and inherited baseline cannot diverge. Selecting `CURRENT_CHILD` instead resolves the complete schema-v5 child profile from the current registered specialist, provider, environment, policies, hooks, budgets, context controls, tools, model, and prompt body; it requires `ExecutionProfileAdoptionIntent` and an attributable application-policy authorization before any child, transcript, checkpoint, or event mutation. That review is required even when the candidate profile is structurally equal because `CURRENT_CHILD` explicitly chooses current application authority instead of inheriting the parent's frozen authority. The selected child agent may target a different registered provider; every provider change projects the complete portable transcript and calls the target provider's portability preflight even when the model name is unchanged. The provider change and authorization decision are stored atomically with the fork relationship. Agent, model, or environment overrides and `ForkSystemPromptPolicy.CURRENT_AGENT` require this explicit current-child selection. A rejected, malformed, authority-widening, unavailable, or nonportable current-child selection leaves the parent unchanged and creates neither a runnable child nor partial decision evidence. When the caller omits `session_id`, Cayu derives one opaque parent-and-request-scoped child identity from the prepared request so retries and concurrent submissions converge on the same exact fork across key rotation and process restart.
 
 The store atomically persists the child baseline, immutable parent/child profile relationship, accepted decision actor/policy/reason when applicable, and ordered decision-then-`session.forked` evidence. Exact retry, lost-acknowledgement reconciliation, and concurrent delivery use the caller-selected or runtime-derived child ID plus a digest of the complete pre-redaction fork request and converge on that one relationship across in-memory, SQLite, and PostgreSQL stores. When secret-bearing requests are admitted, the digest is derived through the configured durable authority keyring: distinct raw values that share a redacted representation still conflict, while retained authority keys keep exact replay valid during key rotation. A conflicting request or incomplete evidence fails closed. SQLite pruning retains those content-bound fork events while the relationship exists, so exact replay does not depend on otherwise-prunable history. Deleting a terminal parent may clear the surviving child's live parent foreign key, but the immutable relationship retains the original source identity and remains authoritative for the child's creation profile. Child run, resume, approval continuation, and recovery consult the child's own baseline. A later child-profile adoption changes only the child's expected profile and retains its immutable fork baseline; it never changes the parent baseline or retroactively changes which parent invocation authority the fork selected, and exact replay continues to validate against the creation target rather than the child's mutable current provider/model fields.
 
@@ -5019,7 +5019,7 @@ Fork copies the source transcript and persists `parent_session_id` on the child 
 variant. It requires a stable caller-selected or runtime-derived descendant ID,
 a concrete registered environment, `copy_checkpoint=False`, and the source provider;
 provider changes use inherited-prompt current-child selection instead. The runtime renders the current
-registered agent prompt plus current workspace instructions, then asks the
+registered specialist prompt plus current workspace instructions, then asks the
 store to remove inherited system messages and install that single rendered
 message inside the same transaction that copies non-system transcript history.
 No-environment and factory-backed registrations fail before factory invocation,
@@ -6084,7 +6084,7 @@ or durably mutated. These limits are framework safety ceilings and cannot be
 weakened by a reverse proxy.
 
 The dashboard's New Run surface resolves the protected registered-agent
-inventory before enabling execution. It selects a sole registered agent
+inventory before enabling execution. It selects a sole registered specialist
 automatically, requires an explicit operator choice when multiple agents are
 registered, and includes that exact identity in every `/run` request. An empty
 or initially unavailable inventory leaves the mutation disabled. New Run calls
@@ -11817,7 +11817,7 @@ misreport an unsupported direct invocation as a tool failure.
 
 Tool declarations are captured when an agent is registered with `CayuApp`.
 The registered name, description, and input schema are the public contract shown to the model for that agent.
-Changing `tool.spec` after registration does not update the registered agent or the model-facing tool declaration.
+Changing `tool.spec` after registration does not update the registered specialist or the model-facing tool declaration.
 To change a tool's public contract, create/register a new agent configuration or re-register the tool through an explicit runtime API once one exists.
 
 Tool results must support:
@@ -17056,7 +17056,7 @@ underlying store. The model does not need to know every namespace, label, kind,
 aspect, impact target, or source value to use `search_knowledge`; it can search
 with only `query`, then use returned hit metadata to refine later searches. Apps
 that rely on non-default namespaces or strict project/user labels should make
-that scope part of the registered agent/tool configuration or instructions.
+that scope part of the registered specialist/tool configuration or instructions.
 
 Apps can use `AutomaticRecallContextPolicy` to turn multi-source recall into a
 bounded, interaction-scoped memory contribution before a model call. Recall and
@@ -18352,7 +18352,7 @@ recorded provider lifecycle state, not attention or use.
 section, and their containing case/run/result revisions transitively bind it.
 JSON and EvalStore round-trips therefore preserve the same meaning for fresh
 and captured evidence across memory, SQLite, and PostgreSQL implementations.
-CLI JSON and Control Plane schemas preserve the complete section. HTML reports
+CLI JSON and Developer dashboard schemas preserve the complete section. HTML reports
 retain its bounded classification, limitation, and lifecycle summary while
 explicitly directing full record inspection to JSON. The compact generic result-comparison
 projection currently declares `memory_attribution_support="unsupported"`;
@@ -18419,7 +18419,7 @@ The SDK builder launches no work. Deterministic JSON is the complete retained
 authority contract; HTML is a human-readable summary of its primary versioned
 statuses, identities, distributions, decisions, and report revision.
 `cayu eval memory-report` accepts the bounded request document. Protected
-Control Plane `POST /api/evals/memory-reports` and
+Developer dashboard `POST /api/evals/memory-reports` and
 `POST /api/evals/memory-reports/report.html` additionally require each supplied
 published graph and its associated execution-profile snapshot to match the exact
 current `EvalStore` run before building the report. Result-less rows retain their
@@ -19614,11 +19614,11 @@ page in process; the server serves the same pages to Cayu Cloud's reader.
 
 When `CAYU_CLOUD_READER_TOKEN_SHA256` is set, `cayu serve` and `mount_cayu`
 serve the contract at `{api}/cloud` with its own bearer authentication, never
-the operator's. The variable holds comma-separated lowercase hex SHA-256
+the Developer dashboard login. The variable holds comma-separated lowercase hex SHA-256
 digests of the reader's bearer tokens, at most 8 (two while rotating), so the
 token itself never reaches the process. A malformed value stops the server from
 starting, and errors never include digests. The reader's token answers 401 on
-every other route, and the operator login answers 401 here. A server with its
+every other route, and the Developer dashboard login answers 401 here. A server with its
 API disabled serves neither. `cayu.server.cloud_reporting.create_cloud_reporting_router(app,
 authenticate=...)` serves the same routes behind a host's own authentication.
 
@@ -19731,7 +19731,7 @@ carries its source's status, no `ended_at`, and only its own counts and cost.
 | `source` | How the session was created: `http_run`, `sdk_run`, `task`, `workflow_step`, `subagent` or `fork`. |
 | `forked`, `fork_controller` | Whether the session is a fork or was created under one, and the enrolled [fork controller](fork-overlays.md) whose lineage it is, such as `compass`. `fork_controller` is `null` for the host's own work and when the lineage cannot be resolved. |
 | `eval` | Whether the session is an eval trial or was created under one: the trial's subagents, forks of the trial or of its subagents, and so on down. Runtime marks every session created while the eval runner runs a trial, including the cases a server runs inside the deployed application and the sessions of a workflow target, with the runtime-owned session metadata `cayu:eval_trial`, and copies the mark onto each subagent and fork when it creates it, so deleting a session in between does not clear it. Run, fork and metadata requests that set `cayu:eval_trial` are refused, so a caller cannot take its own runs out of the measures. Added within version 1: readers that predate it ignore it. |
-| `agent_name` | The registered agent. |
+| `agent_name` | The registered specialist. |
 | `status` | `running`, `waiting_approval`, `waiting_input`, `needs_recovery`, `completed`, `failed` or `interrupted`. A pending action decides a waiting status, manual recovery before approval before input. A delegated action is followed through each subagent's current pending actions, up to eight levels, rather than the kind its parent recorded when it began waiting; a session whose subagent waits on no person is `running`. Otherwise the session status decides; pending, running and interrupting sessions are `running`. |
 | `reason` | The Runtime's outcome code: `completed`, `failed`, the interruption type such as `tool_approval_required`, `user_input_required`, `operator_requested` or `limit_reached`, or the session status while it runs. |
 | `started_by` | `{"subject", "trust"}` from the session's invocation origin, `trust` being `server_verified` or `host_asserted`; `null` when the origin is unattributed. |

@@ -189,7 +189,7 @@ async def _run_browser_journey(base_url: str, project_root: Path) -> dict[str, o
             await _require_declared_judge_profile(page, base_url)
             await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
             await expect(page.get_by_role("heading", name="New Run", exact=True)).to_be_visible()
-            await page.get_by_label("Agent", exact=True).select_option(AGENT_NAME)
+            await page.get_by_label("Specialist", exact=True).select_option(AGENT_NAME)
             await page.get_by_label("Prompt", exact=True).fill(
                 f"Reply with exactly {EXPECTED_MARKER} and no other text."
             )

@@ -1,6 +1,6 @@
 # Cayu editable dashboard
 
-This is the version-matched source for Cayu's open-source developer/operator control plane.
+This is the version-matched source for Cayu's open-source Developer dashboard.
 It was extracted from an installed Cayu release and is now owned by your application. Cayu
 will not rewrite this directory during upgrades.
 
@@ -107,7 +107,7 @@ The normal build retains `LICENSE`, `NOTICE`, `REDISTRIBUTION.md`, and
 
 ## Compatibility and ownership
 
-The dashboard refuses to load control-plane data when the server reports a different contract
+The dashboard refuses to load its data when the server reports a different contract
 version. After upgrading Cayu, run `npm run check:api:repo` to detect contract or generated-client
 drift. Run `npm run generate:api:repo` only when you intentionally want to update this
 application-owned copy for the newly installed server.

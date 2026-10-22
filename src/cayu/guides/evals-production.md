@@ -26,7 +26,7 @@ receipts and worker results; preserve application session stores separately.
 
 ## Evaluate a retained session
 
-Open the session in Control Plane and choose **Evaluate**.
+Open the session in the Developer dashboard and choose **Evaluate**.
 
 1. Review **Captured evidence** before adding expectations. Missing, redacted,
    truncated, or unavailable evidence is not a failed assertion and must not be
@@ -44,7 +44,7 @@ Open the session in Control Plane and choose **Evaluate**.
    review.
 
 **Run on current app** is available only when the captured input can be
-reconstructed safely. It uses the current registered agent, provider, tools,
+reconstructed safely. It uses the current registered specialist, provider, tools,
 environment, policies, and limits. A readiness message that names a missing
 tool, environment, secret, fixture, approval path, or evidence field is a real
 current dependency—not a request to fabricate it in the browser.
@@ -115,7 +115,7 @@ immutable references, never raw private memory identity or content.
 ## Compare and automate
 
 Captured, fresh simple, and scenario results share the same result, baseline,
-report, and comparison contracts. Download JSON/HTML from Control Plane or use:
+report, and comparison contracts. Download JSON/HTML from the Developer dashboard or use:
 
 ```console
 cayu eval report result.eval-result.json --html --output report.html

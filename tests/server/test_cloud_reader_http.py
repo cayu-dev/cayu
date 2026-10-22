@@ -114,7 +114,7 @@ def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
             assert response.headers["cache-control"] == NO_STORE
     repeated = client.get(path, headers=[("authorization", f"Bearer {TOKEN}")] * 2)
     assert repeated.status_code == 401
-    # The reader's token is not an operator login.
+    # The reader's token is not a Developer dashboard login.
     assert client.get("/cayu/api/sessions", headers=_bearer(TOKEN)).status_code == 401
     assert client.get("/cayu/api/pending-actions", headers=_bearer(TOKEN)).status_code == 401
 

@@ -103,7 +103,7 @@ events = [
             execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
             profile_adoption=ExecutionProfileAdoptionIntent(
                 idempotency_key="agent-v2-session-profile",
-                reason="Install the registered agent-v2 execution profile.",
+                reason="Install the registered agent-v2 specialist execution profile.",
                 requested_by=ResolutionActor(
                     subject="release-operator",
                     source=ResolutionActorSource.REQUEST,
@@ -114,7 +114,7 @@ events = [
 ]
 ```
 
-This opt-in fork renders the current registered agent prompt and current
+This opt-in fork renders the current registered specialist prompt and current
 workspace instructions, atomically replaces inherited system messages, and
 preserves the selected non-system history. It records a durable
 `PromptAnatomyTransitionReceipt` containing source/child prompt SHA-256 digests

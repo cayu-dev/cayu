@@ -1692,7 +1692,7 @@ def app_body_snapshot_ref(
     agent_id: str,
     source_ref: str | None = None,
 ) -> AgentSnapshotLogicalRef:
-    """Bind one registered agent body to an AppManifest and release identity."""
+    """Bind one registered specialist body to an AppManifest and release identity."""
 
     from cayu.runtime.manifest import AppManifest
 

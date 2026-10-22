@@ -1112,7 +1112,7 @@ settlement fence as allocation recovery. Separate allocations sharing the server
 retain independent network attachments.
 
 The [runnable protected viewer/reconnect composition](../examples/browser_view_reconnect/README.md)
-uses the existing operator UI, view-only policy, SQLite, protected human-review
+uses the existing Developer dashboard, view-only policy, SQLite, protected human-review
 references and real TLS/WSS. Worker restart keeps the original browser/page;
 reopening a view requires fresh authorization and observation. The native guest
 settles the old channel before acknowledging a newer invocation's control epoch.

@@ -544,9 +544,9 @@ tool evidence. Supply a terminal outcome only after an operator has obtained
 trustworthy external evidence. A recovery request records that evidence; it is
 not permission to guess that an effect succeeded.
 
-The local operator surface uses these same durable APIs: run `cayu session` for
+The local Developer dashboard uses these same durable APIs: run `cayu session` for
 CLI inspection, or `cayu serve --dev` on a trusted local machine and open
-`/cayu/`. Production control-plane access requires `AuthenticatedAccess(...)`.
+`/cayu/`. Production Developer dashboard access requires `AuthenticatedAccess(...)`.
 Do not create a parallel approval database or expose private checkpoint IDs and
 arguments in a product API.
 

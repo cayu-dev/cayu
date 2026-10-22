@@ -276,7 +276,7 @@ def test_mount_cayu_serves_the_environment_controller_with_its_own_bearer(enviro
     assert client.get(path, headers=_bearer(OPERATOR)).status_code == 401
     assert client.get(path, headers=_bearer("x" * 48)).status_code == 401
     assert client.get(path).status_code == 401
-    # The controller's token is not an operator login.
+    # The controller's token is not a Developer dashboard login.
     assert client.get("/cayu/api/sessions", headers=_bearer(TOKEN)).status_code == 401
 
 

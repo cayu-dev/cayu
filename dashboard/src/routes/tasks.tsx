@@ -397,7 +397,7 @@ export function TasksPage() {
               <TableRow>
                 <TableHead>Task</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead>Agent</TableHead>
+                <TableHead>Specialist</TableHead>
                 <TableHead>Worker</TableHead>
                 <TableHead>Lease</TableHead>
                 <TableHead>Availability</TableHead>
@@ -529,7 +529,7 @@ export function TasksPage() {
                   </div>
                 )}
                 <div className="flex items-start justify-between gap-3">
-                  <span className="text-muted-foreground">Agent</span>
+                  <span className="text-muted-foreground">Specialist</span>
                   {selectedTask.assigned_agent_name ? (
                     <a
                       href={dashboardPath("/agents", { q: selectedTask.assigned_agent_name })}

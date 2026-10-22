@@ -34,7 +34,7 @@ approval_policy = AlwaysRequireApprovalToolPolicy(
 ```
 
 Register the tool with `tool_policy=approval_policy`. Each call pauses the
-session durably until `app.resolve_tool_approval(...)` or the control plane's
+session durably until `app.resolve_tool_approval(...)` or the Developer dashboard's
 Pending page resolves it; resolving after the expiry denies the call.
 `ctx.idempotency_key` is stable for the call, including Cayu's one replay after
 a crash, so pass it to your provider. Deep guides: `cayu guide durable-operations`

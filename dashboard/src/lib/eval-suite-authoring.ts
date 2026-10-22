@@ -232,7 +232,7 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV3): EvalSuiteDraftV
       if (evalCase.stimulus.kind === "simple_input") {
         if (evalCase.stimulus.input.opaque_external_case_ref != null) {
           throw new Error(
-            `${label} uses runtime-owned opaque external input, which Control Plane suite authoring cannot edit.`,
+            `${label} uses runtime-owned opaque external input, which Developer dashboard suite authoring cannot edit.`,
           )
         }
         const messages = evalCase.stimulus.input.messages

@@ -24,7 +24,7 @@ def run_project_entrypoint(
     *,
     validate_run: Callable[[CayuApp, str], None] | None = None,
 ) -> int:
-    """Run one registered agent from a generated project's command line."""
+    """Run one registered specialist from a generated project's command line."""
 
     args = _parser().parse_args(argv)
     if not args.message.strip():
@@ -106,7 +106,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a registered Cayu agent.")
     parser.add_argument(
         "--agent",
-        help="Registered agent name; optional when the project has only one.",
+        help="Registered specialist name; optional when the project has only one.",
     )
     parser.add_argument("--message", required=True, help="User message text.")
     parser.add_argument(
@@ -136,5 +136,5 @@ def _select_agent(app: CayuApp, requested: str | None) -> str:
     if len(available) == 1:
         return available[0]
     if not available:
-        raise ValueError("the project has no registered agents")
+        raise ValueError("the project has no registered specialists")
     raise ValueError(f"multiple agents are registered; pass --agent NAME (available: {rendered})")

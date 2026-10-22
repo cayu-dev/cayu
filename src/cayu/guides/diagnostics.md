@@ -23,7 +23,7 @@ attributes retain `AttributeError`. No removed route loads its former object.
 
 ## app-no-agents
 
-`APP_NO_AGENTS` means the factory returned an app with no registered agent.
+`APP_NO_AGENTS` means the factory returned an app with no registered specialist.
 Register an `AgentSpec` with `CayuApp.register_agent()`.
 
 ## agent-generated-tracer-bullet-unfinished
@@ -147,7 +147,7 @@ references to enable runtime validation. No remote schema URLs are fetched. Run
 
 `PUBLIC_SERVICE_DEVELOPMENT_MODE` means the maintained public-service factory
 was assembled with its explicit local-development profile. Development access
-may accept caller-selected test identities and an open operator mount, so it is
+may accept caller-selected test identities and an open Developer dashboard mount, so it is
 restricted to `cayu serve --dev` on a loopback listener. Build the same service
 factory with `mode="production"` before deployment.
 
@@ -201,10 +201,10 @@ verified token and rejects a token without the tenant claim.
 ## public-service-operator-access-unsafe
 
 `PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE` means the separately mounted `/cayu/`
-operator control plane uses `OpenAccess` or a fail-closed placeholder because
+Developer dashboard uses `OpenAccess` or a fail-closed placeholder because
 production authentication is missing or invalid. Configure
-`AuthenticatedAccess` for production. Operator authentication protects the raw
-control plane; it does not make that surface customer-facing or tenant-scoped.
+`AuthenticatedAccess` for production. Dashboard authentication protects the raw
+Developer dashboard; it does not make that surface customer-facing or tenant-scoped.
 
 ## public-service-identity-store-not-durable
 
@@ -510,8 +510,8 @@ Check the cost of an open page before calling UI work done:
    changed, push changes over a stream, and make GET handlers read only recent
    or changed records instead of rebuilding everything per request.
 
-The same summary is available to operators at `GET /api/diagnostics/requests`
-(protected like the rest of the control plane) and can be added to a support
+The same summary is available to dashboard users at `GET /api/diagnostics/requests`
+(protected like the rest of the Developer dashboard) and can be added to a support
 bundle with `cayu doctor --bundle cayu-support.zip --requests-from SERVER_URL`.
 
 CPU time is process CPU shared out across the requests running at the same

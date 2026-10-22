@@ -920,7 +920,7 @@ def test_generate_slice_fails_closed_for_a_reassigned_agent_symbol(
     plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
 
     assert plan.status == "manual_action_required"
-    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert "cannot determine the registered specialist name" in plan.conflicts[0]["reason"]
     assert _files(project) == before
 
 
@@ -1035,7 +1035,7 @@ def test_generate_slice_fails_closed_for_a_function_local_agent_shadow(
     plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
 
     assert plan.status == "manual_action_required"
-    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert "cannot determine the registered specialist name" in plan.conflicts[0]["reason"]
     assert _files(project) == before
 
 
@@ -1075,7 +1075,7 @@ def test_generate_slice_fails_closed_for_a_pattern_bound_agent_shadow(
     plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
 
     assert plan.status == "manual_action_required"
-    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert "cannot determine the registered specialist name" in plan.conflicts[0]["reason"]
     assert (
         main(
             [
@@ -1186,7 +1186,7 @@ def test_generate_slice_fails_closed_for_a_dynamic_registered_agent_name(
     plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
 
     assert plan.status == "manual_action_required"
-    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert "cannot determine the registered specialist name" in plan.conflicts[0]["reason"]
     assert (
         main(
             [

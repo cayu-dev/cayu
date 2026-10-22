@@ -1,7 +1,7 @@
 """Designated disposable login/TOTP acceptance; no external account or API key.
 
 The model and allocation adapter are test doubles. CayuApp, HTTPS/WSS, the
-compiled operator dashboard, native Chromium and password/TOTP verification are
+compiled Developer dashboard, native Chromium and password/TOTP verification are
 real. Production Docker/egress and profile-consent proofs are separate tests.
 """
 

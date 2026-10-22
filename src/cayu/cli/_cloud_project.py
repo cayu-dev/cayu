@@ -866,7 +866,7 @@ def _serve_setup_report(setup: ServeSetupPlan, *, created_auth_module: bool) -> 
         )
     else:
         notes.append(
-            "The project's service_factory owns product and operator access; "
+            "The project's service_factory owns product and Developer dashboard access; "
             "[tool.cayu.serve].auth does not apply."
         )
     report["notes"] = notes

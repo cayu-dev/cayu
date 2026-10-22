@@ -601,7 +601,7 @@ def external_effect_tool_names() -> tuple[str, ...]:
     return ("remember_knowledge",) if __KNOWLEDGE_ENABLED__ else ()
 '''
 
-_TOOL_POLICY_PY = '''"""Tool exposure and authorization policy for registered agents."""
+_TOOL_POLICY_PY = '''"""Tool exposure and authorization policy for registered specialists."""
 
 from cayu.tools import (
     DenyPatternRule,
@@ -738,7 +738,7 @@ def register_agents(
     starter_tools = list(build_agent_tools())
     # Every tool named here pauses for human approval before each call, or is
     # denied without the approvals capability (see policies/tools.py). Resolve
-    # pauses on the control plane's Pending page.
+    # pauses on the Developer dashboard's Pending page.
     starter_external_tool_names = list(external_effect_tool_names())
     # <cayu:generated-starter-tools>
     # </cayu:generated-starter-tools>

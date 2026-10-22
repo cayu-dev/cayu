@@ -34,7 +34,7 @@ the [benchmark campaign command path](benchmark-campaigns.md).
 
 The installed package includes three focused, version-matched guides:
 
-- `cayu guide evals-first` creates a Control Plane suite, runs it, approves a
+- `cayu guide evals-first` creates a Developer dashboard suite, runs it, approves a
   baseline, and compares the next result.
 - `cayu guide evals-ai-quality` adds bounded AI-judge authority, a rubric,
   reference truth, and calibration.
@@ -320,7 +320,7 @@ an `EvalSuite`.
 
 This CLI target is hermetic test-program authority. `[tool.cayu].eval_target` builds the
 app, fixtures, request base, and suites selected by `cayu eval run`; it is not the target
-shown in the Control Plane. Control Plane trials instead use the current target published
+shown in the Developer dashboard. Developer dashboard trials instead use the current target published
 by the running server, including that mounted app's current provider, tools, environment,
 approval policy, and runtime policy.
 
@@ -518,7 +518,7 @@ complete project that declares objectives and validates.
 ## Author-first suite contracts
 
 `EvalSuiteDraftV1` remains the closed deterministic authoring contract.
-`EvalSuiteDraftV2` is the bounded, authority-free SDK and Control Plane
+`EvalSuiteDraftV2` is the bounded, authority-free SDK and Developer dashboard
 contract for a reusable evaluation that may also contain revision-free
 `StructuredModelJudgeAssertionDraftV1` material. The server—not the browser—
 compiles rubric and public-reference drafts into content-addressed immutable
@@ -568,7 +568,7 @@ do not create provider, tool, environment, fixture, secret, or runtime
 authority. New V3 drafts still default to one trial, one required pass, and
 concurrency one; V1/V2 documents remain readable with that fail-closed policy.
 
-### Control Plane: create and run an evaluation
+### Developer dashboard: create and run an evaluation
 
 For an ordinary project started with `cayu serve`, users do not need to write an
 Evals-specific Python suite. Select a server-published target on the **Evals**
@@ -618,7 +618,7 @@ state. One launch response maps every selected case to its resulting run; mixed
 selections therefore remain one user action without pretending that separately
 recoverable scenarios share one runtime state machine.
 
-Control Plane-authored suite launches execute the complete immutable trial
+Developer dashboard-authored suite launches execute the complete immutable trial
 policy. Every admitted trial runs; Cayu does not stop early after enough passes
 or failures. A case passes only when it reaches the required pass count and has
 zero runtime errors, evaluator errors, unavailable required evidence, or
@@ -654,7 +654,7 @@ Completed results retain each trial's observed candidate usage/cost evidence and
 each rubric-string or structured judgment's observed judge usage/cost; unpriced
 observations remain explicitly unavailable.
 
-### Control Plane: calibrate an AI judge
+### Developer dashboard: calibrate an AI judge
 
 After adding a structured judge, choose **Check suite**. A successful preview
 returns the exact compiled rubric, reference, profile, implementation, and
@@ -781,7 +781,7 @@ prior-version compatibility loader.
 name and one-based `occurrence`, then checks that its finalized public arguments
 contain a bounded expected JSON object. `ToolResultContainsAssertionSpec` uses
 the same stable selection but is admitted only when the trusted target enables
-public-safe result retention. In Control Plane these are **Tool arguments
+public-safe result retention. In the Developer dashboard these are **Tool arguments
 contain JSON** and **Tool result contains JSON**; they are available in new
 evaluations, suite edits and duplication, and captured-session promotion.
 
@@ -827,7 +827,7 @@ Unsupported capture, unavailable terminal evidence, malformed retained data,
 incompatible call identity, cardinality overflow, truncation, and redaction on
 an expected path are distinct `unavailable` observation states. Redaction on an
 unselected extra field does not prevent a safe comparison. These states and the
-bounded safe actual value are the same in SDK/HTTP results, Control Plane
+bounded safe actual value are the same in SDK/HTTP results, Developer dashboard
 drill-down, CLI, and JSON/HTML reports.
 
 ### Portable workspace and artifact assertions
@@ -863,7 +863,7 @@ artifact_output = ArtifactAssertionSpec(
 
 Both kinds are available in **Evals → New evaluation**, saved-suite editing and
 duplication, imported/exported corpus JSON, and captured-session promotion. No
-Python assertion class is required. Control Plane supplies expectation values;
+Python assertion class is required. The Developer dashboard supplies expectation values;
 the trusted target continues to own the app, environment, stores, redactor, and
 evidence policy.
 
@@ -891,11 +891,11 @@ browser input cannot grant that authority. Only supported textual media are
 decoded, only a complete bounded object is eligible, and the application
 redactor runs before at most 64 KiB of text becomes portable. A suite containing
 `text_contains` is rejected during compilation and reported not ready in
-Control Plane when the selected profile does not publish that exact policy.
+the Developer dashboard when the selected profile does not publish that exact policy.
 
 Captured-session quick-adds use only complete retained observations and label
 them as observed drafts, not truth. When a production trajectory did not retain
-a path/scope, or retained it incompletely, Control Plane creates an explicit
+a path/scope, or retained it incompletely, the Developer dashboard creates an explicit
 editable expectation instead of inventing an observation. Fresh execution then
 captures exactly the probes required by that reviewed assertion.
 
@@ -994,7 +994,7 @@ limit-reached fact. Portable input cannot name custom events or internal event
 strings and cannot inspect raw payloads, approval IDs, actors, reasons, policy
 metadata, or secrets. Direct Python `EventOccurred` remains available for
 application-owned specialized assertions, but it is intentionally not a
-portable Control Plane or corpus contract.
+portable Developer dashboard or corpus contract.
 
 Process evidence retains at most 4,096 allowlisted facts. Missing root evidence
 and bounded prefixes are `unavailable`, never a pass or candidate mismatch.
@@ -1002,7 +1002,7 @@ Exact ordering applies only within an ordinary root session. A typed workflow
 target projects the workflow's causally ordered child closure in durable lineage
 order. `ChildStatusAssertionSpec` separately
 supports completed, failed, and interrupted direct children; incomplete child
-tree capture remains unavailable. Control Plane can author all three contracts
+tree capture remains unavailable. The Developer dashboard can author all three contracts
 for a new suite or captured-session promotion, and SDK, stores, result
 presentation, CLI, comparison, and JSON/HTML reports consume the same evaluator
 and safe published details.
@@ -1011,7 +1011,7 @@ Captured-session quick authoring uses only complete process evidence. For a
 trace longer than the 256-event order contract, it selects whole observed event
 kinds whose complete filtered occurrence sequence fits the bound; it never
 truncates one kind or substitutes generic events. When evidence is incomplete
-or no exact observed sequence is representable, Control Plane labels the action
+or no exact observed sequence is representable, the Developer dashboard labels the action
 `Add expectation` and creates an editable explicit draft instead of claiming
 the default was observed.
 
@@ -1318,7 +1318,7 @@ restart-safe external execution.
 
 Portable model judges deepen that same compiler rather than introducing a
 scorer or plugin registry. `ModelJudgeTarget` binds one portable evaluator key
-to a locally constructed `CayuApp` and registered agent. The agent must exist
+to a locally constructed `CayuApp` and registered specialist. The agent must exist
 and be tool-free. Missing keys, invalid registrations, missing or ambiguous
 provider resolution, and tool-bearing
 registrations reject during compilation before the candidate provider is
@@ -1574,11 +1574,11 @@ produces a content-addressed schema-version-10 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
-JSON, SDK, CLI, HTML, and Control Plane readers do not need raw runtime events
+JSON, SDK, CLI, HTML, and Developer dashboard readers do not need raw runtime events
 to distinguish complete, truncated, and unavailable evidence. Captured-session
 scoring embeds the same
 section in `CapturedRunScoreV1`; fresh and captured publications therefore use
-one memory evidence model and revision contract. CLI JSON and Control Plane
+one memory evidence model and revision contract. CLI JSON and Developer dashboard
 schemas preserve the complete section. HTML reports retain its bounded
 classification, limitation, and lifecycle summary while explicitly directing
 full record inspection to JSON. The current compact generic
@@ -1774,7 +1774,7 @@ The same suite/assertion surface supports several modes:
   no live runtime, on any machine, from a saved JSON file.
 - **Production replay** — promote a completed or failed durable session tree with
   `trajectory_from_session(...)`, then score or export the resulting `Trajectory` without running
-  the application again. The Control Plane can persist this captured result and, for a simple
+  the application again. The Developer dashboard can persist this captured result and, for a simple
   safely reconstructable invocation, launch a bounded current-app trial. This uses the mounted
   application's current provider, tools, environment, approvals, and policy; it is distinct from
   the hermetic target configured through `[tool.cayu].eval_target`. Scenario-v2 extends that path
@@ -1786,7 +1786,7 @@ The same suite/assertion surface supports several modes:
 Every captured or fresh immutable result can be compiled with
 `present_eval_result(...)` into `EvalResultPresentationV1`. This bounded,
 versioned projection is the single human-facing result contract used by the
-protected HTTP API, Control Plane, and HTML reporting. It does not rerun an
+protected HTTP API, Developer dashboard, and HTML reporting. It does not rerun an
 assertion or reinterpret raw model output. It validates and presents only the
 facts already admitted into the immutable public result.
 
@@ -1822,7 +1822,7 @@ judgments retain their bounded rubric revision and threshold. Private reference
 content, judge prompts, provider credentials/options, and raw judge output are
 not part of this contract.
 
-The Control Plane Results and Runs views expose the same projection with
+The Developer dashboard Results and Runs views expose the same projection with
 case/trial drill-down. Users can see why a judgment passed or failed, including
 each bounded explanation and contribution, without opening JSON. Downloaded
 JSON reports use the versioned `EvalResultReportV2` envelope, which binds the
@@ -1840,7 +1840,7 @@ comparisons separately report assertion-contract incompatibility, evidence-state
 changes, safe observed-value changes, and outcome regressions. They do not
 mistake a changed extra value for an assertion change. Cayu never pairs a
 captured observation with a fresh trial heuristically and never diffs
-incompatible contracts. The protected comparison API, Control Plane, CLI JSON,
+incompatible contracts. The protected comparison API, Developer dashboard, CLI JSON,
 and HTML comparison all consume this same schema-version-4 comparison document.
 
 `run_eval_case(..., trials=N)` defaults to an all-trials-must-pass policy and
@@ -1895,7 +1895,7 @@ candidate, and an improving candidate that remained eligible but was not
 selected.
 
 Use `cayu eval memory-report REQUEST.json --format json|html` for local report
-construction. A configured Control Plane exposes the equivalent protected
+construction. A configured Developer dashboard exposes the equivalent protected
 `POST /api/evals/memory-reports` and
 `POST /api/evals/memory-reports/report.html` entrances. Those routes prove that
 each supplied published result and its associated profile snapshot belongs to
@@ -2509,7 +2509,7 @@ predates the required attestation, missing or inaccessible artifacts,
 contradictory boundaries, and bounded-size failures return stable messages and
 remediation while the captured score remains available. The operation reloads
 terminal evidence after artifact reads so a changing source cannot be published
-as one coherent scenario. The authenticated Control Plane preview exposes this
+as one coherent scenario. The authenticated Developer dashboard preview exposes this
 result and never invokes providers, tools, environments, hooks, recovery, or
 mutation paths.
 
@@ -2752,7 +2752,7 @@ mutation = await store.set_baseline(
 `compare_eval_results(...)` provide the common captured/fresh comparison path.
 Application releases may differ, but target, corpus, suite, case, assertion,
 evidence-policy, and applicable-pricing contracts must match. Cayu never picks
-a baseline inside the comparison function. The Control Plane uses the suite's
+a baseline inside the comparison function. The Developer dashboard uses the suite's
 explicitly approved baseline pointer by default and permits a manual immutable
 result-revision override. Existing custom `EvalStore` implementations remain
 source-compatible and advertise this optional contract only when
@@ -2773,7 +2773,7 @@ part of this configuration from project-owned declarations:
   the project-local `data/cayu.db` default.
 
 After the application is built, project assembly generates one trusted
-normal-authority target for every registered agent. The empty request base names
+normal-authority target for every registered specialist. The empty request base names
 that agent and otherwise retains ordinary runtime defaults. A target key is
 derived from length-delimited UTF-8 project, agent, and profile identities under
 the `cayu-generated-eval-target-v1` domain and published as
@@ -2853,7 +2853,7 @@ to publish one complete application-owned `PriceBook` through server
 configuration. A judge cost ceiling requires a configured project price book.
 
 Author-first launch readiness can additionally accept a per-trial candidate
-cost budget from Control Plane when the target publishes compatible pricing.
+cost budget from the Developer dashboard when the target publishes compatible pricing.
 That value narrows only the reviewed launch, is retained in its accepted
 exposure, and becomes a fail-closed observed-cost interruption threshold. As
 with other runtime cost budgets, one provider completion can cross the
@@ -2957,9 +2957,9 @@ An embedded mount must supply `access`; `OpenAccess` with Evals and an incomplet
 `EvalsConfig` both fail construction. When `evals` is omitted, the dashboard keeps Evals
 visible but marks execution and catalog operations not ready and names the missing target
 or durable store wiring. An arbitrary embedded mount does not infer executable authority
-from registered agents. `cayu serve --dev` is different: project assembly creates trusted
+from registered specialists. `cayu serve --dev` is different: project assembly creates trusted
 loopback access, a project-local durable store when needed, and server-published targets
-for registered agents.
+for registered specialists.
 
 The target must reference the exact `CayuApp` attached to the server. Open
 access, a disabled API, an in-memory store, incomplete wiring, or an unavailable
@@ -3426,7 +3426,7 @@ the downloaded dashboard result.
 The focused real-application check starts from a freshly generated project and
 an actual OpenAI or Anthropic model. It adds an explicit project judge
 declaration to `pyproject.toml`—but no Evals-specific Python—then runs `cayu
-serve --dev`. In Control Plane it creates one source session, promotes and
+serve --dev`. In the Developer dashboard it creates one source session, promotes and
 baselines that retained result, launches one production-first current-app
 trial, authors one same-model judged suite and trial, and verifies their
 results, reports, comparisons, route labels, and stable CLI exits:

@@ -195,7 +195,8 @@ def add_generate_parser(subparsers: Any) -> None:
         help="Migrate a generated maintained service to Cayu project context assembly.",
         description=(
             "Safely add the framework-owned project_context pass-through required for "
-            "zero-code Control Plane features. Customized factories receive manual guidance."
+            "zero-code Developer dashboard features. Customized factories receive manual "
+            "guidance."
         ),
     )
     service_context_parser.add_argument(
@@ -876,7 +877,7 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
             "path": registration_relative,
             "operation": "update_region",
             "reason": (
-                "cannot determine the registered agent name for "
+                "cannot determine the registered specialist name for "
                 f"{_render_agent_origin(origin)} without executing project code; "
                 "use a literal name or extend the application manually"
             ),
@@ -1039,13 +1040,13 @@ def _inspect_registered_agents(
     *,
     source_path: str = "app.py",
 ) -> _AgentRegistrationInspection:
-    """Inspect registered agent identities without importing or executing project code."""
+    """Inspect registered specialist identities without importing or executing project code."""
 
     try:
         app_tree = ast.parse(app_source, filename=source_path)
     except SyntaxError as exc:
         raise ValueError(
-            f"Cannot inspect registered agent identities in {source_path}: {exc.msg}."
+            f"Cannot inspect registered specialist identities in {source_path}: {exc.msg}."
         ) from exc
     parents = _ast_parents(app_tree)
 
@@ -1453,7 +1454,7 @@ def _literal_agent_name(
                     tree = ast.parse(content.decode("utf-8"), filename=relative)
                 except SyntaxError as exc:
                     raise ValueError(
-                        f"Cannot inspect registered agent identity in {relative}: {exc.msg}."
+                        f"Cannot inspect registered specialist identity in {relative}: {exc.msg}."
                     ) from exc
                 module_snapshots[module] = _AgentModuleSnapshot(
                     tree=tree,

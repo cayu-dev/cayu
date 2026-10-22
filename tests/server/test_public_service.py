@@ -2998,7 +2998,7 @@ def test_product_request_boundary_rejects_declared_and_streamed_oversize() -> No
 
 
 def test_public_service_requires_its_selected_agent_to_be_registered() -> None:
-    with pytest.raises(ValueError, match="agent_name must identify a registered agent"):
+    with pytest.raises(ValueError, match="agent_name must identify a registered specialist"):
         _build_service(agent_name="missing", registered_agent_name="registered")
 
 

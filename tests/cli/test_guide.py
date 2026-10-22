@@ -167,7 +167,7 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert "cayu guide tool-effects" in authoring
     assert "uv run cayu serve --dev" in authoring
     assert "http://127.0.0.1:8000/cayu/" in authoring
-    assert "A deployed control plane still requires configured authentication" in authoring
+    assert "A deployed Developer dashboard still requires configured authentication" in authoring
     assert "Never use `OpenAccess()` on a public listener" in authoring
     assert "Client-IP and forwarded-header checks are not authentication" in authoring
 

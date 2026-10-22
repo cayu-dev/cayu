@@ -153,9 +153,9 @@ def add_dashboard_parser(subparsers: Any) -> None:
     """Register the ``dashboard eject`` command group."""
     dashboard = subparsers.add_parser(
         "dashboard",
-        help="Manage the bundled Cayu control-plane source.",
+        help="Manage the bundled Cayu Developer dashboard source.",
         description=(
-            "Manage the bundled Cayu control-plane source. "
+            "Manage the bundled Cayu Developer dashboard source. "
             "Use `cayu dashboard eject DESTINATION` to create an editable project."
         ),
     )

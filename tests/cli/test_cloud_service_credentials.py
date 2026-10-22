@@ -1,4 +1,4 @@
-"""`cayu cloud service credentials`: the Agent's per-Agent `/cayu/` operator login."""
+"""`cayu cloud service credentials`: the Agent's per-Agent `/cayu/` Developer dashboard login."""
 
 from __future__ import annotations
 
@@ -101,7 +101,9 @@ def test_an_older_cloud_without_the_endpoint_says_so(
     assert output == {
         "error": {
             "category": "operator_credentials_unsupported",
-            "message": "This Cayu Cloud does not support per-Agent operator credentials yet.",
+            "message": (
+                "This Cayu Cloud does not support per-Agent Developer dashboard credentials yet."
+            ),
         },
         "ok": False,
     }
@@ -151,7 +153,7 @@ def test_a_malformed_answer_is_rejected_without_echoing_it(
     assert code == 2
     assert output["error"] == {
         "category": "api_response_invalid",
-        "message": "Operator credentials response is invalid.",
+        "message": "Developer dashboard credentials response is invalid.",
     }
     assert PASSWORD not in json.dumps(output)
 

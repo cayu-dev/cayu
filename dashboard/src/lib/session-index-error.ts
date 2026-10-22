@@ -50,7 +50,7 @@ export function sessionIndexErrorState(error: unknown): SessionIndexErrorState {
     return {
       kind: "authorization",
       title: "You do not have permission to view these sessions.",
-      detail: "Ask an administrator for access to the control plane.",
+      detail: "Ask an administrator for access to the Developer dashboard.",
       retryable: false,
     }
   }

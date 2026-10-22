@@ -305,7 +305,7 @@ export function PendingActionsPage() {
             <TableRow>
               <TableHead>Action</TableHead>
               <TableHead>Session</TableHead>
-              <TableHead>Agent</TableHead>
+              <TableHead>Specialist</TableHead>
               <TableHead>Tool</TableHead>
               <TableHead>Created</TableHead>
               <TableHead>Open</TableHead>

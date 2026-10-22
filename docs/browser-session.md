@@ -140,7 +140,7 @@ separate application-owned profile setup.
 ### Local login/MFA acceptance
 
 The opt-in designated-account test uses a disposable HTTPS password/TOTP service,
-native Chromium, the protected Cayu server and the compiled operator dashboard.
+native Chromium, the protected Cayu server and the compiled Developer dashboard.
 It needs no external account or model API key. With the browser test dependencies,
 Chromium and dashboard build already available, run from the repository root:
 

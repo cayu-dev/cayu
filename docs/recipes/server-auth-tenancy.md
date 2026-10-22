@@ -40,7 +40,7 @@ In particular, the built-in routes do not automatically filter:
 - sessions, events, or transcripts;
 - tasks or usage;
 - knowledge or artifacts; or
-- the packaged dashboard/control plane.
+- the packaged Developer dashboard.
 
 If callers from two tenants can reach those routes and one caller knows the
 other tenant's raw record identifier, authentication alone does not prevent the
@@ -66,7 +66,7 @@ cayu new my-service --preset service
 Its `build_service(*, mode=...)` factory is shared by `cayu serve`,
 `cayu check --deploy`, generated documentation, and
 `tests/test_public_service_security.py`. The factory owns a narrow product API,
-separate product and operator authentication policies, an authenticated
+separate product and Developer dashboard authentication policies, an authenticated
 `/cayu/` mount in production, and an inspectable identity-store category. The
 generated SQLite product store demonstrates atomic idempotency and
 tenant-qualified lookup for a single service process. Replace it with an
@@ -293,10 +293,10 @@ scope with the job. Reload it from application storage in the worker. Do not
 let a queued payload or model-selected argument choose the tenant whose records
 will be read.
 
-## Treat the inspector as an operator surface
+## Treat the Developer dashboard as an internal surface
 
-The simplest safe hosted layout keeps Cayu's complete control plane on an
-operator-only boundary:
+The simplest safe hosted layout keeps Cayu's complete Developer dashboard on an
+internal-only boundary:
 
 ```python
 from cayu.server import AuthenticatedAccess, mount_cayu
@@ -311,7 +311,7 @@ mount_cayu(
 )
 ```
 
-Network policy, a separate operator host, or an authenticated gateway can add
+Network policy, a separate internal host, or an authenticated gateway can add
 another boundary. Do not expose the mount to product tenants unless every route
 and backing store has been reviewed for end-to-end tenant scoping. The auth
 dependency runs before protected routes, but returning different

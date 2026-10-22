@@ -373,7 +373,7 @@ class InvocationContext:
             ):
                 raise ValueError("Work-attempt authority conflicts with its invocation binding.")
         if self.registered_agent.spec.name != binding.agent_name:
-            raise ValueError("Registered agent conflicts with invocation authority.")
+            raise ValueError("Registered specialist conflicts with invocation authority.")
         if self.registered_provider.name != binding.provider_name:
             raise ValueError("Registered provider conflicts with invocation authority.")
         environment_name = (

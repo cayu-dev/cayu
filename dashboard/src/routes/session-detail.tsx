@@ -521,7 +521,7 @@ function EventDetailPanel({ event }: { event: SessionEvent | null }) {
 
       <div className="grid gap-3 rounded-md border border-border bg-muted/30 p-3 text-sm">
         <DetailPair label="Timestamp" value={formatDateTime(event.timestamp)} />
-        <DetailPair label="Agent" value={event.agent_name || "-"} />
+        <DetailPair label="Specialist" value={event.agent_name || "-"} />
         <DetailPair label="Environment" value={event.environment_name || "-"} />
         <DetailPair label="Workflow" value={event.workflow_name || "-"} />
       </div>
@@ -631,13 +631,13 @@ function EventHistoryFilterControls({
           htmlFor="session-event-filter-agent"
           className="space-y-1 text-xs text-muted-foreground"
         >
-          <span>Agent</span>
+          <span>Specialist</span>
           <Input
             id="session-event-filter-agent"
             value={draft.agentName}
             onChange={(event) => update("agentName", event.target.value)}
             placeholder="assistant"
-            aria-label="Filter events by exact agent name"
+            aria-label="Filter events by exact specialist name"
           />
         </label>
         <label

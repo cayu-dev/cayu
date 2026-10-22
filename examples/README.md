@@ -113,7 +113,7 @@ corresponding credentials or service.
   [`context_pressure_calibration_live.py`](context_pressure_calibration_live.py) — context limits and calibration.
 - [`otel_tracing.py`](otel_tracing.py) — OpenTelemetry runtime events.
 - [`dashboard_pending_actions.py`](dashboard_pending_actions.py) and
-  [`dashboard_knowledge_review.py`](dashboard_knowledge_review.py) — operator dashboard projections.
+  [`dashboard_knowledge_review.py`](dashboard_knowledge_review.py) — Developer dashboard projections.
 - [`business_approval_tiers.py`](business_approval_tiers.py) — application-owned approval routing.
 - [`github_pr_reviewer/`](github_pr_reviewer/) — durable cloud PR-review workflow.
 - [`ADVANCED_RUNTIME_EXAMPLES.md`](ADVANCED_RUNTIME_EXAMPLES.md) — asynchronous

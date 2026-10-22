@@ -150,7 +150,7 @@ Cancellation during attachment waits for the command outcome before rollback;
 unconfirmed detachment leaves binding cleanup retryable. Combine this with
 `reconnect_state_dir` to retain allocations across worker restart inside that exact
 surviving application container. The [combined runnable composition](../examples/browser_view_reconnect/README.md)
-uses SQLite, protected human review and the existing view-only operator UI.
+uses SQLite, protected human review and the existing view-only Developer dashboard.
 The reconnect claim binds and fences this exact attachment; container replacement
 is an explicit rebuild boundary, never a same-name reconnect.
 
@@ -368,9 +368,9 @@ exported eval. Configure the same nested fields through `ServerSettings` with
 `CAYU_SERVER_EVALUATION_PROMOTION__SOURCE_AGENT_NAME`, and
 `CAYU_SERVER_EVALUATION_PROMOTION__APPLICATION_RELEASE_ID`.
 
-This adapter is independent of the control plane's current **Evaluate** action.
+This adapter is independent of the Developer dashboard's current **Evaluate** action.
 Configured projects started with `cayu serve` automatically publish their
-registered agents as eval targets and use durable project storage, so operators
+registered specialists as eval targets and use durable project storage, so operators
 can evaluate a terminal session, save it, approve it as a baseline, launch a
 current-app trial using the mounted application's provider, tools, environment,
 approvals, and policy, compare results, and download reports without adding Evals-specific
@@ -380,7 +380,7 @@ Python configuration.
 
 Configured projects started with `cayu serve` do not construct Evals objects.
 Cayu derives the eval store from the project's declared SQLite or PostgreSQL
-storage, generates one bounded target for each registered agent, and uses the
+storage, generates one bounded target for each registered specialist, and uses the
 normal application provider, tools, environment, approvals, and runtime policy.
 Each catalog request prepares and publishes the current candidate execution
 profile. Generated targets require no Evals-specific Python configuration and
@@ -388,7 +388,7 @@ default to one fresh trial at concurrency one. Browser launches are pinned to
 the published profile revision, while admission and workers fail closed if the
 runtime identity changes before execution.
 `cayu serve --dev` grants only trusted loopback product access; an authenticated
-production control plane uses the same automatic assembly. Missing durable
+production Developer dashboard uses the same automatic assembly. Missing durable
 storage or ordinary runtime authority remains visible as an operation-level
 readiness reason rather than removing Evals from the dashboard.
 

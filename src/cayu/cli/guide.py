@@ -44,7 +44,7 @@ _GUIDES = {
     ),
     "evals-first": (
         "evals-first.md",
-        "First Control Plane suite, run, baseline, and comparison.",
+        "First Developer dashboard suite, run, baseline, and comparison.",
     ),
     "evals-production": (
         "evals-production.md",

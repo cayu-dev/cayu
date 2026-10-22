@@ -787,7 +787,7 @@ auth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"
 _SERVE_DEPLOYMENT_README = f"""
 ## Serve a deployment
 
-Without `--dev`, `cayu serve` requires operator credentials.
+Without `--dev`, `cayu serve` requires Developer dashboard credentials.
 `[tool.cayu.serve].auth` in `pyproject.toml` names
 `{ENVIRONMENT_OPERATOR_AUTH_TARGET}`, which reads HTTP Basic
 credentials from `{OPERATOR_USERNAME_VARIABLE}` and `{OPERATOR_PASSWORD_VARIABLE}` when the
@@ -807,7 +807,7 @@ identity source, point `auth` at your own auth dependency, for example one built
 with `BasicAuth.from_environment(...)` (`uv run --no-sync cayu guide references#server`).
 """
 
-_SERVE_DEPLOYMENT_AGENTS = f"""- Deployed control plane: `cayu serve` without `--dev` authenticates operators with
+_SERVE_DEPLOYMENT_AGENTS = f"""- Deployed Developer dashboard: `cayu serve` without `--dev` authenticates operators with
   `{OPERATOR_USERNAME_VARIABLE}` and `{OPERATOR_PASSWORD_VARIABLE}` through
   `[tool.cayu.serve].auth` and refuses to start without them. Keep that setting
   unless you replace it with another authentication dependency; never remove it.
@@ -850,9 +850,9 @@ __DATABASE_README_PROOF_GUIDANCE__
 These commands require no model API key. They prove project construction,
 static wiring, a deterministic model response, and its eval.
 
-## Inspect with the local control plane
+## Inspect with the Developer dashboard
 
-Cayu's packaged developer/operator control plane reads the same durable stores
+Cayu's packaged Developer dashboard reads the same durable stores
 as the project commands. Start it in a separate terminal:
 
 ```bash
@@ -860,21 +860,21 @@ uv run --no-sync cayu serve --dev
 ```
 
 Then open `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag enables
-unauthenticated trusted-local access only. It does not make the control plane
+unauthenticated trusted-local access only. It does not make the Developer dashboard
 the application's end-user UI or configure a production deployment.
 Project serving also derives Evals project/release identity and uses
 __DATABASE_EVALS_STORAGE_GUIDANCE__ automatically. With the normal live
 provider configured, open a completed or failed simple session, choose
 **Evaluate**, review its assertions, save or approve the captured result, and
-start one bounded fresh trial. The generated target reuses the registered agent
+start one bounded fresh trial. The generated target reuses the registered specialist
 and its ordinary runtime policy; no Evals-specific Python configuration is
 required.
 Run `uv run --no-sync cayu guide evals-first` for the shortest suite, baseline,
 and comparison workflow. Add `cayu guide evals-ai-quality` only after explicitly
 choosing judge provider, model, privacy, and same-model policy.
 Never mount it with unauthenticated open access on a public listener;
-client-IP checks are not authentication. Public or deployed control-plane
-access requires an authenticated access policy.
+client-IP checks are not authentication. Public or deployed Developer
+dashboard access requires an authenticated access policy.
 __SERVE_DEPLOYMENT_README__
 ## Run with a live provider
 
@@ -948,7 +948,7 @@ or multi-user services, credential sharing, resale, or bypassing plan limits.
 For production, use the OpenAI Platform API or another officially supported
 provider. Run `uv run --no-sync cayu guide providers#openai-subscription` for the local
 support boundary.
-`--agent` is optional while this is the only registered agent. The checked-in
+`--agent` is optional while this is the only registered specialist. The checked-in
 `AGENTS.md` is the local instruction surface for coding agents.
 """
 
@@ -992,7 +992,7 @@ yourself, use the Cayu feature that already does it:
 | The user asks for | Use | Read |
 | --- | --- | --- |
 | A chat, follow-up questions, "remember what I said" | Keep `outcome.session_id`, then `run_to_completion(app, ResumeRequest(session_id=..., messages=[...]))`. A new `RunRequest` always starts an empty conversation. | `cayu guide references#sessions` |
-| Approval before the agent acts, "let me confirm first" | A tool generated with `cayu generate tool NAME --agent __AGENT_NAME__ --effect external`. Listed external tools pause for approval under `policies/tools.py`; resolve pauses on the control plane's Pending page. Do not build a separate approve button or approval table. | `cayu guide durable-operations` |
+| Approval before the agent acts, "let me confirm first" | A tool generated with `cayu generate tool NAME --agent __AGENT_NAME__ --effect external`. Listed external tools pause for approval under `policies/tools.py`; resolve pauses on the Developer dashboard's Pending page. Do not build a separate approve button or approval table. | `cayu guide durable-operations` |
 | The agent asking the user a question mid-task | The `ask_user` tool, a durable user-input pause | `cayu guide references#approvals` |
 | Structured data back (JSON, fields, a list) | `RunRequest(structured_output=StructuredOutputSpec(...))`, then `outcome.structured_output.output`. Do not parse JSON out of `final_text`. | `cayu guide structured-output` |
 | A new capability: call an API, read data, compute | A typed tool with a declared `ToolEffect` | `cayu guide references#domain-tool` |
@@ -1031,13 +1031,13 @@ __DATABASE_AGENTS_PROOF_GUIDANCE__
 - Inspect/check: `uv run --no-sync cayu inspect --json` and
   `uv run --no-sync cayu check --fail-on warning --json`.
 - Hermetic proof: `uv run --no-sync pytest` and `uv run --no-sync cayu eval run`.
-- Local developer/operator control plane: run `uv run --no-sync cayu serve --dev` in a separate
+- Local Developer dashboard: run `uv run --no-sync cayu serve --dev` in a separate
   terminal and open `http://127.0.0.1:8000/cayu/`. This is not the application's
   end-user UI or a production server configuration.
-__SERVE_DEPLOYMENT_AGENTS__- First Control Plane evaluation: `uv run --no-sync cayu guide evals-first`.
+__SERVE_DEPLOYMENT_AGENTS__- First Developer dashboard evaluation: `uv run --no-sync cayu guide evals-first`.
 - Never mount it with `OpenAccess()` on a public listener.
 - Client-IP and forwarded-header checks are not authentication. Use
-  `AuthenticatedAccess(...)` for any public or deployed control-plane surface.
+  `AuthenticatedAccess(...)` for any public or deployed Developer dashboard.
 - Live execution: `uv run --no-sync python run.py --message "USER REQUEST"` after configuring a
   provider in `app.configured_provider()`.
 
@@ -1204,7 +1204,7 @@ def _production_operator_access() -> ServerAccessConfig | PlaceholderOperatorAcc
         token = _bearer_token(request)
         if token is None or not hmac.compare_digest(token, configured_token):
             raise HTTPException(
-                status_code=401, detail="Operator authentication required."
+                status_code=401, detail="Developer dashboard authentication required."
             )
         return {"subject": "configured-operator"}
 
@@ -2425,8 +2425,8 @@ _SERVICE_GUIDANCE = """
 ## Public service security contract
 
 This project uses Cayu's maintained public-service factory. Product customers
-authenticate at `/api/operations`; `/cayu/` is a separate operator-only control
-plane. Every product read is tenant-qualified through the product operation
+authenticate at `/api/operations`; `/cayu/` is the separate Developer
+dashboard. Every product read is tenant-qualified through the product operation
 store, which `build_service()` opens with the other stores in
 `configuration/storage.py`. Never authorize from request tenant fields, Cayu
 IDs, labels, metadata, model output, or tool input, and never return raw runtime
@@ -2457,8 +2457,8 @@ its exact execution claim. Recoverable abandoned work is fenced through Cayu's
 durable incomplete-session recovery and resumed on the same session and task;
 the allow-listed `recovery_status` reports active, approval, input, interrupted,
 or manual-reconciliation states without exposing raw runtime records.
-The maintained control-plane mount attaches this publication contract to
-operator resume, approval, user-input, and tool-recovery continuations. It uses
+The maintained Developer dashboard mount attaches this publication contract to
+dashboard resume, approval, user-input, and tool-recovery continuations. It uses
 the private application-owned session index, acquires and heartbeats the product
 claim only at final publication, and interrupts instead of completing without a
 receipt when another product worker owns that claim. These process-local loop
@@ -2510,7 +2510,7 @@ uv run --no-sync cayu serve --host 0.0.0.0
 
 The `cayu serve` listener uses plain HTTP. Put it behind a trusted
 TLS-terminating ingress or reverse proxy, restrict the backend listener to that
-trusted network, and expose only the HTTPS endpoint to customers and operators.
+trusted network, and expose only the HTTPS endpoint to customers and dashboard users.
 Never send either bearer token over a directly exposed HTTP connection.
 
 The generated token map is a bounded self-hosted example, not an identity
@@ -2523,7 +2523,7 @@ uv run --no-sync pytest -q tests/test_public_service_security.py
 ```
 
 The check verifies the maintained factory, configured exposure posture, and
-authenticated control plane. The assembled-ASGI tests prove the generated
+authenticated Developer dashboard. The assembled-ASGI tests prove the generated
 customer authorization behavior. Routes added outside this factory, including
 an arbitrary ASGI or Uvicorn target, remain unverified by Cayu.
 
@@ -2540,7 +2540,7 @@ This is the supported multi-user service template. Preserve `build_service()`
 as the one serving/check/test factory. Product customer identity comes only
 from `AuthenticatedProductAccess`; authorize every resource through a
 tenant-qualified lookup in the application-owned product store. Keep the
-operator policy separate and never expose `/cayu/` or raw Cayu evidence to
+Developer dashboard policy separate and never expose `/cayu/` or raw Cayu evidence to
 customers. An arbitrary ASGI route is outside Cayu's verification boundary.
 
 Before declaring production work complete, run:
@@ -2882,18 +2882,18 @@ def _rendered_project_files(
                 and {"delegation", "knowledge", "human-input"} <= set(plan.capabilities)
                 else "A maintained coding composition for a trusted Git repository. Its explicit\nconstructors expose only the capabilities selected in the scaffold profile."
                 if plan.preset == "coding"
-                else "A small invoice-payment agent that shows each long-running pattern: approval\nbefore a side effect, a waited-for reply, reminder and deadline timers, a\nper-session spend cap, and a restart test for each pause. Its registered agent\nidentity is `__AGENT_NAME__`.".replace(
+                else "A small invoice-payment agent that shows each long-running pattern: approval\nbefore a side effect, a waited-for reply, reminder and deadline timers, a\nper-session spend cap, and a restart test for each pause. Its registered specialist\nidentity is `__AGENT_NAME__`.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
                 if plan.preset == "long-running"
-                else "A Cayu application with the standard capability layout. Its registered agent\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
+                else "A Cayu application with the standard capability layout. Its registered specialist\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
             ),
             "__AGENT_OWNERSHIP__": (
                 "This preset registers a primary coding agent and a bounded reviewer. Extend the\nprimary through the canonical generated regions in `agents/agent.py` and\n`agents/registration.py`. Keep the reviewer tool-free unless a reviewed composition\nchange intentionally expands its role.\nDo not create echo, pass-through, or placeholder tools."
                 if plan.preset == "coding" and "delegation" in plan.capabilities
-                else "The registered agent identity is `__AGENT_NAME__`.\n\nEdit the existing agent, test, and eval to implement the user's first requested\njob. Do not retain the starter and add a second agent. Tools are registered in\n`agents/registration.py`; change their policies deliberately. Do not create echo,\npass-through, or placeholder tools.".replace(
+                else "The registered specialist identity is `__AGENT_NAME__`.\n\nEdit the existing agent, test, and eval to implement the user's first requested\njob. Do not retain the starter and add a second agent. Tools are registered in\n`agents/registration.py`; change their policies deliberately. Do not create echo,\npass-through, or placeholder tools.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
             ),
@@ -3298,9 +3298,9 @@ def _render_new_receipt(
     if plan.preset == "service":
         print("  Local public service: uv run --no-sync cayu serve --dev")
         print("  Product API: http://127.0.0.1:8000/api/operations")
-        print("  Operator control plane: http://127.0.0.1:8000/cayu/")
+        print("  Developer dashboard: http://127.0.0.1:8000/cayu/")
     else:
-        print("  Local control plane: uv run --no-sync cayu serve --dev")
+        print("  Local Developer dashboard: uv run --no-sync cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")
     if plan.provider == "neutral":
         print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")

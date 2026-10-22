@@ -27,7 +27,7 @@ parent call automatically; do not submit unrelated input to wake the parent.
 If the child asks again, `session.delegated_action.updated` refreshes parent
 discovery without ending another parent run or interaction.
 
-## Serve the control plane
+## Serve the Developer dashboard
 
 For trusted local development, open access requires an explicit opt-in:
 
@@ -54,7 +54,7 @@ application factory runs, and must be a callable accepted by
 `ServerConfig.protected()`: it takes the request and returns an `AuthContext`
 (or a compatible mapping), or raises `HTTPException(401)`.
 
-### Operator credentials from the environment
+### Developer dashboard credentials from the environment
 
 Cayu ships a ready-made target that reads HTTP Basic credentials from
 `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD`:
@@ -115,8 +115,8 @@ For bearer tokens from your organization's identity provider, use
 system, expose a callable that verifies the request and returns `AuthContext`,
 then set `auth = "operator_auth:AUTH"` to its module and attribute.
 
-This guards operator access to the Agent's own control plane: the sessions
-API, the dashboard, and `/cayu/` on Cayu Cloud. It is not end-user product
+This guards access to the Agent's Developer dashboard: the sessions
+API, the dashboard pages, and `/cayu/` on Cayu Cloud. It is not end-user product
 login. Customer identity for a product belongs in the service preset's
 `AuthenticatedProductAccess` (see
 [Serve a maintained public-agent service](#serve-a-maintained-public-agent-service)).
@@ -236,14 +236,14 @@ the application's [release identity](runtime-contracts.md#release-identity)
 may create the project-local `data/cayu.db` default; production without an
 explicit or already-discovered durable store keeps Evals storage gated rather
 than guessing. After the application factory returns, Cayu publishes one
-bounded executable eval target per registered agent. An optional
+bounded executable eval target per registered specialist. An optional
 `[tool.cayu.evals.default_judge]` declaration can also publish one exact,
 tool-free model judge; it must name an already-registered provider, privacy
 policy, same-model decision, and bounded time/token ceilings. An explicit
 `[tool.cayu.evals].price_book = "bundled-public"` selection additionally makes
 the packaged public-rate snapshot available for generated candidate budgets
 and an optional judge cost threshold. Run `cayu guide evals-first` and `cayu
-guide evals-ai-quality` for the operator workflows.
+guide evals-ai-quality` for the Developer dashboard workflows.
 
 Incomplete-session startup recovery is off by default. Opt in with both a
 bounded status set and an inactivity fence:
@@ -282,9 +282,9 @@ service_factory = "service:build_service"
 
 For these projects, `cayu serve` loads the service factory with an explicit
 `development` or `production` mode and serves its assembled FastAPI product app
-on the same listener as the separately mounted `/cayu/` operator control plane.
+on the same listener as the separately mounted `/cayu/` Developer dashboard.
 The service factory, not `[tool.cayu.serve].auth`, owns the distinct customer
-and operator policies. Supplying both configurations is rejected rather than
+and Developer dashboard policies. Supplying both configurations is rejected rather than
 silently choosing one.
 
 Current generated factories also accept the optional, framework-owned
@@ -296,8 +296,8 @@ factories still start, but cannot receive automatic Evals project assembly.
 
 `cayu serve --dev` remains loopback-only and selects the generated development
 adapters. Without `--dev`, serving refuses to start if the service manifest
-reports development or placeholder product access, open or placeholder operator
-access, a development-only product identity store, a non-durable runtime session
+reports development or placeholder product access, open or placeholder Developer
+dashboard access, a development-only product identity store, a non-durable runtime session
 store, or a missing or non-durable runtime task store. Run
 `cayu check --deploy --fail-on warning --json` for the stable diagnostic codes.
 Passing an arbitrary ASGI object from `service_factory` is rejected as
@@ -326,14 +326,14 @@ recovery state before retrying work with external side effects.
 The built-in listener uses HTTP. A production public service must run behind a
 trusted TLS-terminating ingress or reverse proxy with the backend listener
 restricted to that trusted network. Expose only HTTPS to customers and
-operators; neither bearer policy is safe over a directly exposed HTTP
+dashboard users; neither bearer policy is safe over a directly exposed HTTP
 connection.
 
-### Customer and operator access with OIDC
+### Customer and Developer dashboard access with OIDC
 
 The service factory can take both policies from one OIDC provider. Share the key
-cache, take the tenant from a verified claim for customers, and require an
-operator scope for the control plane:
+cache, take the tenant from a verified claim for customers, and require a
+separate scope for the Developer dashboard:
 
 ```python
 from cayu.server import (
@@ -368,7 +368,7 @@ string tenant claim is rejected with 401; there is no default tenant. Pass
 verifier's own. `cayu check --deploy` treats this like any other
 `AuthenticatedProductAccess` and `AuthenticatedAccess`. Keep the two policies
 distinct, here with a scope; a separate audience also works. A customer token
-must not be able to reach the operator control plane.
+must not be able to reach the Developer dashboard.
 
 ## Migrate storage before starting a release
 

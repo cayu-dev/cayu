@@ -270,8 +270,9 @@ def check_serve_can_start(
                     "SERVE_AUTH_WITH_SERVICE_FACTORY",
                     path=_AUTH_PATH if configured else _WEB_COMMAND_PATH,
                     message=(
-                        "A public service's service_factory owns product and operator access, "
-                        "so `cayu serve` refuses [tool.cayu.serve].auth and --auth."
+                        "A public service's service_factory owns product and Developer "
+                        "dashboard access, so `cayu serve` refuses "
+                        "[tool.cayu.serve].auth and --auth."
                     ),
                     hint=(
                         "Remove [tool.cayu.serve].auth."
@@ -339,8 +340,8 @@ def _dev_finding(host: str) -> ProjectDiagnostic:
         message = f"`cayu serve --dev` would refuse to start: {exc}"
     else:
         message = (
-            f"`cayu serve --dev` serves an unauthenticated control plane on loopback host "
-            f"{host}, which Cayu Cloud cannot route requests to."
+            "`cayu serve --dev` serves an unauthenticated Developer dashboard on loopback "
+            f"host {host}, which Cayu Cloud cannot route requests to."
         )
     return _serve_diagnostic(
         "SERVE_DEV_MODE",
@@ -348,7 +349,7 @@ def _dev_finding(host: str) -> ProjectDiagnostic:
         message=message,
         hint=(
             "Remove --dev from the [web] command in cayu-cloud.toml and authenticate "
-            "operators with [tool.cayu.serve].auth or --auth."
+            "the Developer dashboard with [tool.cayu.serve].auth or --auth."
         ),
     )
 
@@ -480,7 +481,9 @@ def init_deploy_check_notice(check: CloudDeployCheck) -> str | None:
                 item.parameters.get("configured") == "placeholder" for item in service
             )
             reason = (
-                " Its product or operator access is still a placeholder." if placeholder else ""
+                " Its product or Developer dashboard access is still a placeholder."
+                if placeholder
+                else ""
             )
             parts.append(
                 "This public service won't start on Cayu Cloud yet: the deploy check reports "

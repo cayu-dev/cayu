@@ -1,14 +1,14 @@
 # Run your first evaluation
 
 Use this guide when you want to turn expected agent behavior into a reusable
-regression suite. The ordinary path is entirely in Control Plane: the browser
+regression suite. The ordinary path is entirely in the Developer dashboard: the browser
 authors bounded data, while the running Cayu application remains the only
 source of provider, tool, environment, policy, and credential authority.
 
 ## Start the project
 
 A conventional project created by `cayu new` already publishes one safe eval
-target per registered agent. It also uses the project's normal SQLite or
+target per registered specialist. It also uses the project's normal SQLite or
 PostgreSQL storage for suites, runs, results, and baselines.
 
 For trusted local development:
@@ -20,7 +20,7 @@ uv run --no-sync cayu serve --dev
 ```
 
 Open `http://127.0.0.1:8000/cayu/evals`. `--dev` is loopback-only trusted-local
-access. A deployed Control Plane needs its normal authentication and durable
+access. A deployed Developer dashboard needs its normal authentication and durable
 store; do not expose `OpenAccess` publicly.
 
 The Evals page names each operation that is ready and each missing dependency.

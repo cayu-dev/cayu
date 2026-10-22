@@ -3,11 +3,11 @@ import test from "node:test"
 
 import { reconcileRunAgentSelection } from "../src/lib/run-agent-selection.ts"
 
-test("a single registered agent is selected automatically", () => {
+test("a single registered specialist is selected automatically", () => {
   assert.equal(reconcileRunAgentSelection("", [{ name: "reviewer" }]), "reviewer")
 })
 
-test("multiple registered agents require an explicit selection", () => {
+test("multiple registered specialists require an explicit selection", () => {
   const agents = [{ name: "assistant" }, { name: "reviewer" }]
 
   assert.equal(reconcileRunAgentSelection("", agents), "")

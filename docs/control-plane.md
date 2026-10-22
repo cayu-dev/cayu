@@ -1,16 +1,16 @@
-# Open and replaceable control plane
+# Developer dashboard
 
-Cayu's bundled developer/operator control plane is open-source React and TypeScript. The
+Cayu's bundled Developer dashboard is open-source React and TypeScript. The
 compiled dashboard is convenient package data, not an opaque or mandatory product UI. An
 application can choose among three supported modes:
 
 | Mode | Owner | Use it when |
 | --- | --- | --- |
-| Bundled dashboard | Cayu | You want the stock zero-configuration operator UI. |
+| Bundled dashboard | Cayu | You want the stock zero-configuration Developer dashboard. |
 | Editable Cayu dashboard | Your application after extraction | You want to customize the same source and generated API client used by Cayu maintainers. |
 | Bring your own UI | Your application | You want a completely independent frontend over the versioned control-plane API. |
 
-All three modes expose an operator surface. Public deployment requires explicit authentication
+All three modes expose a Developer dashboard surface. Public deployment requires explicit authentication
 and authorization; unauthenticated `ServerConfig.local_development()` access is for trusted
 loopback development only.
 
@@ -26,7 +26,7 @@ public application-manifest fingerprint, and a matching SQLite or PostgreSQL
 does not invent a database.
 
 After the application is constructed, Cayu generates one bounded `default` eval
-target for every registered agent. Each target keeps the agent's normal provider,
+target for every registered specialist. Each target keeps the agent's normal provider,
 tools, environment defaults, approvals, and runtime policy. Its stable key is a
 domain-separated SHA-256 of the project, agent, and profile identities, so the
 key does not change when the application release changes. The current release
@@ -236,3 +236,16 @@ UI must display the exact `stage_id` and `run_epoch`, recovery reason,
 with a guessed provider operation id. The bundled dashboard requires an
 operator reason and warns whenever `duplicate_request_risk=true` that fallback
 can duplicate provider work and cost.
+
+## Naming and compatibility
+
+The `/cayu/` UI is the **Developer dashboard**, both locally and on Cloud.
+The app registers **specialists**: the Specialists page lists them, and sessions,
+tasks and New Run identify the specialist they use. A **subagent** remains a child
+session started with `SubagentTool`.
+
+Python names (`CayuApp`, `register_agent`, `AgentSpec`), API fields, `/agents`
+routes and existing authentication configuration remain unchanged. In particular,
+`CAYU_OPERATOR_USERNAME`, `CAYU_OPERATOR_PASSWORD` and
+`cayu.server.environment_auth:OPERATOR_BASIC_AUTH` still configure the Developer
+dashboard login. This naming change does not remove authentication outside Cloud.

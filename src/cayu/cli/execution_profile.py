@@ -121,7 +121,7 @@ def add_execution_profile_parser(subparsers: Any) -> None:
         "--agent",
         action="append",
         default=[],
-        help="Inspect this agent (repeatable; default: every registered agent).",
+        help="Inspect this agent (repeatable; default: every registered specialist).",
     )
     environment = candidates.add_mutually_exclusive_group()
     environment.add_argument(

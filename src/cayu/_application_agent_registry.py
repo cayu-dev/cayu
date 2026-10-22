@@ -839,7 +839,7 @@ class ApplicationAgentRegistry:
         )
 
     def list_agents(self) -> tuple[str, ...]:
-        """Return the names of all registered agents, sorted."""
+        """Return the names of all registered specialists, sorted."""
         return tuple(sorted(self._agents))
 
     def _get_registered_agent(self, name: str) -> runtime_records.RegisteredAgentState:
@@ -965,7 +965,7 @@ def _registered_agent_after_mcp_refresh(
     timeout_seconds: float | None,
 ) -> runtime_records.RegisteredAgentState:
     if not _registered_agent_contains_mcp_source(registered_agent, source):
-        raise ValueError("Registered agent does not contain the refreshed MCP source.")
+        raise ValueError("Registered specialist does not contain the refreshed MCP source.")
     refreshed_toolsets = tuple(
         candidate if toolset._refresh_source is source else toolset
         for toolset in registered_agent.mcp_toolsets

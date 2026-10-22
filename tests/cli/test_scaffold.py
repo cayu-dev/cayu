@@ -281,7 +281,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run --no-sync cayu session list" in readme
     assert "uv run --no-sync cayu serve --dev" in readme
     assert "http://127.0.0.1:8000/cayu/" in readme
-    assert "developer/operator control plane" in readme
+    assert "Developer dashboard" in readme
     assert "no Evals-specific Python configuration" in readme
     assert "uv run --no-sync cayu guide evals-first" in readme
     assert "cayu guide evals-ai-quality" in readme
@@ -1894,7 +1894,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
         assert "cayu check --deploy --fail-on warning --json" in guidance
         assert "pytest -q tests/test_public_service_security.py" in guidance
         assert "customer" in guidance
-        assert "operator" in guidance
+        assert "Developer dashboard" in guidance
         assert "tenant-qualified" in guidance
         assert "arbitrary ASGI" in guidance
     assert "TLS-terminating" in readme
@@ -1906,7 +1906,8 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "cayu check --deploy --fail-on warning --json" in output
     assert "pytest -q tests/test_public_service_security.py" in output
     assert "Product API: http://127.0.0.1:8000/api/operations" in output
-    assert "Operator control plane: http://127.0.0.1:8000/cayu/" in output
+    assert "Developer dashboard: http://127.0.0.1:8000/cayu/" in output
+    assert re.search(r"control[- ]plane", output, re.IGNORECASE) is None
 
 
 def test_scaffolded_service_replacement_recovery_uses_profiled_admission(
@@ -2627,7 +2628,7 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "uv run --no-sync cayu eval run" in instructions
     assert "uv run --no-sync cayu serve --dev" in instructions
     assert "http://127.0.0.1:8000/cayu/" in instructions
-    assert "developer/operator control plane" in instructions
+    assert "Developer dashboard" in instructions
     assert "uv run --no-sync cayu guide evals-first" in instructions
     assert "end-user UI" in instructions
     assert "Never mount it with `OpenAccess()` on a public listener" in instructions
@@ -2706,9 +2707,9 @@ def test_cayu_new_uses_an_explicit_agent_name_across_the_generated_contract(
     assert 'agent_name="code-review-agent"' in (project / "tests" / "test_agent.py").read_text()
     assert 'agent_name="code-review-agent"' in (project / "evals" / "agent.py").read_text()
     readme = " ".join((project / "README.md").read_text().split())
-    assert "registered agent identity is `code-review-agent`" in readme
+    assert "registered specialist identity is `code-review-agent`" in readme
     instructions = " ".join((project / "AGENTS.md").read_text().split())
-    assert "registered agent identity is `code-review-agent`" in instructions
+    assert "registered specialist identity is `code-review-agent`" in instructions
     assert "--agent code-review-agent --effect EFFECT" in instructions
 
     environment = os.environ.copy()
@@ -2768,9 +2769,9 @@ def test_cayu_new_preserves_reserved_tokens_in_the_default_agent_identity(
     assert f'agent_name="{project_name}"' in (project / "tests" / "test_agent.py").read_text()
     assert f'agent_name="{project_name}"' in (project / "evals" / "agent.py").read_text()
     readme = " ".join((project / "README.md").read_text().split())
-    assert f"registered agent identity is `{project_name}`" in readme
+    assert f"registered specialist identity is `{project_name}`" in readme
     instructions = " ".join((project / "AGENTS.md").read_text().split())
-    assert f"registered agent identity is `{project_name}`" in instructions
+    assert f"registered specialist identity is `{project_name}`" in instructions
 
 
 @pytest.mark.parametrize("reserved_token", _RESERVED_TEMPLATE_TOKENS)
@@ -2799,9 +2800,9 @@ def test_cayu_new_preserves_reserved_tokens_in_an_explicit_agent_identity(
     assert f'agent_name="{agent_name}"' in (project / "tests" / "test_agent.py").read_text()
     assert f'agent_name="{agent_name}"' in (project / "evals" / "agent.py").read_text()
     readme = " ".join((project / "README.md").read_text().split())
-    assert f"registered agent identity is `{agent_name}`" in readme
+    assert f"registered specialist identity is `{agent_name}`" in readme
     instructions = " ".join((project / "AGENTS.md").read_text().split())
-    assert f"registered agent identity is `{agent_name}`" in instructions
+    assert f"registered specialist identity is `{agent_name}`" in instructions
 
 
 def test_scaffolded_default_eval_runs_from_nested_directory_without_api_keys(

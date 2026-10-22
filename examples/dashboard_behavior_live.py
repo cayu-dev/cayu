@@ -3552,7 +3552,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
 
         observed_requests.clear()
         await page.goto(f"{base_url}/cayu/agents", wait_until="networkidle")
-        await expect(page.get_by_role("heading", name="Agents", exact=True)).to_be_visible()
+        await expect(page.get_by_role("heading", name="Specialists", exact=True)).to_be_visible()
         await expect(page.get_by_text("Tasks are unavailable.", exact=False)).to_be_visible()
         require(
             not any(request.startswith("GET /api/tasks") for request in observed_requests),
@@ -3927,7 +3927,7 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
 
     await page.get_by_text("Session filters", exact=True).click()
-    await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+    await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
     await page.locator("#usage-label-filter").fill("stage=initial")
     await page.get_by_role("button", name="Apply", exact=True).click()
     await expect(page).to_have_url(re.compile(r"[?&]agent_name=dashboard-contract-agent(?:&|$)"))
@@ -3941,7 +3941,7 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     matching_metric = page.get_by_text("Matching Sessions", exact=True).locator("..").locator("..")
     await expect(matching_metric.get_by_text("1", exact=True)).to_be_visible()
     await page.reload(wait_until="networkidle")
-    await expect(page.get_by_label("Agent", exact=True)).to_have_value(AGENT_NAME)
+    await expect(page.get_by_label("Specialist", exact=True)).to_have_value(AGENT_NAME)
     await expect(page.locator("#usage-label-filter")).to_have_value("stage=initial")
 
     await page.get_by_role("button", name="Clear filters", exact=True).click()
@@ -3968,7 +3968,7 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
         "2026-07-02T02:30:00.123"
     )
     await page.get_by_text("Session filters", exact=True).click()
-    await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+    await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
     async with page.expect_request(
         lambda request: (
             request.method == "POST" and urlsplit(request.url).path == "/api/usage/rollup"
@@ -4030,10 +4030,10 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await page.route(usage_path, delay_superseded_usage)
     try:
         await page.get_by_text("Session filters", exact=True).click()
-        await page.get_by_label("Agent", exact=True).fill(SLOW_USAGE_AGENT)
+        await page.get_by_label("Specialist", exact=True).fill(SLOW_USAGE_AGENT)
         await page.get_by_role("button", name="Apply", exact=True).click()
         await asyncio.wait_for(slow_usage_started.wait(), timeout=5)
-        await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+        await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
         await page.get_by_role("button", name="Apply", exact=True).click()
         await expect(page).to_have_url(
             re.compile(r"[?&]agent_name=dashboard-contract-agent(?:&|$)")
@@ -4173,7 +4173,7 @@ async def _exercise_session_discovery(
     faults: MutationDisconnectFaults,
 ) -> None:
     await page.get_by_text("Advanced filters", exact=True).click()
-    await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+    await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
     await page.get_by_label("Environment", exact=True).fill(DISCOVERY_ENVIRONMENT)
     await page.get_by_label("Provider", exact=True).fill(PROVIDER_NAME)
     await page.get_by_label("Model", exact=True).fill(MODEL_NAME)
@@ -4341,15 +4341,17 @@ async def _exercise_run_agent_inventory(page: Page, base_url: str) -> None:
     await page.route("**/api/agents", serve_agent_inventory)
     try:
         await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
-        agent_select = page.get_by_label("Agent", exact=True)
+        agent_select = page.get_by_label("Specialist", exact=True)
         await expect(agent_select).to_have_value("")
-        await expect(page.get_by_text("No agents are registered.", exact=False)).to_be_visible()
+        await expect(
+            page.get_by_text("No specialists are registered.", exact=False)
+        ).to_be_visible()
         await page.get_by_label("Prompt", exact=True).fill("This run must remain disabled.")
         await expect(page.get_by_role("button", name="Run", exact=True)).to_be_disabled()
 
         inventory_mode = "single"
         await page.reload(wait_until="networkidle")
-        agent_select = page.get_by_label("Agent", exact=True)
+        agent_select = page.get_by_label("Specialist", exact=True)
         await expect(agent_select).to_have_value(AGENT_NAME)
         await page.get_by_label("Prompt", exact=True).fill("This run has one unambiguous agent.")
         await expect(page.get_by_role("button", name="Run", exact=True)).to_be_enabled()
@@ -4376,7 +4378,7 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
         ):
             await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
             await expect(page.get_by_role("heading", name="New Run")).to_be_visible()
-            agent_select = page.get_by_label("Agent", exact=True)
+            agent_select = page.get_by_label("Specialist", exact=True)
             await expect(agent_select).to_have_value("")
             await page.get_by_label("Prompt", exact=True).fill(prompt)
             run_button = page.get_by_role("button", name="Run", exact=True)

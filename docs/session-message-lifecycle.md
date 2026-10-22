@@ -51,7 +51,7 @@ not supply session-message context or bypass the policy.
 
 All HTTP session-message operations require authentication **and** this scoped
 policy, including ordinary enqueue. This is an intentional pre-release change:
-an authenticated operator mount or local-development access alone no longer
+an authenticated Developer dashboard mount or local-development access alone no longer
 enables the message endpoint. It does not change the authorization contract of
 unrelated Cayu routes or introduce native tenant-partitioned storage.
 

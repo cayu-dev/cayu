@@ -130,7 +130,7 @@ def run_request_with_registered_tool_ceiling(
     app: CayuApp,
     **request_fields: Any,
 ) -> RunRequest:
-    """Build a request carrying the registered agent's complete tool ceiling."""
+    """Build a request carrying the registered specialist's complete tool ceiling."""
 
     request = RunRequest(**request_fields)
     return request.model_copy(

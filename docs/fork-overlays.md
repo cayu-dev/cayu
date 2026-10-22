@@ -85,7 +85,7 @@ controller on the app after its agents are registered, and serve the
 fork-controller routes at `<api path>/fork-controller`: `/api/fork-controller`
 for `create_server` and `cayu serve`, `/cayu/api/fork-controller` for
 `mount_cayu` at its default path. The routes authenticate with the
-controller's own bearer token, never the operator login.
+controller's own bearer token, never the Developer dashboard login.
 
 | Variable | Value |
 | --- | --- |
@@ -121,7 +121,7 @@ curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/fork-controller
   `ALLOW_MODEL_RUNS=true` without all three cap variables, a malformed cap or
   total, `TOTAL_BUDGET_USD` without the cap variables, a
   durable session store without a durable budget ledger when model runs are on, an
-  unregistered agent, an unknown host tool, or a name or subject already
+  unregistered specialist, an unknown host tool, or a name or subject already
   enrolled differently in code. Errors never include digests.
 - Mounting the same app twice reuses the one enrollment.
 - Budget reservations, such as each fork's spend, go through the app's budget
