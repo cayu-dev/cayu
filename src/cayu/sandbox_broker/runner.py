@@ -11,11 +11,11 @@ import posixpath
 import secrets
 import tarfile
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TypeVar
 from urllib.parse import quote
 
 from cayu._validation import canonical_durable_json_bytes
@@ -42,6 +42,8 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerExecutionAdmissionObserver,
+    RunnerInteractiveProcess,
+    RunnerInteractiveProcessCapability,
     RunnerSystemExecutionMode,
     attach_cancellation_artifacts,
     copy_exec_command,
@@ -51,6 +53,7 @@ from cayu.sandbox_broker.client import (
     MAX_ARCHIVE_BYTES,
     MAX_ARCHIVE_PATHS,
     MAX_COMMAND_OUTPUT_BYTES,
+    MAX_STDIO_CHUNK_BYTES,
     MAX_WAIT_SECONDS,
     MIN_COMMAND_OUTPUT_BYTES,
     SandboxArchiveTooLargeError,
@@ -83,6 +86,7 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
 BROKERED_SANDBOX_ROOT = "/workspace"
 #: Admission candidate and evidence subject for brokered sandboxes.
 BROKERED_SANDBOX_CANDIDATE = "cayu-cloud-sandbox"
@@ -419,6 +423,16 @@ class BrokeredSandboxRunner(Runner):
         self.sandbox = await self._client.get(self.sandbox.id)
         return self.sandbox
 
+    def interactive_process_capability(self) -> RunnerInteractiveProcessCapability | None:
+        """Interactive commands through the broker, each stopped with its whole process tree.
+
+        The broker runs each one in its own PID namespace and reports it ended only
+        once every process in it has exited, so ``runner_agent_launch`` can run a
+        vendor CLI here. Stdio crosses the broker as offset-addressed requests.
+        """
+
+        return _BrokeredInteractiveProcessCapability(self)
+
     # Admission --------------------------------------------------------------
 
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
@@ -523,6 +537,14 @@ class BrokeredSandboxRunner(Runner):
             await asyncio.sleep(delay)
             delay = min(delay * 2, 2.0)
 
+    async def _cancel_until_finished(self, command_id: str, deadline: float) -> SandboxCommand:
+        command = await self._client.cancel_command(self.sandbox.id, command_id)
+        while not command.finished and asyncio.get_running_loop().time() < deadline:
+            command = await self._client.get_command(
+                self.sandbox.id, command_id, wait_seconds=min(5, self.poll_wait_seconds)
+            )
+        return command
+
     async def _settle_cancelled(self, command_id: str, dispatch: _Dispatch) -> bool:
         """Stop a command the caller abandoned; poison the runner unless the broker confirms.
 
@@ -539,19 +561,11 @@ class BrokeredSandboxRunner(Runner):
                 # Let the in-flight start finish so its outcome is known.
                 with contextlib.suppress(BaseException):
                     await asyncio.wait_for(asyncio.shield(attempt), _CANCEL_SETTLE_SECONDS)
-            if attempt.done() and not attempt.cancelled():
-                error = attempt.exception()
-                if isinstance(error, SandboxBrokerRefusedError) and not dispatch.outcome_unknown:
-                    return True  # Every start was definitively refused.
+            if dispatch.definitively_refused:
+                return True  # Every start was definitively refused.
             while loop.time() < deadline:
                 try:
-                    command = await self._client.cancel_command(self.sandbox.id, command_id)
-                    while not command.finished and loop.time() < deadline:
-                        command = await self._client.get_command(
-                            self.sandbox.id,
-                            command_id,
-                            wait_seconds=min(5, self.poll_wait_seconds),
-                        )
+                    command = await self._cancel_until_finished(command_id, deadline)
                     return command.finished
                 except SandboxNotFoundError:
                     # A start may still be in flight, so absence proves nothing.
@@ -568,6 +582,7 @@ class BrokeredSandboxRunner(Runner):
             settled = await asyncio.shield(task)
         except BaseException:
             settled = False
+        dispatch.cleanup_required = not settled
         if not settled:
             self._poison_exec("the broker could not confirm that an abandoned command stopped")
         return settled
@@ -606,6 +621,222 @@ class BrokeredSandboxRunner(Runner):
         except SandboxLeaseLostError:
             self._close_exec("the brokered sandbox's lease was lost")
             raise
+
+
+class _BrokeredInteractiveProcessCapability(RunnerInteractiveProcessCapability):
+    """Interactive processes in one brokered sandbox; the runner keeps its lifecycle."""
+
+    def __init__(self, runner: BrokeredSandboxRunner) -> None:
+        self._runner = runner
+
+    async def open_interactive_process(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+    ) -> RunnerInteractiveProcess:
+        runner = self._runner
+        runner._ensure_exec_open()
+        argv = _argv(copy_exec_command(command))
+        working_dir = runner.resolve_cwd(cwd)
+        environment = copy_runner_env(env, inherit_env=False)
+        validate_command_shape(argv, environment, None)
+        timeout_seconds = runner._timeout_seconds(validate_timeout(timeout_s))
+        relative_cwd = posixpath.relpath(working_dir, BROKERED_SANDBOX_ROOT)
+        runner._require_lease()
+        command_id = f"cayu-{secrets.token_hex(16)}"
+        dispatch = _Dispatch()
+        process = _BrokeredInteractiveProcess(runner, command_id, timeout_seconds, dispatch)
+        try:
+            await runner._start(
+                command_id,
+                argv,
+                dispatch,
+                cwd=None if relative_cwd == "." else relative_cwd,
+                env=environment,
+                timeout_seconds=timeout_seconds,
+                interactive=True,
+            )
+        except asyncio.CancelledError as cancellation:
+            if not await runner._settle_cancelled(command_id, dispatch):
+                self.retain_failed_start(cancellation, process)
+            raise
+        except (SandboxNotReadyError, SandboxNotFoundError) as error:
+            lost = runner._lease_lost(error)
+            if dispatch.cleanup_required:
+                self.retain_failed_start(lost, process)
+            raise lost from None
+        except BaseException as error:
+            # The start gave up without confirming that what it may have started stopped.
+            if dispatch.cleanup_required:
+                self.retain_failed_start(error, process)
+            raise
+        process.started = True
+        process._deadline = (
+            asyncio.get_running_loop().time() + timeout_seconds + _POLL_RECOVERY_GRACE_SECONDS
+        )
+        return process
+
+
+class _BrokeredInteractiveProcess(RunnerInteractiveProcess):
+    """One interactive command's stdio, addressed by byte offsets through the broker.
+
+    Every stdin write and stdout read names its offset, so a request whose answer was
+    lost is sent again without duplicating or losing bytes.
+    """
+
+    def __init__(
+        self, runner: BrokeredSandboxRunner, command_id: str, timeout_s: int, dispatch: _Dispatch
+    ) -> None:
+        self._runner = runner
+        self._dispatch = dispatch
+        self.command_id = command_id
+        self.started = False
+        # Broker calls keep retrying an outage for as long as the command may run.
+        self._deadline = (
+            asyncio.get_running_loop().time() + timeout_s + _POLL_RECOVERY_GRACE_SECONDS
+        )
+        self._stdin_uncertain = False
+        self._stdin_offset = 0
+        self._stdout_offset = 0
+        self._stdin_closed = False
+        self._stdout_eof = False
+        self._closed = False
+        self._write_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+
+    async def write(self, data: bytes) -> None:
+        async with self._write_lock:
+            if self._stdin_uncertain:
+                raise SandboxBrokerError("Previous stdin delivery is uncertain; close the process.")
+            if self._stdin_closed:
+                raise BrokenPipeError("Interactive process stdin is closed.")
+            data = bytes(data)
+            for start in range(0, len(data), MAX_STDIO_CHUNK_BYTES):
+                await self._write_chunk(data[start : start + MAX_STDIO_CHUNK_BYTES], eof=False)
+                if self._stdin_closed:
+                    raise BrokenPipeError("Interactive process stdin is closed.")
+
+    async def close_stdin(self) -> None:
+        async with self._write_lock:
+            if self._stdin_uncertain:
+                raise SandboxBrokerError("Previous stdin delivery is uncertain; close the process.")
+            if not self._stdin_closed:
+                await self._write_chunk(b"", eof=True)
+                self._stdin_closed = True
+
+    async def _write_chunk(self, chunk: bytes, *, eof: bool) -> None:
+        runner = self._runner
+        try:
+            written = await self._call(
+                lambda: runner.broker.write_command_stdin(
+                    runner.sandbox_id,
+                    self.command_id,
+                    offset=self._stdin_offset,
+                    data=chunk,
+                    eof=eof,
+                )
+            )
+        except SandboxNotReadyError:
+            # The sandbox is gone, and the process with it.
+            self._stdin_closed = True
+            return
+        except BaseException:
+            self._stdin_uncertain = True
+            raise
+        if written.closed:
+            self._stdin_closed = True
+            return
+        if written.offset != self._stdin_offset + len(chunk):
+            self._stdin_uncertain = True
+            raise SandboxBrokerError("The broker's stdin offset is inconsistent.")
+        self._stdin_offset = written.offset
+
+    async def read(self) -> bytes:
+        async with self._read_lock:
+            runner = self._runner
+            while not self._stdout_eof:
+                chunk = await self._call(
+                    lambda: runner.broker.read_command_stdout(
+                        runner.sandbox_id,
+                        self.command_id,
+                        offset=self._stdout_offset,
+                        wait_seconds=runner.poll_wait_seconds,
+                    )
+                )
+                self._stdout_offset += len(chunk.data)
+                self._stdout_eof = chunk.eof
+                if chunk.data:
+                    return chunk.data
+            return b""
+
+    async def wait(self) -> int:
+        runner = self._runner
+        while True:
+            command = await self._call(
+                lambda: runner.broker.get_command(
+                    runner.sandbox_id, self.command_id, wait_seconds=runner.poll_wait_seconds
+                )
+            )
+            if command.finished:
+                break
+        if command.status == "failed":
+            raise runner._lease_lost(None)
+        return command.exit_code if command.exit_code is not None else -1
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._stdin_closed = True
+            runner = self._runner
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _CANCEL_SETTLE_SECONDS
+            while True:
+                if not self.started and self._dispatch.definitively_refused:
+                    break
+                try:
+                    command = await runner._cancel_until_finished(self.command_id, deadline)
+                    # The broker reports an interactive command ended only once its whole
+                    # process tree has exited, or destroys the sandbox.
+                    if command.finished:
+                        break
+                except SandboxNotReadyError:
+                    break
+                except SandboxNotFoundError:
+                    # A start whose answer was lost may still register it.
+                    if self.started:
+                        break
+                except SandboxBrokerError:
+                    pass
+                if loop.time() >= deadline:
+                    raise SandboxBrokerError(
+                        "The broker could not confirm that the interactive process tree exited."
+                    )
+                await asyncio.sleep(1.0)
+            self._closed = True
+
+    async def _call(self, request: Callable[[], Awaitable[_T]]) -> _T:
+        """One broker request, retried through an outage while the command may still run.
+
+        The offsets make every retry idempotent.
+        """
+
+        runner = self._runner
+        loop = asyncio.get_running_loop()
+        while True:
+            runner._require_lease()
+            try:
+                return await request()
+            except SandboxNotFoundError as error:
+                raise runner._lease_lost(error) from None
+            except SandboxBrokerUnavailableError:
+                if loop.time() >= self._deadline:
+                    raise
+            await asyncio.sleep(1.0)
 
 
 class BrokeredSandboxWorkspace(RunnerWorkspace):
@@ -975,6 +1206,18 @@ class _Dispatch:
 
     attempt: asyncio.Future[SandboxCommand] | None = None
     outcome_unknown: bool = False
+    cleanup_required: bool = False
+
+    @property
+    def definitively_refused(self) -> bool:
+        attempt = self.attempt
+        return (
+            not self.outcome_unknown
+            and attempt is not None
+            and attempt.done()
+            and not attempt.cancelled()
+            and isinstance(attempt.exception(), SandboxBrokerRefusedError)
+        )
 
 
 def _kill_receipt(status: str) -> dict[str, Any]:

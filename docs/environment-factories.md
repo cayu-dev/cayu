@@ -554,7 +554,9 @@ Each part also works alone:
 - `SandboxBrokerClient` is the wire client;
 - `SandboxLeaseKeeper` renews one lease;
 - `BrokeredSandboxRunner` is a `Runner` over one sandbox and destroys it when
-  closed;
+  closed. Its `interactive_process_capability()` opens interactive commands
+  through the broker, each stopped with its whole process tree, so
+  `runner_agent_launch` can run Claude Code or Codex in the sandbox;
 - `BrokeredSandboxWorkspace` is a `RunnerWorkspace` whose bulk copies use the
   broker's archive routes.
 

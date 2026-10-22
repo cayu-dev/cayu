@@ -161,20 +161,23 @@ def test_stand_in_relays_arguments_stdio_and_exit_code(tmp_path: Path) -> None:
             assert home.is_dir()
 
         [(command, options)] = capability.opened
-        state = str(Path(command.argv[5]).parent)
-        assert command.argv[:7] == [
+        state = str(Path(command.argv[6]).parent)
+        assert command.argv[:8] == [
             "/bin/sh",
             "-c",
-            'mkdir -p -- "$HOME" "$1" && { [ -e "$2" ] || ln -s -- "$PWD" "$2"; } '
-            '&& shift 2 && exec "$@"',
+            'HOME=$1 && export HOME && mkdir -p -- "$HOME" "$2" '
+            '&& { [ -e "$3" ] || ln -s -- "$PWD" "$3"; } && shift 3 && exec "$@"',
             "cayu-agent",
+            str(home),
             state,
             f"{state}/workspace",
             sys.executable,
         ]
-        assert command.argv[7:] == ["-c", _SCRIPT, "--flag"]
+        assert command.argv[8:] == ["-c", _SCRIPT, "--flag"]
         assert options["cwd"] == str(tmp_path)
         assert options["timeout_s"] == 120
+        # HOME reaches the guest as an argument; a runner may own the environment's HOME.
+        assert options["env"] == {"MODE": "review", "CAYU_MODEL_PROXY_TOKEN": "tok"}
         assert capability.processes[0].closed == 1
 
     asyncio.run(scenario())

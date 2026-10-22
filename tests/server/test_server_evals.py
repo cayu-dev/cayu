@@ -2705,6 +2705,7 @@ def test_claim_monitor_uses_adaptive_lightweight_observations(
         original_heartbeat = store.heartbeat_run
         original_heartbeat_observation = store.heartbeat_run_observation
         monitor = None
+        two_heartbeats = asyncio.Event()
 
         async def counted_load_run(run_id):
             calls["full_load"] += 1
@@ -2720,10 +2721,13 @@ def test_claim_monitor_uses_adaptive_lightweight_observations(
 
         async def counted_heartbeat_observation(claim, *, extend_seconds=300):
             calls["observation_heartbeat"] += 1
-            return await original_heartbeat_observation(
+            record = await original_heartbeat_observation(
                 claim,
                 extend_seconds=extend_seconds,
             )
+            if calls["observation_heartbeat"] >= 2:
+                two_heartbeats.set()
+            return record
 
         monkeypatch.setattr(store, "load_run", counted_load_run)
         monkeypatch.setattr(store, "load_run_observation", counted_load_observation)
@@ -2758,7 +2762,7 @@ def test_claim_monitor_uses_adaptive_lightweight_observations(
                 )
             )
             monitor = asyncio.create_task(coordinator._monitor_claim(lease.claim))
-            await asyncio.sleep(0.8)
+            await asyncio.wait_for(two_heartbeats.wait(), timeout=5)
             assert calls["full_load"] == 0
             assert calls["full_heartbeat"] == 0
             assert 2 <= calls["observation_load"] <= 5

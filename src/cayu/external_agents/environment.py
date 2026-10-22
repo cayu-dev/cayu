@@ -182,11 +182,14 @@ async def docker_agent_launch(
 
 
 _GUEST_HOME = "/tmp/cayu-agent"
-# Create the guest home and make the launch's working-directory path ($2, which
-# also exists on the host for the SDK) name the guest working directory, then
-# replace the shell with the CLI. "$0" is only a label.
+# Set and create the guest home ($1), make the launch's working-directory path
+# ($3, which also exists on the host for the SDK) name the guest working
+# directory, then replace the shell with the CLI. "$0" is only a label. HOME
+# travels as an argument, not in the environment, because a runner may own the
+# environment's HOME (a brokered sandbox refuses it).
 _GUEST_ENTRY = (
-    'mkdir -p -- "$HOME" "$1" && { [ -e "$2" ] || ln -s -- "$PWD" "$2"; } && shift 2 && exec "$@"'
+    'HOME=$1 && export HOME && mkdir -p -- "$HOME" "$2" '
+    '&& { [ -e "$3" ] || ln -s -- "$PWD" "$3"; } && shift 3 && exec "$@"'
 )
 _MAX_SHIM_FRAME_BYTES = 4 * 1024 * 1024
 _SHIM_HELLO_TIMEOUT_SECONDS = 30.0
@@ -288,7 +291,8 @@ async def runner_agent_launch(
     """
     if not Path(cli).is_absolute():
         raise ValueError("The guest CLI path must be absolute.")
-    guest_environment = {"HOME": _GUEST_HOME, **_validated_guest_environment(environment)}
+    guest_environment = _validated_guest_environment(environment)
+    guest_home = guest_environment.pop("HOME", _GUEST_HOME)
     if type(max_processes) is not int or max_processes < 1:
         raise ValueError("max_processes must be a positive integer.")
     capability = runner.interactive_process_capability()
@@ -359,6 +363,7 @@ async def runner_agent_launch(
                     "-c",
                     _GUEST_ENTRY,
                     "cayu-agent",
+                    guest_home,
                     directory,
                     workdir,
                     cli,

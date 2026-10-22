@@ -9,6 +9,7 @@ directory in a command's output back to ``/workspace``, as the guest's mount wou
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import io
@@ -39,6 +40,10 @@ ARCHIVE_LIMIT = 8 * 1024 * 1024
 STORAGE_URL = "https://storage.example.test"
 
 
+# Names the broker owns in a command's environment; it refuses them.
+CLOUD_ENVIRONMENT_NAMES = frozenset({"PATH", "HOME", "HTTPS_PROXY", "https_proxy"})
+
+
 @dataclass
 class FakeCommand:
     body: dict[str, Any]
@@ -49,10 +54,20 @@ class FakeCommand:
     stderr: bytes = b""
     process: asyncio.subprocess.Process | None = None
     task: asyncio.Task | None = None
+    # An interactive command's streams: stdin written so far, and stdout from stdout_start.
+    stdin_offset: int = 0
+    stdin_closed: bool = False
+    stdout_start: int = 0
+    stdout_eof: bool = False
+    stdout_changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def interactive(self) -> bool:
+        return self.body.get("interactive") is True
 
     def view(self) -> dict[str, Any]:
-        limit = self.body["output_limit_bytes"]
-        stdout, stdout_truncated = _json_capped(self.stdout, limit)
+        limit = self.body.get("output_limit_bytes", 1024 * 1024)
+        stdout, stdout_truncated = _json_capped(b"" if self.interactive else self.stdout, limit)
         stderr, stderr_truncated = _json_capped(self.stderr, limit)
         return {
             "command_id": self.body["command_id"],
@@ -65,6 +80,7 @@ class FakeCommand:
             "started_at": "2026-10-18T12:00:00Z",
             "finished_at": None if self.status == "running" else "2026-10-18T12:00:01Z",
             "duration_ms": 1,
+            "interactive": self.interactive,
         }
 
 
@@ -138,6 +154,8 @@ class FakeBroker:
         # Staged objects by key, and every request the storage received.
         self.objects: dict[str, bytes] = {}
         self.storage_requests: list[httpx.Request] = []
+        # Stdio requests whose answer is lost after the broker applied them.
+        self.drop_stdio_responses = 0
 
     def client(self, **settings: Any) -> SandboxBrokerClient:
         return SandboxBrokerClient(
@@ -178,6 +196,9 @@ class FakeBroker:
         ):
             # The broker applied the start, but the answer was lost.
             self.drop_start_responses -= 1
+            raise httpx.ReadError("connection reset", request=request)
+        if self.drop_stdio_responses and request.url.path.endswith(("/stdin", "/stdout")):
+            self.drop_stdio_responses -= 1
             raise httpx.ReadError("connection reset", request=request)
         return response
 
@@ -246,6 +267,8 @@ class FakeBroker:
                 return httpx.Response(
                     404, json={"error": {"code": "x", "message": "", "detail": {}}}
                 )
+            if action[2:] == ["stdout"]:
+                return await self._read_stdout(command, request)
             wait = int(request.url.params.get("wait_seconds", "0"))
             if command.task is not None and wait:
                 with contextlib.suppress(TimeoutError):
@@ -269,6 +292,13 @@ class FakeBroker:
             if self.cancel_confirms:
                 await self._kill(command, "cancelled")
             return httpx.Response(202, json=command.view())
+        if action[:1] == ["commands"] and action[2:] == ["stdin"]:
+            command = sandbox.commands.get(action[1])
+            if command is None:
+                return httpx.Response(
+                    404, json={"error": {"code": "x", "message": "", "detail": {}}}
+                )
+            return await self._write_stdin(command, json.loads(request.content))
         if action == ["archive"] and request.method == "PUT":
             if len(request.content) > self.archive_limit:
                 return _error(413, "archive_too_large", {"bytes": len(request.content)})
@@ -322,6 +352,10 @@ class FakeBroker:
         sizes = [len(item.encode()) for item in body["argv"]]
         if max(sizes) > 131_071 or sum(sizes) > 256 * 1024:
             return _error(422, "sandbox_invalid")
+        if CLOUD_ENVIRONMENT_NAMES & set(body.get("env") or {}):
+            return _error(422, "sandbox_invalid")
+        if body.get("interactive") and ("stdin" in body or "output_limit_bytes" in body):
+            return _error(422, "sandbox_invalid")
         if self.busy_responses:
             self.busy_responses -= 1
             return _error(409, "sandbox_busy")
@@ -344,9 +378,82 @@ class FakeBroker:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        command.task = asyncio.create_task(self._wait(command))
+        command.task = asyncio.create_task(
+            self._relay(command) if command.interactive else self._wait(command)
+        )
         sandbox.commands[body["command_id"]] = command
         return httpx.Response(202, json=command.view())
+
+    async def _relay(self, command: FakeCommand) -> None:
+        """Hold an interactive command's stdout until it is read; it exits after its output."""
+
+        process = command.process
+        assert process is not None and process.stdout is not None
+        try:
+            async with asyncio.timeout(command.body["timeout_seconds"]):
+                while chunk := await process.stdout.read(65536):
+                    command.stdout += chunk
+                    command.stdout_changed.set()
+                exit_code = await process.wait()
+        except TimeoutError:
+            await self._kill(command, "timed_out")
+            return
+        command.stdout_eof = True
+        command.stdout_changed.set()
+        if command.status == "running":
+            command.status = "exited"
+            command.exit_code = exit_code
+
+    async def _write_stdin(self, command: FakeCommand, body: dict[str, Any]) -> httpx.Response:
+        if not command.interactive:
+            return _error(409, "command_not_interactive")
+        offset = body["offset"]
+        if offset > command.stdin_offset:
+            return _error(409, "stdin_offset_mismatch", {"offset": command.stdin_offset})
+        if command.stdin_closed or command.status != "running":
+            return httpx.Response(200, json={"offset": command.stdin_offset, "closed": True})
+        process = command.process
+        assert process is not None and process.stdin is not None
+        pending = base64.b64decode(body["data"])[command.stdin_offset - offset :]
+        try:
+            if pending:
+                process.stdin.write(pending)
+                await process.stdin.drain()
+            if body.get("eof"):
+                process.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            command.stdin_closed = True
+            return httpx.Response(200, json={"offset": command.stdin_offset, "closed": True})
+        command.stdin_offset += len(pending)
+        command.stdin_closed = bool(body.get("eof"))
+        return httpx.Response(200, json={"offset": command.stdin_offset, "closed": False})
+
+    async def _read_stdout(self, command: FakeCommand, request: httpx.Request) -> httpx.Response:
+        if not command.interactive:
+            return _error(409, "command_not_interactive")
+        offset = int(request.url.params["offset"])
+        wait = int(request.url.params.get("wait_seconds", "0"))
+        max_bytes = int(request.url.params.get("max_bytes", str(1024 * 1024)))
+        if command.status not in {"running", "exited"}:
+            # Cancelled, timed out or lost: nothing more will be delivered.
+            return httpx.Response(200, json={"offset": offset, "data": "", "eof": True})
+        end = command.stdout_start + len(command.stdout)
+        if not command.stdout_start <= offset <= end:
+            return _error(
+                409, "stdout_offset_mismatch", {"start": command.stdout_start, "end": end}
+            )
+        command.stdout = command.stdout[offset - command.stdout_start :]
+        command.stdout_start = offset
+        if not command.stdout and not command.stdout_eof and wait:
+            command.stdout_changed.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(command.stdout_changed.wait(), wait)
+        data = command.stdout[:max_bytes]
+        eof = command.stdout_eof and len(data) == len(command.stdout)
+        return httpx.Response(
+            200,
+            json={"offset": offset, "data": base64.b64encode(data).decode(), "eof": eof},
+        )
 
     async def _wait(self, command: FakeCommand) -> None:
         process = command.process

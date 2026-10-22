@@ -568,8 +568,11 @@ runs the CLI inside any runner whose `interactive_process_capability()` returns 
 `RunnerInteractiveProcessCapability`. `LambdaMicroVMRunner` provides one through
 its sidecar. Each CLI process runs in its own PID namespace in the MicroVM,
 so closing it confirms that every process the CLI started has exited, including
-processes that left its process group. Another sandbox plugs in by implementing
-the capability on its runner; the launcher and the adapters stay the same.
+processes that left its process group. `BrokeredSandboxRunner` provides one
+through Cayu Cloud's sandbox broker, so a Cloud Agent runs the CLI in a sandbox
+it gets from Cloud, with no cloud-provider credential. Another sandbox plugs in
+by implementing the capability on its runner; the launcher and the adapters stay
+the same.
 If a failed start cannot confirm process cleanup, the capability must call
 `retain_failed_start(error, process)` before re-raising the original error.
 Callers recover the handle with `failed_start_process(error)` and retry `close()`

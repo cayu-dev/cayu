@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -28,6 +29,8 @@ from cayu.environments import (
 )
 from cayu.environments._ephemeral_git import initialize_ephemeral_git_baseline
 from cayu.environments.admission import ExecutionRequirements, evaluate_execution_admission
+from cayu.external_agents import runner_agent_launch
+from cayu.external_agents.environment import scrub_external_environment
 from cayu.runners import ExecCommand
 from cayu.runners.base import runner_workspace_mutation_settlement
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
@@ -1007,6 +1010,178 @@ def test_waiting_for_a_busy_slot_never_dispatches_after_poisoning(
     asyncio.run(scenario())
 
 
+# Interactive processes ----------------------------------------------------
+
+_UPPER = (
+    "import sys\n"
+    "print('ready', flush=True)\n"
+    "for line in sys.stdin:\n"
+    "    sys.stdout.write(line.upper())\n"
+    "    sys.stdout.flush()\n"
+    "sys.exit(3)\n"
+)
+
+
+async def _read_all(process) -> bytes:
+    output = bytearray()
+    while chunk := await process.read():
+        output.extend(chunk)
+    return bytes(output)
+
+
+def test_an_interactive_process_streams_its_stdio_through_the_broker(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        (broker.sandboxes[runner.sandbox_id].root / "sub").mkdir()
+        capability = runner.interactive_process_capability()
+        assert capability is not None and capability.secret_values == ()
+        process = await capability.open_interactive_process(
+            ExecCommand.process(sys.executable, "-c", _UPPER),
+            cwd="sub",
+            env={"MODE": "review"},
+            timeout_s=60,
+        )
+        assert process.secret_values == ()
+        assert await process.read() == b"ready\n"
+        await process.write(b"one\n")
+        assert await process.read() == b"ONE\n"
+        # Lost answers are recovered by repeating the same offset.
+        broker.drop_stdio_responses = 2
+        await process.write(b"two\n")
+        await process.close_stdin()
+        assert await _read_all(process) == b"TWO\n"
+        assert await process.wait() == 3
+        with pytest.raises(BrokenPipeError):
+            await process.write(b"late\n")
+        await process.close()
+        await process.close()
+        [body] = [command.body for command in broker.running() + _commands(broker)]
+        assert body["interactive"] is True
+        assert body["cwd"] == "sub"
+        assert body["env"] == {"MODE": "review"}
+        assert body["timeout_seconds"] == 60
+        assert "stdin" not in body and "output_limit_bytes" not in body
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def _commands(broker: FakeBroker):
+    return [
+        command
+        for sandbox in broker.sandboxes.values()
+        for command in sandbox.commands.values()
+        if command.status != "running"
+    ]
+
+
+def test_closing_an_interactive_process_stops_its_whole_tree(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        capability = runner.interactive_process_capability()
+        assert capability is not None
+        process = await capability.open_interactive_process(
+            ExecCommand.bash("sleep 60 & echo $!; wait"), timeout_s=60
+        )
+        child = int((await process.read()).strip())
+        await process.close()
+        assert broker.running() == []
+        [command] = _commands(broker)
+        assert command.status == "cancelled"
+        await asyncio.sleep(0.1)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        # The broker drops output nobody read once the command is stopped.
+        assert await process.read() == b""
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_interactive_process_past_its_timeout_ends(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        capability = runner.interactive_process_capability()
+        assert capability is not None
+        process = await capability.open_interactive_process(
+            ExecCommand.process("sleep", "30"), timeout_s=1
+        )
+        assert await _read_all(process) == b""
+        assert await process.wait() == -1
+        await process.close()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_interactive_process_in_a_destroyed_sandbox_reports_the_lost_lease(
+    tmp_path: Path,
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        capability = runner.interactive_process_capability()
+        assert capability is not None
+        process = await capability.open_interactive_process(
+            ExecCommand.process("sleep", "30"), timeout_s=60
+        )
+        await broker.client().destroy(runner.sandbox_id)
+        assert await process.read() == b""
+        with pytest.raises(SandboxLeaseLostError):
+            await process.wait()
+        with pytest.raises(BrokenPipeError):
+            await process.write(b"x")
+        await process.close()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_runner_agent_launch_runs_the_cli_in_a_brokered_sandbox(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    home = tmp_path / "home"
+    script = "import json, os\nprint(json.dumps({'home': os.environ['HOME']}), flush=True)\n" + (
+        _UPPER.removeprefix("import sys\nprint('ready', flush=True)\n")
+    )
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        async with runner_agent_launch(
+            runner=runner,
+            cli=sys.executable,
+            environment={"HOME": str(home), "MODE": "review"},
+            timeout_s=60,
+        ) as launch:
+            launch.protect_secrets(lambda secret: None)
+            shim = await asyncio.create_subprocess_exec(
+                launch.executable,
+                "-c",
+                "import sys\n" + script,
+                env=scrub_external_environment(launch.environment),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(shim.communicate(b"a\nb\n"), 30)
+            assert shim.returncode == 3
+            first, rest = stdout.split(b"\n", 1)
+            assert json.loads(first) == {"home": str(home)}
+            assert rest == b"A\nB\n"
+        # The broker owns HOME in a command's environment; the launch sets it in the guest.
+        [command] = _commands(broker)
+        assert command.body["env"] == {"MODE": "review"}
+        assert (command.status, command.exit_code) == ("exited", 3)
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
 # Admission -----------------------------------------------------------------
 
 
@@ -1504,6 +1679,149 @@ def test_refused_copy_commit_only_fences_previously_uncertain_mutation(
                 await runner.exec(ExecCommand.process("echo", "unsafe"))
         else:
             assert (await runner.exec(ExecCommand.process("echo", "safe"))).stdout == "safe\n"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_stdin_delivery_fences_later_payloads(tmp_path: Path):
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        process = await runner.interactive_process_capability().open_interactive_process(
+            ExecCommand.process("cat"), timeout_s=60
+        )
+        broker.drop_stdio_responses = 10
+        writing = asyncio.create_task(process.write(b"one\n"))
+        while broker.drop_stdio_responses == 10:
+            await asyncio.sleep(0.01)
+        writing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writing
+        broker.drop_stdio_responses = 0
+        with pytest.raises(runner_module.SandboxBrokerError, match="uncertain"):
+            await process.write(b"two\n")
+        with pytest.raises(runner_module.SandboxBrokerError, match="uncertain"):
+            await process.close_stdin()
+        await process.close()
+        assert not broker.running()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_start_lease_loss_retains_cleanup_handle(tmp_path: Path, monkeypatch):
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        capability = runner.interactive_process_capability()
+
+        async def unconfirmed_start(*args, **kwargs):
+            runner._exec_poisoned = True
+            args[2].cleanup_required = True
+            raise SandboxNotFoundError("lost")
+
+        monkeypatch.setattr(runner, "_start", unconfirmed_start)
+        with pytest.raises(SandboxLeaseLostError) as caught:
+            await capability.open_interactive_process(ExecCommand.process("cat"), timeout_s=60)
+        assert capability.failed_start_process(caught.value) is not None
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_busy_interactive_start_does_not_claim_another_commands_cleanup(tmp_path: Path):
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        capability = runner.interactive_process_capability()
+        broker.busy_responses = 1000
+        opening = asyncio.create_task(
+            capability.open_interactive_process(ExecCommand.process("cat"), timeout_s=60)
+        )
+        while broker.busy_responses == 1000:
+            await asyncio.sleep(0.01)
+        runner._poison_exec("another command did not settle")
+        with pytest.raises(RuntimeError) as caught:
+            await opening
+        assert capability.failed_start_process(caught.value) is None
+        assert not broker.running()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_interactive_recovery_deadline_starts_after_dispatch(tmp_path: Path, monkeypatch):
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        original = runner._start
+        returned_at = []
+
+        async def delayed(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            result = await original(*args, **kwargs)
+            returned_at.append(asyncio.get_running_loop().time())
+            return result
+
+        monkeypatch.setattr(runner, "_start", delayed)
+        process = await runner.interactive_process_capability().open_interactive_process(
+            ExecCommand.process("cat"), timeout_s=60
+        )
+        assert process._deadline >= returned_at[0] + 60 + runner_module._POLL_RECOVERY_GRACE_SECONDS
+        await process.close()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("earlier_uncertainty", [False, True])
+def test_failed_start_cleanup_observes_late_refusal(tmp_path, monkeypatch, earlier_uncertainty):
+    broker = FakeBroker(tmp_path / "cloud")
+    monkeypatch.setattr(runner_module, "_CANCEL_SETTLE_SECONDS", 0)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        pending = asyncio.Event()
+        release = asyncio.Event()
+        attempts = 0
+
+        async def late_refusal(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if earlier_uncertainty and attempts == 1:
+                raise SandboxBrokerUnavailableError("response lost", outcome_unknown=True)
+            pending.set()
+            await release.wait()
+            raise client_module.SandboxBusyError("busy")
+
+        monkeypatch.setattr(runner.broker, "start_command", late_refusal)
+        capability = runner.interactive_process_capability()
+        opening = asyncio.create_task(
+            capability.open_interactive_process(ExecCommand.process("cat"), timeout_s=60)
+        )
+        await pending.wait()
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await opening
+        process = capability.failed_start_process(caught.value)
+        assert process is not None
+        # An unresolved attempt's 404 cannot prove cleanup.
+        with pytest.raises(client_module.SandboxBrokerError):
+            await process.close()
+        release.set()
+        await asyncio.sleep(0)
+        if earlier_uncertainty:
+            # A refused replay does not settle an earlier lost response.
+            with pytest.raises(client_module.SandboxBrokerError):
+                await process.close()
+        else:
+            await process.close()
+            await process.close()
         await runner.close()
 
     asyncio.run(scenario())

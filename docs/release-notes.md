@@ -137,6 +137,16 @@ unchanged.
   ephemeral local Git repository in the sandbox, as the Docker coding factory
   does, so coding agents see their changes as a diff. Pass `git_baseline=False`
   for an image without `git`.
+- `BrokeredSandboxRunner` implements `RunnerInteractiveProcessCapability` over
+  Cayu Cloud's interactive sandbox commands, so `runner_agent_launch` runs
+  Claude Code or Codex in a sandbox brokered by Cayu Cloud. Stdin and stdout
+  cross the broker as offset-addressed requests that are safe to retry, and
+  closing a process returns once the broker confirms its whole process tree
+  has exited. `SandboxBrokerClient` gains `write_command_stdin`,
+  `read_command_stdout` and `start_command(interactive=True)`.
+- `runner_agent_launch` sets the guest's `HOME` in the command it starts
+  instead of in the process environment, because a runner may own that
+  variable; a brokered sandbox refuses it. The guest sees the same `HOME`.
 - Fix: a closed or poisoned runner was admitted at the next pre-exposure check
   while its evidence was still fresh, and then failed every tool call; once the
   evidence expired the session failed as `stale_evidence`. The check now reads

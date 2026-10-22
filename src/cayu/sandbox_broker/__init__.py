@@ -4,7 +4,7 @@ The parts compose but each works alone:
 
 - ``SandboxBrokerClient`` speaks the ``cayu.cloud.sandbox`` v1 wire contract.
 - ``SandboxLeaseKeeper`` renews one sandbox's lease.
-- ``BrokeredSandboxRunner`` is a ``Runner`` over one sandbox.
+- ``BrokeredSandboxRunner`` is a ``Runner`` over one sandbox, with interactive processes.
 - ``BrokeredSandboxWorkspace`` is a ``RunnerWorkspace`` whose bulk copies use the broker's
   archives, and its staged copies for trees and files larger than one archive.
 - ``BrokeredSandboxCodingEnvironmentFactory`` assembles them into per-session coding sandboxes.
@@ -40,6 +40,8 @@ from cayu.sandbox_broker.client import (
     SandboxRecord,
     SandboxSignedTransfer,
     SandboxStagedCopies,
+    SandboxStdinWrite,
+    SandboxStdoutChunk,
 )
 from cayu.sandbox_broker.coding import (
     BROKERED_SANDBOX_EGRESS_ENV,
@@ -91,5 +93,7 @@ __all__ = [
     "SandboxRecord",
     "SandboxSignedTransfer",
     "SandboxStagedCopies",
+    "SandboxStdinWrite",
+    "SandboxStdoutChunk",
     "sandbox_capability_claims",
 ]

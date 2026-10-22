@@ -1,7 +1,7 @@
 """HTTPS client for Cayu Cloud's sandbox broker contract (``cayu.cloud.sandbox`` v1).
 
 The client knows only the wire contract: it creates a sandbox from a catalog
-image, polls it, renews its lease, starts, polls and cancels commands, copies
+image, polls it, renews its lease, starts, polls and cancels commands (including interactive stdio), copies
 archives in and out, moves larger trees as staged copies, and destroys it. It
 holds a broker credential (the Agent's sandbox token or an Organization API
 key), never a cloud-provider credential, endpoint or image identity, and it
@@ -12,6 +12,7 @@ archive and the headers the broker signed, never the broker credential.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -41,6 +42,7 @@ __all__ = [
     "MAX_COMMAND_OUTPUT_BYTES",
     "MAX_COMMAND_STDIN_BYTES",
     "MAX_LEASE_SECONDS",
+    "MAX_STDIO_CHUNK_BYTES",
     "MAX_WAIT_SECONDS",
     "MIN_COMMAND_OUTPUT_BYTES",
     "MIN_LEASE_SECONDS",
@@ -67,6 +69,8 @@ __all__ = [
     "SandboxRecord",
     "SandboxSignedTransfer",
     "SandboxStagedCopies",
+    "SandboxStdinWrite",
+    "SandboxStdoutChunk",
 ]
 
 #: Base URL of the Cloud API, for example ``https://cloud.cayu.dev``. Cloud injects it.
@@ -94,6 +98,8 @@ MAX_COMMAND_ENV_BYTES = 64 * 1024
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_ARCHIVE_PATHS = 1_000
 MAX_ARCHIVE_EXCLUDES = 50
+#: The most one interactive stdin write carries, or one stdout read returns.
+MAX_STDIO_CHUNK_BYTES = 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 #: Worst-case growth of one output byte in the response JSON: a control byte
 #: becomes a six-byte ``\u00XX`` escape. The broker measures each stream's
@@ -126,6 +132,9 @@ _KNOWN_CODES = frozenset(
         "copy_id_conflict",
         "copy_too_large",
         "copies_unavailable",
+        "command_not_interactive",
+        "stdin_offset_mismatch",
+        "stdout_offset_mismatch",
     }
 )
 
@@ -306,6 +315,7 @@ class SandboxCommand(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     duration_ms: int | None = None
+    interactive: bool = False
 
     @property
     def finished(self) -> bool:
@@ -356,6 +366,24 @@ class SandboxCopy(BaseModel):
     @property
     def finished(self) -> bool:
         return self.status in {"done", "failed", "expired"}
+
+
+@dataclass(frozen=True)
+class SandboxStdinWrite:
+    """Where an interactive command's stdin ends after a write; ``closed`` when the command
+    takes no more input and nothing was added."""
+
+    offset: int
+    closed: bool
+
+
+@dataclass(frozen=True)
+class SandboxStdoutChunk:
+    """An interactive command's stdout from ``offset``; ``eof`` once ``data`` is the rest."""
+
+    offset: int
+    data: bytes = field(repr=False)
+    eof: bool
 
 
 @dataclass(frozen=True)
@@ -691,12 +719,18 @@ class SandboxBrokerClient:
         timeout_seconds: int = 300,
         stdin: str | None = None,
         output_limit_bytes: int = 1024 * 1024,
+        interactive: bool = False,
         retry: bool = True,
     ) -> SandboxCommand:
         """Start a command, or return the existing one started under the same id and body.
 
         With ``retry=False`` exactly one HTTP request is sent, so a caller that
         tracks which dispatches may have reached the broker sees every one.
+
+        An ``interactive`` command keeps stdin open and streams stdout while it
+        runs (``write_command_stdin``, ``read_command_stdout``); it takes no
+        one-shot ``stdin``, and ``output_limit_bytes`` doesn't apply to it.
+        Cancelling it stops its whole process tree.
         """
 
         if type(command_id) is not str or _COMMAND_ID.fullmatch(command_id) is None:
@@ -712,14 +746,20 @@ class SandboxBrokerClient:
                 f"Sandbox command output_limit_bytes must be from {MIN_COMMAND_OUTPUT_BYTES} to "
                 f"{MAX_COMMAND_OUTPUT_BYTES}."
             )
+        if type(interactive) is not bool:
+            raise TypeError("Sandbox command interactive must be a bool.")
+        if interactive and stdin is not None:
+            raise ValueError("An interactive sandbox command takes its input through its stdin.")
         payload: dict[str, Any] = {
             "command_id": command_id,
             "argv": list(argv),
             "env": dict(env or {}),
             "timeout_seconds": timeout_seconds,
-            "stdin": stdin,
-            "output_limit_bytes": output_limit_bytes,
         }
+        if interactive:
+            payload["interactive"] = True
+        else:
+            payload.update(stdin=stdin, output_limit_bytes=output_limit_bytes)
         relative_cwd = relative_workspace_path(cwd)
         if relative_cwd is not None:
             payload["cwd"] = relative_cwd
@@ -744,6 +784,89 @@ class SandboxBrokerClient:
     async def cancel_command(self, sandbox_id: str, command_id: str) -> SandboxCommand:
         body, _ = await self._json("POST", self._command_url(sandbox_id, command_id) + "/cancel")
         return self._model(SandboxCommand, body)
+
+    async def write_command_stdin(
+        self,
+        sandbox_id: str,
+        command_id: str,
+        *,
+        offset: int,
+        data: bytes = b"",
+        eof: bool = False,
+    ) -> SandboxStdinWrite:
+        """Add ``data`` to an interactive command's stdin at byte ``offset``.
+
+        Replaying a write adds nothing, so a lost answer is recovered by sending
+        it again. ``eof`` ends the input.
+        """
+
+        if type(offset) is not int or offset < 0:
+            raise ValueError("Sandbox stdin offset must be a non-negative integer.")
+        if type(data) is not bytes or len(data) > MAX_STDIO_CHUNK_BYTES:
+            raise ValueError(f"Sandbox stdin writes carry bytes, at most {MAX_STDIO_CHUNK_BYTES}.")
+        if type(eof) is not bool:
+            raise TypeError("Sandbox stdin eof must be a bool.")
+        body, _ = await self._json(
+            "POST",
+            self._command_url(sandbox_id, command_id) + "/stdin",
+            payload={"offset": offset, "data": base64.b64encode(data).decode("ascii"), "eof": eof},
+        )
+        written = body.get("offset") if isinstance(body, Mapping) else None
+        closed = body.get("closed") if isinstance(body, Mapping) else None
+        if type(written) is not int or type(closed) is not bool or written < 0:
+            raise SandboxBrokerError("Sandbox broker stdin answer has an unexpected shape.")
+        return SandboxStdinWrite(offset=written, closed=closed)
+
+    async def read_command_stdout(
+        self,
+        sandbox_id: str,
+        command_id: str,
+        *,
+        offset: int,
+        wait_seconds: int = 0,
+        max_bytes: int = MAX_STDIO_CHUNK_BYTES,
+    ) -> SandboxStdoutChunk:
+        """Read an interactive command's stdout from byte ``offset``.
+
+        Waits up to ``wait_seconds`` for bytes there. Reading at an offset
+        acknowledges every earlier byte; read the same offset again after a lost
+        answer.
+        """
+
+        if type(offset) is not int or offset < 0:
+            raise ValueError("Sandbox stdout offset must be a non-negative integer.")
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= MAX_WAIT_SECONDS:
+            raise ValueError(f"wait_seconds must be from 0 to {MAX_WAIT_SECONDS}.")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_STDIO_CHUNK_BYTES:
+            raise ValueError(f"max_bytes must be from 1 to {MAX_STDIO_CHUNK_BYTES}.")
+        body, _ = await self._json(
+            "GET",
+            self._command_url(sandbox_id, command_id) + "/stdout",
+            params={
+                "offset": str(offset),
+                "wait_seconds": str(wait_seconds),
+                "max_bytes": str(max_bytes),
+            },
+            timeout_s=self.settings.request_timeout_s + wait_seconds,
+        )
+        encoded = body.get("data") if isinstance(body, Mapping) else None
+        eof = body.get("eof") if isinstance(body, Mapping) else None
+        if (
+            not isinstance(body, Mapping)
+            or body.get("offset") != offset
+            or type(encoded) is not str
+            or type(eof) is not bool
+        ):
+            raise SandboxBrokerError("Sandbox broker stdout answer has an unexpected shape.")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except ValueError:
+            raise SandboxBrokerError(
+                "Sandbox broker stdout answer has an unexpected shape."
+            ) from None
+        if len(data) > max_bytes:
+            raise SandboxBrokerError("Sandbox broker stdout answer exceeds max_bytes.")
+        return SandboxStdoutChunk(offset=offset, data=data, eof=eof)
 
     # Archives -------------------------------------------------------------
 
