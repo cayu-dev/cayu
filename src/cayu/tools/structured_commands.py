@@ -74,6 +74,9 @@ from cayu.workspaces.base import (
 RUN_COMMAND_RESULT_SCHEMA = "cayu.run_command_result.v1"
 STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA = "cayu.structured_command_tool_policy.v1"
 _OUTPUT_TRUNCATION_MARKER = "\n[command output preview truncated]"
+# Room a journaled result leaves for the fields terminal recovery adds
+# (``recovered``, ``replayed`` and ``dispatch``, about 64 bytes).
+_RECOVERY_EVIDENCE_HEADROOM_BYTES = 256
 _COMMAND_MANIFEST_MAX_PATHS = 10_000
 _COMMAND_MANIFEST_MAX_FILE_BYTES = 8 * 1024 * 1024
 _COMMAND_MANIFEST_MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -844,6 +847,9 @@ class RunCommandTool(Tool):
                 timing=process_timing,
                 before_manifest=before_manifest,
                 after_manifest=after_manifest,
+                durable_evidence=(
+                    None if journal is None else _durable_result_evidence(journal.record)
+                ),
             )
             return await self._finish_durable_result(journal, result)
         except TypeError as exc:
@@ -865,23 +871,8 @@ class RunCommandTool(Tool):
         if journal is None:
             return result
         structured = {} if result.structured is None else dict(result.structured)
-        structured.setdefault("argv_sha256", journal.record["argv_sha256"])
-        structured.setdefault(
-            "working_directory_sha256",
-            journal.record["working_directory_sha256"],
-        )
-        structured.setdefault("environment_identity", journal.record["environment_identity"])
-        structured.setdefault(
-            "mutation_scope_identity",
-            journal.record["mutation_scope_identity"],
-        )
-        if journal.record.get("runner_operation") is not None:
-            structured.setdefault("runner_operation", journal.record["runner_operation"])
-        if journal.record.get("runner_terminal_identity") is not None:
-            structured.setdefault(
-                "runner_terminal_identity",
-                journal.record["runner_terminal_identity"],
-            )
+        for field, value in _durable_result_evidence(journal.record).items():
+            structured.setdefault(field, value)
         result = result.model_copy(update={"structured": structured})
         authority = next(
             (
@@ -896,12 +887,15 @@ class RunCommandTool(Tool):
             and type(structured.get("stdout")) is str
             and type(structured.get("stderr")) is str
         ):
+            # A projected result already fits here: ``_project_result`` sized
+            # it with these fields and the recovery headroom, and stored its
+            # output artifact if that cut it. This fits the other results.
             result = _bound_command_result_publication(
                 result,
                 authority=authority,
                 stdout=structured["stdout"],
                 stderr=structured["stderr"],
-                maximum=self._result_publication_ceiling,
+                maximum=self._result_publication_ceiling - _RECOVERY_EVIDENCE_HEADROOM_BYTES,
             )
         try:
             await journal.terminal(result)
@@ -1038,7 +1032,16 @@ class RunCommandTool(Tool):
         timing: Mapping[str, object],
         before_manifest: _WorkspaceCommandManifest,
         after_manifest: _WorkspaceCommandManifest | None,
+        durable_evidence: Mapping[str, object] | None = None,
     ) -> ToolResult:
+        """Project a runner result, fitted to the size it will be published at.
+
+        A journaled result passes the ``durable_evidence`` it is journaled with.
+        It is sized with those fields and with room for the fields recovery
+        adds, so the output-artifact decision here sees the result's final size
+        and nothing later has to cut its output.
+        """
+
         structured = raw_result.structured
         error = None if structured is None else structured.get("error")
         if error in {"command_denied", "command_approval_required"}:
@@ -1208,6 +1211,11 @@ class RunCommandTool(Tool):
             **self._profile.evidence(),
             "artifacts": artifacts,
         }
+        publication_ceiling = self._result_publication_ceiling
+        if durable_evidence is not None:
+            for field, value in durable_evidence.items():
+                projected.setdefault(field, value)
+            publication_ceiling -= _RECOVERY_EVIDENCE_HEADROOM_BYTES
         if not mutation_observation_complete:
             projected["error"] = "workspace_observation_incomplete"
         elif not mutation_scope_admitted:
@@ -1240,7 +1248,6 @@ class RunCommandTool(Tool):
                 or not cleanup_complete
             ),
         )
-        publication_ceiling = self._result_publication_ceiling
         if _tool_result_publication_bytes(result) > publication_ceiling and not store_output:
             artifact_status, output_artifact = await _store_output_artifact(
                 ctx,
@@ -1445,6 +1452,24 @@ async def _capture_workspace_command_manifest(
             raise _WorkspaceManifestError
         entries.append((path, result.sha256, result.total_bytes, result.git_mode))
     return _WorkspaceCommandManifest(entries=tuple(entries), total_bytes=total_bytes)
+
+
+def _durable_result_evidence(record: Mapping[str, Any]) -> dict[str, object]:
+    """The journal identities a journaled command result carries."""
+
+    evidence: dict[str, object] = {
+        field: record[field]
+        for field in (
+            "argv_sha256",
+            "working_directory_sha256",
+            "environment_identity",
+            "mutation_scope_identity",
+        )
+    }
+    for field in ("runner_operation", "runner_terminal_identity"):
+        if record.get(field) is not None:
+            evidence[field] = record[field]
+    return evidence
 
 
 def _copy_command_journal_record(value: object) -> dict[str, Any]:
@@ -2083,7 +2108,18 @@ async def _recover_runner_terminal_command_result(
             "execution_profile_fingerprint": execution_profile_fingerprint,
         },
     )
+    recovery_evidence = {
+        "runner_operation": record.get("runner_operation"),
+        "runner_terminal_identity": terminal_identity,
+        "recovered": True,
+        "replayed": False,
+        "dispatch": "runner_terminal_evidence",
+        "runner_observation_state": "terminal",
+        "reconstruction_required": False,
+    }
     try:
+        # Sized with the recovery fields, so its output-artifact decision sees
+        # the size the result is published and journaled at.
         result = await tool._project_result(
             context,
             authority=authority,
@@ -2096,21 +2132,12 @@ async def _recover_runner_terminal_command_result(
             timing=recovered_timing,
             before_manifest=before_manifest,
             after_manifest=after_manifest,
+            durable_evidence=recovery_evidence,
         )
     except (TypeError, ValueError):
         return _command_recovery_refusal("durable_runner_terminal_result_invalid")
     structured = {} if result.structured is None else dict(result.structured)
-    structured.update(
-        {
-            "runner_operation": record.get("runner_operation"),
-            "runner_terminal_identity": terminal_identity,
-            "recovered": True,
-            "replayed": False,
-            "dispatch": "runner_terminal_evidence",
-            "runner_observation_state": "terminal",
-            "reconstruction_required": False,
-        }
-    )
+    structured.update(recovery_evidence)
     result = result.model_copy(update={"structured": structured})
     raw_structured = runner_result.structured
     if raw_structured is None:
@@ -2177,6 +2204,9 @@ def _recover_terminal_command_result(
         }
     )
     recovered = result.model_copy(update={"structured": structured})
+    # The journaled result was fitted with room for these recovery fields, so
+    # it fits unchanged unless the bound has since been lowered. Then its
+    # output is omitted, never cut: see ``_bound_command_result_publication``.
     if type(structured.get("stdout")) is str and type(structured.get("stderr")) is str:
         recovered = _bound_command_result_publication(
             recovered,
@@ -2184,7 +2214,10 @@ def _recover_terminal_command_result(
             stdout=structured["stdout"],
             stderr=structured["stderr"],
             maximum=maximum,
+            cut_output=False,
         )
+    elif _tool_result_publication_bytes(recovered) > maximum:
+        recovered = _minimal_publication_ceiling_result(authority, maximum=maximum)
     return _command_terminal_recovery_evidence(recovered)
 
 
@@ -2424,8 +2457,16 @@ def _bound_command_result_publication(
     stdout: str,
     stderr: str,
     maximum: int,
+    cut_output: bool = True,
 ) -> ToolResult:
-    """Fit the complete duplicated ToolResult beneath the profile publication ceiling."""
+    """Fit the complete duplicated ToolResult beneath the profile publication ceiling.
+
+    With ``cut_output=False`` the output previews are never shortened: a result
+    that does not fit as it is omits both previews instead. Recovery uses it,
+    because it projects journaled text with no invocation registry to redact
+    with first, and a new cut could leave part of a secret registered since the
+    command ran that the runtime's later redaction no longer matches.
+    """
 
     if _tool_result_publication_bytes(result) <= maximum:
         return result
@@ -2467,17 +2508,21 @@ def _bound_command_result_publication(
                 "result_publication_ceiling_applied": True,
             }
         )
+        content = _model_content(
+            selector=authority.selector,
+            status=str(projected["status"]),
+            exit_code=int(projected["exit_code"]),
+            stdout=stdout_preview,
+            stdout_encoding=_command_output_encoding(projected, "stdout"),
+            stderr=stderr_preview,
+            stderr_encoding=_command_output_encoding(projected, "stderr"),
+            truncated=(projected["stdout_truncated"] or projected["stderr_truncated"]),
+        )
+        if not cut_output:
+            projected["recovered_output_omitted"] = True
+            content += "\n\nThe recovered output is larger than this tool returns and was omitted."
         return ToolResult(
-            content=_model_content(
-                selector=authority.selector,
-                status=str(projected["status"]),
-                exit_code=int(projected["exit_code"]),
-                stdout=stdout_preview,
-                stdout_encoding=_command_output_encoding(projected, "stdout"),
-                stderr=stderr_preview,
-                stderr_encoding=_command_output_encoding(projected, "stderr"),
-                truncated=(projected["stdout_truncated"] or projected["stderr_truncated"]),
-            ),
+            content=content,
             structured=projected,
             artifacts=list(result.artifacts),
             is_error=result.is_error,
@@ -2485,9 +2530,12 @@ def _bound_command_result_publication(
 
     lower = 0
     upper = authority.max_model_output_bytes
+    # A zero-byte preview omits each stream rather than cutting it.
     bounded = candidate(0)
     if _tool_result_publication_bytes(bounded) > maximum:
         return _minimal_publication_ceiling_result(authority, maximum=maximum)
+    if not cut_output:
+        return bounded
     while lower < upper:
         midpoint = (lower + upper + 1) // 2
         attempted = candidate(midpoint)

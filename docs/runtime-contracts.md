@@ -3348,7 +3348,9 @@ lease. The lease remains owned until every durable staged terminal has been
 published. This whole-round admission prevents sibling results from deadlocking
 after their effects have executed.
 
-Every built-in tool declares a bound and keeps its results inside it; see
+Every built-in tool declares a bound and keeps its results inside it, except
+`subagent` with a foreground child, which declares none unless the application
+sets one, so its rounds take the exclusive lease; see
 [Built-in terminal payload bounds](#built-in-terminal-payload-bounds).
 
 Related rounds use the same capacity family, identified from their durable
@@ -4440,7 +4442,9 @@ Every read walks the ledger under these bounds before anything else. A ledger
 whose exact JSON value has already passed full validation in this process
 reuses that result instead of validating every receipt again; readers always
 receive private copies. A ledger that differs in any value or number type is
-validated in full.
+validated in full. The process keeps only the ledger it validated most recently
+for each session, and at most 8 MiB of ledger JSON across sessions, so earlier
+versions of a growing ledger are not retained.
 Receipt validation binds each result to the independently loaded session's
 immutable identity and baseline profile authority instead of trusting a
 self-consistent embedded snapshot. Pre-v5 active-profile state cannot substitute for
@@ -12623,10 +12627,13 @@ Default built-in tool caps are intentionally large enough for normal coding work
 
 ### Built-in terminal payload bounds
 
-Every built-in tool declares `ToolSpec.max_terminal_payload_bytes`, so a
-deferred round of built-ins shares terminal-publication capacity instead of
-taking the exclusive lease an undeclared tool takes (see
-[Tool terminal publication capacity](#tool-terminal-publication-capacity)). A
+Every built-in tool except `subagent` with a foreground child declares
+`ToolSpec.max_terminal_payload_bytes`, so a deferred round of those built-ins
+shares terminal-publication capacity instead of taking the exclusive lease an
+undeclared tool takes (see
+[Tool terminal publication capacity](#tool-terminal-publication-capacity)).
+A round that includes `subagent` with a foreground child still takes the
+exclusive lease unless the application sets its bound (see below). A
 bound must be between 64 KiB and 1,984 KiB: the durable event limit of 2 MiB
 less the 64 KiB runtime envelope that travels with every terminal result.
 
@@ -12669,16 +12676,25 @@ stdout and stderr to a common size and sets `stdout_truncated` or
 `stderr_truncated`. Text keeps its start and end around the marker. A stream
 carried as a JSON string literal keeps its start and becomes
 `json-string-preview`. `run_command`, and `run_check` with a toolchain profile,
-tighten their profile's publication ceiling to the bound, so live and recovered
-results are fitted the same way. `run_check` shortens its output previews, as
+tighten their profile's publication ceiling to the bound. A journaled result
+is sized with its journal identities and with room for the fields recovery
+adds before the tool decides whether to store its full output, so a preview
+shortened to fit always has its output artifact, and under the same bound a
+recovered result returns the live output unchanged. Recovery has no invocation registry to
+redact with, so it never cuts output again: if the application has since
+lowered the bound, a recovered result that no longer fits omits both output
+previews (`recovered_output_omitted=true`) and keeps its other evidence.
+`run_check` shortens its output previews, as
 `max_model_output_bytes` would, before it journals a result, so the encoding
 and truncation fields stay accurate, the full output stays in its output
 artifact, and a recovered result fits like the live one. `apply_patch` shrinks
 its diff preview and fits its evidence to the bound before its journal seals,
 adding `terminal_payload_bytes` to `diff_truncation_reasons`; when even its
 compact manifest does not fit, it lists the leading operations
-(`manifest_truncated`). A recovered patch lists the leading operations the
-bound holds, with `operation_count` and `operations_truncated`. `list_files`, `git_changes` and `search_text` size
+(`manifest_truncated`, with `terminal_payload_bytes` in
+`manifest_truncation_reasons`). A recovered patch that does not fit lists its
+leading operations the same way, beside `operation_count`; if not even an empty
+listing fits, it keeps only its short outcome fields. `list_files`, `git_changes` and `search_text` size
 their pages to the bound before computing their continuation, so following
 `next_offset` never skips entries; `list_files` measures paths as published,
 after redaction. `subagent` fits a foreground child's result

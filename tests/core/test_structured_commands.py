@@ -12,6 +12,7 @@ from tests._session_provenance import fixture_session_invocation
 
 import cayu.tools.structured_commands as structured_commands
 from cayu.agents import AgentSpec
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
@@ -33,6 +34,7 @@ from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     ToolContext,
     ToolExecutableRequirement,
+    ToolResult,
     _bind_runtime_tool_invocation_authority,
 )
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyRequest
@@ -1171,14 +1173,14 @@ def test_structured_command_durable_recovery_reconstructs_terminal_result(
         encoding = recovered.structured[f"{stream}_encoding"]
         value = recovered.structured[stream]
         assert encoding == completed.structured[f"{stream}_encoding"]
+        # The journaled result left room for the recovery metadata, so the
+        # same ceiling returns the live preview unchanged.
+        assert value == completed.structured[stream]
         if encoding == "json-string-preview":
             assert recovered.structured[f"{stream}_projection_truncated"]
             assert "not a complete JSON literal" in recovered.content
-            # Recovery metadata can require a shorter preview under the same ceiling.
-            assert completed.structured[stream].startswith(value.split("\n", 1)[0])
             assert len(recovered.model_dump_json().encode()) <= profile.result_publication_max_bytes
         else:
-            assert value == completed.structured[stream]
             assert (json.loads(value) if encoding == "json-string" else value) == output
     assert recovered.structured["status"] == completed.structured["status"]
     assert recovered.structured["output_sha256"] == completed.structured["output_sha256"]
@@ -1186,6 +1188,257 @@ def test_structured_command_durable_recovery_reconstructs_terminal_result(
     assert recovered.structured["replayed"] is False
     assert recovered.structured["dispatch"] == "terminal_evidence"
     assert len(runner.commands) == 1
+
+
+def test_structured_command_recovery_omits_output_rather_than_cutting_it(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
+    authority = (
+        _profile()
+        .structured_command_authorities[0]
+        .model_copy(update={"max_output_bytes": 200_000, "max_model_output_bytes": 50_000})
+    )
+    profile = _profile().model_copy(
+        update={"command_authorities": (authority,), "result_publication_max_bytes": 200_000}
+    )
+    # A secret the registry learns only after the command was journaled sits
+    # where a cut to the lowered bound would land.
+    output = "a" * 30_000 + "late-registered-secret" + "b" * 10_000
+    runner = _AdmittedRunner(profile, result=ExecResult(stdout=output, stderr=output))
+    arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        assert records.get(storage_key) == expected
+        records[storage_key] = desired
+        return desired
+
+    ctx = ToolContext(
+        session_id="omit-session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id="workspace",
+        idempotency_key="omit-invocation",
+        workspace=workspace,
+        runner=runner,
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=7,
+        model_step_id="mstep_30000000000000000000000000000000",
+        model_attempt_id="mattempt_30000000000000000000000000000000",
+        tool_round_id="tround_30000000000000000000000000000000",
+        tool_call_id="omit-call",
+        tool_name="run_command",
+        idempotency_key="omit-invocation",
+        effective_arguments=arguments,
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+
+    completed = asyncio.run(RunCommandTool(toolchain_profile=profile).run(ctx, arguments))
+    assert completed.structured["stdout"] == output
+
+    def recover(tool: RunCommandTool):
+        evidence = asyncio.run(
+            tool.reconcile_durable_tool_call(
+                parent_session_id="omit-session",
+                parent_run_epoch=7,
+                execution_profile_fingerprint="profile",
+                environment_name="coding",
+                environment_allocation_fingerprint="allocation",
+                model_step_id="mstep_30000000000000000000000000000000",
+                model_attempt_id="mattempt_30000000000000000000000000000000",
+                tool_round_id="tround_30000000000000000000000000000000",
+                tool_call_id="omit-call",
+                idempotency_key="omit-invocation",
+                arguments=arguments,
+                started=True,
+                load_operation=load_operation,
+            )
+        )
+        assert evidence is not None
+        return evidence
+
+    # Under the bound it was journaled with, the result is recovered whole.
+    same = recover(RunCommandTool(toolchain_profile=profile))
+    assert same.disposition == "confirmed"
+    assert same.result.structured["stdout"] == output
+    assert "recovered_output_omitted" not in same.result.structured
+
+    # After the application lowers the bound, recovery has no registry to
+    # redact with, so it omits both streams instead of cutting them.
+    bound = 64 * 1024
+    lowered = recover(RunCommandTool(toolchain_profile=profile, max_terminal_payload_bytes=bound))
+    result = lowered.result
+    assert lowered.disposition == "confirmed"
+    assert len(result.model_dump_json().encode("utf-8")) <= bound - 4 * 1024
+    assert result.structured["recovered_output_omitted"] is True
+    assert result.structured["stdout"] == ""
+    assert result.structured["stderr"] == ""
+    assert result.structured["stdout_truncated"] is True
+    assert result.structured["output_sha256"] == completed.structured["output_sha256"]
+    assert "late-registered" not in result.model_dump_json()
+    assert "a" * 64 not in result.content
+    assert "was omitted" in result.content
+
+
+def test_structured_command_recovery_under_its_journaled_bound_never_recuts(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
+    profile = _profile()
+    # Large enough that the live result is fitted to the profile ceiling.
+    runner = _AdmittedRunner(profile, result=ExecResult(stdout="x" * 16_384, stderr="y" * 16_384))
+    arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        records[storage_key] = desired
+        return desired
+
+    ctx = ToolContext(
+        session_id="recut-session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id="workspace",
+        idempotency_key="recut-invocation",
+        workspace=workspace,
+        runner=runner,
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=7,
+        model_step_id="mstep_40000000000000000000000000000000",
+        model_attempt_id="mattempt_40000000000000000000000000000000",
+        tool_round_id="tround_40000000000000000000000000000000",
+        tool_call_id="recut-call",
+        tool_name="run_command",
+        idempotency_key="recut-invocation",
+        effective_arguments=arguments,
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+    tool = RunCommandTool(toolchain_profile=profile)
+    completed = asyncio.run(tool.run(ctx, arguments))
+    assert completed.structured["result_publication_ceiling_applied"] is True
+
+    recovered = asyncio.run(
+        tool.reconcile_durable_tool_call(
+            parent_session_id="recut-session",
+            parent_run_epoch=7,
+            execution_profile_fingerprint="profile",
+            environment_name="coding",
+            environment_allocation_fingerprint="allocation",
+            model_step_id="mstep_40000000000000000000000000000000",
+            model_attempt_id="mattempt_40000000000000000000000000000000",
+            tool_round_id="tround_40000000000000000000000000000000",
+            tool_call_id="recut-call",
+            idempotency_key="recut-invocation",
+            arguments=arguments,
+            started=True,
+            load_operation=load_operation,
+        )
+    )
+
+    # The journaled result left room for the recovery fields, so recovery
+    # returns the live previews unchanged instead of omitting them.
+    assert recovered is not None
+    result = recovered.result
+    assert len(result.model_dump_json().encode("utf-8")) <= profile.result_publication_max_bytes
+    assert "recovered_output_omitted" not in result.structured
+    assert result.structured["stdout"] == completed.structured["stdout"]
+    assert result.structured["stderr"] == completed.structured["stderr"]
+
+
+def test_journaled_command_result_never_cuts_output_it_did_not_store(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
+    artifact_store = LocalArtifactStore(tmp_path.parent / "artifacts", store_id="commands")
+    profile = _profile()
+    arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
+    # Sizes whose live projection fits the ceiling only before the journal
+    # identities and the recovery headroom are counted.
+    for size in range(10_900, 12_100, 100):
+        records: dict[str, dict[str, object]] = {}
+
+        async def load_operation(storage_key: str, records=records):
+            return records.get(storage_key)
+
+        async def compare_and_set_operation(
+            storage_key, expected, desired, secondary, records=records
+        ):
+            records[storage_key] = desired
+            return desired
+
+        runner = _AdmittedRunner(profile, result=ExecResult(stdout="x" * size, stderr="y" * size))
+        ctx = ToolContext(
+            session_id="headroom-session",
+            agent_name="agent",
+            environment_name="coding",
+            workspace_id="workspace",
+            idempotency_key=f"headroom-invocation-{size}",
+            workspace=workspace,
+            runner=runner,
+            artifact_store=artifact_store,
+        )
+        _bind_runtime_tool_invocation_authority(
+            ctx,
+            parent_task_id="task",
+            parent_run_epoch=7,
+            model_step_id="mstep_50000000000000000000000000000000",
+            model_attempt_id="mattempt_50000000000000000000000000000000",
+            tool_round_id="tround_50000000000000000000000000000000",
+            tool_call_id=f"headroom-call-{size}",
+            tool_name="run_command",
+            idempotency_key=f"headroom-invocation-{size}",
+            effective_arguments=arguments,
+            execution_profile_fingerprint="profile",
+            environment_allocation_fingerprint="allocation",
+            load_durable_operation=load_operation,
+            compare_and_set_durable_operation=compare_and_set_operation,
+            seal_durable_output=lambda record: record,
+            secret_publication_sealer=lambda: None,
+        )
+        result = asyncio.run(RunCommandTool(toolchain_profile=profile).run(ctx, arguments))
+
+        structured = result.structured
+        assert structured is not None
+        journaled = ToolResult.model_validate(next(iter(records.values()))["terminal_result"])
+        assert journaled == result
+        assert len(result.model_dump_json().encode("utf-8")) <= (
+            profile.result_publication_max_bytes - 256
+        )
+        if structured["stdout_projection_truncated"] or structured["stderr_projection_truncated"]:
+            # A shortened preview keeps the full output in its artifact.
+            assert structured["output_artifact_status"] == "stored", size
+            assert structured["output_publication_complete"] is True
+            assert len(result.artifacts) == 1
+        else:
+            assert structured["stdout"] == "x" * size
+            assert structured["stderr"] == "y" * size
+            assert structured["output_artifact_status"] == "not_requested"
 
 
 @pytest.mark.parametrize(

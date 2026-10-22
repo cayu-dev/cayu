@@ -569,6 +569,122 @@ def test_toolchain_run_check_journals_and_recovers_a_result_within_its_bound(
     assert len(recovered.result.model_dump_json().encode("utf-8")) <= bound
 
 
+def test_toolchain_run_check_recovers_its_output_under_unchanged_limits(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Neither stream exceeds the default preview limit, but together they
+    # exceed the default toolchain publication ceiling.
+    script = "import sys; print('x' * 16000); print('y' * 16000, file=sys.stderr)"
+    command = ExecCommand.process(sys.executable, "-c", script)
+    authority = DockerCodingCommandAuthority(
+        selector="test",
+        revision="1",
+        description="Run the named test check.",
+        exposure="named_check",
+        executable=sys.executable,
+        fixed_arguments=("-c", script),
+        max_arguments=0,
+        dependency_sensitive=False,
+    )
+    profile = DockerCodingToolchainProfile(
+        profile_id="test-profile",
+        revision="1",
+        image_identity=DockerImageIdentity(
+            reference="test-image@sha256:" + ("a" * 64),
+        ),
+        platform_architecture="arm64",
+        command_authorities=(authority,),
+    )
+    (tmp_path / "workspace").mkdir()
+    workspace = LocalWorkspace(tmp_path / "workspace", workspace_id="limits-check-workspace")
+    runner = LocalRunner(tmp_path / "workspace", inherit_env=False)
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="checks")
+
+    async def admitted(_runner, **_kwargs):
+        return None
+
+    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        records[storage_key] = desired
+        return desired
+
+    ctx = ToolContext(
+        session_id="limits-check-session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id=workspace.id,
+        idempotency_key="limits-check-invocation",
+        workspace=workspace,
+        runner=runner,
+        artifact_store=artifact_store,
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=1,
+        model_step_id="mstep_60000000000000000000000000000000",
+        model_attempt_id="mattempt_60000000000000000000000000000000",
+        tool_round_id="tround_60000000000000000000000000000000",
+        tool_call_id="limits-check-call",
+        tool_name="run_check",
+        idempotency_key="limits-check-invocation",
+        effective_arguments={"check": "test"},
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+    tool = RunCheckTool(
+        checks=[_check(command=command)],
+        command_policy=ProcessCommandPolicy(
+            allowed_executables=(sys.executable,),
+            allowed_cwds=(str(tmp_path / "workspace"),),
+        ),
+        toolchain_profile=profile,
+    )
+    result = asyncio.run(tool.run(ctx, {"check": "test"}))
+
+    # The live result is fitted to the toolchain ceiling it is recovered
+    # under, and keeps the full output in its artifact.
+    assert result.structured["status"] == "passed"
+    assert len(result.model_dump_json().encode("utf-8")) <= profile.result_publication_max_bytes
+    assert result.structured["stdout_projection_truncated"] is True
+    assert result.structured["output_artifact_status"] == "stored"
+
+    recovered = asyncio.run(
+        tool.reconcile_durable_tool_call(
+            parent_session_id=ctx.session_id,
+            parent_run_epoch=1,
+            execution_profile_fingerprint="profile",
+            environment_name="coding",
+            environment_allocation_fingerprint="allocation",
+            model_step_id="mstep_60000000000000000000000000000000",
+            model_attempt_id="mattempt_60000000000000000000000000000000",
+            tool_round_id="tround_60000000000000000000000000000000",
+            tool_call_id="limits-check-call",
+            idempotency_key="limits-check-invocation",
+            arguments={"check": "test"},
+            started=True,
+            load_operation=load_operation,
+        )
+    )
+    assert recovered is not None
+    assert recovered.disposition == "confirmed"
+    # Under unchanged limits, recovery returns the live previews.
+    assert "recovered_output_omitted" not in recovered.result.structured
+    assert recovered.result.structured["stdout"] == result.structured["stdout"]
+    assert recovered.result.structured["stderr"] == result.structured["stderr"]
+    assert recovered.result.structured["stdout"]
+
+
 def test_run_check_binds_a_pass_to_the_complete_post_check_workspace_revision(
     tmp_path,
 ) -> None:

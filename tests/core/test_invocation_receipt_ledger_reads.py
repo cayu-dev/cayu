@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from copy import deepcopy
 
 import pytest
@@ -137,3 +138,54 @@ def test_cached_ledger_does_not_admit_a_tampered_or_oversized_copy(monkeypatch):
     monkeypatch.setattr(lifecycle, "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES", 1024)
     with pytest.raises(RuntimeError, match="malformed"):
         lifecycle._invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
+
+
+def _empty_ledger_cache(monkeypatch) -> None:
+    monkeypatch.setattr(lifecycle, "_validated_ledgers", OrderedDict())
+    monkeypatch.setattr(lifecycle, "_validated_ledger_by_session", {})
+    monkeypatch.setattr(lifecycle, "_validated_ledger_source_bytes", 0)
+
+
+def test_cache_keeps_only_the_latest_ledger_of_each_session(monkeypatch):
+    _empty_ledger_cache(monkeypatch)
+    checkpoint = asyncio.run(_converse(InMemorySessionStore(), 6))
+
+    latest = lifecycle._invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
+
+    # Every turn appended receipts, each making a new ledger; only the latest
+    # stays cached, so stale versions do not hold memory until evicted.
+    entries = list(lifecycle._validated_ledgers.values())
+    assert len(entries) == 1
+    assert lifecycle._validated_ledger_source_bytes == entries[0][1]
+    assert entries[0][0].model_dump(mode="json") == latest.model_dump(mode="json")
+    assert (
+        lifecycle._VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES
+        <= lifecycle.INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES
+    )
+
+
+def test_ledgers_sharing_a_session_id_are_never_conflated(monkeypatch):
+    _empty_ledger_cache(monkeypatch)
+    first = asyncio.run(_converse(InMemorySessionStore(), 2))
+    second = asyncio.run(_converse(InMemorySessionStore(), 3))
+    validated = []
+    validate = lifecycle._validate_receipt_ledger
+
+    def count(raw):
+        validated.append(len(raw["receipts"]))
+        return validate(raw)
+
+    lifecycle._invocation_lifecycle_receipt_ledger_from_checkpoint(second)
+    monkeypatch.setattr(lifecycle, "_validate_receipt_ledger", count)
+    for checkpoint in (second, first, first):
+        ledger = lifecycle._invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
+        assert (
+            ledger.model_dump(mode="json")
+            == checkpoint[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY]
+        )
+
+    # Both stores used session "s": the second ledger is cached, and the first
+    # is validated in full, then replaces it, rather than being served from it.
+    first_count = len(first[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY]["receipts"])
+    assert validated == [first_count]
+    assert len(lifecycle._validated_ledgers) == 1

@@ -1413,17 +1413,42 @@ def _invocation_lifecycle_command_receipt(
 # unchanged ledger is deterministic in its exact JSON value, so reads reuse it.
 # The source is still walked under the ledger bounds before it is hashed, and
 # callers only ever receive private copies of a cached ledger.
-_VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024
+#
+# A validated ledger retains about three times its source text, so the cache
+# counts at most 8 MiB of source (one ledger at its limit). Appending a receipt
+# makes a new ledger, so the cache keeps only the ledger it validated last
+# for each session: an earlier version is dropped as soon as a later one is
+# cached. Entries stay keyed by their exact content; the session only decides
+# which entry a later one replaces, so different ledgers are never conflated.
+_VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
 _VALIDATED_LEDGER_CACHE_MAX_ENTRIES = 128
-_validated_ledgers: OrderedDict[bytes, tuple[_InvocationLifecycleReceiptLedger, int]] = (
-    OrderedDict()
-)
+_validated_ledgers: OrderedDict[
+    bytes, tuple[_InvocationLifecycleReceiptLedger, int, str | None]
+] = OrderedDict()
+_validated_ledger_by_session: dict[str, bytes] = {}
 _validated_ledger_source_bytes = 0
 _validated_ledger_lock = threading.Lock()
 
 
 def _validate_receipt_ledger(raw: dict[str, Any]) -> _InvocationLifecycleReceiptLedger:
     return _InvocationLifecycleReceiptLedger.model_validate(raw)
+
+
+def _receipt_ledger_session(ledger: _InvocationLifecycleReceiptLedger) -> str | None:
+    """The one session a validated ledger's receipts belong to, if there is one."""
+
+    sessions = {receipt.session_id for receipt in ledger.receipts}
+    return next(iter(sessions)) if len(sessions) == 1 else None
+
+
+def _evict_validated_ledger(key: bytes) -> None:
+    """Remove one cache entry. Callers hold ``_validated_ledger_lock``."""
+
+    global _validated_ledger_source_bytes
+    _, size, session_id = _validated_ledgers.pop(key)
+    _validated_ledger_source_bytes -= size
+    if session_id is not None and _validated_ledger_by_session.get(session_id) == key:
+        del _validated_ledger_by_session[session_id]
 
 
 def _validated_receipt_ledger(raw: dict[str, Any]) -> _InvocationLifecycleReceiptLedger:
@@ -1454,16 +1479,21 @@ def _validated_receipt_ledger(raw: dict[str, Any]) -> _InvocationLifecycleReceip
     size = len(source)
     if size > _VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES:
         return ledger
+    session_id = _receipt_ledger_session(ledger)
     with _validated_ledger_lock:
         if key not in _validated_ledgers:
-            _validated_ledgers[key] = (ledger, size)
+            if session_id is not None:
+                previous = _validated_ledger_by_session.get(session_id)
+                if previous is not None:
+                    _evict_validated_ledger(previous)
+                _validated_ledger_by_session[session_id] = key
+            _validated_ledgers[key] = (ledger, size, session_id)
             _validated_ledger_source_bytes += size
         while (
             _validated_ledger_source_bytes > _VALIDATED_LEDGER_CACHE_MAX_SOURCE_BYTES
             or len(_validated_ledgers) > _VALIDATED_LEDGER_CACHE_MAX_ENTRIES
         ):
-            _, (_, evicted_size) = _validated_ledgers.popitem(last=False)
-            _validated_ledger_source_bytes -= evicted_size
+            _evict_validated_ledger(next(iter(_validated_ledgers)))
     return ledger
 
 

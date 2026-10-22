@@ -100,6 +100,7 @@ from cayu.sessions._invocation_lifecycle import (
 from cayu.sessions._invocation_lifecycle import (
     _compact_invocation_lifecycle_receipts as _compact_invocation_lifecycle_receipts,
 )
+from cayu.sessions._invocation_lifecycle import _evict_validated_ledger as _evict_validated_ledger
 from cayu.sessions._invocation_lifecycle import (
     _ExternalExecutionOrigin as _ExternalExecutionOrigin,
 )
@@ -132,6 +133,7 @@ from cayu.sessions._invocation_lifecycle import (
     _projected_invocation_release_receipt as _projected_invocation_release_receipt,
 )
 from cayu.sessions._invocation_lifecycle import _receipt_ledger_material as _receipt_ledger_material
+from cayu.sessions._invocation_lifecycle import _receipt_ledger_session as _receipt_ledger_session
 from cayu.sessions._invocation_lifecycle import (
     _ReleaseInvocationAuthority as _ReleaseInvocationAuthority,
 )

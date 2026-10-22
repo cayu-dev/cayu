@@ -27,11 +27,13 @@ from cayu.tools._resources import (
 )
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
     ToolContext,
     ToolEffect,
+    ToolResult,
     _bind_runtime_tool_invocation_authority,
 )
-from cayu.tools.patches import ApplyPatchTool, _patch_journal_key
+from cayu.tools.patches import ApplyPatchTool, _fit_recovered_patch_evidence, _patch_journal_key
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces.base import WorkspaceMoveAmbiguousError, WorkspaceMutationResult
 from cayu.workspaces.local import LocalWorkspace
@@ -1263,9 +1265,56 @@ def test_apply_patch_recovery_lists_the_operations_its_bound_holds(tmp_path: Pat
     result = recovered.result
     assert len(result.model_dump_json().encode("utf-8")) <= bound
     assert result.structured["outcome"] == "applied"
-    assert result.structured["operations_truncated"] is True
+    # Recovery lists the leading operations with the same fields live uses.
+    assert "operations_truncated" not in result.structured
+    assert result.structured["manifest_truncated"] is True
+    assert "terminal_payload_bytes" in result.structured["manifest_truncation_reasons"]
     assert result.structured["operation_count"] == 100
     listed = result.structured["operations"]
     assert 0 < len(listed) < 100
     assert [operation["index"] for operation in listed] == list(range(len(listed)))
-    assert f"Only the first {len(listed)} of 100 operations" in result.content
+
+
+def test_apply_patch_recovery_falls_back_to_a_result_that_always_fits() -> None:
+    bound = 64 * 1024
+    structured = {
+        "version": 2,
+        "recovered": True,
+        "patch_id": "patch_" + "0" * 32,
+        "outcome": "applied",
+        "failure_category": None,
+        "session_id": "s" * (bound // 2),
+        "tool_call_id": "c" * (bound // 2),
+        "operations": [{"index": index, "status": "applied"} for index in range(3)],
+        "diff": "",
+        "diff_unavailable": True,
+        "artifact_status": "unavailable_during_recovery",
+        "artifact": None,
+        "requires_fresh_read": False,
+    }
+    evidence = DurableToolRecoveryEvidence(
+        "confirmed",
+        ToolResult(content="Recovered patch.", structured=structured, is_error=False),
+    )
+
+    fitted = _fit_recovered_patch_evidence(evidence, bound)
+
+    # Even an empty listing is too large here, so the short fields remain and
+    # the result fits instead of failing the terminal payload limit.
+    assert fitted.disposition == "confirmed"
+    assert len(fitted.result.model_dump_json().encode("utf-8")) <= bound - 4 * 1024
+    assert fitted.result.structured == {
+        "version": 2,
+        "recovered": True,
+        "patch_id": "patch_" + "0" * 32,
+        "outcome": "applied",
+        "failure_category": None,
+        "operation_count": 3,
+        "manifest_truncated": True,
+        "manifest_truncation_reasons": ["terminal_payload_bytes"],
+        "diff": "",
+        "diff_unavailable": True,
+        "artifact_status": "unavailable_during_recovery",
+        "artifact": None,
+        "requires_fresh_read": False,
+    }

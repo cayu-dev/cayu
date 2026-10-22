@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,7 @@ from cayu.runners.local import LocalRunner
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
+from cayu.tools import _terminal_bounds as terminal_bounds
 from cayu.tools._terminal_bounds import (
     MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
     MIN_TOOL_TERMINAL_PAYLOAD_BYTES,
@@ -594,6 +597,26 @@ def test_subagent_with_a_foreground_child_declares_no_bound_unless_asked() -> No
 
     assert tool(None).spec.max_terminal_payload_bytes is None
     assert tool(96 * KIB).spec.max_terminal_payload_bytes == 96 * KIB
+
+
+def test_claims_that_built_ins_declare_a_bound_name_the_foreground_subagent() -> None:
+    # Because of the case above, a claim that every built-in declares a bound
+    # must name foreground subagents, whose rounds still take the exclusive lease.
+    contracts = Path(__file__).resolve().parents[2] / "docs" / "runtime-contracts.md"
+    texts = {
+        "runtime-contracts.md": " ".join(contracts.read_text(encoding="utf-8").split()),
+        "_terminal_bounds": " ".join((terminal_bounds.__doc__ or "").split()),
+    }
+    for name, text in texts.items():
+        claims = [
+            sentence
+            for sentence in re.findall(r"[^.]*\bevery built-in\b.*?\.(?= [A-Z]|$)", text, re.I)
+            if re.search(r"\bdeclares?\b", sentence)
+            and re.search(r"bound|declaration|max_terminal_payload_bytes", sentence)
+        ]
+        assert claims, name
+        for claim in claims:
+            assert "foreground" in claim, (name, claim)
 
 
 def test_read_file_reads_a_file_over_one_mebibyte_whole_for_its_revision(tmp_path) -> None:

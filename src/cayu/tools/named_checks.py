@@ -63,6 +63,7 @@ from cayu.tools.commands import (
     _command_output_preview_encoding,
 )
 from cayu.tools.structured_commands import (
+    _RECOVERY_EVIDENCE_HEADROOM_BYTES,
     RunCommandTool,
     _argv_digest,
     _bind_durable_runner_operation,
@@ -243,11 +244,20 @@ class _RunCheckRecoveryCommandTool(RunCommandTool):
                 observer="cayu-run-check-recovery",
                 limits=owner._workspace_observation_limits,
             )
+        check = owner._checks_by_name[kwargs["authority"].selector]
         result = await owner._project_result(
             ctx,
-            check=owner._checks_by_name[kwargs["authority"].selector],
+            check=check,
             raw_result=kwargs["raw_result"],
             workspace_observation=workspace_observation,
+        )
+        # Fitted like a live result, so recovery never cuts it afterwards.
+        result = await owner._fit_projected_result(
+            ctx,
+            check=check,
+            raw_result=kwargs["raw_result"],
+            workspace_observation=workspace_observation,
+            projected=result,
         )
         authority = kwargs["authority"]
         result = owner._attach_toolchain_evidence(owner._checks_by_name[authority.selector], result)
@@ -813,12 +823,20 @@ class RunCheckTool(Tool, DurableToolRecovery):
     ) -> ToolResult:
         """Shorten the output previews until the result fits the terminal bound.
 
+        A toolchain-backed result is journaled, and recovered under the
+        toolchain publication ceiling, so it fits that ceiling with room for
+        the fields recovery adds.
+
         The previews are cut like ``max_model_output_bytes`` cuts them, so the
         encoding and truncation fields stay accurate and the complete output
         stays in the output artifact.
         """
 
         bound = self.spec.max_terminal_payload_bytes
+        if self._recovery_tool is not None:
+            bound = (
+                self._recovery_tool._result_publication_ceiling - _RECOVERY_EVIDENCE_HEADROOM_BYTES
+            )
         if bound is None:
             return projected
         # Room for the timing, toolchain and journal evidence added afterwards.

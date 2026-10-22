@@ -3,7 +3,9 @@
 A deferred tool round reserves the result size each of its tools declares in
 ``ToolSpec.max_terminal_payload_bytes`` from capacity shared by the whole
 process. A tool without a declaration makes its round exclusive, so every
-built-in declares one. The declaration is honest only if the tool keeps its
+built-in declares one, except ``subagent`` with a foreground child unless the
+application sets its bound (see ``_subagent_terminal_payload_bound``). The
+declaration is honest only if the tool keeps its
 result inside it: ``bounded_terminal_result`` fits whatever ``run`` returns to
 the declared bound, keeping as much of the result as fits and saying in the
 result that it was cut.

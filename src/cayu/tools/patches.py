@@ -1008,7 +1008,10 @@ class ApplyPatchTool(Tool):
         if len(_canonical_json_bytes(structured)) > structured_limit:
             # A small terminal bound lists the leading operations it holds; the
             # artifact, when stored, keeps the complete manifest.
-            structured = _leading_manifest_within(structured, structured_limit)
+            structured = _leading_manifest_within(
+                structured,
+                lambda candidate: len(_canonical_json_bytes(candidate)) <= structured_limit,
+            )
         if len(_canonical_json_bytes(structured)) > structured_limit:
             return ToolResult(
                 content=(
@@ -1041,44 +1044,75 @@ class ApplyPatchTool(Tool):
         )
 
 
-def _leading_manifest_within(structured: dict[str, Any], limit: int) -> dict[str, Any]:
-    """Keep the longest prefix of the operation and path manifests within ``limit``."""
+def _leading_manifest_within(
+    structured: dict[str, Any], fits: Callable[[dict[str, Any]], bool]
+) -> dict[str, Any]:
+    """Keep the longest prefix of the operation and path manifests that ``fits``.
+
+    Live and recovered results list their leading operations the same way: the
+    paths listed are those of the operations kept, and ``manifest_truncated``
+    with ``terminal_payload_bytes`` says the listing is partial. A recovered
+    result has no path manifest, so it lists operations alone.
+    """
 
     operations = structured["operations"]
-    changed_paths = structured["changed_paths"]
+    changed_paths = structured.get("changed_paths")
 
     def listing(count: int) -> dict[str, Any]:
         kept = operations[:count]
-        indexes = {operation["index"] for operation in kept}
-        return {
+        listed = {
             **structured,
             "operations": kept,
-            "changed_paths": [
-                path for path in changed_paths if path.get("operation_index") in indexes
-            ],
             "manifest_truncated": True,
             "manifest_truncation_reasons": sorted(
-                {*structured["manifest_truncation_reasons"], "terminal_payload_bytes"}
+                {*structured.get("manifest_truncation_reasons", ()), "terminal_payload_bytes"}
             ),
         }
+        if type(changed_paths) is list:
+            indexes = {operation["index"] for operation in kept}
+            listed["changed_paths"] = [
+                path for path in changed_paths if path.get("operation_index") in indexes
+            ]
+        return listed
 
     low, high = 0, len(operations)
     while low < high:
         middle = (low + high + 1) // 2
-        if len(_canonical_json_bytes(listing(middle))) <= limit:
+        if fits(listing(middle)):
             low = middle
         else:
             high = middle - 1
     return listing(low)
 
 
+# Fields a recovered patch keeps when not even an empty operation listing fits.
+# Each is a short scalar, so the reduced result fits the smallest bound.
+_MINIMAL_RECOVERED_PATCH_FIELDS = (
+    "version",
+    "recovered",
+    "patch_id",
+    "outcome",
+    "failure_category",
+    "cross_file_atomic",
+    "operation_count",
+    "manifest_truncated",
+    "manifest_truncation_reasons",
+    "diff",
+    "diff_unavailable",
+    "artifact_status",
+    "artifact",
+    "requires_fresh_read",
+)
+
+
 def _fit_recovered_patch_evidence(
     evidence: DurableToolRecoveryEvidence,
     max_bytes: int | None,
 ) -> DurableToolRecoveryEvidence:
-    """List as many recovered operations as the terminal bound holds, in order.
+    """List as many recovered operations as the terminal bound holds, as live does.
 
-    The journal keeps every operation; the result says how many it lists.
+    The journal keeps every operation; ``operation_count`` says how many there
+    are. If not even an empty listing fits, only short scalar fields are kept.
     """
 
     result = evidence.result
@@ -1088,31 +1122,21 @@ def _fit_recovered_patch_evidence(
     operations = structured.get("operations")
     if type(operations) is not list:
         return evidence
+    structured["operation_count"] = len(operations)
 
-    def listing(count: int) -> ToolResult:
-        return result.model_copy(
-            update={
-                "content": (
-                    f"{result.content} Only the first {count} of {len(operations)} "
-                    "operations are listed; the durable journal holds them all."
-                ),
-                "structured": {
-                    **structured,
-                    "operations": list(operations[:count]),
-                    "operation_count": len(operations),
-                    "operations_truncated": True,
-                },
-            }
-        )
+    def fits(candidate: dict[str, Any]) -> bool:
+        return tool_result_fits(result.model_copy(update={"structured": candidate}), max_bytes)
 
-    low, high = 0, len(operations)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if tool_result_fits(listing(middle), max_bytes):
-            low = middle
-        else:
-            high = middle - 1
-    return DurableToolRecoveryEvidence(evidence.disposition, listing(low))
+    listed = _leading_manifest_within(structured, fits)
+    if not fits(listed):
+        listed = {
+            field_name: listed[field_name]
+            for field_name in _MINIMAL_RECOVERED_PATCH_FIELDS
+            if field_name in listed
+        }
+    return DurableToolRecoveryEvidence(
+        evidence.disposition, result.model_copy(update={"structured": listed})
+    )
 
 
 def _seal_patch_artifact_projection(
