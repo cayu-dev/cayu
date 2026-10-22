@@ -3096,6 +3096,53 @@ def test_cloud_github_file_keeps_manifest_error_when_authentication_is_usable(
     assert raised.value.category == "manifest_unavailable"
 
 
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_cloud_optional_github_file_reports_a_file_the_revision_lacks(
+    authenticated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if command[1:3] == ["auth", "status"]:
+            if authenticated:
+                return SimpleNamespace(stdout="")
+            raise subprocess.CalledProcessError(1, command)
+        raise subprocess.CalledProcessError(1, command, stderr="gh: Not Found (HTTP 404)")
+
+    class Client:
+        def __init__(self, *, follow_redirects: bool, timeout: float) -> None:
+            pass
+
+        def __enter__(self) -> Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, url: str, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(status_code=404 if "/contents/" in url else 200, content=b"")
+
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(cloud_project.subprocess, "run", run)
+    monkeypatch.setattr(
+        cloud_project,
+        "httpx",
+        SimpleNamespace(Client=Client, RequestError=OSError),
+        raising=False,
+    )
+    arguments = {
+        "revision": "a" * 40,
+        "path": "cayu-cloud.toml",
+    }
+
+    assert (
+        cloud_project._optional_github_file("https://github.com/example/project", **arguments)
+        is None
+    )
+    with pytest.raises(CloudApiError) as raised:
+        cloud_project._github_file("https://github.com/example/project", **arguments)
+    assert raised.value.category == "manifest_unavailable"
+
+
 def test_cloud_deploy_reports_redacted_source_authentication_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3525,7 +3572,11 @@ def test_cloud_source_preserves_custom_manifests_without_storage_acknowledgement
             assert (repository, revision, path) == (source, "a" * 40, "cloud-prod.toml")
             return manifest_text
 
+        def root_manifest(repository: str, *, revision: str, path: str) -> None:
+            assert (repository, revision, path) == (source, "a" * 40, "cayu-cloud.toml")
+
         monkeypatch.setattr(cloud_project, "_github_file", github_file)
+        monkeypatch.setattr(cloud_project, "_optional_github_file", root_manifest)
 
     project = cloud_project.resolve_project(
         source, manifest_path=Path("cloud-prod.toml"), revision=revision

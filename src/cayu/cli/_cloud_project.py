@@ -15,8 +15,8 @@ import tarfile
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import cast
-from urllib.parse import quote, urlsplit
+from typing import TypeGuard, cast
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -76,16 +76,21 @@ _READY_START_PERIOD_SECONDS = 180
 _READY_START_PERIOD_RANGE = (0, 300)
 
 
+def _is_local_ascii_path(value: object) -> TypeGuard[str]:
+    # An absolute path with no host, of at most 1024 printable ASCII characters.
+    return (
+        type(value) is str
+        and 1 <= len(value) <= 1024
+        and value.startswith("/")
+        and not value.startswith("//")
+        and all(33 <= ord(char) <= 126 for char in value)
+    )
+
+
 def _ready_path(value: object) -> str:
     # The probe's urllib refuses spaces, control characters and non-ASCII, so such
     # a path would fail every check and restart the web process in a loop.
-    if (
-        type(value) is not str
-        or not 1 <= len(value) <= 1024
-        or not value.startswith("/")
-        or value.startswith("//")
-        or any(not 33 <= ord(char) <= 126 for char in value)
-    ):
+    if not _is_local_ascii_path(value):
         raise CloudApiError(
             "manifest_invalid",
             "Runtime web ready_path must be a local absolute HTTP path of printable ASCII "
@@ -170,6 +175,76 @@ def _local_file(path: object, reason: object) -> CloudLocalFile:
     return CloudLocalFile(path=path.strip(), reason=reason.strip())
 
 
+_SIGN_IN_MODES = ("cloud", "own")
+_PUBLIC_PATHS_LIMIT = 50
+_SIGN_IN_MODE_ERROR = (
+    '[sign_in] mode must be "cloud" (Cayu Cloud signs people in) or "own" (the Agent\'s own login).'
+)
+_PUBLIC_PATHS_ERROR = (
+    "[sign_in] public_paths must be an array of at most 50 different path prefixes."
+)
+_PUBLIC_PATHS_MODE_ERROR = (
+    '[sign_in] public_paths is allowed only with mode = "cloud"; with mode = "own" '
+    "the Agent's own login decides which pages are public."
+)
+
+
+@dataclass(frozen=True)
+class CloudSignIn:
+    """How people sign in to the Agent's pages; `own` when `[sign_in]` is absent."""
+
+    mode: str = "own"
+    public_paths: tuple[str, ...] = ()
+
+
+def _same_host_path(value: object, *, label: str) -> str:
+    # Cloud redirects to `home` and matches `public_paths` against request paths, so
+    # each must stay on the Agent's host and mean the same path to every parser.
+    if (
+        not _is_local_ascii_path(value)
+        or "?" in value
+        or "#" in value
+        or "\\" in unquote(value)
+        or ".." in unquote(value).split("/")
+    ):
+        raise CloudApiError(
+            "manifest_invalid",
+            f'{label} must be a path on the Agent\'s own host that starts with "/": at most '
+            "1024 printable ASCII characters, with no scheme, host, query, fragment, "
+            '".." segment, space or backslash.',
+        )
+    return value
+
+
+def _home(value: object) -> str | None:
+    if value is None:
+        return None
+    return _same_host_path(value, label="cayu-cloud.toml home")
+
+
+def _sign_in(table: dict[str, object] | None) -> CloudSignIn:
+    if table is None:
+        return CloudSignIn()
+    return _checked_sign_in(table.get("mode"), table.get("public_paths"))
+
+
+def _checked_sign_in(mode: object, public_paths: object) -> CloudSignIn:
+    if mode not in _SIGN_IN_MODES:
+        raise CloudApiError("manifest_invalid", _SIGN_IN_MODE_ERROR)
+    if public_paths is None:
+        return CloudSignIn(mode=cast("str", mode))
+    if mode != "cloud":
+        raise CloudApiError("manifest_invalid", _PUBLIC_PATHS_MODE_ERROR)
+    if not isinstance(public_paths, list) or len(public_paths) > _PUBLIC_PATHS_LIMIT:
+        raise CloudApiError("manifest_invalid", _PUBLIC_PATHS_ERROR)
+    paths = tuple(
+        _same_host_path(item, label="Each [sign_in] public_paths entry") for item in public_paths
+    )
+    if len(set(paths)) != len(paths):
+        raise CloudApiError("manifest_invalid", _PUBLIC_PATHS_ERROR)
+    return CloudSignIn(mode="cloud", public_paths=paths)
+
+
 def _process_resources(payload: dict[str, object]) -> dict[str, int]:
     resources = {}
     for name, minimum, maximum in (("cpu_millis", 100, 16_000), ("memory_mb", 128, 131_072)):
@@ -199,6 +274,8 @@ class CloudProjectManifest:
     schedules: tuple[CloudSchedule, ...] = ()
     runtime_environment: dict[str, str] | None = None
     local_files: tuple[CloudLocalFile, ...] = ()
+    home: str | None = None
+    sign_in: CloudSignIn = CloudSignIn()
 
     @classmethod
     def load(cls, path: Path) -> CloudProjectManifest:
@@ -235,6 +312,8 @@ class CloudProjectManifest:
             "worker",
             "schedules",
             "storage",
+            "home",
+            "sign_in",
         }
         schema_version = payload.get("schema_version")
         if set(payload) - allowed or schema_version not in {1, 2}:
@@ -249,6 +328,11 @@ class CloudProjectManifest:
                 "manifest_invalid",
                 "Application processes require cayu-cloud.toml schema_version 2.",
             )
+        if schema_version == 1 and any(key in payload for key in ("home", "sign_in")):
+            raise CloudApiError(
+                "manifest_invalid",
+                "home and [sign_in] require cayu-cloud.toml schema_version 2.",
+            )
         application = payload.get("application")
         if type(application) is not str:
             raise CloudApiError(
@@ -260,6 +344,9 @@ class CloudProjectManifest:
             worker = payload.get("worker")
             schedules = payload.get("schedules", [])
             runtime_environment = payload.get("env", {})
+            sign_in = payload.get("sign_in")
+            if sign_in is not None and not isinstance(sign_in, dict):
+                raise TypeError("sign_in must be a table")
             if web is not None and not isinstance(web, dict):
                 raise TypeError("web must be a table")
             if worker is not None and not isinstance(worker, dict):
@@ -277,6 +364,7 @@ class CloudProjectManifest:
             for table_name, table, model in (
                 ("web", web, CloudWebProcess),
                 ("worker", worker, CloudProcess),
+                ("sign_in", sign_in, CloudSignIn),
                 *(
                     (
                         f'schedule "{item["name"]}"'
@@ -348,6 +436,8 @@ class CloudProjectManifest:
                 ),
                 runtime_environment=dict(runtime_environment),
                 local_files=_local_files(payload.get("storage")),
+                home=_home(payload.get("home")),
+                sign_in=_sign_in(sign_in),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CloudApiError(
@@ -447,6 +537,8 @@ class CloudProjectManifest:
             raise CloudApiError("manifest_invalid", _STORAGE_TABLE_ERROR)
         for entry in self.local_files:
             _local_file(entry.path, entry.reason)
+        _home(self.home)
+        _checked_sign_in(self.sign_in.mode, list(self.sign_in.public_paths) or None)
 
     def deployment_payload(self, *, repository: str, revision: str) -> dict[str, object]:
         return {
@@ -819,6 +911,9 @@ def _render_initial_manifest(
         values.extend(("[web]", f"command = {json.dumps(command)}", "port = 8000", ""))
     else:
         values.extend(("[worker]", f"command = {json.dumps(command)}", ""))
+    # Cayu Cloud signs people in. No `home`: `cayu serve` serves only the Developer
+    # dashboard, and init cannot know a page of the project's own.
+    values.extend(("[sign_in]", 'mode = "cloud"', ""))
     return "\n".join(values)
 
 
@@ -853,8 +948,11 @@ def resolve_project(
                 "Local manifest must be inside the project directory.",
             ) from exc
         manifest = CloudProjectManifest.load(selected_manifest)
-        _validate_storage_manifest_path(manifest, selected_manifest.relative_to(project_root))
+        relative_manifest = selected_manifest.relative_to(project_root)
+        _validate_source_manifest_path(manifest, relative_manifest)
         bundle = _archive_project(project_root, required_file=selected_manifest)
+        if relative_manifest != _ROOT_MANIFEST:
+            _validate_root_sign_in(_uploaded_root_manifest(bundle), relative_manifest)
         content_digest = "sha256:" + hashlib.sha256(bundle).hexdigest()
         digest = content_digest.removeprefix("sha256:")
         return ResolvedCloudProject(
@@ -885,7 +983,12 @@ def resolve_project(
     manifest = CloudProjectManifest.loads(
         _github_file(repository, revision=revision, path=selected_manifest.as_posix())
     )
-    _validate_storage_manifest_path(manifest, selected_manifest)
+    _validate_source_manifest_path(manifest, selected_manifest)
+    if selected_manifest != _ROOT_MANIFEST:
+        root_manifest = _optional_github_file(
+            repository, revision=revision, path=_ROOT_MANIFEST.as_posix()
+        )
+        _validate_root_sign_in(root_manifest, selected_manifest)
     return ResolvedCloudProject(
         root=None,
         manifest_path=selected_manifest,
@@ -895,15 +998,69 @@ def resolve_project(
     )
 
 
-def _validate_storage_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:
-    # Source admission reads only the root file, not the selected CLI manifest path.
-    if manifest.local_files and path != Path("cayu-cloud.toml"):
+def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:
+    # Cloud reads storage acknowledgements, sign-in and home only from the root file, not
+    # from the selected CLI manifest path.
+    if path == _ROOT_MANIFEST:
+        return
+    if manifest.home is not None or manifest.sign_in != CloudSignIn():
+        raise CloudApiError(
+            "manifest_invalid",
+            'home and [sign_in] mode = "cloud" require cayu-cloud.toml at the deployment '
+            "root. Move the manifest there as a regular file and deploy without --manifest; "
+            "Cloud reads sign-in and the home page only from that file.",
+        )
+    if manifest.local_files:
         raise CloudApiError(
             "manifest_invalid",
             "Storage local_files requires cayu-cloud.toml at the deployment root. "
             "Move the manifest there as a regular file and deploy without --manifest; "
             "Cloud reads storage acknowledgements only from that file.",
         )
+
+
+_ROOT_MANIFEST = Path("cayu-cloud.toml")
+_ROOT_MANIFEST_UNREADABLE = (
+    "Could not read the deployment root's cayu-cloud.toml, which Cloud reads sign-in and "
+    "the home page from. Fix that file, leave it out of the upload, or deploy without "
+    "--manifest."
+)
+
+
+def _validate_root_sign_in(root_manifest: str | None, path: Path) -> None:
+    # A custom manifest deploys with the root file's sign-in and home, because Cloud reads
+    # them only from there. Refuse when that file declares anything but the default.
+    if root_manifest is None:
+        return
+    try:
+        payload = tomllib.loads(root_manifest)
+    except tomllib.TOMLDecodeError as exc:
+        raise CloudApiError("manifest_invalid", _ROOT_MANIFEST_UNREADABLE) from exc
+    if payload.get("home") is None and payload.get("sign_in", {"mode": "own"}) == {"mode": "own"}:
+        return
+    raise CloudApiError(
+        "manifest_invalid",
+        "The deployment root's cayu-cloud.toml declares home or [sign_in], and Cloud reads "
+        f"sign-in and the home page only from that file, not from {path.as_posix()}. Deploy "
+        "without --manifest, or remove home and [sign_in] from the root cayu-cloud.toml.",
+    )
+
+
+def _uploaded_root_manifest(bundle: bytes) -> str | None:
+    # Read the bundled copy, not the working tree, which can change after archiving.
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive:
+        try:
+            member = archive.getmember(f"source/{_ROOT_MANIFEST.as_posix()}")
+        except KeyError:
+            return None
+        try:
+            # A symlink resolves only to another file in the same upload.
+            content = archive.extractfile(member)
+            if content is None:
+                raise CloudApiError("manifest_invalid", _ROOT_MANIFEST_UNREADABLE)
+            return content.read().decode("utf-8")
+        except (KeyError, tarfile.TarError, UnicodeDecodeError) as exc:
+            raise CloudApiError("manifest_invalid", _ROOT_MANIFEST_UNREADABLE) from exc
 
 
 class CloudSourceInputsError(CloudApiError):
@@ -1063,6 +1220,17 @@ def _source_path_excluded(path: Path) -> bool:
 
 
 def _github_file(repository: str, *, revision: str, path: str) -> str:
+    content = _optional_github_file(repository, revision=revision, path=path)
+    if content is None:
+        raise CloudApiError(
+            "manifest_unavailable",
+            "Could not read the Cayu Cloud manifest from the exact GitHub revision.",
+        )
+    return content
+
+
+def _optional_github_file(repository: str, *, revision: str, path: str) -> str | None:
+    """Read a file at the exact revision, or None when the readable repository lacks it."""
     owner, name = urlsplit(repository).path.strip("/").split("/", maxsplit=1)
     environment = _source_command_environment()
     authentication_available = _github_authentication_available(environment)
@@ -1090,6 +1258,8 @@ def _github_file(repository: str, *, revision: str, path: str) -> str:
             timeout=30,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, subprocess.CalledProcessError) and "(HTTP 404)" in str(exc.stderr):
+            return None
         raise CloudApiError(
             "manifest_unavailable",
             "Could not read the Cayu Cloud manifest from the exact GitHub revision.",
@@ -1108,7 +1278,7 @@ def _anonymous_github_file(
     repository: str,
     revision: str,
     path: str,
-) -> str:
+) -> str | None:
     repository_url = f"https://api.github.com/repos/{owner}/{repository}"
     content_url = f"{repository_url}/contents/{quote(path, safe='/')}"
     repository_response: httpx.Response | None = None
@@ -1144,10 +1314,7 @@ def _anonymous_github_file(
         )
     if response.status_code == 404 and repository_response is not None:
         if 200 <= repository_response.status_code < 300:
-            raise CloudApiError(
-                "manifest_unavailable",
-                "Could not read the Cayu Cloud manifest from the exact GitHub revision.",
-            )
+            return None
         if repository_response.status_code == 404:
             raise CloudApiError(
                 "source_auth_unavailable",

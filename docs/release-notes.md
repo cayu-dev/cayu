@@ -215,6 +215,17 @@ unchanged.
   session-store reservation. App run and fork admission still refuse IDs retired
   by task-store deletion claims; use fresh IDs with dependent stores. SQLite
   and Postgres receipt retention is unchanged.
+- An Agent deployed to Cayu Cloud can declare in `cayu-cloud.toml` how people
+  sign in and which page they land on. `[sign_in] mode = "cloud"` has Cayu
+  Cloud sign them in, `mode = "own"` keeps the Agent's own login, and
+  `public_paths` (only with `"cloud"`) lists path prefixes anyone can open.
+  The top-level `home` names the page people land on when they open the Agent
+  from Cayu Cloud. Both need `schema_version = 2`, and `home` or `"cloud"`
+  must be in the deployment root's `cayu-cloud.toml`. `home` and each public
+  path must be a same-host path starting with `/`; `cayu cloud deploy` refuses
+  anything else with `manifest_invalid`. An Agent that declares nothing keeps its own sign-in.
+  `cayu cloud init` now writes `[sign_in]` with `mode = "cloud"` and no
+  `home`. Cayu Cloud acts on these settings once its router sign-in ships.
 
 ## v0.13.0
 
