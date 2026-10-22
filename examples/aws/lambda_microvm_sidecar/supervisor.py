@@ -134,6 +134,7 @@ class OwnerFence:
         self._generation = 0
         self._digest: bytes | None = None
         self._lease: _LifecycleLease | None = None
+        self._pending_supersede: Callable[[], None] | None = None
 
     def claim(
         self,
@@ -144,12 +145,21 @@ class OwnerFence:
         """Return the current generation and whether this claim superseded another.
 
         ``on_supersede`` runs under the fence's lock after the swap, before any
-        command of the new owner can be admitted.
+        command of the new owner can be admitted. If it fails, its exact
+        callback remains mandatory and neither owner has authority. A retry
+        settles it before completing that claim or advancing another claim.
         """
 
         digest = _claim_digest(claim_id)
         with self._lock:
-            if self._digest is not None and hmac.compare_digest(self._digest, digest):
+            same_claim = self._digest is not None and hmac.compare_digest(self._digest, digest)
+            if self._pending_supersede is not None:
+                self._pending_supersede()
+                self._pending_supersede = None
+                if same_claim:
+                    # The route must still cancel commands of earlier owners.
+                    return self._generation, True
+            if same_claim:
                 return self._generation, False
             if self._lease is not None:
                 raise OwnerLifecycleLeasedError(
@@ -159,7 +169,9 @@ class OwnerFence:
             self._generation += 1
             self._digest = digest
             if superseded and on_supersede is not None:
-                on_supersede()
+                self._pending_supersede = on_supersede
+                self._pending_supersede()
+                self._pending_supersede = None
             return self._generation, superseded
 
     def is_current(self, claim_id: object) -> bool:
@@ -232,7 +244,11 @@ class OwnerFence:
                 self._lease = None
 
     def _is_current_locked(self, digest: bytes) -> bool:
-        return self._digest is not None and hmac.compare_digest(self._digest, digest)
+        return (
+            self._pending_supersede is None
+            and self._digest is not None
+            and hmac.compare_digest(self._digest, digest)
+        )
 
 
 def _claim_digest(claim_id: object) -> bytes:

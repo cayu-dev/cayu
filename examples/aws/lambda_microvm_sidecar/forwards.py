@@ -54,6 +54,8 @@ class _Connection:
         self.write_lock = threading.Lock()
         self.write_offset = 0
         self.write_closed = False
+        self.close_lock = threading.Lock()
+        self.close_complete = False
         self.reader = threading.Thread(target=self._receive, daemon=True)
 
     def _receive(self) -> None:
@@ -123,16 +125,17 @@ class _Connection:
             return {"offset": self.write_offset, "closed": self.write_closed}
 
     def close(self) -> None:
-        with self.condition:
-            if self.closed:
+        with self.close_lock:
+            if self.close_complete:
                 return
-            self.closed = True
-            self.buffer.clear()
-            self.condition.notify_all()
-        with contextlib.suppress(OSError):
-            self.socket.shutdown(socket.SHUT_RDWR)
-        with contextlib.suppress(OSError):
+            with self.condition:
+                self.closed = True
+                self.buffer.clear()
+                self.condition.notify_all()
+            with contextlib.suppress(OSError):
+                self.socket.shutdown(socket.SHUT_RDWR)
             self.socket.close()
+            self.close_complete = True
 
 
 class _Forward:
@@ -157,6 +160,7 @@ class _Forward:
         self.on_expire = on_expire
         self.condition = threading.Condition()
         self.connections: dict[int, _Connection] = {}
+        self.pending_connections: set[_Connection] = set()
         self.last_connection = 0
         self.closed = False
         self.thread = threading.Thread(
@@ -177,17 +181,32 @@ class _Forward:
                 continue
             except OSError:
                 return
-            client.settimeout(_SEND_TIMEOUT_SECONDS)
+            connection = _Connection(client, self.window_bytes)
             with self.condition:
-                if self.closed or len(self.connections) >= self.max_connections:
-                    with contextlib.suppress(OSError):
-                        client.close()
-                    continue
-                self.last_connection += 1
-                connection = _Connection(client, self.window_bytes)
-                self.connections[self.last_connection] = connection
-                connection.reader.start()
-                self.condition.notify_all()
+                self.pending_connections.add(connection)
+            try:
+                client.settimeout(_SEND_TIMEOUT_SECONDS)
+                with self.condition:
+                    if not self.closed and len(self.connections) < self.max_connections:
+                        self.last_connection += 1
+                        self.connections[self.last_connection] = connection
+                        self.pending_connections.remove(connection)
+                        connection.reader.start()
+                        self.condition.notify_all()
+                        continue
+                connection.close()
+                with self.condition:
+                    self.pending_connections.discard(connection)
+            except OSError:
+                # Retain even a rejected client's socket when setup/close
+                # fails. Stop accepting so the retained set stays bounded;
+                # immediately attempt the owning teardown, including healthy
+                # connections, rather than abandoning lifetime cleanup.
+                with self.condition:
+                    self.closed = True
+                    self.condition.notify_all()
+                self.on_expire(self.forward_id)
+                return
 
     def accept(self, after: int, *, wait_s: float) -> dict[str, Any]:
         with self.condition:
@@ -213,24 +232,89 @@ class _Forward:
 
     def close_connection(self, identifier: int) -> None:
         with self.condition:
-            connection = self.connections.pop(identifier, None)
+            connection = self.connections.get(identifier)
         if connection is not None:
             connection.close()
+            with self.condition:
+                self.connections.pop(identifier, None)
 
     def close(self) -> None:
+        # The registry's closing record serializes calls, including retries
+        # after an incomplete teardown. ``closed`` fences I/O, not completion.
         with self.condition:
-            if self.closed:
-                return
             self.closed = True
-            connections = tuple(self.connections.values())
-            self.connections.clear()
             self.condition.notify_all()
-        with contextlib.suppress(OSError):
-            self.listener.close()
-        for connection in connections:
-            connection.close()
+        failure: Exception | None = None
+        # Attempt each independent resource even when another cannot close.
+        # The last drain includes clients returned by accept during teardown.
+        for close in (
+            self.listener.close,
+            self._close_connections,
+            self._join_accept_thread,
+            self._close_connections,
+        ):
+            try:
+                close()
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def _join_accept_thread(self) -> None:
         if threading.current_thread() is not self.thread:
             self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                raise CommandConflictError("forward teardown is still running; retry close")
+
+    def _close_connections(self) -> None:
+        with self.condition:
+            identifiers = tuple(self.connections)
+            pending = tuple(self.pending_connections)
+        failure: Exception | None = None
+        for identifier in identifiers:
+            try:
+                self.close_connection(identifier)
+            except Exception as exc:
+                failure = failure or exc
+        for connection in pending:
+            try:
+                connection.close()
+                with self.condition:
+                    self.pending_connections.discard(connection)
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+
+class _ClosingForward:
+    """One retained teardown, shared by individual and lifecycle closes."""
+
+    def __init__(self, forward: _Forward) -> None:
+        self.forward = forward
+        self.condition = threading.Condition()
+        self.running = False
+        self.complete = False
+
+    def close(self, *, wait: bool = True) -> bool:
+        with self.condition:
+            while self.running:
+                if not wait:
+                    return False
+                self.condition.wait()
+            if self.complete:
+                return True
+            self.running = True
+        complete = False
+        try:
+            self.forward.close()
+            complete = True
+        finally:
+            with self.condition:
+                self.complete = complete
+                self.running = False
+                self.condition.notify_all()
+        return True
 
 
 class PortForwardRegistry:
@@ -258,6 +342,7 @@ class PortForwardRegistry:
         self.window_bytes = window_bytes
         self._lock = threading.Lock()
         self._forwards: dict[str, _Forward] = {}
+        self._closing: dict[str, _ClosingForward] = {}
         self._tombstones: dict[str, float] = {}
 
     def open(
@@ -271,16 +356,18 @@ class PortForwardRegistry:
         lifetime = _lifetime(timeout_s)
         with self._lock:
             self._prune_tombstones()
-            if identifier in self._tombstones:
+            if identifier in self._tombstones or identifier in self._closing:
                 raise CommandConflictError("forward was already closed")
             existing = self._forwards.get(identifier)
             if existing is not None:
                 if existing.owner_generation != owner_generation:
                     raise CommandConflictError("forward belongs to another owner")
+                if existing.closed:
+                    raise CommandConflictError("forward teardown is incomplete; retry close")
                 return self._describe(existing)
             # Reserve the close fence at admission so expiry never depends on
             # spare tombstone capacity, even when the host has disappeared.
-            if len(self._forwards) + len(self._tombstones) >= _MAX_TOMBSTONES:
+            if self._entry_count() >= _MAX_TOMBSTONES:
                 raise CommandConflictError("forward closure fencing capacity exhausted")
             listener = self._bind_locked()
             forward = _Forward(
@@ -290,7 +377,7 @@ class PortForwardRegistry:
                 expires_at=None if lifetime is None else time.monotonic() + lifetime,
                 max_connections=self.max_connections,
                 window_bytes=self.window_bytes,
-                on_expire=self.close,
+                on_expire=self._expire,
             )
             self._forwards[identifier] = forward
             forward.thread.start()
@@ -349,7 +436,9 @@ class PortForwardRegistry:
     ) -> dict[str, Any]:
         identifier = _non_negative_int(connection, "connection")
         with contextlib.suppress(CommandNotFoundError):
-            self._forward(forward_id, owner_generation).close_connection(identifier)
+            self._forward(forward_id, owner_generation, include_closing=True).close_connection(
+                identifier
+            )
         return {"connection": identifier, "closed": True}
 
     def close(self, forward_id: object) -> dict[str, Any]:
@@ -358,35 +447,87 @@ class PortForwardRegistry:
             self._prune_tombstones()
             if (
                 identifier not in self._forwards
+                and identifier not in self._closing
                 and identifier not in self._tombstones
-                and len(self._forwards) + len(self._tombstones) >= _MAX_TOMBSTONES
+                and self._entry_count() >= _MAX_TOMBSTONES
             ):
                 raise CommandConflictError(
                     "forward closure fencing capacity exhausted; retry close"
                 )
             self._tombstones[identifier] = time.monotonic() + _TOMBSTONE_TTL_SECONDS
-            forward = self._forwards.pop(identifier, None)
-        if forward is not None:
-            forward.close()
+            closing = self._retire(identifier)
+        if closing is not None:
+            self._finish_close(identifier, closing)
         return {"forward_id": identifier, "closed": True}
 
     def close_all(self) -> None:
         with self._lock:
-            forwards = tuple(self._forwards.values())
-            self._forwards.clear()
-        for forward in forwards:
-            forward.close()
+            for identifier in tuple(self._forwards):
+                self._retire(identifier)
+            closing = tuple(self._closing.items())
+        failure: Exception | None = None
+        for identifier, record in closing:
+            try:
+                self._finish_close(identifier, record)
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
 
-    def _forward(self, forward_id: object, owner_generation: int | None) -> _Forward:
+    def _expire(self, identifier: str) -> None:
+        # A different closer may be joining this accept thread. Expiry does
+        # not acknowledge closure: leave that closer's record for all waiters
+        # and return so its join can finish.
+        with self._lock:
+            if identifier in self._closing:
+                return
+            self._tombstones[identifier] = time.monotonic() + _TOMBSTONE_TTL_SECONDS
+            closing = self._retire(identifier)
+        if closing is not None:
+            try:
+                self._finish_close(identifier, closing, wait=False)
+            except (OSError, CommandConflictError):
+                # Internal expiry/fault teardown acknowledges nothing. Keep
+                # uncertain resources fenced for an explicit positive close.
+                return
+
+    def _retire(self, identifier: str) -> _ClosingForward | None:
+        """Move admission to the retained closing set while holding ``_lock``."""
+        forward = self._forwards.pop(identifier, None)
+        if forward is not None:
+            self._closing[identifier] = _ClosingForward(forward)
+        return self._closing.get(identifier)
+
+    def _finish_close(
+        self, identifier: str, closing: _ClosingForward, *, wait: bool = True
+    ) -> None:
+        if closing.close(wait=wait):
+            with self._lock:
+                if self._closing.get(identifier) is closing:
+                    del self._closing[identifier]
+
+    def _entry_count(self) -> int:
+        # A closing forward may already have its reserved tombstone. Count
+        # that identifier once, and retain its capacity until teardown ends.
+        return len(self._forwards) + len(self._tombstones.keys() | self._closing.keys())
+
+    def _forward(
+        self, forward_id: object, owner_generation: int | None, *, include_closing: bool = False
+    ) -> _Forward:
         identifier = _forward_id(forward_id)
         with self._lock:
             forward = self._forwards.get(identifier)
+            if forward is None and include_closing:
+                closing = self._closing.get(identifier)
+                forward = None if closing is None else closing.forward
         if forward is None or forward.owner_generation != owner_generation:
             raise CommandNotFoundError("forward not found")
         return forward
 
     def _bind_locked(self) -> socket.socket:
-        used = {forward.port for forward in self._forwards.values()}
+        used = {forward.port for forward in self._forwards.values()} | {
+            closing.forward.port for closing in self._closing.values()
+        }
         for port in self.ports:
             if port in used:
                 continue

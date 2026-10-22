@@ -14313,6 +14313,18 @@ image that reports another version. Protocol 7 adds port forwards through
 runner relays each connection to a host `host:port` over the owner-fenced endpoint, moving bytes
 by offset in both directions. A newer owner claim, suspension, termination or the forward's
 `timeout_s` closes it, and `close()` returns only after the sidecar confirms the listener closed.
+Duplicate closes and lifecycle shutdowns wait for the same retained teardown of the listener
+and its accepted connections, including an expiry-driven close already in progress. Admission
+is fenced immediately, but a socket-close failure or accept-thread join timeout does not
+acknowledge closure: the exact draining forward remains available to a subsequent close.
+Rejected-client setup or close failure triggers one immediate teardown attempt. Aggregate
+teardown attempts every independently reachable connection and forward before reporting its
+first failure, retaining uncertain resources for an explicit successful close.
+An owner takeover interrupted by relay teardown retains its original cleanup callback.
+Neither the previous nor the pending owner can pass an ownership check, admit commands, or
+acquire a lifecycle lease until that callback succeeds. Retrying the same claim settles the
+existing generation; a different claim first settles the pending cleanup, then advances the
+generation. Supplying a different callback or omitting it cannot skip that retained cleanup.
 A failed open that cannot confirm closure retains its cleanup handle on the original error
 (including cancellation). Recover it with `RunnerPortForwardCapability.failed_open_forward(error)`
 and retry `close()` before treating the listener as closed. Idle guest receive timeouts keep

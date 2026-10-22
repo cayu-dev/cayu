@@ -231,6 +231,18 @@ A forward accepts at most 32 connections at a time. A superseding owner claim, t
 terminate hooks, and the forward's `timeout_s` all close it. Forward requests run on their own
 thread pool, as stdio requests do.
 
+Concurrent closes share one retained teardown. A duplicate close or lifecycle hook waits for
+the listener and accepted connections to close; removing admission or reaching a join timeout
+does not confirm closure. Failed teardown remains fenced and retryable. A rejected-client setup
+or close failure immediately attempts teardown; it does not abandon the listener or healthy
+connections. Aggregate teardown attempts every independently reachable connection and forward
+before reporting its first failure. Persistent failures still require a successful explicit close.
+If this interrupts an
+owner takeover, both owners have no authority until the original cleanup callback succeeds.
+Retrying the same claim settles that takeover without another generation; a third claim must
+settle it before advancing ownership. Omitting or replacing the retry's callback cannot bypass
+the retained cleanup. Rebuild the sidecar image to apply these fixes; the protocol stays 7.
+
 - `GET /health`
 - `POST /v1/owner`
 - `POST /v1/owner/check`

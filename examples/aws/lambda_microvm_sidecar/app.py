@@ -396,17 +396,22 @@ async def resume_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
 @app.post("/aws/lambda-microvms/runtime/v1/suspend")
 async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
-    await asyncio.to_thread(SUPERVISOR.cancel_all)
-    await asyncio.to_thread(FORWARDS.close_all)
-    # The provider applied the leased suspend, and the owner never retries it.
-    OWNER.settle_lifecycle("suspend")
+    try:
+        await asyncio.to_thread(SUPERVISOR.cancel_all)
+        await asyncio.to_thread(FORWARDS.close_all)
+    finally:
+        # The provider applied the leased suspend even if cleanup failed.
+        # Retained forward custody is settled separately by its next close.
+        OWNER.settle_lifecycle("suspend")
     return {"status": "ok"}
 
 
 @app.post("/aws/lambda-microvms/runtime/v1/terminate")
 async def terminate_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
-    await asyncio.to_thread(SUPERVISOR.cancel_all)
-    await asyncio.to_thread(FORWARDS.close_all)
-    OWNER.settle_lifecycle("terminate")
+    try:
+        await asyncio.to_thread(SUPERVISOR.cancel_all)
+        await asyncio.to_thread(FORWARDS.close_all)
+    finally:
+        OWNER.settle_lifecycle("terminate")
     return {"status": "ok"}

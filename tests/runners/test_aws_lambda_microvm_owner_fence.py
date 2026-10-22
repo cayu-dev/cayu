@@ -107,6 +107,53 @@ def test_repeated_claim_is_idempotent_and_does_not_cancel(sidecar, tmp_path: Pat
     assert sidecar.SUPERVISOR.get(running["command_id"])["state"] == "running"
 
 
+@pytest.mark.parametrize("third_claim", [False, True], ids=["same_claim", "third_claim"])
+@pytest.mark.parametrize("replacement", [False, True], ids=["omitted", "replaced"])
+def test_pending_takeover_retains_its_settlement_and_refuses_authority(third_claim, replacement):
+    from examples.aws.lambda_microvm_sidecar.supervisor import OwnerFence, OwnerSupersededError
+
+    fence = OwnerFence()
+    assert fence.claim(_CLAIM_A) == (1, False)
+    fail = True
+    calls = []
+
+    def settle():
+        calls.append("retained")
+        if fail:
+            raise OSError("partial teardown")
+
+    with pytest.raises(OSError, match="partial teardown"):
+        fence.claim(_CLAIM_B, on_supersede=settle)
+    for claim in (_CLAIM_A, _CLAIM_B):
+        assert not fence.is_current(claim)
+        with pytest.raises(OwnerSupersededError):
+            fence.require(claim)
+        with pytest.raises(OwnerSupersededError), fence.admitted(claim):
+            pytest.fail("pending takeover admitted work")
+        with pytest.raises(OwnerSupersededError):
+            fence.acquire_lifecycle(claim, "suspend")
+
+    successor = "c" * 64 if third_claim else _CLAIM_B
+    replacement_callback = (lambda: calls.append("replacement")) if replacement else None
+    with pytest.raises(OSError, match="partial teardown"):
+        fence.claim(successor, on_supersede=replacement_callback)
+    assert calls == ["retained", "retained"]
+    assert not fence.is_current(successor)
+
+    fail = False
+    generation = 3 if third_claim else 2
+    assert fence.claim(successor, on_supersede=replacement_callback) == (generation, True)
+    expected = ["retained"] * 3
+    if third_claim and replacement:
+        expected.append("replacement")
+    assert calls == expected
+    assert fence.claim(successor) == (generation, False)
+    assert fence.require(successor) == generation
+    assert not fence.is_current(_CLAIM_A)
+    if third_claim:
+        assert not fence.is_current(_CLAIM_B)
+
+
 def _wait_for_state(sidecar, command_id: str, state: str, timeout_s: float = 10) -> None:
     deadline = time.monotonic() + timeout_s
     while sidecar.SUPERVISOR.get(command_id)["state"] != state:
