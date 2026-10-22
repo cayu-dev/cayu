@@ -1923,3 +1923,65 @@ io.BytesIO = reject_memory
         _workspace(tmp_path).write_tar_stream(archive, archive_bytes=len(archive.getvalue()))
     )
     assert (tmp_path / "result.bin").read_bytes() == content
+
+
+@pytest.mark.parametrize("limit", ["explicit", "memory"])
+@pytest.mark.parametrize("capacity", ["full", "small"])
+def test_streamed_tar_refuses_in_memory_staging_past_its_limit(
+    tmp_path, monkeypatch, limit, capacity
+):
+    # Without disk space for the archive, staging it in memory must fail
+    # clearly before reading the stream, not grow until the guest is killed.
+    content = b"payload" * 1024
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        info = tarfile.TarInfo("result.bin")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    size = len(archive.getvalue())
+    archive.seek(0)
+    program = runner_workspace_module._RUNNER_WORKSPACE_PROGRAM
+    if capacity == "full":
+        injected = """
+def reject_tmp(*args, **kwargs):
+    raise OSError(28, "No space left on device")
+tempfile.TemporaryFile = reject_tmp
+"""
+    else:
+        injected = """
+from types import SimpleNamespace
+os.fstatvfs = lambda fd: SimpleNamespace(f_bavail=1, f_frsize=1)
+"""
+    injected += """
+def reject_memory(*args, **kwargs):
+    raise MemoryError("Archive must not be staged in memory")
+io.BytesIO = reject_memory
+"""
+    program = program.replace(
+        "import tarfile\nimport tempfile", "import tarfile\nimport tempfile\n" + injected
+    )
+    if limit == "explicit":
+        marker = (
+            "MEMORY_TAR_STAGING_LIMIT_BYTES = "
+            f"{runner_workspace_module.RUNNER_WORKSPACE_TAR_MEMORY_STAGING_LIMIT_BYTES}\n"
+        )
+        assert marker in program
+        program = program.replace(marker, f"MEMORY_TAR_STAGING_LIMIT_BYTES = {size - 1}\n")
+        expected = "exceeds the .*-byte in-memory staging limit"
+    else:
+        cgroup = tmp_path / "cgroup"
+        cgroup.mkdir()
+        (cgroup / "memory.max").write_text(f"{64 * 1024 * 1024}\n", encoding="ascii")
+        (cgroup / "memory.current").write_text(f"{64 * 1024 * 1024 - size}\n", encoding="ascii")
+        assert '"/sys/fs/cgroup/memory.max"' in program
+        program = program.replace(
+            '"/sys/fs/cgroup/memory.max"', repr(str(cgroup / "memory.max"))
+        ).replace('"/sys/fs/cgroup/memory.current"', repr(str(cgroup / "memory.current")))
+        expected = f"needs about {2 * size} bytes but the guest's memory limit leaves {size}"
+    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_PROGRAM", program)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    with pytest.raises(RuntimeError, match=expected):
+        asyncio.run(_workspace(workspace_root).write_tar_stream(archive, archive_bytes=size))
+    assert not (workspace_root / "result.bin").exists()

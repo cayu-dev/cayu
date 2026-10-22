@@ -895,10 +895,10 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     the default for coding products that publish Git changes.
 
     ``command_cleanup`` selects what a command timeout or cancellation stops.
-    The default ``"command_or_sandbox"`` kills the command's process tree and
-    keeps the container and its workspace once the guest confirms that every
-    descendant exited; it removes the container only when that cannot be
-    confirmed. ``"sandbox"`` always removes the container.
+    The default ``"sandbox"`` always removes the container. ``"command_or_sandbox"``
+    kills the command's process tree and keeps the container and its workspace
+    once Cayu verifies, from outside the command's user, that the tree exited;
+    it removes the container whenever that cannot be verified.
     """
 
     @property
@@ -925,7 +925,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         knowledge_access_scope: KnowledgeAccessScope | None = None,
         deferred: bool = False,
         warm_spares: int = 0,
-        command_cleanup: Literal["command_or_sandbox", "sandbox"] = "command_or_sandbox",
+        command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
@@ -2689,7 +2689,7 @@ def _docker_coding_configuration_fingerprint(
     immutable_input_runtime_compatibility_fingerprint: str | None,
     git_baseline: bool = True,
     deferred: bool = False,
-    command_cleanup: Literal["command_or_sandbox", "sandbox"] = "command_or_sandbox",
+    command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
 ) -> str:
     material = {
         "schema": "cayu.docker_coding_environment.v3",
@@ -2722,8 +2722,11 @@ def _docker_coding_configuration_fingerprint(
     if deferred:
         # Eager fingerprints stay byte-for-byte unchanged.
         material["materialization"] = "deferred"
-    if command_cleanup != "command_or_sandbox":
-        # Default fingerprints stay byte-for-byte unchanged.
+    if command_cleanup != "sandbox":
+        # Container removal is the behaviour every earlier fingerprint
+        # described, so it keeps them byte-for-byte unchanged. Keeping the
+        # container changes the identity: a preserved session cannot resume
+        # under different cleanup rules.
         material["command_cleanup"] = command_cleanup
     return (
         "sha256:"

@@ -77,9 +77,9 @@ class DockerImageIdentity(BaseModel):
 class DockerTmpfsMount(BaseModel):
     """One bounded guest-writable tmpfs mount.
 
-    Mounts are executable by default, like the default ``/tmp`` and
-    ``/workspace`` mounts, so a virtual environment or build output placed on
-    one can run. Pass ``noexec=True`` for a mount that only holds data.
+    Mounts are ``noexec`` by default. Pass ``noexec=False`` for a mount whose
+    files must run, such as a virtual environment or build output; the default
+    ``/tmp`` and ``/workspace`` mounts do.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -87,7 +87,7 @@ class DockerTmpfsMount(BaseModel):
     target: str = Field(max_length=4096)
     size_bytes: StrictInt = Field(ge=1024 * 1024, le=16 * 1024 * 1024 * 1024)
     mode: StrictInt = Field(default=0o700, ge=0, le=0o7777)
-    noexec: StrictBool = False
+    noexec: StrictBool = True
 
     @field_validator("target")
     @classmethod

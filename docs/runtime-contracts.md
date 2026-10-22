@@ -13852,32 +13852,82 @@ evidence. An ambiguous delayed start permanently poisons execution, including
 
 Evidence-bearing Docker creation and `DockerRunner.reconnect_strict()` accept
 `"sandbox"` or `"command_or_sandbox"` for both cleanup fields.
-`DockerCodingEnvironmentFactory` uses `"command_or_sandbox"` by default
-(`command_cleanup="sandbox"` restores container removal). When an
+`DockerCodingEnvironmentFactory` uses `"sandbox"` by default;
+`command_cleanup="command_or_sandbox"` opts in to keeping the container, and
+the choice is part of the factory's configuration fingerprint, so a preserved
+session resumes only under the cleanup rules it was created with. When an
 evidence-bearing runner's admitted executables include `python3`, it runs every
 command, shell or process, in isolated mode (`python3 -I -S`) under a Python
 supervisor that is a child subreaper (`PR_SET_CHILD_SUBREAPER`),
-so every orphaned descendant becomes its child. On timeout or cancellation a
-helper `docker exec` signals the supervisor, which kills its children until
-`/proc` lists none, writes a stop acknowledgement, and removes its state file.
-Only that acknowledgement counts as a confirmed stop: a state file removed by a
-normal exit proves nothing, because a shell command can leave detached
-descendants behind. The supervised command receives the environment the
-supervisor was started with, not Python's locale-coerced copy. This needs no added capability and works with a read-only
-root, a non-root user, all capabilities dropped, `no-new-privileges`, and
-pids and memory limits. The container is removed instead when the helper
-cannot run, the state file is missing or survives the kill, the
-acknowledgement is absent (for example when the command exited normally just
-as cleanup began), a descendant
-survives the bounded kill loop, or the Docker CLI or a stream fails. A runner
-without that supervisor (no runtime evidence or no admitted `python3`) uses
-shell supervisors that cannot see descendants which leave their process group,
-so `"command_or_sandbox"` always removes its container. A durable command
-receipt has no such state file, so its cleanup always removes the container.
-A process command
-returns only after its whole tree exits; a shell command returns when its
-script returns, as before. Confirmation relies on the guest supervisor and
-assumes trusted code; Docker does not claim `untrusted_code_isolation`.
+so every orphaned descendant becomes its child. The supervised command receives
+the environment the supervisor was started with, not Python's locale-coerced
+copy. A process command returns only after its whole tree exits; a shell
+command returns when its script returns, as before.
+
+Under `"command_or_sandbox"` the container is kept only when Cayu verifies the
+stop without trusting any file the command can write. The supervisor's state
+file and stop acknowledgement live in a directory the command's user owns, so
+a command could point them at a decoy; neither counts as evidence. Instead:
+
+1. An observer `docker exec`, run as UID 0 (a user the command cannot ptrace
+   or become), reads `/proc` and finds the supervisor by the exact launch
+   arguments the host recorded, including its unpredictable state path, and
+   by its parent PID of 0. Only `docker exec` can start a process with that
+   parent inside the container, so the command cannot forge one. It records
+   the supervisor's PID and start time.
+2. A helper `docker exec`, run as the command's user, sends that exact PID
+   `SIGTERM`. The supervisor kills its children until `/proc` lists none and
+   exits.
+3. The observer runs again and requires, within a short bound, that the
+   supervisor is gone and that no running process started at or after the
+   supervisor's start time is a child of PID 1 (Docker's init, which adopts
+   every orphan once the supervisor exits). A zombie counts as gone only when
+   it has no other thread, because a process whose main thread exited alone
+   stays a zombie while its other threads run. Reading `/proc` is not atomic,
+   so a scan counts only when the namespace's last allocated PID
+   (`/proc/sys/kernel/ns_last_pid`) is the same before and after it, which
+   shows that no process or thread started meanwhile, and when every process
+   it saw has its parent in the same scan (or a parent PID of 0). A process
+   whose parent exited before the parent's entry was read is reparented to
+   PID 1 only after it was read, so such a scan is repeated.
+
+The observer runs only when the workload restrictions report a read-only
+root, `no-new-privileges` and no added capabilities, and no tmpfs mount is at,
+above or anywhere inside `/bin`, `/etc`, `/lib`, `/lib32`, `/lib64`, `/libx32`,
+`/opt`, `/sbin` or `/usr`. Its shell, the dynamic loader and its configuration
+(`/etc/ld.so.preload`, `/etc/ld.so.cache`), shared libraries, the interpreter
+and its standard library and bytecode caches all come from those trees, and
+the interpreter loads some of them before the observer's own code runs, so a
+writable mount anywhere in them (for example a tmpfs at `/etc`, `/usr/lib64` or
+`/usr/lib/python3.12/encodings/__pycache__`) makes every stop unverifiable. The
+observer starts as `/bin/sh` with the dynamic-loader variables cleared, finds
+`python3` on the container's `PATH` with shell builtins, and runs it only when
+its physical directory is `/usr/bin` or `/usr/local/bin` and it resolves,
+through any symlinks, to a regular file in that directory. A command therefore
+cannot plant the observer, its standard library or a library it loads, and an
+interpreter anywhere else (a virtual environment, `/opt`, a symlink out of the
+system directory) also makes the stop unverifiable. The observer itself
+refuses again when its resolved interpreter or any standard-library directory
+is in, or contains, writable storage. It needs no added capability and works
+with a read-only root, a non-root user, all capabilities dropped,
+`no-new-privileges`, and pids and memory limits. The command cannot replace the
+files the observer runs or gain UID 0; the observer trusts the image's own
+files and symlinks in the system trees, including `/bin/sh`. The container is removed instead when
+any step fails or times out, the supervisor is missing (for example when the
+command exited normally just as cleanup began, or killed its own supervisor),
+a descendant survives, any orphaned process started during the command is
+still running (including another command's background work started meanwhile),
+processes keep starting or exiting anywhere in the container until the bound
+passes, the observer's interpreter is not a system interpreter, `ns_last_pid`
+cannot be read, or the Docker CLI or a stream fails. A runner without that supervisor or
+those restrictions (no runtime evidence, no admitted `python3`, or relaxed
+controls) cannot verify a stop, so `"command_or_sandbox"` always removes its
+container, and `confirmed_cancellation` reports `command_tree_cleanup` as
+false. A durable command receipt has its own guest owner, so its cleanup
+always removes the container. The command's user can still ptrace processes
+that run as that same user, including the supervisor and Docker's init, so
+this verification assumes trusted code; Docker does not claim
+`untrusted_code_isolation`.
 
 After Docker, E2B or Microsandbox allocation is acknowledged, failed or cancelled initial
 workspace setup rolls back under a retained owner. Docker and E2B bound observation by

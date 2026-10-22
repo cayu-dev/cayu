@@ -346,6 +346,7 @@ async def _exercise_timeout_cleanup(
     created = await DockerCodingEnvironmentFactory(
         source_workspace=source,
         toolchain_profile=profile,
+        command_cleanup="command_or_sandbox",
     ).create(
         EnvironmentFactoryRequest(
             session_id=f"live-{label}-timeout",
@@ -378,8 +379,8 @@ async def _exercise_timeout_cleanup(
         )
         assert detached.is_error is True
         assert detached.structured["status"] == "timed_out"
-        # The guest supervisor confirmed that the detached descendant exited,
-        # so the container and its workspace stay usable.
+        # Cayu verified that the detached descendant exited, so the container
+        # and its workspace stay usable.
         assert detached.structured["workspace_mutation_settlement"] == "complete"
         detached_pid = int(detached.structured["stdout"].strip())
         assert detached_pid > 1

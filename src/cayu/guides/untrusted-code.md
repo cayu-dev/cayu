@@ -95,8 +95,10 @@ What the container can and cannot do:
   `HOME` at `/tmp/cayu-home`) are the only writable places, so install packages
   into a virtual environment under `/workspace`. Change the sizes, limits and
   mounts with `DockerWorkloadRestrictions` fields. A `DockerTmpfsMount` you
-  pass replaces the defaults, so keep `/tmp`; mounts may be listed in any order
-  and are executable unless you set `noexec=True`.
+  pass replaces the defaults, so keep `/tmp`; mounts may be listed in any order.
+  A mount you add is `noexec` unless you set `noexec=False`, which the default
+  `/tmp` and `/workspace` mounts do; set it when the mount holds a virtual
+  environment or anything else that must run.
 - Memory is limited to 512 MiB by default (`memory_bytes`), and files written
   to the tmpfs mounts count against it. Keep `memory_bytes` well below the
   memory the Docker engine itself has: the Docker Desktop VM's size on a laptop,

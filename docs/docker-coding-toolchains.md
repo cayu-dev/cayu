@@ -166,19 +166,26 @@ workspace mutations copy back, and exact profile/image/dependency
 identities remain in receipts. The test removes its ephemeral containers and image
 tags on settlement.
 
-A command timeout or cancellation stops that command, not the session. By
-default (`command_cleanup="command_or_sandbox"`) the runner kills the command's
-process tree inside the container and keeps the container, its workspace, and
-the runner once the guest supervisor confirms that every descendant exited.
-The tool result reports a completed `kill_command` cleanup and says the command
+A command timeout or cancellation removes the container by default
+(`command_cleanup="sandbox"`): the result carries a completed `kill_sandbox`
+artifact, says the sandbox was removed, and the environment cannot run more
+commands. Pass `command_cleanup="command_or_sandbox"` to stop only the command:
+the runner kills the command's process tree inside the container and keeps the
+container, its workspace, and the runner once Cayu verifies, from `/proc` and
+as a user other than the command's, that every descendant exited. The tool
+result then reports a completed `kill_command` cleanup and says the command
 was stopped, and the next command runs in the same workspace. The container is
-removed only when that stop cannot be confirmed: the kill helper fails or times
-out, the Docker CLI or a stream fails, or a descendant survives. The result then
-also carries a completed `kill_sandbox` artifact and says the sandbox was
-removed. Pass `command_cleanup="sandbox"` to always remove the container. The
-`confirmed_cancellation` evidence reports `command_tree_cleanup` alongside
-`container_cleanup`; see the Docker cleanup notes in
-[runtime contracts](runtime-contracts.md) for the mechanism.
+still removed whenever that stop cannot be verified: a cleanup helper fails or
+times out, the Docker CLI or a stream fails, a descendant survives, an
+orphaned background process started while the command ran is still running,
+the image's `python3` for the check is not a regular file in `/usr/bin` or
+`/usr/local/bin`, or a writable mount overlaps the image's system directories.
+The result then also carries a completed `kill_sandbox` artifact and says the
+sandbox was removed. The option is part of the factory's configuration
+fingerprint, so a preserved session resumes only under the rules it was
+created with. The `confirmed_cancellation` evidence reports
+`command_tree_cleanup` alongside `container_cleanup`; see the Docker cleanup
+notes in [runtime contracts](runtime-contracts.md) for the mechanism.
 
 If timeout or cancellation removes the owned container before workspace
 publication, finalization fails explicitly and the session cannot claim committed

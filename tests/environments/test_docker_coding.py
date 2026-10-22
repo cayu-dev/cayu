@@ -1271,11 +1271,15 @@ def test_docker_coding_factory_refuses_weakened_privilege_restrictions(
     assert decision.status == "refused"
 
 
-@pytest.mark.parametrize("with_artifacts", [False, True])
+@pytest.mark.parametrize(
+    ("with_artifacts", "command_cleanup"),
+    [(False, None), (True, None), (False, "command_or_sandbox")],
+)
 def test_docker_coding_factory_returns_only_exact_final_evidence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     with_artifacts: bool,
+    command_cleanup: str | None,
 ) -> None:
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
@@ -1309,6 +1313,7 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
             image_identity=_image_identity(), restrictions=restrictions
         ),
         docker_path="/usr/bin/docker",
+        **({} if command_cleanup is None else {"command_cleanup": command_cleanup}),
     )
     request = EnvironmentFactoryRequest(
         session_id="session",
@@ -1361,14 +1366,15 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         assert any("rg" in call and any("name=$1" in arg for arg in call) for call in calls)
         runner = result.environment.runner
         assert isinstance(runner, DockerRunner)
-        assert runner.timeout_cleanup == "command_or_sandbox"
-        assert runner.cancellation_cleanup == "command_or_sandbox"
+        expected_cleanup = command_cleanup or "sandbox"
+        assert runner.timeout_cleanup == expected_cleanup
+        assert runner.cancellation_cleanup == expected_cleanup
         cancellation = next(
             claim for claim in evidence["claims"] if claim["capability"] == "confirmed_cancellation"
         )
         assert {item["name"]: item["value"] for item in cancellation["adapter_details"]} == {
             "container_cleanup": True,
-            "command_tree_cleanup": True,
+            "command_tree_cleanup": command_cleanup == "command_or_sandbox",
             "exact_container_owner": True,
         }
         assert result.environment.binding is not None
@@ -1416,15 +1422,45 @@ def test_docker_coding_command_cleanup_is_an_explicit_option(tmp_path: Path) -> 
         )
 
     default = factory()
-    explicit_default = factory(command_cleanup="command_or_sandbox")
-    container_only = factory(command_cleanup="sandbox")
+    explicit_default = factory(command_cleanup="sandbox")
+    kept_container = factory(command_cleanup="command_or_sandbox")
 
-    assert default.command_cleanup == "command_or_sandbox"
+    # Container removal stays the default until kept containers have soaked.
+    assert default.command_cleanup == "sandbox"
     assert default.execution_profile_identity == explicit_default.execution_profile_identity
-    assert container_only.command_cleanup == "sandbox"
-    assert default.execution_profile_identity != container_only.execution_profile_identity
+    assert kept_container.command_cleanup == "command_or_sandbox"
+    assert default.execution_profile_identity != kept_container.execution_profile_identity
     with pytest.raises(ValueError, match="command_cleanup must be"):
         factory(command_cleanup="command")
+
+
+def test_docker_coding_container_removal_keeps_the_released_fingerprint() -> None:
+    # Every release before command_cleanup removed the container. That
+    # behaviour must keep its fingerprint so preserved sessions still resume,
+    # and keeping the container must change it so a session never resumes
+    # under different cleanup rules than it was created with.
+    configuration: dict[str, Any] = {
+        "image_identity": DockerImageIdentity(reference="example.test/tools@sha256:" + "a" * 64),
+        "restrictions": DockerWorkloadRestrictions(),
+        "artifact_store_fingerprint": None,
+        "required_executables": ("git", "python3", "sh"),
+        "transfer_limits": DockerWorkspaceTransferLimits(),
+        "runtime": None,
+        "seccomp_sha256": None,
+        "toolchain_profile_fingerprint": "sha256:" + "b" * 64,
+        "source_excluded_directory_names": (".git",),
+        "source_excluded_path_patterns": (),
+        "immutable_input_projection_fingerprints": (),
+        "immutable_input_runtime_compatibility_fingerprint": None,
+    }
+    # Computed with Cayu 0.13.0 from the same configuration.
+    released = "sha256:d3ff1ba685d1efe8e02cf41c8ad1622c212150e21bda7bcfc7253820062c3166"
+
+    fingerprint = docker_coding_module._docker_coding_configuration_fingerprint
+
+    assert fingerprint(**configuration) == released
+    assert fingerprint(**configuration, command_cleanup="sandbox") == released
+    assert fingerprint(**configuration, command_cleanup="command_or_sandbox") != released
 
 
 def test_docker_coding_factory_reconnects_exact_preserved_container(
@@ -1534,8 +1570,8 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         assert reconnected.reconnect_metadata == created.reconnect_metadata
         assert reconnected.environment.runner is not None
         assert reconnected.environment.runner.container_id == _CONTAINER_ID
-        assert reconnected.environment.runner.timeout_cleanup == "command_or_sandbox"
-        assert reconnected.environment.runner.cancellation_cleanup == "command_or_sandbox"
+        assert reconnected.environment.runner.timeout_cleanup == "sandbox"
+        assert reconnected.environment.runner.cancellation_cleanup == "sandbox"
         assert store.inspect()[0].reference_count == 1
         assert (
             reconnected.environment.runner.execution_capability_evidence()

@@ -97,8 +97,14 @@ _HOST_ADDRESS_INHIBIT_OPTION = "com.docker.network.bridge.inhibit_ipv4"
 _HOST_ISOLATION_PROBE_TIMEOUT_S = 30.0
 # Runs from the sidecar image in the guest's network namespace, so it sees the
 # guest's interfaces and routes whatever tools the guest image has. A TCP
-# connect that succeeds or is refused means the host answered.
-_HOST_ISOLATION_PROBE_SCRIPT = """
+# connect that succeeds or is refused means the host answered. A missing tool
+# is reported by name before any connect: its "not found" output would
+# otherwise read as an unverified host.
+_HOST_ISOLATION_PROBE_TOOLS = ("timeout", "socat", "awk")
+_HOST_ISOLATION_PROBE_SCRIPT = (
+    f"\nfor tool in {' '.join(_HOST_ISOLATION_PROBE_TOOLS)}; do\n"
+    + """  command -v "$tool" >/dev/null 2>&1 || { echo "probe_tool_missing:$tool"; exit 4; }
+done
 for target do
   output="$(timeout 5 socat -u OPEN:/dev/null "TCP:${target},connect-timeout=2" 2>&1)"
   code=$?
@@ -121,6 +127,7 @@ if [ -r /proc/net/if_inet6 ] && awk '$6 != "lo" { found = 1 } END { exit !found 
 fi
 echo isolated
 """
+)
 _HOST_ISOLATION_PROBE_FAILURES = frozenset(
     {
         "host_reachable",
@@ -1061,6 +1068,14 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             result = lines[-1].strip() if lines else ""
             if code == 0 and result == "isolated":
                 return
+            missing = result.removeprefix("probe_tool_missing:")
+            if missing != result and missing in _HOST_ISOLATION_PROBE_TOOLS:
+                raise UnsupportedEgressError(
+                    "egress_probe_tool_missing: the sidecar image "
+                    f"{self._sidecar_image} has no `{missing}`, which the host isolation "
+                    "probe needs. Use an image that provides /bin/sh, ip, awk, sleep, "
+                    "timeout and socat."
+                )
             reason = result if result in _HOST_ISOLATION_PROBE_FAILURES else "probe_failed"
         except TimeoutError:
             pass

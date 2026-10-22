@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
 from uuid import uuid4
@@ -79,14 +80,18 @@ def _container_exists(docker: str, container_id: str) -> bool:
     )
 
 
-async def _strict_runner(docker: str, image_identity: DockerImageIdentity) -> DockerRunner:
+async def _strict_runner(
+    docker: str,
+    image_identity: DockerImageIdentity,
+    restrictions: DockerWorkloadRestrictions | None = None,
+) -> DockerRunner:
     return await DockerRunner.create(
         f"cayu-tree-cleanup-live-{uuid4().hex[:12]}",
         image=image_identity.reference,
         image_identity=image_identity,
         # Read-only root, nonroot user, all capabilities dropped,
         # no-new-privileges, and pids/memory limits.
-        workload_restrictions=DockerWorkloadRestrictions(),
+        workload_restrictions=restrictions or DockerWorkloadRestrictions(),
         required_executables=("python3", "setsid", "sh", "sleep"),
         network="none",
         replace=False,
@@ -156,6 +161,54 @@ def test_timed_out_command_tree_is_stopped_and_container_is_kept(kind: str) -> N
     asyncio.run(run())
 
 
+# Points the guest-writable state file at a decoy that acknowledges a stop
+# and exits, while the real tree keeps running.
+_DECOY = """
+import os, signal, sys, time
+state = sys.argv[1]
+def stop(*_):
+    open(state + ".stopped", "w").close()
+    os.unlink(state)
+    os._exit(0)
+signal.signal(signal.SIGTERM, stop)
+with open(state, "w") as handle:
+    handle.write(f"{os.getpid()} 2\\n")
+time.sleep(300)
+"""
+_DECOY_SCRIPT = (
+    f"state=$(ls {DOCKER_COMMAND_STATE_DIR}/*.pid); "
+    'read original ignored < "$state"; '
+    f'python3 -c {shlex.quote(_DECOY)} "$state" & '
+    f"echo $! >> {_PIDS}; "
+    f"sleep 300 & echo $! >> {_PIDS}; "
+    'while read current ignored < "$state" && test "$current" = "$original"; do sleep 0.05; done; '
+    f"echo $$ >> {_PIDS}; "
+    "sleep 300"
+)
+
+
+def test_forged_state_file_cannot_fake_a_stop() -> None:
+    docker, image_identity = _docker_and_image()
+
+    async def run() -> None:
+        runner = await _strict_runner(docker, image_identity)
+        try:
+            timed_out = await runner.exec(ExecCommand.bash(_DECOY_SCRIPT), timeout_s=3)
+
+            assert timed_out.timed_out is True
+            # Cayu signals the supervisor it observed, not the decoy, so the
+            # real tree stops; otherwise it would have to remove the container.
+            assert [(item["action"], item["status"]) for item in timed_out.artifacts] == [
+                ("kill_command", "completed")
+            ]
+            assert runner.lifecycle_state == "reusable"
+            await _recorded_pids_are_gone(runner)
+        finally:
+            await runner.close()
+
+    asyncio.run(run())
+
+
 def test_supervised_shell_keeps_the_environment_it_was_given() -> None:
     docker, image_identity = _docker_and_image()
 
@@ -201,24 +254,48 @@ def test_supervised_shell_preserves_signals_and_command_path(script, environment
     asyncio.run(run())
 
 
-def test_unconfirmed_command_tree_falls_back_to_container_removal() -> None:
+def test_deleted_state_file_does_not_defeat_cleanup() -> None:
     docker, image_identity = _docker_and_image()
 
     async def run() -> None:
         runner = await _strict_runner(docker, image_identity)
         try:
-            # Removing the supervisor's state file leaves cleanup no proof
-            # that the tree exited, so the runner must remove the container.
+            # Cleanup never reads the guest-writable state file, so deleting
+            # it neither fakes nor prevents a verified stop.
             timed_out = await runner.exec(
                 ExecCommand.bash(f"rm -f {DOCKER_COMMAND_STATE_DIR}/*.pid; sleep 300"),
                 timeout_s=2,
             )
 
             assert timed_out.timed_out is True
+            assert [(item["action"], item["status"]) for item in timed_out.artifacts] == [
+                ("kill_command", "completed")
+            ]
+            assert runner.lifecycle_state == "reusable"
+        finally:
+            await runner.close()
+
+    asyncio.run(run())
+
+
+def test_unverifiable_command_tree_falls_back_to_container_removal() -> None:
+    docker, image_identity = _docker_and_image()
+
+    async def run() -> None:
+        # A writable root lets the command replace files the observer would
+        # run, so this runner cannot verify a stop and removes the container.
+        runner = await _strict_runner(
+            docker, image_identity, DockerWorkloadRestrictions(read_only_root=False)
+        )
+        try:
+            timed_out = await runner.exec(ExecCommand.bash("sleep 300"), timeout_s=2)
+
+            assert timed_out.timed_out is True
             command_cleanup, container_cleanup = timed_out.artifacts
-            assert command_cleanup["action"] == "kill_command"
-            # Retried helpers can exhaust the phase bound on a loaded host.
-            assert command_cleanup["status"] in {"failed", "timeout"}
+            assert (command_cleanup["action"], command_cleanup["status"]) == (
+                "kill_command",
+                "failed",
+            )
             assert (container_cleanup["action"], container_cleanup["status"]) == (
                 "kill_sandbox",
                 "completed",

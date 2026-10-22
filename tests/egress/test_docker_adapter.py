@@ -1132,6 +1132,14 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
         (_isolated_network(), (3, "ipv6_address_present\n"), r"\(ipv6_address_present\)"),
         (_isolated_network(), (125, "unexpected\n"), r"\(probe_failed\)"),
         (_isolated_network(), (0, ""), r"\(probe_failed\)"),
+        # A sidecar image without a probe tool says so instead of reading as
+        # an unverified host.
+        (
+            _isolated_network(),
+            (4, "probe_tool_missing:timeout\n"),
+            r"^egress_probe_tool_missing: the sidecar image .* has no `timeout`",
+        ),
+        (_isolated_network(), (4, "probe_tool_missing:curl\n"), r"\(probe_failed\)"),
     ],
 )
 def test_create_runner_refuses_a_hardened_guest_that_may_reach_the_host(
@@ -1154,6 +1162,33 @@ def test_create_runner_refuses_a_hardened_guest_that_may_reach_the_host(
         asyncio.run(adapter.create_runner(_hardened_runner_request()))
     # The runner is never handed out; its container is removed.
     assert closed == [_GUEST_ID]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize("missing", ["timeout", "socat", "awk"])
+def test_host_probe_names_a_missing_tool_before_connecting(tmp_path, missing) -> None:
+    import subprocess
+
+    from cayu.egress.docker_adapter import _HOST_ISOLATION_PROBE_SCRIPT
+
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    for tool in {"timeout", "socat", "awk"} - {missing}:
+        # Any connect attempt would be recorded and then look unverified.
+        stub = tools / tool
+        stub.write_text(f"#!/bin/sh\necho {tool} ran >> {tmp_path}/ran\nexit 1\n")
+        stub.chmod(0o755)
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", _HOST_ISOLATION_PROBE_SCRIPT, "probe", "10.213.42.1:41000"],
+        env={"PATH": str(tools)},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert (completed.returncode, completed.stdout) == (4, f"probe_tool_missing:{missing}\n")
+    assert not (tmp_path / "ran").exists()
 
 
 def test_host_probe_targets_a_free_gateway_address(monkeypatch) -> None:

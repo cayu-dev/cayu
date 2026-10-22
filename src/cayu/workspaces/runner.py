@@ -77,9 +77,16 @@ DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES = MAX_READ_LIMIT_BYTES
 DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT = 500
 RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES = 4096
 RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
+# The largest streamed tar a guest stages in memory when its temporary storage
+# cannot hold it. The guest also refuses less when its memory limit leaves no
+# room for the staged archive plus the files it extracts.
+RUNNER_WORKSPACE_TAR_MEMORY_STAGING_LIMIT_BYTES = 128 * 1024 * 1024
 
 _RUNNER_WORKSPACE_PROGRAM = (
     GUEST_DESCRIPTOR_GUARD_SOURCE
+    + f"""
+MEMORY_TAR_STAGING_LIMIT_BYTES = {RUNNER_WORKSPACE_TAR_MEMORY_STAGING_LIMIT_BYTES}
+"""
     + r"""
 import base64
 import hashlib
@@ -796,6 +803,54 @@ def write_tar_operation(root_fd):
     )
 
 
+def guest_memory_headroom():
+    # cgroup v2, then v1. None means no limit could be read.
+    for limit_path, usage_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ),
+    ):
+        try:
+            with open(limit_path, encoding="ascii") as handle:
+                limit = handle.read().strip()
+            with open(usage_path, encoding="ascii") as handle:
+                usage = int(handle.read().strip())
+        except (OSError, ValueError):
+            continue
+        if limit == "max":
+            return None
+        try:
+            return int(limit) - usage
+        except ValueError:
+            return None
+    return None
+
+
+def tar_stream_memory_staging(expected_bytes):
+    # Fail before reading the stream instead of letting a large archive get
+    # guest processes killed for memory.
+    if expected_bytes > MEMORY_TAR_STAGING_LIMIT_BYTES:
+        fail(
+            "workspace_error",
+            f"Workspace tar of {expected_bytes} bytes does not fit in the guest's temporary "
+            f"storage and exceeds the {MEMORY_TAR_STAGING_LIMIT_BYTES}-byte in-memory staging "
+            "limit. Give the guest's temporary directory more space.",
+        )
+    headroom = guest_memory_headroom()
+    # On tmpfs the extracted files use memory too, so leave room for both.
+    if headroom is not None and 2 * expected_bytes > headroom:
+        fail(
+            "workspace_error",
+            f"Workspace tar of {expected_bytes} bytes does not fit in the guest's temporary "
+            f"storage, and staging it in memory needs about {2 * expected_bytes} bytes but the "
+            f"guest's memory limit leaves {max(headroom, 0)}. Give the guest's temporary "
+            "directory more space or the guest more memory.",
+        )
+    return io.BytesIO()
+
+
 def tar_stream_staging_file(expected_bytes):
     # Keep large streamed imports disk-backed when temporary storage can hold
     # them. Hardened guests can have a /tmp tmpfs smaller than valid workspace
@@ -805,14 +860,14 @@ def tar_stream_staging_file(expected_bytes):
     except OSError as error:
         if error.errno != errno.ENOSPC:
             raise
-        return io.BytesIO()
+        return tar_stream_memory_staging(expected_bytes)
     try:
         capacity = os.fstatvfs(staged.fileno())
     except (AttributeError, OSError):
         return staged
     if expected_bytes > capacity.f_bavail * capacity.f_frsize:
         staged.close()
-        return io.BytesIO()
+        return tar_stream_memory_staging(expected_bytes)
     return staged
 
 

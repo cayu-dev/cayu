@@ -419,6 +419,44 @@ def _seccomp_profile_fingerprint(path: str | None) -> str | None:
     return "sha256:" + digest.hexdigest()
 
 
+def _command_tree_is_verifiable(evidence: _DockerRuntimeEvidence | None) -> bool:
+    """Return whether a command's user cannot interfere with the tree observer.
+
+    The observer needs the Python supervisor, runs as UID 0 and trusts the
+    image's files. A read-only root, no-new-privileges and no added
+    capabilities keep a command, which never runs as UID 0 here, from
+    replacing those files, gaining that UID through a set-UID program, or
+    ptracing the observer. Everything the observer loads before it can check
+    anything (its shell, the dynamic loader and its configuration, shared
+    libraries, the interpreter and its standard library) comes from the
+    system trees, so no tmpfs mount may cover them or sit anywhere inside
+    them. The launcher runs only an interpreter in those trees.
+    """
+
+    if (
+        evidence is None
+        or "python3" not in evidence.required_executables
+        or not evidence.restrictions.supports_strict_privilege_evidence
+    ):
+        return False
+    writable = _guest_writable_paths(evidence.restrictions)
+    return not any(
+        _path_is_within(path, tree) or _path_is_within(tree, path)
+        for tree in _COMMAND_TREE_OBSERVER_SYSTEM_TREES
+        for path in writable
+    )
+
+
+def _guest_writable_paths(restrictions: DockerWorkloadRestrictions) -> tuple[str, ...]:
+    """Return every path a hardened guest can write: its tmpfs mounts and system mounts."""
+
+    return (*(mount.target for mount in restrictions.tmpfs), *_GUEST_WRITABLE_SYSTEM_PATHS)
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
 def _cwd_in_tmpfs(cwd: str, restrictions: DockerWorkloadRestrictions) -> bool:
     return any(
         cwd == mount.target or cwd.startswith(mount.target.rstrip("/") + "/")
@@ -1059,6 +1097,165 @@ if os.WIFSIGNALED(direct_status):
 raise SystemExit(125)
 """
 
+# Runs as a user other than the command's, which therefore cannot ptrace it,
+# and reads only /proc: no guest-writable file. ``docker exec`` starts the
+# supervisor from outside the container's PID namespace, so its parent PID is
+# 0 there, and no guest process can create another such process. When the
+# supervisor exits, every descendant still alive reparents to PID 1 (Docker's
+# init), and no guest process can start before the supervisor did.
+#
+# Arguments: the number of guest-writable paths, those paths, the mode and its
+# arguments, and the deadline in seconds.
+_COMMAND_TREE_OBSERVER = """\
+import errno
+import os
+import sys
+import time
+
+PROC = "/proc"
+count = int(sys.argv[1])
+writable = sys.argv[2 : 2 + count]
+args = sys.argv[2 + count :]
+
+def within(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+def guest_writable(path):
+    path = os.path.realpath(path)
+    return any(within(path, root) or within(root, path) for root in writable)
+
+# The host and the launcher already confined the interpreter and its standard
+# library to the system trees; this also refuses one that resolves into, or
+# contains, writable storage.
+if any(guest_writable(path) for path in (sys.executable, *sys.path)):
+    raise SystemExit(1)
+
+def last_pid():
+    with open(PROC + "/sys/kernel/ns_last_pid", "rb") as handle:
+        return int(handle.read())
+
+def processes():
+    own = os.getpid()
+    for name in os.listdir(PROC):
+        if not name.isdigit() or int(name) == own:
+            continue
+        try:
+            with open(PROC + "/" + name + "/stat", "rb") as handle:
+                stat = handle.read()
+            with open(PROC + "/" + name + "/cmdline", "rb") as handle:
+                cmdline = handle.read()
+            # After the parenthesized name: state, ppid, ... starttime (field 22).
+            fields = stat[stat.rindex(b")") + 2 :].split()
+            # A main thread that exits alone stays a zombie while the
+            # process's other threads keep running, so only a zombie with no
+            # other thread is gone.
+            if fields[0] in (b"Z", b"X") and len(os.listdir(PROC + "/" + name + "/task")) <= 1:
+                continue
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            raise
+        yield int(name), int(fields[1]), int(fields[19]), cmdline.split(b"\\0")
+
+deadline = time.monotonic() + float(args[-1])
+if args[0] == "find":
+    state_path = os.fsencode(args[1])
+    while True:
+        found = [
+            (pid, started)
+            for pid, parent, started, argv in processes()
+            if parent == 0 and pid != 1 and argv[1:4] == [b"-I", b"-S", b"-c"]
+            and len(argv) > 5 and argv[5] == state_path
+        ]
+        if len(found) == 1:
+            print(*found[0])
+            raise SystemExit(0)
+        # A cancellation can arrive before the supervisor has started.
+        if found or time.monotonic() >= deadline:
+            raise SystemExit(1)
+        time.sleep(0.05)
+if args[0] != "verify":
+    raise SystemExit(125)
+supervisor, supervisor_started = int(args[1]), int(args[2])
+while True:
+    # The scan is not atomic: a process can fork and exit while it runs. The
+    # namespace's last allocated PID stays the same only if no process or
+    # thread started during the scan, so only then is the scan complete.
+    before = last_pid()
+    observed = list(processes())
+    settled = last_pid() == before
+    # An exit during the scan does not move the last PID. A process whose
+    # parent exited before the parent's entry was read still names that
+    # parent, and is reparented to PID 1 only after it was read, so a scan
+    # that is missing a parent proves nothing either.
+    present = {pid for pid, _, _, _ in observed}
+    settled = settled and all(parent == 0 or parent in present for _, parent, _, _ in observed)
+    remaining = [
+        pid
+        for pid, parent, started, _ in observed
+        if (pid, started) == (supervisor, supervisor_started)
+        or (parent == 1 and started >= supervisor_started)
+    ]
+    # Seeing PID 1 shows that /proc lists the command user's processes.
+    if settled and not remaining and any(pid == 1 for pid, _, _, _ in observed):
+        raise SystemExit(0)
+    if time.monotonic() >= deadline:
+        raise SystemExit(1)
+    time.sleep(0.05)
+"""
+# Starts the observer with the image's system interpreter, using only shell
+# builtins. ``python3`` on the container's PATH must physically be in
+# /usr/bin or /usr/local/bin and resolve to a regular file there (``-ef``
+# follows every symlink), so the interpreter, the standard library it finds
+# from its location, and the libraries it loads are all in the system trees
+# the host checked. Anything else is refused. Arguments as for the observer,
+# whose source is ``$0``.
+_COMMAND_TREE_OBSERVER_LAUNCHER = """\
+p=$(command -v python3) || exit 1
+case $p in /*) ;; *) exit 1 ;; esac
+cd -P "${p%/*}/" 2>/dev/null || exit 1
+dir=$(pwd -P)
+case $dir in /usr/bin|/usr/local/bin) ;; *) exit 1 ;; esac
+python=
+for candidate in "$dir"/python3*; do
+  if [ ! -L "$candidate" ] && [ -f "$candidate" ] && [ "$candidate" -ef "$dir/${p##*/}" ]; then
+    python=$candidate
+    break
+  fi
+done
+[ -n "$python" ] || exit 1
+i=0
+for root do
+  if [ "$i" -ge 1 ] && [ "$i" -le "$1" ]; then
+    case $dir/ in "$root"/*) exit 1 ;; esac
+  fi
+  i=$((i + 1))
+done
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GCONV_PATH LOCPATH
+exec "$python" -I -S -c "$0" "$@"
+"""
+# Writable in every hardened container besides its tmpfs mounts.
+_GUEST_WRITABLE_SYSTEM_PATHS = ("/dev", "/proc", "/sys")
+# Where the observer's shell, loader, loader configuration, libraries,
+# interpreter and standard library come from. A guest-writable mount over or
+# anywhere inside one of these makes the stop unverifiable.
+_COMMAND_TREE_OBSERVER_SYSTEM_TREES = (
+    "/bin",
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/opt",
+    "/sbin",
+    "/usr",
+)
+# Without capabilities the observer cannot signal the command's processes, but
+# it can read their /proc entries. Hardened guests never run as UID 0.
+_COMMAND_TREE_OBSERVER_USER = "0:0"
+_COMMAND_TREE_START_SECONDS = 1.0
+_COMMAND_TREE_SETTLE_SECONDS = 2.0
+
 
 async def _run_docker(
     docker_path: str,
@@ -1068,8 +1265,17 @@ async def _run_docker(
     timeout_s: int | None = None,
     output_redactor: SecretRedactor | None = None,
     admission_completion_token: str | None = None,
+    redact_output: bool = True,
 ) -> ExecResult:
     host_env = docker_cli_env(docker_cli_env_allowlist)
+    if not redact_output:
+        # Only for Runtime-generated control output that the caller validates
+        # strictly and never shows.
+        return await run_subprocess(
+            SubprocessCommand(argv=[docker_path, *args]),
+            env=host_env,
+            timeout_s=timeout_s,
+        )
     allowlisted_redactor = SecretRedactor(
         tuple(value for name in docker_cli_env_allowlist if (value := host_env.get(name)))
     )
@@ -1155,25 +1361,21 @@ def _supervised_command_body(
     )
 
 
-def _kill_supervised_command_script(
-    pid_file: str,
-    *,
-    require_confirmed_tree: bool = False,
-) -> str:
-    """Stop one supervised command; exit 0 only when its stop is confirmed.
+def _kill_supervised_command_script(pid_file: str) -> str:
+    """Stop one supervised command for the ``"command"`` cleanup policy.
 
     The Python supervisor (state ``2``) writes a ``.stopped`` acknowledgement
     only after its signal handler sees no remaining child, and then removes
     the state file. A state file removed without that acknowledgement is a
     normal exit, which proves nothing about detached descendants. Shell
     supervisors (``0`` and ``1``) signal a process group or PID and cannot see
-    descendants that left it, so ``require_confirmed_tree`` reports their
-    cleanup as unconfirmed.
+    descendants that left it. The state file and acknowledgement are writable
+    by the command itself, so ``"command_or_sandbox"`` never relies on this
+    script; see ``_DockerCommandHandle.kill``.
     """
 
     quoted_pid_file = shlex.quote(pid_file)
     quoted_stopped_file = shlex.quote(pid_file + ".stopped")
-    shell_exit = 1 if require_confirmed_tree else 0
     return (
         "attempts=0; "
         f'while ! test -f {quoted_pid_file} && test "$attempts" -lt 20; do '
@@ -1213,7 +1415,7 @@ def _kill_supervised_command_script(
         'kill -KILL "$pid" 2>/dev/null || true; '
         "fi; "
         f"rm -f {quoted_pid_file}; "
-        f"exit {shell_exit}"
+        "exit 0"
     )
 
 
@@ -1233,8 +1435,13 @@ class _DockerCommandHandle:
         self.docker_cli_env_allowlist = tuple(docker_cli_env_allowlist)
         self.user = user
         # Set per cleanup: the command_or_sandbox policy may reuse the runner
-        # only after the guest supervisor confirms that the whole tree exited.
+        # only after Cayu verifies that the command's whole tree exited.
         self.require_confirmed_tree = False
+        # Recorded on the host at launch, only for a Python supervisor in a
+        # container whose controls keep the command from taking another user:
+        # the guest-writable paths the observer must not run from. Without it
+        # the stop can only be confirmed from guest-writable files.
+        self.tree_observer_writable_paths: tuple[str, ...] | None = None
 
     def _exec_argv(self, script: str) -> list[str]:
         argv = ["exec"]
@@ -1260,15 +1467,12 @@ class _DockerCommandHandle:
         return result.exit_code == 0 and not result.timed_out
 
     async def kill(self) -> bool:
+        if self.require_confirmed_tree:
+            return await self._kill_verified_tree()
         for _ in range(RUNNER_COMMAND_KILL_ATTEMPTS):
             result = await _run_docker(
                 self.docker_path,
-                self._exec_argv(
-                    _kill_supervised_command_script(
-                        self.pid_file,
-                        require_confirmed_tree=self.require_confirmed_tree,
-                    )
-                ),
+                self._exec_argv(_kill_supervised_command_script(self.pid_file)),
                 docker_cli_env_allowlist=self.docker_cli_env_allowlist,
             )
             if result.exit_code == 0 and not result.timed_out:
@@ -1277,6 +1481,80 @@ class _DockerCommandHandle:
         # whose supervisor has not started yet. Only acknowledged cleanup may
         # authorize reuse; otherwise the caller must poison the runner.
         return False
+
+    def _observer_argv(self, *args: str) -> list[str]:
+        writable = self.tree_observer_writable_paths
+        assert writable is not None
+        return [
+            "exec",
+            "-u",
+            _COMMAND_TREE_OBSERVER_USER,
+            "-w",
+            "/",
+            # Keep loader settings from the container environment, which may
+            # name guest-writable directories, out of the observer's shell.
+            *("-e", "LD_PRELOAD=", "-e", "LD_LIBRARY_PATH=", "-e", "LD_AUDIT="),
+            self.name,
+            "/bin/sh",
+            "-c",
+            _COMMAND_TREE_OBSERVER_LAUNCHER,
+            _COMMAND_TREE_OBSERVER,
+            str(len(writable)),
+            *writable,
+            *args,
+        ]
+
+    async def _kill_verified_tree(self) -> bool:
+        """Stop the tree and confirm it from /proc as another user, or fail.
+
+        The command can rewrite its state file and acknowledgement, so neither
+        is evidence here. The observer finds the supervisor from host-recorded
+        launch arguments, the command's user signals that exact process, and
+        the observer then requires the supervisor gone and no process that
+        started with or after it left under PID 1. Any failure returns
+        ``False``, so ``command_or_sandbox`` removes the container.
+        """
+
+        if self.tree_observer_writable_paths is None:
+            return False
+        # Read the identity before redaction: an allowlisted value such as an
+        # AWS profile named "4321" must not erase digits from it.
+        found = await _run_docker(
+            self.docker_path,
+            self._observer_argv("find", self.pid_file, str(_COMMAND_TREE_START_SECONDS)),
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+            redact_output=False,
+        )
+        identity = found.stdout.split()
+        if (
+            found.exit_code != 0
+            or found.timed_out
+            or len(identity) != 2
+            or not all(value.isdigit() for value in identity)
+            or int(identity[0]) <= 1
+        ):
+            return False
+        supervisor, started = identity
+        stopped = await _run_docker(
+            self.docker_path,
+            self._exec_argv(
+                f"kill -TERM {supervisor} 2>/dev/null || true; "
+                "attempts=0; "
+                f'while kill -0 {supervisor} 2>/dev/null && test "$attempts" -lt 20; do '
+                "attempts=$((attempts + 1)); sleep 0.1; "
+                "done; "
+                f"rm -f {shlex.quote(self.pid_file)} {shlex.quote(self.pid_file + '.stopped')}"
+            ),
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
+        if stopped.exit_code != 0 or stopped.timed_out:
+            return False
+        verified = await _run_docker(
+            self.docker_path,
+            self._observer_argv("verify", supervisor, started, str(_COMMAND_TREE_SETTLE_SECONDS)),
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
+        return verified.exit_code == 0 and not verified.timed_out
 
 
 def _docker_admission_probe_completion(
@@ -3068,7 +3346,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                             value=(
                                 self.timeout_cleanup == "command_or_sandbox"
                                 and self.cancellation_cleanup == "command_or_sandbox"
-                                and "python3" in evidence.required_executables
+                                and _command_tree_is_verifiable(evidence)
                             ),
                         ),
                         CapabilityDetail(name="exact_container_owner", value=True),
@@ -3588,11 +3866,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         python_executable = "python3"
-        if (
-            "PATH" in environment
-            and self._runtime_evidence is not None
+        python_supervisor = (
+            self._runtime_evidence is not None
             and "python3" in self._runtime_evidence.required_executables
-        ):
+        )
+        if "PATH" in environment and python_supervisor:
             # Resolve under the admitted container environment, before the
             # command's PATH is applied. Keep that PATH intact for its child.
             if self._supervisor_python_path is None:
@@ -3614,6 +3892,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                     raise DockerRuntimeConfigurationError("python_supervisor_unavailable")
                 self._supervisor_python_path = path
             python_executable = self._supervisor_python_path
+        if _command_tree_is_verifiable(self._runtime_evidence):
+            assert self._runtime_evidence is not None
+            handle.tree_observer_writable_paths = _guest_writable_paths(
+                self._runtime_evidence.restrictions
+            )
         with runner_env_file(environment) as env_file:
             environment = {}
             argv = _build_docker_exec_argv(
@@ -3625,10 +3908,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 has_stdin=standard_input is not None or binary_input is not None,
                 pid_file=pid_file,
                 python_executable=python_executable,
-                python_supervisor=(
-                    self._runtime_evidence is not None
-                    and "python3" in self._runtime_evidence.required_executables
-                ),
+                python_supervisor=python_supervisor,
             )
             if receipt is not None:
                 prefix = [self.docker_path, "exec", "-i", "-w", working_dir]

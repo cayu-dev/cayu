@@ -251,22 +251,29 @@ def test_executable_tmpfs_mounts_say_exec_because_docker_defaults_to_noexec() ->
     assert "exec" not in options["/data"]
 
 
-def test_custom_tmpfs_mounts_are_executable_like_the_defaults() -> None:
-    # A mount added only to change a size must still run a virtualenv's scripts.
-    mount = DockerTmpfsMount(target="/workspace", size_bytes=1024 * 1024 * 1024, mode=0o750)
+def test_custom_tmpfs_mounts_are_noexec_unless_they_opt_out() -> None:
+    # A caller's mount stays non-executable unless it asks otherwise; the
+    # default /tmp and /workspace mounts opt out explicitly.
+    data = DockerTmpfsMount(target="/data", size_bytes=1024 * 1024)
+    venv = DockerTmpfsMount(
+        target="/workspace", size_bytes=1024 * 1024 * 1024, mode=0o750, noexec=False
+    )
     restrictions = DockerWorkloadRestrictions(
-        tmpfs=(DockerTmpfsMount(target="/tmp", size_bytes=1024 * 1024, mode=0o1777), mount)
+        tmpfs=(DockerTmpfsMount(target="/tmp", size_bytes=1024 * 1024, mode=0o1777), data, venv)
     )
 
-    assert mount.noexec is False
+    assert data.noexec is True
+    assert data == DockerTmpfsMount(target="/data", size_bytes=1024 * 1024, noexec=True)
     assert all(not default.noexec for default in DockerWorkloadRestrictions().tmpfs)
     args = restrictions.run_args()
-    workspace = next(
-        args[index + 1]
+    options = {
+        args[index + 1].split(":", 1)[0]: args[index + 1].split(":", 1)[1].split(",")
         for index, value in enumerate(args)
-        if value == "--tmpfs" and args[index + 1].startswith("/workspace:")
-    )
-    assert workspace.split(":", 1)[1].split(",")[-1] == "exec"
+        if value == "--tmpfs"
+    }
+    assert options["/data"][-1] == "noexec"
+    assert options["/tmp"][-1] == "noexec"
+    assert options["/workspace"][-1] == "exec"
 
 
 def test_tmpfs_mounts_are_sorted_by_target() -> None:

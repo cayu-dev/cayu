@@ -1492,10 +1492,13 @@ Notes on the Docker adapter:
   `cayu.egress.docker_adapter`, an `alpine/socat` image pinned by digest. Docker
   pulls it on first use, so pull it ahead of time on hosts without registry
   access, or pass a mirrored copy as `sidecar_image=`.
-- A custom `sidecar_image=` must provide `/bin/sh`, `ip`, `awk`, `sleep`, and a
-  `socat` build with `PROXY` plus `proxyauthfile` support, as the default
-  image does. Startup checks that the authenticated listener
-  reached its ready state and fails closed when the image is incompatible.
+- A custom `sidecar_image=` must provide `/bin/sh`, `ip`, `awk`, `sleep`,
+  `timeout`, and a `socat` build with `PROXY` plus `proxyauthfile` support, as
+  the default image does. Startup checks that the authenticated listener
+  reached its ready state and fails closed when the image is incompatible. The
+  hardened guest's host isolation probe also runs from this image; if it lacks
+  `timeout`, `socat` or `awk`, the runner is refused with
+  `egress_probe_tool_missing` naming the tool.
 - `setup_commands` run on the enforced network with the egress overlay applied, so they are
   subject to the **same egress policy** as the app. Bake tools that need arbitrary hosts into the
   image rather than installing them from `setup_commands` under `virtual_egress`.
