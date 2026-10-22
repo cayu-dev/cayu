@@ -206,9 +206,17 @@ app = CayuApp(session_store=store, human_attention_handoff=handoff)
 Applications inherit both variables by default. To disable the handoff for a private
 application in the same process, pass
 `CayuApp(human_attention_handoff=HumanAttentionHandoff(None))`. Runtime does this for its
-internal judge and replay apps, so their sessions never reach the receiver. Leave the
-variables out of separate evaluation processes and coding workspaces. Only one of them
-set is a configuration error for an app using the environment default.
+internal judge, replay, acceptance, benchmark and campaign apps, so their sessions never
+reach the receiver. Eval cases the server runs use the deployed application itself, so
+Runtime marks every session a trial creates instead (runtime-owned metadata
+`cayu:eval_trial`, which callers cannot set). The handoff skips an eval trial, a session
+whose metadata sets `cayu:attention_handoff` to `false`, and every session created under
+either as a subagent or fork, in both the sink and the repair scan. Runtime copies both
+marks onto each subagent and fork when it creates it. Set
+`{"cayu:attention_handoff": false}` on a run of your own that nobody should be asked
+about. It only quiets the receiver: the paused action still waits for an answer. Leave the variables out of separate evaluation
+processes and coding workspaces. Only one of them set is a configuration error for an app
+using the environment default.
 
 `app.human_attention_handoff` is the handoff the application owns, or `None`. An
 application that puts `handoff.event_sinks()` in `event_sinks` itself (the form before

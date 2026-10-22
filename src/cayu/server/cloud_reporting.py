@@ -18,12 +18,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from cayu.applications import CayuApp
 from cayu.cloud_reporting import (
+    CLOUD_ACTIVITY_CURSOR_MAX_CHARS,
     CLOUD_ACTIVITY_DEFAULT_LIMIT,
     CLOUD_ACTIVITY_MAX_LIMIT,
     CloudActivityCursorInvalid,
+    CloudActivityCursorStale,
     CloudActivityPage,
     CloudContract,
     read_cloud_activity,
+    read_cloud_contract,
 )
 from cayu.server._bearer_digests import TOKEN_SHA256_HEX, presented_bearer_digest
 from cayu.server.auth import AuthConfigurationError
@@ -31,8 +34,8 @@ from cayu.server.auth import AuthConfigurationError
 CLOUD_READER_TOKEN_SHA256_VARIABLE = "CAYU_CLOUD_READER_TOKEN_SHA256"
 CLOUD_READER_MAX_TOKENS = 8
 _NO_STORE = {"Cache-Control": "private, no-store"}
-# The longest cursor the contract issues: a sequence of at most 16 digits.
-_CURSOR_MAX_CHARS = 16
+#: The error code of a cursor the agent's store cannot continue.
+CLOUD_ACTIVITY_CURSOR_STALE = "activity_cursor_stale"
 
 
 class CloudReaderBearerAuth:
@@ -108,9 +111,10 @@ def create_cloud_reporting_router(
 ) -> APIRouter:
     """Serve the contract's discovery and activity routes behind ``authenticate``.
 
-    ``GET {prefix}/contract`` names the contract and the versions served;
-    ``GET {prefix}/v1/activity`` returns one ``CloudActivityPage``. A request
-    ``authenticate`` does not accept gets 401.
+    ``GET {prefix}/contract`` names the contract, the versions served and the
+    session store; ``GET {prefix}/v1/activity`` returns one ``CloudActivityPage``,
+    or 410 with code ``activity_cursor_stale`` for a cursor the store cannot
+    continue. A request ``authenticate`` does not accept gets 401.
     """
 
     if not callable(authenticate):
@@ -129,12 +133,14 @@ def create_cloud_reporting_router(
     @router.get("/contract", response_model=CloudContract)
     async def contract(response: Response) -> CloudContract:
         response.headers.update(_NO_STORE)
-        return CloudContract()
+        return await read_cloud_contract(app)
 
     @router.get("/v1/activity", response_model=CloudActivityPage)
     async def activity(
         response: Response,
-        cursor: Annotated[str | None, Query(min_length=1, max_length=_CURSOR_MAX_CHARS)] = None,
+        cursor: Annotated[
+            str | None, Query(min_length=1, max_length=CLOUD_ACTIVITY_CURSOR_MAX_CHARS)
+        ] = None,
         limit: Annotated[
             int, Query(ge=1, le=CLOUD_ACTIVITY_MAX_LIMIT)
         ] = CLOUD_ACTIVITY_DEFAULT_LIMIT,
@@ -144,6 +150,15 @@ def create_cloud_reporting_router(
         except CloudActivityCursorInvalid:
             raise HTTPException(
                 status_code=422, detail="Invalid activity cursor.", headers=_NO_STORE
+            ) from None
+        except CloudActivityCursorStale:
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "code": CLOUD_ACTIVITY_CURSOR_STALE,
+                    "message": "The store cannot continue this cursor; read from the start.",
+                },
+                headers=_NO_STORE,
             ) from None
         except NotImplementedError:
             raise HTTPException(
@@ -176,6 +191,7 @@ def environment_cloud_reporting_router(
 
 
 __all__ = [
+    "CLOUD_ACTIVITY_CURSOR_STALE",
     "CLOUD_READER_MAX_TOKENS",
     "CLOUD_READER_TOKEN_SHA256_VARIABLE",
     "CloudReaderBearerAuth",

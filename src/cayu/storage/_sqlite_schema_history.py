@@ -670,6 +670,14 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    125: """CREATE TABLE IF NOT EXISTS cayu_store_identity (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        store_id TEXT NOT NULL CHECK (
+            length(store_id) = 32 AND store_id NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    INSERT OR IGNORE INTO cayu_store_identity (singleton, store_id)
+    VALUES (1, lower(hex(randomblob(16))));""",
     123: """CREATE TABLE IF NOT EXISTS cayu_task_session_retention_epochs (
         session_id TEXT NOT NULL,
         session_instance_id TEXT NOT NULL,

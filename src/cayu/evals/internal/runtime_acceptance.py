@@ -42,6 +42,7 @@ from cayu.evals import (
     ToolResultContains,
     UsageRecorded,
 )
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -218,6 +219,7 @@ async def build() -> EvalPlan:
     )
 
     app = CayuApp(
+        human_attention_handoff=HumanAttentionHandoff(None),
         context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
         enable_logging=False,
     )

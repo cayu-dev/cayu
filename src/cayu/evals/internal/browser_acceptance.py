@@ -78,6 +78,7 @@ from cayu.evals.runner import EvalCase, EvalPlan, EvalSuite
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import _trajectory_from_terminal_evidence, trajectory_from_session
 from cayu.events import Event, EventType, event_durable_sequence
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.messages import Message, TextPart, ToolResultPart
 from cayu.observability.events import EventSink
 from cayu.providers.base import ModelRequest, ModelStreamEvent
@@ -1120,6 +1121,7 @@ def _build_runtime(
     )
     artifact_store = _FaultArtifactStore(root / "artifacts", control=control)
     app = CayuApp(
+        human_attention_handoff=HumanAttentionHandoff(None),
         session_store=store,
         event_sinks=[_AcceptanceEventJournalSink(root / _OBSERVED_EVENTS_FILENAME)],
         enable_logging=False,

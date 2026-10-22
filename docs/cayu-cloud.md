@@ -688,8 +688,8 @@ application mounts the control plane with `mount_cayu`, `/api/cloud` under
 
 The token is not the operator login. It reads two routes and nothing else:
 
-- `GET {api}/cloud/contract` names the contract and the versions the Agent
-  serves.
+- `GET {api}/cloud/contract` names the contract, the versions the Agent
+  serves and `store_id`, the identity of the Agent's session store.
 - `GET {api}/cloud/v1/activity?cursor=...` returns the summaries of the runs that
   changed after the cursor and the human touches that settled in the same range.
 
@@ -703,9 +703,17 @@ Developer dashboard.
 
 A reader stores the cursor of each page it accepted and continues from it, so
 neither its own restart nor the Agent's leaves a gap, and it keeps the latest
-summary per run and one record per touch. A Runtime older than the contract
-answers 404 there, which a reader reports as too old for the contract. The wire
-format, the cursor rules and how Cloud's four measures are computed are in the
+summary per run and one record per touch. A cursor names the store it came
+from. When the Agent's database is replaced, or restored from a backup and
+written past it, the Agent answers 410 with code `activity_cursor_stale`, and
+the reader reads again from the beginning. After restoring an Agent's database,
+also discard the reader's cursor yourself: a restore the Agent has not written
+past yet cannot be detected. Measures leave out forked sessions, such as the
+copies Compass makes, even though their `root_run_id` names the run they were
+copied from, and eval sessions (`eval: true`): the trials of the eval cases the
+Agent runs, and everything under them. A Runtime older than the contract answers 404 there, which a
+reader reports as too old for the contract. The wire format, the cursor rules
+and how Cloud's four measures are computed are in the
 [runtime contracts](runtime-contracts.md#cayu-cloud-agent-contract).
 
 To read it from a local server:

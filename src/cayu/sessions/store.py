@@ -4757,6 +4757,15 @@ class SessionStore(ABC):
         """Test matching durable evidence without hydrating event payloads."""
         raise NotImplementedError("This SessionStore does not support event existence queries.")
 
+    async def read_store_identity(self) -> str:
+        """This store's identity: 32 lowercase hex digits, chosen once when its storage was created.
+
+        A durable store keeps it in its database, so a restart reads it again and a
+        different database has another. A database restored from a backup keeps the
+        identity it had when the backup was taken.
+        """
+        raise NotImplementedError("This SessionStore has no store identity.")
+
     async def query_events_bounded(
         self,
         query: EventQuery,

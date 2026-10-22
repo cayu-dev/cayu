@@ -689,6 +689,15 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    125: (
+        """CREATE TABLE IF NOT EXISTS cayu_store_identity (
+        singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+        store_id TEXT COLLATE "C" NOT NULL CHECK (store_id ~ '^[0-9a-f]{32}$')
+    )""",
+        "INSERT INTO cayu_store_identity (singleton, store_id) "
+        "VALUES (1, replace(gen_random_uuid()::text, '-', '')) "
+        "ON CONFLICT (singleton) DO NOTHING",
+    ),
     123: (
         """CREATE TABLE IF NOT EXISTS cayu_task_session_retention_epochs (
         session_id TEXT NOT NULL,

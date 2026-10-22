@@ -12,7 +12,7 @@ from starlette.requests import Request as StarletteRequest
 from tests.core.test_cloud_reporting import ARGUMENT, _app, _start
 
 from cayu import __version__
-from cayu.cloud_reporting import CloudActivityPage
+from cayu.cloud_reporting import CloudActivityPage, read_cloud_activity
 from cayu.server import (
     AuthenticatedAccess,
     DashboardConfig,
@@ -23,6 +23,7 @@ from cayu.server import (
 )
 from cayu.server.auth import AuthConfigurationError, AuthContext
 from cayu.server.cloud_reporting import (
+    CLOUD_ACTIVITY_CURSOR_STALE,
     CLOUD_READER_MAX_TOKENS,
     CLOUD_READER_TOKEN_SHA256_VARIABLE,
     CloudReaderBearerAuth,
@@ -83,9 +84,11 @@ def test_without_digests_no_reader_route_is_served(reader) -> None:
 def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
     reader()
     host = FastAPI()
-    mount_cayu(host, _app(), access=AuthenticatedAccess(dependency=_operator), dashboard=False)
+    app = _app()
+    mount_cayu(host, app, access=AuthenticatedAccess(dependency=_operator), dashboard=False)
     client = TestClient(host)
     path = "/cayu/api/cloud/contract"
+    store_id = asyncio.run(app.session_store.read_store_identity())
 
     for token in (TOKEN, ROTATED):
         response = client.get(path, headers=_bearer(token))
@@ -95,6 +98,7 @@ def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
             "contract": "cayu.cloud-agent",
             "versions": [1],
             "runtime_version": __version__,
+            "store_id": store_id,
         }
     for headers in (
         {},
@@ -151,8 +155,33 @@ def test_activity_pages_over_http_carry_no_content(reader) -> None:
             assert invalid.status_code == 422
             assert invalid.json() == {"detail": "Invalid activity cursor."}
             assert invalid.headers["cache-control"] == NO_STORE
-        for params in ({"cursor": "1" * 17}, {"limit": 0}, {"limit": 201}):
+        for params in ({"cursor": "1" * 83}, {"limit": 0}, {"limit": 201}):
             assert client.get(path, params=params, headers=_bearer(TOKEN)).status_code == 422
+
+
+def test_a_cursor_the_store_cannot_continue_answers_410(reader) -> None:
+    reader(_digest(TOKEN))
+    replaced, app = _app(), _app()
+    server = create_server(
+        app, config=ServerConfig.protected(_operator, dashboard=DashboardConfig(enabled=False))
+    )
+    with TestClient(server) as client:
+        portal = client.portal
+        assert portal is not None
+        portal.call(_start, replaced, "before", "approver")
+        portal.call(_start, app, "after", "approver")
+        stored = portal.call(read_cloud_activity, replaced)
+        path = "/api/cloud/v1/activity"
+
+        # A cursor of the store this one replaced, and one issued before cursors
+        # named their store.
+        for cursor in (stored.next_cursor, "7"):
+            stale = client.get(path, params={"cursor": cursor}, headers=_bearer(TOKEN))
+            assert stale.status_code == 410
+            assert stale.json()["detail"]["code"] == CLOUD_ACTIVITY_CURSOR_STALE
+            assert stale.headers["cache-control"] == NO_STORE
+        restarted = client.get(path, headers=_bearer(TOKEN))
+        assert [run["session_id"] for run in restarted.json()["runs"]] == ["after"]
 
 
 def test_a_disabled_api_serves_no_reader_routes(reader) -> None:

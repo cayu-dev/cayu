@@ -829,6 +829,8 @@ class InMemorySessionStore(
                 )
             )
         self._public_authority_alias_codec = public_authority_alias_codec
+        # Nothing outlives the process, so each store is a store of its own.
+        self._store_identity = secrets.token_hex(16)
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._participant_creation_lock = asyncio.Lock()
@@ -6595,6 +6597,9 @@ class InMemorySessionStore(
 
     async def event_exists(self, query: EventQuery) -> bool:
         return await memory_event_reads.event_exists(self._read_event_state, query)
+
+    async def read_store_identity(self) -> str:
+        return self._store_identity
 
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False

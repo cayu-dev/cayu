@@ -63,6 +63,13 @@ including after receiving-configuration changes. This is a
 breaking writer boundary: older writers lack the producer-retention guards and
 must not mutate the upgraded store, even if they recognize its other tables.
 
+Revision 125 adds `cayu_store_identity`, one row whose random `store_id` the
+migration itself creates, so every database gets its own value once and keeps it.
+It is additive: older binaries never read it, and a newer binary against a
+revision-124 database reports no store identity instead of failing. A database
+restored from a backup keeps the backup's `store_id`; readers that must tell a
+restored history apart also compare the events they last read.
+
 1. **Database stays the canonical runtime store.** Keep SQLite for local
    durability; keep Postgres for production. JSONL is an **export/replay/backup**
    format only — never the hot path.

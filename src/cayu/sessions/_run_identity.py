@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -11,6 +14,13 @@ if TYPE_CHECKING:
     from cayu.sessions.records import Session
 
 RUN_LINEAGE_METADATA_KEY = "cayu:run_lineage"
+#: Runtime-owned session metadata, ``True`` on every session created while the eval
+#: runner runs a trial and on every session created under one. Callers cannot set it.
+EVAL_TRIAL_METADATA_KEY = "cayu:eval_trial"
+#: Session metadata that, set to ``False``, keeps the session and the sessions created
+#: under it from the human-attention receiver.
+ATTENTION_HANDOFF_METADATA_KEY = "cayu:attention_handoff"
+_EVAL_TRIAL: ContextVar[bool] = ContextVar("cayu_eval_trial", default=False)
 
 
 class RunLineageMetadata(TypedDict):
@@ -86,6 +96,44 @@ def session_run_lineage(session: Session) -> tuple[str | None, str | None]:
             return session_run_id(session), None
         return marker["root_run_id"], marker["parent_run_id"]
     return None, None
+
+
+@asynccontextmanager
+async def eval_trial_scope() -> AsyncIterator[None]:
+    """Mark every session created inside the scope as an eval trial; the eval runner's own."""
+
+    token = _EVAL_TRIAL.set(True)
+    try:
+        yield
+    finally:
+        _EVAL_TRIAL.reset(token)
+
+
+def is_eval_trial(session: Session) -> bool:
+    """Whether the session is an eval trial or was created under one, as a child or fork."""
+
+    return session.metadata.get(EVAL_TRIAL_METADATA_KEY) is True
+
+
+def attention_withheld(session: Session) -> bool:
+    """Whether the session, or a session it was created under, opted out or is an eval."""
+
+    return session.metadata.get(ATTENTION_HANDOFF_METADATA_KEY) is False or is_eval_trial(session)
+
+
+def run_marks_for_creation(parent: Session | None) -> dict[str, bool]:
+    """The runtime marks a new session takes from its parent and the eval runner.
+
+    They are copied at the creation boundary so that deleting or replacing an
+    ancestor later can never change them.
+    """
+
+    marks: dict[str, bool] = {}
+    if _EVAL_TRIAL.get() or (parent is not None and is_eval_trial(parent)):
+        marks[EVAL_TRIAL_METADATA_KEY] = True
+    if parent is not None and parent.metadata.get(ATTENTION_HANDOFF_METADATA_KEY) is False:
+        marks[ATTENTION_HANDOFF_METADATA_KEY] = False
+    return marks
 
 
 def run_lineage_for_creation(parent: Session | None) -> dict[str, str | bool | None]:

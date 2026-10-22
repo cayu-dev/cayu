@@ -69,6 +69,7 @@ from cayu.evals.workflow_target import (
 from cayu.messages import Message, MessageRole
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions._run_identity import attention_withheld, is_eval_trial
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -435,6 +436,32 @@ def test_workflow_eval_retains_root_children_tools_usage_and_typed_output(tmp_pa
     write_trajectory_json(trial.trajectory, trajectory_path)
     loaded_trajectory = load_trajectory(trajectory_path)
     assert loaded_trajectory.workflow_output == trial.trajectory.workflow_output
+
+
+def test_every_session_a_workflow_trial_creates_is_an_eval_trial() -> None:
+    app = _register_app(
+        [
+            [
+                ModelStreamEvent.text_delta(f"{name} done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+            for name in ("first", "second")
+        ]
+    )
+
+    async def run():
+        result = await run_workflow_eval_suite(
+            _target(app, _TwoChildWorkflow), _suite(FinalOutputContains("second done"))
+        )
+        return result, (await app.session_store.list_sessions()).sessions
+
+    result, sessions = asyncio.run(run())
+
+    assert result.status is EvalStatus.PASSED
+    # A workflow target can be the deployed application, so its trials must stay out
+    # of the human-attention handoff and Cayu Cloud's measures like any other trial.
+    assert len(sessions) >= 3
+    assert all(is_eval_trial(session) and attention_withheld(session) for session in sessions)
 
 
 def test_parallel_workflow_retains_complete_bounded_child_evidence() -> None:

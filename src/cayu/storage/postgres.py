@@ -5699,6 +5699,21 @@ class PostgresSessionStore(
     async def event_exists(self, query: EventQuery) -> bool:
         return await session_queries.event_exists(self._ready_connection, query)
 
+    async def read_store_identity(self) -> str:
+        identity = None
+        async with self._ready_connection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT to_regclass('cayu_store_identity')")
+            registered = await cur.fetchone()
+            if registered is not None and registered[0] is not None:
+                await cur.execute("SELECT store_id FROM cayu_store_identity WHERE singleton = 1")
+                row = await cur.fetchone()
+                identity = None if row is None else str(row[0])
+        if identity is None:
+            raise NotImplementedError(
+                "This database has no store identity; run `cayu storage migrate`."
+            )
+        return identity
+
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:

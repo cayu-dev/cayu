@@ -9,11 +9,13 @@ gave, the tool and the attention identity. Neither carries messages, tool
 arguments, questions, answers or results. Cloud reads a conversation live from
 the agent's Developer dashboard when someone opens it.
 
-The cursor is a position in the store's durable event sequence, so a reader
-that keeps it continues after its own or the agent's restart without a gap.
-A run's summary is its current state, so it can arrive again on a later page;
-readers keep the latest summary per ``run_id`` and each touch once per
-``touch_id``.
+The cursor names the session store and a position in its durable event
+sequence, so a reader that keeps it continues after its own or the agent's
+restart without a gap. A cursor from another store, or from history the store
+no longer holds because it was restored from a backup, is refused as stale, and
+the reader reads again from the start. A run's summary is its current state, so
+it can arrive again on a later page; readers keep the latest summary per
+``run_id`` and each touch once per ``touch_id``.
 
 Within a contract version fields are only added. Readers ignore fields and
 values they do not know.
@@ -26,11 +28,12 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
+from hashlib import sha256
 from typing import TYPE_CHECKING, cast
 
 from pydantic import BaseModel, ConfigDict
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu._version import __version__
 from cayu.approvals.actors import ResolutionActorSource
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, default_price_book
@@ -40,6 +43,7 @@ from cayu.runtime._cost_accounting import COST_EVENT_TYPES
 from cayu.sessions._foreground_child_checkpoint import foreground_child_state_from_checkpoint
 from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
+    is_eval_trial,
     session_run_id,
     session_run_lineage,
 )
@@ -81,7 +85,14 @@ _SCAN_BUDGET = 2_000
 # How many waiting subagents deep a delegated action is followed to the action a
 # person settles, and so how many sessions above a change can depend on it.
 _MAX_DELEGATION_DEPTH = 8
-_CURSOR = re.compile(r"0|[1-9][0-9]{0,15}")
+# A cursor is ``{store_id}.0`` before any event, else ``{store_id}.{sequence}.{mark}``,
+# the mark naming the exact event at that sequence.
+_STORE_IDENTITY = re.compile(r"[0-9a-f]{32}")
+_CURSOR = re.compile(r"([0-9a-f]{32})\.(?:0|([1-9][0-9]{0,15})\.([0-9a-f]{32}))")
+# Cursors issued before they named their store: a bare sequence.
+_STORELESS_CURSOR = re.compile(r"0|[1-9][0-9]{0,15}")
+#: The longest cursor the contract issues.
+CLOUD_ACTIVITY_CURSOR_MAX_CHARS = 32 + 1 + 16 + 1 + 32
 # A session is reported from the event that starts or forks it. After these
 # events a run's summary can read differently (its status, waiting items,
 # Release or cost), and the anchors settle touches.
@@ -113,17 +124,32 @@ class CloudActivityCursorInvalid(ValueError):
     """An activity cursor is not one this contract issues; the message never echoes it."""
 
 
+class CloudActivityCursorStale(ValueError):
+    """A cursor this store cannot continue: read again from the start.
+
+    It names another store, such as one that replaced the agent's database or
+    an in-memory store before a restart, or an event the store no longer holds
+    at its position, as after a restore from a backup taken before the cursor.
+    """
+
+
 class _ContractModel(BaseModel):
     # Fields are only added within a version, so readers ignore the ones they don't know.
     model_config = ConfigDict(extra="ignore", frozen=True)
 
 
 class CloudContract(_ContractModel):
-    """What the agent serves: the contract and the versions of it."""
+    """What the agent serves: the contract, the versions of it and the store it reads.
+
+    ``store_id`` is the session store's identity, which every activity cursor
+    names; it is ``None`` when the store has none, and then activity is not
+    served.
+    """
 
     contract: str = CLOUD_AGENT_CONTRACT
     versions: tuple[int, ...] = CLOUD_AGENT_CONTRACT_VERSIONS
     runtime_version: str = __version__
+    store_id: str | None = None
 
 
 class CloudRunStatus(StrEnum):
@@ -200,7 +226,8 @@ class CloudRun(_ContractModel):
     reusable lookup aliases, never persistence or attribution keys, and
     ``fork_controller`` names the outside controller, such as Compass, whose
     copy this is. A fork that has not run carries its source's status, no
-    ``ended_at`` and only its own counts and cost.
+    ``ended_at`` and only its own counts and cost. ``eval`` says whether the
+    session is an eval trial or was created under one, as a child or a fork.
     ``reason`` is the Runtime's code for the current state, such as
     ``completed``, ``tool_approval_required`` or ``operator_requested``.
     ``ended_at`` is set once the run completed, failed or stopped and is
@@ -217,6 +244,7 @@ class CloudRun(_ContractModel):
     source: str
     forked: bool
     fork_controller: str | None
+    eval: bool
     agent_name: str
     status: CloudRunStatus
     reason: str
@@ -272,15 +300,67 @@ class CloudActivityPage(_ContractModel):
     has_more: bool
 
 
-def _after_sequence(cursor: str | None) -> int:
+async def read_cloud_contract(app: CayuApp) -> CloudContract:
+    """The contract the agent serves, naming its session store."""
+
+    try:
+        store_id = await _store_identity(app)
+    except NotImplementedError:
+        store_id = None
+    return CloudContract(store_id=store_id)
+
+
+async def _store_identity(app: CayuApp) -> str:
+    identity = await app.session_store.read_store_identity()
+    if type(identity) is not str or _STORE_IDENTITY.fullmatch(identity) is None:
+        raise ValueError("The session store returned an invalid store identity.")
+    return identity
+
+
+def _event_mark(record: EventRecord) -> str:
+    """Name the exact event at a sequence, so a store that reissued it is told apart."""
+
+    event = record.event
+    identity = [record.sequence, event.session_id, event.id, event.timestamp.isoformat()]
+    return sha256(canonical_durable_json_bytes(identity, "activity cursor")).hexdigest()[:32]
+
+
+def _cursor(store_id: str, position: int, mark: str | None) -> str:
+    return f"{store_id}.0" if mark is None else f"{store_id}.{position}.{mark}"
+
+
+async def _cursor_position(
+    app: CayuApp, store_id: str, cursor: str | None
+) -> tuple[int, str | None]:
+    """The sequence and event mark a cursor continues from, once it proves this store's.
+
+    A store whose event at the cursor's sequence is another event has reissued
+    that sequence: the cursor is stale. A position without an event is
+    accepted, because deleting a session deletes its events.
+    """
+
     if cursor is None:
-        return 0
-    if type(cursor) is not str or _CURSOR.fullmatch(cursor) is None:
+        return 0, None
+    if type(cursor) is not str:
         raise CloudActivityCursorInvalid("Invalid activity cursor.")
-    position = int(cursor)
+    if _STORELESS_CURSOR.fullmatch(cursor) is not None:
+        raise CloudActivityCursorStale("The activity cursor names no store.")
+    match = _CURSOR.fullmatch(cursor)
+    if match is None:
+        raise CloudActivityCursorInvalid("Invalid activity cursor.")
+    if match[1] != store_id:
+        raise CloudActivityCursorStale("The activity cursor names another store.")
+    if match[2] is None:
+        return 0, None
+    position, mark = int(match[2]), match[3]
     if position > MAX_DURABLE_JSON_INTEGER:
         raise CloudActivityCursorInvalid("Invalid activity cursor.")
-    return position
+    held = await app.session_store.query_events(
+        EventQuery(after_sequence=position - 1, limit=1, order_by=EventOrder.SEQUENCE_ASC)
+    )
+    if held and held[0].sequence == position and _event_mark(held[0]) != mark:
+        raise CloudActivityCursorStale("The store no longer holds the activity cursor's event.")
+    return position, mark
 
 
 def _scan_query(after_sequence: int, limit: int) -> EventQuery:
@@ -304,12 +384,15 @@ async def read_cloud_activity(
     its first change alone affects more: a change reports its session and every
     session above it whose status can follow it. It reads the store's
     cross-session event order, which never moves past an event a concurrent
-    writer has yet to commit.
+    writer has yet to commit. Raises ``CloudActivityCursorStale`` for a cursor
+    this store cannot continue.
     """
 
-    position = _after_sequence(cursor)
     if type(limit) is not int or not 1 <= limit <= CLOUD_ACTIVITY_MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {CLOUD_ACTIVITY_MAX_LIMIT}.")
+    store_id = await _store_identity(app)
+    position, mark = await _cursor_position(app, store_id, cursor)
+    last: EventRecord | None = None
     store = app.session_store
     reader = _RunReader(app)
     changed: dict[str, None] = {}
@@ -340,14 +423,14 @@ async def read_cloud_activity(
             changed.update(dict.fromkeys(affected))
             if anchor:
                 anchors.append(record)
-            position = record.sequence
+            position, last = record.sequence, record
         if has_more or len(batch) < batch_limit:
             break
     touches = await classify_supervision_anchors(store, anchors)
     return CloudActivityPage(
         runs=await reader.runs(tuple(changed)),
         touches=tuple(_touch(app, session, event) for session, event in touches),
-        next_cursor=str(position),
+        next_cursor=_cursor(store_id, position, mark if last is None else _event_mark(last)),
         has_more=has_more,
     )
 
@@ -555,6 +638,7 @@ class _RunReader:
             source=session.invocation.source.value,
             forked=lineage.forked,
             fork_controller=_text(app, lineage.owner()) if lineage.settled else None,
+            eval=is_eval_trial(session),
             agent_name=_redacted(app, session.agent_name),
             status=status,
             reason=_redacted(app, outcome.reason),
@@ -699,11 +783,13 @@ def _text(app: CayuApp, value: str | None) -> str | None:
 
 
 __all__ = [
+    "CLOUD_ACTIVITY_CURSOR_MAX_CHARS",
     "CLOUD_ACTIVITY_DEFAULT_LIMIT",
     "CLOUD_ACTIVITY_MAX_LIMIT",
     "CLOUD_AGENT_CONTRACT",
     "CLOUD_AGENT_CONTRACT_VERSIONS",
     "CloudActivityCursorInvalid",
+    "CloudActivityCursorStale",
     "CloudActivityPage",
     "CloudActor",
     "CloudContract",
@@ -714,4 +800,5 @@ __all__ = [
     "CloudTouch",
     "CloudWaitingItem",
     "read_cloud_activity",
+    "read_cloud_contract",
 ]

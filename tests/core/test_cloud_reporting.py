@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
@@ -42,16 +44,23 @@ from cayu.budgets.pricing import default_price_book
 from cayu.cloud_reporting import (
     CLOUD_ACTIVITY_MAX_LIMIT,
     CloudActivityCursorInvalid,
+    CloudActivityCursorStale,
     CloudActivityPage,
     CloudRunStatus,
     read_cloud_activity,
+    read_cloud_contract,
 )
-from cayu.evals import ScriptedModelProvider
+from cayu.evals import EvalCase, ScriptedModelProvider, run_eval_case
 from cayu.messages import MessageRole
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.releases import ReleaseIdentity
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import ForkOverlay, ForkSessionRequest, InterruptSessionRequest
+from cayu.sessions._run_identity import (
+    ATTENTION_HANDOFF_METADATA_KEY,
+    EVAL_TRIAL_METADATA_KEY,
+    attention_withheld,
+)
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
@@ -61,6 +70,7 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
 )
 from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionRecord
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
@@ -1279,3 +1289,331 @@ def test_a_run_waiting_on_a_subagent_reports_what_the_subagent_waits_on_now() ->
     assert statuses(stuck) == dict.fromkeys(("parent", "child"), CloudRunStatus.NEEDS_RECOVERY)
     assert statuses(recovered) == dict.fromkeys(("parent", "child"), CloudRunStatus.COMPLETED)
     assert [(touch.kind, touch.stepped_in) for touch in recovered.touches] == [("recover", True)]
+
+
+def test_a_cursor_from_a_replaced_store_is_stale(tmp_path) -> None:
+    async def scenario():
+        # An in-memory store does not outlive its process, so a restart replaces it.
+        before = _app()
+        await _start(before, "before", "writer")
+        stored = await read_cloud_activity(before)
+        after = _app()
+        await _start(after, "after", "writer")
+        # A new database file under the same agent.
+        first = SQLiteSessionStore(tmp_path / "first.sqlite")
+        second = SQLiteSessionStore(tmp_path / "second.sqlite")
+        try:
+            await _start(_app(first), "first", "writer")
+            on_first = await read_cloud_activity(_app(first))
+            contracts = [
+                await read_cloud_contract(app) for app in (before, after, _app(first), _app(second))
+            ]
+            for app, cursor in (
+                (after, stored.next_cursor),
+                (_app(second), on_first.next_cursor),
+                # Issued before cursors named their store.
+                (after, "7"),
+            ):
+                with pytest.raises(CloudActivityCursorStale):
+                    await read_cloud_activity(app, cursor=cursor)
+            restarted = await read_cloud_activity(after)
+        finally:
+            await _close_store(first)
+            await _close_store(second)
+        return stored, contracts, restarted
+
+    stored, contracts, restarted = asyncio.run(scenario())
+
+    store_ids = [contract.store_id for contract in contracts]
+    assert all(store_id is not None and len(store_id) == 32 for store_id in store_ids)
+    assert len(set(store_ids)) == 4
+    assert stored.next_cursor.startswith(f"{store_ids[0]}.")
+    assert [run.session_id for run in restarted.runs] == ["after"]
+
+
+def test_a_store_restored_from_a_backup_refuses_a_cursor_past_the_backup(tmp_path) -> None:
+    path, backup = tmp_path / "sessions.sqlite", tmp_path / "backup.sqlite"
+
+    async def scenario():
+        store = SQLiteSessionStore(path)
+        app = _app(store)
+        await _start(app, "kept", "writer")
+        kept = await read_cloud_activity(app)
+        identity = await store.read_store_identity()
+        with sqlite3.connect(path) as source, sqlite3.connect(backup) as target:
+            source.backup(target)
+        await _start(app, "lost", "approver")
+        await _deny(app, "lost")
+        stored = await read_cloud_activity(app, cursor=kept.next_cursor)
+        await _close_store(store)
+        for leftover in (
+            path,
+            path.with_name(f"{path.name}-wal"),
+            path.with_name(f"{path.name}-shm"),
+        ):
+            leftover.unlink(missing_ok=True)
+        backup.rename(path)
+        store = SQLiteSessionStore(path)
+        try:
+            app = _app(store)
+            restored_identity = await store.read_store_identity()
+            # The restored store reissues the sequences the reader already read.
+            for session_id in ("new", "newer"):
+                await _start(app, session_id, "approver")
+                await _deny(app, session_id)
+            with pytest.raises(CloudActivityCursorStale):
+                await read_cloud_activity(app, cursor=stored.next_cursor)
+            # A cursor from before the backup still continues.
+            continued = await read_cloud_activity(app, cursor=kept.next_cursor)
+            restarted = await read_cloud_activity(app)
+        finally:
+            await _close_store(store)
+        return identity, restored_identity, stored, continued, restarted
+
+    identity, restored_identity, stored, continued, restarted = asyncio.run(scenario())
+
+    # A restore keeps the store's identity; the cursor's event tells the histories apart.
+    assert restored_identity == identity
+    assert [touch.session_id for touch in stored.touches] == ["lost"]
+    assert [run.session_id for run in continued.runs] == ["new", "newer"]
+    assert sorted(run.session_id for run in restarted.runs) == ["kept", "new", "newer"]
+    assert [touch.session_id for touch in restarted.touches] == ["new", "newer"]
+
+
+def test_a_database_without_a_store_identity_serves_no_activity(tmp_path) -> None:
+    path = tmp_path / "sessions.sqlite"
+
+    async def scenario():
+        store = SQLiteSessionStore(path)
+        try:
+            await _start(_app(store), "run", "writer")
+            with sqlite3.connect(path) as connection:
+                # As a database migrated only to revision 124 has it.
+                connection.execute("DROP TABLE cayu_store_identity")
+            app = _app(store)
+            with pytest.raises(NotImplementedError, match="cayu storage migrate"):
+                await read_cloud_activity(app)
+            return await read_cloud_contract(app)
+        finally:
+            await _close_store(store)
+
+    assert asyncio.run(scenario()).store_id is None
+
+
+def _record_when_asked_again(request: ModelRequest) -> list[ModelStreamEvent]:
+    """Finish a first turn; on a later one, record an entry once."""
+
+    users = sum(message.role is MessageRole.USER for message in request.messages)
+    if users > 1 and not any(message.role is MessageRole.TOOL for message in request.messages):
+        return [
+            ModelStreamEvent.tool_call(id="call-1", name="record", arguments={"note": ARGUMENT}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls", "usage": USAGE}),
+        ]
+    return [
+        ModelStreamEvent.text_delta("Done."),
+        ModelStreamEvent.completed({"finish_reason": "stop", "usage": USAGE}),
+    ]
+
+
+_FINISHED = {CloudRunStatus.COMPLETED, CloudRunStatus.FAILED, CloudRunStatus.INTERRUPTED}
+
+
+def _measures(pages: list[CloudActivityPage]) -> tuple[int, int, Decimal]:
+    """Finished runs, correct runs and their cost, as the contract's Measures section says."""
+
+    runs = {run.run_id: run for page in pages for run in page.runs}
+    touches = {touch.touch_id: touch for page in pages for touch in page.touches}
+    roots = {
+        run_id: run
+        for run_id, run in runs.items()
+        if run.root_run_id == run_id and not (run.forked or run.eval) and run.status in _FINISHED
+    }
+    # A forked or eval session counts toward no run, even though it names a root.
+    counted = {
+        run_id: run
+        for run_id, run in runs.items()
+        if not (run.forked or run.eval) and run.root_run_id in roots
+    }
+    corrected = {
+        touch.root_run_id
+        for touch in touches.values()
+        if touch.run_id in counted and touch.kind in {"edit", "deny"}
+    }
+    correct = sum(
+        run.status is CloudRunStatus.COMPLETED and run_id not in corrected
+        for run_id, run in roots.items()
+    )
+    return len(roots), correct, sum((run.cost.amount for run in counted.values()), Decimal(0))
+
+
+def test_a_fork_counts_toward_none_of_its_source_runs_measures() -> None:
+    async def scenario():
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _Provider(name=PRICE.provider_name, response_factory=_record_when_asked_again),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="reviewed", model=PRICE.model),
+            tools=[_Record()],
+            tool_policy=_ApproveRecords(),
+        )
+        await _start(app, "trunk", "reviewed")
+        trunk = await read_cloud_activity(app)
+        # A fork, such as one Compass makes to try a change, that a person corrects.
+        await _drain(
+            app.fork_session(ForkSessionRequest(source_session_id="trunk", session_id="trial"))
+        )
+        await _drain(
+            app.resume(ResumeRequest(session_id="trial", messages=[Message.text("user", "again")]))
+        )
+        await _deny(app, "trial")
+        forked = await read_cloud_activity(app, cursor=trunk.next_cursor)
+        return trunk, forked
+
+    trunk_page, forked = asyncio.run(scenario())
+
+    (trunk,) = trunk_page.runs
+    (trial,) = forked.runs
+    (denial,) = forked.touches
+    # Lineage still names the source's root, and the fork says it is one.
+    assert trial.root_run_id == denial.root_run_id == trunk.run_id
+    assert trial.forked and trial.cost.amount > 0
+    assert denial.run_id == trial.run_id and denial.kind == "deny"
+    assert _measures([trunk_page, forked]) == (1, 1, trunk.cost.amount)
+
+
+def test_eval_trials_and_every_session_under_them_are_reported_as_eval() -> None:
+    def call(name: str, arguments: dict) -> list[ModelStreamEvent]:
+        return [
+            ModelStreamEvent.tool_call(id="call-1", name=name, arguments=arguments),
+            ModelStreamEvent.completed(),
+        ]
+
+    def finished(name: str) -> list[ModelStreamEvent]:
+        return [ModelStreamEvent.text_delta(f"{name} finished"), ModelStreamEvent.completed()]
+
+    async def scenario():
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _SequencedProvider(
+                [
+                    call("subagent", {"agent": "helper", "task": "work"}),
+                    finished("helper"),
+                    finished("lead"),
+                    finished("ordinary"),
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="lead", model="test"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={"helper": SubagentSpec(agent_name="helper")},
+                    execution_profile_identity=_identity("cloud-eval-lead"),
+                )
+            ],
+        )
+        app.register_agent(AgentSpec(name="helper", model="test"))
+        # A server runs the deployed application's eval cases in that application.
+        case = EvalCase(
+            id="delegates",
+            request=RunRequest(agent_name="lead", messages=[Message.text("user", "go")]),
+        )
+        result = await run_eval_case(app, case, suite_id="suite")
+        (trial,) = result.trials
+        assert trial.session_id is not None
+        await _start(app, "ordinary", "lead")
+        await _drain(
+            app.fork_session(
+                ForkSessionRequest(source_session_id=trial.session_id, session_id="trial-copy")
+            )
+        )
+        return trial.session_id, await read_cloud_activity(app)
+
+    trial_session_id, page = asyncio.run(scenario())
+
+    runs = {run.session_id: run for run in page.runs}
+    (child,) = [run for run in page.runs if run.agent_name == "helper"]
+    assert child.parent_session_id == trial_session_id
+    # The trial, its subagent and a fork of the trial are eval; the application's own run is not.
+    assert [
+        (runs[trial_session_id].eval, child.eval, runs["trial-copy"].eval, runs["ordinary"].eval)
+    ] == [(True, True, True, False)]
+    assert all(run["eval"] in (True, False) for run in page.model_dump(mode="json")["runs"])
+
+
+def test_a_caller_cannot_mark_its_own_run_as_an_eval_trial() -> None:
+    marked = {EVAL_TRIAL_METADATA_KEY: True}
+    go = [Message.text("user", "go")]
+    # The body of POST /runs and POST /fork, so a remote caller is refused too.
+    with pytest.raises(ValueError, match="eval-trial authority"):
+        RunRequest(agent_name="writer", messages=go, metadata=marked)
+    with pytest.raises(ValueError, match="eval-trial authority"):
+        ForkSessionRequest(source_session_id="write", metadata=marked)
+
+    async def scenario():
+        app = _app()
+        unchecked = RunRequest(agent_name="writer", session_id="hidden", messages=go)
+        with pytest.raises(ValueError, match="eval-trial"):
+            await _drain(app.run(unchecked.model_copy(update={"metadata": marked})))
+        await _start(app, "write", "writer")
+        with pytest.raises(ValueError, match="runtime-owned"):
+            await app.session_store.update_metadata("write", marked)
+        return await app.session_store.load("hidden"), await read_cloud_activity(app)
+
+    hidden, page = asyncio.run(scenario())
+
+    assert hidden is None
+    assert [(run.session_id, run.eval) for run in page.runs] == [("write", False)]
+
+
+def test_deleting_a_session_in_between_keeps_the_marks_of_the_sessions_above_it() -> None:
+    async def scenario():
+        app = _app()
+        await _drain(
+            app.run(
+                RunRequest(
+                    agent_name="writer",
+                    session_id="quiet",
+                    messages=[Message.text("user", "go")],
+                    metadata={ATTENTION_HANDOFF_METADATA_KEY: False},
+                )
+            )
+        )
+        case = EvalCase(
+            id="writes",
+            request=RunRequest(agent_name="writer", messages=[Message.text("user", "go")]),
+        )
+        (trial,) = (await run_eval_case(app, case, suite_id="suite")).trials
+        assert trial.session_id is not None
+        for source, middle, last in (
+            ("quiet", "quiet-b", "quiet-c"),
+            (trial.session_id, "trial-b", "trial-c"),
+        ):
+            await _drain(
+                app.fork_session(ForkSessionRequest(source_session_id=source, session_id=middle))
+            )
+            await _drain(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=middle,
+                        session_id=last,
+                        # A fork cannot turn back on what a session above it turned off.
+                        metadata={ATTENTION_HANDOFF_METADATA_KEY: True},
+                    )
+                )
+            )
+            await app.session_store.delete_session(middle)
+        sessions = {name: await app.session_store.load(name) for name in ("quiet-c", "trial-c")}
+        return sessions, await read_cloud_activity(app)
+
+    sessions, page = asyncio.run(scenario())
+
+    quiet, trial = sessions["quiet-c"], sessions["trial-c"]
+    assert quiet is not None and trial is not None
+    assert attention_withheld(quiet) and attention_withheld(trial)
+    runs = {run.session_id: run for run in page.runs}
+    assert (runs["quiet-c"].eval, runs["trial-c"].eval) == (False, True)

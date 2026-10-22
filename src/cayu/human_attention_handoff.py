@@ -13,6 +13,12 @@ An application that wants people told about paused actions composes three parts:
 * ``HumanAttentionReceiver``: the HTTP client for the ``cayu.human-attention-handoff/v1``
   receiver protocol documented in ``docs/runtime-contracts.md``.
 
+A session whose metadata sets ``cayu:attention_handoff`` to ``False`` is never handed off,
+nor is an eval trial (runtime-owned metadata ``cayu:eval_trial``, which only the eval
+runner causes), nor any session created under either as a child or fork: the runtime
+copies both marks to such a session when it creates it. Trials run in the deployed
+application but have nobody to answer them.
+
 Only identities and Runtime-owned facts leave the process: the exact attention reference,
 Runtime's fixed summary, the observed state and reason, the agent name, and an
 application-owned requester reference read from a session label. Never question text,
@@ -37,6 +43,7 @@ import httpx
 from cayu._version import __version__
 from cayu.observability.events import EventSink
 from cayu.runtime.human_attention import HumanAttentionReference, HumanAttentionRequest
+from cayu.sessions._run_identity import ATTENTION_HANDOFF_METADATA_KEY, attention_withheld
 from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,
     PendingActionRecord,
@@ -51,6 +58,9 @@ if TYPE_CHECKING:
 PROTOCOL = "cayu.human-attention-handoff/v1"
 URL_ENVIRONMENT = "CAYU_ATTENTION_HANDOFF_URL"
 TOKEN_ENVIRONMENT = "CAYU_ATTENTION_HANDOFF_TOKEN"
+#: Session metadata that, set to ``False``, keeps the session and the sessions under it
+#: from the receiver.
+METADATA_KEY = ATTENTION_HANDOFF_METADATA_KEY
 MAX_OBSERVATIONS = 200
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 
@@ -318,9 +328,13 @@ class HumanAttentionHandoff:
 
         receiver, app = self._require()
         store = app.session_store
-        if await store.load(session_id) is None:
+        session = await store.load(session_id)
+        if session is None:
             # Not a session identity this store knows: leave it to the repair scan.
             self._wake.set()
+            return
+        if attention_withheld(session):
+            self._open_sessions.discard(session_id)
             return
         page = await store.query_pending_actions(
             PendingActionQuery(session_id=session_id, limit=200)
@@ -420,6 +434,7 @@ class HumanAttentionHandoff:
         scan_complete = False
         clean = True
         reset = False
+        withheld: dict[str, bool] = {}
         while pages < self._max_pages:
             try:
                 page = await app.session_store.query_pending_actions(
@@ -441,6 +456,12 @@ class HumanAttentionHandoff:
                 issues.add("pending_action_issues")
             observations = []
             for action in page.actions:
+                session_id = action.session.id
+                if session_id not in withheld:
+                    session = await app.session_store.load(session_id)
+                    withheld[session_id] = session is not None and attention_withheld(session)
+                if withheld[session_id]:
+                    continue
                 item = await self._observe_action(action)
                 if item is None:
                     if not _delegated(action):
@@ -560,6 +581,7 @@ __all__ = [
     "DECLINED_STATUSES",
     "FOLLOW_UP_EVENTS",
     "LIFECYCLE_EVENTS",
+    "METADATA_KEY",
     "PROTOCOL",
     "TOKEN_ENVIRONMENT",
     "URL_ENVIRONMENT",

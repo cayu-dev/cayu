@@ -77,6 +77,7 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import SessionTrajectoryError, trajectory_from_session
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.records import (
     KnowledgeEntry,
@@ -328,6 +329,7 @@ class _CampaignApplicationFactory(MemoryInterventionRuntimeApplicationFactory):
         policy: AutomaticRecallPolicy,
     ) -> CayuApp:
         app = CayuApp(
+            human_attention_handoff=HumanAttentionHandoff(None),
             session_store=self.sessions,
             budget_ledger=self.budgets,
             request_footprint=RequestFootprintConfig(

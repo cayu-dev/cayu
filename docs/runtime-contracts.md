@@ -1720,6 +1720,16 @@ URL (`CAYU_ATTENTION_HANDOFF_URL`); every call carries `Authorization: Bearer <t
 `"protocol": "cayu.human-attention-handoff/v1"` and `"runtime_version"`. A `CayuApp`
 started with both variables set hands off by itself, and the server preset runs the
 repair loop; `CayuApp(human_attention_handoff=...)` configures it in code instead.
+Runtime's internal applications (judges, replay, acceptance, benchmark and campaign
+targets) pass `HumanAttentionHandoff(None)`. A session is never observed when its
+metadata sets `cayu:attention_handoff` to `false` or marks it an eval trial
+(`cayu:eval_trial`), or when a session it was created under, as a subagent or a
+fork, does. Runtime copies both marks onto a subagent or fork when it creates it, so
+deleting a session in between changes nothing, and a fork's own metadata cannot set
+`cayu:attention_handoff` back. `cayu:eval_trial` is runtime-owned: Runtime sets it on
+every session created while the eval runner runs a trial, and run, fork and metadata
+requests that name it are refused. So the eval cases a server runs against the
+deployed application, workflow targets included, stay out of the receiver.
 
 | Call | Request | Response |
 | --- | --- | --- |
@@ -19482,19 +19492,28 @@ authenticate=...)` serves the same routes behind a host's own authentication.
 
 | Route | Response |
 | --- | --- |
-| `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str}` |
+| `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str, "store_id": str \| null}` |
 | `GET {api}/cloud/v1/activity?cursor=&limit=` | `{"contract": "cayu.cloud-agent/v1", "runs": [run, ...], "touches": [touch, ...], "next_cursor": str, "has_more": bool}` |
 
 Responses carry `Cache-Control: private, no-store`. A missing or wrong token
 answers 401 with `WWW-Authenticate: Bearer`, a cursor the contract did not issue
-or a `limit` outside 1 to 200 answers 422, and a session store without the reads
-the feed needs answers 501. A Runtime that predates the contract answers 404, or
-a page that is not this JSON where a dashboard serves unknown paths; a reader
-treats both as a Runtime too old for the contract.
+or a `limit` outside 1 to 200 answers 422, a cursor the store cannot continue
+answers 410 with `{"detail": {"code": "activity_cursor_stale", "message": str}}`,
+and a session store without the reads the feed needs answers 501. A Runtime
+that predates the contract answers 404, or a page that is not this JSON where a
+dashboard serves unknown paths; a reader treats both as a Runtime too old for
+the contract.
 
 ### Activity feed
 
 `cursor` is opaque; omit it to read from the beginning. `limit` defaults to 100.
+`store_id` is the session store's identity: 32 lowercase hex digits chosen once,
+when the store's database is created, and kept in it (an in-memory store chooses
+one when it starts, so a restart gives a new one). Every cursor names it.
+Stores return it from `SessionStore.read_store_identity()`; SQLite and PostgreSQL
+keep it in `cayu_store_identity` (storage revision 125). `store_id` is `null`, and
+activity answers 501, while the database is at an earlier revision (run
+`cayu storage migrate`) or a custom store does not implement the method.
 A page holds, in event sequence order, the current summary of each session with
 a run-changing event after the cursor and the touches anchored in the same
 range. A run waiting on a subagent reports what the subagent waits on, so a
@@ -19511,19 +19530,45 @@ exact incarnations. This dependency evidence does not fill in unknown
 historical `root_run_id` or `parent_run_id` links. A missing or mismatched wait
 cannot attach a legacy run to a reused session alias.
 
-The cursor is a position in the store's global event sequence. A cross-session
-read never moves past a lower sequence that a concurrent writer has not
-committed yet (on PostgreSQL, the cross-session commit cutoff), and stores never
-reuse a sequence, so a reader that persists `next_cursor` continues after its
-own restart or the agent's without a gap. A run's summary is read after the
-page has read every event up to `next_cursor`, so it is at least as new as the
+The cursor names the store and a position in its global event sequence, with a
+mark of the exact event at that position. A cross-session read never moves past
+a lower sequence that a concurrent writer has not committed yet (on PostgreSQL,
+the cross-session commit cutoff), and within one store's history a sequence is
+never given to a second event, so a reader that persists `next_cursor`
+continues after its own restart or the agent's without a gap.
+
+A store can lose history the reader already read, and then it gives those
+sequences to new events: a database restored from a backup taken before the
+cursor, or rolled back to one. A cursor the store cannot continue answers 410
+`activity_cursor_stale`, and the reader then reads again from the beginning;
+summaries and touches it receives again keep their `run_id` and `touch_id`. The
+feed refuses:
+
+- a cursor naming another `store_id`: the agent's database was replaced by
+  another one, or its in-memory store restarted;
+- a cursor whose position holds another event than the one it marks: the store
+  was restored and has since written past the backup. A restore keeps the
+  `store_id` the database had when the backup was taken, so this mark is what
+  tells the restored history apart;
+- a cursor without a `store_id`, which earlier builds of this contract issued.
+
+A position whose event is gone is accepted, because deleting a session deletes
+its events. So a restored store whose next event has not yet reached the
+cursor's position is not detected yet, and its new runs below that position
+wait until it is; when a restore skips the cursor's position entirely (a
+sequence a rolled-back write used), it is never detected. A restore procedure
+therefore also resets the reader: after restoring an agent's database, discard
+the reader's saved cursor and read from the beginning. Check `store_id` in
+`{api}/cloud/contract` before resuming, too: a different value means the
+database was replaced.
+
+A run's summary is read after the page has read every event up to `next_cursor`, so it is at least as new as the
 cursor, and any later change arrives on a later page with the run again; keep
 the latest per `run_id`. A session ID can be deleted and reused; a replacement
 has a different `run_id` and must not overwrite the previous run or its cost.
 Each touch is anchored at exactly one event and
 arrives on the page that covers it; a reader that reads a range again receives
-the same `touch_id` and keeps one. A cursor belongs to one session store: when
-an agent's database is replaced, read again from the beginning. A session
+the same `touch_id` and keeps one. A session
 deleted after its summary was read is not reported again. Retain its previously
 ingested summary and touches. Deletion before ingestion can remove evidence;
 the feed does not reconstruct deleted history.
@@ -19553,6 +19598,7 @@ carries its source's status, no `ended_at`, and only its own counts and cost.
 | `session_id`, `root_session_id`, `parent_session_id` | Public lookup/display aliases, the ones the Developer dashboard uses. These IDs can be reused: never use them as persistence keys or to join runs, costs or touches. `root_session_id` is the historical session its invocation started from; `parent_session_id` retains the original parent alias when recorded. A live dashboard lookup may resolve a replacement session. |
 | `source` | How the session was created: `http_run`, `sdk_run`, `task`, `workflow_step`, `subagent` or `fork`. |
 | `forked`, `fork_controller` | Whether the session is a fork or was created under one, and the enrolled [fork controller](fork-overlays.md) whose lineage it is, such as `compass`. `fork_controller` is `null` for the host's own work and when the lineage cannot be resolved. |
+| `eval` | Whether the session is an eval trial or was created under one: the trial's subagents, forks of the trial or of its subagents, and so on down. Runtime marks every session created while the eval runner runs a trial, including the cases a server runs inside the deployed application and the sessions of a workflow target, with the runtime-owned session metadata `cayu:eval_trial`, and copies the mark onto each subagent and fork when it creates it, so deleting a session in between does not clear it. Run, fork and metadata requests that set `cayu:eval_trial` are refused, so a caller cannot take its own runs out of the measures. Added within version 1: readers that predate it ignore it. |
 | `agent_name` | The registered agent. |
 | `status` | `running`, `waiting_approval`, `waiting_input`, `needs_recovery`, `completed`, `failed` or `interrupted`. A pending action decides a waiting status, manual recovery before approval before input. A delegated action is followed through each subagent's current pending actions, up to eight levels, rather than the kind its parent recorded when it began waiting; a session whose subagent waits on no person is `running`. Otherwise the session status decides; pending, running and interrupting sessions are `running`. |
 | `reason` | The Runtime's outcome code: `completed`, `failed`, the interruption type such as `tool_approval_required`, `user_input_required`, `operator_requested` or `limit_reached`, or the session status while it runs. |
@@ -19605,11 +19651,20 @@ carries messages, tool arguments, questions, answers, results or error text.
 
 The four measures Cayu Cloud charts per agent are computable from the feed. Take
 the agent's runs to be its positively identified root incarnations
-(`root_run_id == run_id`) that are not `forked`, attribute each session's `cost`
-and touches only through its verified `root_run_id`, and count a run as finished
-when its status is `completed`, `failed` or `interrupted`. Unknown roots and
-links to a root not yet ingested are excluded from these measures and reported
-as incomplete coverage, rather than joined to a reused session alias:
+(`root_run_id == run_id`) that are not `forked`, attribute the `cost` and touches
+of each session that is not `forked` only through its verified `root_run_id`,
+and count a run as finished when its status is `completed`, `failed` or
+`interrupted`. A forked session, such as a copy Compass makes to try a change,
+and every session under it count toward no run: their `root_run_id` still names
+the source's root, because lineage records where a copy came from, but their
+cost and touches belong to the fork's own work. Eval sessions are left out the
+same way: a run with `eval: true` is not one of the agent's runs, and no session
+with `eval: true` adds cost or touches to any run. Touches carry no run-level
+flags; join a touch to its session's summary by `run_id` to learn whether it is
+`forked` or `eval`. Unknown roots, links to a
+root not yet ingested and touches whose session summary is not ingested are
+excluded from these measures and reported as incomplete coverage, rather than
+joined to a reused session alias:
 
 - correctness: finished runs that completed with no `edit` or `deny` touch, over
   finished runs;

@@ -45,6 +45,7 @@ from cayu.evals.suite_authoring import (
     compile_eval_suite_draft_v3,
 )
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.human_attention_handoff import HumanAttentionHandoff
 from cayu.messages import FilePart, TextPart
 from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -312,7 +313,11 @@ def build_synthetic_benchmark_plan(
 
     root = Path(storage_directory).resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    app = CayuApp(session_store=SQLiteSessionStore(root / "sessions.sqlite3"), enable_logging=False)
+    app = CayuApp(
+        human_attention_handoff=HumanAttentionHandoff(None),
+        session_store=SQLiteSessionStore(root / "sessions.sqlite3"),
+        enable_logging=False,
+    )
     app.register_provider(_SyntheticBenchmarkProvider(root), default=True)
     app.register_environment(
         Environment(

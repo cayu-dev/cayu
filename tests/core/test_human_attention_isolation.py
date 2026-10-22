@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+import cayu
 from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.evals.judges import _isolated_structured_judge_app
 from cayu.evals.runtime_replay import _isolated_app
@@ -77,3 +80,45 @@ def test_internal_apps_do_not_inherit_attention(monkeypatch, kind, complete_envi
         await source.aclose()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["runtime_acceptance", "synthetic_benchmark"])
+def test_internal_eval_targets_do_not_inherit_attention(monkeypatch, tmp_path, kind):
+    from cayu.evals.benchmark_synthetic import build_synthetic_benchmark_plan
+    from cayu.evals.internal.runtime_acceptance import build
+
+    monkeypatch.setenv("CAYU_ATTENTION_HANDOFF_URL", "https://receiver.invalid/attention")
+    monkeypatch.setenv("CAYU_ATTENTION_HANDOFF_TOKEN", "test-token")
+
+    async def run():
+        if kind == "runtime_acceptance":
+            app = (await build()).app
+        else:
+            target = build_synthetic_benchmark_plan(tmp_path).corpus_target
+            assert target is not None
+            app = target.app
+        try:
+            assert app.human_attention_handoff is None
+            assert not any(isinstance(s, HumanAttentionHandoffSink) for s in app._event_sinks)
+        finally:
+            await app.aclose()
+
+    asyncio.run(run())
+
+
+def test_every_internal_app_opts_out_of_the_deployed_handoff():
+    """Runtime's own applications never take the deployment's handoff by default."""
+
+    root = Path(cayu.__file__).parent
+    modules = [*sorted((root / "evals").rglob("*.py")), root / "server" / "evals_registry.py"]
+    missing = []
+    for path in modules:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "CayuApp"
+                and "human_attention_handoff" not in {keyword.arg for keyword in node.keywords}
+            ):
+                missing.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert missing == []

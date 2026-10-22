@@ -153,6 +153,7 @@ from cayu.memory.attribution import (
 from cayu.messages import Message
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+from cayu.sessions._run_identity import eval_trial_scope
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, RunnerObservedEventIdentity, Session, SessionStatus
 from cayu.sessions.requests import RunRequest, copy_run_request
@@ -2143,8 +2144,14 @@ async def _run_workflow_case_once_with_public_projection(
             failure_usage = None
 
     try:
-        async with execution_deadline_scope(
-            ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
+        # A trial can run inside the deployed application. The scope marks every session
+        # the trial creates, and every session under them, as an eval trial, which keeps
+        # them out of the human-attention handoff and out of Cayu Cloud's measures.
+        async with (
+            eval_trial_scope(),
+            execution_deadline_scope(
+                ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
+            ),
         ):
             invocation = WorkflowEvalInvocation(
                 run_id=run_id,
@@ -2921,9 +2928,15 @@ async def _run_case_once_with_public_projection(
     # Keep the deadline around the full case lifecycle: runtime execution, state/probe
     # capture, child traversal, and assertion evaluation all belong to one trial.
     try:
-        async with execution_deadline_scope(
-            ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
-        ) as deadline:
+        # A trial can run inside the deployed application. The scope marks every session
+        # the trial creates, and every session under them, as an eval trial, which keeps
+        # them out of the human-attention handoff and out of Cayu Cloud's measures.
+        async with (
+            eval_trial_scope(),
+            execution_deadline_scope(
+                ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
+            ) as deadline,
+        ):
             try:
                 stream = app.run(trial_request) if run_stream is None else run_stream(trial_request)
                 async for event in stream:

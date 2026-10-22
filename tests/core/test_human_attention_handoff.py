@@ -15,7 +15,7 @@ from examples.human_attention.app import ApprovalPolicy, ApprovalTool
 
 from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
-from cayu.evals import ScriptedModelProvider
+from cayu.evals import EvalCase, ScriptedModelProvider, run_eval_case
 from cayu.human_attention_handoff import (
     PROTOCOL,
     HumanAttentionHandoff,
@@ -665,3 +665,38 @@ def test_an_application_that_failed_to_construct_never_holds_the_handoff(monkeyp
     monkeypatch.undo()
     app = CayuApp(human_attention_handoff=handoff, enable_logging=False)
     assert app.human_attention_handoff is handoff
+
+
+def test_eval_trials_in_the_deployed_application_are_not_handed_off(sqlite_resources):
+    async def run():
+        async with sqlite_resources as resources:
+            receiver = ReferenceReceiver()
+            handoff = _handoff(receiver)
+            approval = _pause("tool_approval")[0]
+            agent = Agent(
+                resources.own(SQLiteSessionStore(resources.path())), handoff, [approval, approval]
+            )
+            case = EvalCase(
+                id="pauses",
+                request=RunRequest(
+                    agent_name="attention-demo", messages=[Message.text("user", "go")]
+                ),
+            )
+            # A server runs the deployed application's eval cases in that application.
+            result = await run_eval_case(agent.app, case, suite_id="suite")
+            (trial,) = result.trials
+            assert trial.session_id is not None
+            waiting = await agent.store.query_pending_actions(
+                PendingActionQuery(session_id=trial.session_id)
+            )
+            assert [action.kind for action in waiting.actions] == [PendingActionKind.TOOL_APPROVAL]
+            await handoff.reconcile_once()
+            assert receiver.requests == {}
+            assert receiver.reports[-1]["scan_complete"] is True
+            # The application's own runs still reach the receiver.
+            await agent.start("approval")
+            assert [item["reference"]["session_id"] for item in receiver.requests.values()] == [
+                "approval"
+            ]
+
+    asyncio.run(run())

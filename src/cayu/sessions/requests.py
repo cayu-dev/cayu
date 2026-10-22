@@ -60,7 +60,7 @@ from cayu.sessions._model_failover import (
     ModelTarget,
     copy_optional_model_failover_policy,
 )
-from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY
+from cayu.sessions._run_identity import EVAL_TRIAL_METADATA_KEY, RUN_LINEAGE_METADATA_KEY
 from cayu.sessions.fork_overlays import (
     FORK_LINEAGE_METADATA_KEY,
     FORK_OVERLAY_METADATA_KEY,
@@ -337,6 +337,7 @@ class RunRequest(BaseModel):
                     FORK_OVERLAY_METADATA_KEY,
                     FORK_LINEAGE_METADATA_KEY,
                     RUN_LINEAGE_METADATA_KEY,
+                    EVAL_TRIAL_METADATA_KEY,
                 )
                 if key in copied
             ),
@@ -360,6 +361,8 @@ class RunRequest(BaseModel):
                 authority_name = "fork-lineage authority"
             elif reserved_key == RUN_LINEAGE_METADATA_KEY:
                 authority_name = "run-lineage authority"
+            elif reserved_key == EVAL_TRIAL_METADATA_KEY:
+                authority_name = "eval-trial authority"
             else:
                 authority_name = "prompt-transition authority"
             raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
@@ -805,6 +808,7 @@ class ForkSessionRequest(BaseModel):
             FORK_OVERLAY_METADATA_KEY: "fork-overlay authority",
             FORK_LINEAGE_METADATA_KEY: "fork-lineage authority",
             RUN_LINEAGE_METADATA_KEY: "run-lineage authority",
+            EVAL_TRIAL_METADATA_KEY: "eval-trial authority",
         }
         reserved_key = next(
             (key for key in reserved_authority_kinds if key in copied),

@@ -6207,6 +6207,28 @@ class SQLiteSessionStore(
     async def event_exists(self, query: EventQuery) -> bool:
         return await session_queries.event_exists(self._run_read, query)
 
+    async def read_store_identity(self) -> str:
+        def read(connection: sqlite3.Connection) -> str | None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'cayu_store_identity'"
+                ).fetchone()
+                is None
+            ):
+                return None
+            row = connection.execute(
+                "SELECT store_id FROM cayu_store_identity WHERE singleton = 1"
+            ).fetchone()
+            return None if row is None else str(row[0])
+
+        identity = await self._run_read(read)
+        if identity is None:
+            raise NotImplementedError(
+                "This database has no store identity; run `cayu storage migrate`."
+            )
+        return identity
+
     async def query_events_bounded(
         self,
         query: EventQuery,
