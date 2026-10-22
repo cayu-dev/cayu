@@ -14403,6 +14403,9 @@ image that reports another version. Protocol 7 adds port forwards through
 runner relays each connection to a host `host:port` over the owner-fenced endpoint, moving bytes
 by offset in both directions. A newer owner claim, suspension, termination or the forward's
 `timeout_s` closes it, and `close()` returns only after the sidecar confirms the listener closed.
+The sidecar closes every earlier owner's forward before a newer claim completes and refuses a
+delayed open under the old claim, so `close()` after a takeover counts the forward as closed
+instead of raising `LambdaMicroVMOwnershipSuperseded`.
 Duplicate closes and lifecycle shutdowns wait for the same retained teardown of the listener
 and its accepted connections, including an expiry-driven close already in progress. Admission
 is fenced immediately, but a socket-close failure or accept-thread join timeout does not

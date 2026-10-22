@@ -899,3 +899,65 @@ def test_partial_write_timeout_closes_both_connection_directions() -> None:
     finally:
         connection.close()
         guest.close()
+
+
+def test_sidecar_writes_never_queue_behind_long_polls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from examples.aws.lambda_microvm_sidecar.forwards import (
+        FORWARD_PORTS,
+        MAX_FORWARD_CONNECTIONS,
+    )
+
+    monkeypatch.setenv("CAYU_MICROVM_WORKSPACE_ROOT", str(tmp_path))
+    sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
+    app = importlib.import_module("examples.aws.lambda_microvm_sidecar.app")
+    # Every long poll the forward limits allow fits in the poll pool at once.
+    assert app.FORWARD_POLL_IO._max_workers == len(FORWARD_PORTS) * (MAX_FORWARD_CONNECTIONS + 1)
+    assert app.FORWARD_IO._max_workers == len(FORWARD_PORTS) * MAX_FORWARD_CONNECTIONS
+    # Small pools make saturation cheap: the polls below fill the poll pool.
+    polls, writes = ThreadPoolExecutor(max_workers=2), ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(app, "FORWARD_POLL_IO", polls)
+    monkeypatch.setattr(app, "FORWARD_IO", writes)
+    monkeypatch.setattr(app, "SUPERVISOR", CommandSupervisor(root=tmp_path))
+    monkeypatch.setattr(app, "FORWARDS", _registry())
+    claim = "c" * 40
+
+    async def scenario() -> None:
+        await app.claim_owner({"claim_id": claim})
+        opened = await app.open_forward({"forward_id": "fwd", "owner_claim": claim})
+        client = await asyncio.to_thread(_connect, opened)
+        try:
+            await app.accept_forward("fwd", {"owner_claim": claim, "after": 0, "wait_s": 5})
+            long_polls = [
+                asyncio.create_task(
+                    app.read_forward(
+                        "fwd", 1, {"owner_claim": claim, "offset": 0, "max_bytes": 16, "wait_s": 5}
+                    )
+                )
+                for _ in range(2)
+            ]
+            await asyncio.sleep(0.2)
+            written = await asyncio.wait_for(
+                app.write_forward(
+                    "fwd", 1, {"owner_claim": claim, "offset": 0, "data_base64": "b2s="}
+                ),
+                2,
+            )
+            assert written == {"offset": 2, "closed": False}
+            assert await asyncio.to_thread(client.recv, 16) == b"ok"
+            app.FORWARDS.close_all()
+            await asyncio.gather(*long_polls)
+        finally:
+            client.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        app.FORWARDS.close_all()
+        app.SUPERVISOR.cancel_all()
+        polls.shutdown(wait=True)
+        writes.shutdown(wait=True)
+        sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)

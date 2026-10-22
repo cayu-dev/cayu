@@ -56,7 +56,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-claude-agent-sdk = ["claude-agent-sdk>=0.2.168,<0.3"]
+claude-agent-sdk = ["claude-agent-sdk==0.2.170"]
 codex = ["openai-codex==0.163.0"]
 dev = [
   # Exercises the bounded Brotli decoder in egress; not a runtime dependency.

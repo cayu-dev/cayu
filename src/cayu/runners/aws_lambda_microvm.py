@@ -3154,7 +3154,13 @@ class _LambdaPortForward(RunnerPortForward):
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            response = await self._call("close_forward")
+            try:
+                response = await self._call("close_forward")
+            except LambdaMicroVMOwnershipSuperseded:
+                # The takeover closed every forward of earlier owners, and a
+                # delayed open under this claim is refused, so nothing remains.
+                self._closed = True
+                return
             if response.get("closed") is not True:
                 raise LambdaMicroVMProtocolError(
                     "Lambda MicroVM did not confirm the forward closed."

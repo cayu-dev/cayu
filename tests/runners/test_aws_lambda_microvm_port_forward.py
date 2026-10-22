@@ -231,9 +231,45 @@ def test_a_successor_owner_closes_the_forward(tmp_path: Path) -> None:
                 await asyncio.to_thread(
                     _guest_exchange, forward.guest_host, forward.guest_port, b"x\n"
                 )
-            with pytest.raises(LambdaMicroVMOwnershipSuperseded):
-                await forward.close()
+            # The takeover already closed the forward, so close confirms it.
+            await forward.close()
+            await forward.close()
+            assert forward._closed
+            assert transport.forwards._forwards == {}
             assert runner.owner_fence_generation is None
+
+    asyncio.run(scenario())
+
+
+def test_a_takeover_keeps_the_runs_own_error(tmp_path: Path) -> None:
+    from cayu.external_agents import runner_port_forward
+
+    class RunFailed(Exception):
+        pass
+
+    async def scenario() -> None:
+        transport = ForwardingTransport(tmp_path)
+        runner = _runner(tmp_path, transport)
+        with pytest.raises(RunFailed):
+            async with runner_port_forward(runner, host="127.0.0.1", port=1):
+                await transport.claim_owner(claim_id="s" * 40)
+                raise RunFailed()
+        assert transport.forwards._forwards == {}
+
+    asyncio.run(scenario())
+
+
+def test_an_open_refused_by_a_successor_owner_retains_no_cleanup(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        transport = ForwardingTransport(tmp_path)
+        runner = _runner(tmp_path, transport)
+        await runner._claim_owner()
+        await transport.claim_owner(claim_id="s" * 40)
+        capability = runner.port_forward_capability()
+        with pytest.raises(LambdaMicroVMOwnershipSuperseded) as caught:
+            await capability.open_port_forward(host="127.0.0.1", port=1)
+        assert capability.failed_open_forward(caught.value) is None
+        assert transport.forwards._forwards == {}
 
     asyncio.run(scenario())
 

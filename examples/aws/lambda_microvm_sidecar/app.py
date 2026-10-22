@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
-from .forwards import PortForwardRegistry
+from .forwards import FORWARD_PORTS, MAX_FORWARD_CONNECTIONS, PortForwardRegistry
 from .supervisor import (
     CommandConflictError,
     CommandExecutionBoundary,
@@ -44,8 +44,18 @@ OWNER_SUPERSEDED_REASON = "owner_superseded"
 # waiting from starving the default pool that serves every other endpoint.
 INTERACTIVE_IO = ThreadPoolExecutor(max_workers=32, thread_name_prefix="cayu-interactive")
 # Each relayed connection keeps one read long poll open, and each forward one
-# accept long poll, so forwards get their own pool too.
-FORWARD_IO = ThreadPoolExecutor(max_workers=64, thread_name_prefix="cayu-forward")
+# accept long poll, so forwards get their own pools too. The poll pool fits every
+# poll the forward limits allow. Writes and connection closes have a separate pool
+# sized to the connection limit, since a write can block while a guest stops
+# reading, so host bytes never queue behind a long poll. Threads start on demand.
+FORWARD_POLL_IO = ThreadPoolExecutor(
+    max_workers=len(FORWARD_PORTS) * (MAX_FORWARD_CONNECTIONS + 1),
+    thread_name_prefix="cayu-forward-poll",
+)
+FORWARD_IO = ThreadPoolExecutor(
+    max_workers=len(FORWARD_PORTS) * MAX_FORWARD_CONNECTIONS,
+    thread_name_prefix="cayu-forward",
+)
 app = FastAPI(title="Cayu Lambda MicroVM sidecar", docs_url=None, redoc_url=None)
 
 
@@ -218,6 +228,7 @@ async def open_forward(payload: dict[str, Any]) -> dict[str, Any]:
 async def accept_forward(forward_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Long-poll for connections accepted after the ``after`` connection number."""
     return await _owned_forward_call(
+        FORWARD_POLL_IO,
         payload,
         FORWARDS.accept,
         forward_id,
@@ -230,6 +241,7 @@ async def accept_forward(forward_id: str, payload: dict[str, Any]) -> dict[str, 
 async def read_forward(forward_id: str, connection: int, payload: dict[str, Any]) -> dict[str, Any]:
     """Long-poll a connection's guest bytes from ``offset``, acknowledging earlier ones."""
     return await _owned_forward_call(
+        FORWARD_POLL_IO,
         payload,
         FORWARDS.read,
         forward_id,
@@ -246,6 +258,7 @@ async def write_forward(
 ) -> dict[str, Any]:
     """Send host bytes to a connection; ``offset`` makes a retry idempotent."""
     return await _owned_forward_call(
+        FORWARD_IO,
         payload,
         FORWARDS.write,
         forward_id,
@@ -260,7 +273,9 @@ async def write_forward(
 async def close_forward_connection(
     forward_id: str, connection: int, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    return await _owned_forward_call(payload, FORWARDS.close_connection, forward_id, connection)
+    return await _owned_forward_call(
+        FORWARD_IO, payload, FORWARDS.close_connection, forward_id, connection
+    )
 
 
 @app.post("/v1/forwards/{forward_id}/close")
@@ -275,14 +290,18 @@ async def close_forward(forward_id: str, payload: dict[str, Any]) -> dict[str, A
 
 
 async def _owned_forward_call(
-    payload: dict[str, Any], operation: Any, *arguments: Any, **keywords: Any
+    executor: ThreadPoolExecutor,
+    payload: dict[str, Any],
+    operation: Any,
+    *arguments: Any,
+    **keywords: Any,
 ) -> dict[str, Any]:
     # The fence is checked, not held: a takeover closes every forward itself.
     def call() -> dict[str, Any]:
         generation = OWNER.require(payload.get("owner_claim"))
         return operation(*arguments, owner_generation=generation, **keywords)
 
-    return await _forward_call(call, executor=FORWARD_IO)
+    return await _forward_call(call, executor=executor)
 
 
 async def _forward_call(call: Any, *, executor: ThreadPoolExecutor | None) -> dict[str, Any]:

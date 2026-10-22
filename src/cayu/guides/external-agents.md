@@ -749,7 +749,7 @@ What to know about this route:
   1 ms. Expect roughly one endpoint round trip per chunk. The gateway itself buffers each model
   response until it ends, so it can commit usage before the CLI sees a finished
   response; the CLI receives the whole stream then.
-- **Claude Code** (2.1.301, the CLI bundled with the pinned `claude-agent-sdk`)
+- **Claude Code** (2.1.306, the CLI bundled with the pinned `claude-agent-sdk`)
   uses `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` and sends the token as
   `Authorization: Bearer`, which the gateway accepts. It may substitute a newer
   model for a retired name (for example it sent `claude-opus-5-5` when asked for
@@ -763,7 +763,7 @@ What to know about this route:
 
 To check this on real AWS, build a MicroVM image from this release's sidecar with
 the CLIs at the pinned versions, for example by adding
-`RUN python3.11 -m pip install claude-agent-sdk==0.2.168 openai-codex-cli-bin==0.163.0`
+`RUN python3.11 -m pip install claude-agent-sdk==0.2.170 openai-codex-cli-bin==0.163.0`
 to the exported Dockerfile and linking the bundled `claude` and `codex` binaries
 into `/usr/local/bin`. Then run the quick start with the launches above, a small
 prompt and `BudgetLimit.usd(0.05)`, and confirm that:
