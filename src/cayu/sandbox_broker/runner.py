@@ -429,8 +429,12 @@ class BrokeredSandboxRunner(Runner):
         The broker runs each one in its own PID namespace and reports it ended only
         once every process in it has exited, so ``runner_agent_launch`` can run a
         vendor CLI here. Stdio crosses the broker as offset-addressed requests.
+        ``None`` unless the sandbox record says the broker runs interactive
+        commands (``interactive_commands``); a broker that doesn't refuses them.
         """
 
+        if not self.sandbox.interactive_commands:
+            return None
         return _BrokeredInteractiveProcessCapability(self)
 
     # Admission --------------------------------------------------------------
@@ -605,7 +609,9 @@ class BrokeredSandboxRunner(Runner):
         return int((expires_at - datetime.now(UTC)).total_seconds())
 
     def _lease_lost(self, error: SandboxBrokerError | None) -> SandboxLeaseLostError:
-        self._close_exec("the brokered sandbox is no longer ready")
+        # A sandbox that stopped being ready never becomes ready again, so the
+        # runner can't be reopened: poison it, which admission treats as terminal.
+        self._poison_exec("the brokered sandbox is no longer ready")
         return SandboxLeaseLostError(
             "The brokered sandbox is no longer ready.",
             status=None if error is None else error.status,
@@ -619,7 +625,7 @@ class BrokeredSandboxRunner(Runner):
         try:
             keeper.check()
         except SandboxLeaseLostError:
-            self._close_exec("the brokered sandbox's lease was lost")
+            self._poison_exec("the brokered sandbox's lease was lost")
             raise
 
 
@@ -961,13 +967,21 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
         """Copy back one file too large for an archive as a staged copy, within the limits."""
 
         prefix = "" if self.cwd is None else self.cwd.rstrip("/") + "/"
-        limit = min(staged.max_bytes, budget.per_file + STAGED_FILE_OVERHEAD_BYTES)
+        file_limit = budget.per_file + STAGED_FILE_OVERHEAD_BYTES
+        limit = min(staged.max_bytes, file_limit)
         with tempfile.TemporaryFile() as spool:
             try:
                 copy = await self._brokered_runner.copy_out(
                     spool, max_bytes=limit, paths=[prefix + path]
                 )
-            except SandboxArchiveTooLargeError:
+            except SandboxArchiveTooLargeError as error:
+                if error.code == "copy_too_large" or limit < file_limit:
+                    # The sandbox's staged copies, not the transfer limits, stopped it.
+                    raise RuntimeError(
+                        "Workspace file is larger than the sandbox's staged copies allow "
+                        f"({staged.max_bytes} bytes per copy, {staged.sandbox_max_bytes} per "
+                        f"sandbox): {path}"
+                    ) from None
                 raise RuntimeError(
                     f"Workspace file exceeds max_file_bytes={budget.per_file}: {path}"
                 ) from None
@@ -1018,13 +1032,30 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
     async def _write_staged(
         self, source: BinaryIO, archive_bytes: int, staged: SandboxStagedCopies
     ) -> None:
-        """Copy the tree in as one staged copy, after checking every member."""
+        """Copy the tree in as one staged copy, after checking every member.
+
+        A seekable source (``SyncBinding`` hands over its sealed, capacity-owned
+        archive) is checked in one pass and uploaded from its start in a
+        second, so no host copy is made beside it. Only a source that can't
+        seek is spooled to a host temporary file first; that spool is outside
+        any ``staging_capacity``.
+        """
 
         if archive_bytes > staged.max_bytes:
             raise RuntimeError(
                 f"Workspace archive of {archive_bytes} bytes exceeds the broker's staged copy "
                 f"limit of {staged.max_bytes} bytes."
             )
+        if source.seekable():
+            origin = source.tell()
+            digest = await asyncio.to_thread(self._spool_checked, source, archive_bytes, None)
+            # The broker checks the upload against this digest, so a source that
+            # changed between the passes is refused rather than extracted.
+            source.seek(origin)
+            await self._brokered_runner.copy_in(
+                source, size=archive_bytes, sha256=digest, path=self.cwd
+            )
+            return
         with tempfile.TemporaryFile() as spool:
             digest = await asyncio.to_thread(self._spool_checked, source, archive_bytes, spool)
             spool.seek(0)
@@ -1032,10 +1063,12 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
                 spool, size=archive_bytes, sha256=digest, path=self.cwd
             )
 
-    def _spool_checked(self, source: BinaryIO, archive_bytes: int, spool: BinaryIO) -> str:
-        """Write the archive to ``spool`` as it is read, checking its members as the split
-        path does; returns its SHA-256."""
+    def _spool_checked(self, source: BinaryIO, archive_bytes: int, spool: BinaryIO | None) -> str:
+        """Read the archive, checking its members as the split path does, and return its
+        SHA-256. With a ``spool`` every byte is written there; without one ``source``
+        must be seekable, and is read again to check what follows its last member."""
 
+        origin = source.tell() if spool is None else 0
         limited = _LimitedReader(source, archive_bytes)
         tee = _TeeReader(limited, spool)
         with tarfile.open(fileobj=tee, mode="r|") as incoming:
@@ -1053,15 +1086,18 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             parsed_bytes = incoming.offset
             while tee.read(1 << 16):
                 pass
-        # tarfile can stop at a zero block or corrupt header without raising.
-        # Readahead may already have copied later headers into the spool, so
-        # inspect from the last parsed member boundary rather than the reader.
-        spool.seek(parsed_bytes)
-        while trailing := spool.read(1 << 16):
-            if any(trailing):
-                raise ValueError("Workspace archive has unvalidated trailing content.")
         if limited.read_bytes != archive_bytes:
             raise RuntimeError("Workspace archive stream did not match its declared size.")
+        # tarfile can stop at a zero block or corrupt header without raising.
+        # Readahead may already have read later headers, so inspect from the
+        # last parsed member boundary rather than the reader's position.
+        rest = spool if spool is not None else source
+        rest.seek(origin + parsed_bytes)
+        remaining = archive_bytes - parsed_bytes
+        while remaining > 0 and (trailing := rest.read(min(1 << 16, remaining))):
+            remaining -= len(trailing)
+            if any(trailing):
+                raise ValueError("Workspace archive has unvalidated trailing content.")
         return tee.hexdigest()
 
     def _split_archive(self, source: BinaryIO, archive_bytes: int) -> list[bytes]:
@@ -1156,9 +1192,9 @@ class _LimitedReader(io.RawIOBase):
 
 
 class _TeeReader(io.RawIOBase):
-    """Reads through ``source``, copying and hashing every byte into ``sink``."""
+    """Reads through ``source``, hashing every byte and copying it into ``sink`` if given."""
 
-    def __init__(self, source: io.RawIOBase, sink: BinaryIO) -> None:
+    def __init__(self, source: io.RawIOBase, sink: BinaryIO | None) -> None:
         self._source = source
         self._sink = sink
         self._digest = hashlib.sha256()
@@ -1169,7 +1205,8 @@ class _TeeReader(io.RawIOBase):
     def read(self, size: int = -1) -> bytes:
         data = self._source.read(size)
         if data:
-            self._sink.write(data)
+            if self._sink is not None:
+                self._sink.write(data)
             self._digest.update(data)
         return data
 

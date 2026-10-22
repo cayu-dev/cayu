@@ -99,6 +99,7 @@ class FakeSandbox:
     commands: dict[str, FakeCommand] = field(default_factory=dict)
     copies: dict[str, dict[str, Any]] = field(default_factory=dict)
     staged_copies: dict[str, int] | None = None
+    interactive_commands: bool = True
 
     def record(self) -> dict[str, Any]:
         return {
@@ -121,6 +122,7 @@ class FakeSandbox:
             "destroyed_at": None,
             "destroy_reason": self.destroy_reason,
             "staged_copies": self.staged_copies,
+            "interactive_commands": self.interactive_commands,
             "guarantees": {"version": 1, "items": list(self.guarantees)},
         }
 
@@ -151,6 +153,8 @@ class FakeBroker:
         self.catalog = {"coding-python"}
         # What new sandboxes offer for staged copies; None offers none.
         self.staged_copies: dict[str, int] | None = None
+        # Whether new sandboxes run interactive commands; Cloud before them refuses the field.
+        self.interactive_commands = True
         # Staged objects by key, and every request the storage received.
         self.objects: dict[str, bytes] = {}
         self.storage_requests: list[httpx.Request] = []
@@ -336,6 +340,7 @@ class FakeBroker:
             root=root,
             guarantees=self.guarantees,
             staged_copies=self.staged_copies,
+            interactive_commands=self.interactive_commands,
         )
         self.sandboxes[sandbox_id] = sandbox
         self.by_key[key] = sandbox_id
@@ -349,6 +354,9 @@ class FakeBroker:
             if existing.body != body:
                 return _error(409, "command_id_conflict")
             return httpx.Response(200, json=existing.view())
+        if "interactive" in body and not sandbox.interactive_commands:
+            # A broker without interactive commands rejects the unknown field.
+            return _error(422, "sandbox_invalid")
         sizes = [len(item.encode()) for item in body["argv"]]
         if max(sizes) > 131_071 or sum(sizes) > 256 * 1024:
             return _error(422, "sandbox_invalid")

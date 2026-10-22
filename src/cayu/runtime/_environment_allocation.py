@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -44,6 +45,12 @@ ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY = "environment_factory_al
 # describes and removed with it. Older checkpoints carry it only as a top-level
 # ``allocation_fingerprint`` inside the reconnect metadata.
 ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY = "environment_factory_allocation_identity"
+# A digest of the reconnect metadata each identity was published beside. Releases
+# from before the identity record replace an allocation without removing either,
+# so an identity whose binding no longer matches its reconnect metadata is stale.
+ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY = (
+    "environment_factory_allocation_identity_binding"
+)
 ENVIRONMENT_FACTORY_ALLOCATION_RECORD_SCHEMA_VERSION = 1
 ENVIRONMENT_FACTORY_RECONNECT_METADATA_MAX_BYTES = 32 * 1024
 _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
@@ -684,6 +691,7 @@ class EnvironmentAllocationCoordinator:
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
             ):
                 values = checkpoint_object_map(checkpoint, key)
                 values.pop(name, None)
@@ -795,6 +803,7 @@ class EnvironmentAllocationCoordinator:
                 checkpoint,
                 environment_name=environment_name,
                 allocation_fingerprint=allocation_fingerprint,
+                reconnect_metadata=reconnect_metadata,
             )
             if records:
                 checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY] = records
@@ -1183,25 +1192,53 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
         self._state = record.state
 
 
+def allocation_identity_binding(reconnect_metadata: Mapping[str, Any]) -> str:
+    """Return the digest that ties an allocation identity to its reconnect metadata."""
+
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "record_type": "cayu.environment-allocation-identity-binding",
+                "schema_version": 1,
+                "reconnect_metadata": dict(reconnect_metadata),
+            },
+            "allocation_identity_binding",
+        )
+    ).hexdigest()
+
+
 def set_checkpoint_allocation_identity(
     checkpoint: dict[str, Any],
     *,
     environment_name: str,
     allocation_fingerprint: str | None,
+    reconnect_metadata: Mapping[str, Any],
 ) -> None:
-    """Record or clear one environment's factory-published allocation identity."""
+    """Record or clear one environment's factory-published allocation identity.
+
+    The identity is bound to the reconnect metadata written beside it.
+    """
 
     identities = checkpoint_object_map(
         checkpoint, ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY
     )
+    bindings = checkpoint_object_map(
+        checkpoint, ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY
+    )
     if allocation_fingerprint is None:
         identities.pop(environment_name, None)
+        bindings.pop(environment_name, None)
     else:
         identities[environment_name] = allocation_fingerprint
-    if identities:
-        checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY] = identities
-    else:
-        checkpoint.pop(ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY, None)
+        bindings[environment_name] = allocation_identity_binding(reconnect_metadata)
+    for key, values in (
+        (ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY, identities),
+        (ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY, bindings),
+    ):
+        if values:
+            checkpoint[key] = values
+        else:
+            checkpoint.pop(key, None)
 
 
 def checkpoint_object_map(

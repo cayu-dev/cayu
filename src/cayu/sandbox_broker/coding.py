@@ -36,7 +36,10 @@ from cayu.environments import (
     EnvironmentFactoryResult,
     EnvironmentSpec,
 )
-from cayu.environments._ephemeral_git import initialize_ephemeral_git_baseline
+from cayu.environments._ephemeral_git import (
+    initialize_ephemeral_git_baseline,
+    sync_bound_tree_size,
+)
 from cayu.environments._sync_staging import SyncBindingStagingCapacity
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -155,7 +158,10 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                 bound.runner, BrokeredSandboxRunner
             ):
                 raise RuntimeError("Brokered coding binding lost its sandbox target.")
-            await initialize_ephemeral_git_baseline(bound.runner, cwd=target.runner_cwd)
+            tree_bytes, tree_files = sync_bound_tree_size(bound.metadata)
+            await initialize_ephemeral_git_baseline(
+                bound.runner, cwd=target.runner_cwd, tree_bytes=tree_bytes, tree_files=tree_files
+            )
         except BaseException:
             self.abandon(bound)
             raise

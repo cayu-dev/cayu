@@ -39,6 +39,7 @@ from cayu.environments._ephemeral_git import (
     ephemeral_git_baseline,
     git_filter_configuration_is_safe,
     initialize_ephemeral_git_baseline,
+    sync_bound_tree_size,
 )
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
 from cayu.environments.admission import (
@@ -505,7 +506,10 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                     )
             git_baseline: EphemeralGitBaseline | None = None
             if self._git_baseline:
-                await initialize_ephemeral_git_baseline(runner)
+                tree_bytes, tree_files = sync_bound_tree_size(bound.metadata)
+                await initialize_ephemeral_git_baseline(
+                    runner, tree_bytes=tree_bytes, tree_files=tree_files
+                )
                 git_baseline = await ephemeral_git_baseline(runner)
             transformed_baseline_paths = frozenset()
             if copied is not None:

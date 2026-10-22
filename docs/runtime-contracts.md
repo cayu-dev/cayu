@@ -2963,6 +2963,17 @@ checkpoints and tombstones written by earlier releases, Cayu reads the identity
 from a top-level `reconnect_metadata["allocation_fingerprint"]`; a result that
 sets both must make them equal.
 
+An earlier release sharing the store (down to the compatibility floor) doesn't
+know the identity record, so when it disposes of an allocation and creates
+another it leaves the old identity behind. Cayu therefore checkpoints each
+identity with a digest of the reconnect metadata written beside it, and reads
+an identity only while that digest matches the current metadata; otherwise the
+identity belongs to a replaced allocation and is ignored, and the reconnect
+proceeds as for an allocation checkpointed without one. An identity written
+before the digest existed is used only when the metadata carries no top-level
+identity, or the same one; when they disagree the top-level one, which every
+release rewrites with its allocation, wins.
+
 The runtime emits the established `environment.factory.*` and
 `environment.binding.*` events plus typed
 `environment.lifecycle.transition` records for selection, preflight,

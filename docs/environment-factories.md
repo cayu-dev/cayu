@@ -528,7 +528,16 @@ back the same way. The storage URL gets only the archive and the headers the
 broker signed, never the sandbox credential, and nothing in the sandbox sees
 it. `transfer_limits.max_file_bytes` may then exceed 8 MiB; a sandbox that
 can't carry a file that large through staged copies is refused at setup and
-destroyed. File tools and commands run as broker commands.
+destroyed. A file the sandbox's staged copies can't carry back fails copy-back
+naming those limits, not `max_file_bytes`. The tree goes up straight from the
+binding's staged archive, which `staging_capacity` already accounts for, so no
+second host copy is made; only a caller of
+`BrokeredSandboxWorkspace.write_tar_stream` whose source can't seek gets its
+archive spooled to a host temporary file first. While a staged copy is handed
+in and runs, a broker outage is retried until the copy's own deadline (ten
+minutes plus a second per MiB), as commands are; only a copy still unconfirmed
+then closes the runner for good. File tools and commands run as broker
+commands.
 
 The parts work on their own too. An Agent that clones a private repository
 itself can hand the sandbox the checkout, `.git` included, without the
@@ -554,8 +563,11 @@ source; `BrokeredSandboxCodingBinding` used on its own refuses, before copying
 anything, a source or target that doesn't exclude `.git` or a target on another
 runner, and makes the repository in its target's directory. The baseline reads
 back no output that grows with the workspace, so the broker's 2 MiB cap on a
-command's output doesn't limit the tree. The image needs `git` (`coding-python`
-has it); a sandbox whose baseline fails isn't bound. `git_baseline=False` drops
+command's output doesn't limit the tree. `git add` and `git commit` get a
+minute plus a quarter second per MiB and ten seconds per thousand files copied
+in, at most 30 minutes each, so a large staged tree has time to commit. The
+image needs `git` (`coding-python` has it); a sandbox whose baseline fails isn't
+bound. `git_baseline=False` drops
 the baseline, for an image without `git`.
 
 Each command starts under a fresh command id and is polled until it finishes:
@@ -596,9 +608,15 @@ Each part also works alone:
 - `SandboxBrokerClient` is the wire client;
 - `SandboxLeaseKeeper` renews one lease;
 - `BrokeredSandboxRunner` is a `Runner` over one sandbox and destroys it when
-  closed. Its `interactive_process_capability()` opens interactive commands
+  closed. Where the broker runs interactive commands (the sandbox record's
+  `interactive_commands`), its `interactive_process_capability()` opens them
   through the broker, each stopped with its whole process tree, so
-  `runner_agent_launch` can run Claude Code or Codex in the sandbox;
+  `runner_agent_launch` can run Claude Code or Codex in the sandbox. That needs
+  a Cayu Cloud whose broker supports interactive commands; against one that
+  doesn't, the capability is `None` and the launch is refused before anything
+  starts. Port forwarding isn't available in brokered sandboxes
+  (`port_forward_capability()` is `None`), so `runner_port_forward` can't reach
+  a gateway on the Agent's host from one;
 - `BrokeredSandboxWorkspace` is a `RunnerWorkspace` whose bulk copies use the
   broker's archive routes.
 
@@ -1018,7 +1036,10 @@ still stale fail closed. A runner whose `lifecycle_state` is `closed` or
 sandbox, is refused before tool-dependent or expired-evidence dispatch without
 a renewal attempt, even while its retained evidence is unexpired. The refusal
 is `missing_final_evidence` with reason code `runner_closed` or
-`runner_poisoned`. A renewal implementation must settle every dispatched
+`runner_poisoned`. A runner whose execution resource is gone for good must
+report one of these, not `fenced` (which a runner may reopen): a brokered
+sandbox runner whose lease was lost, or whose sandbox stopped being ready, is
+`poisoned`. A renewal implementation must settle every dispatched
 probe or transfer an authenticated settlement owner on every return and raise
 path; the runtime fences later dispatch and final binding cleanup behind that
 owner.

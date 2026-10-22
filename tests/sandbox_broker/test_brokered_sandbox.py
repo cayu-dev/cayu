@@ -33,6 +33,7 @@ from cayu.external_agents import runner_agent_launch
 from cayu.external_agents.environment import scrub_external_environment
 from cayu.runners import ExecCommand
 from cayu.runners.base import runner_workspace_mutation_settlement
+from cayu.runtime._environment_exposure import _terminal_runner_state
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sandbox_broker import (
     BrokeredSandboxCodingBinding,
@@ -1395,7 +1396,28 @@ def test_a_lapsed_lease_found_by_a_command_closes_the_runner(tmp_path: Path) -> 
         broker.expire(runner.sandbox_id)
         with pytest.raises(SandboxLeaseLostError):
             await runner.exec(ExecCommand.process("true"))
-        assert runner.lifecycle_state == "fenced"
+        # The sandbox never becomes ready again, so the runner can't be reopened,
+        # and retained admission evidence must not admit it.
+        assert runner.lifecycle_state == "poisoned"
+        assert _terminal_runner_state(runner) == "poisoned"
+        with pytest.raises(RuntimeError, match="poisoned"):
+            runner.reopen_exec()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_lease_the_keeper_lost_poisons_the_runner(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker, renew_every_s=0.05)
+        broker.expire(runner.sandbox_id)
+        while runner.lease_keeper.lost is None:
+            await asyncio.sleep(0.01)
+        with pytest.raises(SandboxLeaseLostError):
+            await runner.exec(ExecCommand.process("true"))
+        assert _terminal_runner_state(runner) == "poisoned"
         await runner.close()
 
     asyncio.run(scenario())
@@ -1547,8 +1569,9 @@ def test_failed_staged_copy_size_uses_archive_too_large_error(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("seekable", [True, False])
 @pytest.mark.parametrize("separator", [b"\0" * 512, b"corrupt" + b"\0" * 505])
-def test_staged_archive_rejects_unparsed_trailing_members(tmp_path, separator):
+def test_staged_archive_rejects_unparsed_trailing_members(tmp_path, separator, seekable):
     broker = FakeBroker(tmp_path / "cloud")
     broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
     # Retain just the first file header and padded payload, then hide a member
@@ -1562,8 +1585,9 @@ def test_staged_archive_rejects_unparsed_trailing_members(tmp_path, separator):
     async def scenario():
         runner = await _ready_runner(broker)
         workspace = BrokeredSandboxWorkspace(runner)
+        source = io.BytesIO(raw) if seekable else io.BufferedReader(_Unseekable(raw))
         with pytest.raises(ValueError, match="unvalidated trailing"):
-            await workspace._write_staged(io.BytesIO(raw), len(raw), runner.staged_copies)
+            await workspace._write_staged(source, len(raw), runner.staged_copies)
         assert not broker.storage_requests
         assert not (broker.sandboxes[runner.sandbox_id].root / "link").exists()
         await runner.close()
@@ -1591,6 +1615,11 @@ def test_abandoned_staged_extraction_fences_runner(tmp_path, monkeypatch, failur
         monkeypatch.setattr(runner.broker, "get_copy", get_copy)
         if failure == "timeout":
             monkeypatch.setattr(client_module, "_COPY_TIMEOUT_FLOOR_SECONDS", -1000)
+        if failure == "poll":
+            # An outage is polled through until the copy's own deadline, then poisons.
+            monkeypatch.setattr(client_module, "_COPY_TIMEOUT_FLOOR_SECONDS", 0.3)
+            monkeypatch.setattr(client_module, "_RETRY_DELAYS_SECONDS", (0.01,))
+            monkeypatch.setattr(client_module, "_OUTAGE_RETRY_SECONDS", 0.05)
         copying = asyncio.create_task(
             runner.copy_in(
                 io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
@@ -1825,3 +1854,224 @@ def test_failed_start_cleanup_observes_late_refusal(tmp_path, monkeypatch, earli
         await runner.close()
 
     asyncio.run(scenario())
+
+
+# Robustness ----------------------------------------------------------------
+
+
+def _outage_broker(tmp_path: Path, monkeypatch, *, failing: str, outages: int) -> FakeBroker:
+    """A broker whose copy polls or commits answer 503 ``outages`` times, then recover."""
+
+    monkeypatch.setattr(client_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01))
+    monkeypatch.setattr(client_module, "_OUTAGE_RETRY_SECONDS", 0.01)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
+    extract = broker._copy_in
+    committed: list[tuple] = []
+    if failing == "poll":
+        # A committed copy stays pending in Cloud until a poll gets through.
+        def pending(sandbox, copy):
+            committed.append((sandbox, copy))
+            copy.update(status="pending")
+
+        monkeypatch.setattr(broker, "_copy_in", pending)
+    transport = broker.transport
+    remaining = outages
+
+    async def flaky(request: httpx.Request) -> httpx.Response:
+        nonlocal remaining
+        parts = request.url.path.split("/")
+        poll = request.method == "GET" and "copies" in parts[:-1]
+        commit = request.method == "POST" and parts[-1] == "commit"
+        if (poll if failing == "poll" else commit) and remaining:
+            remaining -= 1
+            return httpx.Response(503, text="bad gateway")
+        if poll:
+            while committed:
+                extract(*committed.pop())
+        return await transport(request)
+
+    monkeypatch.setattr(broker, "transport", flaky)
+    return broker
+
+
+@pytest.mark.parametrize("failing", ["poll", "commit"])
+def test_a_short_broker_outage_during_a_staged_copy_keeps_the_runner(
+    tmp_path, monkeypatch, failing
+):
+    # More 503s than one request's quick retries take, then the broker answers again.
+    broker = _outage_broker(tmp_path, monkeypatch, failing=failing, outages=6)
+    data = _tar({"result": b"new"})
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        copy = await runner.copy_in(
+            io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
+        )
+        assert copy.status == "done"
+        assert (broker.sandboxes[runner.sandbox_id].root / "result").read_bytes() == b"new"
+        assert runner.lifecycle_state == "reusable"
+        assert (await runner.exec(ExecCommand.process("echo", "safe"))).stdout == "safe\n"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_outage_past_the_copy_deadline_still_poisons(tmp_path, monkeypatch):
+    broker = _outage_broker(tmp_path, monkeypatch, failing="poll", outages=10_000)
+    monkeypatch.setattr(client_module, "_COPY_TIMEOUT_FLOOR_SECONDS", 0.2)
+    data = _tar({"result": b"new"})
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        with pytest.raises(SandboxBrokerUnavailableError):
+            await runner.copy_in(
+                io.BytesIO(data), size=len(data), sha256=hashlib.sha256(data).hexdigest()
+            )
+        assert runner.lifecycle_state == "poisoned"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_interactive_processes_need_a_broker_that_offers_them(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    # A Cloud broker from before interactive commands doesn't say it runs them,
+    # and refuses the field.
+    broker.interactive_commands = False
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        assert runner.sandbox.interactive_commands is False
+        assert runner.interactive_process_capability() is None
+        with pytest.raises(ValueError, match="cannot open interactive processes"):
+            async with runner_agent_launch(runner=runner, cli=sys.executable, environment={}):
+                pass
+        with pytest.raises(SandboxBrokerRefusedError) as refused:
+            await runner.broker.start_command(runner.sandbox_id, "c-1", ["cat"], interactive=True)
+        assert refused.value.code == "sandbox_invalid"
+        await runner.close()
+        broker.interactive_commands = True
+        offered = await _ready_runner(broker)
+        assert offered.interactive_process_capability() is not None
+        await offered.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_interactive_offer_tolerates_its_possible_shapes() -> None:
+    base = {"id": "s", "image": "coding-python", "egress": {"mode": "none"}, "status": "ready"}
+    record = client_module.SandboxRecord.model_validate
+    assert record(base).interactive_commands is False
+    assert record({**base, "interactive_commands": True}).interactive_commands is True
+    assert record({**base, "interactive_commands": {"max_chunk_bytes": 1}}).interactive_commands
+    for value in (False, None, "yes", 1):
+        assert record({**base, "interactive_commands": value}).interactive_commands is False
+
+
+def test_a_staged_copy_over_the_sandbox_budget_says_so(tmp_path, monkeypatch) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    broker.staged_copies = {"max_bytes": 256 * 1024, "sandbox_max_bytes": 1024 * 1024}
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        workspace = BrokeredSandboxWorkspace(runner)
+        (broker.sandboxes[runner.sandbox_id].root / "big.bin").write_bytes(b"x" * (128 * 1024))
+        # The sandbox refuses the copy although the file is within max_file_bytes.
+        monkeypatch.setattr(
+            broker,
+            "_copy_out",
+            lambda sandbox, copy: copy.update(
+                status="failed", error={"code": "copy_too_large", "message": ""}
+            ),
+        )
+        with pytest.raises(RuntimeError, match="staged copies allow") as caught:
+            await workspace.read_tar_stream(["big.bin"], io.BytesIO(), max_file_bytes=200 * 1024)
+        assert "max_file_bytes" not in str(caught.value)
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+class _Unseekable(io.RawIOBase):
+    def __init__(self, data: bytes) -> None:
+        self._source = io.BytesIO(data)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        chunk = self._source.read(len(buffer))
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+
+@pytest.mark.parametrize("seekable", [True, False])
+def test_a_staged_copy_in_spools_only_a_source_that_cannot_seek(tmp_path, monkeypatch, seekable):
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 2 * 1024 * 1024}
+    data = _tar({"a.txt": b"a" * 1000, "b.txt": b"b"})
+    spools = []
+    temporary_file = runner_module.tempfile.TemporaryFile
+
+    def counted_temporary_file(*args, **kwargs):
+        spools.append(1)
+        return temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.tempfile, "TemporaryFile", counted_temporary_file)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        source = io.BytesIO(data) if seekable else io.BufferedReader(_Unseekable(data))
+        await BrokeredSandboxWorkspace(runner)._write_staged(
+            source, len(data), runner.staged_copies
+        )
+        assert (broker.sandboxes[runner.sandbox_id].root / "a.txt").read_bytes() == b"a" * 1000
+        (upload,) = [request for request in broker.storage_requests if request.method == "PUT"]
+        assert upload.content == data
+        assert len(spools) == (0 if seekable else 1)
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+class _RecordingRunner:
+    """Answers every baseline step, recording each one's timeout."""
+
+    def __init__(self) -> None:
+        self.timeouts: dict[str, int] = {}
+
+    async def exec_system(self, command, *, timeout_s, **_options):
+        argv = command.argv
+        step = "commit" if "commit" in argv else argv[1]
+        self.timeouts.setdefault(step, timeout_s)
+        # The filter check finds nothing configured.
+        exit_code = 1 if "--get-regexp" in argv else 0
+        return runner_module.ExecResult(stdout="", stderr="", exit_code=exit_code)
+
+
+def test_the_git_baseline_gives_a_large_tree_time_to_commit() -> None:
+    from cayu.environments import _ephemeral_git as ephemeral_git
+
+    def timeouts(**options) -> dict[str, int]:
+        runner = _RecordingRunner()
+        asyncio.run(initialize_ephemeral_git_baseline(runner, **options))
+        return runner.timeouts
+
+    small = timeouts()
+    assert small["add"] == small["commit"] == small["init"] == 60
+    # A 1 GiB tree of 10,000 files gets minutes, not one.
+    copied = {"sync_binding": {"copied_bytes": 1024**3, "copied_files": 10_000}}
+    tree_bytes, tree_files = ephemeral_git.sync_bound_tree_size(copied)
+    large = timeouts(tree_bytes=tree_bytes, tree_files=tree_files)
+    assert large["add"] == large["commit"] == 60 + 256 + 100
+    assert large["init"] == large["config"] == 60
+    huge = timeouts(tree_bytes=64 * 1024**3, tree_files=10_000_000)
+    assert huge["add"] == ephemeral_git.MAX_BASELINE_STEP_TIMEOUT_SECONDS
+    assert timeouts(tree_bytes=1024**3, timeout_s=90)["commit"] == 90
+    with pytest.raises(ValueError):
+        timeouts(timeout_s=0)
+    assert ephemeral_git.sync_bound_tree_size({}) == (None, None)

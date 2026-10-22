@@ -28,7 +28,7 @@ from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import certifi
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 __all__ = [
     "BROKER_API_URL_ENV",
@@ -115,6 +115,8 @@ _MAX_LABELS = 10
 _MAX_LABEL_VALUE = 200
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+#: The pause between attempts once a call retries a broker outage past its quick retries.
+_OUTAGE_RETRY_SECONDS = 1.0
 #: Every code the contract names. A response without one is judged by its status.
 _KNOWN_CODES = frozenset(
     {
@@ -288,7 +290,17 @@ class SandboxRecord(BaseModel):
     destroyed_at: datetime | None = None
     destroy_reason: str | None = None
     staged_copies: SandboxStagedCopies | None = None
+    #: Whether the broker runs interactive commands in this sandbox. A broker that
+    #: doesn't say so refuses them, so its absence means it doesn't.
+    interactive_commands: bool = False
     guarantees: SandboxGuarantees | None = None
+
+    @field_validator("interactive_commands", mode="before")
+    @classmethod
+    def _interactive_commands_offered(cls, value: Any) -> bool:
+        # ``true``, or an object describing the offer as ``staged_copies`` does.
+        # Any other shape offers nothing rather than invalidating the record.
+        return value is True or isinstance(value, Mapping)
 
 
 class SandboxImage(BaseModel):
@@ -1122,17 +1134,21 @@ class SandboxBrokerClient:
                 if fresh.upload is None:
                     raise
                 await self.upload_staged(fresh.upload, source, size=size)
-            copy = await self._commit_uploaded_copy(sandbox_id, copy_id, dispatch)
+        # The copy's deadline runs from when it is handed in, through any outage after.
+        deadline = _copy_deadline(size, timeout_s)
+        if copy.status == "awaiting_upload":
+            copy = await self._commit_uploaded_copy(sandbox_id, copy_id, dispatch, deadline)
         dispatch.settled = copy.status not in {"pending", "running", "awaiting_upload"}
-        return await self._finished_copy(
-            sandbox_id, copy, size=size, timeout_s=timeout_s, _dispatch=dispatch
-        )
+        return await self._finished_copy(sandbox_id, copy, deadline=deadline, _dispatch=dispatch)
 
     async def _commit_uploaded_copy(
-        self, sandbox_id: str, copy_id: str, dispatch: _CopyInDispatch
+        self, sandbox_id: str, copy_id: str, dispatch: _CopyInDispatch, deadline: _CopyDeadline
     ) -> SandboxCopy:
+        # A replayed commit returns the copy already handed in, so an outage is
+        # retried until the copy's own deadline, not given up after the quick retries.
         outcome_unknown = False
-        for attempt in range(1 + len(_RETRY_DELAYS_SECONDS)):
+        attempt = 0
+        while True:
             # Cancellation while a request is in flight must fence reuse.
             dispatch.mutation_possible = True
             try:
@@ -1144,10 +1160,10 @@ class SandboxBrokerClient:
             except SandboxBrokerUnavailableError as error:
                 outcome_unknown = outcome_unknown or error.outcome_unknown
                 dispatch.mutation_possible = outcome_unknown
-                if attempt == len(_RETRY_DELAYS_SECONDS):
+                if deadline.passed():
                     raise
-                await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
-        raise AssertionError("unreachable copy commit retry loop")
+            await asyncio.sleep(deadline.pause(attempt))
+            attempt += 1
 
     async def copy_out(
         self,
@@ -1170,7 +1186,9 @@ class SandboxBrokerClient:
             raise ValueError("Staged copy max_bytes must be a positive integer.")
         copy_id = copy_id or f"cayu-{secrets.token_hex(16)}"
         copy = await self.start_copy_out(sandbox_id, copy_id, paths=paths, excludes=excludes)
-        copy = await self._finished_copy(sandbox_id, copy, size=max_bytes, timeout_s=timeout_s)
+        copy = await self._finished_copy(
+            sandbox_id, copy, deadline=_copy_deadline(max_bytes, timeout_s)
+        )
         if copy.size is None or copy.sha256 is None:
             raise SandboxBrokerError("The broker returned a copy without its size and digest.")
         if copy.size > max_bytes:
@@ -1189,23 +1207,24 @@ class SandboxBrokerClient:
         sandbox_id: str,
         copy: SandboxCopy,
         *,
-        size: int,
-        timeout_s: float | None,
+        deadline: _CopyDeadline,
         _dispatch: _CopyInDispatch | None = None,
     ) -> SandboxCopy:
-        loop = asyncio.get_running_loop()
-        limit = (
-            _COPY_TIMEOUT_FLOOR_SECONDS + size / _COPY_BYTES_PER_SECOND
-            if timeout_s is None
-            else timeout_s
-        )
-        deadline = loop.time() + limit
+        attempt = 0
         while copy.status in {"pending", "running"}:
-            if loop.time() >= deadline:
+            if deadline.passed():
                 raise SandboxBrokerUnavailableError(
-                    f"Staged copy {copy.copy_id} did not finish within {limit:g} seconds."
+                    f"Staged copy {copy.copy_id} did not finish within {deadline.limit:g} seconds."
                 )
-            copy = await self.get_copy(sandbox_id, copy.copy_id, wait_seconds=MAX_WAIT_SECONDS)
+            try:
+                copy = await self.get_copy(sandbox_id, copy.copy_id, wait_seconds=MAX_WAIT_SECONDS)
+            except SandboxBrokerUnavailableError:
+                # An outage says nothing about the copy, which goes on in Cloud,
+                # so polling continues until the copy's own deadline.
+                if deadline.passed():
+                    raise
+                await asyncio.sleep(deadline.pause(attempt))
+                attempt += 1
         if _dispatch is not None:
             _dispatch.settled = True
         if copy.status != "done":
@@ -1327,6 +1346,38 @@ class SandboxBrokerClient:
                 continue
             raise error
         raise AssertionError("unreachable broker retry loop")
+
+
+@dataclass(frozen=True)
+class _CopyDeadline:
+    """When a staged copy must have been handed in and finished, outages included."""
+
+    limit: float
+    at: float
+
+    def passed(self) -> bool:
+        return asyncio.get_running_loop().time() >= self.at
+
+    def pause(self, attempt: int) -> float:
+        """The wait before the next attempt, never past the deadline."""
+
+        delay = (
+            _RETRY_DELAYS_SECONDS[attempt]
+            if attempt < len(_RETRY_DELAYS_SECONDS)
+            else _OUTAGE_RETRY_SECONDS
+        )
+        return max(0.0, min(delay, self.at - asyncio.get_running_loop().time()))
+
+
+def _copy_deadline(size: int, timeout_s: float | None) -> _CopyDeadline:
+    """``timeout_s`` from now, or by default ten minutes plus a second per MiB."""
+
+    limit = (
+        _COPY_TIMEOUT_FLOOR_SECONDS + size / _COPY_BYTES_PER_SECOND
+        if timeout_s is None
+        else timeout_s
+    )
+    return _CopyDeadline(limit=limit, at=asyncio.get_running_loop().time() + limit)
 
 
 def _copy_id(copy_id: str) -> str:

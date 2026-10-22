@@ -164,6 +164,7 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
 from cayu.runtime._environment_allocation import (
+    ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
@@ -173,6 +174,7 @@ from cayu.runtime._environment_allocation import (
     EnvironmentAllocationCoordinator,
     EnvironmentAllocationReceipt,
     EnvironmentAllocationRecord,
+    allocation_identity_binding,
     environment_allocation_parent_session_id,
     environment_allocation_source_owner_session_id,
     set_checkpoint_allocation_identity,
@@ -549,6 +551,15 @@ def _checkpoint_allocation_fingerprint(
 
     Checkpoints written before the identity had its own record carry it only as
     a top-level key of the reconnect metadata.
+
+    Releases from before that record (down to the compatibility floor) dispose
+    of and re-create an allocation without removing it, so an identity can
+    outlive the allocation it named. Each identity is therefore bound to the
+    reconnect metadata it was published beside. One whose binding doesn't
+    match the current metadata belongs to a replaced allocation and is
+    ignored. One written before bindings existed is trusted only where it
+    agrees with the metadata's own top-level identity: that one is rewritten
+    with every allocation, so it wins a disagreement.
     """
 
     legacy = _reconnect_allocation_fingerprint(reconnect_metadata)
@@ -561,6 +572,16 @@ def _checkpoint_allocation_fingerprint(
     if value is None:
         return legacy
     value = _validated_allocation_fingerprint(value)
+    bindings = (checkpoint or {}).get(
+        ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY
+    )
+    if bindings is not None and type(bindings) is not dict:
+        raise ValueError("Environment factory allocation identity bindings must be an object.")
+    binding = None if bindings is None else bindings.get(environment_name)
+    if binding is None:
+        return value if legacy is None else legacy
+    if binding != allocation_identity_binding(reconnect_metadata):
+        return legacy
     if legacy is not None and legacy != value:
         raise ValueError(
             "Environment factory allocation identity conflicts with its reconnect metadata."
@@ -3962,6 +3983,7 @@ class EnvironmentLifecycle:
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
             ):
                 values = copied.get(key, {})
                 values.pop(environment_name, None)
@@ -4043,6 +4065,7 @@ class EnvironmentLifecycle:
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
             ):
                 values = copied.get(key, {})
                 values.pop(environment_name, None)
@@ -4574,6 +4597,7 @@ class EnvironmentLifecycle:
             ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
             completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
         )
 
@@ -5113,6 +5137,7 @@ class EnvironmentLifecycle:
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
                 ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
             ):
                 values = copied.get(key, {})
                 if type(values) is not dict:
@@ -7685,6 +7710,7 @@ class EnvironmentLifecycle:
             copied_checkpoint,
             environment_name=environment_name,
             allocation_fingerprint=allocation_fingerprint,
+            reconnect_metadata=state[environment_name],
         )
         try:
             await self._session_store.transform_checkpoint(

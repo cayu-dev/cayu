@@ -1895,6 +1895,69 @@ def test_reconnect_keeps_the_allocation_identity_it_was_checkpointed_with(tmp_pa
     assert "changed its allocation fingerprint" in str(failed.payload)
 
 
+def test_reconnect_ignores_an_identity_an_older_release_left_behind(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "dynamic"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="dynamic-workspace"),
+            ),
+            reconnect_metadata={"envelope": {"sandbox_id": "sandbox_1"}},
+            allocation_fingerprint="a" * 64,
+        )
+        turns = [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+            for _ in range(2)
+        ]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider(turns), default=True)
+        app.register_environment_factory(EnvironmentSpec(name="dynamic"), factory, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_stale",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        checkpoint = await store.load_checkpoint("sess_stale")
+        assert checkpoint["environment_factory_allocation_identity"] == {"dynamic": "a" * 64}
+        assert set(checkpoint["environment_factory_allocation_identity_binding"]) == {"dynamic"}
+
+        # A release from before the identity record replaced the allocation: it
+        # wrote the new reconnect metadata and left the identity record alone.
+        def replace(_session, current):
+            current["environment_factory_reconnect"] = {
+                "dynamic": {"envelope": {"sandbox_id": "sandbox_2"}}
+            }
+            return current
+
+        await store.transform_checkpoint("sess_stale", replace)
+        factory.reconnect_metadata = {"envelope": {"sandbox_id": "sandbox_2"}}
+        factory.allocation_fingerprint = "b" * 64
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(session_id="sess_stale", messages=[Message.text("user", "go")])
+            )
+        ]
+        assert not any(event.type is EventType.ENVIRONMENT_FACTORY_FAILED for event in events)
+        assert (await store.load("sess_stale")).status is SessionStatus.COMPLETED
+        # The stale identity is gone, and the replacement gains none from the typed field.
+        checkpoint = await store.load_checkpoint("sess_stale")
+        assert "environment_factory_allocation_identity" not in checkpoint
+        assert "environment_factory_allocation_identity_binding" not in checkpoint
+
+    asyncio.run(run())
+
+
 def test_cayu_app_environment_factory_reconnect_metadata_survives_context_checkpoint(
     tmp_path,
 ):

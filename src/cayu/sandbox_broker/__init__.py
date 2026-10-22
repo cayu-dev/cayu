@@ -4,7 +4,8 @@ The parts compose but each works alone:
 
 - ``SandboxBrokerClient`` speaks the ``cayu.cloud.sandbox`` v1 wire contract.
 - ``SandboxLeaseKeeper`` renews one sandbox's lease.
-- ``BrokeredSandboxRunner`` is a ``Runner`` over one sandbox, with interactive processes.
+- ``BrokeredSandboxRunner`` is a ``Runner`` over one sandbox, with interactive processes
+  where the broker offers them.
 - ``BrokeredSandboxWorkspace`` is a ``RunnerWorkspace`` whose bulk copies use the broker's
   archives, and its staged copies for trees and files larger than one archive.
 - ``BrokeredSandboxCodingEnvironmentFactory`` assembles them into per-session coding sandboxes.

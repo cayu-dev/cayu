@@ -569,8 +569,14 @@ runs the CLI inside any runner whose `interactive_process_capability()` returns 
 its sidecar. Each CLI process runs in its own PID namespace in the MicroVM,
 so closing it confirms that every process the CLI started has exited, including
 processes that left its process group. `BrokeredSandboxRunner` provides one
-through Cayu Cloud's sandbox broker, so a Cloud Agent runs the CLI in a sandbox
-it gets from Cloud, with no cloud-provider credential. Another sandbox plugs in
+through Cayu Cloud's sandbox broker, so a Cloud Agent can run the CLI in a
+sandbox it gets from Cloud, with no cloud-provider credential. That needs a Cayu
+Cloud whose broker supports interactive commands, which its sandbox records say
+(`interactive_commands`); with any other, the runner offers no capability and
+`runner_agent_launch` refuses it before starting anything. A brokered sandbox
+has no port forwarding (see
+[Model access from a runner](#model-access-from-a-runner)), so the CLI there
+reaches the model over the sandbox's own egress. Another sandbox plugs in
 by implementing the capability on its runner; the launcher and the adapters stay
 the same.
 If a failed start cannot confirm process cleanup, the capability must call
@@ -631,7 +637,10 @@ The forward is a provider-neutral runner capability:
 `LambdaMicroVMRunner` provides it through sidecar protocol 7: the guest listens on
 its agent network's gateway address, `192.0.2.1`, at a port from 18500 to 18563,
 reachable only from processes in the MicroVM. Another sandbox plugs in by
-implementing the capability on its runner.
+implementing the capability on its runner. `BrokeredSandboxRunner` doesn't:
+Cayu Cloud's broker relays no connections into its sandboxes, so
+`runner_port_forward` refuses a brokered sandbox, and a CLI there needs a
+gateway URL it can reach through the sandbox's `public_web` egress.
 
 Put the per-run URL in the CLI's configuration. Claude Code takes it from the
 environment. Codex takes it from `codex_config_overrides`, which replaces the

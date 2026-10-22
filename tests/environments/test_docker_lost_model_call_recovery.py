@@ -41,6 +41,7 @@ from cayu.providers import (
 from cayu.runners.docker import DockerRunner, _DockerRuntimeEvidence
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.local import LocalRunner
+from cayu.runtime._environment_allocation import allocation_identity_binding
 from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import (
@@ -658,7 +659,7 @@ def test_live_identity_reads_its_record_or_an_older_top_level_key(tmp_path, monk
                     )
                 )
 
-            def live(reconnect, identities):
+            def live(reconnect, identities, *, bound_to=None):
                 def transform(_session, checkpoint):
                     checkpoint["environment_factory_reconnect"] = {"coding": reconnect}
                     checkpoint["environment_factory_allocation_owner"] = {"coding": "build-session"}
@@ -666,6 +667,12 @@ def test_live_identity_reads_its_record_or_an_older_top_level_key(tmp_path, monk
                         checkpoint.pop("environment_factory_allocation_identity", None)
                     else:
                         checkpoint["environment_factory_allocation_identity"] = identities
+                    if bound_to is None:
+                        checkpoint.pop("environment_factory_allocation_identity_binding", None)
+                    else:
+                        checkpoint["environment_factory_allocation_identity_binding"] = {
+                            "coding": allocation_identity_binding(bound_to)
+                        }
                     return checkpoint
 
                 return transform
@@ -685,9 +692,29 @@ def test_live_identity_reads_its_record_or_an_older_top_level_key(tmp_path, monk
                 "build-session", live(_nest({"handle": "h"}), {"coding": "b" * 64})
             )
             assert await identity() == "b" * 64
+            nested = _nest({"handle": "h"})
+            await store.transform_checkpoint(
+                "build-session", live(nested, {"coding": "b" * 64}, bound_to=nested)
+            )
+            assert await identity() == "b" * 64
+            # An older release disposed of that allocation and made another without
+            # removing the identity record. Its unbound identity yields to the new
+            # allocation's top-level one, and one bound to other metadata is stale.
+            legacy = {"handle": "h2", "allocation_fingerprint": "a" * 64}
+            await store.transform_checkpoint("build-session", live(legacy, {"coding": "b" * 64}))
+            assert await identity() == "a" * 64
+            await store.transform_checkpoint(
+                "build-session", live(legacy, {"coding": "b" * 64}, bound_to=nested)
+            )
+            assert await identity() == "a" * 64
             await store.transform_checkpoint(
                 "build-session",
-                live({"handle": "h", "allocation_fingerprint": "a" * 64}, {"coding": "b" * 64}),
+                live(_nest({"handle": "h2"}), {"coding": "b" * 64}, bound_to=nested),
+            )
+            assert await identity() is None
+            # An identity bound to this very metadata that disagrees with it is corrupt.
+            await store.transform_checkpoint(
+                "build-session", live(legacy, {"coding": "b" * 64}, bound_to=legacy)
             )
             with pytest.raises(ValueError, match="identity conflicts"):
                 await identity()
