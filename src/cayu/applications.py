@@ -20,6 +20,7 @@ from uuid import uuid4
 from cayu import _application_accounting as accounting
 from cayu import _application_attention as attention
 from cayu import _application_context_views as context_views
+from cayu import _application_event_batches as event_batches
 from cayu import _application_task_creation as task_creation
 from cayu._application_agent_registry import ApplicationAgentRegistry
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
@@ -9888,7 +9889,7 @@ class CayuApp:
         """
 
         async def emit(events: list[Event]) -> list[Event]:
-            _validate_workflow_event_batch(events, allow_cayu_internal=True)
+            event_batches.validate_workflow_event_batch(events, allow_cayu_internal=True)
             return await self._event_writer.emit_many(session_id, events)
 
         return emit
@@ -9901,7 +9902,7 @@ class CayuApp:
         """Return the atomic reservation boundary for one workflow journal."""
 
         async def reserve(event: Event, attempt_id: str) -> bool:
-            _validate_workflow_event_batch([event], allow_cayu_internal=True)
+            event_batches.validate_workflow_event_batch([event], allow_cayu_internal=True)
             if event.session_id != session_id:
                 raise ValueError("Workflow reservation event has the wrong session_id.")
             return await self._event_writer.reserve_workflow_step_started(
@@ -9940,29 +9941,9 @@ class CayuApp:
         so application callers must not forge them even though every accepted
         batch uses the same durable budget/sink handoff.
         """
-        _validate_workflow_event_batch(events, allow_cayu_internal=False)
+        event_batches.validate_workflow_event_batch(events, allow_cayu_internal=False)
         emitted = await self._event_writer.emit_many(session_id, events)
         return [await self._project_emitted_event_for_public_api(event) for event in emitted]
-
-
-def _validate_workflow_event_batch(
-    events: list[Event],
-    *,
-    allow_cayu_internal: bool,
-) -> None:
-    if type(events) is not list:
-        raise TypeError("Runtime events must be a list.")
-    for event in events:
-        if type(event) is not Event:
-            raise TypeError("Runtime events must be Event instances.")
-        event_type = str(event.type)
-        if not event_type.startswith(("workflow.", "custom.")):
-            raise ValueError(
-                "emit_events only accepts workflow. or custom. namespace "
-                f"events; got {event_type!r}."
-            )
-        if not allow_cayu_internal and event_type.startswith("custom."):
-            validate_public_custom_event_type(event_type)
 
 
 def _validate_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
