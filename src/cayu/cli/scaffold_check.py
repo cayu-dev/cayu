@@ -851,6 +851,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     tags=_IMPORT_SAFETY_TAGS,
                 )
             )
+    reported: set[Path] = set(declaration_proofs.migrations)
     for path in _application_module_paths(root):
         # Repair invalid imports before attempting to prove their declarations.
         # The migration finding blocks application loading on its own.
@@ -869,10 +870,12 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     tags=_IMPORT_SAFETY_TAGS,
                 )
             )
+            reported.add(path)
+            continue
+        if path in declaration_proofs.modules:
             continue
         try:
-            source = path.read_text(encoding="utf-8")
-            tree = _without_postponed_annotations(ast.parse(source, filename=relative))
+            ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         except (OSError, UnicodeError, SyntaxError) as exc:
             diagnostics.append(
                 _diagnostic(
@@ -885,98 +888,56 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     tags=_IMPORT_SAFETY_TAGS,
                 )
             )
+            reported.add(path)
+    for path in sorted(declaration_proofs.blockers.keys() - declaration_proofs.modules):
+        if path in reported:
             continue
-        import_bindings = _import_bindings(tree)
-        rebound_names = _module_rebound_names(tree)
-        identity_lines = _declarative_identity_lines(
-            tree,
-            import_bindings=import_bindings,
-            rebound_names=rebound_names,
+        diagnostics.append(
+            _diagnostic(
+                code="SCAFFOLD_MODULE_SOURCE_INVALID",
+                path=path.relative_to(root).as_posix(),
+                message="An explicitly imported local dependency has unavailable or unsafe source.",
+                hint="Restore ordinary parseable source before importing the application.",
+                parameters={"reason": "dependency_source_invalid"},
+                severity=DiagnosticSeverity.ERROR,
+                tags=_IMPORT_SAFETY_TAGS,
+            )
         )
-        declarative_subscriptions = _declarative_subscription_names(root, tree)
-        declarative_bases = declaration_proofs.proven.get(path, {})
-        for node in tree.body:
-            unsafe_import = next(
-                (
-                    import_node
-                    for import_node in _import_time_import_from_nodes(node)
-                    if not _project_local_import_from_is_declarative(
-                        root,
-                        importing_path=path,
-                        node=import_node,
-                    )
-                ),
-                None,
-            )
-            unsafe_node: ast.expr | ast.stmt | None = unsafe_import
-            if unsafe_node is None:
-                unsafe_node = _unsafe_import_time_expression(
-                    node,
-                    import_bindings=import_bindings,
-                    rebound_names=rebound_names,
-                    declarative_identities=_identities_before(identity_lines, node),
-                    declarative_subscriptions=declarative_subscriptions,
-                    project_root=root,
-                    declarative_bases=declarative_bases,
-                )
-            if unsafe_node is None:
-                continue
-            if any(unsafe_node is base for base, _scope in _import_time_class_base_uses(node)):
-                primary = _unsafe_import_time_expression(
-                    node,
-                    import_bindings=import_bindings,
-                    rebound_names=rebound_names,
-                    declarative_identities=_identities_before(identity_lines, node),
-                    declarative_subscriptions=declarative_subscriptions,
-                    project_root=root,
-                    declarative_bases=declaration_proofs.structural.get(path, {}),
-                )
-                if primary is not None:
-                    unsafe_node = primary
-            unproven_base = any(
-                unsafe_node is base for base, _scope in _import_time_class_base_uses(node)
-            )
-            diagnostics.append(
-                _import_side_effect_diagnostic(
-                    relative,
-                    unsafe_node,
-                    unproven_base=unproven_base,
-                    blocking_modules=tuple(
-                        sorted(
-                            cause.relative_to(root).as_posix()
-                            for cause in declaration_proofs.blockers.get(path, ())
-                        )
-                    )
-                    if unproven_base
-                    else (),
-                )
-            )
-    # Include primary failures in explicitly imported helpers outside the normal
-    # concern directories. A missing inheritance proof must not hide the cause.
-    reported = {diagnostic.path for diagnostic in diagnostics}
-    for path, failures in sorted(declaration_proofs.failures.items()):
+        reported.add(path)
+    # Report each cause once, at the expression that cannot be proven. A use of
+    # a failing definition elsewhere is not reported again: the cause blocks the
+    # import of every module that depends on it.
+    locations: set[str] = set()
+
+    def report(path: Path, finding: ProjectDiagnostic) -> None:
+        if finding.path not in locations:
+            locations.add(finding.path)
+            diagnostics.append(finding)
+        reported.add(path)
+
+    for path in sorted(
+        declaration_proofs.causes.keys() | declaration_proofs.base_obstacles.keys(),
+        key=lambda item: item.relative_to(root).as_posix(),
+    ):
         if path in declaration_proofs.migrations:
             continue
         relative = path.relative_to(root).as_posix()
-        for unsafe_node in failures:
-            location = f"{relative}:{_narrowed_unsafe_node(unsafe_node).lineno}"
-            if location not in reported:
-                diagnostics.append(_import_side_effect_diagnostic(relative, unsafe_node))
-                reported.add(location)
-    for path in sorted(declaration_proofs.blockers.keys() - declaration_proofs.structural.keys()):
+        for statement, unsafe_node in declaration_proofs.causes.get(path, ()):
+            report(path, _import_side_effect_diagnostic(relative, statement, unsafe_node))
+        for base, obstacle, dependents in declaration_proofs.base_obstacles.get(path, ()):
+            report(path, _unproven_base_diagnostic(relative, base, obstacle, len(dependents)))
+            # The subclasses' modules are explained by this finding.
+            reported.update(dependents)
+    # Never let an unexplained failure pass silently: a module whose failures
+    # have no reported cause anywhere in its dependency closure reports them all.
+    for path, failures in sorted(
+        declaration_proofs.failures.items(), key=lambda item: item[0].relative_to(root).as_posix()
+    ):
+        if declaration_proofs.blockers.get(path, frozenset()) & reported:
+            continue
         relative = path.relative_to(root).as_posix()
-        if relative not in reported:
-            diagnostics.append(
-                _diagnostic(
-                    code="SCAFFOLD_MODULE_SOURCE_INVALID",
-                    path=relative,
-                    message="An explicitly imported local dependency has unavailable or unsafe source.",
-                    hint="Restore ordinary parseable source before importing the application.",
-                    parameters={"reason": "dependency_source_invalid"},
-                    severity=DiagnosticSeverity.ERROR,
-                    tags=_IMPORT_SAFETY_TAGS,
-                )
-            )
+        for statement, unsafe_node in failures:
+            report(path, _import_side_effect_diagnostic(relative, statement, unsafe_node))
     return tuple(diagnostics)
 
 
@@ -1182,11 +1143,12 @@ def _narrowed_unsafe_node(node: ast.expr | ast.stmt) -> ast.expr | ast.stmt:
 
 def _import_side_effect_diagnostic(
     relative: str,
+    statement: ast.stmt,
     unsafe_node: ast.expr | ast.stmt,
-    *,
-    unproven_base: bool = False,
-    blocking_modules: tuple[str, ...] = (),
 ) -> ProjectDiagnostic:
+    unproven_base = any(
+        unsafe_node is base for base, _scope in _import_time_class_base_uses(statement)
+    )
     if not unproven_base:
         unsafe_node = _narrowed_unsafe_node(unsafe_node)
     construct = _construct_name(unsafe_node)
@@ -1195,11 +1157,11 @@ def _import_side_effect_diagnostic(
         reason = "unproven_class_base"
         message = (
             f"Class inheritance from `{construct}` cannot be proven declarative; the "
-            "base or its import dependency closure is unproven."
+            "base is not a proven class declaration."
         )
         hint = (
-            "Inspect unsupported_expression findings in the base's defining "
-            "module and dependencies before changing the dependent class."
+            "Inherit from a uniquely bound local class or model defined before this "
+            "class, or from a reviewed base such as `BaseModel`, `ABC` or Cayu's `Tool`."
         )
     elif _is_environment_read(unsafe_node):
         reason = "import_time_configuration"
@@ -1250,8 +1212,44 @@ def _import_side_effect_diagnostic(
             "expression_kind": type(unsafe_node).__name__,
             "line": unsafe_node.lineno,
             "module": relative,
-            "blocking_modules": list(blocking_modules[:8]),
-            "blocking_module_count": len(blocking_modules),
+        },
+        severity=DiagnosticSeverity.ERROR,
+        tags=_IMPORT_SAFETY_TAGS,
+    )
+
+
+def _unproven_base_diagnostic(
+    relative: str,
+    base: ast.ClassDef,
+    obstacle: ast.expr | ast.stmt,
+    dependents: int,
+) -> ProjectDiagnostic:
+    """Report a class that cannot be inherited from once, at its definition."""
+    construct = (
+        obstacle.name
+        if isinstance(obstacle, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        else _construct_name(obstacle)
+    )
+    return _diagnostic(
+        code="SCAFFOLD_IMPORT_SIDE_EFFECT",
+        path=f"{relative}:{obstacle.lineno}",
+        message=(
+            f"`{construct}` keeps class `{base.name}` from being proven as a declarative "
+            f"base, so the {dependents} {'class' if dependents == 1 else 'classes'} that "
+            "inherit from it cannot be proven either."
+        ),
+        hint=(
+            "Remove the subclass hook, class decorator, metaclass or unreviewed base "
+            "from the class, or stop inheriting from it (for example by composition)."
+        ),
+        parameters={
+            "reason": "unproven_base_definition",
+            "construct": construct,
+            "symbol": base.name,
+            "expression_kind": type(obstacle).__name__,
+            "line": obstacle.lineno,
+            "module": relative,
+            "dependent_classes": dependents,
         },
         severity=DiagnosticSeverity.ERROR,
         tags=_IMPORT_SAFETY_TAGS,
@@ -1499,6 +1497,11 @@ class _DeclarativeBinding:
     kind: Literal["class", "model", "enum", "literal", "annotation", "function"] = "class"
     enum_members: frozenset[str] | None = None
     metadata_shape: Literal["str", "tuple"] | None = None
+    # The value of a numeric literal constant, for bounded arithmetic on it.
+    number: int | float | None = None
+    # Pydantic rebinds inherited serializers to undecorated overrides.
+    serializer_methods: frozenset[str] = frozenset()
+    unproven_method_returns: frozenset[str] = frozenset()
 
 
 def _is_pydantic_base(
@@ -1561,6 +1564,37 @@ def _stdlib_declaration_is_inert(
             and (proof := proofs.get(call.args[0].id)) is not None
             and proof.enum_members is not None
             and proof.line < call.lineno
+        )
+    if binding in {("datetime", "datetime"), ("datetime", "date")}:
+        # A fixed instant such as datetime(1970, 1, 1, tzinfo=UTC).
+        fields = ("year", "month", "day") + (
+            ("hour", "minute", "second", "microsecond") if binding[1] == "datetime" else ()
+        )
+        return (
+            len(call.args) <= len(fields)
+            and all(isinstance(arg, ast.Constant) and type(arg.value) is int for arg in call.args)
+            and all(
+                (
+                    keyword.arg in fields[len(call.args) :]
+                    and isinstance(keyword.value, ast.Constant)
+                    and type(keyword.value.value) is int
+                )
+                or (
+                    binding[1] == "datetime"
+                    and keyword.arg == "tzinfo"
+                    and (
+                        _trusted_symbol(keyword.value, imports, rebound, root)
+                        == ("datetime", "UTC")
+                        or (
+                            isinstance(keyword.value, ast.Attribute)
+                            and keyword.value.attr == "utc"
+                            and _trusted_symbol(keyword.value.value, imports, rebound, root)
+                            == ("datetime", "timezone")
+                        )
+                    )
+                )
+                for keyword in call.keywords
+            )
         )
     if binding == ("datetime", "timedelta"):
         return (
@@ -1653,18 +1687,57 @@ def _enum_value_is_declarative(
     )
 
 
-def _bounded_integer_product(expression: ast.expr, depth: int = 0) -> int | None:
+_MAX_LITERAL_NUMBER = 2**63
+
+
+def _bounded_number(
+    expression: ast.expr,
+    proofs: Mapping[str, _DeclarativeBinding],
+    depth: int = 0,
+) -> int | float | None:
+    """Evaluate bounded arithmetic on numeric literals and proven numeric constants."""
     if depth > 8:
         return None
-    if isinstance(expression, ast.Constant) and type(expression.value) is int:
-        return expression.value if abs(expression.value) <= 2**31 else None
-    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Mult):
-        left = _bounded_integer_product(expression.left, depth + 1)
-        right = _bounded_integer_product(expression.right, depth + 1)
-        if left is not None and right is not None:
+    value: int | float
+    if isinstance(expression, ast.Constant) and isinstance(expression.value, (int, float)):
+        if isinstance(expression.value, bool) or abs(expression.value) > 2**31:
+            return None
+        value = expression.value
+    elif isinstance(expression, ast.Name):
+        proof = proofs.get(expression.id)
+        if proof is None or proof.number is None or proof.line >= expression.lineno:
+            return None
+        value = proof.number
+    elif isinstance(expression, ast.UnaryOp) and isinstance(expression.op, (ast.UAdd, ast.USub)):
+        operand = _bounded_number(expression.operand, proofs, depth + 1)
+        if operand is None:
+            return None
+        value = -operand if isinstance(expression.op, ast.USub) else operand
+    elif isinstance(expression, ast.BinOp) and isinstance(
+        expression.op, (ast.Add, ast.Sub, ast.Mult, ast.Pow)
+    ):
+        left = _bounded_number(expression.left, proofs, depth + 1)
+        right = _bounded_number(expression.right, proofs, depth + 1)
+        if left is None or right is None:
+            return None
+        if isinstance(expression.op, ast.Add):
+            value = left + right
+        elif isinstance(expression.op, ast.Sub):
+            value = left - right
+        elif isinstance(expression.op, ast.Mult):
             value = left * right
-            return value if abs(value) < 2**63 else None
-    return None
+        elif type(right) is int and 0 <= right <= 64 and abs(left) <= 2**16:
+            # Bound the operands first, as in 1024**3, so the proof never
+            # computes a huge power itself. A float power can still overflow.
+            try:
+                value = left**right
+            except OverflowError:
+                return None
+        else:
+            return None
+    else:
+        return None
+    return value if abs(value) < _MAX_LITERAL_NUMBER else None
 
 
 def _declaration_value_is_inert(
@@ -1676,8 +1749,10 @@ def _declaration_value_is_inert(
     if isinstance(expression, ast.Name):
         proof = proofs.get(expression.id)
         return proof is not None and proof.kind == "literal" and proof.line < expression.lineno
-    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Mult):
-        return _bounded_integer_product(expression) is not None
+    if isinstance(expression, (ast.BinOp, ast.UnaryOp)) and (
+        _bounded_number(expression, proofs) is not None
+    ):
+        return True
     if isinstance(expression, ast.JoinedStr):
         return all(
             isinstance(item, ast.Constant)
@@ -1712,6 +1787,7 @@ def _pydantic_field_argument_is_declarative(
     imports: Mapping[str, tuple[str, str | None]],
     rebound: frozenset[str],
     proofs: Mapping[str, _DeclarativeBinding],
+    root: Path,
 ) -> bool:
     """Field stores a factory; it does not call it while declaring a model.
 
@@ -1723,38 +1799,10 @@ def _pydantic_field_argument_is_declarative(
     if keyword.arg is None:
         return False
     value = keyword.value
-    if keyword.arg == "exclude_if" and isinstance(value, ast.Lambda):
-        return (
-            len(value.args.args) == 1
-            and not value.args.posonlyargs
-            and not value.args.kwonlyargs
-            and not value.args.defaults
-            and value.args.vararg is None
-            and value.args.kwarg is None
-            and (
-                (
-                    isinstance(value.body, ast.UnaryOp)
-                    and isinstance(value.body.op, ast.Not)
-                    and isinstance(value.body.operand, ast.Name)
-                    and value.body.operand.id == value.args.args[0].arg
-                )
-                or (
-                    isinstance(value.body, ast.Compare)
-                    and len(value.body.ops) == 1
-                    and isinstance(value.body.ops[0], (ast.Is, ast.IsNot))
-                    and isinstance(value.body.left, ast.Name)
-                    and value.body.left.id == value.args.args[0].arg
-                    and _declaration_value_is_inert(
-                        value.body.comparators[0],
-                        {
-                            name: proof
-                            for name, proof in proofs.items()
-                            if name != value.args.args[0].arg
-                        },
-                    )
-                )
-            )
-        )
+    if keyword.arg in {"default_factory", "exclude_if"} and isinstance(value, ast.Lambda):
+        # Pydantic calls these at validation or serialization time, never while
+        # declaring the model, so only the lambda's own defaults are evaluated.
+        return not value.args.defaults and not any(value.args.kw_defaults)
     if keyword.arg != "default_factory":
         if (
             isinstance(value, ast.Call)
@@ -1776,20 +1824,15 @@ def _pydantic_field_argument_is_declarative(
         proof = proofs.get(value.id)
         if proof is not None and proof.kind in {"model", "function"} and proof.line < value.lineno:
             return True
-        return (
-            value.id in {"list", "dict", "tuple", "set", "frozenset"}
-            and value.id not in imports
-            and value.id not in rebound
-        )
-    if isinstance(value, ast.Lambda):
-        return (
-            not value.args.posonlyargs
-            and not value.args.args
-            and not value.args.kwonlyargs
-            and value.args.vararg is None
-            and value.args.kwarg is None
-            and not value.args.defaults
-            and not value.args.kw_defaults
+        if value.id in rebound:
+            return False
+        binding = imports.get(value.id)
+        if binding is None:
+            return value.id in _BUILTIN_COLLECTION_FACTORIES
+        # Pydantic inspects the factory's signature. Runtime classes and
+        # functions have reviewed signatures; other packages' objects may not.
+        return (binding[0] == "cayu" or binding[0].startswith("cayu.")) and (
+            not _import_binding_is_project_local(root, binding)
         )
     return isinstance(value, ast.Constant) and value.value is None
 
@@ -1832,19 +1875,47 @@ def _unsafe_import_time_expression(
             isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
             and decorator in definition.decorator_list
             and definition.returns is not None
-            and _pydantic_annotation_is_declarative(
-                definition.returns,
+            and _deferred_return_is_declarative(
+                node,
+                definition,
                 import_bindings=import_bindings,
-                rebound_names=decorator_rebound_names,
+                rebound_names=rebound_names,
                 project_root=project_root,
-                declarative_bases={
-                    name: proof
-                    for name, proof in declarative_bases.items()
-                    if name not in class_rebound_names
-                },
+                declarative_bases=declarative_bases,
             )
             for definition in _import_time_definition_nodes(node)
         ):
+            continue
+        if _pydantic_serializer_is_declarative(
+            decorator,
+            import_bindings=import_bindings,
+            rebound_names=decorator_rebound_names,
+            project_root=project_root,
+        ):
+            # Pydantic builds a schema from the serializer's return annotation
+            # while it declares the model, so that annotation needs the same proof.
+            serializer_return = next(
+                (
+                    definition.returns
+                    for definition in _import_time_definition_nodes(node)
+                    if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and decorator in definition.decorator_list
+                    and definition.returns is not None
+                    and not _deferred_return_is_declarative(
+                        node,
+                        definition,
+                        import_bindings=import_bindings,
+                        rebound_names=rebound_names,
+                        project_root=project_root,
+                        declarative_bases=declarative_bases,
+                    )
+                ),
+                None,
+            )
+            if serializer_return is not None:
+                return serializer_return
+            if isinstance(decorator, ast.Call):
+                declarative_values.add(decorator)
             continue
         if isinstance(decorator, ast.Call) and _pydantic_validator_is_declarative(
             decorator,
@@ -1910,7 +1981,37 @@ def _unsafe_import_time_expression(
                 for name, proof in declarative_bases.items()
                 if name not in class_bindings
             }
+            inherited_serializers = frozenset().union(
+                *(
+                    declarative_bases[base.id].serializer_methods
+                    for base in definition.bases
+                    if isinstance(base, ast.Name) and base.id in declarative_bases
+                )
+            )
+            inherited_unproven_returns = frozenset().union(
+                *(
+                    declarative_bases[base.id].unproven_method_returns
+                    for base in definition.bases
+                    if isinstance(base, ast.Name) and base.id in declarative_bases
+                )
+            )
+            # Pydantic rebinds serializers through the entire MRO, including a
+            # plain method on a different base. A local override is checked below.
+            if (inherited_unproven_returns - class_bindings) & inherited_serializers:
+                return definition
             for statement in definition.body:
+                if _scope_rebound_names([statement], include_imports=True) & inherited_serializers:
+                    if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        return statement
+                    if not _deferred_return_is_declarative(
+                        node,
+                        statement,
+                        import_bindings=import_bindings,
+                        rebound_names=rebound_names,
+                        project_root=project_root,
+                        declarative_bases=declarative_bases,
+                    ):
+                        return statement.returns
                 if (
                     isinstance(statement, (ast.Assign, ast.AnnAssign))
                     and statement.value is not None
@@ -1929,26 +2030,36 @@ def _unsafe_import_time_expression(
                     statement.value, ast.Call
                 ):
                     call = statement.value
+                    helper = (
+                        import_bindings.get(call.func.id)
+                        if isinstance(call.func, ast.Name) and call.func.id not in class_scope
+                        else None
+                    )
                     if (
-                        isinstance(call.func, ast.Name)
-                        and call.func.id not in class_scope
-                        and import_bindings.get(call.func.id)
-                        in {("pydantic", "ConfigDict"), ("pydantic", "Field")}
-                        and not _import_binding_is_project_local(
-                            project_root, import_bindings[call.func.id]
-                        )
+                        helper
+                        in {
+                            ("pydantic", "ConfigDict"),
+                            ("pydantic", "Field"),
+                            ("pydantic", "PrivateAttr"),
+                        }
+                        and not _import_binding_is_project_local(project_root, helper)
                         and all(_literal_collection_is_data_only(arg) for arg in call.args)
                         and all(
                             (
-                                _pydantic_field_argument_is_declarative(
-                                    keyword,
-                                    import_bindings,
-                                    class_scope,
-                                    class_proofs,
-                                )
-                                if import_bindings.get(call.func.id) == ("pydantic", "Field")
-                                else keyword.arg is not None
+                                keyword.arg is not None
                                 and _literal_collection_is_data_only(keyword.value)
+                            )
+                            if helper == ("pydantic", "ConfigDict")
+                            else (
+                                helper == ("pydantic", "Field")
+                                or keyword.arg in {"default", "default_factory", "init"}
+                            )
+                            and _pydantic_field_argument_is_declarative(
+                                keyword,
+                                import_bindings,
+                                class_scope,
+                                class_proofs,
+                                project_root,
                             )
                             for keyword in call.keywords
                         )
@@ -2014,6 +2125,9 @@ def _unsafe_import_time_expression(
                         import_bindings=import_bindings,
                         rebound_names=rebound_names | class_bindings,
                     )
+                )
+                or _empty_immutable_collection(
+                    statement.value, import_bindings, rebound_names | class_bindings
                 )
             )
         }
@@ -2116,6 +2230,62 @@ def _unsafe_import_time_expression(
     return None
 
 
+def _deferred_return_is_declarative(
+    node: ast.stmt,
+    definition: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+    project_root: Path,
+    declarative_bases: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """Prove a method's return annotation that Pydantic resolves later.
+
+    Pydantic evaluates a computed field's or serializer's return annotation in
+    the completed class namespace, so every name the class body binds, including
+    those bound after the method, shadows the module binding.
+    """
+    returns = definition.returns
+    if returns is None:
+        return True
+    class_scope = next(
+        (
+            _scope_rebound_names(owner.body, include_imports=True)
+            for owner in _import_time_class_nodes(node)
+            if definition in owner.body
+        ),
+        frozenset(),
+    )
+    return _pydantic_annotation_is_declarative(
+        returns,
+        import_bindings=import_bindings,
+        rebound_names=rebound_names | class_scope,
+        project_root=project_root,
+        declarative_bases={
+            name: proof for name, proof in declarative_bases.items() if name not in class_scope
+        },
+    )
+
+
+_MAX_STRING_ANNOTATION_CHARS = 1000
+
+
+def _string_annotation(node: ast.Constant) -> ast.expr | None:
+    """Parse a forward-reference annotation at the location of its string."""
+    if not isinstance(node.value, str) or len(node.value) > _MAX_STRING_ANNOTATION_CHARS:
+        return None
+    try:
+        parsed = ast.parse(node.value.strip(), mode="eval").body
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    for child in ast.walk(parsed):
+        # Ordering checks compare a reference with its binding's line, and the
+        # reference is evaluated where the string is written.
+        if isinstance(child, ast.expr):
+            child.lineno = child.end_lineno = node.lineno
+    return parsed
+
+
 def _pydantic_annotation_is_declarative(
     annotation: ast.expr,
     *,
@@ -2123,10 +2293,18 @@ def _pydantic_annotation_is_declarative(
     rebound_names: frozenset[str],
     project_root: Path,
     declarative_bases: Mapping[str, _DeclarativeBinding] = {},
+    allow_forward_references: bool = True,
 ) -> bool:
     """Model construction evaluates annotations and invokes custom schema hooks."""
 
     def safe(node: ast.expr) -> bool:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            # Pydantic evaluates a string annotation as the expression it holds.
+            return (
+                allow_forward_references
+                and (parsed := _string_annotation(node)) is not None
+                and safe(parsed)
+            )
         if isinstance(node, ast.Constant):
             return node.value is None or node.value is Ellipsis
         if isinstance(node, ast.Name):
@@ -2203,7 +2381,11 @@ def _pydantic_annotation_is_declarative(
                         )
                         and all(
                             _pydantic_field_argument_is_declarative(
-                                keyword, import_bindings, rebound_names, declarative_bases
+                                keyword,
+                                import_bindings,
+                                rebound_names,
+                                declarative_bases,
+                                project_root,
                             )
                             for keyword in arg.keywords
                         )
@@ -2274,6 +2456,55 @@ def _pydantic_validator_is_declarative(
     return isinstance(mode, str) and mode in modes
 
 
+_SERIALIZER_WHEN_USED = frozenset({"always", "unless-none", "json", "json-unless-none"})
+
+
+def _pydantic_serializer_is_declarative(
+    decorator: ast.expr,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+    project_root: Path,
+) -> bool:
+    """``model_serializer``/``field_serializer`` registration with literal options."""
+    call = decorator if isinstance(decorator, ast.Call) else None
+    helper = _trusted_symbol(
+        decorator if call is None else call.func,
+        import_bindings,
+        rebound_names,
+        project_root,
+    )
+    if helper not in {("pydantic", "model_serializer"), ("pydantic", "field_serializer")}:
+        return False
+    if call is None:
+        return helper == ("pydantic", "model_serializer")
+    if helper == ("pydantic", "model_serializer"):
+        if call.args:
+            return False
+    elif not call.args or any(
+        not isinstance(arg, ast.Constant) or not isinstance(arg.value, str) for arg in call.args
+    ):
+        return False
+    options: dict[str, object] = {}
+    for keyword in call.keywords:
+        if (
+            keyword.arg is None
+            or keyword.arg in options
+            or not isinstance(keyword.value, ast.Constant)
+        ):
+            return False
+        options[keyword.arg] = keyword.value.value
+    allowed = {"mode", "when_used"} | (
+        {"check_fields"} if helper == ("pydantic", "field_serializer") else set()
+    )
+    return (
+        set(options) <= allowed
+        and options.get("mode", "plain") in {"plain", "wrap"}
+        and options.get("when_used", "always") in _SERIALIZER_WHEN_USED
+        and type(options.get("check_fields")) in {bool, type(None)}
+    )
+
+
 def _bare_decorator_is_declarative(
     decorator: ast.expr,
     *,
@@ -2318,7 +2549,7 @@ def _expression_root_name(expression: ast.expr) -> str | None:
 # These builtins have no application-owned metaclass or subclass hook. Unknown
 # unbound names are not evidence of safety (nor are calls or local subscriptions).
 _INERT_BUILTIN_BASES = frozenset(
-    {"object"}
+    {"object", "bytes", "dict", "float", "frozenset", "int", "list", "set", "str", "tuple"}
     | {
         name
         for name, value in vars(builtins).items()
@@ -2445,14 +2676,11 @@ def _toolspec_metadata_is_inert(
             "cayu",
             "ToolEffect",
         ) and value.attr in {"NONE", "IDEMPOTENT", "EXTERNAL"}
-    if isinstance(value, ast.UnaryOp) or (
-        isinstance(value, ast.BinOp) and isinstance(value.op, ast.Mult)
-    ):
-        # Reuse the numeric literal/product bounds without admitting operators
-        # on application objects or the other declaration metadata forms.
+    if isinstance(value, ast.UnaryOp):
         return _declaration_value_is_inert(value, proofs)
     if isinstance(value, ast.BinOp):
-        return _metadata_shape(value, proofs) == "str"
+        # Bounded arithmetic on numbers only; no operators on application objects.
+        return _bounded_number(value, proofs) is not None or _metadata_shape(value, proofs) == "str"
     if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
         return all(safe(item) for item in value.elts)
     if isinstance(value, ast.Dict):
@@ -2534,9 +2762,17 @@ def _unsafe_class_namespace(
 
 @dataclass(frozen=True)
 class _DeclarationGraph:
-    proven: dict[Path, dict[str, _DeclarativeBinding]]
-    structural: dict[Path, dict[str, _DeclarativeBinding]]
-    failures: dict[Path, tuple[ast.expr | ast.stmt, ...]]
+    modules: frozenset[Path]
+    # Every unproven top-level (statement, expression); each blocks its module.
+    failures: dict[Path, tuple[tuple[ast.stmt, ast.expr | ast.stmt], ...]]
+    # The (statement, expression) failures that do not only depend on another
+    # failing definition, so each cause is reported once.
+    causes: dict[Path, tuple[tuple[ast.stmt, ast.expr | ast.stmt], ...]]
+    # (class, obstacle, subclass modules) for an inert class that cannot be a
+    # proven base, reported at the class instead of at each subclass.
+    base_obstacles: dict[
+        Path, tuple[tuple[ast.ClassDef, ast.expr | ast.stmt, tuple[Path, ...]], ...]
+    ]
     blockers: dict[Path, frozenset[Path]]
     migrations: dict[Path, tuple[ProjectDiagnostic, ...]]
 
@@ -2632,106 +2868,205 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
                 names = [alias.asname or alias.name for alias in statement.names]
                 unique[path].difference_update(name for name in names if names.count(name) > 1)
 
-    proofs: dict[Path, dict[str, _DeclarativeBinding]] = {path: {} for path in trees}
-    inputs: dict[Path, tuple[tuple[Path, tuple[tuple[str, _DeclarativeBinding], ...]], ...]] = {}
-    # Every successful round establishes at least one source binding. The bound
-    # is derived from this finite graph, not from a timeout or optimistic cycle.
-    for _ in range(1 + sum(len(names) for names in unique.values())):
-        changed = False
-        for path, tree in trees.items():
-            incoming = tuple(
-                (target, tuple(proofs.get(target, {}).items()))
-                for target in sorted(dependencies[path])
-                if target != path
-            )
-            if path in inputs and inputs[path] == incoming:
-                continue
-            inputs[path] = incoming
-            proven: dict[str, _DeclarativeBinding] = {}
-            for node in tree.body:
-                if isinstance(node, ast.ImportFrom):
-                    _local, target = _project_local_import_module_path(
-                        root, importing_path=path, module=node.module, level=node.level
-                    )
-                    if target is None:
-                        continue
-                    imported_proofs = proven if target == path else proofs.get(target, {})
-                    for alias in node.names:
-                        name = alias.asname or alias.name
-                        proof = imported_proofs.get(alias.name)
-                        if name in unique[path] and proof is not None:
-                            proven[name] = replace(proof, line=node.lineno)
-                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    target = (
-                        node.targets[0]
-                        if isinstance(node, ast.Assign) and len(node.targets) == 1
-                        else (node.target if isinstance(node, ast.AnnAssign) else None)
-                    )
-                    if (
-                        isinstance(target, ast.Name)
-                        and target.id in unique[path]
-                        and node.value is not None
-                    ):
-                        value = node.value
-                        # Mutable collections are never exported as trusted constants.
-                        if isinstance(
-                            value, (ast.Constant, ast.Tuple, ast.BinOp, ast.UnaryOp)
-                        ) and _declaration_value_is_inert(value, proven):
-                            if not any(
-                                isinstance(item, (ast.List, ast.Dict, ast.Set))
-                                for item in ast.walk(value)
+    def prove(
+        assumed: Mapping[Path, frozenset[ast.stmt]] | None = None,
+    ) -> dict[Path, dict[str, _DeclarativeBinding]]:
+        assumed = assumed or {}
+        proofs: dict[Path, dict[str, _DeclarativeBinding]] = {path: {} for path in trees}
+        inputs: dict[
+            Path, tuple[tuple[Path, tuple[tuple[str, _DeclarativeBinding], ...]], ...]
+        ] = {}
+        # Every successful round establishes at least one source binding. The bound
+        # is derived from this finite graph, not from a timeout or optimistic cycle.
+        # An assumed class binding can also change kind once (class to model).
+        for _ in range((1 + sum(len(names) for names in unique.values())) * (2 if assumed else 1)):
+            changed = False
+            for path, tree in trees.items():
+                incoming = tuple(
+                    (target, tuple(proofs.get(target, {}).items()))
+                    for target in sorted(dependencies[path])
+                    if target != path
+                )
+                if path in inputs and inputs[path] == incoming:
+                    continue
+                inputs[path] = incoming
+                proven: dict[str, _DeclarativeBinding] = {}
+                assumed_here = assumed.get(path, frozenset())
+                for node in tree.body:
+                    if isinstance(node, ast.ImportFrom):
+                        _local, target = _project_local_import_module_path(
+                            root, importing_path=path, module=node.module, level=node.level
+                        )
+                        if target is None:
+                            continue
+                        imported_proofs = proven if target == path else proofs.get(target, {})
+                        for alias in node.names:
+                            name = alias.asname or alias.name
+                            proof = imported_proofs.get(alias.name)
+                            if name in unique[path] and proof is not None:
+                                proven[name] = replace(proof, line=node.lineno)
+                    elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                        target = (
+                            node.targets[0]
+                            if isinstance(node, ast.Assign) and len(node.targets) == 1
+                            else (node.target if isinstance(node, ast.AnnAssign) else None)
+                        )
+                        if (
+                            isinstance(target, ast.Name)
+                            and target.id in unique[path]
+                            and node.value is not None
+                        ):
+                            value = node.value
+                            # Mutable collections are never exported as trusted constants.
+                            if isinstance(
+                                value, (ast.Constant, ast.Tuple, ast.BinOp, ast.UnaryOp)
+                            ) and _declaration_value_is_inert(value, proven):
+                                if not any(
+                                    isinstance(item, (ast.List, ast.Dict, ast.Set))
+                                    for item in ast.walk(value)
+                                ):
+                                    proven[target.id] = _DeclarativeBinding(
+                                        node.lineno,
+                                        kind="literal",
+                                        metadata_shape=_metadata_shape(value, proven),
+                                        number=_bounded_number(value, proven),
+                                    )
+                            elif isinstance(
+                                value, (ast.Subscript, ast.BinOp)
+                            ) and _pydantic_annotation_is_declarative(
+                                value,
+                                import_bindings=imports[path],
+                                rebound_names=rebounds[path],
+                                project_root=root,
+                                declarative_bases=proven,
+                                # Imported aliases resolve strings in the consumer's
+                                # namespace, whose schema hooks are not proven here.
+                                allow_forward_references=False,
                             ):
                                 proven[target.id] = _DeclarativeBinding(
-                                    node.lineno,
-                                    kind="literal",
-                                    metadata_shape=_metadata_shape(value, proven),
+                                    node.lineno, kind="annotation"
                                 )
-                        elif isinstance(
-                            value, (ast.Subscript, ast.BinOp)
-                        ) and _pydantic_annotation_is_declarative(
-                            value,
-                            import_bindings=imports[path],
-                            rebound_names=rebounds[path],
-                            project_root=root,
-                            declarative_bases=proven,
+                    elif isinstance(node, ast.FunctionDef) and node.name in unique[path]:
+                        if (
+                            not node.decorator_list
+                            and _unsafe_import_time_expression(
+                                node,
+                                import_bindings=imports[path],
+                                rebound_names=rebounds[path],
+                                declarative_identities=frozenset(),
+                                declarative_subscriptions=frozenset(),
+                                project_root=root,
+                                declarative_bases=proven,
+                            )
+                            is None
                         ):
-                            proven[target.id] = _DeclarativeBinding(node.lineno, kind="annotation")
-                elif isinstance(node, ast.FunctionDef) and node.name in unique[path]:
-                    if (
-                        not node.decorator_list
-                        and _unsafe_import_time_expression(
-                            node,
-                            import_bindings=imports[path],
-                            rebound_names=rebounds[path],
-                            declarative_identities=frozenset(),
-                            declarative_subscriptions=frozenset(),
-                            project_root=root,
-                            declarative_bases=proven,
+                            proven[node.name] = _DeclarativeBinding(node.lineno, kind="function")
+                    elif isinstance(node, ast.ClassDef) and node.name in unique[path]:
+                        proof = _class_declaration_proof(
+                            root, node, imports[path], rebounds[path], proven
                         )
-                        is None
-                    ):
-                        proven[node.name] = _DeclarativeBinding(node.lineno, kind="function")
-                elif isinstance(node, ast.ClassDef) and node.name in unique[path]:
-                    proof = _class_declaration_proof(
-                        root, node, imports[path], rebounds[path], proven
-                    )
-                    if proof is not None:
-                        proven[node.name] = proof
-            if proven != proofs[path]:
-                proofs[path] = proven
-                changed = True
-        if not changed:
-            break
-    else:
-        raise _DeclarationGraphLimit
+                        if proof is not None:
+                            proven[node.name] = proof
+                    if node in assumed_here:
+                        for name, binding in _assumed_bindings(
+                            root, node, imports[path], rebounds[path], proven
+                        ):
+                            if name in unique[path]:
+                                proven.setdefault(name, binding)
+                if proven != proofs[path]:
+                    proofs[path] = proven
+                    changed = True
+            if not changed:
+                break
+        else:
+            raise _DeclarationGraphLimit
+        return proofs
 
-    failures = {
+    proofs = prove()
+    unproven = {
         path: failed
         for path, tree in trees.items()
         if (failed := _module_declaration_failures(root, path, tree, proofs[path]))
     }
-    for path, imports in invalid_imports.items():
-        failures[path] = tuple(dict.fromkeys((*failures.get(path, ()), *imports)))
+    # Report each failure that remains when every failing definition is assumed
+    # to be what it declares. The others only depend on those definitions, so
+    # one finding at the cause replaces a finding at every dependent use.
+    try:
+        assumed_proofs = prove(
+            {
+                path: frozenset(statement for statement, _ in failed)
+                for path, failed in unproven.items()
+            }
+        )
+    except _DeclarationGraphLimit:
+        assumed_proofs = proofs
+    causes: dict[Path, tuple[tuple[ast.stmt, ast.expr | ast.stmt], ...]] = {}
+    base_obstacles: dict[ast.ClassDef, tuple[Path, ast.expr | ast.stmt, list[Path]]] = {}
+    for path, failed in unproven.items():
+        remaining: list[tuple[ast.stmt, ast.expr | ast.stmt]] = []
+        for statement, unsafe in _module_declaration_failures(
+            root,
+            path,
+            trees[path],
+            assumed_proofs[path],
+            statements=frozenset(statement for statement, _ in failed),
+        ):
+            base_name = (
+                unsafe.id
+                if isinstance(statement, ast.ClassDef)
+                and isinstance(unsafe, ast.Name)
+                and any(unsafe is base for base in statement.bases)
+                else None
+            )
+            definition = (
+                _local_class_definition(root, trees, unique, path, base_name)
+                if base_name is not None
+                else None
+            )
+            obstacle = (
+                _class_base_obstacle(
+                    root,
+                    definition[2],
+                    imports[definition[1]],
+                    rebounds[definition[1]],
+                    assumed_proofs[definition[1]],
+                )
+                if definition is not None
+                else None
+            )
+            if base_name is None or definition is None or obstacle is None:
+                remaining.append((statement, unsafe))
+                continue
+            # The base is inert but cannot be inherited from: report it once
+            # where it is defined, and check the rest of this subclass as if
+            # its base were proven.
+            line, base_path, base = definition
+            base_obstacles.setdefault(base, (base_path, obstacle, []))[2].append(path)
+            with_base = {
+                **assumed_proofs[path],
+                base_name: replace(
+                    _class_binding(
+                        root,
+                        base,
+                        imports[base_path],
+                        rebounds[base_path],
+                        assumed_proofs[base_path],
+                    ),
+                    line=line,
+                ),
+            }
+            remaining.extend(
+                _module_declaration_failures(
+                    root, path, trees[path], with_base, statements=frozenset({statement})
+                )
+            )
+        if remaining:
+            causes[path] = tuple(remaining)
+    failures = dict(unproven)
+    for path, imported in invalid_imports.items():
+        pairs = tuple((item, item) for item in imported)
+        failures[path] = tuple(dict.fromkeys((*failures.get(path, ()), *pairs)))
+        causes[path] = tuple(dict.fromkeys((*causes.get(path, ()), *pairs)))
     migrations = {
         path: findings
         for path, tree in trees.items()
@@ -2749,11 +3084,15 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
                 changed = True
         if not changed:
             break
+    obstacles: dict[Path, list[tuple[ast.ClassDef, ast.expr | ast.stmt, tuple[Path, ...]]]] = {}
+    for base, (base_path, obstacle, dependents) in base_obstacles.items():
+        obstacles.setdefault(base_path, []).append((base, obstacle, tuple(dependents)))
     return _DeclarationGraph(
-        {path: proof for path, proof in proofs.items() if not blockers[path]},
-        proofs,
+        frozenset(trees),
         failures,
-        {path: frozenset(causes) for path, causes in blockers.items() if causes},
+        causes,
+        {path: tuple(found) for path, found in obstacles.items()},
+        {path: frozenset(found) for path, found in blockers.items() if found},
         migrations,
     )
 
@@ -2765,23 +3104,7 @@ def _class_declaration_proof(
     rebound: frozenset[str],
     proven: Mapping[str, _DeclarativeBinding],
 ) -> _DeclarativeBinding | None:
-    if node.decorator_list or node.keywords:
-        return None
-    if any(_import_time_statement_may_bind_name(item, "__init_subclass__") for item in node.body):
-        return None
-    enum_members = _enum_declaration_members(node, imports, rebound, root)
-    pydantic = any(_is_pydantic_base(base, imports, proven) for base in node.bases)
-    if enum_members is None and not all(
-        _class_base_is_declarative(
-            base,
-            project_root=root,
-            import_bindings=imports,
-            rebound_names=rebound,
-            declarative_bases=proven,
-            require_inert_metaclass=True,
-        )
-        for base in node.bases
-    ):
+    if _class_base_obstacle(root, node, imports, rebound, proven) is not None:
         return None
     if (
         _unsafe_import_time_expression(
@@ -2796,10 +3119,141 @@ def _class_declaration_proof(
         is not None
     ):
         return None
+    return _class_binding(root, node, imports, rebound, proven)
+
+
+def _class_binding(
+    root: Path,
+    node: ast.ClassDef,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    proven: Mapping[str, _DeclarativeBinding],
+) -> _DeclarativeBinding:
+    """The kind of binding a class definition declares, once it is proven."""
+    enum_members = _enum_declaration_members(node, imports, rebound, root)
+    pydantic = any(_is_pydantic_base(base, imports, proven) for base in node.bases)
+    serializers = (
+        frozenset().union(
+            *(
+                proven[base.id].serializer_methods
+                for base in node.bases
+                if isinstance(base, ast.Name) and base.id in proven
+            )
+        )
+        if pydantic
+        else frozenset()
+    )
+    unproven_returns: frozenset[str] = frozenset()
+    if pydantic:
+        class_bindings = _scope_rebound_names(node.body, include_imports=True)
+        class_scope = rebound | class_bindings
+        unproven_returns = (
+            frozenset().union(
+                *(
+                    proven[base.id].unproven_method_returns
+                    for base in node.bases
+                    if isinstance(base, ast.Name) and base.id in proven
+                )
+            )
+            # Pydantic removes field attributes, exposing inherited methods again.
+            - frozenset(
+                statement.name
+                for statement in node.body
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+        )
+        unproven_returns |= frozenset(
+            statement.name
+            for statement in node.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not _deferred_return_is_declarative(
+                node,
+                statement,
+                import_bindings=imports,
+                rebound_names=rebound,
+                project_root=root,
+                declarative_bases=proven,
+            )
+        )
+        serializers |= frozenset(
+            statement.name
+            for statement in node.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                _pydantic_serializer_is_declarative(
+                    decorator,
+                    import_bindings=imports,
+                    rebound_names=class_scope,
+                    project_root=root,
+                )
+                for decorator in statement.decorator_list
+            )
+        )
     return _DeclarativeBinding(
         node.lineno,
         "model" if pydantic else "enum" if enum_members is not None else "class",
         enum_members,
+        serializer_methods=serializers,
+        unproven_method_returns=unproven_returns,
+    )
+
+
+def _class_base_obstacle(
+    root: Path,
+    node: ast.ClassDef,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    proven: Mapping[str, _DeclarativeBinding],
+) -> ast.expr | ast.stmt | None:
+    """Return what keeps an otherwise inert class from being a proven base.
+
+    Defining such a class can be safe, but a subclass would run its hook, or
+    inherit from something the proof cannot follow, when it is defined.
+    """
+    enum_members = _enum_declaration_members(node, imports, rebound, root)
+    pydantic = any(_is_pydantic_base(base, imports, proven) for base in node.bases)
+    for decorator in node.decorator_list:
+        if (
+            pydantic
+            or enum_members is not None
+            or not _dataclass_decorator_is_declarative(decorator, imports, rebound, root)
+        ):
+            return decorator
+    if node.keywords:
+        return node.keywords[0].value
+    for item in node.body:
+        if _import_time_statement_may_bind_name(item, "__init_subclass__"):
+            return item
+    if enum_members is None:
+        for base in node.bases:
+            if not _class_base_is_declarative(
+                base,
+                project_root=root,
+                import_bindings=imports,
+                rebound_names=rebound,
+                declarative_bases=proven,
+                require_inert_metaclass=True,
+            ):
+                return base
+    return None
+
+
+def _dataclass_decorator_is_declarative(
+    decorator: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> bool:
+    """``@dataclass`` with literal options generates methods and runs no hooks."""
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    if _trusted_symbol(target, imports, rebound, root) != ("dataclasses", "dataclass"):
+        return False
+    return not isinstance(decorator, ast.Call) or (
+        not decorator.args
+        and all(
+            keyword.arg is not None and isinstance(keyword.value, ast.Constant)
+            for keyword in decorator.keywords
+        )
     )
 
 
@@ -2839,17 +3293,26 @@ def _module_declaration_failures(
     path: Path,
     tree: ast.Module,
     bases: Mapping[str, _DeclarativeBinding],
-) -> tuple[ast.expr | ast.stmt, ...]:
+    *,
+    statements: frozenset[ast.stmt] | None = None,
+) -> tuple[tuple[ast.stmt, ast.expr | ast.stmt], ...]:
+    """Return each unproven top-level statement with the expression to report.
+
+    *statements* rechecks only those statements, each without any binding it
+    declares itself, so an assumed binding cannot justify its own definition.
+    """
     bindings = _import_bindings(tree)
     rebound = _module_rebound_names(tree)
     identity_lines = _declarative_identity_lines(
         tree, import_bindings=bindings, rebound_names=rebound
     )
     subscriptions = _declarative_subscription_names(root, tree)
-    failures: list[ast.expr | ast.stmt] = []
+    failures: list[tuple[ast.stmt, ast.expr | ast.stmt]] = []
     for statement in tree.body:
+        if statements is not None and statement not in statements:
+            continue
         if _import_time_statement_may_bind_name(statement, "__getattr__"):
-            failures.append(statement)
+            failures.append((statement, statement))
             continue
         unsafe: ast.expr | ast.stmt | None = next(
             (
@@ -2862,6 +3325,11 @@ def _module_declaration_failures(
             None,
         )
         if unsafe is None:
+            own = (
+                _scope_rebound_names([statement], include_imports=True)
+                if statements is not None
+                else frozenset()
+            )
             unsafe = _unsafe_import_time_expression(
                 statement,
                 import_bindings=bindings,
@@ -2869,11 +3337,89 @@ def _module_declaration_failures(
                 declarative_identities=_identities_before(identity_lines, statement),
                 declarative_subscriptions=subscriptions,
                 project_root=root,
-                declarative_bases=bases,
+                declarative_bases=(
+                    {name: proof for name, proof in bases.items() if name not in own}
+                    if own
+                    else bases
+                ),
             )
         if unsafe is not None:
-            failures.append(unsafe)
+            failures.append((statement, unsafe))
     return tuple(failures)
+
+
+def _assumed_bindings(
+    root: Path,
+    node: ast.stmt,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    proven: Mapping[str, _DeclarativeBinding],
+) -> tuple[tuple[str, _DeclarativeBinding], ...]:
+    """What a failing definition declares, for finding what else fails.
+
+    These bindings only decide which findings are reported. They never prove a
+    module, and the definition itself is still a finding.
+    """
+    if isinstance(node, ast.ClassDef):
+        return ((node.name, _class_binding(root, node, imports, rebound, proven)),)
+    if isinstance(node, ast.FunctionDef):
+        return ((node.name, _DeclarativeBinding(node.lineno, kind="function")),)
+    target = (
+        node.targets[0]
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        else node.target
+        if isinstance(node, ast.AnnAssign) and node.value is not None
+        else None
+    )
+    # A failing type alias still declares a type. Any other failing assignment
+    # holds a computed object, so its uses are findings of their own.
+    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+    if isinstance(target, ast.Name) and (
+        isinstance(value, ast.Subscript)
+        or (isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr))
+    ):
+        return ((target.id, _DeclarativeBinding(node.lineno, kind="annotation")),)
+    return ()
+
+
+def _local_class_definition(
+    root: Path,
+    trees: Mapping[Path, ast.Module],
+    unique: Mapping[Path, set[str]],
+    path: Path,
+    name: str,
+) -> tuple[int, Path, ast.ClassDef] | None:
+    """Follow a uniquely bound name through explicit local imports to its class.
+
+    Returns the line that binds the name in the first module, then the class.
+    """
+    seen: set[tuple[Path, str]] = set()
+    line: int | None = None
+    while (path, name) not in seen and len(seen) < 64:
+        seen.add((path, name))
+        tree = trees.get(path)
+        if tree is None or name not in unique.get(path, ()):
+            return None
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == name:
+                return node.lineno if line is None else line, path, node
+            if isinstance(node, ast.ImportFrom):
+                alias = next(
+                    (alias for alias in node.names if (alias.asname or alias.name) == name), None
+                )
+                if alias is None:
+                    continue
+                _local, target = _project_local_import_module_path(
+                    root, importing_path=path, module=node.module, level=node.level
+                )
+                if target is None:
+                    return None
+                line = node.lineno if line is None else line
+                path, name = target, alias.name
+                break
+        else:
+            return None
+    return None
 
 
 def _imported_class_base_is_declarative(
@@ -2927,6 +3473,17 @@ def _imported_subscription_is_declarative(
 ) -> bool:
     if not _imported_class_base_is_declarative(root, binding):
         module = binding[0]
+        # Only the real packages' classes: a project-local module of the same
+        # name could define an effectful __class_getitem__.
+        if module == "contextlib":
+            # The generic context-manager ABCs only build typing aliases.
+            return not _import_binding_is_project_local(root, binding) and binding[1] in {
+                "AbstractContextManager",
+                "AbstractAsyncContextManager",
+            }
+        if binding == ("pydantic", "ModelWrapValidatorHandler"):
+            # The typed handler a wrap model validator receives.
+            return not _import_binding_is_project_local(root, binding)
         return module in {
             "collections",
             "collections.abc",
@@ -3694,6 +4251,23 @@ def _private_collection_update_is_inert(
     return isinstance(call.args[0], (ast.Constant, ast.Name))
 
 
+def _empty_immutable_collection(
+    value: ast.expr,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+) -> bool:
+    """``frozenset()`` or ``tuple()``: an empty value with no descriptor hooks."""
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in {"frozenset", "tuple"}
+        and value.func.id not in import_bindings
+        and value.func.id not in rebound_names
+        and not value.args
+        and not value.keywords
+    )
+
+
 _DATACLASS_FIELD_FLAGS = frozenset({"compare", "hash", "init", "kw_only", "repr"})
 _BUILTIN_COLLECTION_FACTORIES = frozenset({"dict", "frozenset", "list", "set", "tuple"})
 
@@ -3704,7 +4278,7 @@ def _dataclass_field_is_declarative(
     import_bindings: Mapping[str, tuple[str, str | None]],
     rebound_names: frozenset[str],
 ) -> bool:
-    """``field(default=...)`` with literals or a builtin empty-collection factory."""
+    """``field(default=...)`` with literals, a builtin collection factory or a lambda."""
 
     function = call.func
     is_field = (
@@ -3723,7 +4297,11 @@ def _dataclass_field_is_declarative(
     for keyword in call.keywords:
         if keyword.arg == "default_factory":
             factory = keyword.value
-            if not (
+            # The dataclass decorator stores the factory; instances call it.
+            if isinstance(factory, ast.Lambda):
+                if factory.args.defaults or any(factory.args.kw_defaults):
+                    return False
+            elif not (
                 isinstance(factory, ast.Name)
                 and factory.id in _BUILTIN_COLLECTION_FACTORIES
                 and factory.id not in import_bindings

@@ -68,12 +68,15 @@ initializers. These dependencies must also be declarative: a helper import can
 install subclass hooks after a class is defined. The proof is bounded to 64 local
 source modules and fails closed beyond that limit. Rebindings, import cycles,
 opaque descriptors, custom metaclasses,
-class decorators on a base, and application `__init_subclass__` hooks remain
+class decorators on a base other than `@dataclass` with literal options, and
+application `__init_subclass__` hooks remain
 unproven and fail closed. Dynamic base expressions and class namespaces also
 require a stronger proof than this static check supports. Keep lifecycle and
 external work in methods or explicit builders. External roots of a local class
 hierarchy must also have reviewed subclass-creation behavior: builtin exceptions,
-`object`, `abc.ABC`, and Cayu's `Tool` are supported. Enum-derived application
+`object`, the builtin value types (`tuple`, `list`, `dict`, `set`, `frozenset`,
+`str`, `int`, `float`, `bytes`), `abc.ABC`, and Cayu's `Tool` are supported.
+Enum-derived application
 bases remain unproven because enum metaclasses can execute inherited member
 initializers; mixing a local base with an enum has the same restriction.
 
@@ -85,8 +88,15 @@ the check accepts without executing them:
   module-level constant holding one. This is the shape `cayu generate tool`
   emits.
 - `logging.getLogger(__name__)` or with a literal name.
-- Dataclass fields `field(default=<literal>)` or
-  `field(default_factory=list|dict|set|tuple|frozenset)` with literal flags.
+- Dataclass fields `field(default=<literal>)`,
+  `field(default_factory=list|dict|set|tuple|frozenset)` or
+  `field(default_factory=lambda: ...)` with literal flags, and empty
+  `frozenset()` or `tuple()` class defaults. A lambda body runs when an instance
+  is created, not at import; a lambda with default arguments stays unproven.
+- Fixed instants `datetime(...)` and `date(...)` with integer literal fields and
+  `tzinfo=UTC` or `tzinfo=timezone.utc`.
+- Type aliases such as `Callable[..., AbstractContextManager[T]]` built from
+  `typing`, `collections.abc` and the `contextlib` context-manager ABCs.
 - `Enum`/`StrEnum`/`IntEnum`, `TypedDict` and `NamedTuple` declarations with
   annotations and literal values.
 - `@functools.cache`, `@functools.lru_cache` and `@lru_cache(maxsize=...)` with
@@ -107,17 +117,47 @@ example an application function call such as `load(...)`, including one nested
 inside a `ToolSpec`). Move either kind into a builder, lifecycle hook or tool
 `run`.
 
+Each cause is reported once, at the expression the check cannot prove. A class,
+annotation or import that only depends on a failing definition, such as every
+subclass of a model whose `Field` default cannot be proven or every module that
+imports one with an import-time call, is not reported again; it still blocks
+importing the application until the cause is fixed. A class that is inert itself
+but cannot be inherited from, for example because it defines
+`__init_subclass__`, is reported at that hook with
+`reason: unproven_base_definition` and the number of classes that inherit from
+it. `reason: unproven_class_base` remains for a base that is not a proven class
+at all, such as a constant or a function.
+
 Pydantic `BaseModel` declarations (including named import aliases) may register `@field_validator` and
 `@model_validator` methods. Import these helpers explicitly from `pydantic`
 (named aliases and `import pydantic as pd` are supported). Field names must be
 literal strings; `mode` must be a supported literal string and `check_fields`
 a literal boolean or `None`. Model validators require an explicit `mode` of
 `before`, `after`, or `wrap`; field validators also accept `plain` and default
-to `after`. Validator bodies run during validation, not registration. Model
-assignments may also use explicitly imported `ConfigDict` and `Field` with
-literal data arguments; callbacks and computed defaults remain unproven.
+to `after`. Validator bodies run during validation, not registration. A wrap
+model validator's `handler: ModelWrapValidatorHandler[Self]` parameter is
+accepted. Models may also register `@model_serializer` (bare, or with literal
+`mode` of `plain` or `wrap` and `when_used`) and `@field_serializer` with literal
+field names and literal `mode`, `when_used` and `check_fields`. Pydantic builds a
+schema from a serializer's return annotation while it declares the model, so that
+annotation must be a proven model annotation; `return_type` stays unproven.
+
+Model assignments may also use explicitly imported `ConfigDict`, `Field` and
+`PrivateAttr` with literal data arguments. Numeric options and defaults may use
+bounded arithmetic (`+`, `-`, `*`, and `**` with a small exponent) on numeric
+literals and module constants, such as `8 * 1024**3`. `default_factory` and
+`exclude_if` may be lambdas: Pydantic calls them during validation or
+serialization, not while declaring the model, so only lambda default arguments
+are evaluated and those stay unproven. `default_factory` may also name a builtin
+collection, a proven local model or function, or a class or function imported
+from Cayu. Other callbacks (for example `field_title_generator`) and computed
+defaults remain unproven. Annotations may use `X | None`, subscripted generics
+and quoted forward references directly in model fields or return annotations,
+which are proven as the expression they contain. Exported type aliases containing
+forward references are not proven: Pydantic resolves those references in the
+importing model namespace, which can bind different types and schema hooks.
 Unknown options, computed arguments, unpacking, shadowed/rebound imports,
-project-local substitutes for Pydantic, opaque/quoted model field annotations,
+project-local substitutes for Pydantic, opaque model field annotations,
 explicit `__annotations__`, `__annotate__`, or `__annotate_func__` bindings,
 and model construction/schema hooks
 remain unproven. Inherited models retain these checks through explicit named

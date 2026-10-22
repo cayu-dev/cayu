@@ -58,9 +58,10 @@ class Child(Configured):
         },
     )
     findings = _check_import_inertness(tmp_path)
-    assert findings
-    assert any(d.parameters["reason"] == "unsupported_expression" for d in findings)
-    assert any(d.parameters["reason"] == "unproven_class_base" for d in findings)
+    # The factory is the cause; the subclass is not reported again.
+    assert [(d.path, d.parameters["reason"]) for d in findings] == [
+        (f"domain/model.py:{prefix.count(chr(10)) + 3}", "unsupported_expression")
+    ]
 
 
 @pytest.mark.parametrize("shadow", ["module", "class", "package"])
@@ -80,7 +81,7 @@ class Model(BaseModel):
     assert _check_import_inertness(tmp_path)
 
 
-def test_diagnostics_distinguish_primary_from_dependent_without_source_literals(tmp_path):
+def test_cause_is_reported_once_without_source_literals(tmp_path):
     write(
         tmp_path,
         {
@@ -92,9 +93,7 @@ class Child(Parent):
 """
         },
     )
-    primary, dependent = _check_import_inertness(tmp_path)
+    (primary,) = _check_import_inertness(tmp_path)
     assert primary.parameters["reason"] == "unsupported_expression"
     assert primary.parameters["symbol"] == "Field"
-    assert dependent.parameters["reason"] == "unproven_class_base"
-    assert dependent.parameters["symbol"] == "Parent"
     assert "private-value" not in primary.model_dump_json()

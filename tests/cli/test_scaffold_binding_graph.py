@@ -76,8 +76,10 @@ def test_dependency_effect_invalidates_schema_proofs(tmp_path, module):
     modules[module] += '\nopen("executed", "w").write("effect")\n'
     write(tmp_path, modules)
     findings = _check_import_inertness(tmp_path)
-    assert findings
-    assert any(d.parameters.get("reason") == "unproven_class_base" for d in findings)
+    # The effect blocks every module that imports it, and is the only finding.
+    assert [(d.path.partition(":")[0], d.parameters["reason"]) for d in findings] == [
+        (module, "import_time_effect")
+    ]
     assert not (tmp_path / "executed").exists()
 
 
@@ -211,7 +213,7 @@ def test_generated_service_uses_local_schema_graph(tmp_path, monkeypatch):
     generated.test_generated_composed_service(tmp_path)
 
 
-def test_primary_expression_survives_dependent_base_failures(tmp_path):
+def test_dependent_classes_are_not_reported_again(tmp_path):
     modules = dict(MODULES)
     modules["domain/typed.py"] += """
 class Broken(Configured):
@@ -221,16 +223,9 @@ class Dependent(Broken):
 """
     write(tmp_path, modules)
     findings = _check_import_inertness(tmp_path)
-    assert any(
-        d.parameters.get("reason") == "unsupported_expression"
-        and d.parameters.get("symbol") == "Field"
-        for d in findings
-    )
-    assert any(
-        d.parameters.get("reason") == "unproven_class_base"
-        and "domain/typed.py" in d.parameters["blocking_modules"]
-        for d in findings
-    )
+    assert [(d.parameters["reason"], d.parameters["symbol"]) for d in findings] == [
+        ("unsupported_expression", "Field")
+    ]
 
 
 def test_explicit_helper_primary_is_reported_without_inheritance(tmp_path):
