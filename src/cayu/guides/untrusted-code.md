@@ -94,7 +94,16 @@ What the container can and cannot do:
 - It runs as UID/GID 1000. `/workspace` (256 MiB) and `/tmp` (64 MiB, with
   `HOME` at `/tmp/cayu-home`) are the only writable places, so install packages
   into a virtual environment under `/workspace`. Change the sizes, limits and
-  mounts with `DockerWorkloadRestrictions` fields.
+  mounts with `DockerWorkloadRestrictions` fields. A `DockerTmpfsMount` you
+  pass replaces the defaults, so keep `/tmp`; mounts may be listed in any order
+  and are executable unless you set `noexec=True`.
+- Memory is limited to 512 MiB by default (`memory_bytes`), and files written
+  to the tmpfs mounts count against it. Keep `memory_bytes` well below the
+  memory the Docker engine itself has: the Docker Desktop VM's size on a laptop,
+  or the outer container's limit when the engine runs inside a container. If the
+  limit is above that, a test that allocates too much can get the engine, or
+  your own app, killed by the out-of-memory killer instead of failing the
+  sandboxed process alone.
 - Its only network is an internal Docker network whose one exit is Cayu's
   broker. Requests to allowlisted hosts go through the `HTTPS_PROXY` Cayu sets.
   Everything else fails: direct IP connections, cloud metadata, the network's
@@ -106,6 +115,18 @@ What the container can and cannot do:
 - Host files are not mounted unless you pass `host_workspace_path`.
 - `setup_commands` run as the same restricted user, not root. Bake system
   packages into the image.
+- The runner also has `exec_stream` for binary stdin and stdout (for example a
+  tar of the repository), and `runner.name` is the container's name.
+- Each session also starts a small sidecar container that links the internal
+  network to the broker. Its image is `DEFAULT_SIDECAR_IMAGE` from
+  `cayu.egress.docker_adapter`, an `alpine/socat` image pinned by digest, and
+  Docker pulls it on first use. On a host without registry access, pull it
+  beforehand, or push it to your own registry and pass that reference as
+  `DockerEgressAdapter(sidecar_image=...)`:
+
+  ```sh
+  docker pull "$(python -c 'from cayu.egress.docker_adapter import DEFAULT_SIDECAR_IMAGE; print(DEFAULT_SIDECAR_IMAGE)')"
+  ```
 
 Before the runner is returned, Cayu inspects the live container and fails
 closed, removing it, if any declared control is missing. It also checks that

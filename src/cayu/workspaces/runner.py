@@ -796,6 +796,26 @@ def write_tar_operation(root_fd):
     )
 
 
+def tar_stream_staging_file(expected_bytes):
+    # Keep large streamed imports disk-backed when temporary storage can hold
+    # them. Hardened guests can have a /tmp tmpfs smaller than valid workspace
+    # archives; only those transfers need the text path's memory fallback.
+    try:
+        staged = tempfile.TemporaryFile(mode="w+b", prefix="cayu-workspace-tar-")
+    except OSError as error:
+        if error.errno != errno.ENOSPC:
+            raise
+        return io.BytesIO()
+    try:
+        capacity = os.fstatvfs(staged.fileno())
+    except (AttributeError, OSError):
+        return staged
+    if expected_bytes > capacity.f_bavail * capacity.f_frsize:
+        staged.close()
+        return io.BytesIO()
+    return staged
+
+
 def write_tar_stream_operation(root_fd):
     excluded_directory_names = frozenset(json.loads(sys.argv[2]))
     excluded_path_regexes = tuple(
@@ -804,7 +824,7 @@ def write_tar_stream_operation(root_fd):
     expected_bytes = int(sys.argv[4])
     if expected_bytes < 0:
         fail("workspace_error", "Workspace tar byte count must be non-negative.")
-    with tempfile.TemporaryFile(mode="w+b", prefix="cayu-workspace-tar-") as staged:
+    with tar_stream_staging_file(expected_bytes) as staged:
         remaining = expected_bytes
         while remaining:
             chunk = sys.stdin.buffer.read(min(remaining, 1 << 16))

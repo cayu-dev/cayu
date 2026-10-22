@@ -72,7 +72,12 @@ from cayu.vaults import SecretRedactor
 #: Where the per-session CA is mounted inside the container and trusted from.
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
 _SIDECAR_LISTEN_PORT = 8080
-_DEFAULT_SIDECAR_IMAGE = "alpine/socat"
+#: The sidecar image used when ``sidecar_image=`` is not given: socat 1.8.1.3,
+#: pinned by digest. Docker pulls it on first use; pre-pull it, or pass a mirrored
+#: copy as ``sidecar_image=``, on hosts without registry access.
+DEFAULT_SIDECAR_IMAGE = (
+    "alpine/socat:1.8.1.3@sha256:22d77becaeeea8ef56b8c4bb2312323acafe85354be6a85714ff5050e3537842"
+)
 _SESSION_LABEL = "cayu.egress.session"
 _SIDECAR_AUTH_PATH = "/run/cayu/broker.auth"
 _SIDECAR_CONNECTOR_PATH = "/run/cayu/connect-broker"
@@ -415,7 +420,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         loop: asyncio.AbstractEventLoop | None = None,
         docker_exec: DockerExec | None = None,
         docker_run: DockerRun | None = None,
-        sidecar_image: str = _DEFAULT_SIDECAR_IMAGE,
+        sidecar_image: str = DEFAULT_SIDECAR_IMAGE,
         proxy_host: str | None = None,
         proxy_bind_host_resolver: Callable[[], Awaitable[str]] | None = None,
         seccomp_profile: str | None = None,

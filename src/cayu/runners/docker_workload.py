@@ -75,14 +75,19 @@ class DockerImageIdentity(BaseModel):
 
 
 class DockerTmpfsMount(BaseModel):
-    """One bounded guest-writable tmpfs mount."""
+    """One bounded guest-writable tmpfs mount.
+
+    Mounts are executable by default, like the default ``/tmp`` and
+    ``/workspace`` mounts, so a virtual environment or build output placed on
+    one can run. Pass ``noexec=True`` for a mount that only holds data.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     target: str = Field(max_length=4096)
     size_bytes: StrictInt = Field(ge=1024 * 1024, le=16 * 1024 * 1024 * 1024)
     mode: StrictInt = Field(default=0o700, ge=0, le=0o7777)
-    noexec: StrictBool = True
+    noexec: StrictBool = False
 
     @field_validator("target")
     @classmethod
@@ -173,9 +178,9 @@ class DockerWorkloadRestrictions(BaseModel):
         targets = [mount.target for mount in value]
         if len(targets) != len(set(targets)):
             raise ValueError("Docker tmpfs targets must be unique.")
-        if tuple(sorted(targets)) != tuple(targets):
-            raise ValueError("Docker tmpfs mounts must be sorted by target.")
-        return value
+        # Mount order carries no meaning, so keep one canonical order for the
+        # run arguments and the fingerprint.
+        return tuple(sorted(value, key=lambda mount: mount.target))
 
     @model_validator(mode="after")
     def validate_resource_relationships(self) -> Self:

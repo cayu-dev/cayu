@@ -1881,3 +1881,45 @@ def test_content_manifest_rejects_invalid_or_out_of_scope_guest_evidence(entries
                 max_paths=10, max_file_bytes=10, max_total_bytes=10
             )
         )
+
+
+@pytest.mark.parametrize("capacity", ["full", "small", "sufficient"])
+def test_streamed_tar_uses_disk_when_capacity_allows(tmp_path, monkeypatch, capacity):
+    program = runner_workspace_module._RUNNER_WORKSPACE_PROGRAM
+    if capacity == "full":
+        injected = """
+def reject_tmp(*args, **kwargs):
+    raise OSError(28, "No space left on device")
+tempfile.TemporaryFile = reject_tmp
+"""
+    elif capacity == "small":
+        injected = """
+from types import SimpleNamespace
+os.fstatvfs = lambda fd: SimpleNamespace(f_bavail=1, f_frsize=1)
+"""
+    else:
+        injected = """
+from types import SimpleNamespace
+os.fstatvfs = lambda fd: SimpleNamespace(f_bavail=1 << 40, f_frsize=1)
+def reject_memory(*args, **kwargs):
+    raise MemoryError("Archive must use disk-backed staging")
+io.BytesIO = reject_memory
+"""
+    monkeypatch.setattr(
+        runner_workspace_module,
+        "_RUNNER_WORKSPACE_PROGRAM",
+        program.replace(
+            "import tarfile\nimport tempfile", "import tarfile\nimport tempfile\n" + injected
+        ),
+    )
+    content = b"payload" * 1024
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        info = tarfile.TarInfo("result.bin")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    archive.seek(0)
+    asyncio.run(
+        _workspace(tmp_path).write_tar_stream(archive, archive_bytes=len(archive.getvalue()))
+    )
+    assert (tmp_path / "result.bin").read_bytes() == content

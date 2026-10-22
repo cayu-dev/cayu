@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import Any, Literal, TypeVar
+from typing import Any, BinaryIO, Literal, TypeVar
 
 from cayu._exception_groups import (
     add_exception_note_safely,
@@ -142,6 +142,8 @@ from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.runners._subprocess import (
     copy_runner_env,
+    validate_binary_input_stream,
+    validate_binary_output_stream,
     validate_output_limit,
     validate_runner_env_remove,
     validate_stdin,
@@ -152,6 +154,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerBinaryStreamCapability,
     RunnerExecutionAdmissionObserver,
     RunnerInteractiveProcess,
     RunnerInteractiveProcessCapability,
@@ -2284,6 +2287,15 @@ class _EgressManagedRunner(Runner):
     def resource_key(self) -> tuple[object, ...] | None:
         return self._runner.resource_key
 
+    @property
+    def name(self) -> str:
+        """Return the backend sandbox's name, such as the Docker container name."""
+
+        name = getattr(self._runner, "name", None)
+        if type(name) is not str:
+            raise AttributeError(f"{type(self._runner).__name__} runners have no sandbox name.")
+        return name
+
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
         """Return the adapter's evidence for the exact managed runner."""
 
@@ -2404,6 +2416,81 @@ class _EgressManagedRunner(Runner):
         if inner is None:
             return None
         return _EgressInteractiveProcessCapability(self, inner)
+
+    def binary_stream_capability(self) -> RunnerBinaryStreamCapability | None:
+        """Expose the backend's binary streams under this runner's dispatch fences."""
+
+        if self._runner.binary_stream_capability() is None:
+            return None
+        return _EgressBinaryStreamCapability(self)
+
+    async def exec_stream(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: BinaryIO | None = None,
+        stdout: BinaryIO | None = None,
+        stdout_limit_bytes: int | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        """Execute with binary stdin or stdout when the backend supports it.
+
+        Each call counts as one workspace dispatch, like ``exec``.
+        """
+
+        self._ensure_exec_open()
+        inner = self._runner.binary_stream_capability()
+        if inner is None:
+            raise RuntimeError("The managed runner's backend does not support binary streams.")
+        try:
+            stdin = validate_binary_input_stream(stdin)
+            stdout = validate_binary_output_stream(stdout)
+            if stdin is None and stdout is None:
+                raise ValueError("Managed runner exec_stream requires binary stdin or stdout.")
+            if stdout is None and stdout_limit_bytes is not None:
+                raise ValueError("Managed runner stdout_limit_bytes requires binary stdout.")
+            if stdout_limit_bytes is not None:
+                validate_output_limit(stdout_limit_bytes)
+            owned_command = copy_exec_command(command)
+            kwargs = _validated_runner_dispatch_kwargs(
+                self._runner,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                None,
+                output_limit_bytes,
+            )
+            self._runner.preflight_exec(owned_command, **kwargs)
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            kwargs = {}
+            cwd = None
+            env = None
+            env_remove = ()
+            raise
+        finally:
+            del command
+        del kwargs["stdin"]
+        dispatch_id = self._begin_workspace_dispatch()
+        try:
+            result = await inner.exec_stream(
+                owned_command,
+                **kwargs,
+                stdin=stdin,
+                stdout=stdout,
+                stdout_limit_bytes=stdout_limit_bytes,
+            )
+        except BaseException as exc:
+            self._finish_workspace_dispatch(dispatch_id=dispatch_id, error=exc)
+            raise
+        self._finish_workspace_dispatch(dispatch_id=dispatch_id, result=result)
+        return result
 
     @_clean_runner_preflight
     def preflight_exec(
@@ -4400,6 +4487,14 @@ class _EgressManagedRunner(Runner):
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         return self._runner.resolve_cwd(cwd)
+
+
+class _EgressBinaryStreamCapability(RunnerBinaryStreamCapability):
+    def __init__(self, runner: _EgressManagedRunner) -> None:
+        self._runner = runner
+
+    async def exec_stream(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+        return await self._runner.exec_stream(command, **kwargs)
 
 
 class _EgressInteractiveProcessCapability(RunnerInteractiveProcessCapability):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -24,6 +25,7 @@ pytest.importorskip("cryptography")
 # Imported after importorskip: docker_adapter -> proxy_server -> cryptography.
 from cayu.egress.adapter import EgressBinding, VirtualEgressRunnerRequest
 from cayu.egress.docker_adapter import (
+    DEFAULT_SIDECAR_IMAGE,
     GUEST_CA_PATH,
     DockerEgressAdapter,
     _default_docker_exec,
@@ -485,7 +487,7 @@ def test_prepare_authenticates_sidecar_without_putting_broker_credentials_in_gue
     assert sidecar_run[-4:] == [
         "--entrypoint",
         "/run/cayu/connect-broker",
-        "alpine/socat",
+        DEFAULT_SIDECAR_IMAGE,
         "listen",
     ]
     assert any(value.startswith("CAYU_BROKER_PORT=") for value in sidecar_run)
@@ -504,6 +506,10 @@ def test_prepare_authenticates_sidecar_without_putting_broker_credentials_in_gue
             part.removeprefix("src=") for part in mount.split(",") if part.startswith("src=")
         )
         assert Path(source).exists() is False
+
+
+def test_default_sidecar_image_is_pinned_by_digest() -> None:
+    assert re.fullmatch(r"alpine/socat:[0-9.]+@sha256:[0-9a-f]{64}", DEFAULT_SIDECAR_IMAGE)
 
 
 def test_transport_authorization_repr_omits_the_raw_token() -> None:

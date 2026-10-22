@@ -234,7 +234,7 @@ def test_hardened_cutover_fence_runs_as_the_restricted_user(
 def test_executable_tmpfs_mounts_say_exec_because_docker_defaults_to_noexec() -> None:
     restrictions = DockerWorkloadRestrictions(
         tmpfs=(
-            DockerTmpfsMount(target="/data", size_bytes=1024 * 1024),
+            DockerTmpfsMount(target="/data", size_bytes=1024 * 1024, noexec=True),
             DockerTmpfsMount(target="/tmp", size_bytes=1024 * 1024, mode=0o1777, noexec=False),
         )
     )
@@ -249,6 +249,41 @@ def test_executable_tmpfs_mounts_say_exec_because_docker_defaults_to_noexec() ->
     assert "noexec" not in options["/tmp"]
     assert "noexec" in options["/data"]
     assert "exec" not in options["/data"]
+
+
+def test_custom_tmpfs_mounts_are_executable_like_the_defaults() -> None:
+    # A mount added only to change a size must still run a virtualenv's scripts.
+    mount = DockerTmpfsMount(target="/workspace", size_bytes=1024 * 1024 * 1024, mode=0o750)
+    restrictions = DockerWorkloadRestrictions(
+        tmpfs=(DockerTmpfsMount(target="/tmp", size_bytes=1024 * 1024, mode=0o1777), mount)
+    )
+
+    assert mount.noexec is False
+    assert all(not default.noexec for default in DockerWorkloadRestrictions().tmpfs)
+    args = restrictions.run_args()
+    workspace = next(
+        args[index + 1]
+        for index, value in enumerate(args)
+        if value == "--tmpfs" and args[index + 1].startswith("/workspace:")
+    )
+    assert workspace.split(":", 1)[1].split(",")[-1] == "exec"
+
+
+def test_tmpfs_mounts_are_sorted_by_target() -> None:
+    tmp = DockerTmpfsMount(target="/tmp", size_bytes=1024 * 1024, mode=0o1777)
+    workspace = DockerTmpfsMount(target="/workspace", size_bytes=1024 * 1024)
+    cache = DockerTmpfsMount(target="/cache", size_bytes=1024 * 1024)
+
+    restrictions = DockerWorkloadRestrictions(tmpfs=[workspace, tmp, cache])
+
+    assert restrictions.tmpfs == (cache, tmp, workspace)
+    assert restrictions == DockerWorkloadRestrictions(tmpfs=(cache, tmp, workspace))
+    assert (
+        restrictions.fingerprint
+        == DockerWorkloadRestrictions(tmpfs=(tmp, cache, workspace)).fingerprint
+    )
+    with pytest.raises(ValueError, match="targets must be unique"):
+        DockerWorkloadRestrictions(tmpfs=(workspace, tmp, workspace))
 
 
 def test_containers_created_before_explicit_exec_still_verify(

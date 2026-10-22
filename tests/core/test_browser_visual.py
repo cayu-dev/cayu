@@ -437,6 +437,7 @@ def test_mutated_visual_policy_is_rejected_without_diagnostic_side_channels(
     capfd: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import gc
     import warnings
 
     canary = "visual-policy-private-canary"
@@ -456,6 +457,8 @@ def test_mutated_visual_policy_is_rejected_without_diagnostic_side_channels(
         raise AssertionError("Invalid pixel authority must fail before backend preflight.")
 
     monkeypatch.setattr(tool._backend, "preflight", no_dispatch)
+    # Flush unrelated resource finalizers before capturing this operation's warnings.
+    gc.collect()
     with warnings.catch_warnings(record=True) as emitted:
         warnings.simplefilter("always")
         result = asyncio.run(

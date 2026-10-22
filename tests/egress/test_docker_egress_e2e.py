@@ -153,6 +153,7 @@ def test_sidecar_probe_requires_a_real_authenticated_broker_route(network, authe
     from cayu.egress.docker_adapter import (
         _SIDECAR_AUTH_PATH,
         _SIDECAR_CONNECTOR_PATH,
+        DEFAULT_SIDECAR_IMAGE,
         _create_sidecar_transport_authorization,
         _default_docker_exec,
     )
@@ -193,7 +194,7 @@ def test_sidecar_probe_requires_a_real_authenticated_broker_route(network, authe
                     f"CAYU_BROKER_PORT={port}",
                     "--entrypoint",
                     "sleep",
-                    "alpine/socat",
+                    DEFAULT_SIDECAR_IMAGE,
                     "60",
                 ]
             )

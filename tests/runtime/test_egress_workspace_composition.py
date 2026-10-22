@@ -330,7 +330,10 @@ def test_factory_composes_provider_workspace_without_unwrapping(
         assert isinstance(capability, capability_type)
         assert not hasattr(capability, "close")
         assert not hasattr(capability, "filesystem")
-        assert not hasattr(managed, private_identity_attribute)
+        if private_identity_attribute == "name":
+            assert managed.name == inner.name
+        else:
+            assert not hasattr(managed, private_identity_attribute)
 
         with pytest.raises(ValueError, match="escapes the workspace root"):
             await workspace.read_bytes("../escape.txt")

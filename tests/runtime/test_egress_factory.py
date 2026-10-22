@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import warnings
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -2220,6 +2221,133 @@ def test_virtual_egress_redacted_exec_includes_generated_workload_credentials(
     assert result.stdout.strip() == REDACTED_SECRET
     assert virtual_value not in result.stdout
     assert result.stdout_bytes == len(f"{virtual_value}\n".encode())
+
+
+class _StreamingVirtualRunner(LocalRunner):
+    """Local runner that, like DockerRunner, has binary streams and a name."""
+
+    isolation = "lambda-microvm"
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root, credential_mode=CredentialMode.VIRTUAL_EGRESS)
+        self.name = "cayu-egress-sandbox-test"
+
+
+def test_virtual_egress_runner_forwards_binary_streams_and_name(tmp_path: Path) -> None:
+    guest_root = tmp_path / "virtual-egress-streams"
+    guest_root.mkdir()
+
+    async def runner_factory(request: Any) -> Runner:
+        return _StreamingVirtualRunner(guest_root)
+
+    adapter = _LifecycleRecordingAdapter(runner_factory=runner_factory)
+
+    async def run() -> tuple[ExecResult, ExecResult, bytes, bytes]:
+        created = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_virtual_streams",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = created.environment.runner
+        assert runner is not None
+        assert runner.name == "cayu-egress-sandbox-test"
+        capability = runner.binary_stream_capability()
+        assert capability is not None
+        written = io.BytesIO()
+        echoed = io.BytesIO()
+        try:
+            direct = await runner.exec_stream(
+                ExecCommand.process("cat"),
+                stdin=io.BytesIO(b"\x00binary\xff"),
+                stdout=written,
+            )
+            delegated = await capability.exec_stream(
+                ExecCommand.process("cat"),
+                stdin=io.BytesIO(b"through the capability"),
+                stdout=echoed,
+                stdout_limit_bytes=7,
+            )
+        finally:
+            await runner.close()
+        with pytest.raises(RuntimeError):
+            await runner.exec_stream(ExecCommand.process("cat"), stdin=io.BytesIO(b""))
+        return direct, delegated, written.getvalue(), echoed.getvalue()
+
+    direct, delegated, written, echoed = asyncio.run(run())
+
+    assert direct.exit_code == 0 and written == b"\x00binary\xff"
+    assert delegated.stdout_truncated and echoed == b"through"
+
+
+@pytest.mark.parametrize(
+    "stream_kwargs",
+    [
+        {},
+        {"stdin": io.BytesIO(), "stdout_limit_bytes": 5},
+        {"stdout": io.BytesIO(), "stdout_limit_bytes": -1},
+        {"stdout": io.BytesIO(), "stdout_limit_bytes": True},
+        {"stdin": b"raw"},
+        {"stdout": b"raw"},
+        {"stdin": object()},
+        {"stdout": object()},
+    ],
+)
+def test_virtual_egress_stream_rejection_does_not_open_dispatch(tmp_path, stream_kwargs):
+    async def runner_factory(request):
+        return _StreamingVirtualRunner(tmp_path)
+
+    async def run():
+        created = await _virtual_factory(
+            adapter=_LifecycleRecordingAdapter(runner_factory=runner_factory)
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_bad_stream", agent_name="agent", environment_name="egress-env"
+            )
+        )
+        runner = created.environment.runner
+        try:
+            with pytest.raises((ValueError, TypeError)):
+                await runner.exec_stream(ExecCommand.process("cat"), **stream_kwargs)
+            assert not runner._uncertain_workspace_dispatches
+            assert not runner._active_workspace_dispatches
+            result = await runner.exec_stream(ExecCommand.process("cat"), stdin=io.BytesIO(b"ok"))
+            assert result.stdout == "ok"
+        finally:
+            await runner.close()
+
+    asyncio.run(run())
+
+
+def test_virtual_egress_runner_without_streams_or_name_says_so() -> None:
+    adapter = _LifecycleRecordingAdapter(
+        runner_factory=lambda request: _async_value(_ExecutingVirtualRunner(Path("/"), {}))
+    )
+
+    async def run() -> None:
+        created = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_virtual_no_streams",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = created.environment.runner
+        assert runner is not None
+        try:
+            assert not hasattr(runner, "name")
+            assert runner.binary_stream_capability() is None
+            with pytest.raises(RuntimeError, match="does not support binary streams"):
+                await runner.exec_stream(ExecCommand.process("cat"), stdin=io.BytesIO(b""))
+        finally:
+            await runner.close()
+
+    asyncio.run(run())
+
+
+async def _async_value(value: Any) -> Any:
+    return value
 
 
 def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:

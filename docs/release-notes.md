@@ -68,6 +68,19 @@ unchanged.
   cutover, and refuses the runner if the host may be reachable. The check needs
   a Docker engine that honors that option; Docker Engine on Linux and Docker
   Desktop do. Allowlisted hosts still work through the broker.
+- Smoother hardened Docker egress. A `DockerTmpfsMount` is now executable
+  unless it sets `noexec=True`, like the default `/tmp` and `/workspace`
+  mounts, so a virtual environment on a resized mount runs instead of failing
+  with "Permission denied". A mount that relied on the old default needs
+  `noexec=True` to stay non-executable. `DockerWorkloadRestrictions` sorts its tmpfs mounts
+  by target instead of rejecting another order. The runner from
+  `VirtualEgressEnvironmentFactory` now has `exec_stream`, reports binary
+  streams through `binary_stream_capability()` when its backend supports them,
+  and forwards the backend's `name`. `DockerEgressAdapter` pins its default
+  socat sidecar by digest (`DEFAULT_SIDECAR_IMAGE` in
+  `cayu.egress.docker_adapter`). The untrusted-code guide explains how to supply
+  that image offline and why `memory_bytes` must stay below the memory the
+  Docker engine has.
 - `OpenAIProvider` accepts a `base_url` that ends in `/v1`, the form the
   OpenAI SDK's `OPENAI_BASE_URL` uses. It used to add its own `/v1` on top and
   send requests to `.../v1/v1/responses`; now `https://host` and
