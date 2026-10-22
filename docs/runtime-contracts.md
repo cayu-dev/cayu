@@ -17641,6 +17641,33 @@ within that pinned shard. A full agent can therefore be hundreds of gigabytes
 while its root and index remain small. Platforms without those descriptor
 guards fail closed. Object and total-transfer bounds still apply.
 
+On supported filesystems, successful `put()` and `put_file()` acknowledge the
+verified regular object only after flushing that file and its shard, `objects`
+directory, and store root. The named file and each directory must still refer
+to the pinned inode after those barriers. An exact retry verifies and flushes
+the retained object and directory chain again; visible bytes alone do not
+establish that an earlier publication finished. Failed barriers refuse success
+without replacing an otherwise valid retained object.
+
+Construction prepares missing store directories beneath the first existing,
+externally provisioned durable ancestor. Each newly published directory carries
+private pending metadata and a permanent cooperative lock; replacement processes
+finish a marked publication before admitting writes. Metadata is excluded from
+object inventories. Existing unmarked directories remain an explicit durable
+provisioning prerequisite: construction does not repair unrelated ancestors or
+infer their durability. Preprovisioned path aliases and the advertised `root`
+remain unchanged. Corrupt or substituted pending metadata refuses recovery.
+Pending markers bind the parent and child inode numbers and normalized name;
+they do not persist mount-local device numbers that can change after a reboot.
+Recovery still checks the current parent/child filesystem relationship and live
+named `(device, inode)` identities. This assumes the same retained filesystem
+beneath the configured provisioned ancestor; it does not authenticate an
+arbitrarily copied or relocated tree on another filesystem.
+These barriers cover the filesystem CAS, not initialization of external storage,
+bundle export destinations, `copy_to()` destinations, or component materialization
+directories. They do not establish a recoverable snapshot when required objects
+or a higher-level root reference are missing.
+
 `AgentBundleCoordinator.export()` installs an `exporting` root protection,
 enumerates the authorized snapshot closure, verifies every portable component
 and blob, writes an ordinary filesystem directory through a private staging

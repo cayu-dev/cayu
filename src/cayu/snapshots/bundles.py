@@ -19,6 +19,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager, suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -44,6 +45,18 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     require_durable_clean_nonblank,
+)
+from cayu.snapshots._filesystem_publication import (
+    identity as _directory_identity,
+)
+from cayu.snapshots._filesystem_publication import (
+    prepare_child as _prepare_cas_child,
+)
+from cayu.snapshots._filesystem_publication import (
+    prepare_directory as _prepare_cas_directory,
+)
+from cayu.snapshots._filesystem_publication import (
+    require_named_directory as _require_named_cas_directory,
 )
 from cayu.snapshots.base import (
     AGENT_SNAPSHOT_MAX_BYTES,
@@ -266,25 +279,132 @@ _CAS_PATH_ERROR_NUMBERS = frozenset(
 )
 
 
+def _cas_descriptor_guards_available() -> bool:
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+
+
 def _require_cas_descriptor_guards() -> None:
-    if (
-        not hasattr(os, "O_DIRECTORY")
-        or not hasattr(os, "O_NOFOLLOW")
-        or os.open not in os.supports_dir_fd
-        or os.mkdir not in os.supports_dir_fd
-        or os.rename not in os.supports_dir_fd
-        or os.stat not in os.supports_dir_fd
-        or os.unlink not in os.supports_dir_fd
-    ):
+    if not _cas_descriptor_guards_available():
         raise AgentBundleError("object_store_descriptor_guard_unavailable")
+
+
+@dataclass(frozen=True)
+class _CASPublication:
+    root: Path
+    root_fd: int
+    base_fd: int
+    shard_fd: int
+    prefix: str
+    name: str
+
+    def require_current(self) -> None:
+        if _directory_identity(self.root.stat()) != _directory_identity(os.fstat(self.root_fd)):
+            raise AgentBundleError("object_store_directory_changed")
+        _require_named_cas_directory(self.root_fd, AGENT_BUNDLE_OBJECT_DIRECTORY, self.base_fd)
+        _require_named_cas_directory(self.base_fd, self.prefix, self.shard_fd)
+
+    def sync(self) -> None:
+        self.require_current()
+        for descriptor in (self.shard_fd, self.base_fd, self.root_fd):
+            os.fsync(descriptor)
+            self.require_current()
+
+
+@contextmanager
+def _open_cas_publication(
+    root: Path,
+    digest: str,
+    root_identity: tuple[int, int] | None,
+    base_identity: tuple[int, int] | None,
+) -> Iterator[_CASPublication]:
+    _sha256_hex(digest, "digest")
+    _require_cas_descriptor_guards()
+    root_fd = os.open(root.resolve(), _CAS_DIRECTORY_FLAGS)
+    base_fd: int | None = None
+    shard_fd: int | None = None
+    try:
+        if _directory_identity(os.fstat(root_fd)) != root_identity:
+            raise AgentBundleError("object_store_directory_changed")
+        base_fd = os.open(AGENT_BUNDLE_OBJECT_DIRECTORY, _CAS_DIRECTORY_FLAGS, dir_fd=root_fd)
+        if _directory_identity(os.fstat(base_fd)) != base_identity:
+            raise AgentBundleError("object_store_directory_changed")
+        shard_fd = _prepare_cas_child(base_fd, digest[:2], mode=0o700)
+        publication = _CASPublication(root, root_fd, base_fd, shard_fd, digest[:2], digest[2:])
+        publication.require_current()
+        yield publication
+    except OSError as error:
+        if error.errno in _CAS_PATH_ERROR_NUMBERS:
+            raise AgentBundleError("object_path_not_regular") from error
+        raise
+    finally:
+        if shard_fd is not None:
+            os.close(shard_fd)
+        if base_fd is not None:
+            os.close(base_fd)
+        os.close(root_fd)
+
+
+def _confirm_object_publication(
+    publication: _CASPublication,
+    reference: AgentBundleObjectRef,
+    expected_content: bytes | None = None,
+) -> bool:
+    try:
+        descriptor = os.open(publication.name, _CAS_FILE_FLAGS, dir_fd=publication.shard_fd)
+    except FileNotFoundError:
+        return False
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise AgentBundleError("object_path_not_regular")
+        if before.st_size != reference.byte_count:
+            raise AgentBundleError("object_collision")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            hasher = sha256()
+            byte_count = 0
+            while chunk := stream.read(min(1024 * 1024, reference.byte_count - byte_count + 1)):
+                if (
+                    expected_content is not None
+                    and chunk != expected_content[byte_count : byte_count + len(chunk)]
+                ):
+                    raise AgentBundleError("object_collision")
+                byte_count += len(chunk)
+                if byte_count > reference.byte_count:
+                    raise AgentBundleError("object_collision")
+                hasher.update(chunk)
+            if byte_count != reference.byte_count or hasher.hexdigest() != reference.digest:
+                raise AgentBundleError("object_collision")
+            os.fsync(stream.fileno())
+            publication.sync()
+            named = os.stat(publication.name, dir_fd=publication.shard_fd, follow_symlinks=False)
+            if not stat.S_ISREG(named.st_mode) or _directory_identity(named) != _directory_identity(
+                before
+            ):
+                raise AgentBundleError("object_changed_during_publication")
+            after = os.fstat(stream.fileno())
+            if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ):
+                raise AgentBundleError("object_changed_during_publication")
+    finally:
+        os.close(descriptor)
+    return True
 
 
 @contextmanager
 def _open_object_shard(
     root: Path,
     digest: str,
-    *,
-    create: bool,
 ) -> Iterator[tuple[int, str] | None]:
     """Pin a CAS shard directory without following a substituted symlink."""
 
@@ -302,17 +422,8 @@ def _open_object_shard(
         try:
             shard_fd = os.open(digest[:2], _CAS_DIRECTORY_FLAGS, dir_fd=base_fd)
         except FileNotFoundError:
-            if not create:
-                yield None
-                return
-            with suppress(FileExistsError):
-                os.mkdir(digest[:2], mode=0o700, dir_fd=base_fd)
-            try:
-                shard_fd = os.open(digest[:2], _CAS_DIRECTORY_FLAGS, dir_fd=base_fd)
-            except OSError as error:
-                if error.errno in _CAS_PATH_ERROR_NUMBERS:
-                    raise AgentBundleError("object_path_not_regular") from error
-                raise
+            yield None
+            return
         except OSError as error:
             if error.errno in _CAS_PATH_ERROR_NUMBERS:
                 raise AgentBundleError("object_path_not_regular") from error
@@ -329,7 +440,7 @@ def _open_regular_object(
     root: Path,
     digest: str,
 ) -> Iterator[tuple[BinaryIO, int] | None]:
-    with _open_object_shard(root, digest, create=False) as opened:
+    with _open_object_shard(root, digest) as opened:
         if opened is None:
             yield None
             return
@@ -1040,7 +1151,17 @@ class FileSystemAgentSnapshotObjectStore(AgentSnapshotObjectStore):
             raise ValueError("Agent snapshot object-store root must be absolute.")
         self.root = path
         self._lock = threading.RLock()
-        (self.root / AGENT_BUNDLE_OBJECT_DIRECTORY).mkdir(parents=True, exist_ok=True)
+        self._root_identity: tuple[int, int] | None = None
+        self._base_identity: tuple[int, int] | None = None
+        if _cas_descriptor_guards_available():
+            self._root_identity = _prepare_cas_directory(self.root)
+            self._base_identity = _prepare_cas_directory(self.root / AGENT_BUNDLE_OBJECT_DIRECTORY)
+            if _directory_identity(self.root.stat()) != self._root_identity:
+                raise AgentBundleError("object_store_directory_changed")
+        else:
+            # Preserve construction compatibility; operations retain the existing
+            # explicit refusal when descriptor-relative guards are unavailable.
+            (self.root / AGENT_BUNDLE_OBJECT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
     async def put(self, reference: AgentBundleObjectRef, content: bytes) -> None:
         if type(reference) is not AgentBundleObjectRef:
@@ -1060,21 +1181,12 @@ class FileSystemAgentSnapshotObjectStore(AgentSnapshotObjectStore):
                 validated.digest,
                 lock_directory_name="cayu-agent-snapshot-object-locks",
             ),
-            _open_object_shard(self.root, validated.digest, create=True) as opened,
+            _open_cas_publication(
+                self.root, validated.digest, self._root_identity, self._base_identity
+            ) as publication,
         ):
-            assert opened is not None
-            shard_fd, name = opened
-            try:
-                existing, _ = _read_regular_at(
-                    shard_fd,
-                    name,
-                    max_bytes=validated.byte_count,
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                if existing != content:
-                    raise AgentBundleError("object_collision")
+            shard_fd, name = publication.shard_fd, publication.name
+            if _confirm_object_publication(publication, validated, content):
                 return
             temporary = f".{name}.{os.getpid()}.tmp"
             try:
@@ -1108,6 +1220,8 @@ class FileSystemAgentSnapshotObjectStore(AgentSnapshotObjectStore):
                     src_dir_fd=shard_fd,
                     dst_dir_fd=shard_fd,
                 )
+                if not _confirm_object_publication(publication, validated, content):
+                    raise AgentBundleError("object_publication_missing")
             except BaseException:
                 with suppress(FileNotFoundError):
                     os.unlink(temporary, dir_fd=shard_fd)
@@ -1196,21 +1310,12 @@ class FileSystemAgentSnapshotObjectStore(AgentSnapshotObjectStore):
                 reference.digest,
                 lock_directory_name="cayu-agent-snapshot-object-locks",
             ),
-            _open_object_shard(self.root, reference.digest, create=True) as opened,
+            _open_cas_publication(
+                self.root, reference.digest, self._root_identity, self._base_identity
+            ) as publication,
         ):
-            assert opened is not None
-            shard_fd, name = opened
-            try:
-                existing, _ = _read_regular_at(
-                    shard_fd,
-                    name,
-                    max_bytes=reference.byte_count,
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                if len(existing) != reference.byte_count or _digest(existing) != reference.digest:
-                    raise AgentBundleError("object_collision")
+            shard_fd, name = publication.shard_fd, publication.name
+            if _confirm_object_publication(publication, reference):
                 return
             temporary = f".{name}.{os.getpid()}.tmp"
             try:
@@ -1252,6 +1357,8 @@ class FileSystemAgentSnapshotObjectStore(AgentSnapshotObjectStore):
                     src_dir_fd=shard_fd,
                     dst_dir_fd=shard_fd,
                 )
+                if not _confirm_object_publication(publication, reference):
+                    raise AgentBundleError("object_publication_missing")
             except BaseException:
                 with suppress(FileNotFoundError):
                     os.unlink(temporary, dir_fd=shard_fd)
@@ -1336,7 +1443,7 @@ class FileSystemAgentSnapshotObjectStore(AgentSnapshotObjectStore):
         return contains
 
     def _has_sync(self, digest: str) -> bool:
-        with _open_object_shard(self.root, digest, create=False) as opened:
+        with _open_object_shard(self.root, digest) as opened:
             if opened is None:
                 return False
             shard_fd, name = opened
