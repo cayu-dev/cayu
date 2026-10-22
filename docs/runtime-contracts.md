@@ -18817,6 +18817,18 @@ retained records follow their retention policy and are never reported as erased.
 Session-scoped artifacts are matched by
 both scope and exact session ID. Budget records currently support retention
 only; no destructive or pseudonymizing budget disposition is available.
+`CayuApp.delete_session()` composes validation, parked-egress discard and
+erasure, and is what `DELETE /api/sessions/{id}` calls. By default it refuses
+any session that is not `completed` or `failed`; `finished_only=False` admits
+every status the closure itself admits. SQLite and Postgres keep every closure
+receipt, so an erased session id stays retired and an exact erase replays its
+report. `InMemorySessionStore` drops the closure's progress record and the
+session's public aliases with the session, and keeps only the newest
+`closure_receipt_limit` receipts (10,000 by default). Eviction frees only the
+standalone session-store identity reservation and drops erase replay evidence.
+Dependent-store deletion fences remain authoritative: application run and fork
+admission reject IDs with retained task-deletion claims before creating a session.
+Use fresh session IDs across composed stores.
 For a limited artifact listing, Local and S3 retain at most `limit` matching
 metadata records while scanning; they do not collect all matching metadata and
 then truncate it. Local directory names and S3 object pages are consumed

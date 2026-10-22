@@ -49,6 +49,14 @@ stores carry shared state across processes. In-memory stores and Python object
 identity do not. Registration and live resource ownership remain local to the
 process that constructed the app.
 
+One app can serve many requests. Sessions stay in the session store until
+something deletes them, so a long-running app calls
+`await app.delete_session(session_id)` once a session has completed or failed.
+It runs the same closure as `DELETE /api/sessions/{id}` and raises `ValueError`
+for a session that can still run or resume. With `InMemorySessionStore` this
+keeps memory bounded. See
+[Dropping finished sessions from a shared app](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md#dropping-finished-sessions-from-a-shared-app).
+
 ## Resume versus anatomical succession
 
 Reconstructing an app and calling `resume(...)` keeps the same durable session.

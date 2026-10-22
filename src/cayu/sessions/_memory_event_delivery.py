@@ -6,7 +6,7 @@ import math
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.sessions import _closure_records as closure_records
@@ -35,7 +35,7 @@ class MemoryEventDeliveryState(NamedTuple):
 
     persisted_event_side_effect_deliveries: dict[tuple[str, str], PersistedEventSideEffectDelivery]
     event_records_by_id: dict[tuple[str, str], EventRecord]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     ownership_clock: Callable[[], datetime]
 
 
@@ -85,15 +85,10 @@ async def _claim_persisted_event_side_effect(
             state.persisted_event_side_effect_deliveries.values(),
             key=lambda delivery: delivery.event_sequence,
         )
-        closure_targets = {
-            target
-            for owner in state.session_closure_progress.values()
-            for target in closure_records._closure_progress_targets(owner)
-        }
         for delivery in deliveries:
             if expected is not None and delivery != expected:
                 continue
-            if delivery.session_id in closure_targets:
+            if state.session_closure_progress.owns(delivery.session_id):
                 continue
             if session_id is not None and (
                 delivery.session_id != session_id or delivery.event_id != event_id

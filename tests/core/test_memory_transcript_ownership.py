@@ -16,6 +16,7 @@ from tests._session_provenance import fixture_session_invocation
 import cayu
 from cayu.messages import Message, MessageRole, ToolCallPart
 from cayu.sessions import _memory_transcripts as transcripts
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions.records import Session
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.sessions.transcript_queries import TranscriptQuery, TranscriptSearchQuery
@@ -231,7 +232,7 @@ def _write_state(state, lock, calls):
         sessions=state.sessions,
         deferred_interaction_inputs=state.deferred_interaction_inputs,
         checkpoints=checkpoints,
-        session_closure_progress={},
+        session_closure_progress=ClosureProgressIndex(),
         participant_session_receipts={},
         ownership_clock=lambda: now,
         register_private_alias=alias,

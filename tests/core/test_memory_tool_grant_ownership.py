@@ -21,6 +21,7 @@ import cayu
 from cayu.events import Event, EventType
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _memory_tool_grants as grants
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
 from cayu.sessions.records import EventRecord, Session, SessionIdentity, SessionStatus
@@ -196,7 +197,7 @@ class _Composition:
             interaction_event_records={self.session.id: {"interaction": [event_record]}},
             latest_interaction_event_records_by_sequence={self.session.id: [event_record]},
             public_authority_aliases={},
-            session_closure_progress={},
+            session_closure_progress=ClosureProgressIndex(),
             sessions={self.session.id: self.session},
             targeted_tool_grant_ids_by_interaction={},
             targeted_tool_grant_ids_by_request={},

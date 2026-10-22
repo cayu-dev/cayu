@@ -22,6 +22,7 @@ from cayu.memory.evidence import (
     RecallEvidenceQuery,
 )
 from cayu.sessions import _memory_evidence as evidence
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions.records import Session
 
 
@@ -45,7 +46,7 @@ def _recall_state():
         recall_receipt_page_keys_by_session={},
         recall_receipt_page_keys_by_step={},
         recall_receipts={},
-        session_closure_progress={},
+        session_closure_progress=ClosureProgressIndex(),
         sessions={session.id: session},
     )
 
@@ -222,7 +223,7 @@ def _exposure_state(receipt):
         context_exposures={},
         recall_item_exposures={},
         recall_receipts={receipt.receipt_id: receipt},
-        session_closure_progress={},
+        session_closure_progress=ClosureProgressIndex(),
         sessions=recalls.sessions,
     )
 

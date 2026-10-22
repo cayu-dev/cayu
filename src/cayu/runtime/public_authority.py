@@ -29,6 +29,10 @@ _KEY_FINGERPRINT_CONTEXT = b"cayu.public-authority-alias.key-fingerprint.v1"
 _EVIDENCE_DIGEST_CONTEXT = b"cayu:public-evidence-digest:v1\x00"
 
 
+class PublicSessionAliasNotFound(ValueError):
+    """A well-formed session alias has no registered store authority."""
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedPublicAuthorityAlias:
     """Canonical, non-secret fields parsed from a public authority alias."""

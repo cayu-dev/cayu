@@ -6,7 +6,7 @@ import heapq
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
-from typing import Any, Generic, NamedTuple, TypeVar
+from typing import Generic, NamedTuple, TypeVar
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event, EventType, copy_event
@@ -68,7 +68,7 @@ class MemoryToolGrantState(NamedTuple, Generic[PreparedAppend]):
     interaction_event_records: dict[str, dict[str, list[EventRecord]]]
     latest_interaction_event_records_by_sequence: dict[str, list[EventRecord]]
     public_authority_aliases: dict[tuple[str, str, str], str]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     sessions: dict[str, Session]
     targeted_tool_grant_ids_by_interaction: dict[tuple[str, str], list[str]]
     targeted_tool_grant_ids_by_request: dict[tuple[str, str, str], str]
@@ -742,7 +742,7 @@ async def revoke_targeted_tool_grant(
                 event_record.event,
             )
             return copy_targeted_tool_grant_record(record)
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
         uses = state.targeted_tool_uses.get(record.grant_id, {})
         if any(binding.bound_at > revoked_at for binding in uses.values()):

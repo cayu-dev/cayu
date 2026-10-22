@@ -8,9 +8,39 @@ from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
 )
 from cayu.tasks.contracts import TaskCompletionDecisionRequired
-from cayu.tasks.records import Task, copy_task
+from cayu.tasks.records import Task, copy_task, copy_task_session_closure_claim
 from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
+
+
+async def require_unretired_task_session_identity(
+    session_id: str, *, task_store: TaskStore | None, redactor: SecretRedactor
+) -> None:
+    """Refuse a new session while its dependent task namespace remains retired."""
+    if task_store is None or not task_store.supports_session_closure_claims:
+        return
+    outcome = await capture_task_store_operation(
+        lambda: task_store.load_session_closure_claim(session_id),
+        operation_name="Session identity task-closure lookup",
+        redactor=redactor,
+    )
+    if outcome.failure is not None:
+        raise_task_store_operation_failure(outcome.failure)
+    if outcome.result is None:
+        return
+    validation = capture_sensitive_validation(
+        lambda claim=outcome.result: copy_task_session_closure_claim(claim),
+        operation_name="Session identity task-closure validation",
+        redactor=redactor,
+    )
+    del outcome
+    if validation.failure is not None:
+        raise_task_store_operation_failure(validation.failure)
+    claim = validation.result
+    if claim is None or claim.session_id != session_id:
+        raise RuntimeError("Task store returned conflicting session closure authority.")
+    if claim.purpose == "deletion":
+        raise ValueError("Session identity remains retired by task closure.")
 
 
 async def verifier_aware_task_execution_outcome(

@@ -48,7 +48,7 @@ class MemoryContextViewSourceState(NamedTuple):
     pending_session_messages: dict[
         tuple[str, SessionMessageDeliveryMode], deque[SessionQueuedMessage]
     ]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     session_event_records: dict[str, list[EventRecord]]
     session_operation_records: dict[str, dict[str, dict[str, Any]]]
     sessions: dict[str, Session]
@@ -173,10 +173,7 @@ async def capture_completed_turn_snapshot(
                 (session_id, mode) in state.pending_session_messages
                 for mode in SessionMessageDeliveryMode
             ),
-            has_closure_owner=any(
-                session_id in closure_records._closure_progress_targets(owner)
-                for owner in state.session_closure_progress.values()
-            ),
+            has_closure_owner=state.session_closure_progress.owns(session_id),
             has_active_model_stage=MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
             in state.session_operation_records.get(session_id, {}),
             current_transcript_cursor=len(messages),

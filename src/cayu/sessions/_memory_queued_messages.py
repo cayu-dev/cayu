@@ -146,7 +146,7 @@ class MemoryQueuedMessageState(NamedTuple):
     ]
     queued_session_messages_by_idempotency: dict[str, dict[str, SessionQueuedMessage]]
     reject_new_work_after_steering: RejectNewWorkAfterSteering
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     session_message_acceptance_event_ids: dict[tuple[str, str], set[str]]
     session_message_delivery_records: dict[str, MemoryMessageDeliveryRecord]
     session_message_terminal_receipts: dict[tuple[str, str], dict[str, Any]]
@@ -339,7 +339,7 @@ async def apply_session_message_action(
                 event=replay,
                 replayed=True,
             )
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session.id,)):
             closure_records._check_closure_lineage_owner(owner, (session.id,))
         if (
             raw_revision(raw) != request.expected_revision
@@ -464,7 +464,7 @@ async def enqueue_session_message(
                 event=record.event,
                 replayed=True,
             )
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((request.session_id,)):
             closure_records._check_closure_lineage_owner(owner, (request.session_id,))
         from cayu.runtime._session_message_queue import require_open_admission
 

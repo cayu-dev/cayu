@@ -25,6 +25,7 @@ from cayu._application_agent_registry import ApplicationAgentRegistry
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
+from cayu._application_session_deletion import delete_app_session, export_app_session_closure
 from cayu._event_schema import private_event_linkage_value
 from cayu._task_wait import collect_failures, combine_drain_results, wait_until_idle
 from cayu._validation import (
@@ -451,7 +452,6 @@ from cayu.runtime._run_limits import (
 from cayu.runtime._session_abandonment import SessionAbandonment
 from cayu.runtime._session_checkpoint_admission import _reject_unresumable_session_checkpoint
 from cayu.runtime._session_closure_projection import (
-    project_closure_export,
     project_closure_manifest,
     project_closure_report,
 )
@@ -547,13 +547,13 @@ from cayu.runtime.provider_operations import (
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
+    PublicSessionAliasNotFound,
     parse_public_authority_alias,
     public_authority_alias_is_reserved,
 )
 from cayu.runtime.session_closure import (
     BudgetSessionClosureStore,
     SessionClosureExport,
-    SessionClosureExportIncomplete,
     SessionClosurePolicy,
     SessionClosureReport,
     SessionClosureStore,
@@ -4626,6 +4626,21 @@ class CayuApp:
         )
 
     @_tracked_entrance
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        finished_only: bool = True,
+    ) -> SessionClosureReport | None:
+        """Delete a session through dependent-first closure.
+
+        By default only completed or failed sessions qualify. Running sessions or
+        incomplete cleanup raise ValueError. Missing sessions return None.
+        """
+
+        return await delete_app_session(self, session_id, finished_only=finished_only)
+
+    @_tracked_entrance
     async def validate_session_closure(
         self,
         session_id: str,
@@ -4652,22 +4667,8 @@ class CayuApp:
     ) -> SessionClosureExport:
         """Export bounded closure records, requiring opt-in for incomplete diagnostics."""
 
-        try:
-            export = await self._environment_registry.session_closure.export(
-                session_id, policy=policy, allow_partial=allow_partial
-            )
-        except SessionClosureExportIncomplete as exc:
-            raise SessionClosureExportIncomplete(
-                project_closure_manifest(
-                    exc.manifest,
-                    redactor=self._secret_redactor,
-                    project_session_id=self.project_session_id_for_exposure,
-                )
-            ) from None
-        return project_closure_export(
-            export,
-            redactor=self._secret_redactor,
-            project_session_id=self.project_session_id_for_exposure,
+        return await export_app_session_closure(
+            self, session_id, policy=policy, allow_partial=allow_partial
         )
 
     def stream_redacted_bytes(
@@ -5115,7 +5116,7 @@ class CayuApp:
         if private_value is None:
             if raw_session is not None:
                 return value, value
-            raise ValueError("Public session_id alias was not found.")
+            raise PublicSessionAliasNotFound("Public session_id alias was not found.")
         if raw_session is not None and private_value != value:
             raise ValueError(
                 "session_id is ambiguous between legacy private authority and a public event alias."

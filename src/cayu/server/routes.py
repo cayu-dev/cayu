@@ -152,6 +152,7 @@ from cayu.runtime.provider_operations import (
     copy_provider_operation_resolution_metadata,
     inspect_provider_operation,
 )
+from cayu.runtime.public_authority import PublicSessionAliasNotFound
 from cayu.runtime.request_costs import (
     DEFAULT_REQUEST_COST_WINDOW_SECONDS,
     MAX_REQUEST_COST_WINDOW_SECONDS,
@@ -8545,7 +8546,12 @@ def create_router(
         dependencies=protected,
     )
     async def get_session(session_id: NonBlankString):
-        session_id = await _resolve_public_session_id(session_id)
+        try:
+            session_id = await cayu_app._resolve_public_session_id(session_id)
+        except PublicSessionAliasNotFound:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -8553,24 +8559,15 @@ def create_router(
 
     @router.delete("/sessions/{session_id}", status_code=204, dependencies=protected)
     async def delete_session(session_id: NonBlankString):
-        session_id = await _resolve_public_session_id(session_id)
         try:
-            if await session_store.load(session_id) is None:
-                return None
-            inspection = await cayu_app.validate_session_closure(session_id)
-            if not inspection.complete:
-                raise ValueError(
-                    "Session closure inventory is incomplete; no destructive work was started."
-                )
-            if not await cayu_app.discard_parked_egress_allocations(session_id):
-                raise ValueError(
-                    "Session has a parked egress allocation whose cleanup remains in flight."
-                )
-            closure = await cayu_app.erase_session_closure(session_id)
-            if not closure.complete:
-                raise ValueError(
-                    closure.error or "Session closure is incomplete; no deletion was acknowledged."
-                )
+            session_id = await cayu_app._resolve_public_session_id(session_id)
+        except PublicSessionAliasNotFound:
+            return None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            # The HTTP API deletes any session the closure admits, not only finished ones.
+            await cayu_app.delete_session(session_id, finished_only=False)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None

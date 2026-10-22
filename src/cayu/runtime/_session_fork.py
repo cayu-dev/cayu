@@ -112,7 +112,10 @@ from cayu.runtime._session_tool_discovery import (
     _require_tool_discovery_view,
     _tool_discovery_operation_initializer,
 )
-from cayu.runtime._task_execution_admission import require_ordinary_session_execution
+from cayu.runtime._task_execution_admission import (
+    require_ordinary_session_execution,
+    require_unretired_task_session_identity,
+)
 from cayu.runtime._tool_invocation.admission import ToolInvocationAdmission
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -968,6 +971,12 @@ class SessionFork:
             destination_session_id = runtime_generated_session_id
         if destination_session_id is not None:
             existing_descendant = await self.session_store.load(destination_session_id)
+            if existing_descendant is None:
+                await require_unretired_task_session_identity(
+                    destination_session_id,
+                    task_store=self._task_store,
+                    redactor=self._secret_redactor,
+                )
             if existing_descendant is not None and verified_controller is not None:
                 # Replay returns durable evidence, so it needs current enrollment
                 # for the child's own agent; the source may be gone by now.

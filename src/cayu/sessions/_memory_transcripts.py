@@ -536,7 +536,7 @@ class MemoryTranscriptWriteState(NamedTuple):
     sessions: dict[str, Session]
     deferred_interaction_inputs: dict[str, DeferredInteractionInput]
     checkpoints: dict[str, dict[str, Any]]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     participant_session_receipts: dict[str, ParticipantSessionCreationReceipt]
     ownership_clock: Callable[[], datetime]
     register_private_alias: RegisterPrivateAlias
@@ -564,7 +564,7 @@ async def append_transcript_messages(
         invocation_scope._assert_session_run_epoch(session_id, session)
         if not copied_messages:
             return
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
         if interaction_id is not None:
             state.register_private_alias(
@@ -604,7 +604,7 @@ async def replace_initial_transcript_messages(
         deferred = state.deferred_interaction_inputs.get(session_id)
         if deferred is None or deferred.interaction_id != interaction_id:
             raise RuntimeError("Deferred interaction input changed before finalization.")
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
         require_deferred_initial_transcript_replacement(
             deferred,
@@ -687,7 +687,7 @@ async def materialize_deferred_interaction_input(
             return False
         if deferred.interaction_id != interaction_id:
             raise RuntimeError("Deferred interaction input belongs to another interaction.")
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
         messages = deferred.source_messages
         state.indexes.messages[session_id].extend(messages)
@@ -722,7 +722,7 @@ async def append_transcript_messages_and_transform_checkpoint(
         if session is None:
             raise KeyError(f"Session not found: {session_id}")
         invocation_scope._assert_session_run_epoch(session_id, session)
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
         current = state.checkpoints.get(session_id)
         transformed = checkpoint_transform(

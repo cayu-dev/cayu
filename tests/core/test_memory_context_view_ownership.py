@@ -19,6 +19,7 @@ from cayu.collaboration._contracts import ExactConflict, ExactMatch, ExactNotFou
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions import _memory_context_views as views
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions._context_selection_fence import (
     _CONTEXT_SELECTION_AUTHORITY,
     ContextViewSelectionExcluded,
@@ -147,7 +148,7 @@ class _SourceComposition:
             event_records_by_id={(session.id, event.id): record},
             participant_session_bindings={session.id: binding},
             pending_session_messages={},
-            session_closure_progress={},
+            session_closure_progress=ClosureProgressIndex(),
             session_event_records={session.id: [record]},
             session_operation_records={},
             sessions={session.id: session},

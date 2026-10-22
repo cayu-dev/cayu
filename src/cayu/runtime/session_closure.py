@@ -8,6 +8,7 @@ and application stores have independent ownership and retention rules.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,6 +64,7 @@ SESSION_CLOSURE_DEFAULT_MAX_RECORDS = 10_000
 SESSION_CLOSURE_DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 SESSION_CLOSURE_MAX_FIELD_CHARS = 4096
 SESSION_CLOSURE_DEFAULT_MAX_DESCENDANTS = 10_000
+_COMPLETED_PLAN_ID_LIMIT = 10_000
 
 
 class SessionClosureDisposition(StrEnum):
@@ -321,7 +323,9 @@ class SessionClosureStore(Protocol):
 class SessionClosureLineageStore(Protocol):
     """Atomic session-store operations required by descendant closure."""
 
-    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None: ...
+    async def claim_session_closure_progress(
+        self, progress: dict[str, Any], *, finished_only: bool = False
+    ) -> None: ...
 
     async def detach_session_children(
         self,
@@ -1028,7 +1032,8 @@ class SessionClosureCoordinator:
         )
         self._clock = clock
         self._secret_redactor = secret_redactor or SecretRedactor()
-        self._completed_plan_ids: set[str] = set()
+        # Process-local replay hint for stores without receipts; oldest evicted first.
+        self._completed_plan_ids: OrderedDict[str, None] = OrderedDict()
         self._erase_lock = asyncio.Lock()
 
     def _copy_adapter_record(self, value: object) -> SessionClosureRecord:
@@ -1174,6 +1179,7 @@ class SessionClosureCoordinator:
         *,
         descendants: tuple[tuple[str, str], ...] = (),
         phase: str = "target",
+        finished_only: bool = False,
     ) -> dict[str, Any]:
         progress = {
             "schema_version": 1,
@@ -1196,7 +1202,10 @@ class SessionClosureCoordinator:
         claim = getattr(self._session_store, "claim_session_closure_progress", None)
         if claim is None:
             raise ValueError("Session store does not support closure lineage claims.")
-        await claim(progress)
+        if finished_only:
+            await claim(progress, finished_only=True)
+        else:
+            await claim(progress)
         return progress
 
     async def _validated_progress(
@@ -1586,12 +1595,14 @@ class SessionClosureCoordinator:
         *,
         policy: SessionClosurePolicy | None = None,
         expected_plan_id: str | None = None,
+        finished_only: bool = False,
     ) -> SessionClosureReport:
         async with self._erase_lock:
             return await self._erase(
                 session_id,
                 policy=policy,
                 expected_plan_id=expected_plan_id,
+                finished_only=finished_only,
             )
 
     async def validate(self, session_id: str, *, policy: SessionClosurePolicy | None = None):
@@ -1644,8 +1655,16 @@ class SessionClosureCoordinator:
         *,
         policy: SessionClosurePolicy | None = None,
         expected_plan_id: str | None = None,
+        finished_only: bool = False,
     ) -> SessionClosureReport:
         """Erase dependents first and the session-store row last."""
+
+        if (
+            finished_only
+            and getattr(self._session_store, "supports_session_closure_finished_only", False)
+            is not True
+        ):
+            raise ValueError("Session store cannot enforce finished-only closure admission.")
 
         policy = SessionClosurePolicy() if policy is None else policy
         plan_id = self._plan_id(session_id, policy)
@@ -1744,6 +1763,7 @@ class SessionClosureCoordinator:
                 session_id,
                 plan_id,
                 policy,
+                finished_only=finished_only,
                 phase="recursive"
                 if policy.child_policy is SessionClosureChildPolicy.RECURSIVE
                 else "reject"
@@ -1801,7 +1821,12 @@ class SessionClosureCoordinator:
                     for child_id, _parent_id in descendants:
                         await self._require_native_admission(child_id, policy)
                     progress = await self._claim_progress(
-                        session_id, plan_id, policy, descendants=descendants, phase="recursive"
+                        session_id,
+                        plan_id,
+                        policy,
+                        descendants=descendants,
+                        phase="recursive",
+                        finished_only=finished_only,
                     )
                 try:
                     validated_progress = await self._validated_progress(
@@ -1999,7 +2024,10 @@ class SessionClosureCoordinator:
                 manifest=inspection,
                 error="Session closure store did not publish a durable erase receipt.",
             )
-        self._completed_plan_ids.add(plan_id)
+        self._completed_plan_ids[plan_id] = None
+        self._completed_plan_ids.move_to_end(plan_id)
+        while len(self._completed_plan_ids) > _COMPLETED_PLAN_ID_LIMIT:
+            self._completed_plan_ids.popitem(last=False)
         return SessionClosureReport(
             session_id=session_id,
             plan_id=plan_id,

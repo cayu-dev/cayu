@@ -54,7 +54,10 @@ from cayu.runtime._model_step_executor import (
     preflight_portable_model_material,
 )
 from cayu.runtime._session_finalization import SessionFinalization
-from cayu.runtime._task_execution_admission import verifier_aware_task_execution_outcome
+from cayu.runtime._task_execution_admission import (
+    require_unretired_task_session_identity,
+    verifier_aware_task_execution_outcome,
+)
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
@@ -434,6 +437,9 @@ class SessionPreparation:
             None if inspect_only and generated_session_id else request.session_id
         )
         task_store = self.task_store
+        await require_unretired_task_session_identity(
+            request.session_id, task_store=task_store, redactor=self._secret_redactor
+        )
         task_id = request.task_id
         if task_id is not None:
             self._session_finalization.require_terminal_interaction_publication_protocol()

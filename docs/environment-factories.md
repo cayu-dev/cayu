@@ -222,6 +222,48 @@ not sandbox hostile code or prevent a hostile filesystem owner from replacing
 paths. Supply `execution_profile_identity` when declaring stable callback
 behavior for recovery.
 
+#### Dropping finished sessions from a shared app
+
+One `CayuApp` with this factory can serve every request. Sessions stay in the
+session store until something deletes them, so a long-running app should delete
+each session once it has the answer. `CayuApp.delete_session` does that:
+
+```python
+async def handle(session_id: str, root: Path, prompt: str) -> list[Event]:
+    prepared_roots[session_id] = root
+    events = [event async for event in app.run(RunRequest(
+        session_id=session_id, agent_name="reviewer",
+        messages=[Message.text("user", prompt)],
+    ))]
+    if events[-1].type in {EventType.SESSION_COMPLETED, EventType.SESSION_FAILED}:
+        await app.delete_session(session_id)
+        prepared_roots.pop(session_id, None)
+    return events
+```
+
+An interrupted session, for example one waiting for an approval, can still
+resume, so keep it and its root until it finishes.
+
+`delete_session` runs the same closure as `DELETE /api/sessions/{id}`. It
+removes the session's events, transcript, checkpoint and grants, its settled
+tasks and its session-scoped artifacts, and keeps budget records. It does not
+touch the workspace directory, which the application owns. It raises
+`ValueError` and keeps the session when the session is still pending, running
+or interrupted, has active tasks or child sessions, or has anything the closure
+cannot fully list or erase. `finished_only=False` also deletes pending and
+interrupted sessions. It returns `None` for a session that does not exist.
+
+With `InMemorySessionStore`, deletion keeps memory bounded. The store keeps a
+closure receipt of a few kilobytes per deleted session, so the id stays retired
+and a repeated erase returns the same report, but only for the newest
+`closure_receipt_limit` deletions (10,000 by default). Once a receipt is
+evicted, the standalone session store frees its identity reservation and its
+erase cannot be replayed. This does not free dependent-store deletion fences:
+application run and fork admission refuse IDs still retired by the task store.
+Use fresh session IDs when combining stores. SQLite and Postgres keep every receipt. To drop old sessions on a schedule
+instead, use storage retention with a durable store
+([Storage retention](storage-retention.md)).
+
 When a factory attaches an already-configured durable artifact store to every
 concrete environment, register that same store with the factory registration:
 

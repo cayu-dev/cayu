@@ -493,6 +493,7 @@ class SessionStore(ABC):
     supports_session_closure_receipts: ClassVar[bool] = False
     supports_session_closure_detachment: ClassVar[bool] = False
     supports_session_closure_recursive_deletion: ClassVar[bool] = False
+    supports_session_closure_finished_only: ClassVar[bool] = False
     supports_session_closure_progress: ClassVar[bool] = False
     # Storage retention is an explicit operator capability, never implicit.
     supports_storage_retention: ClassVar[bool] = False
@@ -5314,8 +5315,14 @@ class SessionStore(ABC):
     async def save_session_closure_progress(self, progress: dict[str, Any]) -> None:
         raise NotImplementedError("This SessionStore does not support closure progress.")
 
-    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+    async def claim_session_closure_progress(
+        self, progress: dict[str, Any], *, finished_only: bool = False
+    ) -> None:
         """Atomically validate and reserve a recursive plan's current lineage.
+
+        When finished_only=True, atomically require the root to be COMPLETED or
+        FAILED before publishing ownership. Advertise support only if this check
+        shares the claim transaction; refusals must leave no claim behind.
 
         Verify the complete recursive edge set, not just the listed edges,
         including plans with no descendants. Reject unexplained additions before

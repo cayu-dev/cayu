@@ -178,6 +178,17 @@ unchanged.
   `anyOf` at the top of a tool's input schema and OpenAI-compatible backends
   differ in what they keep. They now allow a blank `pattern` and an empty
   `patterns` or `files`, which the tools read as left out.
+- Delete finished sessions from a long-running app with
+  `CayuApp.delete_session(session_id)`. It runs the same closure as
+  `DELETE /api/sessions/{id}`, which now calls it, and by default accepts only
+  completed or failed sessions. `InMemorySessionStore` now stays bounded when
+  sessions are deleted: it drops a closure's progress record and the session's
+  public aliases once the session is gone, and keeps at most
+  `closure_receipt_limit` closure receipts (10,000 by default), evicting the
+  oldest. Eviction drops erase replay evidence and frees only the standalone
+  session-store reservation. App run and fork admission still refuse IDs retired
+  by task-store deletion claims; use fresh IDs with dependent stores. SQLite
+  and Postgres receipt retention is unchanged.
 
 ## v0.13.0
 

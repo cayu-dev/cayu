@@ -264,6 +264,62 @@ def _closure_progress_targets(progress: dict[str, Any]) -> set[str]:
     return {progress["root_session_id"], *(item["session_id"] for item in progress["descendants"])}
 
 
+class ClosureProgressIndex(dict[tuple[str, str], dict[str, Any]]):
+    """Closure progress keyed by ``(root_session_id, plan_id)`` and indexed by target.
+
+    A progress record's targets (its root and planned descendants) never change
+    for one key, so lookups by session cost the number of owners of that session
+    rather than the number of closures the store has seen.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._keys_by_target: dict[str, set[tuple[str, str]]] = {}
+        self._order: dict[tuple[str, str], int] = {}
+        self._next_order = 0
+
+    def __setitem__(self, key: tuple[str, str], value: dict[str, Any]) -> None:
+        if key in self:
+            self._unindex(key, self[key])
+        super().__setitem__(key, value)
+        self._order[key] = self._next_order
+        self._next_order += 1
+        for target in _closure_progress_targets(value):
+            self._keys_by_target.setdefault(target, set()).add(key)
+
+    def __delitem__(self, key: tuple[str, str]) -> None:
+        self._unindex(key, self[key])
+        super().__delitem__(key)
+
+    def pop(self, key: tuple[str, str], *default: Any) -> Any:
+        if key in self:
+            self._unindex(key, self[key])
+        return super().pop(key, *default)
+
+    def _unindex(self, key: tuple[str, str], value: dict[str, Any]) -> None:
+        self._order.pop(key, None)
+        for target in _closure_progress_targets(value):
+            keys = self._keys_by_target.get(target)
+            if keys is None:
+                continue
+            keys.discard(key)
+            if not keys:
+                del self._keys_by_target[target]
+
+    def owners(self, session_ids: Iterable[str]) -> tuple[dict[str, Any], ...]:
+        """Return progress records that claim any of ``session_ids``, oldest first."""
+        keys: set[tuple[str, str]] = set()
+        for session_id in session_ids:
+            keys.update(self._keys_by_target.get(session_id, ()))
+        return tuple(self[key] for key in sorted(keys, key=self._order.__getitem__))
+
+    def owns(self, session_id: str) -> bool:
+        return session_id in self._keys_by_target
+
+    def targets(self) -> frozenset[str]:
+        return frozenset(self._keys_by_target)
+
+
 def _check_closure_lineage_owner(
     progress: dict[str, Any], session_ids: Iterable[str], receipt: dict[str, Any] | None = None
 ) -> None:

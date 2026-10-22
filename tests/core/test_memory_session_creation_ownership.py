@@ -21,6 +21,7 @@ import cayu
 from cayu.messages import Message
 from cayu.sessions import _memory_session_creation as creation
 from cayu.sessions import _memory_transcripts as transcripts
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions.forks import fork_session_invocation
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
@@ -46,6 +47,7 @@ class _Composition:
         self.indexes = transcripts.MemoryTranscriptIndexes({}, {}, {}, {}, {}, {})
         bindings = {field.name: {} for field in fields(creation.MemorySessionCreationState)}
         bindings.update(
+            session_closure_progress=ClosureProgressIndex(),
             apply_checkpoint_store=self.apply_checkpoint,
             apply_event_append=self.unexpected,
             append_events=self.unexpected,

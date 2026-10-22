@@ -16,6 +16,7 @@ import pytest
 import cayu
 from cayu.events import Event, EventType
 from cayu.sessions import _memory_event_delivery as delivery
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
@@ -45,7 +46,7 @@ def _state(clock):
             status=PersistedEventSideEffectStatus.PENDING,
             updated_at=now,
         )
-    return delivery.MemoryEventDeliveryState(deliveries, records, {}, clock)
+    return delivery.MemoryEventDeliveryState(deliveries, records, ClosureProgressIndex(), clock)
 
 
 def test_memory_delivery_imports_without_store_implementations():

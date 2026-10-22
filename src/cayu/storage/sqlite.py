@@ -1122,6 +1122,7 @@ class SQLiteSessionStore(
     supports_session_closure_receipts: ClassVar[bool] = True
     supports_session_closure_detachment: ClassVar[bool] = True
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
+    supports_session_closure_finished_only: ClassVar[bool] = True
     supports_session_closure_progress: ClassVar[bool] = True
     supports_storage_retention: ClassVar[bool] = True
     participant_session_binding_version: ClassVar[int | None] = 1
@@ -2250,13 +2251,22 @@ class SQLiteSessionStore(
         ).fetchall()
         return tuple(json.loads(row[0]) for row in rows)
 
-    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+    async def claim_session_closure_progress(
+        self, progress: dict[str, Any], *, finished_only: bool = False
+    ) -> None:
         payload = json.dumps(progress, ensure_ascii=False, separators=(",", ":"))
         progress = json.loads(payload)
         targets = _closure_progress_targets(progress)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                if finished_only:
+                    root = self._load_unlocked(progress["root_session_id"])
+                    if root is None or root.status not in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                    }:
+                        raise ValueError("Only completed or failed sessions can be deleted.")
                 for owner in self._closure_lineage_owners_unlocked(targets):
                     if (owner["root_session_id"], owner["plan_id"]) == (
                         progress["root_session_id"],

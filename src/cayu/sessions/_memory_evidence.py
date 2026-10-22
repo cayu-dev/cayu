@@ -7,7 +7,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
@@ -54,7 +54,7 @@ class MemoryRecallState(NamedTuple):
     recall_receipt_page_keys_by_session: dict[str, list[tuple[datetime, str]]]
     recall_receipt_page_keys_by_step: dict[tuple[str, str], list[tuple[datetime, str]]]
     recall_receipts: dict[str, RecallReceipt]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     sessions: dict[str, Session]
 
 
@@ -73,7 +73,7 @@ async def create_recall_receipt(locked: LockedRecallState, receipt: RecallReceip
             return copy_recall_receipt(current)
         if copied.session_id not in state.sessions:
             raise KeyError(f"Session not found: {copied.session_id}")
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((copied.session_id,)):
             closure_records._check_closure_lineage_owner(owner, (copied.session_id,))
         state.recall_receipts[copied.receipt_id] = copied
         state.recall_receipt_ids_by_session.setdefault(copied.session_id, set()).add(
@@ -209,7 +209,7 @@ class MemoryContextExposureState(NamedTuple):
     context_exposures: dict[str, ContextExposure]
     recall_item_exposures: dict[str, tuple[RecallItemExposure, ...]]
     recall_receipts: dict[str, RecallReceipt]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     sessions: dict[str, Session]
 
 
@@ -240,7 +240,7 @@ async def create_context_exposure(
             return copy_context_exposure(current)
         if copied.session_id not in state.sessions:
             raise KeyError(f"Session not found: {copied.session_id}")
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((copied.session_id,)):
             closure_records._check_closure_lineage_owner(owner, (copied.session_id,))
 
         attempt_key = copied.session_id, copied.model_attempt_id
@@ -442,7 +442,7 @@ async def transition_context_exposure(
                     copied_request.transition_id,
                 )
             return copy_context_exposure(exposure)
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
         updated = append_context_exposure_transition(exposure, copied_request)
         state.context_exposures[exposure_id] = updated

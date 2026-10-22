@@ -19,6 +19,7 @@ from tests.core.test_native_session_message_ownership import _exercise
 import cayu
 from cayu.sessions import _memory_queued_messages as queue
 from cayu.sessions import _memory_transcripts as transcripts
+from cayu.sessions._closure_records import ClosureProgressIndex
 from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
@@ -67,7 +68,7 @@ class _Composition:
             pending_session_messages={},
             queued_session_messages_by_idempotency={},
             reject_new_work_after_steering=self.reject_steering,
-            session_closure_progress={},
+            session_closure_progress=ClosureProgressIndex(),
             session_message_acceptance_event_ids={},
             session_message_delivery_records={},
             session_message_terminal_receipts={},

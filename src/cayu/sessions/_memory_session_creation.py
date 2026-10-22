@@ -179,7 +179,7 @@ class MemorySessionCreationState(Generic[EventsT, CheckpointT]):
     register_private_authority_alias: RegisterAlias
     require_available_closure_identity: Callable[[str], None]
     require_external_creation: Callable[[RunRequest], None]
-    session_closure_progress: dict[tuple[str, str], dict[str, Any]]
+    session_closure_progress: closure_records.ClosureProgressIndex
     session_creation_decisions: dict[str, creation_fence.SessionCreationDecision]
     session_event_records: dict[str, list[EventRecord]]
     session_operation_records: dict[str, dict[str, dict[str, Any]]]
@@ -305,7 +305,7 @@ async def create(
             None if request.parent_session_id is None else state.sessions[request.parent_session_id]
         )
         if parent_session is not None:
-            for owner in state.session_closure_progress.values():
+            for owner in state.session_closure_progress.owners((parent_session.id,)):
                 closure_records._check_closure_lineage_owner(owner, (parent_session.id,))
         now = state.ownership_clock()
         session = Session(
@@ -708,7 +708,7 @@ async def create_fork(
     fork = fork.model_copy(update={"instance_id": str(uuid4())})
     async with locked_state() as state:
         state.require_available_closure_identity(fork.id)
-        for owner in state.session_closure_progress.values():
+        for owner in state.session_closure_progress.owners((source_session_id,)):
             closure_records._check_closure_lineage_owner(owner, (source_session_id,))
         source_session = session_fork_rules._validate_session_fork_source(
             source_session=state.sessions.get(source_session_id),

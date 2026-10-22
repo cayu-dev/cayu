@@ -639,6 +639,7 @@ class PostgresSessionStore(
     supports_session_closure_receipts: ClassVar[bool] = True
     supports_session_closure_detachment: ClassVar[bool] = True
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
+    supports_session_closure_finished_only: ClassVar[bool] = True
     supports_session_closure_progress: ClassVar[bool] = True
     supports_storage_retention: ClassVar[bool] = True
     participant_session_binding_version: ClassVar[int | None] = 1
@@ -1697,12 +1698,21 @@ class PostgresSessionStore(
         )
         return tuple(dict(row[0]) for row in await cur.fetchall())
 
-    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+    async def claim_session_closure_progress(
+        self, progress: dict[str, Any], *, finished_only: bool = False
+    ) -> None:
         progress = deepcopy(progress)
         targets = _closure_progress_targets(progress)
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await self._lock_closure_lineage(cur)
+            if finished_only:
+                root = await self._load_for_update(cur, progress["root_session_id"])
+                if root is None or root.status not in {
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                }:
+                    raise ValueError("Only completed or failed sessions can be deleted.")
             for owner in await self._closure_lineage_owners(cur, targets):
                 if (owner["root_session_id"], owner["plan_id"]) == (
                     progress["root_session_id"],
