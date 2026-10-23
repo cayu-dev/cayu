@@ -6,6 +6,13 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 (`cayu lambda-microvm sidecar export`). `LambdaMicroVMRunner` now requires sidecar
 protocol 7 and refuses an image built from an earlier release at readiness.
 
+Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
+confirm revision 125. Revision 125 is additive: it adds the `cayu_store_identity`
+table that Cayu Cloud reporting needs. The compatibility floor stays 124, so this
+build still starts on a revision 124 store, but until the store is migrated
+`GET {api}/cloud/contract` returns `store_id: null` and `GET {api}/cloud/v1/activity`
+answers 501. Server contract 49 and manifest schema 17 are unchanged.
+
 Upgrade: brokered coding sandbox images now need `git`, or their factory must
 set `git_baseline=False`. Direct binding users must also check the workspace
 requirements below. An Agent reports to Cayu Cloud once
@@ -14,10 +21,10 @@ attention to it once `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TO
 are both set. Set both handoff variables or neither.
 If you set `run_task_worker(execution_timeout_s=...)`, it now bounds the whole
 handler call: check that delivery and retry work fits within it plus
-`execution_grace_s` (see the breaking change below). Storage revision 124,
-compatibility floor 124, server contract 49 and manifest schema 17 are all
-unchanged. The Agent also trusts a sign-in proxy identity header when the
-`CAYU_PROXY_IDENTITY_*` variables are set.
+`execution_grace_s` (see the breaking change below). Hardened Docker egress now
+refuses an engine that cannot keep the guest off the Docker host, and portable
+snapshot materialization refuses on Windows (both below). The Agent also trusts
+a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are set.
 
 ### Breaking changes
 
@@ -40,6 +47,29 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   `ExecutionDeadlineExceeded` (`scope` `task_handler`). A handler that delivers
   or retries after its runs end now has to fit in the limit plus the grace
   period. The default is still `None`.
+- `DockerEgressAdapter(workload_restrictions=...)` now refuses a runner unless it
+  can show that the guest cannot reach the Docker host. Its networks need a
+  Docker engine that honors `com.docker.network.bridge.inhibit_ipv4`; Docker
+  Engine on Linux and Docker Desktop do. On an engine that doesn't, a hardened
+  runner that started on 0.13.0 now fails with `egress_host_reachable`. See the
+  fix below.
+- `PortableAgentSnapshotComponentProvider` materialization, both of its recovery
+  paths, and portable bundle materialization through `AgentBundleCoordinator`
+  now refuse with `AgentBundleError("materialization_durability_unavailable")`,
+  before touching the filesystem, where the POSIX descriptor and directory
+  operations they need to make a result durable are missing. That includes
+  Windows, where 0.13.0 materialized on a best-effort basis. There is no flag to
+  restore that. Constructing the provider and verifying packages still work.
+- A `DockerRunner` with runtime evidence that admits `python3` now reports its
+  process transport as `python_subreaper_supervisor_v3` (was `_v2`) in its
+  execution profile, because its supervisor now stops a timed-out command's
+  whole process tree. The default resume policy adopts only a change to the
+  `runtime` component, so `CayuApp.resume` refuses a session created on 0.13.0
+  with such a runner with `ExecutionProfileMismatchError`. To adopt the change
+  between invocations, configure an `ExecutionProfilePolicy` that returns `adopt`
+  with `authority_decision="authorized"`, and pass an
+  `ExecutionProfileAdoptionIntent` in `ResumeRequest.profile_adoption`.
+  Alternatively, start a new session.
 
 ### Changes
 
@@ -50,10 +80,23 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   runner's own authenticated channel; grant with `public_base_url=forward.guest_url`.
   Runners expose this through the new provider-neutral
   `RunnerPortForwardCapability`, and `LambdaMicroVMRunner` implements it with
-  sidecar protocol 7. `runner_agent_launch` also takes `mcp_servers` and
+  sidecar protocol 7. Brokered sandboxes have no port forwarding.
+  `runner_agent_launch` also takes `mcp_servers` and
   `codex_config_overrides` for settings that name the guest address. The
   external-agents guide shows the setup and what a leaked run token can and
   cannot do.
+- Lambda MicroVM port forwards report closure only once it is true. `close()`
+  returns once the sidecar has torn down the forward's listener and every
+  connection it accepted, a second close or a close-all waits for the same
+  teardown, and a socket that fails to close keeps the forward retained and is
+  reported instead of acknowledged. After an ownership takeover, the old
+  owner's `close()` succeeds once the sidecar has closed the forward, and the run
+  keeps its original error; while the takeover's teardown is still unfinished it
+  raises, and `runner_port_forward` reports `ExternalCleanupIncomplete` so the
+  cleanup is retried. The suspend and terminate hooks close forwards even when
+  command cancellation fails, and forward long polls use their own thread pool,
+  so busy polling cannot stall teardown or traffic. These are sidecar changes:
+  rebuild MicroVM images from this release.
 - Run Claude Code or Codex as Cayu sessions without Docker or a credential
   gateway. `local_agent_launch` (`cayu.external_agents`) starts the vendor CLI
   on the host as the current user, for trusted code and tests. It is not a
@@ -61,11 +104,11 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   uses its own login and provider settings. The external-agents guide now opens
   with what a run needs (the SDK, a launcher, a task store and a deadline), what
   is optional (the gateway and a sandbox), what you give up without the gateway,
-  and a local quick start. `cayu[claude-agent-sdk]` now accepts
-  `claude-agent-sdk>=0.2.168,<0.3` instead of exactly 0.2.168, so the current
-  0.2.170 installs, and package CI runs the adapter against the newest SDK the
-  extra allows. The README, the `cayu guide` index and the package description
-  now point to these runs.
+  and a local quick start. `cayu[claude-agent-sdk]` now pins
+  `claude-agent-sdk==0.2.170`, which bundles Claude Code 2.1.306, instead of
+  0.2.168, and package CI installs the built wheel with that extra and runs the
+  adapter against the pinned SDK. The README, the `cayu guide` index and the
+  package description now point to these runs.
 - The gateway accepts the requests the pinned vendor CLIs send for current models:
   Claude Code's system-role messages carrying inline text and an effort setting,
   and Codex's client-tool declarations as an input item with a reasoning context.
@@ -79,22 +122,43 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   start and end, estimated cost, Release, agent and counts) and the touches that
   settled in the same range (approve, edit, deny, expire, answer, recover,
   interrupt and steer, with who, why and whether a person stepped in), without
-  conversation content. The cursor is a position in the store's event sequence,
-  so a reader continues across restarts without a gap.
-  `cayu.cloud_reporting.read_cloud_activity` reads the same pages in process.
+  conversation content. `cayu.cloud_reporting.read_cloud_activity` reads the
+  same pages in process.
+- Activity cursors name the session store they came from. `GET {api}/cloud/contract`
+  reports the store's `store_id`, and a cursor is `{store_id}.{sequence}.{mark}`,
+  where the mark identifies the event at that position. Activity answers 410
+  with code `activity_cursor_stale` for a cursor from another store (a replaced
+  database, or an in-memory store after a restart), for one whose position now
+  holds a different event because the database was restored from a backup and
+  written past it, and for a bare sequence number issued by an earlier
+  development build. The reader then reads again from the start. A restored
+  database keeps its `store_id`, so discard the reader's cursor after a restore
+  as well: a restore the Agent has not yet written past is not detected.
+  `SessionStore.read_store_identity()` returns the identity, chosen once: SQLite
+  and PostgreSQL keep it in `cayu_store_identity`, and an in-memory store picks a
+  new one each time it starts. A custom store that doesn't implement it reports
+  `store_id: null` and gets 501 from activity.
+- Run summaries carry `eval`, which is true for an eval trial session and every
+  session created under it (its subagents and forks, at any depth). Runtime marks
+  each session an eval trial creates with the runtime-owned metadata
+  `cayu:eval_trial`, which run, fork and metadata requests refuse, so a caller
+  cannot take its own runs out of the measures. The contract's measures leave out
+  forked sessions, such as Compass copies whose `root_run_id` names the run they
+  were copied from, and `eval` runs, with their cost and touches.
 - A server can trust a sign-in proxy in front of it to say who is calling.
   `cayu.server.ProxyIdentityAuth` verifies the short-lived JWT the proxy adds to
   each request as `X-Cayu-Identity` (ES256, `typ` `cayu-proxy-identity+jwt`, at
   most 120 seconds, with a `jti`) against the proxy's JWKS, and returns an
   `AuthContext` with the person (`sub`), their Organization (`org`, as `tenant`)
   and their `role`, `name` and `email`. A request with the header must verify or
-  gets 401; one without it goes to a fallback, such as the operator login. On the
-  control plane `admin` and `developer` use every route and `member` may only read
-  and decide: approvals, questions, inbox items and knowledge proposals, plus the
-  read and query routes and the Developer dashboard. `ControlPlaneRoles` holds
+  gets 401; one without it goes to a fallback, such as the Developer dashboard
+  login. On the control plane `admin` and `developer` use every route and
+  `member` may only read and decide: approvals, questions, inbox items and
+  knowledge proposals, plus the read routes and the Developer dashboard; the
+  runtime contract lists every route a member may use. `ControlPlaneRoles` holds
   that rule, and `product_dependency(roles=...)` gives a product the person and
   limits it to some roles. `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`
-  builds it, with the operator login as the fallback, when
+  builds it, with the Developer dashboard login as the fallback, when
   `CAYU_PROXY_IDENTITY_ISSUER`, `CAYU_PROXY_IDENTITY_AUDIENCE` and
   `CAYU_PROXY_IDENTITY_JWKS_URL` are set (optionally
   `CAYU_PROXY_IDENTITY_HEADER`); setting only some of them stops the server at
@@ -102,6 +166,30 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   dashboard with their Cloud login. The `server` and `server-settings` extras now
   include PyJWT. See
   [trusted proxy identity](runtime-contracts.md#trusted-proxy-identity).
+- An Agent deployed to Cayu Cloud can declare in `cayu-cloud.toml` how people
+  sign in and which page they land on. `[sign_in] mode = "cloud"` has Cayu
+  Cloud sign them in, `mode = "own"` keeps the Agent's own login, and
+  `public_paths` (only with `"cloud"`) lists path prefixes anyone can open.
+  The top-level `home` names the page people land on when they open the Agent
+  from Cayu Cloud. Both need `schema_version = 2`, and `home` or `"cloud"`
+  must be in the deployment root's `cayu-cloud.toml`. `home` and each public
+  path must be a same-host path starting with `/`; `cayu cloud deploy` refuses
+  anything else with `manifest_invalid`. An Agent that declares nothing keeps its
+  own sign-in. `cayu cloud init` writes `[sign_in]` with no `home`: `mode = "cloud"`
+  when `cayu serve` uses `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`, and
+  for a worker; `mode = "own"` for a public service (`service_factory`), a project
+  with an auth target of its own, or the generated `server_auth.py`. The init
+  result reports the mode as `sign_in`. Cayu Cloud acts on these settings once
+  its router sign-in ships.
+- The bundled `/cayu/` UI is now called the Developer dashboard, locally and on
+  Cayu Cloud, and an application's registered agents are called specialists in
+  its pages, CLI output, error messages, generated project guidance and docs.
+  The Agents page is now Specialists, the Dashboard page is now Overview, and the
+  sessions, usage and New Run filters and selectors are labelled Specialist.
+  Python names (`CayuApp`, `register_agent`, `AgentSpec`), API fields, `/agents`
+  routes and the `CAYU_OPERATOR_*` login settings are unchanged. Browser
+  automation that finds dashboard elements by the old "Agents", "Agent" or
+  "Dashboard" labels needs the new names.
 - Fix: a Docker egress container could reach the Docker host through its
   internal network's gateway address, so a host service listening on all
   interfaces was reachable from a hardened guest. `DockerEgressAdapter` now
@@ -109,15 +197,19 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   without IPv6, so the host has no address on them. With
   `workload_restrictions`, the adapter also checks the live network and probes
   from the guest's network namespace, at creation and after an authority
-  cutover, and refuses the runner if the host may be reachable. The check needs
-  a Docker engine that honors that option; Docker Engine on Linux and Docker
-  Desktop do. Allowlisted hosts still work through the broker.
-- Smoother hardened Docker egress. A `DockerTmpfsMount` is now executable
-  unless it sets `noexec=True`, like the default `/tmp` and `/workspace`
-  mounts, so a virtual environment on a resized mount runs instead of failing
-  with "Permission denied". A mount that relied on the old default needs
-  `noexec=True` to stay non-executable. `DockerWorkloadRestrictions` sorts its tmpfs mounts
-  by target instead of rejecting another order. The runner from
+  cutover, and refuses the runner if the host may be reachable. The probe runs
+  from the sidecar image, so a custom `sidecar_image=` must provide `timeout`,
+  `socat` and `awk`; one that lacks a tool is refused with
+  `egress_probe_tool_missing` naming it, not `egress_host_reachable`.
+  Allowlisted hosts still work through the broker.
+- Smoother hardened Docker egress. `DockerWorkloadRestrictions` sorts its tmpfs
+  mounts by target instead of rejecting another order. A `DockerTmpfsMount` you
+  add stays `noexec` unless it sets `noexec=False`; set that on a resized mount
+  that holds a virtual environment, as the default `/tmp` and `/workspace`
+  mounts do. When a guest's temporary storage cannot hold a streamed workspace
+  archive, the guest stages it in memory if it is at most 128 MiB and the
+  guest's memory limit leaves room for twice its size; otherwise it fails with a
+  clear error before reading the stream. The runner from
   `VirtualEgressEnvironmentFactory` now has `exec_stream`, reports binary
   streams through `binary_stream_capability()` when its backend supports them,
   and forwards the backend's `name`. `DockerEgressAdapter` pins its default
@@ -125,6 +217,29 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   `cayu.egress.docker_adapter`). The untrusted-code guide explains how to supply
   that image offline and why `memory_bytes` must stay below the memory the
   Docker engine has.
+- A timed-out or cancelled Docker command can stop without removing its
+  container. `DockerCodingEnvironmentFactory(command_cleanup="command_or_sandbox")`,
+  and the same `timeout_cleanup` and `cancellation_cleanup` value on strict
+  `DockerRunner.create` and `DockerRunner.reconnect_strict`, stops the command's
+  whole process tree and keeps the container when Cayu can verify the stop, and
+  removes the container otherwise. The default stays `"sandbox"`, which always
+  removes the container as before, so sessions saved by 0.13.0 keep their
+  configuration fingerprint; only `"command_or_sandbox"` changes it. Shell
+  commands under an evidence-bearing runner with `python3` admitted now also run
+  under the Python supervisor, which adopts every orphaned descendant. To verify a
+  stop, an observer run as UID 0 reads `/proc` and finds that supervisor by the
+  launch arguments the host recorded, a helper signals it, and the observer
+  confirms that it and every orphan started since are gone; nothing the command
+  can write counts as evidence. The
+  container is removed whenever that cannot be shown, including for runners
+  without the supervisor or whose restrictions allow a writable root, set-UID
+  programs or added capabilities. A command with a durable receipt always
+  removes the container under either setting, and inside an app's tool call
+  `run_command` and `run_check` always have one, so the kept container applies
+  to `ExecCommandTool`, direct `DockerRunner.exec`, and those tools called
+  outside an app. `confirmed_cancellation` reports `command_tree_cleanup` and
+  `receipt_command_tree_cleanup: false`, and `exec_command` says whether the
+  command was stopped or its sandbox removed.
 - `OpenAIProvider` accepts a `base_url` that ends in `/v1`, the form the
   OpenAI SDK's `OPENAI_BASE_URL` uses. It used to add its own `/v1` on top and
   send requests to `.../v1/v1/responses`; now `https://host` and
@@ -139,10 +254,14 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   the receiver with no application code, and the server runs its repair loop. Pass
   `CayuApp(human_attention_handoff=...)` to configure it in code, and read the handoff an
   application owns from `app.human_attention_handoff`; an application that already puts the
-  handoff's sink in `event_sinks` keeps owning it, and passing both is refused. Without either variable nothing changes. Pass a disabled
-  `HumanAttentionHandoff(None)` to opt an application out; Runtime does this for internal
-  judge and replay apps. Leave the variables out of separate evaluation processes and
-  coding workspaces.
+  handoff's sink in `event_sinks` keeps owning it, and passing both is refused. Without
+  either variable nothing changes. Pass a disabled `HumanAttentionHandoff(None)` to opt an
+  application out; Runtime does this for its judge, replay, acceptance, benchmark and
+  campaign apps. The handoff also skips eval trials, sessions whose metadata sets
+  `cayu:attention_handoff` to `false`, and every session created under either (Runtime
+  copies both marks to each subagent and fork), so eval cases a server runs inside the
+  deployed app never reach the receiver. Leave the variables out of separate evaluation
+  processes and coding workspaces.
 - `CayuApp()` now fails at construction when only one of `CAYU_ATTENTION_HANDOFF_URL` and
   `CAYU_ATTENTION_HANDOFF_TOKEN` is set, instead of starting without the handoff. Set both or
   neither.
@@ -159,6 +278,19 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   `client.js` gains `listInbox`, `getInboxItem`, `settleInboxItem` and
   `watchInbox`, and `create_server` and `mount_cayu` take an optional
   `inbox_access` rule that decides who may see and settle each item.
+- The inbox pages to its end with no configuration, `cayu serve` included. A
+  caller no inbox access rule limits gets plain keyset cursors that work on any
+  worker. A caller the rule limits reaches its own items however many of other
+  people's come first: `GET {api}/inbox` and `GET {api}/pending-actions` return a
+  sealed cursor (AES-256-GCM, bound to the caller and the listing, valid for 15
+  minutes) instead of stopping. `inbox_cursor_key` on `create_server`,
+  `mount_cayu` and `create_router` is optional; without it the server generates a
+  key when it starts, so a sealed cursor gets 422 after a restart or on another
+  worker. Restart the listing from no cursor, and pass the same key to every
+  worker that serves an inbox with an access rule. When a later page's cursor
+  gets 409 or 422, `client.watchInbox` starts that refresh over from the first
+  page once, without repeating items; if the restarted listing is refused too,
+  the watch stops and reports the error through `onError`.
 - A task handled by `run_task_worker` no longer stays `claimed` forever when its
   handler catches failures and retries runs that are not attached to the task.
   With `execution_timeout_s` set, the worker refuses new runs at the limit,
@@ -174,38 +306,76 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   that it has passed. The long-running guide's "Time limit for worker runs"
   section now shows the shape most handlers use (unattached runs, deliver, then
   complete) and says which limit ends what.
-- Every built-in tool declares a terminal payload bound, between 64 KiB and
-  1,984 KiB, and its constructor takes `max_terminal_payload_bytes=` to set or
-  tighten it. A deferred round no longer takes the process-wide exclusive lease
-  because a built-in had no bound, so one long `exec_command` round can't hold
-  every other session's rounds. A larger result is cut to fit, keeping every
-  field and a visible notice (`terminal_payload_truncated`), instead of failing.
+- Every built-in tool except `subagent` with a foreground child declares a
+  terminal payload bound, between 64 KiB and 1,984 KiB, and its constructor takes
+  `max_terminal_payload_bytes=` to set or tighten it. A deferred round of those
+  tools no longer takes the process-wide exclusive lease, so one long
+  `exec_command` round can't hold every other session's rounds. A round that
+  includes a foreground `subagent` still takes it unless the application sets
+  `max_terminal_payload_bytes` on `SubagentTool`. Most built-ins cut a larger
+  result to fit, with a visible notice (`terminal_payload_truncated`), instead
+  of failing; the runtime contract lists the ones that never cut. Recovery has no invocation
+  registry to redact with, so it never cuts text again: a recovered `run_command`
+  or `run_check` result comes back unchanged under the same bound, and one that no
+  longer fits because the bound was lowered omits both output previews
+  (`recovered_output_omitted=true`). A recovered `apply_patch` result lists its
+  leading operations the way a live one does (`manifest_truncated`), or keeps
+  only its short outcome fields when not even that fits.
 - `BrokeredSandboxCodingEnvironmentFactory` commits each copy-in to an
   ephemeral local Git repository in the sandbox, as the Docker coding factory
   does, so coding agents see their changes as a diff. Pass `git_baseline=False`
-  for an image without `git`.
+  for an image without `git`. In both factories, `git add` and `git commit` now
+  get 60 seconds plus 0.25 seconds per MiB and 10 seconds per thousand files
+  copied in, at most 30 minutes, instead of a fixed 60 seconds.
+- A brokered sandbox can take a real checkout. When Cayu Cloud's sandbox record
+  offers staged copies (`staged_copies`), `BrokeredSandboxWorkspace` moves a tree
+  or a file larger than one 8 MiB archive as one copy through a signed storage
+  URL, checked by size and SHA-256, and `BrokeredSandboxCodingEnvironmentFactory`
+  accepts `transfer_limits.max_file_bytes` up to 64 MiB; at setup it refuses and
+  destroys a sandbox whose staged copies can't carry that size. Without the
+  offer, copies use the archive routes as before. `SandboxBrokerClient` gains
+  `copy_in` and `copy_out` (and the steps under them), and
+  `BrokeredSandboxRunner.copy_in` and `copy_out` wrap them so an Agent can copy a
+  tree that includes `.git` itself. Requests to the signed URL never carry the
+  broker credential, and nothing in the sandbox receives the URL. A broker outage
+  during a staged copy is retried until the copy's own deadline instead of
+  poisoning the runner, a seekable archive is uploaded without a second host
+  copy, and a copy-back over the sandbox's staged-copy limits names those limits.
+  New exports: `SandboxCopy`, `SandboxCopyFailedError`, `SandboxSignedTransfer`
+  and `SandboxStagedCopies`.
 - `BrokeredSandboxRunner` implements `RunnerInteractiveProcessCapability` over
-  Cayu Cloud's interactive sandbox commands, so `runner_agent_launch` runs
+  Cayu Cloud's interactive sandbox commands, so `runner_agent_launch` can run
   Claude Code or Codex in a sandbox brokered by Cayu Cloud. Stdin and stdout
   cross the broker as offset-addressed requests that are safe to retry, and
   closing a process returns once the broker confirms its whole process tree
   has exited. `SandboxBrokerClient` gains `write_command_stdin`,
-  `read_command_stdout` and `start_command(interactive=True)`.
+  `read_command_stdout` and `start_command(interactive=True)`. The runner offers
+  the capability only when the sandbox record sets `interactive_commands`
+  (new on `SandboxRecord`), which needs a Cayu Cloud whose broker supports
+  interactive commands. Against any other Cloud only `runner_agent_launch` is
+  refused, before anything starts, with a message saying the Cloud must
+  advertise `interactive_commands`; other brokered sandbox use is unaffected.
 - `runner_agent_launch` sets the guest's `HOME` in the command it starts
   instead of in the process environment, because a runner may own that
   variable; a brokered sandbox refuses it. The guest sees the same `HOME`.
 - Fix: a closed or poisoned runner was admitted at the next pre-exposure check
   while its evidence was still fresh, and then failed every tool call; once the
   evidence expired the session failed as `stale_evidence`. The check now reads
-  the runner's lifecycle first and refuses it as closed.
+  the runner's lifecycle first and refuses it as closed or poisoned. A brokered
+  runner whose lease was lost, or whose sandbox stopped being ready, is now
+  poisoned instead of closed, so it is refused as `runner_poisoned`.
 - Fix: a factory that wrapped Cayu's Docker coding factory and nested its
   metadata lost the allocation identity, so recovering a lost model call
   failed. `EnvironmentFactoryResult.allocation_fingerprint` now carries it as a
-  typed field that wrappers pass through.
+  typed field that wrappers pass through. Each identity is checkpointed with a
+  digest of the reconnect metadata beside it, so one left behind when a 0.13.0
+  process replaced the allocation, as in a mixed-version deployment, is ignored
+  instead of failing reconnect.
 - A long conversation uses about a third less CPU per turn: a validated
   invocation receipt ledger is reused instead of validated again on every read,
-  and canonical JSON is encoded in C. Durable formats and recovery are
-  unchanged.
+  and canonical JSON is encoded in C. The process-local cache keeps only the
+  latest ledger of each session and at most 8 MiB of ledger JSON. Durable
+  formats and recovery are unchanged.
 - The built-in `search_text` and `read_file` tools accept the calls that models
   which fill in every schema field send. Release 0.13.0 added batched forms to
   both tools and its notes left them out: `search_text` takes `patterns` (up to
@@ -236,17 +406,31 @@ unchanged. The Agent also trusts a sign-in proxy identity header when the
   session-store reservation. App run and fork admission still refuse IDs retired
   by task-store deletion claims; use fresh IDs with dependent stores. SQLite
   and Postgres receipt retention is unchanged.
-- An Agent deployed to Cayu Cloud can declare in `cayu-cloud.toml` how people
-  sign in and which page they land on. `[sign_in] mode = "cloud"` has Cayu
-  Cloud sign them in, `mode = "own"` keeps the Agent's own login, and
-  `public_paths` (only with `"cloud"`) lists path prefixes anyone can open.
-  The top-level `home` names the page people land on when they open the Agent
-  from Cayu Cloud. Both need `schema_version = 2`, and `home` or `"cloud"`
-  must be in the deployment root's `cayu-cloud.toml`. `home` and each public
-  path must be a same-host path starting with `/`; `cayu cloud deploy` refuses
-  anything else with `manifest_invalid`. An Agent that declares nothing keeps its own sign-in.
-  `cayu cloud init` now writes `[sign_in]` with `mode = "cloud"` and no
-  `home`. Cayu Cloud acts on these settings once its router sign-in ships.
+- `cayu check` no longer reports ordinary declarations as import side effects.
+  Its import-safety analysis now accepts more declarative forms, among them
+  Pydantic `Field(...)` and `PrivateAttr(...)` defaults, lambdas for
+  `default_factory`, quoted forward references, `@model_serializer` and
+  `@field_serializer` with literal options, `@dataclass` with literal options,
+  and `datetime(...)` with integer literals. `cayu guide applications` lists them all. Each
+  cause is reported once: a use of a failing definition is no longer a finding
+  of its own, though it still blocks importing the application. A base class
+  that is inert but cannot be inherited from, such as one with
+  `__init_subclass__`, is reported once with the reason
+  `unproven_base_definition`, and the `unproven_class_base` finding no longer
+  carries `blocking_modules` or `blocking_module_count`.
+- Fix: portable component materialization could acknowledge a published
+  component before its files, receipt and directory entries were flushed, and a
+  retry of a retained result verified its bytes without finishing an uncertain
+  publication. `PortableAgentSnapshotComponentProvider` now flushes them before
+  returning from a fresh publication or an exact recovery, and checks the named
+  files around those barriers. The root `.cayu-materialization.json` path is
+  reserved for the receipt: a package that declares it is refused with
+  `materialization_reserved_path` before any filesystem change.
+- Fix: a filesystem snapshot object write could acknowledge a rename before its
+  directory entries were flushed, and an exact retry returned without flushing
+  the object it found. Both paths now flush the object, its shard, the objects
+  directory and the store root before returning, and an interrupted object
+  directory creation is recovered.
 
 ## v0.13.0
 
