@@ -1944,9 +1944,12 @@ def test_interactive_processes_need_a_broker_that_offers_them(tmp_path: Path) ->
         runner = await _ready_runner(broker)
         assert runner.sandbox.interactive_commands is False
         assert runner.interactive_process_capability() is None
-        with pytest.raises(ValueError, match="cannot open interactive processes"):
+        with pytest.raises(ValueError, match="cannot open interactive processes") as refused:
             async with runner_agent_launch(runner=runner, cli=sys.executable, environment={}):
                 pass
+        # The fix is on the Cloud side, not a different runner.
+        assert "advertise `interactive_commands`" in str(refused.value)
+        assert "LambdaMicroVMRunner" not in str(refused.value)
         with pytest.raises(SandboxBrokerRefusedError) as refused:
             await runner.broker.start_command(runner.sandbox_id, "c-1", ["cat"], interactive=True)
         assert refused.value.code == "sandbox_invalid"

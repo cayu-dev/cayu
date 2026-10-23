@@ -1692,6 +1692,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             "manifest": str(initialized.manifest_path),
             "name": initialized.name,
             "runtime": initialized.runtime,
+            "sign_in": initialized.sign_in,
         }
         if initialized.serve is not None:
             result["serve"] = initialized.serve

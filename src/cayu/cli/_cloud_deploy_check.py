@@ -340,8 +340,8 @@ def _dev_finding(host: str) -> ProjectDiagnostic:
         message = f"`cayu serve --dev` would refuse to start: {exc}"
     else:
         message = (
-            "`cayu serve --dev` serves an unauthenticated Developer dashboard on loopback "
-            f"host {host}, which Cayu Cloud cannot route requests to."
+            "`cayu serve --dev` serves an unauthenticated API and Developer dashboard on "
+            f"loopback host {host}, which Cayu Cloud cannot route requests to."
         )
     return _serve_diagnostic(
         "SERVE_DEV_MODE",

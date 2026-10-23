@@ -294,7 +294,7 @@ def test_serve_rejects_unauthenticated_dev_on_a_non_loopback_host_before_buildin
     assert main(["serve", "--dev", "--host", "0.0.0.0"]) == 1
 
     error = capsys.readouterr().err
-    assert "Refusing to expose an unauthenticated Developer dashboard" in error
+    assert "Refusing to expose an unauthenticated API and Developer dashboard" in error
     assert "loopback host" in error
     assert "unsafe dev bind" not in error
     assert "must_not_build" not in sys.modules
@@ -632,6 +632,10 @@ def test_serve_help_names_the_developer_dashboard(capsys) -> None:
         main(["serve", "--help"])
     assert exited.value.code == 0
     usage = " ".join(capsys.readouterr().out.split())
-    assert "Start one process-scoped Cayu server and its Developer dashboard." in usage
+    assert (
+        "Start one process-scoped Cayu server and its Developer dashboard. Select --dev "
+        "explicitly for unauthenticated local development or configure authentication "
+        "for deployment." in usage
+    )
     assert "control plane" not in usage
     assert "operator" not in usage.casefold()

@@ -17,6 +17,7 @@ jwt = pytest.importorskip("jwt")
 import httpx
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import Depends, FastAPI, WebSocket
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from jwt.algorithms import ECAlgorithm
 
@@ -34,6 +35,7 @@ from cayu.server import (
 )
 from cayu.server.oidc import OidcTokenError
 from cayu.server.proxy_identity import (
+    _READ_AND_DECIDE_ROUTES,
     PROXY_IDENTITY_AUDIENCE_VARIABLE,
     PROXY_IDENTITY_HEADER_VARIABLE,
     PROXY_IDENTITY_ISSUER_VARIABLE,
@@ -256,6 +258,8 @@ def test_unreachable_keys_answer_503(jwks, signing_key) -> None:
         ("POST", "/api/inbox/item-1/settle"),
         ("POST", "/api/tool-approvals/resolve"),
         ("POST", "/api/user-input/resolve"),
+        ("POST", "/api/knowledge/entry-1/approve"),
+        ("POST", "/api/knowledge/entry-1/reject"),
         ("GET", "/api/contract"),
         ("GET", "/client.js"),
         ("GET", "/cayu/"),
@@ -265,6 +269,21 @@ def test_a_member_may_read_and_decide(client, signing_key, method, path) -> None
     response = client.request(method, path, headers=_as(_token(signing_key, role="member")))
 
     assert response.status_code not in {401, 403}, response.text
+
+
+def test_every_member_route_is_a_control_plane_route() -> None:
+    server = create_server(
+        CayuApp(),
+        config=ServerConfig.protected(BasicAuth(username=OPERATOR[0], password=OPERATOR[1])),
+    )
+    routes = {
+        ("GET" if method == "HEAD" else method, route.path.removeprefix("/api"))
+        for route in server.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/")
+        for method in route.methods
+    }
+
+    assert _READ_AND_DECIDE_ROUTES - routes == set()
 
 
 @pytest.mark.parametrize(

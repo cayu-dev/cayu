@@ -48,7 +48,7 @@ def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
         "serve",
         help="Serve a configured Cayu project's API and Developer dashboard.",
         description=(
-            "Start one process-scoped Cayu server and its Developer dashboard. Select --dev explicitly "
+            "Start one process-scoped Cayu server and its Developer dashboard. Select "
             "--dev explicitly for unauthenticated local development or configure "
             "authentication for deployment."
         ),
@@ -244,7 +244,8 @@ def require_loopback_dev_host(host: str) -> None:
         is_loopback = host.casefold() == "localhost"
     if not is_loopback:
         raise ServeError(
-            "Refusing to expose an unauthenticated Developer dashboard on a non-loopback host. "
+            "Refusing to expose an unauthenticated API and Developer dashboard on a "
+            "non-loopback host. "
             "Use --dev with a loopback host such as 127.0.0.1 or ::1, or configure "
             "authentication before binding publicly."
         )

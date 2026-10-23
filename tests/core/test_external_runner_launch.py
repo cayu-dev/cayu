@@ -183,6 +183,19 @@ def test_stand_in_relays_arguments_stdio_and_exit_code(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_a_runner_without_interactive_processes_is_refused_before_starting(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="such as LambdaMicroVMRunner"):
+            async with runner_agent_launch(
+                runner=_Runner(tmp_path, None), cli=sys.executable, environment={}
+            ):
+                pass
+
+    asyncio.run(scenario())
+
+
 def test_close_stops_guest_processes_and_retries_unconfirmed_ones(tmp_path: Path) -> None:
     capability = _LocalCapability()
     capability.fail_close = 1

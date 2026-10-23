@@ -636,6 +636,7 @@ class InitializedCloudProject:
     runtime: str
     serve: dict[str, object] | None = None
     command: str | None = None
+    sign_in: str = "cloud"
 
 
 def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudProject:
@@ -693,12 +694,14 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
     else:
         runtime = "worker"
         command = "python -m " + application.replace("-", "_")
+    sign_in = "cloud" if serve_setup is None else _init_sign_in_mode(serve_setup)
     content = _render_initial_manifest(
         application=application,
         name=name or application,
         version=version,
         command=command,
         runtime=runtime,
+        sign_in=sign_in,
     )
     CloudProjectManifest.loads(content)
     if writes_auth_module:
@@ -737,7 +740,20 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         if serve_setup is None
         else _serve_setup_report(serve_setup, created_auth_module=writes_auth_module),
         command=command,
+        sign_in=sign_in,
     )
+
+
+def _init_sign_in_mode(setup: ServeSetupPlan) -> str:
+    """`cloud` only when `cayu serve` uses the ready-made target, which accepts Cloud's identity.
+
+    A `service_factory` project owns its product and Developer dashboard access,
+    and any other auth target (including the generated `server_auth.py`) does not
+    read the sign-in proxy's identity, so those keep their own sign-in.
+    """
+
+    target = setup.auth_target if setup.auth.status == "missing" else setup.auth.target
+    return "cloud" if target == ENVIRONMENT_OPERATOR_AUTH_TARGET else "own"
 
 
 def _plan_init_serve_setup(pyproject_path: Path) -> ServeSetupPlan:
@@ -891,6 +907,7 @@ def _render_initial_manifest(
     version: str,
     command: str,
     runtime: str,
+    sign_in: str,
 ) -> str:
     values = [
         "schema_version = 2",
@@ -911,9 +928,9 @@ def _render_initial_manifest(
         values.extend(("[web]", f"command = {json.dumps(command)}", "port = 8000", ""))
     else:
         values.extend(("[worker]", f"command = {json.dumps(command)}", ""))
-    # Cayu Cloud signs people in. No `home`: `cayu serve` serves only the Developer
-    # dashboard, and init cannot know a page of the project's own.
-    values.extend(("[sign_in]", 'mode = "cloud"', ""))
+    # No `home`: init cannot know a page of the project's own. A worker has no pages,
+    # so Cloud sign-in costs it nothing.
+    values.extend(("[sign_in]", f"mode = {json.dumps(sign_in)}", ""))
     return "\n".join(values)
 
 

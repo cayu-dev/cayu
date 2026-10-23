@@ -18434,8 +18434,8 @@ remain separate in every disposition.
 The SDK builder launches no work. Deterministic JSON is the complete retained
 authority contract; HTML is a human-readable summary of its primary versioned
 statuses, identities, distributions, decisions, and report revision.
-`cayu eval memory-report` accepts the bounded request document. Protected
-Developer dashboard `POST /api/evals/memory-reports` and
+`cayu eval memory-report` accepts the bounded request document. The protected
+control plane API routes `POST /api/evals/memory-reports` and
 `POST /api/evals/memory-reports/report.html` additionally require each supplied
 published graph and its associated execution-profile snapshot to match the exact
 current `EvalStore` run before building the report. Result-less rows retain their
@@ -19876,7 +19876,7 @@ The server's answer:
   never passed on to another kind of authentication. While no signing keys can
   be fetched, it gets 503 with `Retry-After: 5`.
 - A request without the header goes to the configured fallback, an ordinary auth
-  dependency such as the operator's Basic login, which then acts as `admin`.
+  dependency such as the Developer dashboard's Basic login, which then acts as `admin`.
   Without a fallback it gets 401.
 - A write with the header (any method but `GET`, `HEAD` and `OPTIONS`, and every
   WebSocket) whose `Sec-Fetch-Site` is neither `same-origin` nor `none` gets 403.
@@ -19902,12 +19902,16 @@ data.
 
 On the control plane, `ControlPlaneRoles` applies the role. `admin` and
 `developer` use every route. `member` reads and decides: it may load the
-Developer dashboard and browser client, read agents, environments, sessions and
-their events, transcripts, interactions, messages, state, summaries, usage and
-human review, tasks, artifacts, pending actions, human attention, knowledge and
-the inbox, run the query and rollup routes, resolve tool approvals and questions,
-settle inbox items and approve or reject knowledge proposals. These decisions cannot
-replace arguments, select an approval revision, or override execution configuration. Every other
+Developer dashboard and browser client; read the contract, health, agents,
+environments, sessions and their events (including the event stream),
+transcripts, interactions, messages, state, summaries, tool view, usage and human
+review, tasks, artifacts and their content, pending actions, human attention,
+causal-budget usage, pending knowledge proposals and the inbox; run the reads that
+take their query as a body (session summaries, a session's cost and topology,
+causal-budget cost and summaries, the operations snapshot, supervision events and
+the usage rollup); resolve tool approvals and questions, settle inbox items and
+approve or reject knowledge proposals. These decisions cannot replace arguments,
+select an approval revision, or override execution configuration. Every other
 control-plane route answers 403 `{"code": "role_forbidden"}`, as do WebSocket
 routes and any role the rule doesn't name. Routes are matched on their template
 relative to the API path, which `create_server` and `mount_cayu` give the rule.
@@ -19922,7 +19926,7 @@ and must not forward its own session cookie. The server's checks hold whether or
 not it does: stripping is defence in depth, not the only check.
 
 `cayu.server.environment_auth:OPERATOR_BASIC_AUTH` builds proxy identity, with
-the operator login as its fallback, when these are set:
+the Developer dashboard login as its fallback, when these are set:
 
 | Variable | Value |
 | --- | --- |

@@ -125,7 +125,8 @@ _SAME_ORIGIN_FETCH_SITES: Final = frozenset({"same-origin", "none"})
 #: Control-plane routes the read-and-decide roles may use, relative to the API
 #: path and matched against the whole route template: reads and queries, and
 #: the human decisions (approve, deny and answer approvals and questions, settle
-#: inbox items and knowledge proposals).
+#: inbox items and knowledge proposals). Every entry names a route
+#: ``create_server`` registers; tests check that none is left without one.
 _READ_AND_DECIDE_ROUTES: Final = frozenset(
     {
         ("GET", route)
@@ -145,7 +146,6 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/inbox/{item_id}",
             "/knowledge/pending",
             "/knowledge/pending/{entry_id}",
-            "/knowledge/{entry_id}",
             "/pending-actions",
             "/sessions",
             "/sessions/{session_id}",
@@ -176,17 +176,11 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             # Reads that take their query as a body.
             "/causal-budgets/{causal_budget_id}/cost",
             "/causal-budgets/{causal_budget_id}/summary",
-            "/events/query",
-            "/knowledge/query",
-            "/knowledge/search",
             "/operations/snapshot",
-            "/sessions/query",
             "/sessions/summary",
             "/sessions/{session_id}/cost",
             "/sessions/{session_id}/topology",
             "/supervision-events/query",
-            "/tasks/query",
-            "/usage/query",
             "/usage/rollup",
         )
     }

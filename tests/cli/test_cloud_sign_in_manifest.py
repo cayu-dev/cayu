@@ -11,6 +11,7 @@ import pytest
 from cayu.cli import _cloud_project as cloud_project
 from cayu.cli._cloud_api import CloudApiError
 from cayu.cli._cloud_project import CloudProjectManifest, CloudSignIn
+from cayu.cli.scaffold import project_files
 
 _BASE = """
 schema_version = 2
@@ -444,3 +445,60 @@ def test_init_writes_cloud_sign_in_and_no_home_for_cayu_serve(tmp_path: Path) ->
     manifest = CloudProjectManifest.loads(content)
     assert manifest.home is None
     assert manifest.sign_in == CloudSignIn(mode="cloud")
+
+
+def _write_project_files(root: Path, files: dict[str, str]) -> None:
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
+@pytest.mark.parametrize(
+    ("preset", "mode"),
+    [
+        # `cayu serve` uses the ready-made target, which accepts Cloud's identity.
+        ("agent", "cloud"),
+        # A public service's own bearer tokens and Developer dashboard auth decide access.
+        ("service", "own"),
+    ],
+)
+def test_init_declares_cloud_sign_in_only_when_cayu_serve_accepts_it(
+    tmp_path: Path, preset: str, mode: str
+) -> None:
+    _write_project_files(tmp_path, project_files("smoke-agent", preset=preset))
+
+    initialized = cloud_project.initialize_project(tmp_path)
+
+    manifest = CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
+    assert initialized.runtime == "web"
+    assert initialized.sign_in == mode
+    assert manifest.sign_in == CloudSignIn(mode=mode)
+    assert f'\n[sign_in]\nmode = "{mode}"\n' in (tmp_path / "cayu-cloud.toml").read_text()
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "serve", "mode"),
+    [
+        # Init adds the ready-made target.
+        ('["cayu[server]==0.13.0"]', None, "cloud"),
+        # Init adds the generated BasicAuth module, which ignores Cloud's identity.
+        ('["cayu[server]==0.8.1"]', None, "own"),
+        # An existing auth target of the project's own is kept, and so is its sign-in.
+        ('["cayu[server]==0.13.0"]', 'auth = "research_agent:AUTH"', "own"),
+    ],
+)
+def test_init_sign_in_follows_the_serve_auth_target(
+    tmp_path: Path, dependencies: str, serve: str | None, mode: str
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "research-agent"\nversion = "1.2.3"\n'
+        f"dependencies = {dependencies}\n\n"
+        '[tool.cayu]\nfactory = "research_agent:build_app"\n'
+        + ("" if serve is None else f"\n[tool.cayu.serve]\n{serve}\n")
+    )
+
+    initialized = cloud_project.initialize_project(tmp_path)
+
+    assert initialized.sign_in == mode
+    assert CloudProjectManifest.load(tmp_path / "cayu-cloud.toml").sign_in == CloudSignIn(mode=mode)

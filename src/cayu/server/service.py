@@ -2661,7 +2661,7 @@ def create_agent_service(
         or product_api_path.startswith(f"{control_plane_path}/")
         or control_plane_path.startswith(f"{product_api_path}/")
     ):
-        raise ValueError("The product API must be separate from the Developer dashboard.")
+        raise ValueError("The product API must be separate from the control plane API.")
 
     server = FastAPI(
         title="Cayu public agent service",

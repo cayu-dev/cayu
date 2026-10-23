@@ -452,6 +452,7 @@ recovery_inactive_after_seconds = 900
         "manifest": str(manifest_path),
         "name": "Research Agent",
         "runtime": "web",
+        "sign_in": "cloud",
     }
     assert serve["server_extra"] == {
         "status": "added",

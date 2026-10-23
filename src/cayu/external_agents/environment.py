@@ -257,6 +257,23 @@ def _shim_frame(kind: bytes, payload: bytes = b"") -> bytes:
     return kind + struct.pack(">I", len(payload)) + payload
 
 
+def _no_interactive_processes(runner: Runner) -> str:
+    # Imported here: only this refusal names the broker's runner.
+    from cayu.sandbox_broker.runner import BrokeredSandboxRunner
+
+    if isinstance(runner, BrokeredSandboxRunner):
+        return (
+            "The brokered sandbox cannot open interactive processes: its broker did not "
+            "advertise `interactive_commands` on the sandbox record. The Cayu Cloud that "
+            "provides the sandbox must advertise `interactive_commands` on its sandbox "
+            "records before runner_agent_launch can run a CLI there."
+        )
+    return (
+        "The runner cannot open interactive processes; use a runner that supports "
+        "them, such as LambdaMicroVMRunner."
+    )
+
+
 @asynccontextmanager
 async def runner_agent_launch(
     *,
@@ -297,10 +314,7 @@ async def runner_agent_launch(
         raise ValueError("max_processes must be a positive integer.")
     capability = runner.interactive_process_capability()
     if capability is None:
-        raise ValueError(
-            "The runner cannot open interactive processes; use a runner that supports "
-            "them, such as LambdaMicroVMRunner."
-        )
+        raise ValueError(_no_interactive_processes(runner))
     protect_secret: Callable[[str], None] | None = None
     declared_secrets = tuple(
         dict.fromkeys((*_guest_secret_values(guest_environment), *capability.secret_values))
