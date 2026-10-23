@@ -98,6 +98,7 @@ def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
             "contract": "cayu.cloud-agent",
             "versions": [1],
             "runtime_version": __version__,
+            "features": ["activity", "tool_knowledge_registration", "tool_knowledge_usage"],
             "store_id": store_id,
         }
     for headers in (

@@ -45,6 +45,7 @@ from cayu.execution_units import (
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
+from cayu.knowledge.usage import knowledge_lookup_scope
 from cayu.mcp.tools import McpToolAdapter
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
@@ -1071,6 +1072,20 @@ class ToolInvocation:
             persist_resolved_secret_projection=evidence.persist_resolved,
         )
         tool_context = invocation_resources.context
+
+        async def observe_knowledge_lookup(namespace: str, entry_ids: tuple[str, ...]) -> None:
+            lookup_event = await self.terminals.emit(
+                Event(
+                    type=EventType.KNOWLEDGE_LOOKUP,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=effective_tool_call.name,
+                    payload={"namespace": namespace, "entry_ids": list(entry_ids)},
+                )
+            )
+            dispatch.events.append(lookup_event)
+
         raw_workspace = invocation_resources.raw_workspace
         direct_workspace_mutations = invocation_resources.direct_workspace_mutations
         workspace_mutation_owner = invocation_resources.workspace_mutation_owner
@@ -1761,7 +1776,8 @@ class ToolInvocation:
             ),
         )
         try:
-            execution_outcome = await dispatch.run()
+            with knowledge_lookup_scope(observe_knowledge_lookup):
+                execution_outcome = await dispatch.run()
             for auxiliary_event in dispatch.events:
                 yield auxiliary_event, None
         except tool_execution.ToolDispatchAdmissionRefusal as refused:

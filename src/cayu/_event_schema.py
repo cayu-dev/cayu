@@ -3098,6 +3098,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.CONTEXT_OVERFLOW_RECOVERING] = overflow_policy
     policies[EventType.CONTEXT_OVERFLOW_FAILED] = overflow_policy
 
+    policies[EventType.KNOWLEDGE_LOOKUP] = _observed_policy(
+        "namespace entry_ids model_step_id execution_profile_fingerprint",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        untrusted_container_keys={"entry_ids"},
+    )
+
     automatic_recall_policy = _observed_policy(
         "admission_truncated anchor_transcript_index configuration_sha256 contribution_sha256 duration_seconds "
         "error_type evaluated_candidate_count execution_profile_fingerprint focused_item_count "

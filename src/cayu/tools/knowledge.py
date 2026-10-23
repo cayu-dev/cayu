@@ -85,6 +85,7 @@ from cayu.knowledge.search import (
     KnowledgeQuery,
     KnowledgeSearchMode,
 )
+from cayu.knowledge.usage import record_knowledge_lookup
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     KnowledgeIndexer,
@@ -608,6 +609,7 @@ class SearchKnowledgeTool(Tool):
             )
             for hit in filtered_hits
         ]
+        await record_knowledge_lookup(query.namespace, tuple(hit.entry.id for hit in filtered_hits))
         filtered_count = len(result.hits) - len(filtered_hits)
         min_score_applied = _min_score_applied(
             result.hits,

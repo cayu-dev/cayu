@@ -59,6 +59,7 @@ from cayu.knowledge.search import (
     KnowledgeSearchMode,
     KnowledgeSearchResult,
 )
+from cayu.knowledge.usage import record_knowledge_lookup
 from cayu.memory.retrieval import (
     FusedRetrievalCandidate,
     RankedRetrievalChannel,
@@ -1585,6 +1586,14 @@ class KnowledgeRecallSource(RecallSource):
     ) -> KnowledgeSearchResult:
         return await self._store.search(query, access_scope=access_scope)
 
+    async def _observed_search(
+        self, query: KnowledgeQuery, *, access_scope: KnowledgeAccessScope
+    ) -> KnowledgeSearchResult:
+        # All source variants (ordinary, frontier and exact revision) pass here.
+        result = await self._search_store(query, access_scope=access_scope)
+        await record_knowledge_lookup(query.namespace, tuple(hit.entry.id for hit in result.hits))
+        return result
+
     async def _inspect_lineage_store(
         self,
         query: KnowledgeLineageQuery,
@@ -1630,6 +1639,11 @@ class KnowledgeRecallSource(RecallSource):
                     return None, "semantic_timeout"
                 except Exception:
                     return None, "semantic_failed"
+                # Persistence is outside the search timeout: recording a lookup
+                # must not turn an already successful search into a timeout.
+                await record_knowledge_lookup(
+                    semantic_query.namespace, tuple(hit.entry.id for hit in result.hits)
+                )
                 return result, None
 
             semantic_task = asyncio.create_task(
@@ -1637,7 +1651,7 @@ class KnowledgeRecallSource(RecallSource):
                 name="cayu-knowledge-semantic-recall",
             )
         try:
-            lexical = await self._search_store(
+            lexical = await self._observed_search(
                 lexical_query,
                 access_scope=access_scope,
             )

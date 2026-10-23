@@ -207,6 +207,8 @@ class EventType(StrEnum):
     CONTEXT_OVERFLOW_RECOVERING = "context.overflow.recovering"
     CONTEXT_OVERFLOW_FAILED = "context.overflow.failed"
 
+    KNOWLEDGE_LOOKUP = "knowledge.lookup"
+
     AUTOMATIC_RECALL_STARTED = "memory.recall.started"
     AUTOMATIC_RECALL_COMPLETED = "memory.recall.completed"
     AUTOMATIC_RECALL_FAILED = "memory.recall.failed"

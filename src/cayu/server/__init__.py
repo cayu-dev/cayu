@@ -39,6 +39,7 @@ from typing import Any
 from cayu._validation import require_clean_nonblank, thaw_json_value
 from cayu.applications import CayuApp
 from cayu.budgets.pricing import PriceBook
+from cayu.cloud_inventory import cloud_inventory_lifespan
 from cayu.project_control_plane import (
     ProjectControlPlaneContext,
     ResolvedProjectControlPlaneContext,
@@ -425,7 +426,18 @@ def create_server(
     @asynccontextmanager
     async def policy_lifespan(server):
         resources = nullcontext() if user_lifespan is None else user_lifespan(server)
-        async with resources as state, cayu_lifespan(server):
+        async with (
+            resources as state,
+            cayu_lifespan(server),
+            cloud_inventory_lifespan(
+                app,
+                project_root=(
+                    None
+                    if resolved_project_context is None
+                    else resolved_project_context.app_manifest_project_root
+                ),
+            ),
+        ):
             yield state
 
     resolved_fastapi_options["lifespan"] = policy_lifespan
@@ -1449,7 +1461,15 @@ def _compose_interruption_drain_lifespan(
                     app, side_effect_health
                 )
                 attention_repair_task = _start_human_attention_repair(app)
-                yield state
+                async with cloud_inventory_lifespan(
+                    app,
+                    project_root=(
+                        None
+                        if project_context is None
+                        else project_context.app_manifest_project_root
+                    ),
+                ):
+                    yield state
             finally:
                 try:
                     try:

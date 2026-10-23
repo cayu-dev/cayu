@@ -30,6 +30,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Browser recordings](browser-recording.md)
 - [Build a runner](build-a-runner.md)
 - [Cayu Cloud](cayu-cloud.md)
+- [Tools and knowledge registered with Cloud](cloud-inventory.md)
 - [Maintained coding product](coding-product.md)
 - [Console](console.md)
 - [Developer dashboard](control-plane.md)

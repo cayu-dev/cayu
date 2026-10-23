@@ -1496,6 +1496,7 @@ class ContextRecallTelemetry(BaseModel):
     @classmethod
     def validate_context_event_type(cls, value: EventType) -> EventType:
         if value not in {
+            EventType.KNOWLEDGE_LOOKUP,
             EventType.AUTOMATIC_RECALL_STARTED,
             EventType.AUTOMATIC_RECALL_COMPLETED,
             EventType.AUTOMATIC_RECALL_FAILED,
@@ -1550,9 +1551,21 @@ _CONTEXT_RECALL_TELEMETRY_PUBLISHER: ContextVar[_ContextRecallTelemetryPublisher
 def _context_recall_telemetry_publisher_scope(
     publisher: _ContextRecallTelemetryPublisher | None,
 ) -> Iterator[None]:
+    from cayu.knowledge.usage import knowledge_lookup_scope
+
+    async def publish_lookup(namespace: str, entry_ids: tuple[str, ...]) -> None:
+        if publisher is not None:
+            await publisher(
+                ContextRecallTelemetry(
+                    event_type=EventType.KNOWLEDGE_LOOKUP,
+                    payload={"namespace": namespace, "entry_ids": list(entry_ids)},
+                )
+            )
+
     token = _CONTEXT_RECALL_TELEMETRY_PUBLISHER.set(publisher)
     try:
-        yield
+        with knowledge_lookup_scope(publish_lookup if publisher is not None else None):
+            yield
     finally:
         _CONTEXT_RECALL_TELEMETRY_PUBLISHER.reset(token)
 

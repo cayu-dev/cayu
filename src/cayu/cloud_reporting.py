@@ -149,6 +149,7 @@ class CloudContract(_ContractModel):
     contract: str = CLOUD_AGENT_CONTRACT
     versions: tuple[int, ...] = CLOUD_AGENT_CONTRACT_VERSIONS
     runtime_version: str = __version__
+    features: tuple[str, ...] = ("activity", "tool_knowledge_registration", "tool_knowledge_usage")
     store_id: str | None = None
 
 

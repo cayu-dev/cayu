@@ -18780,6 +18780,7 @@
           "context.overflow.detected",
           "context.overflow.recovering",
           "context.overflow.failed",
+          "knowledge.lookup",
           "memory.recall.started",
           "memory.recall.completed",
           "memory.recall.failed",

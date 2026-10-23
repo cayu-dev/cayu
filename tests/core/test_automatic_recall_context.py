@@ -1805,6 +1805,14 @@ def test_runtime_exposes_base_and_delta_receipts_for_the_exact_tool_round() -> N
             )
         ]
         assert events[-1].type is EventType.SESSION_COMPLETED
+        lookups = [event for event in events if event.type == EventType.KNOWLEDGE_LOOKUP]
+        assert lookups
+        assert any("atlas-runtime-base" in event.payload["entry_ids"] for event in lookups)
+        assert all(event.payload["namespace"] == "project:cayu" for event in lookups)
+        assert all(
+            "text" not in event.payload and "query" not in event.payload for event in lookups
+        )
+
         assert len(provider.requests) == 2
         first_parts = [
             part.text

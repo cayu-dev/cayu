@@ -1012,6 +1012,15 @@ the manifest to the root as a regular file and deploy without `--manifest`. Cust
 manifests with no acknowledgements (including an empty `local_files` array) remain
 supported.
 
+## Tools and knowledge registration
+
+When Cloud binds the Agent's `CAYU_CLOUD_REGISTRY_TOKEN`, the Runtime registers its
+specialists' tools, their package or MCP-server source, and the active shared
+knowledge the application created, then reports how often they are used. Model-written
+memories and other conversation-derived knowledge are never sent. See
+[Tools and knowledge registered with Cloud](cloud-inventory.md) for the privacy
+boundary, routes and retry behavior.
+
 ## Sign-in and home page
 
 An Agent says in `cayu-cloud.toml` how people sign in to its pages and which page they

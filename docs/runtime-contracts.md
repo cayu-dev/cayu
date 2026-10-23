@@ -19836,6 +19836,21 @@ know; the `cayu.cloud_reporting` models ignore unknown fields for that reason.
 `status` gains a value only in a new version. A new version ships in a minor
 release, under its own `{api}/cloud/v{N}` routes, listed in `versions`.
 
+### Cloud tool and knowledge registration
+
+The `cayu.cloud-agent/v1` contract also advertises tool/knowledge registration and
+usage in `features`. Runtime's startup reporter implements Cloud's
+`cayu.agent-registry/v1` with the Agent's own registry credential. It sends
+allowlisted declarations, never prompts, argument schemas, metadata, provider options,
+tool arguments or results, or knowledge text. Knowledge is limited to active,
+unexpired, shared entries the application created; model-written memories,
+people's entries and knowledge derived from conversations are never sent. Usage is
+reported as totals over a window of the durable event sequence, counted only for the
+registered tools and entries; Cloud's cursor for each session store
+(`store_id`) makes every event count once, also when the store starts over or is
+restored from a backup. The routes, limits and retry
+behavior are in [Cloud inventory](cloud-inventory.md).
+
 ## Trusted proxy identity
 
 `cayu.proxy-identity` v1 is how a sign-in proxy in front of a Cayu server tells
