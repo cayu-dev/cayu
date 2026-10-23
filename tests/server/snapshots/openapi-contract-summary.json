@@ -5754,6 +5754,16 @@
             }
           ]
         },
+        "session_overview_queries": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "supervision": {
           "anyOf": [
             {
@@ -11474,7 +11484,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "53",
+          "default": "54",
           "title": "Contract Version",
           "type": "string"
         },
@@ -17334,7 +17344,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "53",
+          "default": "54",
           "title": "Contract Version",
           "type": "string"
         }
@@ -19678,6 +19688,26 @@
           },
           {
             "in": "query",
+            "name": "include_eval",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Eval",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_forks",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Forks",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
             "name": "label",
             "required": false,
             "schema": {
@@ -19760,6 +19790,26 @@
             "schema": {
               "$ref": "#/components/schemas/SessionOrder",
               "default": "updated_at_desc"
+            }
+          },
+          {
+            "in": "query",
+            "name": "overview_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/SessionOverviewStatus"
+                  },
+                  "maxItems": 32,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Overview State"
             }
           },
           {

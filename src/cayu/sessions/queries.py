@@ -22,6 +22,7 @@ from pydantic import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes, copy_label_map
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.budgets.aggregates import AggregateCount
+from cayu.session_metadata import TITLE_METADATA_KEY
 from cayu.sessions.records import (
     PendingActionSession,
     Session,
@@ -403,6 +404,7 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
 def _session_query_text_matches(session: Session, query: str) -> bool:
     needle = query.casefold()
     haystacks = [
+        session.metadata.get(TITLE_METADATA_KEY),
         session.id,
         session.agent_name,
         session.provider_name,
@@ -549,6 +551,7 @@ def decode_session_cursor(cursor: str) -> tuple[datetime, str]:
         ValueError,
         TypeError,
         json.JSONDecodeError,
+        RecursionError,
     ) as exc:
         raise ValueError("Invalid session cursor.") from exc
     try:

@@ -20027,3 +20027,38 @@ arguments remain withheld and protected human review remains authoritative for
 disclosure. See [the inbox contract](inbox.md) for response fields and paging.
 Regenerate clients against contract 53; clients must treat null counts as
 unavailable, not zero, and continue through empty pages with a cursor.
+
+## Sessions query contract (server contract 54)
+
+`SessionQuery.q` includes string-valued canonical `cayu:title` metadata in its
+existing text-search predicate. Memory, SQLite, and PostgreSQL stores retain
+native ordering, pagination, totals, and literal SQL wildcard handling. Other
+metadata, including summaries, is outside that predicate.
+
+Public control-plane text search clears `q` from the native candidate query and
+matches only the currently exposed list fields/labels plus the exact validated,
+redacted overview title. Both list and legacy summary routes share this boundary;
+counts are null and continuation positions derive from the unsearched candidate
+page. No raw-title predicate or write-time redaction assumption can influence
+public membership. Other native filters still intersect before paging. The SDK
+store query remains a raw-store API, with no control-plane exposure guarantee.
+
+The control-plane overview selection is read-only and uses one native candidate
+page per request. The shared `SessionOverviewReader` remains the owner of state,
+evaluation, and fork-lineage evidence; the server projection filters those facts
+before browser, artifact, and subagent enrichment. Incomplete pending evidence
+on an otherwise eligible row fails before testing the requested state. A row
+positively excluded by evaluation/fork selection does not need to establish its
+pending state. Existing incarnation checks align all returned representations.
+
+The filtered continuation envelope binds the complete normalized `SessionQuery`
+(except the cursor, disallowed offset, and disabled candidate count), selected
+states, evaluation/fork flags, and included representations. It wraps the
+store-owned opaque cursor only after existing exposure checks. Its fingerprint
+is query consistency evidence, not authorization or a signed capability; normal
+control-plane read authorization still applies. It imposes bounded JSON/base64
+parsing and retains support for the current 4096-byte native cursor contract.
+The HTTP filtered count is always null, including an exhausted or empty page.
+See [Session overview](control-plane.md#session-overview) for public pagination
+and capability behavior. No store extension method or new persistent index is
+required.

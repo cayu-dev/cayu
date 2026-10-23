@@ -329,6 +329,49 @@ work. Rows include the stable `run_id`, timestamps, bounded redacted
 without configured dashboard pricing; otherwise `complete` identifies whether
 all recorded usage was priced. Aggregate counts use decimal strings on the wire.
 
+Server contract 54 adds overview filtering to the session list. Pass repeated
+`overview_state` values to match any of the seven states, and use
+`include_eval=false` and/or `include_forks=false` to exclude evaluation trials
+and fork-lineage sessions. Both inclusion flags default to true on this list;
+ordinary child sessions are not forks. These filters require `include=overview`
+and cannot be combined with `ids` or a nonzero `offset`. Existing raw `status`,
+debug, identity, label, ordering, and text filters intersect with the overview
+selection. Public text search `q` matches the currently redacted list fields,
+labels, and the same validated/redacted authored title shown by the overview;
+summaries and arbitrary metadata are not searched. Hidden title substrings
+cannot affect membership, totals, or continuation positions. Redaction is
+applied when searching, including when stored titles predate the current policy.
+
+Text search uses bounded candidate paging on both `GET /api/sessions` (with or
+without `include=overview`) and `POST /api/sessions/summary`. It requires cursor
+paging rather than a nonzero offset, returns `total_count: null`, and can return
+empty pages with a continuation. Summary usage and costs cover only the selected
+rows on that page. The shipped Sessions page automatically follows empty
+continuation pages while showing a searching state. It stops at a match or
+confirmed exhaustion; after 25 candidate pages it pauses with an explicit
+Continue searching action. Query changes cancel the previous traversal, and
+repeated cursors fail rather than looping. Native SDK store queries retain their store-data search
+semantics; they are not the public control-plane exposure boundary.
+
+A filtered request reads at most one native candidate page of `limit` rows,
+then selects rows using the public text projection and/or shared overview facts. It can return fewer than
+`limit` matches, including an empty `sessions` array with a non-null
+`next_cursor`. Continue until `next_cursor` is null to traverse all matching
+candidates. Filtered `total_count` is always null: display a loaded-result count,
+not an exact matching total. The separate overview counts endpoint retains its
+exact-count contract. This bounded list design does not promise snapshot
+pagination when sessions change during traversal.
+
+Filtered cursors are opaque, portable across server restarts, and bound to the
+normalized query, inclusion flags, requested representations, order, and page
+limit. Keep those parameters unchanged when continuing; changing them requires
+restarting without a cursor. Native unfiltered cursors and filtered cursors are
+not interchangeable. Invalid or mismatched continuations return 422 without
+reflecting cursor contents. Check
+`capabilities.surfaces.session_overview_queries.read.enabled` before using these
+filters. The capability follows the shared overview store support; unavailable
+evidence still fails the read rather than silently dropping an ambiguous state.
+
 Repeated `ids` parameters select up to 200 public session IDs, preserving first
 occurrence order and omitting missing sessions. IDs cannot be combined with
 listing filters or nondefault pagination. Include `overview` to fetch the same
@@ -359,7 +402,7 @@ state cannot be materialized. Check
 `capabilities.surfaces.session_overview.read.enabled` before using the overview include. The capability describes session accounting support;
 individual reads can still fail when a backing service is unavailable.
 
-For migration, regenerate typed clients from the contract-51 OpenAPI schema;
+Generate typed clients from the current OpenAPI schema;
 existing session listing and Cloud v1 fields remain available. Display metadata
 writes are a separate API; this read does not infer titles from messages or
 change the session metadata mutation contract.

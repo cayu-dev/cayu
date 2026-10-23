@@ -202,6 +202,7 @@ from cayu.server._session_overview import (
     overview_http_error,
     register_session_overview_counts,
 )
+from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server.auth import (
@@ -351,7 +352,7 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
     SessionMessageSource,
 )
-from cayu.sessions.overview import SessionOverviewUnavailable
+from cayu.sessions.overview import SessionOverviewStatus, SessionOverviewUnavailable
 from cayu.sessions.pending_action_contracts import (
     PendingActionListResult,
     PendingActionQuery,
@@ -7348,10 +7349,27 @@ def create_router(
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
         label_selector: Annotated[list[str] | None, Query()] = None,
+        overview_state: Annotated[list[SessionOverviewStatus] | None, Query(max_length=32)] = None,
+        include_eval: bool = True,
+        include_forks: bool = True,
         include: Annotated[
             list[Literal["usage", "execution_profile", "overview"]] | None, Query()
         ] = None,
     ):
+        selection = SessionOverviewSelection(
+            frozenset(overview_state or ()),
+            include_eval,
+            include_forks,
+            text=_clean_optional_query_value(q, "q"),
+        )
+        if selection.overview_active and (
+            include is None or "overview" not in include or offset or ids is not None
+        ):
+            raise HTTPException(
+                422,
+                detail="Overview filters require include=overview and cursor paging without IDs or offset.",
+            )
+        query_binding = ""
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
         (
@@ -7396,35 +7414,43 @@ def create_router(
                         selected.append(session)
                 result = SessionListResult(sessions=selected, total_count=len(selected))
             else:
-                result = await session_store.list_sessions(
-                    SessionQuery(
-                        q=_clean_optional_query_value(q, "q"),
-                        status=status,
-                        debug_state=debug_state,
-                        agent_name=_clean_optional_query_value(agent_name, "agent_name"),
-                        provider_name=_clean_optional_query_value(provider_name, "provider_name"),
-                        model=_clean_optional_query_value(model, "model"),
-                        environment_name=_clean_optional_query_value(
-                            environment_name,
-                            "environment_name",
-                        ),
-                        parent_session_id=private_parent_session_id,
-                        causal_budget_id=private_causal_budget_id,
-                        labels=labels,
-                        label_selectors=label_selectors,
-                        limit=limit,
-                        offset=offset,
-                        cursor=cursor,
-                        include_total_count=True,
-                        order_by=order_by,
-                    )
+                requested_query = SessionQuery(
+                    q=_clean_optional_query_value(q, "q"),
+                    status=status,
+                    debug_state=debug_state,
+                    agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                    provider_name=_clean_optional_query_value(provider_name, "provider_name"),
+                    model=_clean_optional_query_value(model, "model"),
+                    environment_name=_clean_optional_query_value(
+                        environment_name,
+                        "environment_name",
+                    ),
+                    parent_session_id=private_parent_session_id,
+                    causal_budget_id=private_causal_budget_id,
+                    labels=labels,
+                    label_selectors=label_selectors,
+                    limit=limit,
+                    offset=offset,
+                    cursor=None,
+                    include_total_count=not selection.active,
+                    order_by=order_by,
+                )
+                result, query_binding = await selection.read_page(
+                    session_store,
+                    requested_query,
+                    cursor=cursor,
+                    include=include,
+                    project_session=partial(_serialize_session_base, cayu_app),
+                    project_title=overview_service.project_title,
                 )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         overviews = None
         if include is not None and "overview" in include:
             try:
-                sessions, overviews = await overview_service.read(result.sessions)
+                sessions, overviews = await overview_service.read(
+                    result.sessions, selection=selection
+                )
                 result = result.model_copy(update={"sessions": sessions})
             except (
                 SessionOverviewUnavailable,
@@ -7479,10 +7505,15 @@ def create_router(
                 usage = [usage[index] for index in retained]
             if execution_profiles is not None:
                 execution_profiles = [execution_profiles[index] for index in retained]
+        next_cursor = _serialize_session_cursor(cayu_app, result.next_cursor)
+        try:
+            next_cursor = selection.wrap(next_cursor, query_binding)
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from None
         return {
             "sessions": [_serialize_session_base(cayu_app, session) for session in result.sessions],
             "overviews": overviews,
-            "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
+            "next_cursor": next_cursor,
             "total_count": result.total_count,
             "usage": usage,
             "execution_profiles": execution_profiles,
@@ -7760,6 +7791,7 @@ def create_router(
         label_selector: Annotated[list[str] | None, Query()] = None,
     ):
         body = body or SessionsSummaryBody()
+        selection = SessionOverviewSelection(text=_clean_optional_query_value(q, "q"))
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
         (
@@ -7770,7 +7802,8 @@ def create_router(
             causal_budget_id=causal_budget_id,
         )
         try:
-            result = await session_store.list_sessions(
+            result, query_binding = await selection.read_page(
+                session_store,
                 SessionQuery(
                     q=_clean_optional_query_value(q, "q"),
                     status=status,
@@ -7788,10 +7821,14 @@ def create_router(
                     label_selectors=label_selectors,
                     limit=limit,
                     offset=offset,
-                    cursor=cursor,
+                    cursor=None,
                     include_total_count=True,
                     order_by=order_by,
-                )
+                ),
+                cursor=cursor,
+                include=("summary",),
+                project_session=partial(_serialize_session_base, cayu_app),
+                project_title=overview_service.project_title,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -7859,10 +7896,16 @@ def create_router(
                 }
             )
 
+        try:
+            next_cursor = selection.wrap(
+                _serialize_session_cursor(cayu_app, result.next_cursor), query_binding
+            )
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from None
         return {
             "session_count": len(sessions),
             "sessions": session_items,
-            "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
+            "next_cursor": next_cursor,
             "total_count": result.total_count,
             "usage": usage_summary,
             "provider_breakdown": provider_breakdown,

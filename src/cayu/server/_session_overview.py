@@ -21,6 +21,7 @@ from cayu.artifacts.base import (
     ArtifactStoreUnavailableError,
 )
 from cayu.budgets.pricing import PriceBook
+from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server.contracts import (
     SessionOverviewCost,
     SessionOverviewCountsResponse,
@@ -70,8 +71,12 @@ class SessionOverviewService:
         self.artifact_stores = artifact_stores
 
     async def read(
-        self, sessions: list[Session]
+        self,
+        sessions: list[Session],
+        *,
+        selection: SessionOverviewSelection | None = None,
     ) -> tuple[list[Session], list[SessionOverviewResponse]]:
+        selection = SessionOverviewSelection() if selection is None else selection
         expected = {session.id: session.instance_id for session in sessions}
         facts = await SessionOverviewReader(self.store, pricing=self.pricing).read(tuple(expected))
         kept: list[Session] = []
@@ -80,8 +85,14 @@ class SessionOverviewService:
             session = fact.session
             if session.instance_id != expected.get(session.id):
                 continue
+            if (not selection.include_eval and is_eval_trial(session)) or (
+                not selection.include_forks and fact.forked
+            ):
+                continue
             if not fact.pending_complete:
                 raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
+            if selection.states and fact.status not in selection.states:
+                continue
             try:
                 uses = SessionOverviewUses(
                     browser=await self._uses_browser(session),
@@ -180,6 +191,10 @@ class SessionOverviewService:
         except ValueError:
             return None
 
+    def project_title(self, session: Session) -> str | None:
+        """Share the current validated, redacted title with public text search."""
+        return self._text(session.metadata.get(TITLE_METADATA_KEY), limit=MAX_SESSION_TITLE_LENGTH)
+
     def _project(
         self, facts: SessionOverviewFacts, uses: SessionOverviewUses
     ) -> SessionOverviewResponse:
@@ -191,9 +206,7 @@ class SessionOverviewService:
             run_id=session_run_id(session),
             state=facts.status,
             reason=self._text(facts.outcome.reason, limit=1024) or "unknown",
-            title=self._text(
-                session.metadata.get(TITLE_METADATA_KEY), limit=MAX_SESSION_TITLE_LENGTH
-            ),
+            title=self.project_title(session),
             summary=self._text(
                 session.metadata.get(SUMMARY_METADATA_KEY), limit=MAX_SESSION_SUMMARY_LENGTH
             ),

@@ -22,6 +22,7 @@ import { formatDateTime } from "../lib/format"
 import { dashboardPath } from "../lib/links"
 import { summarizeSessionDebugState } from "../lib/session-debug"
 import { sessionIndexErrorState } from "../lib/session-index-error"
+import { loadSessionIndexPage } from "../lib/session-index-pages"
 import {
   DEFAULT_SESSION_ORDER,
   multilineSessionFilters,
@@ -367,17 +368,24 @@ export function SessionsPage() {
 
   const sessions = useQuery({
     queryKey: ["sessions-summary", "sessions-page", requestQuery],
-    queryFn: ({ signal }) => fetchSessionsSummary(requestQuery, {}, signal),
+    queryFn: ({ signal }) =>
+      loadSessionIndexPage(
+        requestQuery,
+        (query, requestSignal) => fetchSessionsSummary(query, {}, requestSignal),
+        signal,
+      ),
     gcTime: 0,
     retry: (failureCount, error) => sessionIndexErrorState(error).retryable && failureCount < 3,
   })
   const errorState = sessions.isError ? sessionIndexErrorState(sessions.error) : null
-  const list = sessions.data?.sessions ?? []
-  const totalCount = sessions.data?.total_count
-  const nextCursor = sessions.data?.next_cursor
+  const list = sessions.data?.page.sessions ?? []
+  const totalCount = sessions.data?.page.total_count
+  const nextCursor = sessions.data?.page.next_cursor
+  const searchPaused = sessions.data?.searchPaused ?? false
+  const loadingText = search.q ? "Searching sessions..." : "Loading session page..."
   const confirmedPageDescription = `${list.length} on this page${totalCount != null ? ` · ${totalCount} matching` : ""}${currentCursor ? " · later page" : " · first page"}`
   const pageDescription = sessions.isLoading
-    ? "Loading a bounded session page..."
+    ? loadingText
     : sessions.isError
       ? "Session page unavailable"
       : confirmedPageDescription
@@ -519,7 +527,7 @@ export function SessionsPage() {
             {sessions.isLoading ? (
               <TableRow>
                 <TableCell colSpan={8}>
-                  <StateMessage>Loading session page...</StateMessage>
+                  <StateMessage>{loadingText}</StateMessage>
                 </TableCell>
               </TableRow>
             ) : sessions.isError ? (
@@ -554,11 +562,15 @@ export function SessionsPage() {
               <TableRow>
                 <TableCell colSpan={8}>
                   <StateMessage>
-                    {filterCount > 0
-                      ? "No sessions match the current filters."
-                      : currentCursor
-                        ? "This session page is empty. Return to the first page or go back."
-                        : "No sessions yet"}
+                    {searchPaused
+                      ? "No matches in the pages scanned. Search paused; continue searching to check more sessions."
+                      : filterCount > 0
+                        ? currentCursor
+                          ? "No more sessions match the current filters."
+                          : "No sessions match the current filters."
+                        : currentCursor
+                          ? "This session page is empty. Return to the first page or go back."
+                          : "No sessions yet"}
                   </StateMessage>
                 </TableCell>
               </TableRow>
@@ -613,7 +625,7 @@ export function SessionsPage() {
         {(currentCursor || nextCursor) && (
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border p-4">
             <span className="text-sm text-muted-foreground" aria-live="polite">
-              {sessions.isFetching ? "Loading session page..." : pageDescription}
+              {sessions.isFetching ? loadingText : pageDescription}
             </span>
             <div className="flex items-center gap-2">
               <Button
@@ -630,7 +642,7 @@ export function SessionsPage() {
                 onClick={showNextPage}
                 disabled={!nextCursor || sessions.isFetching}
               >
-                Next page
+                {searchPaused ? "Continue searching" : "Next page"}
               </Button>
             </div>
           </div>

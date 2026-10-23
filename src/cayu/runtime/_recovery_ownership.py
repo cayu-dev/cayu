@@ -1805,6 +1805,12 @@ class RecoveryOwnership:
                     )
                 if not isinstance(outcome.error, Exception):
                     raise outcome.error
+                if isinstance(outcome.error, SessionRunFenced):
+                    # A successor epoch is positive evidence of lost ownership,
+                    # not a transient renewal failure to retry until lease expiry.
+                    raise _IncompleteRecoveryClaimLost(
+                        f"Incomplete-session recovery claim lost for session {session_id}."
+                    ) from outcome.error
                 last_renewal_failure = outcome.error
                 # Elapsed monotonic time is only a conservative local stop
                 # boundary. It cannot authorize takeover, but it prevents

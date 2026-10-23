@@ -14,6 +14,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -903,13 +904,31 @@ def _block_process_scenario_until_killed(
 def _persist_trial_receipt_until_staging_is_durable(
     receipt_document: dict[str, Any],
     receipt_directory: str,
+    startup_delay_seconds: float,
+    phases: Connection,
 ) -> None:
+    # Model a child whose bootstrap exceeds the old combined ten-second budget.
+    time.sleep(startup_delay_seconds)
     receipt = acceptance_module.BrowserAcceptanceTrialReceiptV1.model_validate(receipt_document)
+    phases.send("prepared")
+    assert phases.recv() == "persist"
+    staging_fsynced = False
+    original_fsync = os.fsync
+
+    def fsync_staging(descriptor: int) -> None:
+        nonlocal staging_fsynced
+        original_fsync(descriptor)
+        staging_fsynced = True
 
     def exit_before_publication(_source: object, _destination: object) -> None:
+        assert staging_fsynced
+        phases.send("fsynced")
         os._exit(87)
 
-    with patch.object(os, "link", exit_before_publication):
+    with (
+        patch.object(os, "fsync", fsync_staging),
+        patch.object(os, "link", exit_before_publication),
+    ):
         acceptance_module._persist_trial_receipt(receipt, receipt_directory)
 
 
@@ -2928,8 +2947,10 @@ def test_browser_acceptance_discards_partial_journal_staging(
     assert not staging.exists()
 
 
+@pytest.mark.parametrize("startup_delay_seconds", [0.0, 11.0], ids=["normal", "slow-bootstrap"])
 def test_browser_acceptance_recovers_fsynced_staging_after_process_loss_without_redispatch(
     tmp_path: Path,
+    startup_delay_seconds: float,
 ) -> None:
     receipt_directory = tmp_path / "receipts"
     with BrowserAcceptanceFixtureV1() as fixture:
@@ -2953,17 +2974,48 @@ def test_browser_acceptance_recovers_fsynced_staging_after_process_loss_without_
             },
             attempt_number=2,
         )
-        process = multiprocessing.get_context("spawn").Process(
+        context = multiprocessing.get_context("spawn")
+        parent_phases, child_phases = context.Pipe()
+        process = context.Process(
             target=_persist_trial_receipt_until_staging_is_durable,
-            args=(future.model_dump(mode="json"), str(receipt_directory)),
+            args=(
+                future.model_dump(mode="json"),
+                str(receipt_directory),
+                startup_delay_seconds,
+                child_phases,
+            ),
         )
-        process.start()
-        process.join(timeout=10)
-        if process.is_alive():
-            process.terminate()
+
+        def await_phase(expected: str, timeout: float) -> None:
+            assert parent_phases.poll(timeout), (
+                f"Child did not reach {expected}; exitcode={process.exitcode}"
+            )
+            try:
+                observed = parent_phases.recv()
+            except EOFError:
+                pytest.fail(f"Child exited before {expected}; exitcode={process.exitcode}")
+            assert observed == expected
+
+        try:
+            process.start()
+            child_phases.close()
+            # Spawn imports this module and the runtime before reaching the target.
+            # Start the write deadline only after that independent phase completes.
+            await_phase("prepared", timeout=30)
+            parent_phases.send("persist")
+            await_phase("fsynced", timeout=10)
             process.join(timeout=5)
-        assert process.exitcode == 87
-        process.close()
+            assert process.exitcode == 87
+        finally:
+            parent_phases.close()
+            child_phases.close()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            process.close()
         assert not tuple(receipt_directory.glob(f"{future.row_id[7:]}*.trial.json"))
         assert tuple(receipt_directory.glob(".*.trial.json.*.staging"))
         requests_after_process_loss = len(provider.requests)

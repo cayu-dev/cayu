@@ -4137,6 +4137,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_display_metadata?: OptionalSurfaceCapability | null;
     session_follow?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
+    session_overview_queries?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
@@ -24215,6 +24216,18 @@ export type ListSessionsApiSessionsGetData = {
          * Label Selector
          */
         label_selector?: Array<string> | null;
+        /**
+         * Overview State
+         */
+        overview_state?: Array<SessionOverviewStatus> | null;
+        /**
+         * Include Eval
+         */
+        include_eval?: boolean;
+        /**
+         * Include Forks
+         */
+        include_forks?: boolean;
         /**
          * Include
          */

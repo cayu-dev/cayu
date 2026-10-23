@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from cayu.events import EventType
+from cayu.session_metadata import TITLE_METADATA_KEY
 from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.queries import (
     LabelSelectorOperator,
@@ -283,7 +284,7 @@ def build_session_query_sql(
     if query.q is not None:
         like = _contains_pattern(query.q)
         clauses.append(_session_search_clause(dialect))
-        params.extend([like, like, like, like, like, like, like, like, like])
+        params.extend([like] * 10)
     if query.status is not None:
         clauses.append(f"status = {dialect.placeholder}")
         params.append(str(query.status))
@@ -413,7 +414,17 @@ def _session_search_clause(dialect: SessionStoreSqlDialect) -> str:
         "parent_session_id",
         "causal_budget_id",
     )
-    field_clauses = [dialect.contains_clause(field) for field in fields]
+    if dialect.contains_style == "sqlite_nocase_like":
+        title = (
+            f"CASE WHEN json_type(metadata_json, '$.\"{TITLE_METADATA_KEY}\"') = 'text' "
+            f"THEN json_extract(metadata_json, '$.\"{TITLE_METADATA_KEY}\"') END"
+        )
+    else:
+        title = (
+            f"CASE WHEN jsonb_typeof(metadata -> '{TITLE_METADATA_KEY}') = 'string' "
+            f"THEN metadata ->> '{TITLE_METADATA_KEY}' END"
+        )
+    field_clauses = [dialect.contains_clause(field) for field in (*fields, title)]
     label_key_clause = dialect.contains_clause("cayu_session_labels.key")
     label_value_clause = dialect.contains_clause("cayu_session_labels.value")
     return f"""
