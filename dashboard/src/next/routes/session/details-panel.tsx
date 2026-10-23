@@ -1,0 +1,171 @@
+import { X } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
+import type { SessionDetail, SessionOverview } from "../../api/types"
+import type { SessionRow } from "../../app/queries"
+import { formatDuration } from "../../app/session-model"
+import { LabelChips, NavLink, sessionPath } from "../common"
+
+export const PANEL_TABS = ["overview", "usage", "artifacts", "browser"] as const
+export type PanelTab = (typeof PANEL_TABS)[number]
+const TAB_LABEL: Record<PanelTab, string> = {
+  overview: "Overview",
+  usage: "Usage",
+  artifacts: "Artifacts",
+  browser: "Browser",
+}
+
+const when = (iso: string | null | undefined) =>
+  iso
+    ? `${new Date(iso).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })} PT`
+    : "–"
+
+function Row({ k, children, mono }: { k: string; children: React.ReactNode; mono?: boolean }) {
+  return (
+    <div className="grid grid-cols-[7.5rem_1fr] gap-3 py-1.5 text-sm">
+      <dt className="text-muted-foreground">{k}</dt>
+      <dd className={cn("min-w-0 break-words", mono && "font-mono text-xs leading-5")}>
+        {children}
+      </dd>
+    </div>
+  )
+}
+
+export function DetailsPanel({
+  tab,
+  setTab,
+  onClose,
+  session,
+  overview,
+  parent,
+  onOpenTrace,
+}: {
+  tab: PanelTab
+  setTab: (tab: PanelTab) => void
+  onClose: () => void
+  session: SessionDetail
+  overview: SessionOverview | null
+  parent: SessionRow | null
+  /** Events, workflow and debug detail live in the session's trace. */
+  onOpenTrace: () => void
+}) {
+  const tabs = PANEL_TABS.filter((t) => t !== "browser" || overview?.uses.browser)
+  const seconds = overview?.ended_at
+    ? (Date.parse(overview.ended_at) - Date.parse(overview.started_at)) / 1000
+    : null
+  const metadata = Object.entries(session.metadata).filter(([k]) => !k.startsWith("cayu:"))
+
+  return (
+    <aside
+      aria-label="Session details"
+      className="fixed inset-y-0 right-0 z-40 flex w-full max-w-[400px] flex-col border-l border-border bg-background shadow-xl xl:static xl:z-auto xl:w-[380px] xl:shadow-none"
+    >
+      <div className="flex h-12 shrink-0 items-center justify-between border-b border-border px-3">
+        <span className="text-sm font-medium">Session details</span>
+        <Button variant="ghost" size="icon-sm" aria-label="Close details" onClick={onClose}>
+          <X />
+        </Button>
+      </div>
+      <div
+        role="tablist"
+        className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-2 py-1.5"
+      >
+        {tabs.map((t) => (
+          <button
+            key={t}
+            type="button"
+            role="tab"
+            aria-selected={tab === t}
+            onClick={() => setTab(t)}
+            className={cn(
+              "rounded-md px-2.5 py-1 text-sm whitespace-nowrap",
+              tab === t ? "bg-muted font-medium" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {TAB_LABEL[t]}
+          </button>
+        ))}
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        {tab === "overview" && (
+          <dl className="divide-y divide-border">
+            <Row k="Session ID" mono>
+              {session.id}
+            </Row>
+            <Row k="Specialist">{session.agent_name}</Row>
+            <Row k="Title">{overview?.title ?? "–"}</Row>
+            <Row k="Summary">{overview?.summary ?? "–"}</Row>
+            <Row k="Started">{when(session.created_at)}</Row>
+            <Row k="Last activity">{when(overview?.last_activity_at ?? session.updated_at)}</Row>
+            <Row k="Model">
+              {session.model ?? "–"}
+              {session.provider_name ? ` via ${session.provider_name}` : ""}
+            </Row>
+            <Row k="Environment">{session.environment_name ?? "–"}</Row>
+            <Row k="Started by">{session.invocation.source.replaceAll("_", " ")}</Row>
+            {parent && (
+              <Row k="Parent session">
+                <NavLink to={sessionPath(parent.session.id)} className="hover:underline">
+                  {parent.overview?.title ?? parent.session.id}
+                </NavLink>
+              </Row>
+            )}
+            <Row k="Labels">
+              {Object.keys(session.labels).length ? <LabelChips labels={session.labels} /> : "–"}
+            </Row>
+            {metadata.map(([k, v]) => (
+              <Row key={k} k={k} mono>
+                {typeof v === "object" ? JSON.stringify(v) : String(v)}
+              </Row>
+            ))}
+          </dl>
+        )}
+
+        {tab === "artifacts" && (
+          <p className="text-sm text-muted-foreground">
+            {overview?.uses.artifacts
+              ? `${overview.uses.artifacts} artifacts.`
+              : "This session saved no artifacts."}
+          </p>
+        )}
+
+        {tab === "browser" && (
+          <p className="text-sm text-muted-foreground">
+            This session used a browser. Today's browser view and recordings render here instead of
+            above every session.
+          </p>
+        )}
+
+        {tab === "usage" && (
+          <dl className="divide-y divide-border">
+            <Row k="Duration">{overview?.ended_at ? formatDuration(seconds) : "Still running"}</Row>
+            <Row k="Model steps">{overview?.model_steps ?? "–"}</Row>
+            <Row k="Tool calls">{overview?.tool_calls ?? "–"}</Row>
+            <Row k="Input tokens">
+              {overview ? overview.tokens.input.toLocaleString() : "–"}
+              {overview ? (
+                <span className="text-muted-foreground">
+                  {" "}
+                  ({overview.tokens.cached.toLocaleString()} cached)
+                </span>
+              ) : null}
+            </Row>
+            <Row k="Output tokens">{overview ? overview.tokens.output.toLocaleString() : "–"}</Row>
+            <Row k="Cost">
+              {overview?.cost ? (
+                `${overview.cost.currency === "USD" ? "$" : `${overview.cost.currency} `}${overview.cost.amount.toFixed(2)}${overview.cost.complete ? "" : " (partial)"}`
+              ) : (
+                <span className="text-muted-foreground">No price book configured</span>
+              )}
+            </Row>
+          </dl>
+        )}
+      </div>
+      <div className="shrink-0 border-t border-border p-3">
+        <Button variant="outline" size="sm" className="w-full" onClick={onOpenTrace}>
+          Open trace: events, workflow and internals
+        </Button>
+      </div>
+    </aside>
+  )
+}

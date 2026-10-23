@@ -1,0 +1,268 @@
+/**
+ * Every call the reworked dashboard makes. Existing endpoints use the server's
+ * generated types, so the fake API (mock/api.ts) answers in exactly the shapes the
+ * runtime returns, and switching to the real server means passing real.ts instead.
+ *
+ * Calls marked "Proposed" need a runtime change first (see PAGE-MAP.md, backend items).
+ */
+import type {
+  AgentsPage,
+  SessionDetail,
+  SessionEventsPage,
+  SessionEventsQuery,
+  SessionListQuery,
+  SessionState as SessionStateRecord,
+  SessionsPage,
+  SessionTranscriptPage,
+  SessionTranscriptQuery,
+  Task,
+  TaskDetail,
+} from "@/lib/api"
+import type {
+  ApiTaskScheduleEvent,
+  InboxItem,
+  InboxItemState,
+  InboxPage,
+  InboxSettleRequest,
+} from "@/lib/generated/server-api"
+import type {
+  AddToEvals,
+  EvalRunDetail,
+  EvalSettings,
+  EvalSuiteDetail,
+  EvalSuiteSummary,
+  NewEvalSuite,
+} from "./eval-types"
+
+export type {
+  ApiAgentSummary as Specialist,
+  ApiEventRecord as SessionEvent,
+  ApiSessionBase as Session,
+  ApiTranscriptMessage as TranscriptMessage,
+} from "@/lib/generated/server-api"
+export type {
+  AgentsPage,
+  InboxItem,
+  InboxItemState,
+  InboxPage,
+  InboxSettleRequest,
+  SessionDetail,
+  SessionEventsPage,
+  SessionListQuery,
+  SessionStateRecord,
+  SessionsPage,
+  SessionTranscriptPage,
+  Task,
+  TaskDetail,
+}
+export type TaskScheduleEvent = ApiTaskScheduleEvent
+export type * from "./eval-types"
+
+/**
+ * Proposed (backend item 13): the graph a task belongs to and the tasks it waits on. The
+ * store keeps both, but the API doesn't serialize them yet.
+ */
+export type TaskRelations = { graph_id?: string | null; prerequisite_task_ids?: string[] }
+export type TaskItem = Task & TaskRelations
+export type TaskInfo = TaskDetail & TaskRelations
+/** The holds `POST /api/tasks/{id}/pause | block | needs-attention` put on a task. */
+export type TaskHold = "pause" | "block" | "needs-attention"
+
+/** One merged state per session; waiting states win over running (as in cloud_reporting). */
+export type SessionState =
+  | "running"
+  | "waiting_approval"
+  | "waiting_input"
+  | "needs_recovery"
+  | "completed"
+  | "failed"
+  | "interrupted"
+
+/**
+ * Proposed (backend item 9): how a tool reads in a summary line, declared with the tool
+ * (`"Read"` + `"file"` gives "read 9 files"). Built-in tools ship one; others may set it.
+ */
+export type ToolDisplay = { verb: string; noun?: string; plural?: string }
+/**
+ * Where a tool comes from, as Cloud's inventory reports it (`CloudToolSource` in
+ * cayu/cloud_inventory.py): the agent's own code, Cayu, a package (with its version), an
+ * MCP server, or the model provider (hosted tools).
+ */
+export type ToolSource =
+  | { kind: "agent" }
+  | { kind: "cayu" }
+  | { kind: "package"; package?: string | null; version?: string | null }
+  | { kind: "mcp"; server?: string | null }
+  | { kind: "provider"; provider?: string | null }
+  | { kind: "unknown" }
+/**
+ * Whether a tool asks a person before it runs (`_Approval` in cayu/cloud_inventory.py):
+ * never, always, only for some arguments, or never runs at all.
+ */
+export type ToolApproval = "never" | "always" | "sometimes" | "blocked" | "unknown"
+export type ToolWithDisplay = import("@/lib/generated/server-api").ApiToolSummary & {
+  display?: ToolDisplay | null
+  /** Proposed (backend item 11): where the tool comes from, and whether it asks a person first. */
+  source?: ToolSource | null
+  approval?: ToolApproval | null
+}
+
+/** Proposed (backend item 11): how each tool has been used, from the runtime's usage reporting. */
+export type ToolUsage = {
+  tool: string
+  calls: number
+  failed: number
+  approvals: { approved: number; denied: number; waiting: number }
+  last_used_at: string | null
+  recent: { session_id: string; at: string; status: "ok" | "error" | "waiting" }[]
+}
+
+/**
+ * Proposed (backend item 7): a kind of task the app's own worker handles. Creating one
+ * runs the app the real way, through its orchestration, not one specialist directly.
+ */
+export type TaskType = {
+  name: string
+  description: string
+  input_schema: Record<string, unknown>
+  /** The specialist the app's worker hands it to, when there is one. */
+  agent_name: string | null
+}
+
+/** Proposed (backend item 12): knowledge the agent has kept and uses. */
+export type KnowledgeEntry = {
+  id: string
+  text: string
+  kind: string
+  agent_name: string | null
+  source_session_id: string | null
+  kept_by: string | null
+  kept_at: string
+  lookups: number
+  last_used_at: string | null
+}
+
+/** How an agent marks its summary: "attention" when the result needs a person to look. */
+export type SummaryTone = "neutral" | "attention"
+
+/**
+ * Proposed (backend items 1 and 2): `GET /api/sessions?include=overview`.
+ * `title`, `summary` and `summary_tone` are set by the agent; everything else the runtime
+ * derives.
+ */
+export type SessionOverview = {
+  session_id: string
+  title: string | null
+  summary: string | null
+  summary_tone: SummaryTone | null
+  state: SessionState
+  reason: string | null
+  started_at: string
+  ended_at: string | null
+  last_activity_at: string
+  model_steps: number
+  tool_calls: number
+  tokens: { input: number; output: number; cached: number }
+  cost: { amount: number; currency: string; complete: boolean } | null
+  uses: { browser: boolean; subagents: number; artifacts: number }
+  /**
+   * The session ran as an eval trial (runtime-owned metadata `cayu:eval_trial`, set on
+   * the trial and every session created under it). Cloud's numbers leave these out.
+   */
+  eval_trial?: boolean
+}
+
+/**
+ * Proposed (backend item 3): inbox filters. `/api/inbox` itself exists; today's server
+ * ignores these, so real.ts filters what it reads.
+ */
+export type InboxQuery = {
+  limit?: number
+  cursor?: string | null
+  session_id?: string
+  agent_name?: string
+  kind?: InboxItem["kind"]
+}
+
+/**
+ * Settling a manual recovery with the evidence of what happened: whether the tool call
+ * that never reported a result really completed or failed, the externally verified result
+ * or failure reason, and, when the call was a question, the person's answer again.
+ */
+export type RecoveryRequest = {
+  /** The inbox item's `attention_id`, naming which pending recovery this settles. */
+  attention_id?: string | null
+  outcome: "completed" | "failed"
+  message: string
+  answer?: string | null
+}
+
+/** What the shell shows about the running app. Proposed: a small `/api/app` read. */
+export type AppInfo = { name: string; runtime_version: string }
+
+export type Api = {
+  app(): Promise<AppInfo>
+  specialists(): Promise<AgentsPage>
+  sessions(query?: SessionListQuery): Promise<SessionsPage>
+  session(id: string): Promise<SessionDetail>
+  overviews(ids: string[]): Promise<SessionOverview[]>
+  transcript(id: string, query?: SessionTranscriptQuery): Promise<SessionTranscriptPage>
+  events(id: string, query?: SessionEventsQuery): Promise<SessionEventsPage>
+  /** `GET /api/tasks`, every task including Cayu's own (`cayu.*` types). */
+  tasks(): Promise<TaskItem[]>
+  /** `GET /api/tasks/{id}`. */
+  task(id: string): Promise<TaskInfo>
+  /** `GET /api/tasks/{id}/schedule/events`; empty for tasks without a schedule. */
+  taskScheduleEvents(id: string): Promise<TaskScheduleEvent[]>
+  holdTask(id: string, hold: TaskHold, reason?: string): Promise<TaskInfo>
+  /** `POST /api/tasks/{id}/resume`: back to pending. */
+  resumeTask(id: string): Promise<TaskInfo>
+  inbox(query?: InboxQuery): Promise<InboxPage>
+  /** `POST /api/inbox/{id}/settle`. Recovery items can't be settled here (409 `not_settleable`). */
+  settle(itemId: string, body: InboxSettleRequest): Promise<InboxItemState>
+  /**
+   * Settle the session's manual recovery: `POST /api/user-input/recover`,
+   * `/api/tool-approvals/recover` or `/api/tool-rounds/recover`, whichever the pending
+   * recovery names, as today's session page does.
+   */
+  recover(sessionId: string, body: RecoveryRequest): Promise<void>
+  /** `POST /api/run`: start a session with one specialist. Returns the new session's ID. */
+  start(body: { agent: string; prompt: string }): Promise<{ session_id: string }>
+  /** `POST /api/sessions/{id}/resume` with a new prompt (backend item 5 for completed sessions). */
+  reply(id: string, prompt: string): Promise<void>
+  /** `POST /api/sessions/{id}/interrupt`, with an optional reason. */
+  interrupt(id: string, reason?: string): Promise<void>
+  /** `GET /api/sessions/{id}/state`: execution state, snapshots, interruption cascade. */
+  state(id: string): Promise<SessionStateRecord>
+  /** Proposed (backend item 7): `GET /api/task-types`. */
+  taskTypes(): Promise<TaskType[]>
+  /** Proposed (backend item 7): `POST /api/tasks`; the app's worker picks it up. */
+  createTask(body: { type: string; input: Record<string, unknown> }): Promise<{
+    task_id: string
+    session_id: string | null
+  }>
+  /**
+   * Replay a session's original input through the same path: rerun its task, or start the
+   * same specialist with the same first message and labels (`POST /api/run`, available today).
+   */
+  runAgain(sessionId: string): Promise<{ session_id: string }>
+  /** Proposed (backend item 11). */
+  toolUsage(): Promise<ToolUsage[]>
+  /** Proposed (backend item 12): `GET /api/knowledge`, active entries. */
+  knowledge(): Promise<KnowledgeEntry[]>
+  /** Proposed (backend item 12): retire an active entry. */
+  removeKnowledge(id: string): Promise<void>
+  /** Proposed (backend item 14): every suite with its last run and baseline. */
+  evalSuites(): Promise<EvalSuiteSummary[]>
+  evalSuite(id: string): Promise<EvalSuiteDetail>
+  /** A run, compared with the suite's baseline unless `compareWith` names another run. */
+  evalRun(id: string, compareWith?: string): Promise<EvalRunDetail>
+  /** `POST /api/evals/runs` for the suite; returns the queued run. */
+  runEvalSuite(suiteId: string): Promise<{ run_id: string }>
+  /** `POST /api/evals/results/{revision}/baseline` for the run's result. */
+  approveBaseline(runId: string): Promise<void>
+  createEvalSuite(body: NewEvalSuite): Promise<{ suite_id: string }>
+  /** The captured-evaluation and promotion flows (`/api/evals/sessions/{id}/evaluation/*`). */
+  addToEvals(body: AddToEvals): Promise<{ suite_id: string; run_id: string | null }>
+  evalSettings(): Promise<EvalSettings>
+}
