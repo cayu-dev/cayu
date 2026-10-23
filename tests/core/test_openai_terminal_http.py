@@ -99,7 +99,7 @@ DEADLINES = ProviderStreamDeadlines(
 REQUEST = ModelRequest(model="synthetic", messages=[Message.text("user", "Synthetic probe")])
 
 
-async def consume(body, *, subscription=False, direct=False, background=False):
+async def consume(body, *, subscription=False, direct=False, background=False, deadlines=DEADLINES):
     transport = HttpxOpenAITransport()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body))
@@ -107,17 +107,17 @@ async def consume(body, *, subscription=False, direct=False, background=False):
         transport._client._client = client
         provider = (
             OpenAISubscriptionProvider(
-                auth=StaticAuth(), transport=transport, stream_deadlines=DEADLINES
+                auth=StaticAuth(), transport=transport, stream_deadlines=deadlines
             )
             if subscription
             else OpenAIProvider(
-                api_key="synthetic", transport=transport, stream_deadlines=DEADLINES
+                api_key="synthetic", transport=transport, stream_deadlines=deadlines
             )
         )
         events = []
         failure = None
         try:
-            async with asyncio.timeout(3):
+            async with asyncio.timeout(deadlines.absolute_stream_timeout_s + 1):
                 stream = provider.runtime_stream(REQUEST)
                 if direct:
                     stream = openai_stream_events(
@@ -126,10 +126,10 @@ async def consume(body, *, subscription=False, direct=False, background=False):
                             headers={},
                             payload={},
                             timeout_s=2,
-                            transport_idle_timeout_s=1,
-                            protocol_idle_timeout_s=1,
-                            semantic_progress_timeout_s=0.15,
-                            absolute_stream_timeout_s=2,
+                            transport_idle_timeout_s=deadlines.transport_idle_timeout_s,
+                            protocol_idle_timeout_s=deadlines.protocol_idle_timeout_s,
+                            semantic_progress_timeout_s=deadlines.semantic_progress_timeout_s,
+                            absolute_stream_timeout_s=deadlines.absolute_stream_timeout_s,
                         )
                     )
                 if background:
@@ -139,10 +139,10 @@ async def consume(body, *, subscription=False, direct=False, background=False):
                             headers={},
                             starting_after=0,
                             timeout_s=2,
-                            transport_idle_timeout_s=1,
-                            protocol_idle_timeout_s=1,
-                            semantic_progress_timeout_s=0.15,
-                            absolute_stream_timeout_s=2,
+                            transport_idle_timeout_s=deadlines.transport_idle_timeout_s,
+                            protocol_idle_timeout_s=deadlines.protocol_idle_timeout_s,
+                            semantic_progress_timeout_s=deadlines.semantic_progress_timeout_s,
+                            absolute_stream_timeout_s=deadlines.absolute_stream_timeout_s,
                         ),
                         state=ProviderOperationState.model_validate(
                             {
@@ -259,12 +259,26 @@ def test_real_tail_timeout_error_is_not_treated_as_drain_expiry():
 @pytest.mark.parametrize("mode", ["api", "subscription", "direct", "background"])
 @pytest.mark.parametrize("chain_cancellation", [False, True])
 def test_tail_timeout_during_drain_cancellation_is_not_success(mode, chain_cancellation):
+    # Only the 50 ms post-terminal drain should expire here. The shared
+    # 150 ms semantic deadline can expire during setup on a loaded CI runner,
+    # before this test reaches the tail whose cancellation it needs to inspect.
+    deadlines = ProviderStreamDeadlines(
+        semantic_progress_timeout_s=5,
+        transport_idle_timeout_s=10,
+        protocol_idle_timeout_s=10,
+        absolute_stream_timeout_s=20,
+    )
+
     class Failure(Body):
+        drain_cancelled = False
+
         async def __aiter__(self):
             yield frame({**terminal(), "sequence_number": 1})
+            self.tail_read = True
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError as cancellation:
+                self.drain_cancelled = True
                 raise TimeoutError("synthetic private tail failure") from (
                     cancellation if chain_cancellation else None
                 )
@@ -276,17 +290,19 @@ def test_tail_timeout_during_drain_cancellation_is_not_success(mode, chain_cance
             subscription=mode == "subscription",
             direct=mode == "direct",
             background=mode == "background",
+            deadlines=deadlines,
         )
     )
     assert error is not None
     if mode in {"api", "subscription"}:
         assert isinstance(error, ModelProviderError)
+        assert not isinstance(error, ModelStreamDeadlineError)
         assert error.retryable is False
         assert "synthetic private tail failure" not in str(error)
     else:
         assert isinstance(error, TimeoutError)
     assert sum(e.type is ModelStreamEventType.COMPLETED for e in events) == 1
-    assert body.closed
+    assert body.closed and body.tail_read and body.drain_cancelled
 
 
 @pytest.mark.parametrize("mode", ["api", "subscription", "direct", "background"])

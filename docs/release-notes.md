@@ -1,6 +1,6 @@
 # Release notes
 
-## Unreleased
+## v0.14.0
 
 Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 (`cayu lambda-microvm sidecar export`). `LambdaMicroVMRunner` now requires sidecar
@@ -113,6 +113,16 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
   Claude Code's system-role messages carrying inline text and an effort setting,
   and Codex's client-tool declarations as an input item with a reasoning context.
   Provider-hosted tools in either are still refused.
+- When `CAYU_CLOUD_REGISTRY_TOKEN` is configured, an Agent registers its tools
+  and active, shared knowledge created by the application with Cayu Cloud and
+  reports their usage. Registration excludes model-written memories, personal
+  knowledge, prompts, argument schemas, arguments, results, and knowledge text.
+  Usage cursors identify each session store so reporting can recover when a
+  store restarts, is replaced, or is restored from a backup. Migrate stores to
+  revision 125 to provide the identity needed for this tracking.
+- `search_knowledge` and automatic knowledge recall now record a
+  `knowledge.lookup` event containing the namespace and entry IDs, without
+  knowledge content.
 - Report run summaries and human touches to Cayu Cloud through the versioned
   `cayu.cloud-agent` contract. With `CAYU_CLOUD_READER_TOKEN_SHA256` set to the
   digest of Cloud's reader token, `cayu serve` and `mount_cayu` serve

@@ -1039,6 +1039,11 @@ def _crash_worker_tool_publication(
             "sqlite" if postgres_dsn is None else "postgres", root, postgres_dsn
         )
         sessions, tasks = factory()
+        if postgres_dsn is not None:
+            # Validate both child-owned stores before the worker takes a short
+            # lease; lazy session-schema validation is not part of this crash.
+            await tasks.ensure_schema()
+            await sessions.ensure_schema()
         app = CayuApp(
             session_store=sessions,
             task_store=tasks,
@@ -1151,6 +1156,20 @@ def test_worker_recovers_tool_publication_after_process_exit(
     crash_staged_terminal = publication_boundary == "staged"
     repository = Path(__file__).resolve().parents[2]
     factory = store_factory or VerifiedWorkerStoreFactory("sqlite", tmp_path)
+    if factory.postgres_dsn is not None:
+        # Schema creation is setup, not part of the publication crash boundary.
+        # Bound it separately so loaded CI can still reach the injected crash.
+        async def prepare_database():
+            sessions, tasks = factory()
+            try:
+                async with asyncio.timeout(_RECOVERY_COMPLETION_TIMEOUT_SECONDS):
+                    await tasks.ensure_schema()
+                    await sessions.ensure_schema()
+            finally:
+                await tasks.close()
+                await sessions.close()
+
+        asyncio.run(prepare_database())
     child_environment = _worker_environment()
     child_environment.pop("CAYU_TEST_VERIFIED_WORKER_DSN", None)
     if factory.postgres_dsn is not None:
@@ -1177,7 +1196,9 @@ def test_worker_recovers_tool_publication_after_process_exit(
         env=child_environment,
         capture_output=True,
         text=True,
-        timeout=30,
+        # Includes interpreter startup and PostgreSQL schema preparation before
+        # the worker reaches the injected crash; this is a harness guard.
+        timeout=_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
         check=False,
     )
     assert child.returncode == (77 if crash_staged_terminal else 75), (child.stdout, child.stderr)
