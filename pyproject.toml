@@ -84,6 +84,7 @@ dev = [
   "testcontainers[postgres]>=4.0",
   "ty>=0.0.1a8",
   "uvicorn>=0.30",
+  "watchfiles>=1.1,<2",
   "websockets>=17.0.1,<17.1",
 ]
 console = [
@@ -131,6 +132,7 @@ server = [
   # Verifies a sign-in proxy's identity header (ProxyIdentityAuth).
   "pyjwt[crypto]>=2.15.0,<3",
   "uvicorn>=0.30",
+  "watchfiles>=1.1,<2",
   "websockets>=17.0.1,<17.1",
   "sse-starlette>=2.0",
 ]
@@ -140,6 +142,7 @@ server-settings = [
   "pyjwt[crypto]>=2.15.0,<3",
   "sse-starlette>=2.0",
   "uvicorn>=0.30",
+  "watchfiles>=1.1,<2",
   "websockets>=17.0.1,<17.1",
 ]
 oidc = [
@@ -148,6 +151,7 @@ oidc = [
   "pyjwt[crypto]>=2.15.0,<3",
   "sse-starlette>=2.0",
   "uvicorn>=0.30",
+  "watchfiles>=1.1,<2",
   "websockets>=17.0.1,<17.1",
 ]
 all = [
@@ -167,6 +171,7 @@ all = [
   "pydantic-settings>=2.7,<3",
   "pyjwt[crypto]>=2.15.0,<3",
   "uvicorn>=0.30",
+  "watchfiles>=1.1,<2",
   "websockets>=17.0.1,<17.1",
   "sse-starlette>=2.0",
 ]

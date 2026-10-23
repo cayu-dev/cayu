@@ -346,7 +346,9 @@ def test_project_server_command_is_release_visible_and_fail_closed() -> None:
     assert "docs/project-server.md" in readme
     assert "`cayu serve` is a process-role adapter" in runtime_contract
     assert "Without `--dev`, the command fails closed" in guide
-    assert "Autoreload and multi-process workers are v1 non-goals" in guide
+    assert "Reload is off by default" in guide
+    assert "cayu serve --dev --reload" in guide
+    assert "Multi-process serving without reload remains outside this command's scope" in guide
     assert "Incomplete-session startup recovery is off by default" in guide
 
 

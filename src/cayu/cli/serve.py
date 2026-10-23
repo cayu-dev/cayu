@@ -18,6 +18,7 @@ from cayu._operator_credentials import (
 )
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import (
+    CayuProject,
     build_project_app,
     build_project_service,
     discover_cayu_project_configuration,
@@ -96,6 +97,11 @@ def add_serve_arguments(parser: argparse.ArgumentParser) -> None:
         default=8000,
         help="TCP port passed to uvicorn (default: 8000).",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Restart on Python source changes for development; in-memory state is lost.",
+    )
     access = parser.add_mutually_exclusive_group()
     access.add_argument(
         "--dev",
@@ -109,120 +115,134 @@ def add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _resolve_serve_project(
+    args: argparse.Namespace, *, start: Path | None = None
+) -> tuple[CayuProject, _ServeSettings]:
+    if args.dev:
+        require_loopback_dev_host(args.host)
+    project = resolve_project(command="cayu serve", suggest_explicit_target=False, start=start)
+    settings = _serve_settings(project.root)
+    auth_target = serve_auth_target(args, settings.auth_target)
+    if project.service_target is None and not args.dev and auth_target is None:
+        raise ServeError(
+            "Refusing to start an unauthenticated server. Pass --dev only for "
+            "trusted local development or configure an authentication target, "
+            "for example [tool.cayu.serve] auth = "
+            f'"{ENVIRONMENT_OPERATOR_AUTH_TARGET}", which reads '
+            f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}."
+        )
+    return project, settings
+
+
+def _build_serve_app(
+    args: argparse.Namespace,
+    project: CayuProject,
+    settings: _ServeSettings,
+    project_control_plane: ProjectControlPlaneContext,
+):
+    """Assemble either supported server with the same access and lifecycle policy."""
+    server_module = importlib.import_module("cayu.server")
+    service_mode = "development" if args.dev else "production"
+    auth_target = serve_auth_target(args, settings.auth_target)
+    if project.service_target is not None:
+        if args.auth is not None or settings.auth_target is not None:
+            raise ServeError(
+                "A maintained public service owns its separate product and Developer "
+                "dashboard access policies; do not configure "
+                "[tool.cayu.serve].auth or --auth."
+            )
+        service = build_project_service(
+            project.service_target,
+            mode=service_mode,
+            command="Serve",
+            project_context=project_control_plane,
+        )
+        if not args.dev:
+            from cayu.runtime.checks import check_public_service_deployment
+
+            findings = check_public_service_deployment(service.manifest)
+            if findings:
+                codes = ", ".join(item.code for item in findings)
+                raise ServeError(
+                    "Refusing to start an unsafe public service: "
+                    f"{codes}. Run `cayu check --deploy --fail-on warning --json`."
+                )
+        server = service.asgi_app
+        print(
+            "Cayu product service: "
+            f"{_service_endpoint_url(args.host, args.port, service.manifest.product_api_path)}"
+            "/operations"
+        )
+        print(
+            "Cayu Developer dashboard: "
+            f"{_control_plane_url(args.host, args.port, service.manifest.control_plane_path)}"
+        )
+    else:
+        auth = None if args.dev else _load_auth(auth_target)
+        app = build_project_app(project.target, command="Serve")
+        lifecycle = server_module.ServerLifecycleConfig(
+            startup_recovery_statuses=settings.startup_recovery_statuses,
+            recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
+        )
+        # Request timing is on for every `cayu serve` process so
+        # `cayu diagnostics requests` and support bundles can read it.
+        request_timing = server_module.RequestTimingConfig()
+        config = (
+            server_module.ServerConfig.local_development(
+                lifecycle=lifecycle,
+                request_timing=request_timing,
+            )
+            if args.dev
+            else server_module.ServerConfig.protected(
+                auth,
+                lifecycle=lifecycle,
+                request_timing=request_timing,
+            )
+        )
+        server = server_module.create_server(
+            app,
+            config=config,
+            project_context=project_control_plane,
+        )
+        print(
+            "Cayu Developer dashboard: "
+            f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
+        )
+    return server
+
+
 def run_serve(args: argparse.Namespace) -> int:
     project_control_plane: ProjectControlPlaneContext | None = None
     exit_code = 0
     try:
-        if args.dev:
-            require_loopback_dev_host(args.host)
-        project = resolve_project(
-            command="cayu serve",
-            suggest_explicit_target=False,
-        )
-        settings = _serve_settings(project.root)
-        auth_target = serve_auth_target(args, settings.auth_target)
-        if project.service_target is None and not args.dev and auth_target is None:
+        project, settings = _resolve_serve_project(args)
+        try:
+            uvicorn = importlib.import_module("uvicorn")
+        except ModuleNotFoundError as exc:
+            if exc.name != "uvicorn":
+                raise
             raise ServeError(
-                "Refusing to start an unauthenticated server. Pass --dev only for "
-                "trusted local development or configure an authentication target, "
-                "for example [tool.cayu.serve] auth = "
-                f'"{ENVIRONMENT_OPERATOR_AUTH_TARGET}", which reads '
-                f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}."
-            )
-        with project_context(project.root):
-            try:
-                server_module = importlib.import_module("cayu.server")
-                try:
-                    uvicorn = importlib.import_module("uvicorn")
-                except ModuleNotFoundError as exc:
-                    if exc.name != "uvicorn":
-                        raise
-                    raise ServeError(
-                        "Cayu serve requires the server extra. "
-                        'Install it with: pip install "cayu[server]"'
-                    ) from exc
-                service_mode = "development" if args.dev else "production"
-                project_control_plane = build_project_control_plane_context(
-                    project.root,
-                    mode=service_mode,
-                )
-                if project.service_target is not None:
-                    if args.auth is not None or settings.auth_target is not None:
-                        raise ServeError(
-                            "A maintained public service owns its separate product and Developer "
-                            "dashboard access policies; do not configure "
-                            "[tool.cayu.serve].auth or --auth."
-                        )
-                    service = build_project_service(
-                        project.service_target,
-                        mode=service_mode,
-                        command="Serve",
-                        project_context=project_control_plane,
-                    )
-                    if not args.dev:
-                        from cayu.runtime.checks import check_public_service_deployment
+                'Cayu serve requires the server extra. Install it with: pip install "cayu[server]"'
+            ) from exc
+        if args.reload:
+            from cayu.cli._serve_reload import run_reload
 
-                        findings = check_public_service_deployment(service.manifest)
-                        if findings:
-                            codes = ", ".join(item.code for item in findings)
-                            raise ServeError(
-                                "Refusing to start an unsafe public service: "
-                                f"{codes}. Run `cayu check --deploy --fail-on warning --json`."
-                            )
-                    server = service.asgi_app
-                    config = None
-                else:
-                    auth = None if args.dev else _load_auth(auth_target)
-                    app = build_project_app(project.target, command="Serve")
-                    lifecycle = server_module.ServerLifecycleConfig(
-                        startup_recovery_statuses=settings.startup_recovery_statuses,
-                        recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
+            run_reload(uvicorn, args, project.root)
+        else:
+            with project_context(project.root):
+                try:
+                    project_control_plane = build_project_control_plane_context(
+                        project.root, mode="development" if args.dev else "production"
                     )
-                    # Request timing is on for every `cayu serve` process so
-                    # `cayu diagnostics requests` and support bundles can read it.
-                    request_timing = server_module.RequestTimingConfig()
-                    config = (
-                        server_module.ServerConfig.local_development(
-                            lifecycle=lifecycle,
-                            request_timing=request_timing,
-                        )
-                        if args.dev
-                        else server_module.ServerConfig.protected(
-                            auth,
-                            lifecycle=lifecycle,
-                            request_timing=request_timing,
-                        )
-                    )
-                    server = server_module.create_server(
-                        app,
-                        config=config,
-                        project_context=project_control_plane,
-                    )
-            except SystemExit as exc:
-                status = exc.code if type(exc.code) is int else 1
-                raise ServeError(
-                    f"Serve project startup raised SystemExit with status {status}."
-                ) from exc
-            try:
-                if project.service_target is None:
-                    assert config is not None
-                    print(
-                        "Cayu Developer dashboard: "
-                        f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
-                    )
-                else:
-                    print(
-                        "Cayu product service: "
-                        f"{_service_endpoint_url(args.host, args.port, service.manifest.product_api_path)}"
-                        "/operations"
-                    )
-                    print(
-                        "Cayu Developer dashboard: "
-                        f"{_control_plane_url(args.host, args.port, service.manifest.control_plane_path)}"
-                    )
+                    server = _build_serve_app(args, project, settings, project_control_plane)
+                except SystemExit as exc:
+                    status = exc.code if type(exc.code) is int else 1
+                    raise ServeError(
+                        f"Serve project startup raised SystemExit with status {status}."
+                    ) from exc
                 uvicorn.run(server, host=args.host, port=args.port)
-            except SystemExit as exc:
-                exit_code = exc.code if isinstance(exc.code, int) else 1
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         exit_code = 1

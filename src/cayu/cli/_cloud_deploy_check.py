@@ -111,7 +111,7 @@ def run_cloud_deploy_check(
 
     When the web command is `cayu serve`, the project must declare `cayu[server]`
     or an extra that includes it (in `pyproject.toml` and, when present, `uv.lock`).
-    The command must not use `--dev`, and, unless a service factory owns access,
+    The command must not use `--dev` or `--reload`, and, unless a service factory owns access,
     the auth target `cayu serve`
     would load (`--auth`, else `[tool.cayu.serve].auth`) must resolve. These checks
     read files and import only a custom auth target; they don't need the server
@@ -255,6 +255,15 @@ def check_serve_can_start(
             )
         )
         return tuple(findings), None
+    if arguments.reload:
+        findings.append(
+            _serve_diagnostic(
+                "SERVE_RELOAD_MODE",
+                path=_WEB_COMMAND_PATH,
+                message="`cayu serve --reload` runs a development file watcher, not a production server.",
+                hint="Remove --reload from the [web] command in cayu-cloud.toml.",
+            )
+        )
     if arguments.dev:
         findings.append(_dev_finding(arguments.host))
         return tuple(findings), None

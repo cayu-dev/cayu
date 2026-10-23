@@ -73,6 +73,12 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
 
 ### Changes
 
+- `cayu serve --reload` watches project Python source and starts a fresh worker
+  after edits. Reload is opt-in and preserves normal authentication and service
+  checks. Each worker warns that in-memory state is lost and active runs may be
+  interrupted; persistent stores retain saved data. See
+  [development reload](project-server.md#reload-python-code-during-development).
+
 - A Claude Code or Codex run through `runner_agent_launch` can now reach the model
   through `ExternalAgentGateway` without a public gateway URL or any route from the
   guest to the host. `runner_port_forward` opens a listening address in the guest

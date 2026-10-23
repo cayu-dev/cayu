@@ -297,12 +297,49 @@ session sweep.
 
 `cayu serve` reports project discovery, factory, auth-target, optional
 dependency, server construction, port binding, startup, and termination
-failures through its process exit. The command boots one uvicorn process with
-one in-memory application object. Autoreload and multi-process workers are v1
-non-goals because they require an importable server factory and separate
-process-lifecycle decisions. Project-side `SystemExit` during import or
-construction is reported as a labeled startup error; Uvicorn's own intentional
-process exit keeps its status.
+failures through its process exit in the default, non-reloading mode. That mode
+boots one uvicorn process with one application object. Project-side `SystemExit`
+during import or construction is reported as a labeled startup error; Uvicorn's
+own intentional process exit keeps its status. The opt-in reload mode below
+reports worker startup errors while its supervisor continues watching for fixes.
+Multi-process serving without reload remains outside this command's scope.
+
+## Reload Python code during development
+
+Reload is off by default. To restart automatically when Python source under the
+resolved project root changes, use:
+
+```bash
+cayu serve --dev --reload
+```
+
+A supervisor starts a fresh worker after the previous worker exits. Each worker
+constructs its own application or maintained public service, applies the same
+access and startup-recovery settings, and runs the normal server lifecycle.
+The supervisor does not construct an application or open project stores.
+`--reload` does not enable `--dev` or weaken authentication; omit `--dev` to use
+the configured protected access while developing. `--dev` remains loopback-only.
+
+Each worker startup prints a warning: in-memory state is lost on restart and
+active runs can be interrupted. In-memory stores are allowed for disposable
+experiments. Persistent stores retain saved data, but do not keep active runs
+uninterrupted; the normal recovery rules still apply. A run still in flight when
+the worker exits can remain `running` in its durable record until explicitly
+recovered; reload does not enable the optional startup-recovery sweep.
+HTTP requests get up to five seconds to drain before cancellation, followed by
+the existing Cayu application shutdown grace period. The next worker starts
+only after the old process exits. Use reload for local
+development, not production.
+
+The watcher observes Python source edits, creation and deletion using the
+`watchfiles` dependency included in the server extra; it does not rebuild
+dashboard assets. Synchronous factories run before the worker event loop starts,
+just as in ordinary serving, so they may use `asyncio.run()` during construction.
+Cloud deployment checks reject a web command containing `--reload`.
+Restart the command manually after changing environment variables, dependencies
+or non-Python configuration. If an edit prevents worker startup, the supervisor
+keeps watching: correct the source and save again to start another worker.
+Stop the command with Ctrl+C to shut down the worker and supervisor.
 
 ## Serve a maintained public-agent service
 

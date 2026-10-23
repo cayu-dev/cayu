@@ -464,3 +464,19 @@ def test_deploy_uploads_a_project_protected_only_by_the_command_line_override(
         "command": "cayu check --deploy --fail-on warning --json",
         "status": "passed",
     }
+
+
+@pytest.mark.parametrize("dev", [False, True])
+def test_reload_mode_blocks_a_cloud_web_process(tmp_path: Path, dev: bool) -> None:
+    project = _project(tmp_path)
+    command = "cayu serve --reload --dev" if dev else _SERVE + " --reload"
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=command)
+
+    assert check.status == "failed"
+    assert "SERVE_RELOAD_MODE" in check.codes
+    if dev:
+        assert "SERVE_DEV_MODE" in check.codes
+    finding = next(item for item in check.blocking if item.code == "SERVE_RELOAD_MODE")
+    assert finding.path == "cayu-cloud.toml:[web].command"
+    assert "Remove --reload" in finding.hint

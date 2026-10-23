@@ -14,6 +14,15 @@ All three modes expose a Developer dashboard surface. Public deployment requires
 and authorization; unauthenticated `ServerConfig.local_development()` access is for trusted
 loopback development only.
 
+## Local development reload
+
+Use `cayu serve --dev --reload` to restart the server after Python source changes.
+Reload is opt-in and prints a warning at every worker startup: in-memory state is
+lost and active runs can be interrupted. Persistent stores retain saved data,
+but do not keep active runs uninterrupted. Authentication and the loopback-only
+`--dev` restriction remain unchanged. See [project server reload](project-server.md#reload-python-code-during-development)
+for watched files, startup failures and shutdown behavior.
+
 ## Agent identity and viewer access
 
 `GET /api/app` returns `name`, `runtime_version`, `role` and `full_access`.

@@ -863,6 +863,7 @@ and don't need `cayu[server]` installed locally:
 | `SERVE_SERVER_EXTRA_MISSING` | `[project].dependencies` has no `cayu` requirement with the `server` extra or an extra that includes its dependencies (`all`, `server-settings`, or `oidc`). |
 | `SERVE_LOCK_MISSING_SERVER_EXTRA` | `pyproject.toml` declares server dependencies through one of those extras but `uv.lock` doesn't; Cloud installs from `uv.lock`. Run `uv lock`. |
 | `SERVE_COMMAND_INVALID` | `cayu serve` would reject the web command's arguments, for example `--dev` with `--auth`, an unknown option, or an unclosed quote. |
+| `SERVE_RELOAD_MODE` | The web command passes development-only `--reload`. Remove it before deploying; Cloud must not run the file watcher or restart on source edits. |
 | `SERVE_DEV_MODE` | The web command passes `--dev`. `cayu serve` refuses it on a non-loopback host such as `0.0.0.0`, and on loopback it is unauthenticated and unreachable from Cloud. |
 | `SERVE_AUTH_MISSING` | Neither `--auth` nor `[tool.cayu.serve].auth` names a target and there is no `service_factory`, or `[tool.cayu.serve].auth` is not a non-empty string (which `cayu serve` rejects even with `--auth`). |
 | `SERVE_AUTH_TARGET_UNRESOLVABLE` | The effective target's project module or attribute doesn't exist, it isn't callable, or it is the ready-made target and the declared `cayu` requirement allows 0.8.1 or older, which don't ship it. |
