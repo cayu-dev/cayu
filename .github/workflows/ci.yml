@@ -136,7 +136,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, server, dashboard, authoring, coding, docker, service]
+        group: [core, server, campaign, dashboard, authoring, coding, docker, service]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         # Verification consumes the shared archives and current scripts. Only

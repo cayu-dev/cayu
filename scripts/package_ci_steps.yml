@@ -53,10 +53,10 @@ steps:
     groups: build
     run: uv run python scripts/check_release_artifacts.py dist/first/*
   - name: Create base release environment
-    groups: core, server, dashboard, authoring, coding, docker, service
+    groups: core, server, campaign, dashboard, authoring, coding, docker, service
     run: uv venv --python 3.11 .release-venv
   - name: Install built wheel
-    groups: core, server, dashboard, authoring, coding, docker, service
+    groups: core, server, campaign, dashboard, authoring, coding, docker, service
     run: uv pip install --python .release-venv/bin/python dist/first/*.whl
   - name: Verify complete public concept layout from the built wheel
     groups: core
@@ -197,7 +197,8 @@ steps:
       unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
       .release-server-venv/bin/python examples/dashboard_behavior_live.py
   - name: Verify installed benchmark campaign lifecycle
-    groups: server
+    # Its own group: it runs beside the server journeys instead of after them.
+    groups: campaign
     run: |
       unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
       unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN

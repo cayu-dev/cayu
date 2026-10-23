@@ -111,6 +111,7 @@ class VerificationScope:
 _PACKAGE_VERIFICATION_GROUPS = (
     "core",
     "server",
+    "campaign",
     "dashboard",
     "authoring",
     "coding",

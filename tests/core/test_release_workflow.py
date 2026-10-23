@@ -376,7 +376,9 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     assert package_manifest.count(sidecar_verifier_command) == 1
     checks = _job_block(workflow, "package")
     assert "needs: package-build" in checks
-    assert "group: [core, server, dashboard, authoring, coding, docker, service]" in checks
+    assert (
+        "group: [core, server, campaign, dashboard, authoring, coding, docker, service]" in checks
+    )
     assert "matrix.group == 'core'" in checks
     assert '["self-hosted","linux","arm64","gcp-ci"]' in checks
     assert "ubuntu-24.04-arm" in checks

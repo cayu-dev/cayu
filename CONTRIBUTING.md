@@ -427,7 +427,7 @@ retry alone does not establish that an ownership failure is harmless.
 Release tags rerun every retained gate and require full-scale qualification, add release-only
 freshness and tag/version checks, and may publish the exact artifact validated by that release
 path. Package verification builds one wheel and source archive, then checks those same archives
-in parallel core, server, dashboard, authoring, coding, Docker, and service jobs.
+in parallel core, server, campaign, dashboard, authoring, coding, Docker, and service jobs.
 
 Run the complete contract, including full-scale qualification, locally from a clean tracked checkout:
 
