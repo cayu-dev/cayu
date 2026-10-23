@@ -108,6 +108,7 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.session_supervision_events_supported,
                     mutation_supported=False,
                 ),
+                inbox_queries=_optional_surface(True, mutation_supported=False),
                 inbox=_optional_surface(
                     True,
                     mutation_supported=True,

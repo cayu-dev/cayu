@@ -8400,6 +8400,16 @@
               }
             ]
           },
+          "inbox_queries": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "pricing": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -20468,6 +20478,68 @@
         "title": "InboxConflictResponse",
         "type": "object"
       },
+      "InboxCounts": {
+        "additionalProperties": false,
+        "description": "Exact live-inbox totals, unavailable when access or source evidence is incomplete.",
+        "properties": {
+          "complete": {
+            "default": false,
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "counts": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "propertyNames": {
+                  "enum": [
+                    "approval",
+                    "question",
+                    "recovery",
+                    "knowledge"
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counts"
+          },
+          "total_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Count"
+          },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "access_limited",
+                  "source_incomplete"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Reason"
+          }
+        },
+        "title": "InboxCounts",
+        "type": "object"
+      },
       "InboxDecider": {
         "additionalProperties": false,
         "description": "Who settled an item, as the Runtime recorded it.",
@@ -20567,6 +20639,23 @@
               }
             ],
             "title": "Agent Name"
+          },
+          "arguments": {
+            "description": "Proposed arguments remain quarantined before execution.",
+            "title": "Arguments",
+            "type": "null"
+          },
+          "arguments_unavailable_reason": {
+            "anyOf": [
+              {
+                "const": "quarantined",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments Unavailable Reason"
           },
           "attention_id": {
             "anyOf": [
@@ -32999,7 +33088,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "52",
+            "default": "53",
             "title": "Contract Version",
             "type": "string"
           },
@@ -39985,7 +40074,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "52",
+            "default": "53",
             "title": "Contract Version",
             "type": "string"
           }
@@ -44716,6 +44805,62 @@
               ],
               "title": "Cursor"
             }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "approval",
+                    "question",
+                    "recovery",
+                    "knowledge"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
           }
         ],
         "responses": {
@@ -44761,6 +44906,91 @@
           }
         },
         "summary": "List Inbox"
+      }
+    },
+    "/api/inbox/counts": {
+      "get": {
+        "description": "Count every pending inbox kind independently of list page size. Limited callers receive unavailable counts, never hidden totals. Reads bounded source pages to exhaustion; source issues yield unavailable counts.",
+        "operationId": "inbox_counts_api_inbox_counts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboxCounts"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Inbox Counts"
       }
     },
     "/api/inbox/{item_id}": {

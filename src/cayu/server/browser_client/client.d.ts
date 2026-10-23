@@ -219,6 +219,8 @@ export interface InboxItem {
   title: string
   detail: string | null
   tool_name: string | null
+  arguments: null
+  arguments_unavailable_reason: "quarantined" | null
   question: string | null
   options: string[]
   knowledge: { entry_id: string; revision: number; kind: string } | null
@@ -310,7 +312,20 @@ export interface InboxSnapshot {
   complete: boolean
 }
 
-export interface WatchInboxOptions {
+export interface InboxFilters {
+  session_id?: string
+  agent_name?: string
+  kind?: InboxItemKind
+}
+
+export interface InboxCounts {
+  counts: Record<InboxItemKind, number> | null
+  total_count: number | null
+  complete: boolean
+  unavailable_reason: "access_limited" | "source_incomplete" | null
+}
+
+export interface WatchInboxOptions extends InboxFilters {
   /** Called with the whole inbox whenever an item appears or leaves it. */
   onChange?: (inbox: InboxSnapshot) => void
   /**
@@ -337,7 +352,16 @@ export interface CayuClient {
   getSessionUsage(sessionId: string, options?: { signal?: AbortSignal }): Promise<CayuSessionUsage>
   /** Whether the server serves the agent's inbox. The inbox methods throw `unavailable` otherwise. */
   readonly inboxAvailable: boolean
-  listInbox(options?: { limit?: number; cursor?: string; signal?: AbortSignal }): Promise<InboxPage>
+  listInbox(
+    options?: InboxFilters & {
+      limit?: number
+      cursor?: string
+      signal?: AbortSignal
+    },
+  ): Promise<InboxPage>
+  getInboxCounts(
+    options?: Omit<InboxFilters, "kind"> & { signal?: AbortSignal },
+  ): Promise<InboxCounts>
   getInboxItem(itemId: string, options?: { signal?: AbortSignal }): Promise<InboxItemState>
   /**
    * Settle one item as the signed-in person. Resolves with `settled: false` when

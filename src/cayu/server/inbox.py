@@ -93,6 +93,10 @@ class InboxItem(_InboxModel):
     title: str
     detail: str | None = None
     tool_name: str | None = None
+    arguments: None = Field(
+        default=None, description="Proposed arguments remain quarantined before execution."
+    )
+    arguments_unavailable_reason: Literal["quarantined"] | None = None
     question: str | None = None
     options: list[str] = Field(default_factory=list)
     knowledge: InboxKnowledgeEntry | None = None
@@ -163,6 +167,19 @@ class InboxPage(_InboxModel):
     next_cursor: str | None
     has_more: bool
     issues: list[InboxIssue] = Field(default_factory=list)
+
+
+class InboxCounts(_InboxModel):
+    """Exact live-inbox totals, unavailable when access or source evidence is incomplete."""
+
+    counts: dict[InboxItemKind, int] | None = None
+    total_count: int | None = Field(default=None, ge=0)
+    complete: bool = False
+    unavailable_reason: Literal["access_limited", "source_incomplete"] | None = None
+
+    @classmethod
+    def unavailable(cls, reason: Literal["access_limited", "source_incomplete"]) -> InboxCounts:
+        return cls(unavailable_reason=reason)
 
 
 class InboxSettleRequest(_InboxModel):

@@ -20014,3 +20014,16 @@ operation records and matching tool names are not evidence. The exact built-in
 browser tool owner publishes that reserved receipt atomically with its durable
 operation. Generic operation publishers cannot create or replace it.
 Cloud's existing content-free summaries do not gain display metadata.
+
+## Inbox query contract (server contract 53)
+
+Contract 53 adds the read-only `inbox_queries` capability, server-side
+`session_id`, `agent_name` and `kind` filters on `GET /api/inbox`, and
+`GET /api/inbox/counts` for exact per-kind totals independent of page size.
+Counts remain unavailable for access-limited callers or incomplete source
+evidence. Filter changes invalidate pagination cursors. Approval and recovery
+items explicitly report quarantined arguments as unavailable; private executable
+arguments remain withheld and protected human review remains authoritative for
+disclosure. See [the inbox contract](inbox.md) for response fields and paging.
+Regenerate clients against contract 53; clients must treat null counts as
+unavailable, not zero, and continue through empty pages with a cursor.

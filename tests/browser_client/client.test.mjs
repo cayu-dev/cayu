@@ -1130,3 +1130,65 @@ test("watchInbox sends nothing while hidden and stops on authorization failures"
   assert.deepEqual(stops, ["error"])
   await assertQuiet(server)
 })
+
+test("inbox filters reach list and every watched continuation", async () => {
+  const server = new FakeServer()
+  server.inboxPages = new Map([
+    [null, { items: [], issues: [], next_cursor: "hidden-position" }],
+    ["hidden-position", { items: [inboxItem("approval")], issues: [], next_cursor: null }],
+  ])
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const filters = {
+    session_id: "public session",
+    agent_name: "specialist",
+    kind: "approval",
+  }
+  await client.listInbox({ ...filters, limit: 1 })
+  const changes = []
+  const stop = client.watchInbox({
+    ...filters,
+    onChange: (inbox) => changes.push(inbox),
+  })
+  await flush()
+  assert.equal(changes.length, 1)
+  assert.equal(changes[0].complete, true)
+  for (const request of server.requestsTo("/inbox")) {
+    for (const [key, value] of Object.entries(filters)) assert.equal(request.query.get(key), value)
+  }
+  stop()
+  await flush()
+})
+
+test("getInboxCounts sends only scope filters to the shared count endpoint", async () => {
+  const server = new FakeServer()
+  const counts = {
+    counts: null,
+    total_count: null,
+    complete: false,
+    unavailable_reason: "access_limited",
+  }
+  const requests = []
+  const client = await connect({
+    apiBaseUrl: API,
+    fetch: (url, init) => {
+      const parsed = new URL(url)
+      if (parsed.pathname.endsWith("/inbox/counts")) {
+        requests.push(parsed)
+        return Promise.resolve(json(counts))
+      }
+      return server.fetch(url, init)
+    },
+  })
+  assert.deepEqual(
+    await client.getInboxCounts({
+      session_id: "public/session",
+      agent_name: "agent",
+      kind: "approval",
+    }),
+    counts,
+  )
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].searchParams.get("session_id"), "public/session")
+  assert.equal(requests[0].searchParams.get("agent_name"), "agent")
+  assert.equal(requests[0].searchParams.has("kind"), false)
+})

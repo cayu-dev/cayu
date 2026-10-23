@@ -12,7 +12,7 @@
 /** Version of this module's public API, advertised as `client.version` by `/api/contract`. */
 export const CLIENT_VERSION = "1"
 /** Exact server contract version this module was released with. */
-export const CONTRACT_VERSION = "52"
+export const CONTRACT_VERSION = "53"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"])
 const ACTIVE_STATUSES = new Set(["pending", "running", "interrupting"])
@@ -143,7 +143,21 @@ class CayuClient {
 
   async listInbox(options = {}) {
     requireInbox(this.#context.contract)
-    return readInboxPage(this.#context, options.cursor ?? null, options.limit, options.signal)
+    return readInboxPage(
+      this.#context,
+      options.cursor ?? null,
+      options.limit,
+      options.signal,
+      options,
+    )
+  }
+
+  async getInboxCounts(options = {}) {
+    requireInbox(this.#context.contract)
+    const params = inboxFilters(options, false)
+    return requestJson(this.#context, `/inbox/counts?${params}`, {
+      signal: options.signal,
+    })
   }
 
   async getInboxItem(itemId, options = {}) {
@@ -553,7 +567,9 @@ function watchInbox(context, options) {
     for (let page = 0; page < DEFAULTS.inboxMaxPages; page += 1) {
       let body
       try {
-        body = await runner.run((signal) => readInboxPage(context, cursor, undefined, signal))
+        body = await runner.run((signal) =>
+          readInboxPage(context, cursor, undefined, signal, options),
+        )
       } catch (error) {
         // A later page the server can no longer continue (for example it restarted
         // and its cursor key changed) starts this refresh over from the first page,
@@ -649,8 +665,19 @@ function startWatch(options, read) {
   return () => stop("stopped")
 }
 
-async function readInboxPage(context, cursor, limit, signal) {
-  const params = new URLSearchParams({ limit: String(positive(limit, DEFAULTS.inboxPageLimit)) })
+function inboxFilters(options, includeKind = true) {
+  const params = new URLSearchParams()
+  for (const key of includeKind
+    ? ["session_id", "agent_name", "kind"]
+    : ["session_id", "agent_name"]) {
+    if (options[key] !== undefined) params.set(key, options[key])
+  }
+  return params
+}
+
+async function readInboxPage(context, cursor, limit, signal, options = {}) {
+  const params = inboxFilters(options)
+  params.set("limit", String(positive(limit, DEFAULTS.inboxPageLimit)))
   if (cursor !== null) params.set("cursor", cursor)
   const page = await requestJson(context, `/inbox?${params}`, { signal })
   if (!page || !Array.isArray(page.items) || !Array.isArray(page.issues)) {
@@ -894,7 +921,9 @@ async function httpError(response) {
     })
   }
   if (status === 404) {
-    return new CayuClientError("not_found", `Not found (404)${suffix}`, { status })
+    return new CayuClientError("not_found", `Not found (404)${suffix}`, {
+      status,
+    })
   }
   const retryable = status === 408 || status === 425 || status === 429 || status >= 500
   return new CayuClientError("http", `The server responded ${status}${suffix}`, {

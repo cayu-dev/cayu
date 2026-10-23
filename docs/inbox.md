@@ -49,6 +49,33 @@ the call, so an approval shows the policy's reason, not the arguments. To show a
 person more, configure a [human-review policy](human-review.md), which decides what
 each reviewer may see.
 
+`GET /api/inbox` accepts `session_id`, `agent_name` and `kind` (`approval`,
+`question`, `recovery`, `knowledge`). Filters combine with AND and are applied by
+the source reader, before pagination. Knowledge proposals have no session or
+specialist identity, so session/specialist filters exclude them. Blank filters
+and unknown kinds return 422. A cursor belongs to its filters; changing them
+requires starting without a cursor. The browser client's `listInbox` and
+`watchInbox` accept these same filters.
+
+`GET /api/inbox/counts` accepts `session_id` and `agent_name` and returns
+`counts` for all four kinds, `total_count`, `complete`, and `unavailable_reason`.
+It follows the same bounded source pages to exhaustion, independently of the
+list's page size, deduplicating exact item identities. It never returns a capped
+subtotal. With an inbox access rule, `counts` and `total_count` are null,
+`complete` is false and `unavailable_reason` is `access_limited`; no hidden
+store totals are exposed. Source issues or conflicting representations of an
+item similarly return null counts with `source_incomplete`. Read failures and
+cancellation do not publish partial totals. A repeated cursor returns 409.
+The queue is live, not a transactional snapshot across sources; refresh after
+settling an item. `client.getInboxCounts` reads this endpoint. The read-only
+`inbox_queries` capability advertises filters, counts and argument availability.
+
+Approval and recovery items explicitly return `arguments: null` and
+`arguments_unavailable_reason: "quarantined"`. Other kinds return a null reason.
+The public API never reconstructs executable arguments from private checkpoints
+for display. The separately authorized human-review policy remains the route
+for reviewer-specific disclosure; this field does not bypass it.
+
 The list is paged. Follow `next_cursor` until it is `null`, including when a page
 has no items. Knowledge proposals come after the session items, starting pages of
 their own. Each request scans at most ten knowledge store pages of 200 proposals,
@@ -57,7 +84,8 @@ continues after the last scanned proposal, including hidden proposals, so those
 proposals cannot block later permitted ones. Settling or deleting preceding
 proposals does not shift this keyset position. The queue is live: a proposal whose
 priority or update time changes can move before the position; refresh to see it.
-`issues` names sessions too large or invalid to list.
+`issues` names sessions too large or invalid to list and reports an incomplete
+source scan when the source cannot supply a continuation.
 
 Paging needs no configuration: `cayu serve`, `create_server`, `mount_cayu` and
 `create_router` page every inbox to its end. A caller no
@@ -76,7 +104,7 @@ always comes with a cursor.
 
 A sealed cursor is encrypted and authenticated with AES-256-GCM, bound to the
 verified subject and tenant and to the listing (the knowledge review scope and
-query, or the pending-action filters), and expires after 15 minutes. Decoding
+query, and the inbox or pending-action filters), and expires after 15 minutes. Decoding
 permits an issuing worker's clock to be up to 60 seconds ahead; it does not extend
 the 15-minute expiry measured from the authenticated issuance time. Every page
 rechecks current authorization.

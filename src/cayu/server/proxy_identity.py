@@ -144,6 +144,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/health",
             "/human-attention/{attention_id}",
             "/inbox",
+            "/inbox/counts",
             "/inbox/{item_id}",
             "/knowledge/pending",
             "/knowledge/pending/{entry_id}",

@@ -224,6 +224,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     session_follow: OptionalSurfaceCapability | None = None
     supervision: OptionalSurfaceCapability | None = None
     inbox: OptionalSurfaceCapability | None = None
+    inbox_queries: OptionalSurfaceCapability | None = None
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability
     artifacts: OptionalSurfaceCapability

@@ -4131,6 +4131,7 @@ export type ControlPlaneSurfaceCapabilities = {
     evals: OptionalSurfaceCapability;
     evaluation_promotion: OptionalSurfaceCapability;
     inbox?: OptionalSurfaceCapability | null;
+    inbox_queries?: OptionalSurfaceCapability | null;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     session_display_metadata?: OptionalSurfaceCapability | null;
@@ -10090,6 +10091,32 @@ export type InboxConflictResponse = {
 };
 
 /**
+ * InboxCounts
+ *
+ * Exact live-inbox totals, unavailable when access or source evidence is incomplete.
+ */
+export type InboxCounts = {
+    /**
+     * Complete
+     */
+    complete?: boolean;
+    /**
+     * Counts
+     */
+    counts?: {
+        [key: string]: number;
+    } | null;
+    /**
+     * Total Count
+     */
+    total_count?: number | null;
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: 'access_limited' | 'source_incomplete' | null;
+};
+
+/**
  * InboxDecider
  *
  * Who settled an item, as the Runtime recorded it.
@@ -10148,6 +10175,16 @@ export type InboxItem = {
      * Agent Name
      */
     agent_name?: string | null;
+    /**
+     * Arguments
+     *
+     * Proposed arguments remain quarantined before execution.
+     */
+    arguments?: null;
+    /**
+     * Arguments Unavailable Reason
+     */
+    arguments_unavailable_reason?: 'quarantined' | null;
     /**
      * Attention Id
      *
@@ -23520,6 +23557,18 @@ export type ListInboxApiInboxGetData = {
          * Cursor
          */
         cursor?: string | null;
+        /**
+         * Session Id
+         */
+        session_id?: string | null;
+        /**
+         * Agent Name
+         */
+        agent_name?: string | null;
+        /**
+         * Kind
+         */
+        kind?: 'approval' | 'question' | 'recovery' | 'knowledge' | null;
     };
     url: '/api/inbox';
 };
@@ -23549,6 +23598,48 @@ export type ListInboxApiInboxGetResponses = {
 };
 
 export type ListInboxApiInboxGetResponse = ListInboxApiInboxGetResponses[keyof ListInboxApiInboxGetResponses];
+
+export type InboxCountsApiInboxCountsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Session Id
+         */
+        session_id?: string | null;
+        /**
+         * Agent Name
+         */
+        agent_name?: string | null;
+    };
+    url: '/api/inbox/counts';
+};
+
+export type InboxCountsApiInboxCountsGetErrors = {
+    /**
+     * Conflict
+     */
+    409: ApiErrorResponse;
+    /**
+     * Request Entity Too Large
+     */
+    413: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type InboxCountsApiInboxCountsGetError = InboxCountsApiInboxCountsGetErrors[keyof InboxCountsApiInboxCountsGetErrors];
+
+export type InboxCountsApiInboxCountsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: InboxCounts;
+};
+
+export type InboxCountsApiInboxCountsGetResponse = InboxCountsApiInboxCountsGetResponses[keyof InboxCountsApiInboxCountsGetResponses];
 
 export type GetInboxItemApiInboxItemIdGetData = {
     body?: never;
