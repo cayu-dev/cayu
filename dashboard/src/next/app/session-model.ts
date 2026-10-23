@@ -197,10 +197,11 @@ export function argPreview(args: unknown): string {
   return json === "{}" ? "" : (json ?? "")
 }
 
-const TZ = "America/Los_Angeles"
-const dayKey = (ms: number, timeZone = TZ) => new Date(ms).toLocaleDateString("en-CA", { timeZone })
+const viewerTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone
+const dayKey = (ms: number, timeZone = viewerTimeZone()) =>
+  new Date(ms).toLocaleDateString("en-CA", { timeZone })
 
-export function relativeTime(ms: number, now: number, timeZone = TZ): string {
+export function relativeTime(ms: number, now: number, timeZone = viewerTimeZone()): string {
   const s = Math.max(0, (now - ms) / 1000)
   if (s < 60) return "now"
   if (s < 3600) return `${Math.round(s / 60)}m`

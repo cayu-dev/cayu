@@ -1,3 +1,5 @@
+import { ROLE_FORBIDDEN_REASON, roleForbiddenMessage } from "./dashboard-access.ts"
+
 // This client is deliberately separate from the shared query/mutation caches.
 export type BrowserIdentity = {
   session_id: string
@@ -185,7 +187,7 @@ export function createBrowserControlClient(
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       })
-      if (!response.ok || !response.body) {
+      if ((!response.ok && response.status !== 403) || !response.body) {
         await response.body?.cancel()
         unavailable()
       }
@@ -211,8 +213,12 @@ export function createBrowserControlClient(
         bytes.set(chunk, offset)
         offset += chunk.length
       }
-      return object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)))
-    } catch {
+      const result = object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)))
+      if (roleForbiddenMessage(response.status, result.detail)) throw new BrowserRoleForbidden()
+      if (!response.ok) unavailable()
+      return result
+    } catch (error) {
+      if (error instanceof BrowserRoleForbidden) throw error
       // Never render server details or transport exceptions containing tokens.
       unavailable()
     }
@@ -431,9 +437,14 @@ export async function requestFreshBrowserView(
 }
 
 export class BrowserViewUnavailable extends Error {}
+export class BrowserRoleForbidden extends Error {
+  constructor() {
+    super(ROLE_FORBIDDEN_REASON)
+  }
+}
 
 export function browserViewFailureMessage(error: unknown): string {
-  return error instanceof BrowserViewUnavailable
+  return error instanceof BrowserViewUnavailable || error instanceof BrowserRoleForbidden
     ? error.message
     : "Private view unavailable. The browser or page may have changed or closed, or capture may be paused. Refresh discovery before opening a new view."
 }

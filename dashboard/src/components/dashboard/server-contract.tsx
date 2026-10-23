@@ -1,11 +1,13 @@
 import { createContext, type ReactNode, useContext } from "react"
 import type { ServerContract } from "../../lib/api"
+import { applyViewerAccess } from "../../lib/dashboard-access"
 import {
   type DashboardCapabilityRequirement,
   dashboardCapabilityUnavailableText,
   resolveDashboardCapability,
 } from "../../lib/dashboard-capabilities"
 import { Page, PageHeader, StateMessage } from "./layout"
+import { useViewer } from "./viewer"
 
 const ServerContractContext = createContext<ServerContract | null>(null)
 
@@ -30,7 +32,11 @@ export function useServerContract(): ServerContract {
 }
 
 export function useDashboardCapability(requirement: DashboardCapabilityRequirement) {
-  return resolveDashboardCapability(useServerContract().capabilities, requirement)
+  return applyViewerAccess(
+    resolveDashboardCapability(useServerContract().capabilities, requirement),
+    requirement,
+    useViewer(),
+  )
 }
 
 export function CapabilityRoute({

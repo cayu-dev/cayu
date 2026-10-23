@@ -30,7 +30,6 @@ const ts = (e: SessionEvent) => Date.parse((e as { timestamp: string }).timestam
 const toolOf = (e: SessionEvent) => (e as { tool_name?: string | null }).tool_name ?? null
 const clock = (ms: number, seconds = true) =>
   new Date(ms).toLocaleTimeString("en-US", {
-    timeZone: "America/Los_Angeles",
     hour: "numeric",
     minute: "2-digit",
     ...(seconds ? { second: "2-digit" } : {}),
@@ -642,7 +641,7 @@ function SpanDetail({
             {STATUS_LABEL[span.status]}
           </span>
           <span className="tabular-nums">{duration}</span>
-          <span className="tabular-nums">started {clock(span.start)} PT</span>
+          <span className="tabular-nums">started {clock(span.start)}</span>
           {span.kind === "tool" && (
             <NavLink
               to={sessionPath(session.id)}
@@ -871,7 +870,7 @@ function EventDetail({
             <EventTypeName event={event} />
           </p>
           <p className="text-xs text-muted-foreground tabular-nums">
-            #{event.sequence} · {clock(ts(event))} PT
+            #{event.sequence} · {clock(ts(event))}
           </p>
         </div>
         <button

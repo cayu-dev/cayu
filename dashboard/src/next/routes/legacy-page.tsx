@@ -15,6 +15,7 @@ import {
   useRouter,
 } from "@tanstack/react-router"
 import { CapabilityRoute, ServerContractProvider } from "@/components/dashboard/server-contract"
+import { ViewerProvider } from "@/components/dashboard/viewer"
 import { fetchServerContract, isSupportedServerContract } from "@/lib/api"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "@/lib/dashboard-capabilities"
 import { parseDashboardSearch, stringifyDashboardSearch } from "@/lib/search-params"
@@ -34,7 +35,11 @@ function ContractGate() {
     return <ErrorState error={new Error("This Cayu server's contract isn't supported.")} />
   return (
     <ServerContractProvider contract={contract.data}>
-      <Outlet />
+      <ViewerProvider
+        value={{ name: "Prototype", runtime_version: "prototype", role: null, full_access: true }}
+      >
+        <Outlet />
+      </ViewerProvider>
     </ServerContractProvider>
   )
 }

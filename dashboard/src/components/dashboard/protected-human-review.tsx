@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react"
+import { ApiClientError, throwResponseError } from "../../lib/api"
 import { apiUrl } from "../../lib/config"
+import { roleForbiddenMessage } from "../../lib/dashboard-access"
 import type {
   HumanReviewView,
   ToolApprovalBody,
@@ -73,7 +75,7 @@ export function ProtectedHumanReview({
           signal: controller.signal,
         },
       )
-      if (!response.ok) throw new Error("Review access was denied or is unavailable.")
+      if (!response.ok) await throwResponseError(response)
       const next: HumanReviewView = await response.json()
       if (
         next.session_id !== sessionId ||
@@ -83,10 +85,13 @@ export function ProtectedHumanReview({
         throw new Error("The review does not match this pending interaction.")
       }
       if (!controller.signal.aborted) setView(next)
-    } catch {
+    } catch (error) {
       if (!controller.signal.aborted)
         setError(
-          "Review access was denied or is unavailable. Refresh the review or contact the application owner.",
+          (error instanceof ApiClientError
+            ? roleForbiddenMessage(error.status, error.detail)
+            : null) ??
+            "Review access was denied or is unavailable. Refresh the review or contact the application owner.",
         )
     } finally {
       if (!controller.signal.aborted) setBusy(false)

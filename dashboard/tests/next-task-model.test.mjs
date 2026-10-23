@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { groupOf, holdable, isCayuTask, statusLine, when } from "../src/next/app/task-model.ts"
 
-const NOW = Date.parse("2026-10-21T23:30:00Z") // 4:30 PM Pacific
+process.env.TZ = "UTC"
+const NOW = Date.parse("2026-10-21T23:30:00Z")
 const min = 60_000
 const iso = (ms) => new Date(ms).toISOString()
 const task = (over = {}) => ({
@@ -28,11 +29,11 @@ test("statuses fall into five groups", () => {
   assert.equal(groupOf("cancelled"), "done")
 })
 
-test("near times are relative, later ones a Pacific clock time", () => {
+test("near times are relative, later ones the viewer clock time", () => {
   assert.equal(when(NOW + 6 * min, NOW), "in 6m")
   assert.equal(when(NOW - 5_000, NOW), "just now")
-  assert.equal(when(NOW + 2 * 60 * min, NOW), "6:30 PM")
-  assert.equal(when(Date.parse("2026-11-01T14:00:00Z"), NOW), "Nov 1, 6:00 AM")
+  assert.equal(when(NOW + 2 * 60 * min, NOW), "Oct 22, 1:30 AM")
+  assert.equal(when(Date.parse("2026-11-01T14:00:00Z"), NOW), "Nov 1, 2:00 PM")
 })
 
 test("waiting on prerequisites counts the ones not completed", () => {
@@ -48,7 +49,7 @@ test("waiting on prerequisites counts the ones not completed", () => {
 test("pending tasks say when they start", () => {
   assert.equal(statusLine(task(), [], NOW), "Queued")
   const later = task({ available_at: iso(Date.parse("2026-11-01T14:00:00Z")), schedule: {} })
-  assert.equal(statusLine(later, [], NOW), "Scheduled for Nov 1, 6:00 AM")
+  assert.equal(statusLine(later, [], NOW), "Scheduled for Nov 1, 2:00 PM")
   const retry = task({
     available_at: iso(NOW + 6 * min),
     retry_series: { attempt: 2, next_eligible_at: iso(NOW + 6 * min), policy: { max_attempts: 3 } },

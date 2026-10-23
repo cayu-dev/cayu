@@ -154,7 +154,8 @@ test("a previous v4 response without a newer optional surface fails closed", () 
 test("direct optional routes share the same server-authoritative requirements as navigation", () => {
   const snapshot = capabilities()
 
-  assert.equal("/evals" in DASHBOARD_ROUTE_REQUIREMENTS, false)
+  assert.deepEqual(DASHBOARD_ROUTE_REQUIREMENTS["/evals"], { kind: "surface", surface: "evals" })
+  assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/evals"]), false)
 
   assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/"]), true)
   assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/tasks"]), false)

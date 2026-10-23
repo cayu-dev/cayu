@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import uvicorn
 from playwright.async_api import (
     BrowserContext,
+    Locator,
     Page,
     Request,
     async_playwright,
@@ -1229,6 +1230,19 @@ def build_release_acceptance_eval_plan() -> EvalPlan:
     )
 
 
+async def _exercise_dashboard_shell(page: Page, base_url: str) -> None:
+    """Exercise only the shared shell; page-port behavior remains independently checked."""
+    await page.goto(f"{base_url}/cayu/sessions?q=shell", wait_until="networkidle")
+    sidebar = page.get_by_role("complementary", name="Sidebar")
+    await expect(sidebar).to_be_visible()
+    navigation = sidebar.get_by_role("navigation", name="Main")
+    for label in ("Home", "Inbox", "Sessions", "Tasks", "Usage", "Specialists"):
+        await expect(navigation.get_by_role("link", name=label, exact=True)).to_be_visible()
+    search = sidebar.get_by_label("Search sessions", exact=True)
+    await page.keyboard.press("ControlOrMeta+k")
+    await expect(search).to_be_focused()
+
+
 async def _run_browser_contract(
     base_url: str,
     provider: DashboardContractProvider,
@@ -1288,6 +1302,7 @@ async def _run_browser_contract(
         )
         try:
             await _exercise_contract_version_gate(page, base_url)
+            await _exercise_dashboard_shell(page, base_url)
             await _exercise_capability_contract(page, base_url)
             await _exercise_system_page(page, base_url)
             await _exercise_dashboard(
@@ -3293,6 +3308,7 @@ async def _exercise_workflow(
 
         allowed_workflow_requests = {
             ("GET", "/api/contract"),
+            ("GET", "/api/app"),  # Shell identity and role refresh.
             ("POST", topology_path),
             ("POST", "/api/usage/rollup"),
         }
@@ -3304,7 +3320,7 @@ async def _exercise_workflow(
         require_equal(
             unexpected_workflow_requests,
             [],
-            "the Workflow route must use only its bounded topology, usage, and contract APIs",
+            "the Workflow route must use only its bounded topology, usage, contract, and shell identity APIs",
         )
 
         exact_task_path = f"/api/tasks/{WORKFLOW_PARENT_TASK_ID}"
@@ -3498,6 +3514,89 @@ async def _serve_dashboard_without_pricebook(route) -> None:
     )
 
 
+async def _exercise_unconfigured_evals_shell(page: Page, base_url: str) -> None:
+    async def serve_without_evals_configuration(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        body["capabilities"]["surfaces"]["evals"] = {
+            "configured": False,
+            "read": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+            "mutate": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+        }
+        body["capabilities"]["evals_readiness"] = {
+            "captured_evaluation": {
+                "state": "gated",
+                "reason_code": "evaluation_promotion_not_configured",
+            },
+            "catalog_read": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "catalog_write": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "captured_result_persistence": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "scenario_conversion": {
+                "state": "unsupported",
+                "reason_code": "scenario_v2_not_available",
+            },
+            "fresh_launch": {
+                "state": "gated",
+                "reason_code": "eval_target_not_configured",
+            },
+            "cancellation": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "comparison": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "reports": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+        }
+        await route.fulfill(response=response, json=body)
+
+    observed_evals_requests: list[str] = []
+
+    def record_evals_request(request) -> None:
+        path = urlsplit(request.url).path
+        if path.startswith("/api/evals"):
+            observed_evals_requests.append(f"{request.method} {path}")
+
+    await page.route("**/api/contract", serve_without_evals_configuration)
+    page.on("request", record_evals_request)
+    try:
+        await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
+        await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
+            "Evals is unavailable"
+        )
+        await expect(
+            page.get_by_role("navigation", name="Main").get_by_role(
+                "link", name="Evals", exact=True
+            )
+        ).to_have_count(0)
+        require(
+            not observed_evals_requests,
+            f"the unconfigured Evals shell probed absent endpoints: {observed_evals_requests!r}",
+        )
+    finally:
+        page.remove_listener("request", record_evals_request)
+        await page.unroute("**/api/contract", serve_without_evals_configuration)
+
+
 async def _exercise_capability_contract(page: Page, base_url: str) -> None:
     observed_requests: list[str] = []
 
@@ -3570,89 +3669,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         page.remove_listener("request", record_api_request)
         await page.unroute("**/api/contract", serve_without_task_or_artifact_surface)
 
-    async def serve_without_evals_configuration(route) -> None:
-        response = await route.fetch()
-        body = await response.json()
-        body["capabilities"]["surfaces"]["evals"] = {
-            "configured": False,
-            "read": {
-                "enabled": False,
-                "unavailable_reason": "not_configured",
-            },
-            "mutate": {
-                "enabled": False,
-                "unavailable_reason": "not_configured",
-            },
-        }
-        body["capabilities"]["evals_readiness"] = {
-            "captured_evaluation": {
-                "state": "gated",
-                "reason_code": "evaluation_promotion_not_configured",
-            },
-            "catalog_read": {
-                "state": "gated",
-                "reason_code": "eval_store_not_configured",
-            },
-            "catalog_write": {
-                "state": "gated",
-                "reason_code": "eval_store_not_configured",
-            },
-            "captured_result_persistence": {
-                "state": "gated",
-                "reason_code": "eval_store_not_configured",
-            },
-            "scenario_conversion": {
-                "state": "unsupported",
-                "reason_code": "scenario_v2_not_available",
-            },
-            "fresh_launch": {
-                "state": "gated",
-                "reason_code": "eval_target_not_configured",
-            },
-            "cancellation": {
-                "state": "gated",
-                "reason_code": "eval_store_not_configured",
-            },
-            "comparison": {
-                "state": "gated",
-                "reason_code": "eval_store_not_configured",
-            },
-            "reports": {
-                "state": "gated",
-                "reason_code": "eval_store_not_configured",
-            },
-        }
-        await route.fulfill(response=response, json=body)
-
-    observed_evals_requests: list[str] = []
-
-    def record_evals_request(request) -> None:
-        path = urlsplit(request.url).path
-        if path.startswith("/api/evals"):
-            observed_evals_requests.append(f"{request.method} {path}")
-
-    await page.route("**/api/contract", serve_without_evals_configuration)
-    page.on("request", record_evals_request)
-    try:
-        await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
-        await expect(page.get_by_role("heading", name="Evals", exact=True)).to_be_visible()
-        await expect(page.get_by_role("link", name="Evals", exact=True)).to_be_visible()
-        await expect(
-            page.get_by_text("The Evals catalog is not ready yet", exact=True)
-        ).to_be_visible()
-        await expect(
-            page.get_by_text(
-                "Scenario-v2 conversion is unavailable in this deployment.",
-                exact=True,
-            )
-        ).to_be_visible()
-        require(
-            not observed_evals_requests,
-            f"the unconfigured Evals shell probed absent endpoints: {observed_evals_requests!r}",
-        )
-    finally:
-        page.remove_listener("request", record_evals_request)
-        await page.unroute("**/api/contract", serve_without_evals_configuration)
+    await _exercise_unconfigured_evals_shell(page, base_url)
 
     async def serve_usage_without_pricing_contract(route) -> None:
         response = await route.fetch()
@@ -3749,13 +3766,17 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await expect(page.get_by_role("button", name="Deny", exact=True)).to_be_disabled()
         await expect(page.get_by_test_id("pending-action-unavailable")).to_be_visible()
 
-        await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
-        await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
-            "New Run is unavailable"
-        )
-        await expect(page.get_by_role("textbox")).to_have_count(0)
+        await _assert_unavailable_run_page(page, base_url)
     finally:
         await page.unroute("**/api/contract", serve_read_only_contract)
+
+
+async def _assert_unavailable_run_page(page: Page, base_url: str) -> None:
+    await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
+    await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
+        "New Run is unavailable"
+    )
+    await expect(page.get_by_role("main").get_by_role("textbox")).to_have_count(0)
 
 
 async def _exercise_system_page(page: Page, base_url: str) -> None:
@@ -4168,6 +4189,10 @@ async def _exercise_session_annotations(page: Page) -> None:
         await page.unroute(metadata_path, count_metadata_saves)
 
 
+def _session_discovery_search(page: Page) -> Locator:
+    return page.get_by_role("main").get_by_label("Search sessions", exact=True)
+
+
 async def _exercise_session_discovery(
     page: Page,
     faults: MutationDisconnectFaults,
@@ -4239,7 +4264,7 @@ async def _exercise_session_discovery(
     await page.get_by_role("button", name="Clear filters").click()
     await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
 
-    search = page.get_by_label("Search sessions")
+    search = _session_discovery_search(page)
     await search.fill(SLOW_SESSION_QUERY)
     await asyncio.wait_for(faults.slow_summary_started.wait(), timeout=5)
     await search.fill(FILTERED_SESSION_ID)

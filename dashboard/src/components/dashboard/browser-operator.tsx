@@ -5,6 +5,7 @@ import {
   type BrowserInputKind,
   type BrowserPage,
   type BrowserPageLocation,
+  BrowserRoleForbidden,
   browserViewFailureMessage,
   createBrowserControlClient,
   requestFreshBrowserView,
@@ -110,7 +111,7 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
       await action(client.current, current)
     } catch (error) {
       if (current()) {
-        if (readOnlyView) {
+        if (readOnlyView || error instanceof BrowserRoleForbidden) {
           setStatus(browserViewFailureMessage(error))
           return
         }

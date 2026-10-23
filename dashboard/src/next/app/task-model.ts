@@ -30,10 +30,10 @@ export const isCayuTask = (task: Pick<TaskItem, "type">) => task.type.startsWith
 
 export const taskName = (task: Pick<TaskItem, "title" | "type">) => task.title || task.type
 
-const TZ = "America/Los_Angeles"
+const viewerTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone
 
 /** "in 6m", "4:00 PM", "Nov 1, 6:00 AM": near times relative, later ones as a clock time. */
-export function when(ms: number, now: number, timeZone = TZ): string {
+export function when(ms: number, now: number, timeZone = viewerTimeZone()): string {
   if (Math.abs(ms - now) < 60_000) return "just now"
   const minutes = Math.round((ms - now) / 60_000)
   if (minutes > 0 && minutes < 60) return `in ${minutes}m`
@@ -62,7 +62,12 @@ const HOLD_WORD: Record<string, string> = {
  * What the task is doing or waiting for, in plain words: "Waiting on 2 tasks", "Scheduled
  * for Nov 1, 6:00 AM", "Blocked: vendor file late", "Retry 2 of 3 in 6m".
  */
-export function statusLine(task: TaskItem, all: TaskItem[], now: number, timeZone = TZ): string {
+export function statusLine(
+  task: TaskItem,
+  all: TaskItem[],
+  now: number,
+  timeZone = viewerTimeZone(),
+): string {
   const byId = new Map(all.map((t) => [t.id, t]))
   const retry = task.retry_series
   const reason = task.status_reason ? `: ${task.status_reason}` : ""

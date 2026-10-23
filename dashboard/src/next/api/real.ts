@@ -8,6 +8,7 @@ import {
   ApiClientError,
   blockTask,
   fetchAgents,
+  fetchDashboardIdentity,
   fetchPendingActions,
   fetchSession,
   fetchSessionEvents,
@@ -20,6 +21,7 @@ import {
   pauseTask,
   resumeTask,
   type Session as SessionRecord,
+  throwResponseError,
 } from "@/lib/api"
 import { apiUrl } from "@/lib/config"
 import type { SessionUsageSummary } from "@/lib/generated/server-api"
@@ -53,11 +55,7 @@ async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init.headers },
   })
-  if (!response.ok)
-    throw new ApiClientError(
-      `${init.method ?? "GET"} ${path} failed with ${response.status}.`,
-      response.status,
-    )
+  if (!response.ok) await throwResponseError(response)
   return (await response.json()) as T
 }
 
@@ -159,7 +157,7 @@ function rememberListed(sessions: SessionRecord[], usage: SessionUsageSummary[])
 }
 
 export const realApi: Api = {
-  app: async () => ({ name: "", runtime_version: "" }),
+  app: fetchDashboardIdentity,
   specialists: () => fetchAgents(),
   async sessions(q) {
     const page = await fetchSessionsPage({ include: ["usage"], ...q } as Parameters<

@@ -17,7 +17,13 @@ const TAB_LABEL: Record<PanelTab, string> = {
 
 const when = (iso: string | null | undefined) =>
   iso
-    ? `${new Date(iso).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })} PT`
+    ? new Date(iso).toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+      })
     : "–"
 
 function Row({ k, children, mono }: { k: string; children: React.ReactNode; mono?: boolean }) {

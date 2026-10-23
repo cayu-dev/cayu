@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react"
+import { ApiClientError, throwResponseError } from "../../lib/api"
 import { apiUrl } from "../../lib/config"
+import { roleForbiddenMessage } from "../../lib/dashboard-access"
 import { useDashboardCapability } from "./server-contract"
 
 type Recording = {
@@ -43,7 +45,7 @@ export function BrowserRecordings({ sessionId }: { sessionId: string }) {
           if (!abort.signal.aborted) setRecordings([])
           return
         }
-        if (!response.ok) throw new Error("Browser recordings are unavailable.")
+        if (!response.ok) await throwResponseError(response)
         const records: unknown = await response.json()
         if (!Array.isArray(records) || records.length > 1024)
           throw new Error("Invalid recording response.")
@@ -66,8 +68,13 @@ export function BrowserRecordings({ sessionId }: { sessionId: string }) {
           setRecordings(records as Recording[])
           setError("")
         }
-      } catch {
-        if (!abort.signal.aborted) setError("Browser recordings are unavailable.")
+      } catch (error) {
+        if (!abort.signal.aborted)
+          setError(
+            (error instanceof ApiClientError
+              ? roleForbiddenMessage(error.status, error.detail)
+              : null) ?? "Browser recordings are unavailable.",
+          )
       } finally {
         if (!abort.signal.aborted && !unavailable) timer = setTimeout(refresh, 5000)
       }

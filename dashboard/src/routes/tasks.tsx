@@ -246,6 +246,8 @@ export function TasksPage() {
 
   const action = useMutation({
     mutationFn: async ({ action, body, task }: TaskActionVariables) => {
+      if (!taskLifecycleCapability.enabled)
+        throw new Error(taskLifecycleUnavailableText ?? "Task changes are unavailable.")
       if (action === "pause") return pauseTask(task.id, body)
       if (action === "block") return blockTask(task.id, body)
       if (action === "needs_attention") return markTaskNeedsAttention(task.id, body)

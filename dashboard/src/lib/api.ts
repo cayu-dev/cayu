@@ -1,4 +1,5 @@
 import { apiUrl } from "./config.ts"
+import { parseDashboardIdentity, roleForbiddenMessage } from "./dashboard-access.ts"
 import type {
   AgentsResponse,
   ApiAgentSummary,
@@ -370,6 +371,8 @@ export async function throwResponseError(response: Response): Promise<never> {
   if (contentType.includes("application/json")) {
     const body = (await response.json().catch(() => null)) as ErrorEnvelope | null
     const detail = body?.detail ?? body?.error ?? body?.message
+    const roleReason = roleForbiddenMessage(response.status, detail)
+    if (roleReason) throw new ApiClientError(roleReason, response.status, detail)
     if (typeof detail === "string" && detail.trim()) {
       throw new ApiClientError(detail, response.status, detail)
     }
@@ -382,6 +385,10 @@ export async function throwResponseError(response: Response): Promise<never> {
 
 export function isSupportedServerContract(contract: ServerContract): boolean {
   return contract.contract_version === SUPPORTED_SERVER_CONTRACT_VERSION
+}
+
+export async function fetchDashboardIdentity() {
+  return parseDashboardIdentity(await requestJson<unknown>("/app"))
 }
 
 export async function fetchServerContract(): Promise<ServerContract> {

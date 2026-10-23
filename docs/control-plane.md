@@ -36,6 +36,39 @@ each API route still enforces its own authorization and runtime preconditions.
 Server contract 50 adds this read; independently hosted dashboards must
 regenerate their client and upgrade their supported contract version together.
 
+## Dashboard navigation and member access
+
+The dashboard sidebar groups Home, Inbox, Sessions and Tasks, with Evals and
+Usage under Improve and Specialists, Knowledge, Environments, Artifacts and
+System under Agent. Items depend on the server capabilities and viewer access.
+Existing URLs remain valid: Inbox uses `/pending-actions`
+and Specialists uses `/agents`. Search sessions from the sidebar; `Ctrl+K` or
+`Cmd+K` focuses search, and Enter opens the session index with its `q` filter.
+The sidebar can be collapsed on desktop or opened as a drawer on mobile.
+Escape closes the mobile drawer and returns focus to its opener.
+
+Use the theme button to cycle System, Light and Dark. The choice is saved in
+this browser; System follows the operating system appearance. The external
+initialization script applies the choice before styles load under the existing
+content security policy, including when the dashboard is mounted below a path.
+
+To check the member experience, sign in through the configured identity proxy
+with a role in `ControlPlaneRoles.read_and_decide`, then open the dashboard.
+The authenticated `/api/app` response drives the shell's access presentation.
+Members can browse sessions and pending work, approve or deny a pending tool
+approval, answer a pending question, and approve or reject knowledge proposals
+when the corresponding server capability is available. Open Inbox and follow
+a pending item's session link to make its decision.
+
+Evals, System and Run are omitted for members; opening those URLs directly
+shows an access explanation before their page requests start. Full-access
+mutation controls elsewhere are hidden or disabled with an explanation.
+Browser-control and evaluation-authoring panels do not mount for members.
+These presentation rules also follow custom role policies; they do not grant
+permission. The server independently authenticates and authorizes every read
+and decision. The server-contract gate still precedes page reads, and an
+unavailable app identity does not grant full access.
+
 ## Project-owned Evals assembly
 
 `cayu serve` assembles the durable, non-executable Evals foundation without
@@ -178,12 +211,14 @@ The dashboard checks the server's exact control-plane contract before loading da
 upgrade that changes that contract produces a visible compatibility failure, and `npm run
 check:api` reports OpenAPI/client drift; neither mechanism silently modifies source.
 
-Evals remains present in navigation even when its catalog has not been assembled. Server
-contract version 19 introduced independent readiness for captured evaluation, catalog reads and writes,
-captured-result persistence, scenario conversion, fresh execution, cancellation, comparison,
-and reports. An unready Evals page renders those states without requesting unavailable Evals
-endpoints. Readiness is explanatory metadata only; authenticated API routes continue to enforce
-operator identity, mutation policy, and execution preconditions.
+Evals appears in navigation when its read capability is enabled and the viewer has
+full access. If the read capability is disabled, opening `/evals` shows a capability
+explanation before mounting the page or requesting Evals endpoints. When the page
+is available, independent readiness describes captured evaluation, catalog reads
+and writes, captured-result persistence, scenario conversion, fresh execution,
+cancellation, comparison, and reports. Readiness is explanatory metadata only;
+authenticated API routes continue to enforce operator identity, mutation policy,
+and execution preconditions.
 
 Server contract version 25 adds durable scenario launch, per-trial progress,
 and fresh scenario-approval mutations. Independently deployed dashboards,

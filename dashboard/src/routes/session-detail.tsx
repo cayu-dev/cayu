@@ -39,6 +39,7 @@ import {
 } from "../components/dashboard/protected-human-review"
 import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { SessionAnnotations } from "../components/dashboard/session-annotations"
+import { useViewer } from "../components/dashboard/viewer"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -72,6 +73,7 @@ import {
   type SessionTranscriptPage,
 } from "../lib/api"
 import { dashboardConfig } from "../lib/config"
+import { ROLE_FORBIDDEN_REASON } from "../lib/dashboard-access"
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import {
   formatBytes,
@@ -1322,6 +1324,7 @@ export function SessionDetailPage() {
 }
 
 function SessionDetail({ sessionId }: { sessionId: string }) {
+  const fullAccess = useViewer()?.full_access === true
   const queryClient = useQueryClient()
   const navigate = useNavigate({ from: "/sessions/$sessionId" })
   const historySearch = useSearch({ from: "/sessions/$sessionId" })
@@ -2631,7 +2634,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     message: string,
     answer: string | null,
   ) => {
-    if (!pendingActionResolutionCapability.enabled) return
+    if (!fullAccess || !pendingActionResolutionCapability.enabled) return
     if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
     setActionError(null)
@@ -2971,8 +2974,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
   return (
     <Page className="space-y-4">
-      <BrowserOperator key={sessionId} sessionId={sessionId} />
-      <BrowserRecordings key={`recordings-${sessionId}`} sessionId={sessionId} />
+      {fullAccess && (
+        <>
+          <BrowserOperator key={sessionId} sessionId={sessionId} />
+          <BrowserRecordings key={`recordings-${sessionId}`} sessionId={sessionId} />
+        </>
+      )}
       <div className="flex flex-shrink-0 items-start gap-3">
         <Link
           to="/sessions"
@@ -3092,11 +3099,13 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 Artifacts
               </a>
             )}
-            <EvaluationPromotionAction
-              key={`${session.id}:${session.status}`}
-              sessionId={session.id}
-              status={session.status}
-            />
+            {fullAccess && (
+              <EvaluationPromotionAction
+                key={`${session.id}:${session.status}`}
+                sessionId={session.id}
+                status={session.status}
+              />
+            )}
             {sessionPollPhase(session.status) !== "active" && (
               <Button
                 variant="outline"
@@ -3395,7 +3404,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             }
             action={pendingAction}
             resolving={resolvingAction || mutationCommandsLocked}
-            unavailableReason={pendingActionResolutionUnavailableText}
+            unavailableReason={
+              pendingAction.kind === "manual_recovery" && !fullAccess
+                ? ROLE_FORBIDDEN_REASON
+                : pendingActionResolutionUnavailableText
+            }
             error={actionError}
             onApprove={(reason) =>
               pendingAction.kind === "approval" &&

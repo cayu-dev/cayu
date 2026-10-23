@@ -171,3 +171,31 @@ def test_dashboard_csp_allows_cross_origin_browser_resources(tmp_path, control_t
                     await browser.close()
 
     asyncio.run(scenario())
+
+
+def test_dashboard_theme_bootstrap_is_external_before_styles_under_nested_mount():
+    from fastapi.testclient import TestClient
+
+    from cayu.applications import CayuApp
+    from cayu.server import ServerConfig, create_server
+
+    parent = FastAPI()
+    parent.mount("/product", create_server(CayuApp(), config=ServerConfig.local_development()))
+    client = TestClient(parent)
+    response = client.get("/product/cayu/sessions")
+    assert response.status_code == 200
+    bootstrap = re.search(r'<script\b[^>]*\bsrc="\./theme-init.js"[^>]*>', response.text)
+    assert bootstrap is not None
+    assert 'type="module"' not in bootstrap.group()
+    assert "defer" not in bootstrap.group()
+    assert "async" not in bootstrap.group()
+    assert response.text.index('<base href="/product/cayu/"') < bootstrap.start()
+    assert bootstrap.start() < response.text.index('rel="stylesheet"')
+    script = client.get("/product/cayu/theme-init.js")
+    assert script.status_code == 200
+    assert "javascript" in script.headers["content-type"]
+    assert "cayu-dashboard-theme" in script.text
+    policy = response.headers["content-security-policy"]
+    script_policy = policy.split("script-src ", 1)[1].split(";", 1)[0]
+    assert "'self'" in script_policy
+    assert "'unsafe-inline'" not in script_policy

@@ -1,3 +1,4 @@
+import { type DashboardOperation, ROLE_FORBIDDEN_REASON } from "./dashboard-access.ts"
 import type {
   CapabilityOperation,
   ControlPlaneCapabilities,
@@ -28,6 +29,7 @@ export type DashboardCapabilityRequirement =
 
 export const DASHBOARD_ROUTE_REQUIREMENTS = {
   "/": { kind: "surface", surface: "dashboard" },
+  "/evals": { kind: "surface", surface: "evals" },
   "/tasks": { kind: "surface", surface: "tasks" },
   "/usage": { kind: "surface", surface: "usage" },
   "/knowledge": { kind: "surface", surface: "reviewed_knowledge" },
@@ -47,8 +49,9 @@ export function resolveDashboardCapability(
   return surface?.[requirement.operation ?? "read"] ?? UNSUPPORTED_OPTIONAL_SURFACE
 }
 
-export function dashboardCapabilityUnavailableText(operation: CapabilityOperation): string | null {
+export function dashboardCapabilityUnavailableText(operation: DashboardOperation): string | null {
   if (operation.enabled) return null
+  if (operation.unavailable_reason === "role_forbidden") return ROLE_FORBIDDEN_REASON
   if (operation.unavailable_reason === "not_configured") {
     return "This feature is not configured for this Cayu deployment."
   }
