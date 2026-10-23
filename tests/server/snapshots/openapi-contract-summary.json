@@ -5782,6 +5782,16 @@
             }
           ]
         },
+        "session_followups": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_overview": {
           "anyOf": [
             {
@@ -11130,6 +11140,38 @@
       "title": "RetryPolicy",
       "type": "object"
     },
+    "RoleForbiddenDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "role_forbidden",
+          "default": "role_forbidden",
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "const": "Your role can't use this.",
+          "default": "Your role can't use this.",
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "title": "RoleForbiddenDetail",
+      "type": "object"
+    },
+    "RoleForbiddenResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "$ref": "#/components/schemas/RoleForbiddenDetail"
+        }
+      },
+      "required": [
+        "detail"
+      ],
+      "title": "RoleForbiddenResponse",
+      "type": "object"
+    },
     "RunBody": {
       "properties": {
         "agent": {
@@ -11558,7 +11600,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "56",
+          "default": "57",
           "title": "Contract Version",
           "type": "string"
         },
@@ -17470,7 +17512,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "56",
+          "default": "57",
           "title": "Contract Version",
           "type": "string"
         }
@@ -19495,6 +19537,21 @@
               }
             }
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Resolve Provider Operation Api Provider Operations Resolve Post"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -19593,6 +19650,21 @@
               }
             }
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Resume Agent Api Resume Post"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -19677,6 +19749,21 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Run Agent Api Run Post"
               }
             }
           },
@@ -21184,6 +21271,21 @@
               }
             }
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Interrupt Session Api Sessions  Session Id  Interrupt Post"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -21389,7 +21491,15 @@
           "403": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/ApiErrorResponse"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Inspect Session Messages Api Sessions  Session Id  Messages Get"
               }
             }
           },
@@ -21498,7 +21608,15 @@
           "403": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/ApiErrorResponse"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Enqueue Session Message Api Sessions  Session Id  Messages Post"
               }
             }
           },
@@ -21594,7 +21712,15 @@
           "403": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/ApiErrorResponse"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Snapshot Session Message Source Api Sessions  Session Id  Messages Source Snapshot Post"
               }
             }
           },
@@ -21692,7 +21818,15 @@
           "403": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/ApiErrorResponse"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Quarantine Session Message Api Sessions  Session Id  Messages  Queue Id  Quarantine Post"
               }
             }
           },
@@ -21790,7 +21924,15 @@
           "403": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/ApiErrorResponse"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Withdraw Session Message Api Sessions  Session Id  Messages  Queue Id  Withdraw Post"
               }
             }
           },
@@ -22857,6 +22999,21 @@
               }
             }
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Recover Tool Approval Api Tool Approvals Recover Post"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -22937,6 +23094,21 @@
               }
             }
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Resolve Tool Approval Api Tool Approvals Resolve Post"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -23014,6 +23186,21 @@
               "text/event-stream": {
                 "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
                 "type": "string"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Recover Tool Round Api Tool Rounds Recover Post"
               }
             }
           },
@@ -23155,6 +23342,21 @@
               }
             }
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Recover User Input Api User Input Recover Post"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -23232,6 +23434,21 @@
               "text/event-stream": {
                 "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
                 "type": "string"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Resolve User Input Api User Input Resolve Post"
               }
             }
           },

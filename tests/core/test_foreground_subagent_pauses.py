@@ -114,6 +114,7 @@ def test_foreground_child_action_suspends_and_automatically_continues_parent(
             )
             checkpoint = await store.load_checkpoint("parent")
             assert checkpoint is not None and "pending_tool_round" in checkpoint
+            assert checkpoint["invocation_configuration"]["session_id"] == "parent"
             children = await store.list_sessions(SessionQuery(parent_session_id="parent"))
             assert len(children.sessions) == 1
             child = children.sessions[0]

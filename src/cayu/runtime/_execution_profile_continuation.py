@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -725,7 +726,7 @@ class ExecutionProfileContinuation:
                 )
             ),
         )
-        return plan, active_model_completion
+        return replace(plan, tool_completion=tool_completion), active_model_completion
 
     async def _settle_plan(
         self,
@@ -775,6 +776,7 @@ class ExecutionProfileContinuation:
                 candidate_profile=candidate,
                 changed_component_classes=(),
                 model_failover=plan.model_failover,
+                tool_completion=plan.tool_completion,
             )
 
         if not record_rejection:

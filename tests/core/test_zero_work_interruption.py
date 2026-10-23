@@ -557,3 +557,42 @@ def test_postgres_preflight_keeps_one_snapshot_during_peer_terminalization(
             await writer.close()
 
     asyncio.run(exercise())
+
+
+def test_admitted_settings_do_not_prevent_zero_work_interruption():
+    async def exercise():
+        from cayu.messages import Message
+        from cayu.providers.retry_policy import RetryPolicy
+        from cayu.runtime._resume_configuration import invocation_configuration
+        from cayu.sessions._execution_profile_checkpoint import (
+            active_invocation_execution_profile_from_checkpoint,
+        )
+        from cayu.sessions.requests import ResumeRequest
+
+        store = InMemorySessionStore()
+        await _orphan(store)
+        session = await store.load("zero-work")
+        checkpoint = await store.load_checkpoint(session.id)
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        configuration = invocation_configuration(
+            ResumeRequest(session_id=session.id, messages=[Message.text("user", "start")]),
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            profile=active.profile,
+            retry_policy=RetryPolicy(),
+        ).model_dump(mode="json")
+        # Reconstruct an admitted runtime record in the low-level orphan fixture.
+        # Ordinary checkpoint writers cannot author this private root.
+        store._checkpoints[session.id]["invocation_configuration"] = configuration
+        app = _drifted_app(store)
+        request = IncompleteSessionRecoveryRequest(session_id=session.id, inactive_for_seconds=None)
+        result = await app.recover_incomplete_session(request)
+        assert result.actions == (IncompleteSessionRecoveryAction.TERMINALIZED_ZERO_WORK,)
+        assert result.status is SessionStatus.INTERRUPTED
+        replay = await app.recover_incomplete_session(request)
+        assert [event.id for event in replay.events] == [event.id for event in result.events]
+        assert (await store.load_checkpoint(session.id))[
+            "invocation_configuration"
+        ] == configuration
+
+    asyncio.run(exercise())

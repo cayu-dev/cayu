@@ -1253,7 +1253,16 @@ async def apply_invocation_lifecycle_command(
                 run_epoch=copied.active_profile.run_epoch,
                 profile=copied.active_profile.profile,
             )
-            return updated
+            from cayu.runtime._resume_configuration import (
+                checkpoint_with_invocation_configuration,
+            )
+
+            return checkpoint_with_invocation_configuration(
+                updated,
+                session=session,
+                profile=copied.active_profile.profile,
+                configuration=copied.configuration,
+            )
 
         def record_create_result(session: Session, checkpoint: dict[str, Any] | None):
             return checkpoint_with_invocation_lifecycle_receipt(
@@ -1336,7 +1345,16 @@ async def apply_invocation_lifecycle_command(
                 checkpoint,
                 expected_active_profile=copied.expected_active_profile,
             )
-            return _apply_checkpoint_patch(copied.checkpoint_patch, updated)
+            from cayu.runtime._resume_configuration import (
+                checkpoint_with_invocation_configuration,
+            )
+
+            return checkpoint_with_invocation_configuration(
+                _apply_checkpoint_patch(copied.checkpoint_patch, updated),
+                session=session,
+                profile=copied.target_active_profile.profile,
+                configuration=copied.configuration,
+            )
 
         def record_admit_result(session: Session, checkpoint: dict[str, Any] | None):
             return checkpoint_with_invocation_lifecycle_receipt(

@@ -1430,6 +1430,9 @@ def test_fork_source_snapshot_aliases_secret_causal_budget_and_round_trips(
         ]
         child = await h.store.load(child_session_id)
         assert child is not None
+        assert "invocation_configuration" not in (
+            await h.store.load_checkpoint(child_session_id) or {}
+        )
         return snapshot, events, child
 
     snapshot, events, child = asyncio.run(scenario())

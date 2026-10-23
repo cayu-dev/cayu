@@ -95,6 +95,11 @@ def test_busy_key_defers_verified_continuation_and_worker_services_unrelated_tas
             assert (await tasks.load_task(original.id)).status is TaskStatus.COMPLETED
             successor = await tasks.load_latest_work_attempt_admission(original.id)
             assert successor.continuation.prior_admission_id == predecessor.admission_id
+            configuration = (await sessions.load_checkpoint(successor.session_id))[
+                "invocation_configuration"
+            ]
+            assert configuration["max_steps"] == successor.run_semantics.max_steps
+            assert configuration["limits"] == successor.run_semantics.limits.model_dump(mode="json")
             assert len(provider.requests) == len(verifier.requests) == 3
             assert len(handler.preparations) == 2
         finally:

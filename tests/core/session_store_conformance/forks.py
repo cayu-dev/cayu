@@ -1448,6 +1448,8 @@ def test_session_store_conformance_runtime_hook_fork_preserves_generated_provena
             child = next(session for session in sessions if session.parent_session_id == source.id)
             assert "-" in source.id
             assert "-" in child.id
+            assert "invocation_configuration" in (await store.load_checkpoint(source.id))
+            assert "invocation_configuration" not in (await store.load_checkpoint(child.id) or {})
             source_events = await store.load_events(source.id)
             assert [event.type for event in source_events].count(EventType.SESSION_COMPLETED) == 1
             assert [event.type for event in source_events].count(EventType.HOOK_STARTED) == 1

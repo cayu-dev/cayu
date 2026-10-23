@@ -54,6 +54,7 @@ _ALLOWED_KEYS = {
     "checkpoint_schema_version",
     "active_invocation_execution_profile",
     "invocation_lifecycle_receipt",
+    "invocation_configuration",
     "invocation_terminal_decision",
     "settled_invocation_terminal_decision",
     "incomplete_session_recovery_claim",

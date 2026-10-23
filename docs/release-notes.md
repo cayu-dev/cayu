@@ -11,9 +11,9 @@ confirm revision 126. Task adapters require revision 126: bound continuation
 claims now persist their expected attachment and selected-operation digest in the
 existing claim registry. The compatibility floor is 126; stop older workers before
 migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
-store identity. Server contract 56 adds exact daily accounting to overview counts,
-public-projection Inbox search, durable decision reasons, and explicit controlled
-continuation claims. Regenerate API clients and use the matching browser client
+store identity. Server contract 57 adds session follow-ups alongside exact daily
+accounting in overview counts, public-projection Inbox search, durable decision
+reasons, and explicit controlled continuation claims. Regenerate API clients and use the matching browser client
 and dashboard assets. Manifest schema 17 is unchanged.
 
 Upgrade: brokered coding sandbox images now need `git`, or their factory must
@@ -81,6 +81,13 @@ summaries, canonical merged state, and usage. It preserves existing filters and 
 links, excludes eval trials and forks by default, and lets readers include them.
 Custom dashboard owners should port Sessions changes from `src/next/routes/sessions-page.tsx`;
 `src/routes/sessions.tsx` has been removed. Other page ports remain independent.
+
+- Ordinary completed/failed session follow-ups inherit omitted structured-output
+  and loop settings from profile-verified durable admission, including when the
+  initial provider request failed. Explicit overrides retain profile checks;
+  tool-completion policy remains explicit per turn. Contract 57 advertises
+  `session_followups` and preserves the public `role_forbidden` queue error.
+  Regenerate clients and rebuild dashboards; storage stays at revision 126.
 
 - Validated structured answers now have a `structured_output` transcript part
   with the spec name and JSON output, for native and tool-based strategies.

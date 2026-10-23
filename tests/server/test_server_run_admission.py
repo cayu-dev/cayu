@@ -490,6 +490,7 @@ def test_resume_threads_inbound_traceparent_into_session_metadata() -> None:
         {"traceparent": traceparent},
     )
     assert resumed["type"] == "session.resumed"
+    assert resumed["session_id"] == session_id
     assert resumed["payload"]["traceparent"] == traceparent
 
 

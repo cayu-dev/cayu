@@ -9992,6 +9992,38 @@ workerless handoffs. The browser client and generated dashboard contract match 5
 Storage revision 126 is required by the bound task claim owner; see the task-store
 contract above. No capped browser totals or raw hidden argument searches are used.
 
+Server contract version 57 adds `capabilities.surfaces.session_followups`.
+At an ordinary resumable boundary, a `completed` or `failed` session can accept a new turn through
+`app.resume(ResumeRequest(...))` or `POST /api/resume` with its existing session ID.
+Admission advances the run epoch and keeps the session incarnation. While the
+new turn runs, overview `ended_at` is null; its terminal event supplies the new
+end time. Earlier terminal events remain in history.
+
+Omitted `structured_output`, `max_steps`, `limits`, and `retry_policy` inherit
+verified durable invocation settings. Create/admit writes those settings in the
+same transaction as the profile and input, so an initial provider failure does
+not discard them. Inheritance checks the session incarnation, current active
+profile and epoch, expected profile, and the settings' independently rebuilt
+structured-output/finalization components. Explicit values, including null,
+still pass ordinary profile admission; a changed setting needs the existing
+explicit profile-adoption flow. Pending approval, input, or provider recovery
+continues through its existing dedicated boundary. Session-scoped limits retain
+their cumulative accounting. Request thinking, budget limits, loop policies, and
+ordinary-turn tool-completion policy retain their existing caller requirements.
+
+While a session is running, follow-up input uses the durable
+`POST /api/sessions/{session_id}/messages` endpoint with `delivery_mode: "next_turn"`.
+This endpoint returns the existing queued-event SSE response. Inspection and
+revision-checked withdrawal use the existing session-message endpoints. Queues
+still require authenticated HTTP identity and an application-configured
+`SessionMessageAccessPolicy`; the capability flag is feature discovery, not a
+grant of access. Completed/failed sessions use resume rather than queue admission.
+Members receive HTTP 403 `role_forbidden`; the private queue wrapper preserves
+that fixed public code without exposing application-policy diagnostics.
+Migration: regenerate OpenAPI clients and rebuild ejected dashboards against
+version 57. Persistent backends retain the new private configuration record in
+their existing checkpoint storage; no database schema migration is required.
+
 Server contract version 55 adds the `structured_output_transcript` capability
 and a durable `StructuredOutputPart`
 (`type`, nullable spec `name`, validated JSON `output`) to the existing assistant

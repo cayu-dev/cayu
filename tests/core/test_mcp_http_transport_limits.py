@@ -5230,7 +5230,10 @@ def test_http_initialize_cleanup_preserves_status_before_representation_and_clie
     assert events == ["initialize", "notifications/initialized", "delete", "close"]
 
 
-def test_http_failed_initialization_reports_nested_delete_settlement_failure() -> None:
+@pytest.mark.parametrize("observer_delay", [0.0, 0.2])
+def test_http_failed_initialization_reports_nested_delete_settlement_failure(
+    observer_delay: float,
+) -> None:
     secret = "nested-initialize-delete-settlement-secret"
     delete_stream = _FirstCloseBlocksThenFailsStream([b""], RuntimeError(secret))
     events: list[str] = []
@@ -5266,13 +5269,15 @@ def test_http_failed_initialization_reports_nested_delete_settlement_failure() -
             )
         )
         await asyncio.wait_for(delete_stream.close_started.wait(), timeout=0.5)
-        assert connect_task.done() is False
-        # Let the bounded DELETE owner transfer its still-running context exit
-        # before releasing it, so the retained settlement retry is exercised.
-        await asyncio.sleep(0.12)
-        delete_stream.release_close.set()
-        with pytest.raises(McpProtocolError, match="unsupported content encoding") as exc_info:
-            await connect_task
+        await asyncio.sleep(observer_delay)
+        # The real DELETE deadline cancels the blocked first close; its retained
+        # settlement retries and fails. The observer may run before or after that
+        # work finishes, so assert the outcome rather than a scheduling window.
+        try:
+            with pytest.raises(McpProtocolError, match="unsupported content encoding") as exc_info:
+                await asyncio.wait_for(connect_task, timeout=5.0)
+        finally:
+            delete_stream.release_close.set()
         return exc_info.value, delete_stream.overlapping_close
 
     error, overlapping_close = asyncio.run(run())

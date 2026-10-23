@@ -4155,6 +4155,7 @@ export type ControlPlaneSurfaceCapabilities = {
     reviewed_knowledge: OptionalSurfaceCapability;
     session_display_metadata?: OptionalSurfaceCapability | null;
     session_follow?: OptionalSurfaceCapability | null;
+    session_followups?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
     session_overview_queries?: OptionalSurfaceCapability | null;
     structured_output_transcript?: OptionalSurfaceCapability | null;
@@ -15711,6 +15712,27 @@ export type RetryPolicy = {
 };
 
 /**
+ * RoleForbiddenDetail
+ */
+export type RoleForbiddenDetail = {
+    /**
+     * Code
+     */
+    code?: 'role_forbidden';
+    /**
+     * Message
+     */
+    message?: 'Your role can\'t use this.';
+};
+
+/**
+ * RoleForbiddenResponse
+ */
+export type RoleForbiddenResponse = {
+    detail: RoleForbiddenDetail;
+};
+
+/**
  * RootStatusAssertionSpec
  */
 export type RootStatusAssertionSpec = {
@@ -24065,6 +24087,12 @@ export type ResolveProviderOperationApiProviderOperationsResolvePostData = {
 
 export type ResolveProviderOperationApiProviderOperationsResolvePostErrors = {
     /**
+     * Response 403 Resolve Provider Operation Api Provider Operations Resolve Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -24130,6 +24158,12 @@ export type ResumeAgentApiResumePostData = {
 
 export type ResumeAgentApiResumePostErrors = {
     /**
+     * Response 403 Resume Agent Api Resume Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -24182,6 +24216,12 @@ export type RunAgentApiRunPostErrors = {
      * The authenticated caller identity cannot be represented as durable invocation provenance.
      */
     400: ApiErrorResponse;
+    /**
+     * Response 403 Run Agent Api Run Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The replay session or mutation target does not exist.
      */
@@ -24881,6 +24921,12 @@ export type InterruptSessionApiSessionsSessionIdInterruptPostData = {
 
 export type InterruptSessionApiSessionsSessionIdInterruptPostErrors = {
     /**
+     * Response 403 Interrupt Session Api Sessions  Session Id  Interrupt Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -24986,9 +25032,11 @@ export type InspectSessionMessagesApiSessionsSessionIdMessagesGetErrors = {
      */
     401: ApiErrorResponse;
     /**
+     * Response 403 Inspect Session Messages Api Sessions  Session Id  Messages Get
+     *
      * Session-message access is not authorized.
      */
-    403: ApiErrorResponse;
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The request conflicts with exact durable authority or terminal state.
      */
@@ -25052,9 +25100,11 @@ export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors = {
      */
     401: ApiErrorResponse;
     /**
+     * Response 403 Enqueue Session Message Api Sessions  Session Id  Messages Post
+     *
      * Session-message access is not authorized.
      */
-    403: ApiErrorResponse;
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The replay session or mutation target does not exist.
      */
@@ -25114,9 +25164,11 @@ export type SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapsh
      */
     401: ApiErrorResponse;
     /**
+     * Response 403 Snapshot Session Message Source Api Sessions  Session Id  Messages Source Snapshot Post
+     *
      * Session-message access is not authorized.
      */
-    403: ApiErrorResponse;
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The request conflicts with exact durable authority or terminal state.
      */
@@ -25176,9 +25228,11 @@ export type QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantin
      */
     401: ApiErrorResponse;
     /**
+     * Response 403 Quarantine Session Message Api Sessions  Session Id  Messages  Queue Id  Quarantine Post
+     *
      * Session-message access is not authorized.
      */
-    403: ApiErrorResponse;
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The request conflicts with exact durable authority or terminal state.
      */
@@ -25238,9 +25292,11 @@ export type WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPos
      */
     401: ApiErrorResponse;
     /**
+     * Response 403 Withdraw Session Message Api Sessions  Session Id  Messages  Queue Id  Withdraw Post
+     *
      * Session-message access is not authorized.
      */
-    403: ApiErrorResponse;
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The request conflicts with exact durable authority or terminal state.
      */
@@ -25931,6 +25987,12 @@ export type RecoverToolApprovalApiToolApprovalsRecoverPostData = {
 
 export type RecoverToolApprovalApiToolApprovalsRecoverPostErrors = {
     /**
+     * Response 403 Recover Tool Approval Api Tool Approvals Recover Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -25980,6 +26042,12 @@ export type ResolveToolApprovalApiToolApprovalsResolvePostData = {
 
 export type ResolveToolApprovalApiToolApprovalsResolvePostErrors = {
     /**
+     * Response 403 Resolve Tool Approval Api Tool Approvals Resolve Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -26028,6 +26096,12 @@ export type RecoverToolRoundApiToolRoundsRecoverPostData = {
 };
 
 export type RecoverToolRoundApiToolRoundsRecoverPostErrors = {
+    /**
+     * Response 403 Recover Tool Round Api Tool Rounds Recover Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The replay session or mutation target does not exist.
      */
@@ -26119,6 +26193,12 @@ export type RecoverUserInputApiUserInputRecoverPostData = {
 
 export type RecoverUserInputApiUserInputRecoverPostErrors = {
     /**
+     * Response 403 Recover User Input Api User Input Recover Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -26167,6 +26247,12 @@ export type ResolveUserInputApiUserInputResolvePostData = {
 };
 
 export type ResolveUserInputApiUserInputResolvePostErrors = {
+    /**
+     * Response 403 Resolve User Input Api User Input Resolve Post
+     *
+     * The authenticated role or application policy forbids this operation.
+     */
+    403: ApiErrorResponse | RoleForbiddenResponse;
     /**
      * The replay session or mutation target does not exist.
      */

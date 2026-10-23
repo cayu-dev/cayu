@@ -133,6 +133,10 @@ def _check_delegated_discovery(
 
                 private_checkpoint = await store.load_checkpoint(child.id)
                 assert private_checkpoint is not None
+                assert (
+                    private_checkpoint["invocation_configuration"]["session_instance_id"]
+                    == child.instance_id
+                )
                 redactor = SecretRedactor("cayu-child")
                 with pytest.raises(ValueError, match="workload secret"):
                     pending_user_input_from_checkpoint(private_checkpoint, redactor=redactor)

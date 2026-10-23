@@ -246,6 +246,9 @@ def test_resume_after_compaction_limit_stop_uses_latest_agent_completion_for_con
             ResumeRequest(
                 session_id=session_id,
                 messages=[Message.text("user", "third request")],
+                # Omission inherits admitted limits, including a pre-model stop.
+                # This operator explicitly adopts an unlimited new run.
+                limits=RunLimits(),
                 profile_adoption=ExecutionProfileAdoptionIntent(
                     idempotency_key="resume-after-compaction-limit-stop",
                     reason="The operator authorizes a fresh run without the prior run limit.",

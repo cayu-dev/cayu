@@ -1304,12 +1304,21 @@ def test_continuation_admission_reuses_source_profile_across_app_defaults(
                 work_contract=contract.reference(),
             )
         )
+        from cayu.budgets.run_limits import RunLimits
+        from cayu.context.structured_output import StructuredOutputSpec
+        from cayu.providers.retry_policy import RetryPolicy
+
         first = await source_app.admit_work_attempt(
             RunRequest(
                 agent_name="worker",
                 task_id=task.id,
                 session_id="configured-continuation-session",
                 messages=[Message.text("user", "Produce the first governed result.")],
+                limits=RunLimits(max_tool_calls=7),
+                retry_policy=RetryPolicy(max_attempts=2),
+                structured_output=StructuredOutputSpec(
+                    name="Answer", strategy="tool", json_schema={"type": "object"}
+                ),
             ),
             execution=WorkAttemptExecutionRequest(
                 admission_id="configured-continuation-admission-1",
@@ -1465,6 +1474,18 @@ def test_continuation_admission_reuses_source_profile_across_app_defaults(
         assert first.run_semantics is not None
         assert second.run_semantics == first.run_semantics
         assert second.run_semantics.max_steps == 128
+        from cayu.runtime._resume_configuration import recorded_admitted_configuration
+
+        resumed_session = await sessions.load(second.session_id)
+        configuration = recorded_admitted_configuration(
+            await sessions.load_checkpoint(second.session_id), resumed_session
+        )
+        assert configuration is not None
+        assert configuration.max_steps == second.run_semantics.max_steps
+        assert configuration.structured_output == second.run_semantics.structured_output
+        assert configuration.limits == second.run_semantics.limits
+        assert configuration.retry_policy == second.run_semantics.retry_policy
+        assert configuration.tool_completion == second.run_semantics.tool_completion
         assert await tasks.load_latest_work_attempt_admission(task.id) == second
         assert second.source_execution_profile_fingerprint == (
             first.source_execution_profile_fingerprint

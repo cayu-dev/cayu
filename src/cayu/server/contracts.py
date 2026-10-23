@@ -676,6 +676,15 @@ class ApiErrorResponse(ApiBaseModel):
     detail: str
 
 
+class RoleForbiddenDetail(ApiBaseModel):
+    code: Literal["role_forbidden"] = "role_forbidden"
+    message: Literal["Your role can't use this."] = "Your role can't use this."
+
+
+class RoleForbiddenResponse(ApiBaseModel):
+    detail: RoleForbiddenDetail
+
+
 CheckpointCompatibilityReason = Literal[
     "invalid_root_checkpoint",
     "invalid_checkpoint_schema_version",
@@ -3163,6 +3172,10 @@ STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 BOUNDED_STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     **STREAMING_ENDPOINT_RESPONSES,
+    403: {
+        "description": "The authenticated role or application policy forbids this operation.",
+        "model": ApiErrorResponse | RoleForbiddenResponse,
+    },
     413: {
         "description": "The control-plane request exceeds its encoded byte limit.",
         "model": ApiErrorResponse,

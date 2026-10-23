@@ -5855,7 +5855,9 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
         assert expected_reason in tool_result.content
     checkpoint = asyncio.run(app.session_store.load_checkpoint(blocked[0].session_id))
     assert checkpoint is not None
+    assert checkpoint["invocation_configuration"]["record_type"] == "cayu.invocation-configuration"
     assert set(checkpoint) == {
+        "invocation_configuration",
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,

@@ -130,6 +130,7 @@ from cayu.runtime._run_limits import (
     RunLimitController,
     RunLimitGate,
 )
+from cayu.sessions import _checkpoint_transforms as checkpoint_transforms
 from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._invocation_scope import _current_session_interaction_id
 from cayu.sessions._model_failover import (
@@ -1945,10 +1946,16 @@ class AutomaticCompactionRun:
                         self._session.id
                     )
                     durable_session = await self._owner._session_store.load(self._session.id)
+                    # Match the runtime store writer, including private roots it
+                    # preserves outside the context-policy projection.
                     expected_checkpoint = (
                         None
                         if durable_checkpoint is None or durable_session is None
-                        else checkpoint_transform(durable_session, durable_checkpoint)
+                        else checkpoint_transforms._versioned_checkpoint_transform(
+                            self._session.id,
+                            checkpoint_transform,
+                            preserve_completion_result_publications=True,
+                        )(durable_session, durable_checkpoint)
                     )
                     checkpoint_committed = (
                         durable_checkpoint is not None and expected_checkpoint == durable_checkpoint

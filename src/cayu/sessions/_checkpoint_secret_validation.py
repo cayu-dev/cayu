@@ -19,6 +19,7 @@ from cayu.sessions.checkpoints import (
     AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -164,6 +165,7 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
     "approval_close_intent",
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -322,6 +324,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "thinking",
     "timezone",
     "tool_exposure",
+    "tool_completion",
     "tool_names",
     "registered_count",
     "ceiling_count",
@@ -514,6 +517,7 @@ _QUARANTINED_ASSISTANT_MESSAGE_UNTRUSTED_CONTAINERS = frozenset(
 _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+        INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -889,7 +893,7 @@ def _runtime_session_checkpoint_values(
     path: tuple[str, ...],
     runtime_session: Session | None,
 ) -> frozenset[tuple[tuple[str, ...], str]]:
-    """Preserve only the session ID supplied by the runtime's session owner.
+    """Preserve exact session identities supplied by the runtime's session owner.
 
     A checkpoint, even one with identical identity fields, does not supply this
     provenance. Public/raw checkpoint readers omit runtime_session and retain
@@ -900,7 +904,12 @@ def _runtime_session_checkpoint_values(
         return frozenset()
     if type(runtime_session) is not Session:
         raise TypeError("runtime_session must be a Session.")
-    roots = ("pending_tool_round", "pending_user_input", "user_input_resolution_intent")
+    roots = (
+        "pending_tool_round",
+        "pending_user_input",
+        "user_input_resolution_intent",
+        INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
+    )
     candidates = (
         [(root, value.get(root)) for root in roots]
         if not path and type(value) is dict
@@ -922,6 +931,14 @@ def _runtime_session_checkpoint_values(
             or candidate.get("session_instance_id") != runtime_session.instance_id
         ):
             continue
+        if root == INVOCATION_CONFIGURATION_CHECKPOINT_KEY:
+            from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+            try:
+                InvocationConfiguration.model_validate(candidate)
+            except (TypeError, ValueError):
+                continue
+            trusted.add(((root, "session_instance_id"), runtime_session.instance_id))
         trusted.add(((root, "session_id"), runtime_session.id))
         if root == "pending_user_input":
             # Staged terminal envelopes duplicate the same runtime session.

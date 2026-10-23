@@ -411,6 +411,8 @@ def test_fresh_process_opaque_dispatch_and_competing_terminalizers(tmp_path, bac
             )
         )
         assert len(events) == 1
+        checkpoint = await store.load_checkpoint("opaque-model")
+        assert checkpoint["invocation_configuration"]["session_id"] == "opaque-model"
         assert await store.load_active_model_completion_stage("opaque-model") is None
         await store.close()
 

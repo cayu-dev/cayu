@@ -1122,6 +1122,7 @@ def test_cayu_app_preserves_runtime_owned_projection_identity_after_redaction(tm
         ),
     )
 
+    assert not [event for event in events if event.type == EventType.SESSION_FAILED], events
     terminal = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
     projection = terminal.payload["tool_result_projection"]
     reference = terminal.payload["result"]["artifacts"][-1]

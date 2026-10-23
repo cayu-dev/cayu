@@ -1444,6 +1444,7 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
         assert response.status_code == 200
         list(response.iter_lines())
     assert len(provider.requests) == 2
+    assert store.by_work_id[operation.work_id].result_receipt == pending_with_receipt.result_receipt
 
     terminal = ProductOperation.model_validate(
         {
@@ -1466,6 +1467,7 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
         assert response.status_code == 200
         list(response.iter_lines())
     assert len(provider.requests) == 2
+    assert store.by_work_id[operation.work_id].result_receipt == pending_with_receipt.result_receipt
 
     conflict = client.post(
         "/cayu/api/resume",
@@ -1475,6 +1477,7 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
     assert conflict.status_code == 409
     assert "idempotency key" in conflict.json()["detail"]
     assert len(provider.requests) == 2
+    assert store.by_work_id[operation.work_id].result_receipt == pending_with_receipt.result_receipt
 
 
 def test_replacement_worker_continues_abandoned_session_without_starting_over() -> None:

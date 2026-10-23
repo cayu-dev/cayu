@@ -271,6 +271,8 @@ from cayu.server.contracts import (
     PendingActionsResponse,
     PendingKnowledgeDetailResponse,
     PendingKnowledgeListResponse,
+    RoleForbiddenDetail,
+    RoleForbiddenResponse,
     ServerContractResponse,
     SessionCostEndpointContract,
     SessionFollowContract,
@@ -656,7 +658,7 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
 
 SESSION_MESSAGE_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     status: {
-        "model": ApiErrorResponse,
+        "model": ApiErrorResponse | RoleForbiddenResponse if status == 403 else ApiErrorResponse,
         "description": description,
         "headers": {"Cache-Control": {"schema": {"type": "string", "const": "private, no-store"}}},
     }
@@ -702,6 +704,18 @@ class _PrivateSessionMessageRoute(_BoundedPrivateJsonBodyRoute):
                     503, "Session-message operation is unavailable."
                 )
             except HTTPException as exc:
+                if (
+                    exc.status_code == 403
+                    and type(exc.detail) is dict
+                    and exc.detail.get("code") == "role_forbidden"
+                ):
+                    # Only this constant public classification survives the
+                    # private wrapper; never reflect auth/policy diagnostics.
+                    return JSONResponse(
+                        status_code=403,
+                        content=RoleForbiddenResponse(detail=RoleForbiddenDetail()).model_dump(),
+                        headers={"Cache-Control": "private, no-store"},
+                    )
                 return _private_no_store_error_response(
                     exc.status_code, "Session-message request was denied."
                 )
@@ -5913,11 +5927,12 @@ def create_router(
             profile_adoption=profile_adoption,
             failover=body.failover,
             budget_limits=body.budget_limits,
-            structured_output=body.structured_output,
             metadata=trace_metadata,
             loop_policies=await _continuation_loop_policies(session_id),
         )
         run_default_overrides: dict[str, object] = {}
+        if "structured_output" in body.model_fields_set:
+            run_default_overrides["structured_output"] = body.structured_output
         if "max_steps" in body.model_fields_set:
             run_default_overrides["max_steps"] = body.max_steps
         if "limits" in body.model_fields_set:

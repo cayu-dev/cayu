@@ -25,6 +25,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -259,6 +260,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
             key in authoritative_current
             for key in (
                 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
                 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
                 INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
                 SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -329,6 +331,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
         preserved_lifecycle_authority = False
         for authority_key in (
             ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
             INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
             INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
             SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -401,6 +404,7 @@ def _copy_checkpoint_for_transform(
         if copied is None:
             raise AssertionError("Stored checkpoint decoded to no state.")
     if not lifecycle_authority_allowed and CHECKPOINT_SCHEMA_VERSION_KEY in checkpoint:
+        copied.pop(INVOCATION_CONFIGURATION_CHECKPOINT_KEY, None)
         copied.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
         copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
         copied.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)

@@ -337,6 +337,11 @@ def test_detached_fork_retains_source_alias_until_last_child_is_deleted():
             for index in range(2)
         ]
         originals = [[event async for event in app.fork_session(request)] for request in requests]
+        assert "invocation_configuration" in (await store.load_checkpoint(source_id))
+        for fork_request in requests:
+            assert "invocation_configuration" not in (
+                await store.load_checkpoint(fork_request.session_id) or {}
+            )
         report = await app.erase_session_closure(
             source_id, policy=SessionClosurePolicy(child_policy=SessionClosureChildPolicy.DETACH)
         )

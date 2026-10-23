@@ -52,6 +52,7 @@ _ALLOWED_CHECKPOINT_KEYS = frozenset(
         "checkpoint_schema_version",
         "active_invocation_execution_profile",
         "invocation_lifecycle_receipt",
+        "invocation_configuration",
         "invocation_terminal_decision",
         "pending_session_interrupt",
         "pending_interruption_cascade",
@@ -155,6 +156,7 @@ def prepare_zero_work_interruption(
             "checkpoint_schema_version",
             "active_invocation_execution_profile",
             "invocation_lifecycle_receipt",
+            "invocation_configuration",
             "settled_invocation_terminal_decision",
             "recovery_plan_execution",
         }

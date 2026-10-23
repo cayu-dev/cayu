@@ -300,10 +300,12 @@ prints the same explanation, and exits 3 when the session would not resume.
 It builds the current profile the way Runtime does at the session's next
 boundary. For pending work it restores the run settings recorded with the
 approval, user input or tool round, such as `thinking` and budget limits. At a
-resume boundary, resume inherits `max_steps`, `limits` and `retry_policy`, but
-a finished interaction keeps no `thinking`, `budget_limits` or
-`structured_output`, so a difference in those classes is listed under "not
-compared" with the reason instead of as a change. Request `loop_policies` are
+resume boundary, resume inherits `max_steps`, `limits`, `retry_policy` and
+`structured_output` from verified admitted settings, including when the first
+provider request failed. The comparison uses those same settings. A finished
+interaction does not inherit request `thinking` or `budget_limits`; those classes
+are listed under "not compared" with the reason instead of as a change. An
+ordinary-turn `tool_completion` policy must still be supplied explicitly. Request `loop_policies` are
 never stored, so `invocation_policies` is not compared when the session used
 them. The command runs in a new process, so classes with opaque identity
 always show as changed there. That includes request `loop_policies` without a

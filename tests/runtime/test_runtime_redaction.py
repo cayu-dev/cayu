@@ -1040,6 +1040,7 @@ def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() 
         )
     )
 
+    assert not [event for event in events if event.type == EventType.SESSION_FAILED], events
     expected_reason = _bound_policy_denial_text(redactor.redact_text(raw_reason))
     expected_metadata = redactor.redact_json(raw_metadata)
     blocked = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)

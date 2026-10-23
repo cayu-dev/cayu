@@ -56,6 +56,7 @@ from cayu.runtime._model_completion_contracts import model_completion_recovery_c
 from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_step_executor import reconstruct_assistant_step_result
 from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
+from cayu.runtime._resume_configuration import invocation_configuration
 from cayu.runtime._session_finalization import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     SessionFinalization,
@@ -2256,6 +2257,13 @@ class WorkAttemptExecution:
                     request=request_to_create,
                     identity=identity,
                     active_profile=active_profile,
+                    configuration=invocation_configuration(
+                        request_to_create,
+                        session_id=active_profile.session_id,
+                        session_instance_id=session_instance_id,
+                        profile=active_profile.profile,
+                        retry_policy=self._effective_retry_policy(request_to_create.retry_policy),
+                    ),
                     interaction_started_event=started_event,
                     interaction_source_messages=source_messages,
                     tool_discovery_initialization=discovery_initialization,
@@ -2440,6 +2448,7 @@ class WorkAttemptExecution:
             or predecessor.task_id != task_id
             or predecessor.session_id != session.id
             or predecessor.state is not WorkAttemptAdmissionState.RELEASED
+            or predecessor.run_semantics is None
         ):
             raise WorkAttemptAdmissionConflict(
                 "Continuation predecessor conflicts with released task-session authority."
@@ -2590,6 +2599,13 @@ class WorkAttemptExecution:
             expected_run_epoch=expected_run_epoch,
             expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
             target_active_profile=continuation_active_profile,
+            configuration=invocation_configuration(
+                predecessor.run_semantics,
+                session_id=expected_session_id,
+                session_instance_id=session.instance_id,
+                profile=continuation_active_profile.profile,
+                retry_policy=predecessor.run_semantics.retry_policy,
+            ),
             checkpoint_patch=InvocationCheckpointPatch(
                 mutation=runtime_publication_checkpoint_mutation(
                     checkpoint,

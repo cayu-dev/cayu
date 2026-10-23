@@ -1063,3 +1063,65 @@ def test_queued_turn_keeps_its_admitted_policy_and_completes_from_its_own_tool()
         assert events[-1].payload["tool_completion"]["call"]["tool_call_id"] == "c2"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_unpublished_model_recovery_admits_resolved_completion_policy(store_factory, explicit):
+    class CompletedStageLoss:
+        invocation_lifecycle_command_version = 1
+
+        async def complete_model_completion_stage(self, *args, **kwargs):
+            result = await super().complete_model_completion_stage(*args, **kwargs)
+            if not getattr(self, "lost", False):
+                self.lost = True
+                raise _SimulatedProcessLoss("model stage committed before process loss")
+            return result
+
+    async def scenario():
+        async with store_factory(CompletedStageLoss) as store:
+            session_id = f"recovery-policy-{explicit}"
+            policy = ToolCompletionPolicy(tool_names=["ask_customer"])
+            first = app_for(store, _TwoCallProvider([call()]), FinalTool())
+            with pytest.raises(_SimulatedProcessLoss):
+                [
+                    event
+                    async for event in first.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="support",
+                            messages=[Message.text("user", "Help")],
+                            tool_completion=policy,
+                        )
+                    )
+                ]
+            assert await store.load_active_model_completion_stage(session_id) is not None
+            # Model process-loss recovery revoking the dead owner by one epoch.
+            await store.fence_run_and_transform_checkpoint(
+                session_id,
+                statuses={SessionStatus.RUNNING},
+                checkpoint_transform=lambda session, checkpoint: checkpoint,
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            tool = FinalTool()
+            provider = _TwoCallProvider([])
+            app = app_for(store, provider, tool)
+            controls = {"tool_completion": policy} if explicit else {}
+            events = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "Continue")],
+                        **controls,
+                    )
+                )
+            ]
+            # Recovery admits the exact prior policy without replaying the provider
+            # or executing an unpublished tool call as a fresh ordinary turn.
+            assert events[-1].type == EventType.SESSION_INTERRUPTED, events
+            assert tool.calls == 0 and provider.requests == []
+            assert (await store.load_checkpoint(session_id))["invocation_configuration"][
+                "tool_completion"
+            ] == policy.model_dump(mode="json")
+
+    asyncio.run(scenario())

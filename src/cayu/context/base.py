@@ -117,6 +117,7 @@ from cayu.sessions._checkpoint_secret_validation import require_secret_free_dura
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY,
@@ -1652,6 +1653,7 @@ def _copy_secret_free_context_checkpoint_evidence(
     """Copy the two checkpoint representations through one validation seam."""
 
     private_authority_keys = {
+        INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -7356,6 +7358,7 @@ def project_runtime_managed_context_checkpoint(
     if checkpoint is None:
         return None
     projected = copy_durable_record(checkpoint, "checkpoint")
+    projected.pop(INVOCATION_CONFIGURATION_CHECKPOINT_KEY, None)
     projected.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     projected.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
     projected.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)

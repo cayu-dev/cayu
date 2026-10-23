@@ -4214,6 +4214,13 @@ def test_worker_repeated_gap_uses_semantic_identity_not_prose(
             assert len(handler.preparations) == 1
             assert len(handler.proposals) == expected_runs
             assert receipt.task == final
+            configuration = (await sessions.load_checkpoint(admission.session_id))[
+                "invocation_configuration"
+            ]
+            assert configuration["max_steps"] == admission.run_semantics.max_steps
+            assert configuration["retry_policy"] == admission.run_semantics.retry_policy.model_dump(
+                mode="json"
+            )
             if change == "prose":
                 assert final.status is TaskStatus.NEEDS_ATTENTION
                 assert final.status_reason == "work_contract_repeated_gap_limit"

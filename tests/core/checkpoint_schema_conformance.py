@@ -462,6 +462,12 @@ async def assert_versionless_noop_transform_stamps_conformance(
     session = await store.load(session_id)
     assert session is not None
     assert active_profile.run_epoch + 1 == session.run_epoch
+    from cayu.runtime._resume_configuration import recorded_admitted_configuration
+
+    configuration = recorded_admitted_configuration(checkpoint, session)
+    assert configuration is not None
+    assert configuration.session_instance_id == session.instance_id
+    checkpoint.pop("invocation_configuration")
     checkpoint.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
     receipt_ledger = checkpoint.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
     assert receipt_ledger["record_type"] == ("cayu.invocation-lifecycle-command-receipt-ledger")

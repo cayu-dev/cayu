@@ -30,6 +30,9 @@ class RequestStopPolicy(LoopPolicy):
         self.calls = 0
         self.interrupted = False
 
+    def __deepcopy__(self, memo):
+        raise AssertionError("Request policy state must remain owned by the caller.")
+
     @property
     def execution_profile_identity(self):
         return ExecutionProfileBehaviorIdentity(

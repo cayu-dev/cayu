@@ -85,6 +85,38 @@
       "title": "ResolutionActorSource",
       "type": "string"
     },
+    "RoleForbiddenDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "role_forbidden",
+          "default": "role_forbidden",
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "const": "Your role can't use this.",
+          "default": "Your role can't use this.",
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "title": "RoleForbiddenDetail",
+      "type": "object"
+    },
+    "RoleForbiddenResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "$ref": "#/components/schemas/RoleForbiddenDetail"
+        }
+      },
+      "required": [
+        "detail"
+      ],
+      "title": "RoleForbiddenResponse",
+      "type": "object"
+    },
     "ToolAuthorizationGrant": {
       "additionalProperties": false,
       "description": "Typed, versioned durable grant record.\n\n``status`` is stored lifecycle; :meth:`effective_status` adds deterministic\nexpiry. Only ``ACTIVE`` grants that have not reached ``expires_at`` can\nauthorize a call. ``STAGED`` grants are written before their approval is\nresolved and stay inert until that approval is durably approved by one of\n``resolution_request_digests``.",
@@ -1096,6 +1128,21 @@
               "text/event-stream": {
                 "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
                 "type": "string"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RoleForbiddenResponse"
+                  }
+                ],
+                "title": "Response 403 Approve With Grant Api Tool Authorization Grants Approve Post"
               }
             }
           },

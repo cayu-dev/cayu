@@ -32,6 +32,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentityStrength,
     execution_profile_with_component,
 )
+from cayu.messages import Message
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _runtime_records as runtime_records
@@ -40,9 +41,12 @@ from cayu.runtime._execution_profile_continuation import (
     ExecutionProfileContinuation,
     _runtime_version,
 )
-from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
 from cayu.runtime._recovery_coordinator import recorded_pending_invocation_semantics
-from cayu.runtime._resume_configuration import recorded_invocation_semantics
+from cayu.runtime._resume_configuration import (
+    inherit_resume_configuration,
+    recorded_admitted_configuration,
+    recorded_invocation_semantics,
+)
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions._execution_profile_checkpoint import (
@@ -52,7 +56,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions.records import Session, SessionRuntimeIdentity, SessionStatus
-from cayu.sessions.requests import DEFAULT_MAX_STEPS
+from cayu.sessions.requests import DEFAULT_MAX_STEPS, ResumeRequest
 from cayu.sessions.store import SessionStore
 from cayu.tools.exposure import resolve_tool_capability_ceiling
 from cayu.vaults.redaction import SecretRedactor
@@ -245,10 +249,19 @@ async def compare_session_execution_profile(
     elif boundary is ExecutionProfileAdmissionBoundary.RESUME and stored.expected is not None:
         stored_profile = execution_profile_from_session_metadata(session.metadata)
         context = await recorded_invocation_semantics(store, session, checkpoint)
+        configuration = recorded_admitted_configuration(checkpoint, session)
+        request, _ = await inherit_resume_configuration(
+            store,
+            session,
+            ResumeRequest(
+                session_id=session.id, messages=[Message.text("user", "Compare execution profile.")]
+            ),
+            effective_retry_policy(None),
+        )
         candidate = _resume_candidate(
             session=session,
             stored_profile=stored_profile,
-            context=context,
+            request=request,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
@@ -262,9 +275,12 @@ async def compare_session_execution_profile(
             redactor=redactor,
         )
         unknown = [
-            (component_class, _RESUME_REQUEST_REASON) for component_class in _RESUME_REQUEST_CLASSES
+            (component_class, _RESUME_REQUEST_REASON)
+            for component_class in _RESUME_REQUEST_CLASSES
+            if component_class is not ExecutionProfileComponentClass.STRUCTURED_OUTPUT
+            or (context is None and configuration is None)
         ]
-        if context is None:
+        if context is None and configuration is None:
             unknown.append((ExecutionProfileComponentClass.FINALIZATION, _NO_FINALIZATION_REASON))
         if stored_profile.schema_version >= 4:
             for component_class, reason in unknown:
@@ -395,7 +411,7 @@ def _resume_candidate(
     *,
     session: Session,
     stored_profile: ExecutionProfileIdentity,
-    context: ModelCompletionRecoveryContext | None,
+    request: ResumeRequest,
     registered_agent: runtime_records.RegisteredAgentState,
     registered_provider: runtime_records.RegisteredProvider,
     registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -438,14 +454,14 @@ def _resume_candidate(
             budget_policy=budget_policy,
             request_budget_limits=(),
             causal_budget_id=session.causal_budget_id,
-            structured_output=None,
+            structured_output=request.structured_output,
             thinking=None,
-            max_steps=DEFAULT_MAX_STEPS if context is None else context.max_steps,
-            limits=None if context is None else context.limits,
-            retry_policy=effective_retry_policy(None if context is None else context.retry_policy),
+            max_steps=request.max_steps,
+            limits=request.limits,
+            retry_policy=effective_retry_policy(request.retry_policy),
             tool_capability_ceiling=ceiling,
             runtime_identity=runtime_identity,
-            tool_completion=None if context is None else context.tool_completion,
+            tool_completion=request.tool_completion,
         )
         return execution_profile_with_component(
             candidate,

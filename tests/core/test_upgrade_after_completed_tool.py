@@ -105,6 +105,7 @@ def test_upgrade_closes_later_model_only_with_completed_tool_receipt(
             checkpoint = await store.load_checkpoint(sid)
             assert checkpoint["last_model_step_publication"]["assistant_message_deferred"]
             assert "pending_tool_round" not in checkpoint
+            assert checkpoint["invocation_configuration"]["session_id"] == sid
             active = await store.load_active_model_completion_stage(sid)
             assert active is not None
             provider = _CrashAfterToolProvider(

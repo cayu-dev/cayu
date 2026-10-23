@@ -57,6 +57,7 @@ from cayu.runtime._policy_wire import decode as decode_policy_evidence
 from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
 )
+from cayu.runtime._resume_configuration import invocation_configuration
 from cayu.runtime._session_finalization import (
     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
     _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
@@ -1796,6 +1797,13 @@ class SessionEngine:
                         participant_checkpoint
                     ),
                     target_active_profile=participant_active_profile,
+                    configuration=invocation_configuration(
+                        request,
+                        session_id=participant_active_profile.session_id,
+                        session_instance_id=participant_session.instance_id,
+                        profile=participant_active_profile.profile,
+                        retry_policy=self._effective_retry_policy(request.retry_policy),
+                    ),
                     checkpoint_patch=InvocationCheckpointPatch(
                         mutation=runtime_publication_checkpoint_mutation(None, None)
                     ),
@@ -1932,6 +1940,13 @@ class SessionEngine:
                 request=request,
                 identity=session_identity,
                 active_profile=active_profile,
+                configuration=invocation_configuration(
+                    request,
+                    session_id=session_id,
+                    session_instance_id=session_instance_id,
+                    profile=active_profile.profile,
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                ),
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=tuple(request.messages),
                 tool_discovery_initialization=tool_discovery_initialization,
@@ -2035,6 +2050,13 @@ class SessionEngine:
                 expected_run_epoch=pending_session.run_epoch,
                 expected_checkpoint_sha256=(invocation_checkpoint_state_sha256(pending_checkpoint)),
                 target_active_profile=prepared_active_profile,
+                configuration=invocation_configuration(
+                    request,
+                    session_id=prepared_active_profile.session_id,
+                    session_instance_id=pending_session.instance_id,
+                    profile=prepared_active_profile.profile,
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                ),
                 checkpoint_patch=InvocationCheckpointPatch(
                     mutation=runtime_publication_checkpoint_mutation(
                         pending_checkpoint,
@@ -4744,6 +4766,11 @@ class SessionEngine:
                     else continuing_execution_profile_snapshot.profile
                 ),
             )
+            # Recovery continues the resolved invocation, including its recorded
+            # finalization policy. Ordinary new turns retain explicit policy semantics.
+            request = request.model_copy(
+                update={"tool_completion": continuing_profile_resolution.tool_completion}
+            )
             continuing_execution_profile_snapshot = continuing_profile_resolution.snapshot
             if continuing_profile_resolution.model_failover is not None:
                 model_failover = continuing_profile_resolution.model_failover
@@ -5145,6 +5172,13 @@ class SessionEngine:
                 expected_run_epoch=loaded_session.run_epoch,
                 expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
                 target_active_profile=target_active_profile,
+                configuration=invocation_configuration(
+                    request,
+                    session_id=target_active_profile.session_id,
+                    session_instance_id=loaded_session.instance_id,
+                    profile=target_active_profile.profile,
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                ),
                 checkpoint_patch=InvocationCheckpointPatch(
                     mutation=runtime_publication_checkpoint_mutation(checkpoint, claimed_checkpoint)
                 ),

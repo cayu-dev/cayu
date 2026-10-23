@@ -7395,7 +7395,12 @@ def test_opaque_request_loop_policy_exact_instance_is_process_local_reusable() -
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        policy = OpaqueConfiguredLoopPolicy(BeforeStopDecision.complete("configured-v1"))
+
+        class ResourceOwningPolicy(OpaqueConfiguredLoopPolicy):
+            def __deepcopy__(self, memo):
+                raise AssertionError("Request policy resources must retain their owner.")
+
+        policy = ResourceOwningPolicy(BeforeStopDecision.complete("configured-v1"))
 
         await _collect(
             app.run(

@@ -3331,6 +3331,8 @@ def test_runtime_composes_mcp_session_secrets_before_durable_tool_checkpoint() -
         is not None
     )
     checkpoint_without_active_profile.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    configuration = checkpoint_without_active_profile.pop("invocation_configuration")
+    assert configuration["record_type"] == "cayu.invocation-configuration"
     assert checkpoint_without_active_profile == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }

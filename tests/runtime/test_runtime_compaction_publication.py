@@ -1029,6 +1029,7 @@ def test_automatic_compaction_checkpoint_and_evidence_publish_atomically(
             assert checkpointed_count == 1
             assert checkpoint is not None
             assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+            assert checkpoint["invocation_configuration"]["session_id"] == session_id
         else:
             assert returned[-1].type == EventType.SESSION_FAILED
             assert completed_count == 0

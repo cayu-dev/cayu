@@ -97,6 +97,11 @@ def checkpoint_without_active_invocation_profile(
     copied = dict(checkpoint)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
     copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+    configuration = copied.pop("invocation_configuration", None)
+    if configuration is not None:
+        from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+        InvocationConfiguration.model_validate(configuration)
     return copied
 
 

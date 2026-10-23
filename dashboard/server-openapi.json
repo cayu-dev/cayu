@@ -8474,6 +8474,16 @@
               }
             ]
           },
+          "session_followups": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "session_overview": {
             "anyOf": [
               {
@@ -31543,6 +31553,38 @@
         "title": "RetryPolicy",
         "type": "object"
       },
+      "RoleForbiddenDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "const": "role_forbidden",
+            "default": "role_forbidden",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "const": "Your role can't use this.",
+            "default": "Your role can't use this.",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "title": "RoleForbiddenDetail",
+        "type": "object"
+      },
+      "RoleForbiddenResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/RoleForbiddenDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "RoleForbiddenResponse",
+        "type": "object"
+      },
       "RootStatusAssertionSpec": {
         "additionalProperties": false,
         "properties": {
@@ -33172,7 +33214,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "56",
+            "default": "57",
             "title": "Contract Version",
             "type": "string"
           },
@@ -40210,7 +40252,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "56",
+            "default": "57",
             "title": "Contract Version",
             "type": "string"
           }
@@ -45917,6 +45959,24 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Resolve Provider Operation Api Provider Operations Resolve Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
+          },
           "404": {
             "content": {
               "application/json": {
@@ -46038,6 +46098,24 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Resume Agent Api Resume Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
+          },
           "404": {
             "content": {
               "application/json": {
@@ -46149,6 +46227,24 @@
               }
             },
             "description": "The authenticated caller identity cannot be represented as durable invocation provenance."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Run Agent Api Run Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
           },
           "404": {
             "content": {
@@ -47767,6 +47863,24 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Interrupt Session Api Sessions  Session Id  Interrupt Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
+          },
           "404": {
             "content": {
               "application/json": {
@@ -48020,7 +48134,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Inspect Session Messages Api Sessions  Session Id  Messages Get"
                 }
               }
             },
@@ -48224,7 +48346,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Enqueue Session Message Api Sessions  Session Id  Messages Post"
                 }
               }
             },
@@ -48417,7 +48547,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Snapshot Session Message Source Api Sessions  Session Id  Messages Source Snapshot Post"
                 }
               }
             },
@@ -48609,7 +48747,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Quarantine Session Message Api Sessions  Session Id  Messages  Queue Id  Quarantine Post"
                 }
               }
             },
@@ -48801,7 +48947,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Withdraw Session Message Api Sessions  Session Id  Messages  Queue Id  Withdraw Post"
                 }
               }
             },
@@ -50196,6 +50350,24 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Recover Tool Approval Api Tool Approvals Recover Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
+          },
           "404": {
             "content": {
               "application/json": {
@@ -50298,6 +50470,24 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Resolve Tool Approval Api Tool Approvals Resolve Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
+          },
           "404": {
             "content": {
               "application/json": {
@@ -50399,6 +50589,24 @@
               }
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Recover Tool Round Api Tool Rounds Recover Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
           },
           "404": {
             "content": {
@@ -50581,6 +50789,24 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Recover User Input Api User Input Recover Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
+          },
           "404": {
             "content": {
               "application/json": {
@@ -50682,6 +50908,24 @@
               }
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RoleForbiddenResponse"
+                    }
+                  ],
+                  "title": "Response 403 Resolve User Input Api User Input Resolve Post"
+                }
+              }
+            },
+            "description": "The authenticated role or application policy forbids this operation."
           },
           "404": {
             "content": {

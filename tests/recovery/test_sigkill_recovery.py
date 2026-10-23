@@ -44,7 +44,9 @@ def _assert_only_model_step_publication(
     *,
     settled_terminal_decision: bool = False,
 ) -> None:
+    assert checkpoint["invocation_configuration"]["record_type"] == "cayu.invocation-configuration"
     expected_keys = {
+        "invocation_configuration",
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,

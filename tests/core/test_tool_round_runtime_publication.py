@@ -233,7 +233,9 @@ def _assert_only_model_step_publication_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> None:
     assert checkpoint is not None
+    assert checkpoint["invocation_configuration"]["record_type"] == "cayu.invocation-configuration"
     assert set(checkpoint) == {
+        "invocation_configuration",
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,

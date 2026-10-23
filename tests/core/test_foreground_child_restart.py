@@ -328,9 +328,12 @@ async def _worker(path: str, action: str, phase: str) -> None:
                 )
             )
         ]
-        assert events[-1].type == "session.interrupted", events[-1].payload
+        assert events[-1].type == "session.interrupted", [
+            (event.type, event.payload) for event in events
+        ]
         checkpoint = await store.load_checkpoint("parent")
         assert checkpoint is not None and "foreground_child_wait" in checkpoint
+        assert checkpoint["invocation_configuration"]["session_id"] == "parent"
         if phase == "pause":
             print("PAUSED", flush=True)
             # The harness kills this real process with the SQLite connection open.

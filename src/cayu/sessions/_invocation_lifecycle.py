@@ -75,6 +75,7 @@ from cayu.sessions._interaction_transitions import (
     InteractionTransitionResult,
     InteractionTransitionSpec,
 )
+from cayu.sessions._invocation_configuration import InvocationConfiguration
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -85,6 +86,7 @@ from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION,
@@ -266,6 +268,7 @@ class InvocationCheckpointPatch(BaseModel):
             in {
                 CHECKPOINT_SCHEMA_VERSION_KEY,
                 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
                 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
                 INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
                 SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -306,6 +309,7 @@ class CreateInvocationCommand(_InvocationCommandModel):
     active_profile: ActiveInvocationExecutionProfile
     interaction_started_event: Event
     interaction_source_messages: tuple[Message, ...]
+    configuration: InvocationConfiguration | None = None
     checkpoint_patch: InvocationCheckpointPatch = Field(default_factory=InvocationCheckpointPatch)
     tool_discovery_initialization: ToolDiscoveryViewInitialization | None = None
 
@@ -423,6 +427,8 @@ class AdmitInvocationCommand(_InvocationCommandModel):
     expected_run_epoch: StrictInt = Field(ge=0)
     expected_checkpoint_sha256: str
     target_active_profile: ActiveInvocationExecutionProfile
+    configuration: InvocationConfiguration | None = None
+
     checkpoint_patch: InvocationCheckpointPatch = Field(default_factory=InvocationCheckpointPatch)
     interaction_source_messages: tuple[Message, ...] = ()
     tool_capability_ceiling: ToolCapabilityCeiling

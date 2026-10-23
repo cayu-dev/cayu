@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY = "workspace_observations"
+INVOCATION_CONFIGURATION_CHECKPOINT_KEY = "invocation_configuration"
 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY = "active_invocation_execution_profile"
 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY = "invocation_lifecycle_receipt"
 INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY = "invocation_terminal_decision"

@@ -51,6 +51,7 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
@@ -215,6 +216,11 @@ def assert_only_model_step_publication_checkpoint(
     optional_keys = (
         {SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY} if settled is not None else set()
     )
+    if INVOCATION_CONFIGURATION_CHECKPOINT_KEY in checkpoint:
+        from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+        InvocationConfiguration.model_validate(checkpoint[INVOCATION_CONFIGURATION_CHECKPOINT_KEY])
+        optional_keys.add(INVOCATION_CONFIGURATION_CHECKPOINT_KEY)
     assert set(checkpoint) - optional_keys == {
         CHECKPOINT_SCHEMA_VERSION_KEY,
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -243,6 +249,11 @@ def checkpoint_without_model_step_publication(
     copied = dict(checkpoint)
     copied.pop(model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    configuration = copied.pop(INVOCATION_CONFIGURATION_CHECKPOINT_KEY, None)
+    if configuration is not None:
+        from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+        InvocationConfiguration.model_validate(configuration)
     copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     if SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in copied:
         assert settled_invocation_terminal_decision_from_checkpoint(copied) is not None
@@ -277,6 +288,11 @@ def checkpoint_without_active_invocation_profile(
     )
     copied = dict(checkpoint)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    configuration = copied.pop(INVOCATION_CONFIGURATION_CHECKPOINT_KEY, None)
+    if configuration is not None:
+        from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+        InvocationConfiguration.model_validate(configuration)
     copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     if SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in copied:
         assert settled_invocation_terminal_decision_from_checkpoint(copied) is not None

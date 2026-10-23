@@ -5787,6 +5787,7 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
         ]
         records = await store.query_events(EventQuery(session_id="session-bulk"))
         events = [record.event for record in records]
+        assert not [event for event in events if event.type == EventType.SESSION_FAILED], events
         after = next(
             event
             for event in events

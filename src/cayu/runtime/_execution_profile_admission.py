@@ -139,6 +139,7 @@ class ExecutionProfileContinuationPlan:
     candidate_profile: ExecutionProfileIdentity
     changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
     model_failover: ModelFailoverProfileResolution | None = None
+    tool_completion: ToolCompletionPolicy | None = None
 
 
 def model_finalization_material(

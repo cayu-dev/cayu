@@ -498,10 +498,12 @@ def session_input_contract_evidence(
 class ResumeRequest(BaseModel):
     """Continue a conversation; omitted loop controls inherit verified prior settings.
 
-    ``max_steps``, ``limits``, and ``retry_policy`` inherit from the latest
-    profile-bound model completion when available. Explicit values still pass
-    normal execution-profile admission. Legacy/fork sessions without matching
-    evidence use application defaults. This does not reset session-scoped limits.
+    Omitted ``max_steps``, ``limits``, ``retry_policy``, and ``structured_output``
+    inherit from verified durable invocation settings, including when a provider
+    fails before its first completion. Explicit values (including ``None``) still
+    pass normal execution-profile admission. Missing matching evidence leaves
+    request defaults subject to that admission. Session-scoped limits are not reset.
+    Ordinary-turn ``tool_completion`` remains an explicit per-turn policy.
 
     ``expected_run_epoch`` makes the resume conditional: it is admitted only
     while ``Session.run_epoch`` still has that value, checked in the same
@@ -1183,6 +1185,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         "thinking",
         "retry_policy",
         "tool_completion",
+        "structured_output",
         "expected_session_instance_id",
         "expected_run_epoch",
     ):

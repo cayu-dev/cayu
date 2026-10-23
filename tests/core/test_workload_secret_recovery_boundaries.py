@@ -141,6 +141,8 @@ def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
     )
     checkpoint_without_active_profile.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    configuration = checkpoint_without_active_profile.pop("invocation_configuration")
+    assert configuration["record_type"] == "cayu.invocation-configuration"
     assert checkpoint_without_active_profile == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }
@@ -199,6 +201,8 @@ def test_cayu_app_rejects_workload_secret_before_approval_checkpoint() -> None:
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
     )
     checkpoint_without_active_profile.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    configuration = checkpoint_without_active_profile.pop("invocation_configuration")
+    assert configuration["record_type"] == "cayu.invocation-configuration"
     assert checkpoint_without_active_profile == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }

@@ -324,6 +324,8 @@ def test_fork_does_not_inherit_source_result_event_publication_reservation() -> 
     assert source_checkpoint is not None
     assert COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY in source_checkpoint
     assert child_checkpoint is not None
+    assert "invocation_configuration" in source_checkpoint
+    assert "invocation_configuration" not in child_checkpoint
     assert COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY not in child_checkpoint
 
 
@@ -340,6 +342,7 @@ def test_fork_does_not_inherit_source_result_event_publication_reservation() -> 
         COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "invocation_configuration",
         INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
@@ -372,6 +375,7 @@ def test_context_projection_hides_terminal_decision_authority() -> None:
     }
     source = {
         **ordinary_checkpoint,
+        "invocation_configuration": {"private": "admitted"},
         INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: {"private": "active"},
         SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: {"private": "settled"},
     }

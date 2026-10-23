@@ -172,6 +172,9 @@ def test_resume_does_not_inherit_unbound_or_legacy_defaults(monkeypatch, damage)
         store = InMemorySessionStore()
         app, _ = application(store)
         await start(app)
+        # Isolate the published-step fallback: admission-owned settings are a
+        # separate positive authority and must not be mistaken for this record.
+        store._checkpoints["conversation"].pop("invocation_configuration", None)
         original = store.load_model_completion_stage
 
         async def historical_stage(session_id, stage_id):

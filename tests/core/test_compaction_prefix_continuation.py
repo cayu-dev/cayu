@@ -391,6 +391,9 @@ def test_prefix_checkpoint_and_completion_evidence_remain_atomic(outcome, commit
             self.injected = True
             if committed:
                 await super().publish_checkpoint_and_events(session_id, **kwargs)
+            if committed:
+                checkpoint = await self.load_checkpoint(session_id)
+                assert "invocation_configuration" in checkpoint
             raise ConnectionError("scripted checkpoint acknowledgement failure")
 
     async def exercise():
