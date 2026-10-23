@@ -151,6 +151,7 @@ def test_timed_out_command_tree_is_stopped_and_container_is_kept(kind: str) -> N
             assert {detail.name: detail.value for detail in claim.adapter_details} == {
                 "container_cleanup": True,
                 "command_tree_cleanup": True,
+                "receipt_command_tree_cleanup": False,
                 "exact_container_owner": True,
             }
         finally:

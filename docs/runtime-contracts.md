@@ -13864,9 +13864,10 @@ evidence. An ambiguous delayed start permanently poisons execution, including
 Evidence-bearing Docker creation and `DockerRunner.reconnect_strict()` accept
 `"sandbox"` or `"command_or_sandbox"` for both cleanup fields.
 `DockerCodingEnvironmentFactory` uses `"sandbox"` by default;
-`command_cleanup="command_or_sandbox"` opts in to keeping the container, and
-the choice is part of the factory's configuration fingerprint, so a preserved
-session resumes only under the cleanup rules it was created with. When an
+`command_cleanup="command_or_sandbox"` opts in to keeping the container for
+commands without a durable receipt (see below), and the choice is part of the
+factory's configuration fingerprint, so a preserved session resumes only under
+the cleanup rules it was created with. When an
 evidence-bearing runner's admitted executables include `python3`, it runs every
 command, shell or process, in isolated mode (`python3 -I -S`) under a Python
 supervisor that is a child subreaper (`PR_SET_CHILD_SUBREAPER`),
@@ -13934,11 +13935,26 @@ cannot be read, or the Docker CLI or a stream fails. A runner without that super
 those restrictions (no runtime evidence, no admitted `python3`, or relaxed
 controls) cannot verify a stop, so `"command_or_sandbox"` always removes its
 container, and `confirmed_cancellation` reports `command_tree_cleanup` as
-false. A durable command receipt has its own guest owner, so its cleanup
-always removes the container. The command's user can still ptrace processes
-that run as that same user, including the supervisor and Docker's init, so
-this verification assumes trusted code; Docker does not claim
-`untrusted_code_isolation`.
+false. The command's user can still ptrace processes that run as that same
+user, including the supervisor and Docker's init, so this verification assumes
+trusted code; Docker does not claim `untrusted_code_isolation`.
+
+A command with a durable receipt always removes the container on timeout or
+cancellation, under either policy. The receipt's guest program owns the process
+and leaves no supervisor state file for the observer to start from, so Cayu does
+not attempt a command-level stop.
+Inside a `CayuApp` tool call the runtime binds a durable invocation authority, and
+`RunCommandTool` and a toolchain-profile `RunCheckTool` then ask the runner for a
+receipt. The runner prepares one whenever it has runtime evidence with an admitted
+`python3`, both cleanup policies are strict, it resolves no runner-owned secret
+environment values, and the command is a process. A runner from
+`DockerCodingEnvironmentFactory` always meets these, so in an app every
+`run_command` and `run_check` timeout or cancellation removes its container.
+`"command_or_sandbox"` keeps the container only for commands without a receipt:
+those tools called with a bare `ToolContext`, `ExecCommandTool`, and direct
+`DockerRunner.exec` calls. `command_tree_cleanup` describes only those
+commands; `confirmed_cancellation` also reports `receipt_command_tree_cleanup`,
+which is always false.
 
 After Docker, E2B or Microsandbox allocation is acknowledged, failed or cancelled initial
 workspace setup rolls back under a retained owner. Docker and E2B bound observation by

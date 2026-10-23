@@ -902,7 +902,10 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     The default ``"sandbox"`` always removes the container. ``"command_or_sandbox"``
     kills the command's process tree and keeps the container and its workspace
     once Cayu verifies, from outside the command's user, that the tree exited;
-    it removes the container whenever that cannot be verified.
+    it removes the container whenever that cannot be verified. That stop applies
+    only to commands without a durable receipt: ``run_command`` and ``run_check``
+    inside an app's tool call have one, so their timeout or cancellation always
+    removes the container.
     """
 
     @property

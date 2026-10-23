@@ -81,7 +81,7 @@ Fargate's host and privilege restrictions are described in
 
 | Capability | Docker | Lambda MicroVM |
 | --- | --- | --- |
-| Commands (`ExecCommandTool`), cancellation, timeouts, bounded output | Yes. The coding factory removes the container on a command timeout or cancellation by default; with `command_cleanup="command_or_sandbox"` it stops the command's whole process tree and keeps the container, removing it only when that stop cannot be verified. | Yes (runner conformance suite). |
+| Commands (`ExecCommandTool`), cancellation, timeouts, bounded output | Yes. The coding factory removes the container on a command timeout or cancellation by default; with `command_cleanup="command_or_sandbox"` it stops the command's whole process tree and keeps the container, removing it only when that stop cannot be verified. That applies only to commands without a durable receipt: profile-bound `run_command` and `run_check` inside an app's tool call have one, so their timeout or cancellation always removes the container. | Yes (runner conformance suite). |
 | File tools (read, write, edit, delete, list, `apply_patch`) | Yes. | Yes, through `RunnerWorkspace` inside the MicroVM. |
 | `search_text` | Yes when the image has `rg`. | Yes: the image ships a pinned `ripgrep`. The native `workspace_text_search_v1` capability is not claimed. |
 | `git_changes` | Yes when the image has `git`. | Yes: the image ships `git`. |

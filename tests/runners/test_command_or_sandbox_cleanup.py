@@ -9,11 +9,16 @@ from typing import Any
 
 import pytest
 
+from cayu.environments.docker_toolchains import (
+    DockerCodingCommandAuthority,
+    DockerCodingToolchainProfile,
+)
 from cayu.runners._cleanup import (
     cleanup_runner_command_with_diagnostic,
     runner_cleanup_observation_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._docker_command_receipt import guest_program
 from cayu.runners.base import ExecCommand, ExecResult, runner_workspace_mutation_settlement
 from cayu.runners.docker import (
     _COMMAND_TREE_OBSERVER,
@@ -27,8 +32,16 @@ from cayu.runners.docker_workload import (
     DockerTmpfsMount,
     DockerWorkloadRestrictions,
 )
-from cayu.tools.base import ToolContext
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import invocation_runner_handle
+from cayu.tools.base import ToolContext, _bind_runtime_tool_invocation_authority
+from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import ExecCommandTool
+from cayu.tools.named_checks import NamedCheck, RunCheckTool
+from cayu.tools.structured_commands import RunCommandTool
+from cayu.vaults import SecretRedactor
+from cayu.workspaces import LocalWorkspace
 
 
 def _artifact(action: str, status: str, **extra: Any) -> dict[str, Any]:
@@ -780,3 +793,141 @@ def test_tree_observer_launcher_runs_only_a_system_interpreter(tmp_path) -> None
     # And a system directory that is guest-writable.
     assert _launch(system, system, system=system).returncode == 1
     assert _launch(str(root / "missing"), other, system=system).returncode == 1
+
+
+def _bind_app_tool_call(ctx: ToolContext, *, tool_name: str, arguments: dict[str, Any]) -> None:
+    """Bind the durable authority CayuApp gives every tool call."""
+
+    records: dict[str, dict[str, Any]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        assert records.get(storage_key) == expected
+        records[storage_key] = desired
+        return desired
+
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=1,
+        model_step_id="mstep_" + "1" * 32,
+        model_attempt_id="mattempt_" + "1" * 32,
+        tool_round_id="tround_" + "1" * 32,
+        tool_call_id="call",
+        tool_name=tool_name,
+        idempotency_key="invocation",
+        effective_arguments=arguments,
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["run_command", "run_check"])
+@pytest.mark.parametrize("app_tool_call", [False, True])
+def test_receipt_backed_coding_commands_remove_the_container_on_timeout(
+    monkeypatch, tmp_path, tool_name: str, app_tool_call: bool
+) -> None:
+    # Inside an app's tool call, run_command and run_check get a durable
+    # receipt, and a receipt-backed command's timeout always removes the
+    # container, even under command_or_sandbox. Only a call without that
+    # authority (a bare ToolContext) gets the verified command-level stop.
+    import cayu.tools.named_checks as named_checks
+    import cayu.tools.structured_commands as structured_commands
+
+    async def admitted(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        structured_commands, "ensure_docker_coding_toolchain_runner_admission", admitted
+    )
+    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    docker = _GuestDocker()
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", docker)
+    authority = DockerCodingCommandAuthority(
+        selector="tests",
+        revision="1",
+        description="Run the tests.",
+        exposure="named_check" if tool_name == "run_check" else "structured_command",
+        executable="/usr/bin/python3",
+        fixed_arguments=("-m", "pytest"),
+        max_arguments=0,
+        timeout_seconds=2,
+        max_output_bytes=1024,
+    )
+    profile = DockerCodingToolchainProfile(
+        profile_id="cleanup",
+        revision="1",
+        image_identity=DockerImageIdentity(reference="test@sha256:" + "a" * 64),
+        platform_architecture="amd64",
+        command_authorities=(authority,),
+    )
+    if tool_name == "run_check":
+        tool: Any = RunCheckTool(
+            checks=(
+                NamedCheck(
+                    name="tests",
+                    description="Run the tests.",
+                    command=ExecCommand.process(*authority.command_argv()),
+                    timeout_s=2,
+                    max_output_bytes=1024,
+                    execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                        name="tests.cleanup-check", behavior_version="1", implementation_version="1"
+                    ),
+                ),
+            ),
+            toolchain_profile=profile,
+            command_policy=ProcessCommandPolicy(
+                allowed_executables=("/usr/bin/python3",), allowed_cwds=("/workspace",)
+            ),
+        )
+        arguments: dict[str, Any] = {"check": "tests"}
+    else:
+        tool = RunCommandTool(toolchain_profile=profile)
+        arguments = {"selector": "tests", "args": []}
+    runner = _evidence_runner()
+    # The capability says so: the command-level stop is reported for commands
+    # without a receipt only.
+    claim = runner.execution_capability_evidence().claim_for("confirmed_cancellation")
+    assert claim is not None
+    details = {detail.name: detail.value for detail in claim.adapter_details}
+    assert details["command_tree_cleanup"] is True
+    assert details["receipt_command_tree_cleanup"] is False
+    ctx = ToolContext(
+        session_id="session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id="workspace",
+        idempotency_key="invocation",
+        workspace=LocalWorkspace(tmp_path),
+        runner=invocation_runner_handle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0, redactor=SecretRedactor()
+            ),
+        ),
+    )
+    if app_tool_call:
+        _bind_app_tool_call(ctx, tool_name=tool_name, arguments=arguments)
+
+    result = asyncio.run(tool.run(ctx, arguments))
+
+    assert result.is_error is True
+    assert result.structured["timed_out"] is True
+    receipt_launched = any(guest_program() in argv for argv in docker.issued)
+    if app_tool_call:
+        assert receipt_launched
+        assert _cleanup_steps(result.structured["artifacts"]) == [("kill_sandbox", "completed")]
+        assert runner.lifecycle_state == "closed"
+        assert docker.removed
+        assert not any(_is_observer(argv, "find") for argv in docker.issued)
+    else:
+        assert not receipt_launched
+        assert _cleanup_steps(result.structured["artifacts"]) == [("kill_command", "completed")]
+        assert runner.lifecycle_state == "reusable"
+        assert not docker.removed

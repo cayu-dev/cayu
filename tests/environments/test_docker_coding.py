@@ -1375,6 +1375,7 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         assert {item["name"]: item["value"] for item in cancellation["adapter_details"]} == {
             "container_cleanup": True,
             "command_tree_cleanup": command_cleanup == "command_or_sandbox",
+            "receipt_command_tree_cleanup": False,
             "exact_container_owner": True,
         }
         assert result.environment.binding is not None

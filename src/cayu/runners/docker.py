@@ -3349,6 +3349,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                                 and _command_tree_is_verifiable(evidence)
                             ),
                         ),
+                        # A command with a durable receipt (run_command and
+                        # run_check inside an app's tool call) has no
+                        # command-level stop: its timeout or cancellation
+                        # always removes the container.
+                        CapabilityDetail(name="receipt_command_tree_cleanup", value=False),
                         CapabilityDetail(name="exact_container_owner", value=True),
                     ),
                 ),

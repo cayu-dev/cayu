@@ -160,16 +160,26 @@ That test performs an explicit trusted fixture-image build first, resolves each
 result to its content digest, and then starts separate network-disabled runtime
 containers. It proves hostile image entrypoints cannot replace Cayu's command
 path, direct structured commands and independent named checks both settle, a
-detached-session descendant cannot outlive a successful receipt, a timeout stops
-the command's whole process tree while the container stays usable, ordinary
-workspace mutations copy back, and exact profile/image/dependency
-identities remain in receipts. The test removes its ephemeral containers and image
+detached-session descendant cannot outlive a successful receipt, a timeout of a
+command run without a receipt stops the command's whole process tree while the
+container stays usable, ordinary workspace mutations copy back, and exact
+profile/image/dependency identities remain in receipts. The test removes its ephemeral containers and image
 tags on settlement.
 
 A command timeout or cancellation removes the container by default
 (`command_cleanup="sandbox"`): the result carries a completed `kill_sandbox`
 artifact, says the sandbox was removed, and the environment cannot run more
-commands. Pass `command_cleanup="command_or_sandbox"` to stop only the command:
+commands.
+
+`command_cleanup="command_or_sandbox"` does not change that for `run_command` and
+`run_check` calls made through an app. Inside a `CayuApp` tool call, every
+`run_command` and `run_check` gets a durable command receipt so its result can be
+recovered after a restart, and a timeout or cancellation of a receipt-backed
+command always removes the container.
+
+The option only affects commands that run without a receipt: these tools called
+with a bare `ToolContext` outside an app, `ExecCommandTool`, and direct
+`DockerRunner.exec` calls. For those, `command_or_sandbox` stops only the command:
 the runner kills the command's process tree inside the container and keeps the
 container, its workspace, and the runner once Cayu verifies, from `/proc` and
 as a user other than the command's, that every descendant exited. The tool
@@ -184,8 +194,10 @@ The result then also carries a completed `kill_sandbox` artifact and says the
 sandbox was removed. The option is part of the factory's configuration
 fingerprint, so a preserved session resumes only under the rules it was
 created with. The `confirmed_cancellation` evidence reports
-`command_tree_cleanup` alongside `container_cleanup`; see the Docker cleanup
-notes in [runtime contracts](runtime-contracts.md) for the mechanism.
+`command_tree_cleanup` for commands without a receipt and
+`receipt_command_tree_cleanup` (always false) for receipt-backed commands,
+alongside `container_cleanup`; see the Docker cleanup notes in
+[runtime contracts](runtime-contracts.md) for the mechanism.
 
 If timeout or cancellation removes the owned container before workspace
 publication, finalization fails explicitly and the session cannot claim committed
