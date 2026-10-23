@@ -394,13 +394,13 @@ class MutationDisconnectFaults:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         headers = dict(scope.get("headers", []))
-        is_summary_post = (
+        is_session_list = (
             scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and scope.get("path") == "/api/sessions/summary"
+            and scope.get("method") == "GET"
+            and scope.get("path") == "/api/sessions"
         )
         query = parse_qs(bytes(scope.get("query_string", b"")).decode("utf-8", errors="replace"))
-        if is_summary_post and query.get("q") == [SLOW_SESSION_QUERY]:
+        if is_session_list and query.get("q") == [SLOW_SESSION_QUERY]:
             self.slow_summary_started.set()
             await asyncio.sleep(1)
         is_run_post = (
@@ -1483,10 +1483,10 @@ async def _exercise_dashboard(
 
     await expect(page.get_by_role("heading", name="Sessions").first).to_be_visible()
     await _exercise_session_discovery(page, faults)
-    session_link = page.get_by_role("link", name=SESSION_ID)
+    session_link = _session_list_link(page, SESSION_ID)
     await expect(session_link).to_be_visible()
     session_row = page.get_by_role("row").filter(has_text=SESSION_ID)
-    await expect(session_row.get_by_text("completed", exact=True)).to_be_visible()
+    await expect(session_row.get_by_text("Completed", exact=True)).to_be_visible()
     await session_link.click()
 
     await expect(page).to_have_url(re.compile(rf"/cayu/sessions/{SESSION_ID}$"))
@@ -3748,8 +3748,9 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await expect(page.get_by_test_id("overview-session-execution-unavailable")).to_be_visible()
 
         await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
-        await expect(page.get_by_role("button", name="New Run", exact=True)).to_be_disabled()
-        await expect(page.get_by_test_id("session-execution-unavailable")).to_be_visible()
+        await expect(page.get_by_role("button", name="Start a session", exact=True)).to_have_count(
+            0
+        )
 
         await page.goto(
             f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="networkidle"
@@ -4189,6 +4190,16 @@ async def _exercise_session_annotations(page: Page) -> None:
         await page.unroute(metadata_path, count_metadata_saves)
 
 
+def _session_list_link(page: Page, session_id: str) -> Locator:
+    # The row link is named by its title; the exact session ID is shown beneath it.
+    return (
+        page.get_by_text(session_id, exact=True)
+        .locator("xpath=ancestor::tr")
+        .get_by_role("link")
+        .first
+    )
+
+
 def _session_discovery_search(page: Page) -> Locator:
     return page.get_by_role("main").get_by_label("Search sessions", exact=True)
 
@@ -4197,6 +4208,8 @@ async def _exercise_session_discovery(
     page: Page,
     faults: MutationDisconnectFaults,
 ) -> None:
+    await expect(page.get_by_label("Include eval trials", exact=True)).not_to_be_checked()
+    await expect(page.get_by_label("Include forks", exact=True)).not_to_be_checked()
     await page.get_by_text("Advanced filters", exact=True).click()
     await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
     await page.get_by_label("Environment", exact=True).fill(DISCOVERY_ENVIRONMENT)
@@ -4231,35 +4244,35 @@ async def _exercise_session_discovery(
         "session discovery URL must preserve repeated label selectors",
     )
     require("cursor" not in advanced_query, "changing session filters must reset the cursor")
-    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, FILTERED_SESSION_ID)).to_be_visible()
     require_equal(
         await page.locator("tbody tr").count(),
         100,
         "combined server session filters must retain one bounded first page",
     )
-    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_have_count(0)
+    await expect(_session_list_link(page, f"{PAGINATED_SESSION_PREFIX}-000")).to_have_count(0)
 
     next_page = page.get_by_role("button", name="Next page")
     await expect(next_page).to_be_visible()
     await next_page.click()
     await expect(page).to_have_url(re.compile(r"[?&]cursor="))
-    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
+    await expect(_session_list_link(page, f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
 
     filtered_later_page_url = page.url
     await page.reload(wait_until="networkidle")
     await expect(page).to_have_url(filtered_later_page_url)
-    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
+    await expect(_session_list_link(page, f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
 
     await page.get_by_role("button", name="First page").click()
     await expect(page).not_to_have_url(re.compile(r"[?&]cursor="))
-    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, FILTERED_SESSION_ID)).to_be_visible()
     filtered_first_page_url = page.url
     await page.go_back()
     await expect(page).to_have_url(filtered_later_page_url)
-    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
+    await expect(_session_list_link(page, f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
     await page.go_forward()
     await expect(page).to_have_url(filtered_first_page_url)
-    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, FILTERED_SESSION_ID)).to_be_visible()
 
     await page.get_by_role("button", name="Clear filters").click()
     await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
@@ -4268,9 +4281,9 @@ async def _exercise_session_discovery(
     await search.fill(SLOW_SESSION_QUERY)
     await asyncio.wait_for(faults.slow_summary_started.wait(), timeout=5)
     await search.fill(FILTERED_SESSION_ID)
-    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, FILTERED_SESSION_ID)).to_be_visible()
     await asyncio.sleep(1.1)
-    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, FILTERED_SESSION_ID)).to_be_visible()
     require_equal(
         await page.locator("tbody tr").count(),
         1,
@@ -4288,8 +4301,8 @@ async def _exercise_session_discovery(
     ) -> None:
         async with page.expect_response(
             lambda response: (
-                response.request.method == "POST"
-                and urlsplit(response.url).path == "/api/sessions/summary"
+                response.request.method == "GET"
+                and urlsplit(response.url).path == "/api/sessions"
                 and all(
                     parse_qs(urlsplit(response.url).query).get(field) == [expected]
                     for field, expected in expected_query.items()
@@ -4298,15 +4311,15 @@ async def _exercise_session_discovery(
         ) as response_info:
             await page.get_by_label(label).select_option(value)
         response = await response_info.value
-        require_equal(response.status, 200, f"{label} session summary response")
+        require_equal(response.status, 200, f"{label} session overview response")
 
     await select_session_filter(
-        "Filter by status",
+        "Raw status",
         "completed",
         {"status": "completed", "order_by": "updated_at_desc"},
     )
     await select_session_filter(
-        "Filter by debug state",
+        "Debug state",
         "tool_issue",
         {
             "status": "completed",
@@ -4327,7 +4340,7 @@ async def _exercise_session_discovery(
     require_equal(final_query.get("status"), ["completed"], "status filter URL state")
     require_equal(final_query.get("debug_state"), ["tool_issue"], "debug filter URL state")
     require_equal(final_query.get("order_by"), ["created_at_asc"], "session order URL state")
-    await expect(page.get_by_role("link", name=SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, SESSION_ID)).to_be_visible()
 
     await page.get_by_role("button", name="Clear filters").click()
     cleared_query = parse_qs(urlsplit(page.url).query)
@@ -4340,7 +4353,7 @@ async def _exercise_session_discovery(
         "clearing filters must preserve ordering",
     )
     await expect(page.get_by_label("Sort sessions")).to_have_value("created_at_asc")
-    await expect(page.get_by_role("link", name=SESSION_ID)).to_be_visible()
+    await expect(_session_list_link(page, SESSION_ID)).to_be_visible()
 
 
 async def _exercise_run_agent_inventory(page: Page, base_url: str) -> None:
@@ -5148,8 +5161,8 @@ def _record_browser_failures(
             expected_observer_aborts.append((path, last_event_id, detail))
             return
         if (
-            request.method == "POST"
-            and urlsplit(request.url).path == "/api/sessions/summary"
+            request.method == "GET"
+            and urlsplit(request.url).path == "/api/sessions"
             and parse_qs(urlsplit(request.url).query).get("q") == [SLOW_SESSION_QUERY]
             and request.failure == "net::ERR_ABORTED"
         ):

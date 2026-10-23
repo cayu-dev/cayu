@@ -25,6 +25,8 @@ import type {
   InboxPage,
   InboxSettleRequest,
 } from "@/lib/generated/server-api"
+import type { MutationExecutionOptions } from "@/lib/mutation-browser"
+import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import type {
   AddToEvals,
   EvalRunDetail,
@@ -170,6 +172,7 @@ export type SessionOverview = {
    * the trial and every session created under it). Cloud's numbers leave these out.
    */
   eval_trial?: boolean
+  forked?: boolean
 }
 
 /**
@@ -203,10 +206,14 @@ export type AppInfo = { name: string; runtime_version: string }
 export type Api = {
   app(): Promise<AppInfo>
   specialists(): Promise<AgentsPage>
-  sessions(query?: SessionListQuery): Promise<SessionsPage>
+  sessions(query?: SessionListQuery, signal?: AbortSignal): Promise<SessionsPage>
   session(id: string): Promise<SessionDetail>
   overviews(ids: string[]): Promise<SessionOverview[]>
-  transcript(id: string, query?: SessionTranscriptQuery): Promise<SessionTranscriptPage>
+  transcript(
+    id: string,
+    query?: SessionTranscriptQuery,
+    signal?: AbortSignal,
+  ): Promise<SessionTranscriptPage>
   events(id: string, query?: SessionEventsQuery): Promise<SessionEventsPage>
   /** `GET /api/tasks`, every task including Cayu's own (`cayu.*` types). */
   tasks(): Promise<TaskItem[]>
@@ -227,7 +234,10 @@ export type Api = {
    */
   recover(sessionId: string, body: RecoveryRequest): Promise<void>
   /** `POST /api/run`: start a session with one specialist. Returns the new session's ID. */
-  start(body: { agent: string; prompt: string }): Promise<{ session_id: string }>
+  start(
+    body: { agent: string; prompt: string },
+    options?: MutationExecutionOptions,
+  ): Promise<{ session_id: string; snapshot?: MutationTransportSnapshot }>
   /** `POST /api/sessions/{id}/resume` with a new prompt (backend item 5 for completed sessions). */
   reply(id: string, prompt: string): Promise<void>
   /** `POST /api/sessions/{id}/interrupt`, with an optional reason. */

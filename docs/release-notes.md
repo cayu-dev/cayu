@@ -76,6 +76,12 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
 
 ### Changes
 
+The Developer dashboard Sessions page now leads with agent-authored titles and
+summaries, canonical merged state, and usage. It preserves existing filters and cursor
+links, excludes eval trials and forks by default, and lets readers include them.
+Custom dashboard owners should port Sessions changes from `src/next/routes/sessions-page.tsx`;
+`src/routes/sessions.tsx` has been removed. Other page ports remain independent.
+
 - Validated structured answers now have a `structured_output` transcript part
   with the spec name and JSON output, for native and tool-based strategies.
   Original tool calls remain available in the trace. Custom transcript readers

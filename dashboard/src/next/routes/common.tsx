@@ -30,8 +30,11 @@ export function NavLink({
 
 export function useGo() {
   const navigate = useNavigate()
-  return (to: string, search?: Record<string, unknown>) =>
-    navigate({ to: to as never, search: search as never })
+  return (
+    to: string,
+    search?: Record<string, unknown>,
+    options?: { replace?: boolean; resetScroll?: boolean },
+  ) => navigate({ to: to as never, search: search as never, ...options })
 }
 
 /**
@@ -220,19 +223,21 @@ export function useShell() {
 
 /** The bar at the top of each page: sidebar toggles, a title, and the page's actions. */
 export function TopBar({ children, actions }: { children?: ReactNode; actions?: ReactNode }) {
-  const shell = useShell()
+  const shell = useContext(ShellContext)
   return (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3 sm:px-4">
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        className="md:hidden"
-        aria-label="Open sidebar"
-        onClick={() => shell.setMobileOpen(true)}
-      >
-        <Menu />
-      </Button>
-      {shell.sidebarHidden && (
+      {shell && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className="md:hidden"
+          aria-label="Open sidebar"
+          onClick={() => shell.setMobileOpen(true)}
+        >
+          <Menu />
+        </Button>
+      )}
+      {shell?.sidebarHidden && (
         <Button
           variant="ghost"
           size="icon-sm"
@@ -243,7 +248,7 @@ export function TopBar({ children, actions }: { children?: ReactNode; actions?: 
           <PanelLeft />
         </Button>
       )}
-      <div className="min-w-0 flex-1 truncate text-sm font-medium">{children}</div>
+      <h1 className="min-w-0 flex-1 truncate text-sm font-medium">{children}</h1>
       {actions}
     </header>
   )

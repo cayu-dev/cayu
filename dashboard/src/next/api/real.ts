@@ -159,13 +159,7 @@ function rememberListed(sessions: SessionRecord[], usage: SessionUsageSummary[])
 export const realApi: Api = {
   app: fetchDashboardIdentity,
   specialists: () => fetchAgents(),
-  async sessions(q) {
-    const page = await fetchSessionsPage({ include: ["usage"], ...q } as Parameters<
-      typeof fetchSessionsPage
-    >[0])
-    rememberListed(page.sessions, page.usage ?? [])
-    return page
-  },
+  sessions: (q, signal) => fetchSessionsPage({ include: ["overview"], ...q }, signal),
   session: (id) => fetchSession(id),
   /**
    * The sessions asked for, not the first N: a page of recent sessions covers most lists,
@@ -206,7 +200,7 @@ export const realApi: Api = {
       return o ? [o] : []
     })
   },
-  transcript: (id, q) => fetchSessionTranscript(id, q),
+  transcript: (id, q, signal) => fetchSessionTranscript(id, q, signal),
   events: (id, q) => fetchSessionEvents(id, q),
   tasks: () => fetchTasks({ limit: 200, order_by: "updated_at_desc" }),
   task: (id) => fetchTask(id),
@@ -240,9 +234,9 @@ export const realApi: Api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  async start({ agent, prompt }) {
-    const snapshot = await executeRunMutation({ agent, prompt })
-    return { session_id: snapshot.sessionId }
+  async start({ agent, prompt }, options) {
+    const snapshot = await executeRunMutation({ agent, prompt }, options)
+    return { session_id: snapshot.sessionId, snapshot }
   },
   async reply(id, prompt) {
     await executeResumeMutation({ session_id: id, prompt })

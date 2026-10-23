@@ -53,6 +53,10 @@ System under Agent. Items depend on the server capabilities and viewer access.
 Existing URLs remain valid: Inbox uses `/pending-actions`
 and Specialists uses `/agents`. Search sessions from the sidebar; `Ctrl+K` or
 `Cmd+K` focuses search, and Enter opens the session index with its `q` filter.
+The Sessions page uses `GET /api/sessions?include=overview`, displays authored titles
+and completion summaries, and preserves the existing filter links. Eval trials and
+forks are excluded by default and can be included explicitly. Its footer shows loaded
+rows, not a matching population count; sidebar and Home counts remain separate reads.
 The sidebar can be collapsed on desktop or opened as a drawer on mobile.
 Escape closes the mobile drawer and returns focus to its opener.
 

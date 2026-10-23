@@ -1,4 +1,4 @@
-import type { SessionsSummaryQuery } from "./api"
+import type { SessionListQuery, SessionsSummaryQuery } from "./api"
 
 export const SESSION_INDEX_PAGE_LIMIT = 100
 export const DEFAULT_SESSION_ORDER = "updated_at_desc" as const
@@ -30,7 +30,21 @@ export type SessionIndexStatus = (typeof SESSION_INDEX_STATUSES)[number]
 export type SessionIndexDebugState = (typeof SESSION_INDEX_DEBUG_STATES)[number]
 export type SessionIndexOrder = (typeof SESSION_INDEX_ORDERS)[number]
 
+export const SESSION_OVERVIEW_STATES = [
+  "running",
+  "waiting_approval",
+  "waiting_input",
+  "needs_recovery",
+  "completed",
+  "failed",
+  "interrupted",
+] as const
+export const SESSION_LIST_STATES = ["waiting", ...SESSION_OVERVIEW_STATES] as const
+
 export type SessionIndexSearch = {
+  state?: (typeof SESSION_LIST_STATES)[number]
+  include_eval?: true
+  include_forks?: true
   q?: string
   status?: SessionIndexStatus
   debug_state?: SessionIndexDebugState
@@ -71,7 +85,15 @@ function allowedValue<const T extends readonly string[]>(
 
 export function validateSessionIndexSearch(search: Record<string, unknown>): SessionIndexSearch {
   const order = allowedValue(search.order_by, SESSION_INDEX_ORDERS)
+  const state = allowedValue(search.state, SESSION_LIST_STATES)
   return {
+    ...(state ? { state } : {}),
+    ...(search.include_eval === true || search.include_eval === "true"
+      ? { include_eval: true as const }
+      : {}),
+    ...(search.include_forks === true || search.include_forks === "true"
+      ? { include_forks: true as const }
+      : {}),
     q: optionalSearchValue(search.q),
     status: allowedValue(search.status, SESSION_INDEX_STATUSES),
     debug_state: allowedValue(search.debug_state, SESSION_INDEX_DEBUG_STATES),
@@ -132,6 +154,9 @@ export function multilineSessionFilters(value: string): string[] | undefined {
 export function sessionIndexFilterCount(search: SessionIndexSearch): number {
   const scalarFilters = [
     search.q,
+    search.state,
+    search.include_eval,
+    search.include_forks,
     search.status,
     search.debug_state,
     search.agent_name,
@@ -159,4 +184,20 @@ export function sessionIndexAdvancedFilterKey(search: SessionIndexSearch): strin
     search.label ?? [],
     search.label_selector ?? [],
   ])
+}
+
+/** Server-owned selection; raw status/debug filters continue to intersect with merged state. */
+export function sessionOverviewQuery(search: SessionIndexSearch): SessionListQuery {
+  return {
+    ...sessionIndexQuery(search),
+    include: ["overview"],
+    overview_state:
+      search.state === "waiting"
+        ? ["waiting_approval", "waiting_input", "needs_recovery"]
+        : search.state
+          ? [search.state]
+          : undefined,
+    include_eval: search.include_eval === true,
+    include_forks: search.include_forks === true,
+  }
 }

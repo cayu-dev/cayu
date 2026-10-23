@@ -1,16 +1,16 @@
-import type { SessionsSummary, SessionsSummaryQuery } from "./api"
+import type { SessionListQuery, SessionsPage } from "./api"
 
 export const MAX_AUTOMATIC_SESSION_PAGES = 25
 
 export type SessionIndexPage = {
-  page: SessionsSummary
+  page: SessionsPage
   searchPaused: boolean
 }
 
 /** Find a visible page without treating an empty candidate window as exhaustion. */
 export async function loadSessionIndexPage(
-  query: SessionsSummaryQuery,
-  read: (query: SessionsSummaryQuery, signal: AbortSignal) => Promise<SessionsSummary>,
+  query: SessionListQuery,
+  read: (query: SessionListQuery, signal: AbortSignal) => Promise<SessionsPage>,
   signal: AbortSignal,
 ): Promise<SessionIndexPage> {
   const seen = new Set<string>()

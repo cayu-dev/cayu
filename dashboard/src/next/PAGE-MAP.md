@@ -9,6 +9,14 @@ server's generated types, and replaces `src/routes` and `src/Layout.tsx` area by
 - **Clickable prototype:** https://claude.ai/artifact/JXhabogyvF8bLbt9YqBCrS
 - **This page map, published (takes comments):** https://claude.ai/artifact/HxQypvmhJmouPdgKYWpP8X
 
+## Sessions production port
+
+Sessions now uses this area's page in production with the real overview API. Runtime
+metadata, overview and bounded query contracts are available. Existing filters and
+links remain supported; eval trials and forks are off by default. The footer shows
+loaded rows because filtered totals are intentionally null. The shared prototype
+continues to use its fake API; other areas below remain separate ports.
+
 ## Run it
 
 ```bash
@@ -102,7 +110,7 @@ It is the **developer's** tool for looking deeply into the whole agent. Cayu age
 - **`mock/legacy/`** is a fake server for those pages: it answers their `/api` calls through `fetch`, from the same seed. `contract.ts` is a real 0.13.0 capture. `legacy-config.ts` points their links into the hash.
 - **`mock/seeds/`** holds the made-up agents: Month-end close (three specialists, every state) and New agent (empty).
 - **Real snapshots** come in through `CAYU_PROTOTYPE_SEEDS` (see Run it) and are listed after Month-end close. They never live in the repository.
-- **`next.css`** loads Tailwind plus the shared tokens in `src/theme.css`, and adds status colors and dark mode. `src/index.css` excludes `next/` from its scan, so the packaged dashboard's CSS and bundle stay exactly as they are.
+- **`next.css`** loads Tailwind plus the shared tokens in `src/theme.css`, and adds status colors and dark mode. `src/index.css` also scans `next/` now that Sessions uses these components in production.
 
 ## Backend items (calls marked "Proposed" in `api/types.ts`)
 

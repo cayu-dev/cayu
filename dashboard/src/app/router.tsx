@@ -35,7 +35,10 @@ const SessionDetailPage = lazyRouteComponent(
   () => import("../routes/session-detail"),
   "SessionDetailPage",
 )
-const SessionsPage = lazyRouteComponent(() => import("../routes/sessions"), "SessionsPage")
+const SessionsPage = lazyRouteComponent(
+  () => import("../next/routes/sessions-entry"),
+  "SessionsEntry",
+)
 const TasksPage = lazyRouteComponent(() => import("../routes/tasks"), "TasksPage")
 const UsagePage = lazyRouteComponent(() => import("../routes/usage"), "UsagePage")
 const WorkflowPage = lazyRouteComponent(() => import("../routes/workflow"), "WorkflowPage")

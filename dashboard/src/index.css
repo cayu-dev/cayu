@@ -1,7 +1,6 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-/* The reworked dashboard prototype in ./next has its own stylesheet (next/next.css). */
-@source not "./next";
+/* Production Sessions and the prototype share components in ./next. */
 
 @import "./theme.css";

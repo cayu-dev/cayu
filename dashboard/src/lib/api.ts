@@ -445,8 +445,11 @@ export async function fetchSessions(query: SessionListQuery = {}): Promise<Sessi
   return page.sessions
 }
 
-export async function fetchSessionsPage(query: SessionListQuery = {}): Promise<SessionsPage> {
-  const page = await requestJson<unknown>(`/sessions${queryString(query)}`)
+export async function fetchSessionsPage(
+  query: SessionListQuery = {},
+  signal?: AbortSignal,
+): Promise<SessionsPage> {
+  const page = await requestJson<unknown>(`/sessions${queryString(query)}`, { signal })
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.sessions)) {
     throw new Error("Unexpected /sessions response.")

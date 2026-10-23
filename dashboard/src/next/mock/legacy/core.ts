@@ -160,7 +160,7 @@ function labelMatches(labels: Record<string, string>, selector: LabelSelectorReq
   return value === undefined || !values.includes(value)
 }
 
-function sessionMatches(s: SeedSession, filter: SessionAggregateFilter): boolean {
+export function sessionMatches(s: SeedSession, filter: SessionAggregateFilter): boolean {
   const session = s.session
   const scalar: [string | null | undefined, string | null][] = [
     [filter.agent_name, session.agent_name],

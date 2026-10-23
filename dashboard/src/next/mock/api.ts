@@ -4,6 +4,9 @@
  * decision made on one page shows everywhere (answer a question, and the session runs on).
  */
 import { ApiClientError } from "@/lib/api"
+import { summarizeSessionDebugState } from "@/lib/session-debug"
+import { buildSessionAggregateFilter } from "@/lib/usage-rollup"
+import { validateUsageRollupSearch } from "@/lib/usage-rollup-search"
 import { filterInboxItems } from "../api/paging"
 import type {
   Api,
@@ -21,7 +24,14 @@ import type {
 import { isEvalTrialMetadata } from "../app/session-model"
 import { BUILTIN_DISPLAY, defaultToolSource } from "./builder"
 import { createEvalStore } from "./evals"
-import { holdTask, resumeTask, scheduleEvents, taskInfo, taskList } from "./legacy/core"
+import {
+  holdTask,
+  resumeTask,
+  scheduleEvents,
+  sessionMatches,
+  taskInfo,
+  taskList,
+} from "./legacy/core"
 import type { AppSeed, SeedSession } from "./model"
 import { NotFound } from "./not-found"
 import { SEEDS } from "./seeds"
@@ -366,15 +376,45 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
           tools: a.tools.map((t) => inventoryTool(t)),
         })),
       }),
-    async sessions(query = {}) {
+    async sessions(query = {}, signal) {
+      signal?.throwIfAborted()
       let rows = data.sessions
+      if (query.include_eval === false)
+        rows = rows.filter((row) => !isEvalTrialMetadata(row.metadata))
+      if (query.include_forks === false) rows = rows.filter((row) => !row.overview.forked)
+      if (query.overview_state?.length)
+        rows = rows.filter((row) => query.overview_state?.includes(row.overview.state))
+      const filter = buildSessionAggregateFilter(validateUsageRollupSearch(query))
+      rows = rows.filter((row) => sessionMatches(row, filter))
+      if (query.debug_state)
+        rows = rows.filter((row) => {
+          const counts: Record<string, number> = {}
+          for (const event of row.events) counts[event.type] = (counts[event.type] ?? 0) + 1
+          const debug = summarizeSessionDebugState({
+            status: row.session.status,
+            latestEvent: row.events.at(-1),
+            terminalEvent: row.events.findLast((event) =>
+              ["session.completed", "session.failed", "session.interrupted"].includes(event.type),
+            ),
+            countsByType: counts,
+          })
+          return query.debug_state === "needs_attention"
+            ? debug !== null
+            : debug?.kind ===
+                (query.debug_state === "session_failure" ? "failure" : query.debug_state)
+        })
+      if (query.status)
+        rows = rows.filter(
+          (row) =>
+            (row.session.status === "active" ? "running" : row.session.status) === query.status,
+        )
       if (query.agent_name) rows = rows.filter((s) => s.session.agent_name === query.agent_name)
       if (query.q) {
         const q = query.q.toLowerCase()
         rows = rows.filter((s) =>
           [
             s.session.id,
-            s.overview.title ?? "",
+            appTitles ? (s.overview.title ?? "") : "",
             ...Object.entries(s.session.labels).map(([k, v]) => `${k}=${v}`),
           ]
             .join(" ")
@@ -382,20 +422,46 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
             .includes(q),
         )
       }
-      for (const selector of query.label ?? []) {
-        const [k, v] = selector.split("=")
-        rows = rows.filter((s) => k !== undefined && s.session.labels[k] === v)
-      }
-      rows = [...rows].sort((a, b) =>
-        b.overview.last_activity_at.localeCompare(a.overview.last_activity_at),
-      )
+      const order = query.order_by ?? "updated_at_desc"
+      const field = order.startsWith("created_at") ? "created_at" : "updated_at"
+      const direction = order.endsWith("_asc") ? 1 : -1
+      rows = [...rows].sort((a, b) => direction * a.session[field].localeCompare(b.session[field]))
       const limit = query.limit ?? 100
-      return wait({
-        sessions: rows.slice(0, limit).map((s) => s.session),
-        usage: rows.slice(0, limit).map((s) => s.usage),
-        next_cursor: null,
-        total_count: data.totalSessions ?? rows.length,
+      const offset = query.cursor?.startsWith("mock-session:") ? Number(query.cursor.slice(13)) : 0
+      const page = rows.slice(offset, offset + limit)
+      const result = await wait({
+        sessions: page.map((row) => row.session),
+        usage: page.map((row) => row.usage),
+        overviews: page.map((row) => ({
+          ...row.overview,
+          run_id: row.session.id,
+          reason: row.overview.reason ?? "",
+          title: appTitles ? row.overview.title : null,
+          summary: appTitles ? row.overview.summary : null,
+          summary_tone: appTitles ? row.overview.summary_tone : null,
+          model_steps: String(row.overview.model_steps),
+          tool_calls: String(row.overview.tool_calls),
+          tokens: {
+            input: String(row.overview.tokens.input),
+            output: String(row.overview.tokens.output),
+            cached: String(row.overview.tokens.cached),
+          },
+          cost: row.overview.cost
+            ? { ...row.overview.cost, amount: String(row.overview.cost.amount) }
+            : null,
+          uses: {
+            ...row.overview.uses,
+            subagents: String(row.overview.uses.subagents),
+            artifacts: String(row.overview.uses.artifacts),
+          },
+          eval: isEvalTrialMetadata(row.metadata),
+          forked: row.overview.forked === true,
+        })),
+        next_cursor: offset + limit < rows.length ? `mock-session:${offset + limit}` : null,
+        total_count: null,
       })
+      signal?.throwIfAborted()
+      return result
     },
     async session(id) {
       const s = find(id)
@@ -430,14 +496,17 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
       const s = find(id)
       const offset = query.offset ?? 0
       const limit = query.limit ?? 500
-      const messages = s.transcript.slice(offset, offset + limit)
+      const selected = query.role
+        ? s.transcript.filter((message) => message.role === query.role)
+        : s.transcript
+      const messages = selected.slice(offset, offset + limit)
       return wait({
         session_id: id,
         messages,
         offset,
         next_offset: offset + messages.length,
-        has_more: offset + messages.length < s.transcript.length,
-        total_messages: s.transcript.length,
+        has_more: offset + messages.length < selected.length,
+        total_messages: selected.length,
       })
     },
     /** Pages like the server: at most 1,000 per page, either direction, and `wait_seconds`. */

@@ -5,17 +5,35 @@
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { Play, X } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
+import { MutationTransportStatus } from "@/components/dashboard/mutation-transport-status"
+import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { ROLE_FORBIDDEN_REASON } from "@/lib/dashboard-access"
+import type {
+  MutationTransportController,
+  MutationTransportSnapshot,
+} from "@/lib/mutation-transport"
+import { reconcileRunAgentSelection } from "@/lib/run-agent-selection"
 import { cn } from "@/lib/utils"
 import type { TaskType } from "../api/types"
 import { useSpecialists, useTaskTypes } from "../app/queries"
-import { useApi } from "../app/services"
+import { useApi, useServices } from "../app/services"
 import { ErrorState, sessionPath, taskPath, useGo } from "./common"
+
+function useStartUnavailableReason(): string | null {
+  const viewer = useViewer()
+  const { prototype, executionEnabled } = useServices()
+  if (prototype) return null
+  if (viewer?.full_access !== true) return ROLE_FORBIDDEN_REASON
+  return executionEnabled === true ? null : "Starting sessions is unavailable for this deployment."
+}
 
 /** The button that opens the form, for a page's top bar. */
 export function StartSessionButton({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  const unavailable = useStartUnavailableReason()
+  if (unavailable) return <span className="text-xs text-muted-foreground">{unavailable}</span>
   return (
     <Button variant="outline" size="sm" onClick={onToggle} aria-expanded={open}>
       <Play />
@@ -74,14 +92,20 @@ function inputFrom(fields: Field[], values: Record<string, string>): Record<stri
   return input
 }
 
-export function StartSession({
-  onClose,
-  initialMode,
-}: {
-  onClose: () => void
-  initialMode?: Mode
-}) {
+function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initialMode?: Mode }) {
   const api = useApi()
+  const abort = useRef<AbortController | null>(null)
+  const transport = useRef<MutationTransportController | null>(null)
+  const [snapshot, setSnapshot] = useState<MutationTransportSnapshot | null>(null)
+  const [retrying, setRetrying] = useState(false)
+  const [observationError, setObservationError] = useState<unknown>(null)
+  useEffect(
+    () => () => {
+      abort.current?.abort()
+      transport.current?.dispose()
+    },
+    [],
+  )
   const go = useGo()
   const queryClient = useQueryClient()
   const specialists = useSpecialists()
@@ -95,8 +119,7 @@ export function StartSession({
   const [values, setValues] = useState<Record<string, string>>({})
   const [json, setJson] = useState("{}")
   useEffect(() => {
-    const names = specialists.data?.agents.map((a) => a.name) ?? []
-    if (names.length && !names.includes(agent)) setAgent(names[0] ?? "")
+    setAgent(reconcileRunAgentSelection(agent, specialists.data?.agents ?? []))
   }, [agent, specialists.data])
   useEffect(() => {
     if (types.length && !types.some((t) => t.name === typeName)) setTypeName(types[0]?.name ?? "")
@@ -108,20 +131,49 @@ export function StartSession({
   // A new session opens; a new task opens its task page, where its session shows up.
   const done = (path: string) => {
     void queryClient.invalidateQueries({ queryKey: ["sessions"] })
+    void queryClient.invalidateQueries({ queryKey: ["session-list"] })
     void queryClient.invalidateQueries({ queryKey: ["tasks"] })
     go(path)
   }
   const start = useMutation({
     mutationFn: async () => {
-      if (current === "specialist")
-        return sessionPath((await api.start({ agent, prompt: prompt.trim() })).session_id)
+      abort.current?.abort()
+      transport.current?.dispose()
+      transport.current = null
+      setSnapshot(null)
+      setObservationError(null)
+      if (current === "specialist") {
+        const controller = new AbortController()
+        abort.current = controller
+        const result = await api.start(
+          { agent, prompt: prompt.trim() },
+          {
+            signal: controller.signal,
+            onController: (owner) => {
+              transport.current = owner
+            },
+            onChange: (next) => {
+              if (!controller.signal.aborted) setSnapshot(next)
+            },
+          },
+        )
+        if (controller.signal.aborted) return null
+        if (result.snapshot) setSnapshot(result.snapshot)
+        if (result.snapshot && !["terminal", "runtime_failed"].includes(result.snapshot.phase))
+          return null
+        if (!result.session_id) throw new Error("The runtime did not return a session identity.")
+        return sessionPath(result.session_id)
+      }
       const input = fields
         ? inputFrom(fields, values)
         : (JSON.parse(json) as Record<string, unknown>)
       return taskPath((await api.createTask({ type: typeName, input })).task_id)
     },
-    onSuccess: done,
+    onSuccess: (path) => {
+      if (path) done(path)
+    },
   })
+  const outcomeBlocksSubmission = snapshot !== null && snapshot.phase !== "request_failed"
   const ready =
     current === "specialist" ? !!(prompt.trim() && agent) : !!taskType && missing.length === 0
   const field =
@@ -132,7 +184,7 @@ export function StartSession({
       className="mb-8 space-y-4 rounded-xl border border-border bg-card p-4"
       onSubmit={(e) => {
         e.preventDefault()
-        if (ready) start.mutate()
+        if (ready && !start.isPending && !outcomeBlocksSubmission) start.mutate()
       }}
     >
       <div className="flex items-start justify-between gap-3">
@@ -282,6 +334,7 @@ export function StartSession({
               onChange={(e) => setAgent(e.target.value)}
               className="h-8 rounded-lg border border-input bg-background px-2 text-sm"
             >
+              <option value="">Choose a specialist</option>
               {specialists.data?.agents.map((a) => (
                 <option key={a.name} value={a.name}>
                   {a.name}
@@ -289,6 +342,10 @@ export function StartSession({
               ))}
             </select>
           </div>
+          {specialists.isSuccess && specialists.data.agents.length === 0 && (
+            <p role="status">No specialists are registered.</p>
+          )}
+          {specialists.error && <ErrorState error={specialists.error} />}
           <label htmlFor="start-prompt" className="sr-only">
             Prompt
           </label>
@@ -304,11 +361,43 @@ export function StartSession({
       )}
 
       {start.error && <ErrorState error={start.error} />}
+      {observationError !== null && <ErrorState error={observationError} />}
+      <MutationTransportStatus
+        snapshot={snapshot}
+        retryingObservation={retrying}
+        onRetryObservation={
+          transport.current
+            ? () => {
+                if (retrying) return
+                setRetrying(true)
+                void transport.current
+                  ?.reobserve(abort.current?.signal)
+                  .then((next) => {
+                    setSnapshot(next)
+                    if (["terminal", "runtime_failed"].includes(next.phase) && next.sessionId)
+                      done(sessionPath(next.sessionId))
+                  })
+                  .catch(setObservationError)
+                  .finally(() => setRetrying(false))
+              }
+            : undefined
+        }
+      />
       <div className="flex justify-end">
-        <Button type="submit" size="sm" disabled={!ready || start.isPending}>
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!ready || start.isPending || outcomeBlocksSubmission}
+        >
           {current === "task" ? "Create task" : "Start"}
         </Button>
       </div>
     </form>
   )
+}
+
+export function StartSession(props: { onClose: () => void; initialMode?: Mode }) {
+  const unavailable = useStartUnavailableReason()
+  if (unavailable) return <p role="status">{unavailable}</p>
+  return <StartSessionForm {...props} />
 }

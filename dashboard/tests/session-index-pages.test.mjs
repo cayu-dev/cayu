@@ -109,3 +109,20 @@ test("cursor cycles and pre-aborted work cannot dispatch indefinitely", async ()
     (error) => error.name === "AbortError",
   )
 })
+
+test("canonical overview envelopes retain aligned facts and nullable totals", async () => {
+  const page = {
+    sessions: [{ id: "visible" }],
+    overviews: [{ session_id: "visible", state: "needs_recovery", tool_calls: "9007199254740993" }],
+    next_cursor: "following",
+    total_count: null,
+  }
+  const result = await loadSessionIndexPage(
+    { include: ["overview"], include_forks: false },
+    async () => page,
+    new AbortController().signal,
+  )
+  assert.equal(result.page, page)
+  assert.equal(result.page.overviews[0].tool_calls, "9007199254740993")
+  assert.equal(result.page.total_count, null)
+})

@@ -7,6 +7,23 @@ without requiring operators to know Cayu table names or JSON paths. The
 resolution command talks to the authenticated Cayu server; it never mutates the
 store directly.
 
+## Developer dashboard list
+
+Open `/cayu/sessions` to browse canonical session state and agent-authored titles and
+summaries. Missing titles fall back to labels, then the first user message, then the
+session ID. Completed summaries use the warning colour only when their stored tone is
+`attention`. Tool calls and token/cost figures come from the overview; partial costs
+are marked and retain their currency.
+
+Evaluation trials and forks are excluded initially. Use their separate inclusion
+switches to show them with row markers. Waiting for you combines approval, input,
+and recovery states. Advanced filters preserve specialist, provider, model,
+environment, parent session, causal budget, exact labels and label selectors. Raw
+status, debug state, sort and existing deep-link parameters remain available.
+The footer reports rows loaded on the current page. Next page follows opaque server
+cursors; an empty candidate page does not prove exhaustion. Members can browse the
+list but are not offered Start a session.
+
 ## Titles, completion summaries, and specialist descriptions
 
 Set a session title on its typed request. The `app.run(request)` signature is

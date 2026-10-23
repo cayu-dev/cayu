@@ -4,6 +4,27 @@ This is the version-matched source for Cayu's open-source Developer dashboard.
 It was extracted from an installed Cayu release and is now owned by your application. Cayu
 will not rewrite this directory during upgrades.
 
+## Sessions page
+
+`/sessions` uses `src/next/routes/sessions-page.tsx` and the canonical session overview.
+Rows lead with an authored title, then labels, the first user message, or the ID when
+those are absent. Completed summaries replace the state label; only an explicit
+`attention` tone uses the warning colour. Cost retains its currency and marks partial
+pricing; deployments without a price book show tokens.
+
+The list excludes evaluation trials and forks by default, with independent switches
+to include them. Merged state, raw status, debug state, specialist, provider, model,
+environment, parent, causal budget, exact labels, selectors, and sort are server filters.
+Existing Usage and Environment links keep their query parameters. Cursor paging may
+scan empty candidate windows; the page reports loaded rows, never a filtered total.
+After 25 empty windows it offers Continue searching. Changing filters cancels the old
+read chain. Members can read the list but cannot start sessions.
+
+For customised dashboards, the old `src/routes/sessions.tsx` has been removed. Shared
+filter parsing remains in `src/lib/session-index-search.ts`; the prototype uses the same
+page against its fake API. Other page ports are independent. Tailwind now scans `next/`
+for the components used in production.
+
 ## Develop and build
 
 Install Node.js 22.18.0 or newer, then run:

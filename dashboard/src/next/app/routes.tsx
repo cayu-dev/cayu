@@ -9,6 +9,7 @@ import {
   type RouterHistory,
   redirect,
 } from "@tanstack/react-router"
+import { validateSessionIndexSearch } from "@/lib/session-index-search"
 import { EvalRunPage } from "../routes/eval-run-page"
 import { EvalSettingsPage } from "../routes/eval-settings-page"
 import { EvalSuitePage } from "../routes/eval-suite-page"
@@ -56,12 +57,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     createRoute({
       getParentRoute: () => root,
       path: "/sessions",
-      validateSearch: (s: Record<string, unknown>) => ({
-        q: str(s.q),
-        state: str(s.state),
-        agent: str(s.agent),
-        label: str(s.label),
-      }),
+      validateSearch: validateSessionIndexSearch,
       component: SessionsPage,
     }),
     createRoute({

@@ -9,6 +9,9 @@ test("packaged dashboard carries the licenses for its bundled code", () => {
   const expectedLicenses = new Map([
     ["@base-ui/react", "MIT"],
     ["@base-ui/utils", "MIT"],
+    ["@floating-ui/core", "MIT"],
+    ["@floating-ui/dom", "MIT"],
+    ["@floating-ui/react-dom", "MIT"],
     ["@floating-ui/utils", "MIT"],
     ["@microsoft/fetch-event-source", "MIT"],
     ["@tanstack/history", "MIT"],

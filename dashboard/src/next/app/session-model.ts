@@ -239,3 +239,25 @@ export function constantColumns<T>(rows: T[], columns: Record<string, (row: T) =
   }
   return { constant, varying }
 }
+
+/** Authored title first; callers fetch only the first user record when labels are absent. */
+export function sessionDisplayTitle(
+  session: { id: string; labels: Record<string, string> },
+  title: string | null | undefined,
+  firstUser: { role: string; content: Record<string, unknown>[] } | null | undefined,
+): string {
+  if (title?.trim()) return title
+  const labels = Object.entries(session.labels)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" · ")
+  if (labels) return labels
+  const text =
+    firstUser?.role === "user"
+      ? firstUser.content
+          .filter((part) => part.type === "text")
+          .map((part) => (typeof part.text === "string" ? part.text : ""))
+          .join("")
+          .trim()
+      : ""
+  return text || session.id
+}
