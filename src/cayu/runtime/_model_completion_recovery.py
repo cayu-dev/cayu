@@ -26,7 +26,7 @@ from cayu.events import Event, EventType, copy_event, event_with_runtime_payload
 from cayu.execution_profiles import event_with_execution_profile_authority
 from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
-from cayu.messages import Message, MessageRole, ToolCallPart, ToolResultPart
+from cayu.messages import Message, MessageRole, StructuredOutputPart, ToolCallPart, ToolResultPart
 from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationMode,
@@ -1062,7 +1062,10 @@ class ModelCompletionRecovery:
                     not (pointer.assistant_message_published or pointer.assistant_message_deferred)
                     or not expected_results
                     or next_record is None
-                    or len(tool_results) != len(next_record.message.content)
+                    or any(
+                        type(part) not in {ToolResultPart, StructuredOutputPart}
+                        for part in next_record.message.content
+                    )
                     or tool_results != expected_results
                 ):
                     raise RuntimeError(
@@ -1102,6 +1105,54 @@ class ModelCompletionRecovery:
                     session.id,
                     tool_publication_id,
                 )
+                output_parts = [
+                    part
+                    for part in next_record.message.content
+                    if type(part) is StructuredOutputPart
+                ]
+                if output_parts or (
+                    tool_receipt is not None and "auxiliary" in tool_receipt.intent
+                ):
+                    if tool_receipt is None:
+                        raise RuntimeError(
+                            "Structured transcript output requires its exact receipt."
+                        )
+                    expected_output_parts = []
+                    if len(tool_receipt.appended_event_ids) > 3:
+                        raise RuntimeError("Structured output receipt has an invalid event count.")
+                    for event_id in tool_receipt.appended_event_ids:
+                        rows = await self._session_store.query_events(
+                            EventQuery(session_id=session.id, event_id=event_id, limit=2)
+                        )
+                        if len(rows) != 1:
+                            raise RuntimeError(
+                                "Structured output receipt event is missing or ambiguous."
+                            )
+                        event = rows[0].event
+                        if event.type is EventType.STRUCTURED_OUTPUT_VALIDATED:
+                            if (
+                                event.interaction_id != tool_receipt.interaction_id
+                                or event.payload.get("tool_round_id") != pointer.tool_round_id
+                                or event.payload.get("valid") is not True
+                                or "output" not in event.payload
+                            ):
+                                raise RuntimeError(
+                                    "Structured output event conflicts with its receipt."
+                                )
+                            expected_output_parts.append(
+                                StructuredOutputPart(
+                                    name=event.payload.get("name"), output=event.payload["output"]
+                                )
+                            )
+                    if canonical_durable_json_bytes(
+                        [p.model_dump(mode="json") for p in output_parts], "output parts"
+                    ) != canonical_durable_json_bytes(
+                        [p.model_dump(mode="json") for p in expected_output_parts],
+                        "expected output parts",
+                    ):
+                        raise RuntimeError(
+                            "Structured transcript output conflicts with its validation."
+                        )
                 if tool_receipt is None:
                     if not await self._tool_result_tail_has_durable_lifecycle_provenance(
                         session=session,

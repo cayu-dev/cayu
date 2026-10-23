@@ -21,6 +21,7 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
+    StructuredOutputPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -1750,6 +1751,7 @@ def _user_block(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
@@ -1785,6 +1787,7 @@ def _assistant_block(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
 ) -> dict[str, Any]:
     if type(part) is TextPart:
@@ -1846,6 +1849,7 @@ def _tool_result_block(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],

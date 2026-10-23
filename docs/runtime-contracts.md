@@ -9973,6 +9973,25 @@ preserves them. See [session display metadata](session-inspection.md#titles-comp
 for limits, authoring APIs, and scoped access. Migration: regenerate OpenAPI
 clients and deploy independently hosted dashboards with the matching contract.
 
+Server contract version 55 adds the `structured_output_transcript` capability
+and a durable `StructuredOutputPart`
+(`type`, nullable spec `name`, validated JSON `output`) to the existing assistant
+or tool-result message. Original provider content and tool events remain intact.
+The exact model/tool publication receipt covers this display part; ordinary
+return, acknowledgement-loss reconciliation and recovered publication produce
+the same transcript. Public session inputs cannot author validation evidence,
+and model requests and visible-text exports omit the duplicate display part.
+Whole-record exports preserve it. Completed-turn context capture accepts it
+while preserving exact tool-result identities and receipt authentication.
+Authenticated context-view forks project retained text/tool history without
+copying the source validation claim into the new request; raw caller input
+continues to reject the part. Message-less native completions publish
+without claiming structured-answer evidence. JSON payload nesting remains
+bounded at 64; typed transcript/publication envelopes allow up to six enclosing
+containers without changing byte or node limits. Migration: custom readers
+must accept `structured_output`, regenerate OpenAPI clients, and rebuild ejected
+dashboards for the matching server contract. No storage schema migration is needed.
+
 The protected `GET /api/contract` response also carries the server-authoritative
 control-plane capability projection. It reports whether Workflow topology,
 the read-only session follow stream, Tasks, reviewed

@@ -31,13 +31,14 @@ from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     StructuredOutputValidation,
 )
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType, copy_event
 from cayu.execution_units import copy_tool_round_identity
 from cayu.memory.evidence import ContextExposure, ContextExposureState
-from cayu.messages import Message, detach_message
+from cayu.messages import Message, StructuredOutputPart, detach_message
 from cayu.providers.base import (
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
@@ -448,6 +449,29 @@ class ModelCompletionPublicationRequest:
     tool_exposure: ResolvedToolExposureAuthority | None = None
     operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = ()
 
+    def transcript_assistant_message(self) -> Message | None:
+        """Combine original validation evidence with the exact prepared native spec."""
+        message = self.authoritative_assistant_message
+        result = self.assistant_step_result
+        if message is None or result is None or result.tool_calls:
+            return message
+        context = model_completion_recovery_context_from_stage(self.dispatch.stage)
+        spec = None if context is None else context.structured_output
+        if spec is None or spec.strategy is not StructuredOutputStrategy.NATIVE:
+            return message
+        validation = self.structured_output_validation
+        if validation is None:
+            raise ValueError("Native output publication requires original validation evidence.")
+        if not validation.valid:
+            return message
+        return Message(
+            role=message.role,
+            content=(
+                *message.content,
+                StructuredOutputPart(name=spec.name, output=validation.output),
+            ),
+        )
+
     def __post_init__(self) -> None:
         if type(self.dispatch) is not ModelCompletionDispatch:
             raise TypeError("dispatch must be a ModelCompletionDispatch.")
@@ -522,13 +546,27 @@ class ModelCompletionPublicationRequest:
             raise ValueError(
                 "Deferred assistant publication requires an ordinary tool-call message."
             )
+        context = model_completion_recovery_context_from_stage(dispatch.stage)
+        native_output = (
+            context is not None
+            and context.structured_output is not None
+            and context.structured_output.strategy is StructuredOutputStrategy.NATIVE
+            and result is not None
+            and not result.tool_calls
+            and assistant_message is not None
+        )
+        if native_output and structured_output_validation is None:
+            raise ValueError("Native output publication requires original validation evidence.")
         if structured_output_validation is not None and (
             result is None
             or assistant_message is None
-            or not any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in result.tool_calls)
+            or (
+                not native_output
+                and not any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in result.tool_calls)
+            )
         ):
             raise ValueError(
-                "Structured-output validation requires a published finalizer tool round."
+                "Structured-output validation requires native output or a published finalizer tool round."
             )
         object.__setattr__(self, "dispatch", dispatch)
         object.__setattr__(self, "assistant_step_result", result)

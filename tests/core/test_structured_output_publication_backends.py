@@ -150,6 +150,26 @@ async def _assert_round(store, session_id, *, valid):
     assert isinstance(result, ToolResultPart)
     assert result.tool_call_id == "final-call"
     assert result.is_error is (not valid)
+    output_parts = [
+        part.model_dump(mode="json")
+        for message in transcript
+        for part in message.content
+        if part.type == "structured_output"
+    ]
+    validated = next(
+        (event for event in auxiliary if event.type is EventType.STRUCTURED_OUTPUT_VALIDATED), None
+    )
+    assert output_parts == (
+        []
+        if not valid
+        else [
+            {
+                "type": "structured_output",
+                "name": validated.payload["name"],
+                "output": validated.payload["output"],
+            }
+        ]
+    )
     assert (
         pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(session_id)
@@ -242,6 +262,7 @@ def test_structured_publication_retains_repeated_cancellation(
                 await asyncio.wait_for(store.boundary_reached.wait(), _WATCHDOG_SECONDS)
                 running.cancel("structured publication cancelled")
                 running.cancel("structured publication cancelled")
+                assert running.cancelling() == 2
                 store.release_publication.set()
                 with pytest.raises(
                     asyncio.CancelledError, match="structured publication cancelled"
@@ -282,7 +303,10 @@ def test_mixed_structured_round_retries_without_dispatching_sibling(structured_s
             assert validated[0].payload["tool_round_id"] != retries[0].payload["tool_round_id"]
             transcript = await store.load_transcript(request.session_id)
             results = [message for message in transcript if message.role.value == "tool"]
-            assert [[part.tool_call_id for part in message.content] for message in results] == [
+            assert [
+                [part.tool_call_id for part in message.content if isinstance(part, ToolResultPart)]
+                for message in results
+            ] == [
                 ["final-call", "side-effect-call"],
                 ["final-call"],
             ]
@@ -335,9 +359,11 @@ def test_closed_structured_stream_recovers_partial_terminal_evidence(
             assert not tool.calls
             transcript = await store.load_transcript(request.session_id)
             assert [message.role.value for message in transcript] == ["user", "assistant", "tool"]
-            assert [part.tool_call_id for part in transcript[-1].content] == (
-                ["final-call", "side-effect-call"] if mixed else ["final-call"]
-            )
+            assert [
+                part.tool_call_id
+                for part in transcript[-1].content
+                if isinstance(part, ToolResultPart)
+            ] == (["final-call", "side-effect-call"] if mixed else ["final-call"])
             events = await store.load_events(request.session_id)
             terminals = [
                 event

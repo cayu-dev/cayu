@@ -538,6 +538,7 @@ async def prepared_scenario(
     planning_driver=None,
     request_cancellation=None,
     requested_session_id=None,
+    structured_output=None,
 ):
     collaboration, sessions, *_ = native_stores
     original, initialized, _, recipient, request, _initiating = await setup(collaboration)
@@ -626,6 +627,7 @@ async def prepared_scenario(
         request=RunRequest(
             agent_name="reviewer",
             session_id=requested_session_id,
+            structured_output=structured_output,
             messages=[Message.text("user", "input")],
         ),
         creation_key="prepared-child:" + operation_prefix + initialized.owner.application_scope,

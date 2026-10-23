@@ -2930,11 +2930,21 @@ class ListSessionInteractionsResponse(ApiBaseModel):
     has_more: StrictBool
 
 
+class ApiStructuredOutputPart(ApiBaseModel):
+    # Transcript readers consume extensible records; storage's Message part
+    # remains closed and is validated before this read-only response projection.
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["structured_output"] = "structured_output"
+    name: str | None
+    output: Any
+
+
 class ApiTranscriptMessage(ApiBaseModel):
     index: StrictInt = Field(ge=0)
     interaction_id: str | None
     role: str
-    content: list[dict[str, Any]]
+    content: list[ApiStructuredOutputPart | dict[str, Any]]
 
 
 class SessionTranscriptResponse(ApiBaseModel):

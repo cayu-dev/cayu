@@ -636,7 +636,10 @@ async def retain_native_output(store, session_id, *, invocation, stage_id):
         and bool(messages)
         and all(
             message.role == "assistant"
-            and all(part.type in {"text", "provider_state", "thinking"} for part in message.content)
+            and all(
+                part.type in {"text", "provider_state", "thinking", "structured_output"}
+                for part in message.content
+            )
             for message in messages
         )
     )

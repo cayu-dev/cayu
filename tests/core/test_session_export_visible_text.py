@@ -9,7 +9,14 @@ from tests.core.test_session_exports import backend as backend
 
 from cayu.collaboration.exports import SessionExportConflict, SessionExportDenied
 from cayu.events import EventType
-from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
+from cayu.messages import (
+    Message,
+    ProviderStatePart,
+    StructuredOutputPart,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+)
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 
@@ -45,6 +52,7 @@ def mixed():
             TextPart(text="approved"),
             ProviderStatePart(provider="openai", state={"private": PRIVATE}),
             ThinkingPart(text=PRIVATE),
+            StructuredOutputPart(name="Answer", output={"private": PRIVATE}),
         ),
     )
 
@@ -171,3 +179,96 @@ async def test_private_source_change_conflicts_before_publication(backend):
         finally:
             projector.release.set()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("strategy", ["native", "tool", "native_deep"])
+@pytest.mark.parametrize("selection", ["whole_records", "assistant_visible_text_v1"])
+async def test_structured_runtime_answers_export_under_each_selection(
+    backend, strategy, selection, monkeypatch
+):
+    import json
+
+    from tests.runtime.runtime_provider_support import (
+        FakeProvider,
+        NativeStructuredOutputFakeProvider,
+    )
+
+    from cayu import AgentSpec
+    from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.requests import RunRequest
+
+    async with harness(backend) as case:
+        current, store, _, projector = case.app()
+        output = {"answer": "accepted"}
+        if strategy == "native_deep":
+            output = 1
+            for _ in range(62):
+                output = [output]
+        actual_strategy = "tool" if strategy == "tool" else "native"
+        observed = []
+        original_project = projector.project
+
+        def capture(source):
+            observed.append(source)
+            return original_project(source)
+
+        monkeypatch.setattr(projector, "project", capture)
+        provider = (
+            NativeStructuredOutputFakeProvider if actual_strategy == "native" else FakeProvider
+        )(
+            [
+                ModelStreamEvent.text_delta(json.dumps(output))
+                if actual_strategy == "native"
+                else ModelStreamEvent.tool_call(
+                    id="answer", name=STRUCTURED_OUTPUT_TOOL_NAME, arguments={"output": output}
+                ),
+                ModelStreamEvent.completed(),
+            ]
+        )
+        current.register_provider(provider, default=True)
+        current.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = [
+            event
+            async for event in current.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=case.session_id,
+                    messages=[Message.text("user", "Answer")],
+                    structured_output={
+                        "name": "Answer",
+                        "strategy": actual_strategy,
+                        "json_schema": {"type": "array" if strategy == "native_deep" else "object"},
+                    },
+                )
+            )
+        ]
+        assert any(event.type is EventType.SESSION_COMPLETED for event in events)
+        original = await store.load_transcript(case.session_id)
+        index = len(original) - 1
+        expected = (await case.request(current)).model_copy(
+            update={"source_indices": (index,), "source_selection": selection}
+        )
+        if selection == "assistant_visible_text_v1" and strategy == "tool":
+            with pytest.raises(SessionExportDenied):
+                await current.export_session(expected, context=CONTEXT)
+            assert projector.calls == 0
+            return
+        receipt = await current.export_session(expected, context=CONTEXT)
+        assert receipt == await current.export_session(expected, context=CONTEXT)
+        assert projector.calls == 1
+        parts = [part for row in observed[0] for part in row.message.content]
+        assert [part.output for part in parts if part.type == "structured_output"] == (
+            [output] if selection == "whole_records" else []
+        )
+        assert await store.load_transcript(case.session_id) == original
+        if backend[0] != "memory":
+            await current.drain_session_exports()
+            await store.close()
+            case.stores.remove(store)
+            current, _, _, _ = case.app(projectors=())
+        assert receipt == await current.export_session(expected, context=CONTEXT)
+        assert await current.read_session_export(expected, context=CONTEXT) == {
+            "count": len(json.dumps(output)) if actual_strategy == "native" else 0
+        }

@@ -7348,6 +7348,7 @@ class SessionEngine:
                     and not retain_completion_controls
                 ):
                     return ModelCompletionRecoveryContext(
+                        structured_output=structured_output,
                         interaction_id=interaction_id,
                         execution_profile_fingerprint=execution_profile_fingerprint,
                         budget_reservations=budget_reservation_contexts,

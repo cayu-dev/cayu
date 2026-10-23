@@ -81,6 +81,7 @@ class ControlPlaneCapabilitySnapshot:
                 else ServerContractActor(subject=actor.subject, tenant=actor.tenant)
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
+                structured_output_transcript=_optional_surface(True, mutation_supported=False),
                 session_display_metadata=_optional_surface(True, mutation_supported=False),
                 app_info=_optional_surface(True, mutation_supported=False),
                 session_overview_queries=_optional_surface(

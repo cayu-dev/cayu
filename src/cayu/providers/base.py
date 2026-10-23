@@ -31,11 +31,12 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
+    StructuredOutputPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
-    detach_message,
+    _without_structured_output_parts,
 )
 from cayu.providers._rejection_diagnostics import rejection_fields
 from cayu.providers._thinking import copy_preflight_thinking
@@ -255,7 +256,7 @@ def _preflight_provider_portable_messages(
                 raise ValueError(
                     "Portable target messages cannot contain provider state or thinking parts."
                 )
-            if type(part) in {HostedToolCallPart, CitationPart}:
+            if type(part) in {HostedToolCallPart, CitationPart, StructuredOutputPart}:
                 # Provider-neutral terminal evidence is not executable input.
                 # The assistant text remains the portable conversation surface.
                 continue
@@ -984,7 +985,11 @@ class ModelRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        return [detach_message(message) for message in value]
+        return [
+            projected
+            for message in value
+            if (projected := _without_structured_output_parts(message)) is not None
+        ]
 
     @field_validator("tools", "options", mode="before")
     @classmethod

@@ -21,6 +21,7 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
+    StructuredOutputPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -205,6 +206,7 @@ def assistant_message(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart
     ] = []
     for part in content_parts:
@@ -385,6 +387,7 @@ def assistant_message_without_tool_round(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart
     ] = []
     for part in message.content:

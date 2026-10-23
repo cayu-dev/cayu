@@ -73,6 +73,12 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
 
 ### Changes
 
+- Validated structured answers now have a `structured_output` transcript part
+  with the spec name and JSON output, for native and tool-based strategies.
+  Original tool calls remain available in the trace. Custom transcript readers
+  should handle the new part; regenerate clients and use the matching dashboard
+  contract. See [session inspection](session-inspection.md#validated-structured-output-in-transcripts).
+
 - `cayu serve --reload` watches project Python source and starts a fresh worker
   after edits. Reload is opt-in and preserves normal authentication and service
   checks. Each worker warns that in-memory state is lost and active runs may be

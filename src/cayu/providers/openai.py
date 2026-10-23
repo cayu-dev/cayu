@@ -42,6 +42,7 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
+    StructuredOutputPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -6512,6 +6513,7 @@ def _openai_input_items(
                 HostedToolCallPart,
                 CitationPart,
                 PeerContentPart,
+                StructuredOutputPart,
             }:
                 raise OpenAIProtocolError(
                     "Assistant messages can only contain text, tool_call, provider_state, "
@@ -7158,6 +7160,7 @@ def _user_input_part(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
@@ -7199,6 +7202,7 @@ def _output_text_part(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
 ) -> dict[str, str]:
     if type(part) is not TextPart and type(part) is not PeerContentPart:
@@ -7293,6 +7297,7 @@ def _tool_result_output_item(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
     *,
     tool_discovery_projection: ToolDiscoveryProjectionRequest | None,
@@ -7398,6 +7403,7 @@ def _function_call_output_item(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:

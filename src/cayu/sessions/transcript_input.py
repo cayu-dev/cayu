@@ -11,7 +11,14 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
-from cayu.messages import Message, MessageRole, PeerContentPart, copy_message, detach_message
+from cayu.messages import (
+    Message,
+    MessageRole,
+    PeerContentPart,
+    StructuredOutputPart,
+    copy_message,
+    detach_message,
+)
 
 
 class DeferredInteractionInput(BaseModel):
@@ -253,4 +260,6 @@ def _copy_caller_input_message(message: Message) -> Message:
     copied = detach_message(message)
     if any(isinstance(part, PeerContentPart) for part in copied.content):
         raise ValueError("Peer content requires authenticated peer delivery.")
+    if any(isinstance(part, StructuredOutputPart) for part in copied.content):
+        raise ValueError("Structured output requires runtime validation.")
     return copied

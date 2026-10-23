@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from cayu._validation import copy_durable_json_object
+from cayu._validation import MAX_DURABLE_JSON_ENVELOPE_NESTING, copy_durable_json_object
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event, copy_event
 from cayu.messages import Message, detach_message
@@ -217,7 +217,7 @@ def _prepare_runtime_publication(
     )
     event_payloads = tuple(event.model_dump(mode="json") for event in copied_request.events)
     transcript_digest = session_authority_rules._canonical_runtime_publication_digest(
-        list(transcript_payloads)
+        list(transcript_payloads), max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
     )
     events_digest = session_authority_rules._canonical_runtime_publication_digest(
         list(event_payloads)
@@ -240,7 +240,8 @@ def _prepare_runtime_publication(
                 if copied_request.argument_continuity is not None
                 else {}
             ),
-        }
+        },
+        max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
     )
     return _PreparedRuntimePublication(
         session_id=session_id,
@@ -453,7 +454,8 @@ def _validate_runtime_publication_durable_material(
             "The durable runtime publication transcript attribution conflicts with its receipt."
         )
     transcript_digest = session_authority_rules._canonical_runtime_publication_digest(
-        [message.model_dump(mode="json") for message in transcript]
+        [message.model_dump(mode="json") for message in transcript],
+        max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
     )
     if transcript_digest != receipt.transcript_digest:
         raise SessionRuntimePublicationConflict(

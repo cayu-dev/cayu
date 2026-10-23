@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
-from cayu._validation import copy_durable_json_object
+from cayu._validation import (
+    DURABLE_DOCUMENT_LIMITS,
+    MAX_DURABLE_JSON_ENVELOPE_NESTING,
+    DurableJsonLimits,
+    copy_durable_json_object,
+    copy_durable_record,
+)
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
 from cayu.execution_units import ModelAttemptIdentity
@@ -373,7 +379,7 @@ def _prepare_model_completion_stage_terminal(
         settlement_storage_key=_model_completion_stage_settlement_storage_key(stage_id),
         publication=copied_publication,
         publication_material_digest=session_authority_rules._canonical_runtime_publication_digest(
-            publication_payload
+            publication_payload, max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
         ),
         recovery_fence=recovery_fence,
     )
@@ -471,9 +477,17 @@ def _model_completion_stage_terminal_record(
         "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
     }
     payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
-        payload
+        payload, max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
     )
-    return copy_durable_json_object(payload, "model_completion_stage_terminal")
+    return copy_durable_record(
+        payload,
+        "model_completion_stage_terminal",
+        limits=DurableJsonLimits(
+            DURABLE_DOCUMENT_LIMITS.max_bytes,
+            DURABLE_DOCUMENT_LIMITS.max_nodes,
+            MAX_DURABLE_JSON_ENVELOPE_NESTING,
+        ),
+    )
 
 
 def _active_model_completion_stage_record(
@@ -1367,13 +1381,17 @@ def _reconstruct_model_completion_stage_terminal(
             raise ValueError
         publication_payload = reconstructed.publication.model_dump(mode="json")
         if (
-            session_authority_rules._canonical_runtime_publication_digest(publication_payload)
+            session_authority_rules._canonical_runtime_publication_digest(
+                publication_payload, max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
+            )
             != reconstructed.publication_material_digest
         ):
             raise ValueError
         digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
         if (
-            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            session_authority_rules._canonical_runtime_publication_digest(
+                digest_payload, max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
+            )
             != reconstructed.record_digest
         ):
             raise ValueError

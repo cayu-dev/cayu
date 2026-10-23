@@ -3905,6 +3905,7 @@ def _serialize_message_part(cayu_app: Any, part: Any) -> dict[str, Any]:
             "provider_state",
             "state",
             "structured",
+            "output",
         },
     )
 

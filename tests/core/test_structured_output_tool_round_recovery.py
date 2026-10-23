@@ -16,7 +16,7 @@ from cayu.configuration import ToolExecutionConfig
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 from cayu.events import Event, EventType
 from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
-from cayu.messages import Message, ToolCallPart, ToolResultPart
+from cayu.messages import Message, StructuredOutputPart, ToolCallPart, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_execution_profile
@@ -462,7 +462,10 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
             "tool",
         ]
         grouped_result = transcript[-1]
-        assert len(grouped_result.content) == 1
+        assert len(grouped_result.content) == 2
+        assert grouped_result.content[1] == StructuredOutputPart(
+            name="answer", output={"answer": "recovered"}
+        )
         result_part = grouped_result.content[0]
         assert isinstance(result_part, ToolResultPart)
         assert result_part.tool_call_id == "call-final-valid"

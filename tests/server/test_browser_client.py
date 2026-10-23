@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -132,7 +133,7 @@ def test_create_server_serves_the_client_next_to_its_api() -> None:
 
 
 @pytest.mark.parametrize("entrance", ["server", "mount"])
-def test_browser_client_is_versioned_with_the_server_contract(entrance: str) -> None:
+def test_browser_client_is_versioned_with_the_server_contract(entrance: str, tmp_path) -> None:
     if entrance == "server":
         app = create_server(CayuApp(), config=ServerConfig.local_development())
         prefix = ""
@@ -159,3 +160,55 @@ def test_browser_client_is_versioned_with_the_server_contract(entrance: str) -> 
     )
     assert _exported_constant(types, "CLIENT_VERSION") == BROWSER_CLIENT_VERSION
     assert "cayu guide app-ui" in module
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="Executed in the Node-enabled dashboard lane"
+)
+@pytest.mark.parametrize("entrance", ["server", "mount"])
+def test_served_browser_client_connects_to_real_contract(entrance, tmp_path):
+    if entrance == "server":
+        app = create_server(CayuApp(), config=ServerConfig.local_development())
+        prefix = ""
+    else:
+        app = FastAPI()
+        mount_cayu(app, CayuApp(), path="/ops", access=OpenAccess())
+        prefix = "/ops"
+    client = TestClient(app)
+    contract = client.get(f"{prefix}/api/contract").json()
+    module = client.get(contract["client"]["module_url"]).text
+    # Execute the served module, not a copied constant, against the real contract.
+    import json
+    import subprocess
+
+    node = shutil.which("node")
+    assert node is not None, "Node is required to exercise the shipped browser client."
+    module_path = tmp_path / "client.mjs"
+    module_path.write_text(module)
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(contract))
+    result = subprocess.run(
+        [
+            node,
+            "--input-type=module",
+            "-e",
+            """
+import {readFileSync} from 'node:fs';
+import {pathToFileURL} from 'node:url';
+const {connect} = await import(pathToFileURL(process.argv[1]));
+const contract = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const options = {apiBaseUrl:'http://localhost/api', fetch:async()=>new Response(JSON.stringify(contract), {headers:{'content-type':'application/json'}})};
+await connect(options);
+contract.contract_version = 'incompatible';
+let rejected = false;
+try { await connect(options); } catch (error) { rejected = error.kind === 'contract'; }
+if (!rejected) throw new Error('Mismatched server must be rejected');
+""",
+            str(module_path),
+            str(contract_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

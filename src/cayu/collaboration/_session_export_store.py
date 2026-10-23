@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, StrictBool, StrictInt, model_validator
 
-from cayu._validation import canonical_bounded_durable_json_bytes, canonical_durable_json_bytes
+from cayu._validation import (
+    MAX_DURABLE_JSON_ENVELOPE_NESTING,
+    canonical_bounded_durable_json_bytes,
+    canonical_durable_json_bytes,
+)
 from cayu.collaboration._contracts import (
     MAX_ENVELOPE_BYTES,
     ContractValue,
@@ -65,7 +69,9 @@ def source_digest(records: Sequence[TranscriptRecord]) -> str:
 
 def source_bytes(records: Sequence[TranscriptRecord]) -> bytes:
     return canonical_durable_json_bytes(
-        [record.model_dump(mode="json", warnings=False) for record in records], "export source"
+        [record.model_dump(mode="json", warnings=False) for record in records],
+        "export source",
+        max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
     )
 
 

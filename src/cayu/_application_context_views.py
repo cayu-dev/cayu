@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
 
-from cayu._validation import canonical_bounded_durable_json_bytes
+from cayu._validation import MAX_DURABLE_JSON_ENVELOPE_NESTING, canonical_bounded_durable_json_bytes
 from cayu.artifacts.resources import LocalArtifactResourceOwner
 from cayu.collaboration._coordinator import ParticipantCoordinator
 from cayu.collaboration.access import CollaborationAccessContext
@@ -167,7 +167,7 @@ async def publish_completed_context_view(
             "context view messages",
             max_bytes=8 * 1024 * 1024,
             max_nodes=8192,
-            max_nesting=64,
+            max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
         ).decode("utf-8")
         # Extensions receive only the bounded historical projection source.
         # Passing the executable Session model would expose invocation,

@@ -280,7 +280,12 @@ async def test_public_continue_lost_ack_reconstructs_without_native_target(
 
 
 async def completed_participant(
-    native_stores, *, provider=None, tools=(), terminal_event="session.completed"
+    native_stores,
+    *,
+    provider=None,
+    tools=(),
+    terminal_event="session.completed",
+    structured_output=None,
 ):
     collaboration, sessions, *_ = native_stores
     application = app(collaboration, registration(), session_store=sessions)
@@ -297,7 +302,11 @@ async def completed_participant(
     _, receipt = await create(application, initialized)
     participant = receipt.participants[0].reference
     creation = ParticipantSessionCreationRequest(
-        request=RunRequest(agent_name="reviewer", messages=[Message.text("user", "start")]),
+        request=RunRequest(
+            agent_name="reviewer",
+            messages=[Message.text("user", "start")],
+            structured_output=structured_output,
+        ),
         creation_key="continue-source:" + initialized.owner.application_scope,
     )
     session, _ = await application.create_participant_session(
@@ -733,3 +742,205 @@ async def test_selection_snapshot_is_coherent_while_another_instance_advances(
         async_release.set()
         await asyncio.gather(pending, return_exceptions=True)
         await reader.close()
+
+
+@pytest.mark.parametrize("strategy", ["tool", "native"])
+async def test_structured_completed_turn_supports_context_and_continuation(native_stores, strategy):
+    import json
+
+    from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
+    from cayu.sessions.context_views import ContextViewPublicationRequest
+
+    output = {"answer": "yes"}
+    if strategy == "native":
+        output = 1
+        for _ in range(62):
+            output = [output]
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="answer",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": output},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ],
+        name="provider",
+        supports_native_structured_output=True,
+    )
+    if strategy == "native":
+        provider._batches = (
+            (ModelStreamEvent.text_delta(json.dumps(output)), ModelStreamEvent.completed()),
+        )
+    application, session, participant = await completed_participant(
+        native_stores,
+        provider=provider,
+        structured_output={
+            "name": "Answer",
+            "strategy": strategy,
+            "json_schema": {"type": "object" if strategy == "tool" else "array"},
+        },
+    )
+    store = application.session_store
+    before = await store.load_transcript(session.id)
+    assert any(part.type == "structured_output" for row in before for part in row.content)
+    selection = await store.capture_recipient_continuation(session.id)
+    assert selection == await store.capture_recipient_continuation(session.id)
+    pointer = model_step_publication_from_checkpoint(await store.load_checkpoint(session.id))
+    completion = next(
+        event
+        for event in await store.load_events(session.id)
+        if event.id == pointer.completion_event_id
+    )
+    publication = ContextViewPublicationRequest(
+        source_session_id=session.id,
+        source_session_instance_id=session.instance_id,
+        view_id="structured-view-" + strategy,
+        interaction_id=completion.interaction_id,
+        boundary_id=pointer.logical_step_id,
+        publication_key="structured-publication-" + session.id,
+        projection_schema="whole-turn.v1",
+    )
+    manifest = await application.publish_completed_context_view(
+        publication, participant=participant, context=CONTEXT
+    )
+    assert manifest == await application.publish_completed_context_view(
+        publication, participant=participant, context=CONTEXT
+    )
+    assert before == await store.load_transcript(session.id)
+
+
+@pytest.mark.parametrize("strategy", ["tool", "native"])
+async def test_structured_context_view_fork_keeps_history_without_forgery(native_stores, strategy):
+    import json
+
+    from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
+    from cayu.sessions.context_views import (
+        ContextViewLimits,
+        ContextViewOwnershipRequest,
+        ContextViewPublicationRequest,
+        ContextViewSelectionRequest,
+        RecipientSessionCreationRequest,
+    )
+
+    output = {"answer": "accepted"}
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta(json.dumps(output))
+                if strategy == "native"
+                else ModelStreamEvent.tool_call(
+                    id="answer", name=STRUCTURED_OUTPUT_TOOL_NAME, arguments={"output": output}
+                ),
+                ModelStreamEvent.completed(),
+            ]
+        ],
+        name="provider",
+        supports_native_structured_output=True,
+    )
+    application, session, participant = await completed_participant(
+        native_stores,
+        provider=provider,
+        structured_output={
+            "name": "Answer",
+            "strategy": strategy,
+            "json_schema": {"type": "object"},
+        },
+    )
+    store = application.session_store
+    original = await store.load_transcript(session.id)
+    pointer = model_step_publication_from_checkpoint(await store.load_checkpoint(session.id))
+    completion = next(
+        event
+        for event in await store.load_events(session.id)
+        if event.id == pointer.completion_event_id
+    )
+    manifest = await application.publish_completed_context_view(
+        ContextViewPublicationRequest(
+            source_session_id=session.id,
+            source_session_instance_id=session.instance_id,
+            view_id="fork-view-" + session.id,
+            interaction_id=completion.interaction_id,
+            boundary_id=pointer.logical_step_id,
+            publication_key="fork-publication-" + session.id,
+            projection_schema="whole-turn.v1",
+        ),
+        participant=participant,
+        context=CONTEXT,
+    )
+    selected = await application.select_context_view(
+        ContextViewSelectionRequest(
+            source_owner=participant.owner,
+            source_session_id=session.id,
+            source_session_instance_id=session.instance_id,
+            selector="exact",
+            exact_view_id=manifest.view_id,
+            projection_schema=manifest.projection_schema,
+            extension_set_commitment=manifest.extension_set_commitment,
+            limits=ContextViewLimits(),
+            selection_key="fork-selection-" + session.id,
+        ),
+        participant=participant,
+        context=CONTEXT,
+    )
+    adopted = await application.transition_context_view_ownership(
+        ContextViewOwnershipRequest(
+            selection_key=selected.selection_key,
+            view_id=manifest.view_id,
+            pin_commitment=selected.pin_commitment,
+            expected_state=selected.state,
+            expected_revision=selected.ownership_revision,
+            operation="adopt",
+            current_owner=participant.owner,
+            destination_owner=participant.owner,
+            operation_key="fork-adopt-" + session.id,
+        ),
+        participant=participant,
+        destination_participant=participant,
+        context=CONTEXT,
+    )
+    creation = RecipientSessionCreationRequest(
+        request=RunRequest(agent_name="reviewer", messages=[Message.text("user", "Continue")]),
+        creation_key="structured-fork-" + session.id,
+        recipient=participant,
+        mode="fork",
+        selected_view=adopted,
+    )
+    child, receipt = await application.create_recipient_session(creation, context=CONTEXT)
+    assert (child, receipt) == await application.create_recipient_session(creation, context=CONTEXT)
+    history = await store.load_transcript(child.id)
+    retained = [Message.model_validate(row) for row in json.loads(manifest.messages_json)]
+    expected = [
+        Message(
+            role=message.role,
+            content=tuple(part for part in message.content if part.type != "structured_output"),
+        )
+        for message in retained
+    ]
+    assert history == [*expected, Message.text("user", "Continue")]
+    assert any(part.type == "structured_output" for message in original for part in message.content)
+    forged = RunRequest(
+        agent_name="reviewer",
+        session_id="forged-" + session.id,
+        messages=[Message.text("user", "Forge")],
+    ).model_copy(update={"messages": [original[-1]]})
+    with pytest.raises(ValueError, match="Structured output requires runtime validation"):
+        _ = [event async for event in application.run(forged)]
+    assert await store.load(forged.session_id) is None
+    assert await store.load_transcript(session.id) == original
+    if native_stores[3][0] != "memory":
+        from cayu.storage import PostgresSessionStore, SQLiteSessionStore
+
+        reopened = (
+            SQLiteSessionStore(store.path)
+            if native_stores[3][0] == "sqlite"
+            else PostgresSessionStore(native_stores[3][1])
+        )
+        try:
+            assert await reopened.load_transcript(child.id) == history
+        finally:
+            await reopened.close()

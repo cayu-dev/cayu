@@ -1569,6 +1569,25 @@ export type ApiSessionTopologyNode = {
 };
 
 /**
+ * ApiStructuredOutputPart
+ */
+export type ApiStructuredOutputPart = {
+    /**
+     * Name
+     */
+    name: string | null;
+    /**
+     * Output
+     */
+    output: unknown;
+    /**
+     * Type
+     */
+    type?: 'structured_output';
+    [key: string]: unknown;
+};
+
+/**
  * ApiSupervisionActor
  */
 export type ApiSupervisionActor = {
@@ -2280,7 +2299,7 @@ export type ApiTranscriptMessage = {
     /**
      * Content
      */
-    content: Array<{
+    content: Array<ApiStructuredOutputPart | {
         [key: string]: unknown;
     }>;
     /**
@@ -4138,6 +4157,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_follow?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
     session_overview_queries?: OptionalSurfaceCapability | null;
+    structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
@@ -12484,7 +12504,7 @@ export type Message = {
     /**
      * Content
      */
-    content?: Array<TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart | HostedToolCallPart | CitationPart | PeerContentPart>;
+    content?: Array<TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart | HostedToolCallPart | CitationPart | StructuredOutputPart | PeerContentPart>;
     role: MessageRole;
 };
 
@@ -18050,6 +18070,26 @@ export type StructuredModelJudgeAssertionSpec = {
      * Threshold
      */
     threshold?: string;
+};
+
+/**
+ * StructuredOutputPart
+ *
+ * Validated answer retained for display, alongside its original model content.
+ */
+export type StructuredOutputPart = {
+    /**
+     * Name
+     */
+    name: string | null;
+    /**
+     * Output
+     */
+    output: unknown;
+    /**
+     * Type
+     */
+    type?: 'structured_output';
 };
 
 /**

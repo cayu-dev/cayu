@@ -12,7 +12,13 @@ from cayu._task_wait import (
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
 )
-from cayu._validation import copy_durable_json_object, copy_json_value, require_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_ENVELOPE_NESTING,
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
+    copy_json_value,
+    require_nonblank,
+)
 from cayu.events import Event, copy_event
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
@@ -216,10 +222,9 @@ def _validate_model_completion_publication_result(
         raise RuntimeError("Model completion publisher did not return a terminal stage.")
 
     publication_request = completed.publication
+    expected_message = request.transcript_assistant_message()
     expected_messages = (
-        ()
-        if request.authoritative_assistant_message is None or request.defer_assistant_message
-        else (request.authoritative_assistant_message,)
+        () if expected_message is None or request.defer_assistant_message else (expected_message,)
     )
     if publication_request.publication_id != request.dispatch.logical_step_id:
         raise RuntimeError("Model completion publication acknowledged a different logical step.")
@@ -227,7 +232,15 @@ def _validate_model_completion_publication_result(
         raise RuntimeError("Model completion publication has the wrong publication kind.")
     if publication_request.intent != request.dispatch.intent:
         raise RuntimeError("Model completion publication changed the prepared dispatch intent.")
-    if publication_request.transcript_messages != expected_messages:
+    if canonical_durable_json_bytes(
+        [message.model_dump(mode="json") for message in publication_request.transcript_messages],
+        "published transcript",
+        max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
+    ) != canonical_durable_json_bytes(
+        [message.model_dump(mode="json") for message in expected_messages],
+        "expected transcript",
+        max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
+    ):
         raise RuntimeError("Model completion publication changed the authoritative assistant turn.")
     if publication_request.events != (request.completion_event,):
         raise RuntimeError("Model completion publication changed its completion event.")
@@ -259,7 +272,7 @@ def _validate_model_completion_publication_result(
         durable_tool_exposure = pending_round_value.get("tool_exposure")
     expected_validation = (
         None
-        if request.structured_output_validation is None
+        if not expects_pending_round or request.structured_output_validation is None
         else request.structured_output_validation.model_dump(mode="json")
     )
     if durable_validation != expected_validation:

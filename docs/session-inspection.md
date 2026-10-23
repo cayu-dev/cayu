@@ -67,6 +67,40 @@ The `session_display_metadata` surface capability advertises these conventions;
 the existing session reads expose their metadata, and this adds no summary
 HTTP mutation route.
 
+## Validated structured output in transcripts
+
+Successful native and tool-based structured answers add a `structured_output`
+part to the existing transcript message:
+
+```json
+{"type": "structured_output", "name": "Answer", "output": {"answer": "ready"}}
+```
+
+`name` is the specification's name, or `null` for an unnamed specification;
+`output` is its validated JSON value after the runtime's secret redaction.
+The part is stored atomically with its original assistant text or tool result,
+so retries and recovery do not append duplicate answers. Failed validation adds
+no structured-output part. The original tool calls and results remain in the
+transcript and event trace. Transcript pagination and message indexes are unchanged.
+
+`GET /api/sessions/{id}/transcript` and `SessionStore.load_transcript` expose the
+same part. Check `capabilities.surfaces.structured_output_transcript.read.enabled`
+before rendering it. Custom transcript readers should recognize the new part
+instead of identifying the internal submission tool by name. The runtime omits
+this display evidence from subsequent model requests because the original text
+or tool result already carries the answer. Caller-authored session input cannot
+claim runtime validation by supplying a `StructuredOutputPart`.
+
+Visible-text exports omit this display evidence; whole-record exports preserve
+it for the authorized projector. Completed context views retain it under the
+same exact publication receipt as the original message. A fork from an
+authenticated context view imports the original text and tool results without
+copying the source runtime's validation claim into caller input. Raw caller
+messages containing the display part remain rejected.
+The JSON value keeps the existing payload depth limit; typed transcript and
+publication envelopes have bounded nesting headroom for their enclosing fields.
+Byte and node limits remain unchanged.
+
 ## Configure the session store
 
 New local projects use one SQLite database at `data/cayu.db`:

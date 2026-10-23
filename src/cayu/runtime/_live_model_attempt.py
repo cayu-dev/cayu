@@ -38,6 +38,7 @@ from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputStrategy,
+    validate_structured_output_text,
 )
 from cayu.environments.admission import ExecutionAdmissionError
 from cayu.events import Event, EventType, copy_event, event_with_runtime_generated_id
@@ -2080,6 +2081,21 @@ class LiveModelAttempt:
                             _validate_structured_output_tool_round(
                                 tool_calls=step_result.tool_calls,
                                 spec=structured_output,
+                            ),
+                            self._secret_redactor,
+                        )
+                    if (
+                        terminal_failure is None
+                        and structured_output is not None
+                        and structured_output.strategy is StructuredOutputStrategy.NATIVE
+                        and candidate_step_result.assistant_message is not None
+                        and not step_result.tool_calls
+                    ):
+                        # Preserve the original validation decision across redaction.
+                        # Sanitized text can have a different schema-validity result.
+                        candidate_validation = _redact_structured_output_validation(
+                            validate_structured_output_text(
+                                step_result.text_content, structured_output
                             ),
                             self._secret_redactor,
                         )

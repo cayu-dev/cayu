@@ -141,6 +141,7 @@ from cayu.messages import (
     MessageRole,
     ProviderStatePart,
     ToolResultPart,
+    _without_structured_output_parts,
     detach_message,
 )
 from cayu.providers._credential_boundary import (
@@ -5633,7 +5634,13 @@ def _model_request_messages(
 ) -> list[Message]:
     """Return the complete statically determined message surface for one request."""
 
-    projected = messages
+    # Display evidence duplicates the original text/tool result, which remains
+    # the provider's continuation history. Preserve durable rows, not duplicate input.
+    projected = [
+        projected
+        for message in messages
+        if (projected := _without_structured_output_parts(message)) is not None
+    ]
     if (
         structured_output is not None
         and structured_output.strategy == StructuredOutputStrategy.TOOL

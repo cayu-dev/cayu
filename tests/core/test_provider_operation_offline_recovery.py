@@ -8995,3 +8995,43 @@ def test_deadline_failed_task_allows_provider_failure_settlement_only(
                 await store.close()
 
     asyncio.run(scenario())
+
+
+def test_native_offline_recovery_preserves_manual_reconciliation_boundary() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _OfflineOperationProvider(
+            ProviderOperationStatus.COMPLETED,
+            events=(
+                ModelStreamEvent.text_delta('{"answer":"recovered"}'),
+                ModelStreamEvent.completed(),
+            ),
+        )
+        context = ModelCompletionRecoveryContext(
+            structured_output=StructuredOutputSpec(
+                name="answer", strategy="native", json_schema={"type": "object"}
+            )
+        )
+        await _stage_offline_operation(
+            store,
+            session_id="offline-native-boundary",
+            provider=provider,
+            recovery_context=context.model_dump(mode="json"),
+        )
+        before = await store.load_transcript("offline-native-boundary")
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(
+            ProviderOperationEvidenceError,
+            match="native structured output requires manual reconciliation",
+        ):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id="offline-native-boundary", inactive_for_seconds=0
+                )
+            )
+        assert await store.load_transcript("offline-native-boundary") == before
+        assert await store.load_active_model_completion_stage("offline-native-boundary") is not None
+
+    asyncio.run(scenario())

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from cayu._validation import copy_durable_json_object
+from cayu._validation import MAX_DURABLE_JSON_ENVELOPE_NESTING, copy_durable_json_object
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.sessions._checkpoint_mutations import (
@@ -245,6 +245,7 @@ async def publish_runtime(
                     or not _runtime_publication_json_equal(
                         locked_stage.publication.model_dump(mode="json"),
                         prepared.request.model_dump(mode="json"),
+                        max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
                     )
                 ):
                     raise SessionModelCompletionStageConflict(

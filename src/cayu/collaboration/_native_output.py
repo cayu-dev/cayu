@@ -95,7 +95,8 @@ async def read_native_output(
             raise CollaborationConflict("Reply selects content outside its model publication.")
         message = publication.transcript_messages[offset]
         if message.role != "assistant" or any(
-            part.type not in {"text", "provider_state", "thinking"} for part in message.content
+            part.type not in {"text", "provider_state", "thinking", "structured_output"}
+            for part in message.content
         ):
             raise CollaborationConflict("Reply requires a visible assistant text projection.")
         visible = tuple(part for part in message.content if part.type == "text")

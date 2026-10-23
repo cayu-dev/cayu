@@ -139,8 +139,13 @@ async def output_scenario(
     cancellation="stop",
     unchecked_registration=False,
     requested_session_id=None,
+    structured_output=None,
 ):
     from tests.core.test_peer_content import QualifiedPeerProvider
+
+    class NativePeerProvider(QualifiedPeerProvider):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, supports_native_structured_output=True, **kwargs)
 
     application, resolver, admission, provider, session, initialized = await prepared_scenario(
         native_stores,
@@ -157,7 +162,10 @@ async def output_scenario(
         )
         if with_exports
         else None,
-        provider_factory=QualifiedPeerProvider,
+        provider_factory=NativePeerProvider
+        if structured_output is not None
+        else QualifiedPeerProvider,
+        structured_output=structured_output,
         tools=tools,
         tool_policy=tool_policy,
         loop_policies=loop_policies,
@@ -236,7 +244,10 @@ async def output_scenario(
     )
     execution = ParticipantSessionExecutionRequest(
         request=RunRequest(
-            agent_name="reviewer", session_id=session.id, messages=[Message.text("user", "input")]
+            agent_name="reviewer",
+            session_id=session.id,
+            messages=[Message.text("user", "input")],
+            structured_output=structured_output,
         ),
         session_instance_id=session.instance_id,
         execution_key="producer-one",
@@ -624,7 +635,7 @@ async def test_output_contract_from_real_admission_is_bounded_and_non_dispatchin
     [(14, "ack"), (14, "cancel"), (14, "exclude"), (1024, "none"), (1025, "none")],
 )
 async def test_registered_producer_enters_native_participant_runtime(
-    native_stores, answer_bytes, export_failure, monkeypatch
+    native_stores, answer_bytes, export_failure, monkeypatch, structured=False
 ):
     from tests.core.test_participant_identity import CONTEXT
 
@@ -641,13 +652,21 @@ async def test_registered_producer_enters_native_participant_runtime(
         _,
         proposal,
         execution,
-    ) = await output_scenario(native_stores, with_exports=True)
+    ) = await output_scenario(
+        native_stores,
+        with_exports=True,
+        structured_output={"strategy": "native", "json_schema": {"type": "object"}}
+        if structured
+        else None,
+    )
     oversized = answer_bytes > 1024
     # This matrix qualifies exact concurrent completion and output bounds, not
     # the default short foreground observation deadline under backend contention.
     # Dedicated ownership tests exercise timeout with a dispatched-work barrier.
     monkeypatch.setattr(application._request_coordinator._owners, "observation_timeout", 60)
-    answer = "a" * answer_bytes
+    answer = (
+        ('{"answer":"' + "a" * (answer_bytes - 13) + '"}') if structured else "a" * answer_bytes
+    )
     provider._batches = (
         (
             ModelStreamEvent.thinking("private-producer-canary"),
@@ -2430,3 +2449,10 @@ async def test_cancelled_control_retains_native_exclusion_owner(native_stores, m
         record = await read_output_registration(tx, proposal, redactor=redactor)
         assert record.state == "excluded" and record.reserved_bytes == 0
     await application.drain_collaboration_requests()
+
+
+@pytest.mark.anyio
+async def test_native_structured_producer_exports_visible_text(native_stores, monkeypatch):
+    await test_registered_producer_enters_native_participant_runtime(
+        native_stores, 80, None, monkeypatch, structured=True
+    )

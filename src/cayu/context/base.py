@@ -73,6 +73,7 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
+    StructuredOutputPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -557,7 +558,9 @@ class ObservedDeltaContextEstimator:
             raise TypeError("message must be a Message.")
         total = 0
         for part in message.content:
-            if type(part) is TextPart:
+            if type(part) is StructuredOutputPart:
+                continue
+            elif type(part) is TextPart:
                 total += self._estimate_text(part.text)
             elif type(part) is ToolCallPart:
                 total += self._estimate_text(part.tool_name)
@@ -6906,6 +6909,7 @@ def _strip_old_tool_result_attachments(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart
     ] = []
     for part_index, part in enumerate(message.content):
@@ -6954,6 +6958,7 @@ def _strip_file_parts_from_user_message(message: Message) -> Message:
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart
     ] = []
     stripped_attachments: list[FileAttachment] = []
@@ -7001,6 +7006,7 @@ def noteify_unresolvable_prompt_files(
             | FilePart
             | HostedToolCallPart
             | CitationPart
+            | StructuredOutputPart
             | PeerContentPart
         ] = []
         removed_attachments: list[FileAttachment] = []
@@ -7458,6 +7464,7 @@ def _message_part_digest(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
 ) -> str:
     if type(part) is TextPart:
@@ -7486,6 +7493,8 @@ def _message_part_digest(
         return f"[hosted_tool_call type={part.hosted_tool} status={part.status}]"
     if type(part) is CitationPart:
         return f"[citation url={part.url}]"
+    if type(part) is StructuredOutputPart:
+        return "[validated structured output]"
     if type(part) is PeerContentPart:
         return _PEER_COMPACTION_MARKER
     raise TypeError("Unsupported message part.")

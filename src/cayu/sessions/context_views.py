@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_ENVELOPE_NESTING,
     MAX_DURABLE_JSON_INTEGER,
     canonical_bounded_durable_json_bytes,
     copy_durable_json_object,
@@ -34,7 +35,7 @@ from cayu.artifacts.resources import (
 )
 from cayu.collaboration._contracts import ContractValue, Generation, Identifier, OwnerRef
 from cayu.collaboration.participants import ParticipantRef
-from cayu.messages import FilePart, Message, ToolResultPart
+from cayu.messages import FilePart, Message, ToolResultPart, _without_structured_output_parts
 from cayu.sessions.requests import RunRequest, copy_run_request
 
 CONTEXT_VIEW_CONTRACT_VERSION = 1
@@ -69,7 +70,14 @@ class ContextViewProjectionSource(ContractValue):
     )
     @classmethod
     def validate_source_json(cls, value: str, info) -> str:
-        return _canonical_json_text(value, info.field_name, max_bytes=CONTEXT_VIEW_MAX_JSON_BYTES)
+        return _canonical_json_text(
+            value,
+            info.field_name,
+            max_bytes=CONTEXT_VIEW_MAX_JSON_BYTES,
+            max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
+            if info.field_name == "messages_json"
+            else 64,
+        )
 
     @property
     def commitment(self) -> str:
@@ -266,11 +274,17 @@ class RecipientSessionCreationRequest:
             assert self.selected_view is not None
             try:
                 messages = [
-                    Message.model_validate(item)
+                    projected
                     for item in json.loads(self.selected_view.view.messages_json)
+                    if (projected := _without_structured_output_parts(Message.model_validate(item)))
+                    is not None
                 ]
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError("Selected context-view messages are unavailable.") from exc
+            # The exact selected-view receipt retains the validation evidence.
+            # A fork imports conversation history, not a new claim that its own
+            # runtime validated the answer. Project only retained history; raw
+            # request.messages still cross the caller-input rejection boundary.
             # Retained history precedes the new first input. Neither may erase
             # the other, including in exact readback and lost-ACK replay.
             request = request.model_copy(
@@ -377,7 +391,9 @@ class RecipientSessionCreationReceipt(ContractValue):
         return self
 
 
-def _canonical_json_text(value: object, field_name: str, *, max_bytes: int) -> str:
+def _canonical_json_text(
+    value: object, field_name: str, *, max_bytes: int, max_nesting: int = 64
+) -> str:
     if type(value) is str:
         text = value
         try:
@@ -391,7 +407,7 @@ def _canonical_json_text(value: object, field_name: str, *, max_bytes: int) -> s
             field_name,
             max_bytes=max_bytes,
             max_nodes=8192,
-            max_nesting=64,
+            max_nesting=max_nesting,
         ).decode("utf-8")
         return text
     canonical = canonical_bounded_durable_json_bytes(
@@ -399,10 +415,17 @@ def _canonical_json_text(value: object, field_name: str, *, max_bytes: int) -> s
         field_name,
         max_bytes=max_bytes,
         max_nodes=8192,
-        max_nesting=64,
+        max_nesting=max_nesting,
     ).decode("utf-8")
     if text != canonical:
         raise ValueError(f"{field_name} must be canonical JSON.")
+    if max_nesting > 64:
+        # Headroom belongs only to typed message envelopes, never arbitrary
+        # extension JSON. Each message still validates its individual leaves.
+        if type(parsed) is not list or len(parsed) > CONTEXT_VIEW_MAX_MESSAGES:
+            raise ValueError("A context view must contain a bounded message list.")
+        for item in parsed:
+            Message.model_validate(item)
     return text
 
 
@@ -859,7 +882,14 @@ class ContextViewManifest(ContractValue):
     def validate_json_fields(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return _canonical_json_text(value, info.field_name, max_bytes=CONTEXT_VIEW_MAX_JSON_BYTES)
+        return _canonical_json_text(
+            value,
+            info.field_name,
+            max_bytes=CONTEXT_VIEW_MAX_JSON_BYTES,
+            max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
+            if info.field_name == "messages_json"
+            else 64,
+        )
 
     @field_validator("messages_json")
     @classmethod

@@ -19,7 +19,10 @@ from cayu.sessions.requests import RunRequest
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-async def test_native_output_reads_exact_public_runtime_publication(backend, tmp_path, request):
+@pytest.mark.parametrize("structured", [False, True])
+async def test_native_output_reads_exact_public_runtime_publication(
+    backend, tmp_path, request, structured
+):
     if backend == "memory":
         store = InMemorySessionStore()
     elif backend == "sqlite":
@@ -37,10 +40,11 @@ async def test_native_output_reads_exact_public_runtime_publication(backend, tmp
         provider = ScriptedModelProvider(
             [
                 [
-                    ModelStreamEvent.text_delta("answer"),
+                    ModelStreamEvent.text_delta('{"answer":"yes"}' if structured else "answer"),
                     ModelStreamEvent.completed({"finish_reason": "stop"}),
                 ]
-            ]
+            ],
+            supports_native_structured_output=True,
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
@@ -51,6 +55,9 @@ async def test_native_output_reads_exact_public_runtime_publication(backend, tmp
             async for event in app.run(
                 RunRequest(
                     agent_name="producer",
+                    structured_output={"strategy": "native", "json_schema": {"type": "object"}}
+                    if structured
+                    else None,
                     session_id=session_id,
                     messages=[Message.text("user", "answer")],
                 )

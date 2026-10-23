@@ -215,6 +215,7 @@ class EvalsReadiness(_DiagnosticsModel):
 
 
 class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
+    structured_output_transcript: OptionalSurfaceCapability | None = None
     session_display_metadata: OptionalSurfaceCapability | None = None
     app_info: OptionalSurfaceCapability | None = None
     session_overview: OptionalSurfaceCapability | None = None

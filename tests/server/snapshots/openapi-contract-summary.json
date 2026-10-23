@@ -2695,6 +2695,37 @@
       "title": "ApiSessionTopologyNode",
       "type": "object"
     },
+    "ApiStructuredOutputPart": {
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        },
+        "output": {
+          "title": "Output"
+        },
+        "type": {
+          "const": "structured_output",
+          "default": "structured_output",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "output"
+      ],
+      "title": "ApiStructuredOutputPart",
+      "type": "object"
+    },
     "ApiSupervisionActor": {
       "additionalProperties": false,
       "properties": {
@@ -4260,8 +4291,15 @@
       "properties": {
         "content": {
           "items": {
-            "additionalProperties": true,
-            "type": "object"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApiStructuredOutputPart"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ]
           },
           "title": "Content",
           "type": "array"
@@ -5755,6 +5793,16 @@
           ]
         },
         "session_overview_queries": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "structured_output_transcript": {
           "anyOf": [
             {
               "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -8890,6 +8938,9 @@
                 "$ref": "#/components/schemas/CitationPart"
               },
               {
+                "$ref": "#/components/schemas/StructuredOutputPart"
+              },
+              {
                 "$ref": "#/components/schemas/PeerContentPart"
               }
             ]
@@ -11484,7 +11535,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "54",
+          "default": "55",
           "title": "Contract Version",
           "type": "string"
         },
@@ -13946,6 +13997,38 @@
         }
       },
       "title": "StartupRecoveryResult",
+      "type": "object"
+    },
+    "StructuredOutputPart": {
+      "additionalProperties": false,
+      "description": "Validated answer retained for display, alongside its original model content.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        },
+        "output": {
+          "title": "Output"
+        },
+        "type": {
+          "const": "structured_output",
+          "default": "structured_output",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "output"
+      ],
+      "title": "StructuredOutputPart",
       "type": "object"
     },
     "StructuredOutputSpec": {
@@ -17344,7 +17427,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "54",
+          "default": "55",
           "title": "Contract Version",
           "type": "string"
         }

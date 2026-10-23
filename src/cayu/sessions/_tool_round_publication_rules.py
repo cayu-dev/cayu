@@ -22,7 +22,7 @@ from cayu.context.structured_output import (
 )
 from cayu.events import Event, EventType
 from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
-from cayu.messages import MessageRole, ToolCallPart, ToolResultPart
+from cayu.messages import MessageRole, StructuredOutputPart, ToolCallPart, ToolResultPart
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
@@ -448,6 +448,8 @@ def _validate_tool_round_publication(
         raise ValueError("A tool-round publication must end with a tool-result message.")
     result_parts: list[ToolResultPart] = []
     for part in result_message.content:
+        if type(part) is StructuredOutputPart and auxiliary is not None and auxiliary.valid:
+            continue
         if not isinstance(part, ToolResultPart):
             raise ValueError(
                 "A tool-round publication result message can contain only tool results."
@@ -834,6 +836,22 @@ def _validate_structured_output_tool_round_marker(
             raise SessionRuntimePublicationConflict(
                 "The reserved structured-output call is not bound to its transcript result."
             )
+    output_parts = [
+        part
+        for message in request.transcript_messages
+        for part in message.content
+        if type(part) is StructuredOutputPart
+    ]
+    expected_parts = (
+        [StructuredOutputPart(name=spec.name, output=auxiliary.output)] if auxiliary.valid else []
+    )
+    if not session_authority_rules._runtime_publication_json_equal(
+        [part.model_dump(mode="json") for part in output_parts],
+        [part.model_dump(mode="json") for part in expected_parts],
+    ):
+        raise SessionRuntimePublicationConflict(
+            "Structured-output transcript evidence conflicts with validated output."
+        )
     if auxiliary.valid:
         if len(structured_calls) != 1 or len(raw_calls) != 1:
             raise SessionRuntimePublicationConflict(

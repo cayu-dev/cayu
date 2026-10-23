@@ -33,6 +33,7 @@ from cayu.events import (
 from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import (
     Message,
+    StructuredOutputPart,
 )
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_profiles import (
@@ -297,6 +298,13 @@ def test_session_store_conformance_structured_output_tool_round_auxiliary_public
                     "output": {"answer": "ok"},
                 },
             )
+            result_message = Message.tool_result(
+                tool_call_id=tool_call_id,
+                tool_name=STRUCTURED_OUTPUT_TOOL_NAME,
+                content=result_payload["content"],
+                structured=result_payload["structured"],
+                **round_identity,
+            )
             request = RuntimePublicationRequest(
                 publication_id=f"tool-round:{round_id}",
                 kind="tool-round",
@@ -319,12 +327,12 @@ def test_session_store_conformance_structured_output_tool_round_auxiliary_public
                     {},
                 ),
                 transcript_messages=[
-                    Message.tool_result(
-                        tool_call_id=tool_call_id,
-                        tool_name=STRUCTURED_OUTPUT_TOOL_NAME,
-                        content=result_payload["content"],
-                        structured=result_payload["structured"],
-                        **round_identity,
+                    Message(
+                        role="tool",
+                        content=(
+                            *result_message.content,
+                            StructuredOutputPart(name=spec.name, output={"answer": "ok"}),
+                        ),
                     )
                 ],
                 events=[validating, validated],
@@ -333,6 +341,20 @@ def test_session_store_conformance_structured_output_tool_round_auxiliary_public
                 ],
             )
 
+            # Current-version valid auxiliary evidence requires its exact part.
+            # A missing display part cannot be accepted as a compatibility case.
+            with pytest.raises(
+                SessionRuntimePublicationConflict, match="Structured-output transcript evidence"
+            ):
+                await store.publish_runtime_publication(
+                    session_id,
+                    request=request.model_copy(update={"transcript_messages": (result_message,)}),
+                    expected_statuses={SessionStatus.PENDING},
+                    expected_run_epoch=created.run_epoch,
+                    expected_transcript_cursor=0,
+                )
+            assert await store.load_checkpoint(session_id) == source_checkpoint
+            assert await store.load_transcript(session_id) == []
             published = await store.publish_runtime_publication(
                 session_id,
                 request=request,

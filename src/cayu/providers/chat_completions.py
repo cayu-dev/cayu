@@ -28,6 +28,7 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
+    StructuredOutputPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -1892,6 +1893,7 @@ def _assistant_message(
             HostedToolCallPart,
             CitationPart,
             PeerContentPart,
+            StructuredOutputPart,
         }:
             raise ChatCompletionsProtocolError(
                 "Assistant messages can only contain portable assistant parts."
@@ -1994,6 +1996,7 @@ def _user_message(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart,
         ...,
     ],

@@ -918,7 +918,8 @@ class SessionExportCoordinator:
                     source.append(record.model_copy(deep=True))
                     if request.source_selection == "assistant_visible_text_v1":
                         if record.message.role != "assistant" or any(
-                            part.type not in {"text", "provider_state", "thinking"}
+                            part.type
+                            not in {"text", "provider_state", "thinking", "structured_output"}
                             for part in record.message.content
                         ):
                             raise SessionExportDenied()
@@ -941,7 +942,7 @@ class SessionExportCoordinator:
                         )
                     else:
                         if any(
-                            part.type not in {"text", "tool_result"}
+                            part.type not in {"text", "tool_result", "structured_output"}
                             for part in record.message.content
                         ):
                             raise SessionExportDenied()

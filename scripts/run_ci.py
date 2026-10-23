@@ -854,6 +854,17 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
     # dashboard package; its behavior tests need only Node's built-in runner.
     runner.run("Browser client tests", ("node", "--test", "tests/browser_client/*.test.mjs"))
     runner.run(
+        "Served browser client contract",
+        (
+            "uv",
+            "run",
+            "--no-sync",
+            "pytest",
+            "-q",
+            "tests/server/test_browser_client.py::test_served_browser_client_connects_to_real_contract",
+        ),
+    )
+    runner.run(
         "Packaged dashboard assets unchanged",
         """
 status="$(git status --porcelain -- src/cayu/server/dashboard)"

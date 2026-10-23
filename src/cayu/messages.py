@@ -20,6 +20,7 @@ from pydantic import (
 
 from cayu._validation import (
     DURABLE_DOCUMENT_LIMITS,
+    MAX_DURABLE_JSON_ENVELOPE_NESTING,
     MAX_SESSION_ID_BYTES,
     copy_durable_json_value,
     inspect_bounded_durable_json,
@@ -48,6 +49,26 @@ class TextPart(BaseModel):
     @classmethod
     def validate_text(cls, value: str) -> str:
         return _require_nonblank("text", value)
+
+
+class StructuredOutputPart(BaseModel):
+    """Validated answer retained for display, alongside its original model content."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["structured_output"] = "structured_output"
+    name: str | None
+    output: Any
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str | None) -> str | None:
+        return None if value is None else _require_nonblank("name", value)
+
+    @field_validator("output", mode="before")
+    @classmethod
+    def copy_output(cls, value: Any) -> Any:
+        return copy_durable_json_value(value, "output")
 
 
 class ToolCallPart(BaseModel):
@@ -511,6 +532,7 @@ class _ValidatedContent(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart,
         ...,
     ]
@@ -552,6 +574,7 @@ class Message(BaseModel):
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart,
         ...,
     ] = ()
@@ -579,16 +602,39 @@ class Message(BaseModel):
                 ThinkingPart,
                 HostedToolCallPart,
                 CitationPart,
+                StructuredOutputPart,
                 PeerContentPart,
             )
         elif self.role == MessageRole.TOOL:
-            _require_parts(self.role, self.content, ToolResultPart)
+            _require_parts(self.role, self.content, ToolResultPart, StructuredOutputPart)
+        # Display evidence adds an owned envelope around an independently
+        # bounded JSON value. Keep the old envelope bound for every other part.
+        has_structured_output = any(type(part) is StructuredOutputPart for part in self.content)
+        if has_structured_output:
+            inspect_bounded_durable_json(
+                self.model_copy(
+                    update={
+                        "content": tuple(
+                            part for part in self.content if type(part) is not StructuredOutputPart
+                        )
+                    }
+                ),
+                "transcript.message",
+                max_bytes=DURABLE_DOCUMENT_LIMITS.max_bytes,
+                max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
+                max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
+                canonical_numbers=False,
+                allow_models=True,
+                allow_tuples=True,
+            )
         inspect_bounded_durable_json(
             self,
             "transcript.message",
             max_bytes=DURABLE_DOCUMENT_LIMITS.max_bytes,
             max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
-            max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
+            max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING
+            if has_structured_output
+            else DURABLE_DOCUMENT_LIMITS.max_nesting,
             canonical_numbers=False,
             allow_models=True,
             allow_tuples=True,
@@ -620,6 +666,7 @@ class Message(BaseModel):
             | FilePart
             | HostedToolCallPart
             | CitationPart
+            | StructuredOutputPart
             | PeerContentPart
         ]
         if calls is not None:
@@ -678,6 +725,7 @@ class Message(BaseModel):
             | FilePart
             | HostedToolCallPart
             | CitationPart
+            | StructuredOutputPart
             | PeerContentPart
         ]
         if not isinstance(content, str):
@@ -731,6 +779,7 @@ def _require_parts(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | StructuredOutputPart
         | PeerContentPart
     ],
     *allowed_types: (
@@ -742,6 +791,7 @@ def _require_parts(
         | type[FilePart]
         | type[HostedToolCallPart]
         | type[CitationPart]
+        | type[StructuredOutputPart]
         | type[PeerContentPart]
     ),
 ) -> None:
@@ -768,6 +818,7 @@ _MESSAGE_PART_TYPES = (
     HostedToolCallPart,
     CitationPart,
     PeerContentPart,
+    StructuredOutputPart,
 )
 
 
@@ -812,6 +863,7 @@ def copy_message_part(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart,
 ) -> (
     TextPart
@@ -822,6 +874,7 @@ def copy_message_part(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | StructuredOutputPart
     | PeerContentPart
 ):
     """Return an owned copy of `part`.
@@ -861,3 +914,12 @@ def _require_complete_tool_round_identity(
             "Tool round identity requires tool_round_id, model_step_id, "
             "and model_attempt_id together."
         )
+
+
+def _without_structured_output_parts(message: Message) -> Message | None:
+    """Keep original provider history while omitting duplicate display evidence."""
+    copied = detach_message(message)
+    parts = tuple(part for part in copied.content if type(part) is not StructuredOutputPart)
+    if len(parts) == len(copied.content):
+        return copied
+    return Message(role=copied.role, content=parts) if parts else None

@@ -34,6 +34,10 @@ MAX_DURABLE_JSON_INTEGER = 2**63 - 1
 # though Cayu's durable stores can retain the wider signed-64-bit domain.
 MAX_PORTABLE_JSON_INTEGER = 2**53 - 1
 MAX_DURABLE_JSON_NESTING = 64
+# Typed transcript records add at most six owned containers around a JSON leaf:
+# terminal record, publication, messages, message, content, part. Payload limits
+# remain unchanged; only explicit internal envelope callers use this ceiling.
+MAX_DURABLE_JSON_ENVELOPE_NESTING = MAX_DURABLE_JSON_NESTING + 6
 # Session ids are admitted up to this many UTF-8 bytes; records that copy one use it.
 MAX_SESSION_ID_BYTES = 2048
 
@@ -939,8 +943,8 @@ def _walk_bounded_durable_json(
         raise ValueError("max_bytes must be a non-negative integer.")
     if type(max_nodes) is not int or max_nodes <= 0:
         raise ValueError("max_nodes must be a positive integer.")
-    if type(max_nesting) is not int or not 0 < max_nesting <= MAX_DURABLE_JSON_NESTING:
-        raise ValueError(f"max_nesting must be between 1 and {MAX_DURABLE_JSON_NESTING}.")
+    if type(max_nesting) is not int or not 0 < max_nesting <= MAX_DURABLE_JSON_ENVELOPE_NESTING:
+        raise ValueError(f"max_nesting must be between 1 and {MAX_DURABLE_JSON_ENVELOPE_NESTING}.")
     for ceiling in (max_object_entries, max_array_entries):
         if ceiling is not None and (type(ceiling) is not int or ceiling < 0):
             raise ValueError("Container entry limits must be non-negative integers.")
@@ -1511,6 +1515,7 @@ def canonical_durable_json_bytes(
     *,
     max_bytes: int | None = None,
     max_nodes: int | None = None,
+    max_nesting: int = MAX_DURABLE_JSON_NESTING,
 ) -> bytes:
     """Return one backend-stable canonical encoding of a durable JSON value.
 
@@ -1525,7 +1530,7 @@ def canonical_durable_json_bytes(
         field_name,
         max_bytes=(max_bytes if max_bytes is not None else DURABLE_DOCUMENT_LIMITS.max_bytes),
         max_nodes=(max_nodes if max_nodes is not None else DURABLE_DOCUMENT_LIMITS.max_nodes),
-        max_nesting=MAX_DURABLE_JSON_NESTING,
+        max_nesting=max_nesting,
         # An unbounded call keeps the document policy's plain number sizing.
         canonical_numbers=max_bytes is not None or max_nodes is not None,
     )

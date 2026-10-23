@@ -13,7 +13,7 @@ from cayu.events import Event, EventType
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
-from cayu.messages import ToolCallPart, ToolResultPart
+from cayu.messages import StructuredOutputPart, ToolCallPart, ToolResultPart
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
@@ -175,7 +175,10 @@ def capture_source(
                 )
                 for part in calls
             )
-            or any(not isinstance(part, ToolResultPart) for part in results)
+            # Every native caller verifies the entire transcript digest against
+            # the exact publication receipt before capture. Display evidence is
+            # bound by that digest, but is not another tool result identity.
+            or any(not isinstance(part, (ToolResultPart, StructuredOutputPart)) for part in results)
             or [
                 (part.tool_call_id, part.tool_name)
                 for part in results

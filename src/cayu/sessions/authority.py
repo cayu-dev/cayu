@@ -9,9 +9,12 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import (
+    DURABLE_DOCUMENT_LIMITS,
     MAX_DURABLE_JSON_INTEGER,
+    MAX_DURABLE_JSON_NESTING,
+    DurableJsonLimits,
     canonical_durable_json_bytes,
-    copy_durable_json_value,
+    copy_durable_record,
 )
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 
@@ -49,8 +52,10 @@ def _require_raw_sha256_digest(value: Any) -> None:
         raise ValueError
 
 
-def _canonical_runtime_publication_digest(value: Any) -> str:
-    encoded = canonical_durable_json_bytes(value, "runtime_publication")
+def _canonical_runtime_publication_digest(
+    value: Any, *, max_nesting: int = MAX_DURABLE_JSON_NESTING
+) -> str:
+    encoded = canonical_durable_json_bytes(value, "runtime_publication", max_nesting=max_nesting)
     return sha256(encoded).hexdigest()
 
 
@@ -176,12 +181,17 @@ def checkpoint_root_field_projection_from_storage(
     )
 
 
-def _runtime_publication_json_equal(left: Any, right: Any) -> bool:
+def _runtime_publication_json_equal(
+    left: Any, right: Any, *, max_nesting: int = MAX_DURABLE_JSON_NESTING
+) -> bool:
     """Compare validated JSON material under the durable canonicalization contract."""
 
+    limits = DurableJsonLimits(
+        DURABLE_DOCUMENT_LIMITS.max_bytes, DURABLE_DOCUMENT_LIMITS.max_nodes, max_nesting
+    )
     return _validated_runtime_publication_json_equal(
-        copy_durable_json_value(left, "runtime_publication"),
-        copy_durable_json_value(right, "runtime_publication"),
+        copy_durable_record(left, "runtime_publication", limits=limits),
+        copy_durable_record(right, "runtime_publication", limits=limits),
     )
 
 

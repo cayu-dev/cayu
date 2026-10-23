@@ -30,6 +30,7 @@ from cayu._validation import (
 )
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.events import Event, EventType, copy_event
+from cayu.messages import Message, StructuredOutputPart
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
@@ -614,6 +615,17 @@ def _build_tool_round_publication_request(
     )
     if len(tool_result_messages) != 1:
         raise AssertionError("Tool-round transcript construction must return one message.")
+    spec = copied_pending_round.structured_output
+    validation = copied_pending_round.structured_output_validation
+    if spec is not None and validation is not None and validation.valid:
+        result_message = tool_result_messages[0]
+        tool_result_messages[0] = Message(
+            role=result_message.role,
+            content=(
+                *result_message.content,
+                StructuredOutputPart(name=spec.name, output=validation.output),
+            ),
+        )
     transcript_messages = tuple(tool_result_messages)
     if copied_pending_round.assistant_message_state == "quarantined":
         projected_assistant = transcript_support.assistant_message_with_projected_tool_arguments(

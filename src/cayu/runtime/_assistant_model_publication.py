@@ -10,7 +10,9 @@ from cayu._validation import copy_durable_record
 from cayu.budgets._run_limit_accounting import RunLimitAccountingContext
 from cayu.budgets.base import BudgetLimit
 from cayu.budgets.run_limits import RunLimits
-from cayu.context.structured_output import StructuredOutputSpec
+from cayu.context.structured_output import (
+    StructuredOutputSpec,
+)
 from cayu.context.thinking import ThinkingConfig
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -79,7 +81,7 @@ class AssistantModelPublication:
         if publication.dispatch.stage.session_id != session.id:
             raise RuntimeError("Model completion publication belongs to a different session.")
         assistant_step_result = publication.assistant_step_result
-        assistant_message = publication.authoritative_assistant_message
+        assistant_message = publication.transcript_assistant_message()
         tool_calls = (
             assistant_step_result.tool_calls
             if assistant_message is not None and assistant_step_result is not None

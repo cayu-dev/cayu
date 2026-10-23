@@ -19,6 +19,7 @@ from cayu.vaults import SecretRedactor
 
 _MESSAGE_ROOT_STRUCTURE_KEYS = frozenset({"content", "role"})
 _MESSAGE_PART_STRUCTURE_KEYS = {
+    "structured_output": frozenset({"type", "name", "output"}),
     "text": frozenset({"text", "type"}),
     "tool_call": frozenset(
         {
@@ -93,6 +94,7 @@ _MESSAGE_PART_STRUCTURE_KEYS = {
     ),
 }
 _MESSAGE_PART_UNTRUSTED_CONTAINERS = {
+    "structured_output": frozenset({"output"}),
     "tool_call": frozenset({"arguments"}),
     "tool_result": frozenset({"artifacts", "structured"}),
     "provider_state": frozenset({"state"}),
