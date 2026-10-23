@@ -689,6 +689,10 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    126: (
+        "ALTER TABLE cayu_task_interrupted_continuation_claims "
+        'ADD COLUMN IF NOT EXISTS expected_sha256 TEXT COLLATE "C"',
+    ),
     125: (
         """CREATE TABLE IF NOT EXISTS cayu_store_identity (
         singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),

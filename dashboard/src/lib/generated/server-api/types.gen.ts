@@ -10336,14 +10336,16 @@ export type InboxPage = {
  *
  * A person's decision on one inbox item.
  *
- * ``approve`` and ``deny`` settle an approval, with an optional ``reason``.
+ * ``approve`` and ``deny`` settle an approval. Every decision accepts an optional
+ * durable ``reason``.
  * ``approve`` can carry the changed ``arguments`` the tool runs with, or an
  * ``approval_revision`` naming an edit the application stored itself.
  * ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
  * proposal. ``review_reference`` is required when the application configures
  * a human-review policy; read it from ``GET /api/sessions/{id}/human-review``.
- * Worker-owned approvals and questions require the same ``task_worker_id`` and
- * ``task_handoff_id`` continuation authority as the ordinary resolve routes.
+ * Task-linked approvals and questions require ordinary worker/handoff authority,
+ * or explicit ``task_continuation="claim"`` to acquire a new workerless handoff.
+ * Controlled claims never borrow an active worker's authority.
  */
 export type InboxSettleRequest = {
     /**
@@ -10366,6 +10368,10 @@ export type InboxSettleRequest = {
      */
     reason?: string | null;
     review_reference?: HumanReviewReference | null;
+    /**
+     * Task Continuation
+     */
+    task_continuation?: 'claim' | null;
     /**
      * Task Handoff Id
      */
@@ -10408,6 +10414,10 @@ export type InboxSettlement = {
      * Decision
      */
     decision: 'approve' | 'deny' | 'expire' | 'answer' | 'recover' | 'keep' | 'drop';
+    /**
+     * Reason
+     */
+    reason?: string | null;
 };
 
 /**
@@ -17154,6 +17164,7 @@ export type SessionOverviewCost = {
  * SessionOverviewCountsResponse
  */
 export type SessionOverviewCountsResponse = {
+    cost: SessionOverviewCost | null;
     /**
      * Counts By State
      */
@@ -17172,6 +17183,11 @@ export type SessionOverviewCountsResponse = {
      * Since
      */
     since: string;
+    tokens: SessionOverviewTokens;
+    /**
+     * Tokens Complete
+     */
+    tokens_complete: boolean;
     /**
      * Total Count
      */
@@ -23610,6 +23626,10 @@ export type ListInboxApiInboxGetData = {
          * Kind
          */
         kind?: 'approval' | 'question' | 'recovery' | 'knowledge' | null;
+        /**
+         * Q
+         */
+        q?: string | null;
     };
     url: '/api/inbox';
 };
@@ -23652,6 +23672,10 @@ export type InboxCountsApiInboxCountsGetData = {
          * Agent Name
          */
         agent_name?: string | null;
+        /**
+         * Q
+         */
+        q?: string | null;
     };
     url: '/api/inbox/counts';
 };

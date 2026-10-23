@@ -87,10 +87,11 @@ class _BlockingApprovalContinuationProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-@pytest.mark.parametrize("dynamic_scope", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize("scope", ["static", "dynamic", "unknown"])
 def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp(
-    dynamic_scope: bool,
+    scope: str,
 ):
+    dynamic_scope = scope != "static"
     # Manual recovery for a pure call retains actor/expiry attribution. External
     # calls instead require the registered receipt reconciliation protocol.
     clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
@@ -117,7 +118,7 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp(
     )
     app = CayuApp(session_store=store, clock=lambda: clock["now"])
     app.register_provider(provider, default=True)
-    if dynamic_scope:
+    if scope == "dynamic":
         app.register_environment(
             Environment(
                 EnvironmentSpec(name="dynamic"),
@@ -146,6 +147,10 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp(
             if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval_id = approval_event.payload["approval"]["approval_id"]
+        if scope == "unknown":
+            checkpoint = await store.load_checkpoint("sess_recovery_actor")
+            checkpoint["pending_tool_approval"]["secret_resolution_scope"] = "unknown"
+            await store.checkpoint("sess_recovery_actor", checkpoint)
 
         # In-window approve crashes when the terminal tool event fails to
         # persist; the stream ends interrupted and recovery is required.
@@ -186,6 +191,7 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp(
     resumed = next(event for event in recovery_events if event.type == EventType.SESSION_RESUMED)
     assert resumed.payload["resolved_by"]["subject"] == "reviewer@example.com"
     assert resumed.payload["expired"] is True
+    assert resumed.payload["reason"] == (None if dynamic_scope else recovery_message)
     recovered = next(
         event
         for event in recovery_events

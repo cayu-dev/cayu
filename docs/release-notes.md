@@ -7,11 +7,14 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 protocol 7 and refuses an image built from an earlier release at readiness.
 
 Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
-confirm revision 125. Revision 125 is additive: it adds the `cayu_store_identity`
-table that Cayu Cloud reporting needs. The compatibility floor stays 124, so this
-build still starts on a revision 124 store, but until the store is migrated
-`GET {api}/cloud/contract` returns `store_id: null` and `GET {api}/cloud/v1/activity`
-answers 501. Server contract 49 and manifest schema 17 are unchanged.
+confirm revision 126. Task adapters require revision 126: bound continuation
+claims now persist their expected attachment and selected-operation digest in the
+existing claim registry. The compatibility floor is 126; stop older workers before
+migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
+store identity. Server contract 56 adds exact daily accounting to overview counts,
+public-projection Inbox search, durable decision reasons, and explicit controlled
+continuation claims. Regenerate API clients and use the matching browser client
+and dashboard assets. Manifest schema 17 is unchanged.
 
 Upgrade: brokered coding sandbox images now need `git`, or their factory must
 set `git_baseline=False`. Direct binding users must also check the workspace

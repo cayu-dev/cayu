@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from cayu.tasks._group_maintenance import TaskGroupMaintenance
+    from cayu.tasks.continuation_claims import TaskContinuationExpectation
     from cayu.tasks.graphs import (
         TaskGraphCreate,
         TaskGraphCreationReceipt,
@@ -243,6 +244,7 @@ class TaskStore(ABC):
     supports_attached_task_recovery_terminalization: ClassVar[bool] = False
     supports_interrupted_task_handoffs: ClassVar[bool] = False
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = False
+    supports_bound_interrupted_task_handoffs: ClassVar[bool] = False
     supports_task_cancellation_reconciliation: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
@@ -1144,6 +1146,7 @@ class TaskStore(ABC):
         *,
         handoff_id: str,
         task_id: str | None = None,
+        expected: TaskContinuationExpectation | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
@@ -1159,7 +1162,13 @@ class TaskStore(ABC):
         one-use handoff generation names a fully validated committed receipt and
         that have no live worker lease. Generation consumption and lease publication
         are one atomic mutation so competing recovery owners cannot invoke the same
-        continuation concurrently. ``after`` and ``scan_limit`` bound a stable
+        continuation concurrently. Stores advertising
+        ``supports_bound_interrupted_task_handoffs`` also accept ``expected``:
+        they atomically match its task/session/incarnation/prior generation before
+        claiming and persist its complete digest with the claim. Every replay must
+        provide the identical expectation, including its selected-operation digest.
+        This binding does not replace runtime pause admission.
+        ``after`` and ``scan_limit`` bound a stable
         creation-order scan. The result advances past rejected authority without
         allowing one malformed candidate to block later independent work.
         """

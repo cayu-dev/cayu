@@ -36,6 +36,7 @@ from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeEvidence,
     KnowledgeEvidenceResult,
     KnowledgeRevisionConflict,
     KnowledgeStatus,
@@ -46,6 +47,12 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
 )
 from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
+from cayu.storage._knowledge_rejection import (
+    KnowledgeRejectionDecision,
+    KnowledgeReviewRejection,
+    load_review_rejection,
+    reject_reviewed,
+)
 
 _KNOWLEDGE_REVIEW_STORE_METHODS = (
     "approve_pending_entry",
@@ -139,6 +146,17 @@ class _KnowledgeReviewStore(Protocol):
         *,
         access_scope: KnowledgeAccessScope,
     ) -> KnowledgePublicationReceipt | None: ...
+
+    async def publish_entry_revision(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        evidence: list[KnowledgeEvidence] | None = None,
+        access_scope: KnowledgeAccessScope,
+        operation_id: str,
+        expected_revision: int | None = None,
+    ) -> KnowledgePublicationReceipt: ...
 
     async def list_entries(
         self,
@@ -396,6 +414,40 @@ class KnowledgeReviewWorkflow:
         if durable_receipt != returned_receipt or expected_approval.entry != approval.entry:
             raise KnowledgeActivationConflict("operation_mismatch")
         return approval
+
+    async def reject_reviewed(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        operation_id: str,
+        reviewer_identity: str,
+        reviewer_version: str,
+        reason: str | None = None,
+        annotations: dict[str, object] | None = None,
+    ) -> KnowledgeReviewRejection:
+        """Archive one exact pending proposal with atomically bound review evidence.
+
+        Uses the same bounded source-material limits as reviewed approval and
+        preserves chunks/evidence through their ordinary revision-copy owner.
+        """
+        decision = KnowledgeRejectionDecision(
+            reviewer_identity=reviewer_identity,
+            reviewer_version=reviewer_version,
+            reason=reason,
+            annotations={} if annotations is None else annotations,
+        )
+        return await reject_reviewed(self, entry_id, expected_revision, operation_id, decision)
+
+    async def load_review_rejection(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        operation_id: str,
+    ) -> KnowledgeReviewRejection | None:
+        """Read only rejection annotations authenticated by exact publication evidence."""
+        return await load_review_rejection(self, entry_id, expected_revision, operation_id)
 
     async def reject(
         self,

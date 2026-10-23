@@ -125,8 +125,24 @@ class AmbiguousUserInputSupersessionIntent(BaseModel):
         return require_durable_clean_nonblank(value, info.field_name)
 
 
+USER_INPUT_DECISION_REASON_KEY = "cayu.user_input.decision_reason"
+
+
+def user_input_decision_reason(metadata: dict[str, Any]) -> str | None:
+    """The optional audit rationale, bound by the existing answer/recovery digest."""
+    value = metadata.get(USER_INPUT_DECISION_REASON_KEY)
+    if value is None:
+        return None
+    if type(value) is not str or len(value) > 4096:
+        raise ValueError("User-input decision reason must be a string of at most 4096 characters.")
+    return require_durable_nonblank(value, "user_input.decision_reason")
+
+
 class UserInputResponse(BaseModel):
     """Caller-supplied answer that resumes a session paused by ``ask_user``.
+
+    ``metadata["cayu.user_input.decision_reason"]`` optionally records a bounded
+    audit rationale. Preserve it when recovering the same accepted answer.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``,
     which means "inherit the original run's configuration" as persisted on the pending
@@ -190,7 +206,9 @@ class UserInputResponse(BaseModel):
     @classmethod
     def copy_json_fields(cls, value, info):
         if info.field_name == "metadata":
-            return copy_durable_metadata(value)
+            copied = copy_durable_metadata(value)
+            user_input_decision_reason(copied)
+            return copied
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
@@ -1043,7 +1061,9 @@ class UserInputRecoveryRequest(BaseModel):
     @classmethod
     def copy_json_fields(cls, value, info):
         if info.field_name == "metadata":
-            return copy_durable_metadata(value)
+            copied = copy_durable_metadata(value)
+            user_input_decision_reason(copied)
+            return copied
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output")

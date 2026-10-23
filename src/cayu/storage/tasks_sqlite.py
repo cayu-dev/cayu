@@ -12,6 +12,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 from uuid import uuid4
 
 from cayu._resource_store_surface import model_store_surface
+from cayu.tasks.continuation_claims import (
+    TaskContinuationExpectation,
+    prepare_continuation_expectation,
+    require_expected_continuation,
+)
 
 if TYPE_CHECKING:
     from cayu.tasks.groups import (
@@ -363,7 +368,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 124
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 126
 
 
 @model_store_surface("tasks")
@@ -475,6 +480,7 @@ class SQLiteTaskStore(TaskStore):
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -5247,6 +5253,7 @@ class SQLiteTaskStore(TaskStore):
         *,
         handoff_id: str,
         task_id: str | None = None,
+        expected: TaskContinuationExpectation | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
@@ -5256,6 +5263,7 @@ class SQLiteTaskStore(TaskStore):
         if task_id is not None:
             task_id = require_clean_nonblank(task_id, "task_id")
         handoff_id_sha256 = _interrupted_task_continuation_handoff_id_sha256(handoff_id)
+        expected, expected_sha256 = prepare_continuation_expectation(expected, task_id=task_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
@@ -5269,7 +5277,7 @@ class SQLiteTaskStore(TaskStore):
                 now = self._ownership_clock()
                 lease_expires_at = now + timedelta(seconds=lease_seconds)
                 prior_claim_row = self._connection.execute(
-                    "SELECT task_id, worker_id "
+                    "SELECT task_id, worker_id, expected_sha256 "
                     "FROM cayu_task_interrupted_continuation_claims "
                     "WHERE handoff_id_sha256 = ?",
                     (handoff_id_sha256,),
@@ -5284,6 +5292,7 @@ class SQLiteTaskStore(TaskStore):
                     )
                     if (
                         prior_claim_row["worker_id"] != worker_id
+                        or prior_claim_row["expected_sha256"] != expected_sha256
                         or existing is None
                         or existing.interrupted_handoff_id != handoff_id
                         or existing.worker_id != worker_id
@@ -5364,6 +5373,7 @@ class SQLiteTaskStore(TaskStore):
                     if not self._concurrency_key_available_unlocked(observed, now):
                         filtered += 1
                         continue
+                    require_expected_continuation(observed, expected)
                     candidate_handoff_id = observed.interrupted_handoff_id
                     if candidate_handoff_id is None:
                         raise AssertionError("Continuation candidate lost its handoff generation.")
@@ -5399,13 +5409,14 @@ class SQLiteTaskStore(TaskStore):
                         continue
                     self._connection.execute(
                         "INSERT INTO cayu_task_interrupted_continuation_claims ("
-                        "handoff_id_sha256, task_id, worker_id, claimed_at"
-                        ") VALUES (?, ?, ?, ?)",
+                        "handoff_id_sha256, task_id, worker_id, claimed_at, expected_sha256"
+                        ") VALUES (?, ?, ?, ?, ?)",
                         (
                             handoff_id_sha256,
                             observed.id,
                             worker_id,
                             sqlite_records.format_datetime(now),
+                            expected_sha256,
                         ),
                     )
                     update_cursor = self._connection.execute(

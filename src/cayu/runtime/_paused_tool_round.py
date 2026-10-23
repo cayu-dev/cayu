@@ -12,7 +12,6 @@ from cayu.budgets.base import BudgetLimit
 from cayu.events import Event, EventType
 from cayu.execution_profiles import ExecutionProfileIdentity
 from cayu.execution_units import ToolRoundIdentity
-from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
@@ -257,8 +256,7 @@ class PausedToolRound:
         policy_evidence: ToolPolicyEvidence,
         requested_decision: ToolApprovalDecision | None = None,
         resolved_by_payload: dict[str, Any] | None = None,
-        resolution_reason: str | None = None,
-        resolution_metadata: dict[str, Any] | None = None,
+        public_resolution_audit: dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         """Close a call that lacks positive policy authority without dispatch."""
         approval_id = self.pause.approval_id if isinstance(self.pause, ApprovalRoundPause) else None
@@ -327,12 +325,12 @@ class PausedToolRound:
         if approval_id is not None:
             if requested_decision is not None:
                 evidence_payload["requested_decision"] = requested_decision.value
-                evidence_payload["resolution_reason"] = resolution_reason
+                # The coordinator owns scope gating, redaction, and bounding. Preserve
+                # its complete projection, including evidence that metadata was truncated.
+                audit = public_resolution_audit or {"reason": None, "metadata": {}}
+                evidence_payload["resolution_reason"] = audit["reason"]
                 evidence_payload.update(
-                    approval_support.bounded_resolution_metadata_payload(
-                        {} if resolution_metadata is None else resolution_metadata,
-                        redactor=self.secret_redactor,
-                    )
+                    {key: value for key, value in audit.items() if key != "reason"}
                 )
             evidence_payload["resolved_by"] = resolved_by_payload
 

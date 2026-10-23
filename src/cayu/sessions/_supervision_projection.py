@@ -706,6 +706,7 @@ async def _resumed_record(
         tool_call_ids=_distinct([_text(payload, "tool_call_id")]),
         input_id=input_id,
         actor=payload.get("resolved_by"),
+        reason=payload.get("reason"),
         requested_at=request.event.timestamp if request is not None else None,
         release_position=request.sequence if request is not None else None,
         attention_state="resolved",

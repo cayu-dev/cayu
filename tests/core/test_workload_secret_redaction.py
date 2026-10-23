@@ -3261,6 +3261,12 @@ def test_approval_denial_schema_keys_do_not_block_model_continuation(secret: str
     resumed = asyncio.run(scenario())
 
     assert resumed[-1].type is EventType.SESSION_COMPLETED
+    assert (
+        next(event for event in resumed if event.type is EventType.SESSION_RESUMED).payload[
+            "reason"
+        ]
+        == "operator denied execution"
+    )
     assert len(provider.requests) == 2
     denial_message = provider.requests[1].messages[-1]
     assert denial_message.role is MessageRole.TOOL

@@ -26,15 +26,18 @@ from cayu.approvals.review import HumanReviewDenied
 from cayu.approvals.revisions import approval_revision_metadata
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import (
+    USER_INPUT_DECISION_REASON_KEY,
     UserInputResponse,
     user_input_lifecycle_authority_from_checkpoint,
     user_input_resolution_request_digest,
 )
 from cayu.events import EventType
 from cayu.knowledge.activation_contracts import KnowledgeActivationConflict
+from cayu.knowledge.publication_contracts import KnowledgePublicationConflict
 from cayu.knowledge.records import KnowledgeRevisionConflict, KnowledgeStatus
 from cayu.knowledge.search import decode_knowledge_list_cursor, encode_knowledge_list_cursor
 from cayu.runtime._approval_support import approval_resolution_request_digest
+from cayu.runtime._inbox_continuation import controlled_inbox_continuation
 from cayu.runtime.human_attention import (
     AttentionKind,
     HumanAttentionReference,
@@ -281,15 +284,15 @@ def _unfilter_cursor(cursor: str, filters: list[str | None]) -> str:
     )
 
 
-def _knowledge_operation_id(locator: _KnowledgeLocator) -> str:
+def _knowledge_operation_id(locator: _KnowledgeLocator, decision: str = "keep") -> str:
     """One reviewed approval per exact proposal revision, so a retry replays it."""
 
     digest = hashlib.sha256(
-        json.dumps(["cayu.inbox.knowledge-keep.v1", locator.entry_id, locator.revision]).encode(
-            "utf-8"
-        )
+        json.dumps(
+            [f"cayu.inbox.knowledge-{decision}.v1", locator.entry_id, locator.revision]
+        ).encode("utf-8")
     ).hexdigest()
-    return f"cayu-inbox-keep-{digest}"
+    return f"cayu-inbox-{decision}-{digest}"
 
 
 def _decider(value: object) -> InboxDecider | None:
@@ -372,6 +375,26 @@ def _knowledge_item(entry: KnowledgeEntry, cayu_app: Any) -> InboxItem:
         knowledge=InboxKnowledgeEntry(entry_id=entry.id, revision=entry.revision, kind=entry.kind),
         decisions=list(INBOX_DECISIONS["knowledge"]),
     )
+
+
+def _inbox_item_matches_query(item: InboxItem, q: str | None) -> bool:
+    """Match only the redacted public projection, never quarantined source fields."""
+    if q is None:
+        return True
+    values = [
+        item.kind,
+        item.session_id,
+        item.agent_name,
+        item.title,
+        item.detail,
+        item.tool_name,
+        item.question,
+        *item.options,
+    ]
+    if item.knowledge is not None:
+        values.extend((item.knowledge.entry_id, item.knowledge.kind))
+    folded_query = q.casefold()
+    return any(value is not None and folded_query in value.casefold() for value in values)
 
 
 def _listed_kind(action: PendingActionRecord) -> InboxItemKind | None:
@@ -564,6 +587,9 @@ def register_inbox_routes(
                         decision=decision,
                         decided_by=_decider(cayu_app.redact_json(payload.get("resolved_by"))),
                         decided_at=record.event.timestamp,
+                        reason=cayu_app.redact_json(payload.get("reason"))
+                        if type(payload.get("reason")) is str
+                        else None,
                     )
             if len(records) < _CLAIM_SCAN_PAGE:
                 return None
@@ -679,6 +705,9 @@ def register_inbox_routes(
                 task_handoff_id=body.task_handoff_id,
                 input_id=reference.action_id,
                 answer=body.answer,
+                metadata={}
+                if body.reason is None
+                else {USER_INPUT_DECISION_REASON_KEY: body.reason},
                 resolved_by=actor,
                 loop_policies=loop_policies,
             )
@@ -753,7 +782,9 @@ def register_inbox_routes(
         if item.pending is None:
             return await settled_answer(item, request)
         stream = (
-            cayu_app.resolve_tool_approval(request)
+            controlled_inbox_continuation(cayu_app, request, item.reference)
+            if body.task_continuation == "claim"
+            else cayu_app.resolve_tool_approval(request)
             if isinstance(request, ToolApprovalRequest)
             else cayu_app.resolve_user_input(request)
         )
@@ -823,8 +854,8 @@ def register_inbox_routes(
             if current is not None and current.revision == locator.revision:
                 return _pending_state(_knowledge_item(current, cayu_app)), proposal
             return InboxItemState(id=item_id, kind="knowledge", status="unavailable"), proposal
-        # Keeping or dropping a proposal appends a revision that changes only its
-        # status; any other successor replaced the proposal before it was decided.
+        # Ordinary decisions preserve proposal content. Reviewed drops additionally
+        # carry annotations authenticated by the exact atomic publication receipt.
         lifecycle_only = _proposal_content(successor) == _proposal_content(proposal)
         if lifecycle_only and successor.status is KnowledgeStatus.ACTIVE:
             receipt = await workflow.load_review_approval(_knowledge_operation_id(locator))
@@ -842,10 +873,34 @@ def register_inbox_routes(
                     else _knowledge_decider(decision.annotations, decision.policy_identity)
                 ),
                 decided_at=successor.updated_at,
+                reason=None
+                if decision is None or type(decision.annotations.get("reason")) is not str
+                else cayu_app.redact_json(decision.annotations["reason"]),
             )
-        elif lifecycle_only and successor.status is KnowledgeStatus.ARCHIVED:
-            # The knowledge store records no reviewer for a drop.
-            settlement = InboxSettlement(decision="drop", decided_at=successor.updated_at)
+        elif successor.status is KnowledgeStatus.ARCHIVED:
+            try:
+                reviewed = await workflow.load_review_rejection(
+                    locator.entry_id,
+                    expected_revision=locator.revision,
+                    operation_id=_knowledge_operation_id(locator, "drop"),
+                )
+            except PermissionError:
+                return None
+            except (KnowledgePublicationConflict, TypeError, ValueError):
+                return InboxItemState(id=item_id, kind="knowledge", status="unavailable"), proposal
+            if reviewed is not None:
+                settlement = InboxSettlement(
+                    decision="drop",
+                    decided_at=reviewed.receipt.committed_at,
+                    decided_by=_knowledge_decider(
+                        reviewed.decision.annotations, reviewed.decision.reviewer_identity
+                    ),
+                    reason=cayu_app.redact_json(reviewed.decision.reason),
+                )
+            elif lifecycle_only:
+                settlement = InboxSettlement(decision="drop", decided_at=successor.updated_at)
+            else:
+                return InboxItemState(id=item_id, kind="knowledge", status="superseded"), proposal
         elif successor.status is KnowledgeStatus.DELETED:
             return InboxItemState(id=item_id, kind="knowledge", status="unavailable"), proposal
         else:
@@ -871,13 +926,11 @@ def register_inbox_routes(
             settled is not None and settled.decision != body.decision
         ):
             raise _state_conflict(state)
-        if body.decision == "drop" and settled is not None:
-            # The knowledge store records no reviewer for a drop, so a repeated
-            # drop answers with the settlement it already has.
-            return InboxSettleResponse(replayed=True, item=state)
         try:
+            identity, annotations = _knowledge_reviewer_attribution(auth_context)
             if body.decision == "keep":
-                identity, annotations = _knowledge_reviewer_attribution(auth_context)
+                if body.reason is not None:
+                    annotations["reason"] = cayu_app.redact_json(body.reason)
                 # A repeated keep by the same reviewer replays the recorded approval.
                 await workflow.approve(
                     locator.entry_id,
@@ -888,10 +941,27 @@ def register_inbox_routes(
                     expected_revision=locator.revision,
                 )
             else:
-                await workflow.reject(locator.entry_id, expected_revision=locator.revision)
+                await workflow.reject_reviewed(
+                    locator.entry_id,
+                    expected_revision=locator.revision,
+                    operation_id=_knowledge_operation_id(locator, "drop"),
+                    reviewer_identity=identity,
+                    reviewer_version=_KNOWLEDGE_REVIEWER_VERSION,
+                    reason=cayu_app.redact_json(body.reason),
+                    annotations=annotations,
+                )
         except (KeyError, PermissionError):
             raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
-        except (KnowledgeActivationConflict, KnowledgeRevisionConflict, ValueError) as exc:
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=501, detail="Audited knowledge decisions are unsupported by this store."
+            ) from None
+        except (
+            KnowledgeActivationConflict,
+            KnowledgePublicationConflict,
+            KnowledgeRevisionConflict,
+            ValueError,
+        ) as exc:
             current = await knowledge_item_state(workflow, locator)
             if current is None:
                 raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
@@ -918,6 +988,7 @@ def register_inbox_routes(
         limit: int,
         query: PendingActionQuery,
         filters: list[str | None],
+        q: str | None,
     ) -> tuple[list[InboxItem], list[InboxIssue], str | None]:
         """One page of session items: items, issues, and the cursor that continues
         them, ``None`` once the page ended the session items.
@@ -959,7 +1030,11 @@ def register_inbox_routes(
                     )
                 else:
                     next_cursor = None
-                return items, [], next_cursor
+                return (
+                    [item for item in items if _inbox_item_matches_query(item, q)],
+                    [],
+                    next_cursor,
+                )
             page = await session_store.query_pending_actions(
                 query.model_copy(update={"cursor": after, "limit": limit})
             )
@@ -996,7 +1071,7 @@ def register_inbox_routes(
             if page.has_more and page.next_cursor is not None
             else None
         )
-        return items, issues, next_cursor
+        return [item for item in items if _inbox_item_matches_query(item, q)], issues, next_cursor
 
     async def knowledge_items(
         auth_context: AuthContext | None,
@@ -1004,6 +1079,7 @@ def register_inbox_routes(
         after: str | None = None,
         sealed: bool = False,
         filters: list[str | None] | None = None,
+        q: str | None = None,
     ) -> tuple[list[InboxItem], str | None]:
         """Scan bounded store pages, continuing after hidden positions too.
 
@@ -1017,7 +1093,7 @@ def register_inbox_routes(
         limited = inbox_gate.applies(auth_context)
         binding = {
             **principal(auth_context),
-            "filters": filters or [None, None, None],
+            "filters": filters or [None, None, None, None],
             "query": {
                 "status": "pending",
                 "namespace": workflow.namespace,
@@ -1050,7 +1126,9 @@ def register_inbox_routes(
                 entry = listed_entry.entry
                 position = encode_knowledge_list_cursor(entry)
                 if await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(entry)):
-                    items.append(_knowledge_item(entry, cayu_app))
+                    item = _knowledge_item(entry, cayu_app)
+                    if _inbox_item_matches_query(item, q):
+                        items.append(item)
                 if len(items) == limit:
                     more = more or index + 1 < len(listed.entries)
                     return items, continuation(position) if more else None
@@ -1116,10 +1194,11 @@ def register_inbox_routes(
         session_id: Annotated[str | None, Query(max_length=4096)] = None,
         agent_name: Annotated[str | None, Query(max_length=4096)] = None,
         kind: InboxItemKind | None = None,
+        q: Annotated[str | None, Query(max_length=4096)] = None,
         auth_context: AuthContext | None = inbox_auth_context,
     ) -> InboxPage:
         response.headers.update(_NO_STORE)
-        return await inbox_page(auth_context, limit, cursor, session_id, agent_name, kind)
+        return await inbox_page(auth_context, limit, cursor, session_id, agent_name, kind, q)
 
     async def inbox_page(
         auth_context: AuthContext | None,
@@ -1128,10 +1207,12 @@ def register_inbox_routes(
         session_id: str | None,
         agent_name: str | None,
         kind: InboxItemKind | None,
+        q: str | None,
     ) -> InboxPage:
         public_session = _clean_optional_query_value(session_id, "session_id")
         agent_name = _clean_optional_query_value(agent_name, "agent_name")
-        filters = [public_session, agent_name, kind]
+        q = _clean_optional_query_value(q, "q")
+        filters = [public_session, agent_name, kind, q]
         phase, after, sealed = (
             ("actions", None, False)
             if cursor is None
@@ -1161,7 +1242,9 @@ def register_inbox_routes(
         if phase == "knowledge":
             if not knowledge:
                 return InboxPage(items=[], next_cursor=None, has_more=False)
-            items, next_cursor = await knowledge_items(auth_context, limit, after, sealed, filters)
+            items, next_cursor = await knowledge_items(
+                auth_context, limit, after, sealed, filters, q
+            )
             return InboxPage(
                 items=items,
                 next_cursor=_filtered_cursor(next_cursor, filters),
@@ -1171,13 +1254,15 @@ def register_inbox_routes(
             items, issues, next_cursor = [], [], None
         else:
             items, issues, next_cursor = await session_items(
-                auth_context, after, sealed, limit, query, filters
+                auth_context, after, sealed, limit, query, filters, q
             )
         if next_cursor is None and knowledge:
             if items:
                 next_cursor = _encode_cursor("knowledge", None)
             else:
-                proposals, next_cursor = await knowledge_items(auth_context, limit, filters=filters)
+                proposals, next_cursor = await knowledge_items(
+                    auth_context, limit, filters=filters, q=q
+                )
                 items.extend(proposals)
         return InboxPage(
             items=items,
@@ -1200,17 +1285,19 @@ def register_inbox_routes(
         response: Response,
         session_id: Annotated[str | None, Query(max_length=4096)] = None,
         agent_name: Annotated[str | None, Query(max_length=4096)] = None,
+        q: Annotated[str | None, Query(max_length=4096)] = None,
         auth_context: AuthContext | None = inbox_auth_context,
     ) -> InboxCounts:
         response.headers.update(_NO_STORE)
         session_id = _clean_optional_query_value(session_id, "session_id")
         agent_name = _clean_optional_query_value(agent_name, "agent_name")
+        q = _clean_optional_query_value(q, "q")
         if inbox_gate.applies(auth_context):
             return InboxCounts.unavailable("access_limited")
 
         async def read_page(cursor: str | None) -> InboxPage:
             return await inbox_page(
-                auth_context, _PENDING_SCAN_LIMIT, cursor, session_id, agent_name, None
+                auth_context, _PENDING_SCAN_LIMIT, cursor, session_id, agent_name, None, q
             )
 
         return await count_inbox(read_page)

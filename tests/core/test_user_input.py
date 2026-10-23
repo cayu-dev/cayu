@@ -3060,10 +3060,11 @@ def test_recover_user_input_rejects_secret_structured_output_before_transition()
     assert len(provider.requests) == 1
 
 
-@pytest.mark.parametrize("dynamic_scope", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize("scope", ["static", "dynamic", "unknown"])
 def test_recover_user_input_supplies_outcome_and_completes(
-    dynamic_scope: bool,
+    scope: str,
 ) -> None:
+    dynamic_scope = scope != "static"
     # After a crashed sibling leaves the round on manual_recovery_required, recover_user_input
     # supplies the missing outcome; the round finishes without re-running the sibling, and the
     # re-supplied answer is injected as the ask_user result (it was unrecorded before the crash).
@@ -3093,7 +3094,7 @@ def test_recover_user_input_supplies_outcome_and_completes(
         final_text="all done",
     )
     app.register_provider(provider, default=True)
-    if dynamic_scope:
+    if scope == "dynamic":
         app.register_environment(
             Environment(
                 EnvironmentSpec(name="dynamic"),
@@ -3113,6 +3114,16 @@ def test_recover_user_input_supplies_outcome_and_completes(
             ),
         )
     )
+    if scope == "unknown":
+
+        async def withhold_scope():
+            checkpoint = await store.load_checkpoint(session_id)
+            checkpoint["pending_user_input"]["assistant_publication"]["secret_resolution_scope"] = (
+                "unknown"
+            )
+            await store.checkpoint(session_id, checkpoint)
+
+        asyncio.run(withhold_scope())
     awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
     input_id = awaiting.payload["input_id"]
     private_input_id = asyncio.run(private_event_for_public_event(store, awaiting)).payload[
@@ -3137,7 +3148,10 @@ def test_recover_user_input_supplies_outcome_and_completes(
                     input_id=input_id,
                     answer="a",
                     structured={"answer_detail": "safe"},
-                    metadata={"provided": recovery_message},
+                    metadata={
+                        "provided": recovery_message,
+                        "cayu.user_input.decision_reason": recovery_message,
+                    },
                 )
             )
         )
@@ -3159,7 +3173,10 @@ def test_recover_user_input_supplies_outcome_and_completes(
                     # isolates the manual-recovery publication boundary.
                     structured={"answer_detail": "safe"},
                     reason=recovery_message,
-                    metadata={"provided": recovery_message},
+                    metadata={
+                        "provided": recovery_message,
+                        "cayu.user_input.decision_reason": recovery_message,
+                    },
                 )
             )
         )
@@ -3185,8 +3202,14 @@ def test_recover_user_input_supplies_outcome_and_completes(
         None if dynamic_scope else recovery_message
     )
     assert private_recovered_tool_event.payload["metadata"] == (
-        {} if dynamic_scope else {"provided": recovery_message}
+        {}
+        if dynamic_scope
+        else {"provided": recovery_message, "cayu.user_input.decision_reason": recovery_message}
     )
+    resumed_reason = next(
+        event for event in recovered if event.type == EventType.SESSION_RESUMED
+    ).payload["reason"]
+    assert resumed_reason == (None if dynamic_scope else recovery_message)
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert counting.calls == 0  # the recovered tool was never re-executed
     assert observer.arguments

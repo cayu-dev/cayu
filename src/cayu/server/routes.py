@@ -1496,6 +1496,13 @@ async def _start_accepted_mutation(
             status_code=404,
             detail=_preaccept_error_detail(cayu_app, acceptance_error),
         ) from acceptance_error
+    from cayu.tasks.continuation_claims import TaskContinuationUnsupported
+
+    if isinstance(acceptance_error, TaskContinuationUnsupported):
+        raise HTTPException(
+            status_code=501,
+            detail="Controlled continuation requires bound atomic claims.",
+        ) from acceptance_error
     if isinstance(acceptance_error, conflict_error_types):
         raise HTTPException(
             status_code=409,

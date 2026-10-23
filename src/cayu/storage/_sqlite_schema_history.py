@@ -4340,6 +4340,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    126: (("cayu_task_interrupted_continuation_claims", "expected_sha256", "TEXT COLLATE BINARY"),),
     124: (("cayu_tasks", "concurrency_key", "TEXT COLLATE BINARY"),),
     121: (
         ("cayu_tasks", "restartable", "INTEGER NOT NULL DEFAULT 0 CHECK (restartable IN (0, 1))"),

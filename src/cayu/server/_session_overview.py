@@ -260,7 +260,7 @@ def register_session_overview_counts(
         include_forks: bool = False,
     ) -> SessionOverviewCountsResponse:
         try:
-            counts = await SessionOverviewReader(service.store).counts(
+            counts = await SessionOverviewReader(service.store, pricing=service.pricing).counts(
                 since=since,
                 until=until,
                 include_eval=include_eval,
@@ -285,4 +285,13 @@ def register_session_overview_counts(
             total_count=counts.total_count,
             failed=counts.counts_by_state[SessionOverviewStatus.FAILED],
             counts_by_state=counts.counts_by_state,
+            tokens=SessionOverviewTokens(
+                input=counts.input_tokens, output=counts.output_tokens, cached=counts.cached_tokens
+            ),
+            tokens_complete=counts.tokens_complete,
+            cost=None
+            if counts.cost is None
+            else SessionOverviewCost(
+                amount=counts.cost, currency="USD", complete=counts.cost_complete
+            ),
         )

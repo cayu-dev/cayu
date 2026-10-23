@@ -49,15 +49,16 @@ the call, so an approval shows the policy's reason, not the arguments. To show a
 person more, configure a [human-review policy](human-review.md), which decides what
 each reviewer may see.
 
-`GET /api/inbox` accepts `session_id`, `agent_name` and `kind` (`approval`,
-`question`, `recovery`, `knowledge`). Filters combine with AND and are applied by
-the source reader, before pagination. Knowledge proposals have no session or
+`GET /api/inbox` accepts `session_id`, `agent_name`, `kind` (`approval`,
+`question`, `recovery`, `knowledge`), and `q`. Filters combine with AND.
+Session, specialist and kind filters constrain the source query; public-text
+search filters each bounded page after access checks and redaction. Knowledge proposals have no session or
 specialist identity, so session/specialist filters exclude them. Blank filters
 and unknown kinds return 422. A cursor belongs to its filters; changing them
 requires starting without a cursor. The browser client's `listInbox` and
 `watchInbox` accept these same filters.
 
-`GET /api/inbox/counts` accepts `session_id` and `agent_name` and returns
+`GET /api/inbox/counts` accepts `session_id`, `agent_name` and `q` and returns
 `counts` for all four kinds, `total_count`, `complete`, and `unavailable_reason`.
 It follows the same bounded source pages to exhaustion, independently of the
 list's page size, deduplicating exact item identities. It never returns a capped
@@ -151,15 +152,22 @@ bytes to that function instead. Neither this code nor Runtime prints a key.
 | Status | Means |
 | --- | --- |
 | `pending` | Still waiting. `item` holds the item. |
-| `settled` | Decided. `settlement` holds the `decision` (`approve`, `deny`, `expire`, `answer`, `recover`, `keep` or `drop`), `decided_by` and `decided_at`. |
+| `settled` | Decided. `settlement` holds the `decision` (`approve`, `deny`, `expire`, `answer`, `recover`, `keep` or `drop`), `decided_by`, `decided_at` and the optional `reason`. |
 | `superseded` | Replaced before anyone decided it: an operator interrupt replaced the question, or the proposal was revised. |
 | `unavailable` | The state can't be read right now, for example while the Runtime is between recording a decision and publishing it. Read it again. |
 
 `decided_by` is the person the Runtime recorded, with `subject`, `tenant` and
-`source`. It is `null` for a knowledge proposal dropped anywhere or kept outside the
-inbox (the knowledge store records no reviewer for those), and for a decision made
-under open local access. An approval that expired before anyone decided it is
+`source`. Knowledge decisions made through the inbox retain authenticated reviewer attribution.
+A decision made outside a reviewed workflow can have no recorded reviewer.
+Under open local access, session decisions have no authenticated actor and
+reviewed knowledge decisions use the trusted-local identity. An approval that expired before anyone decided it is
 settled with the decision `expire` and the system actor `cayu:approval-expiry`.
+
+Search `q` is a case-insensitive substring match against the item's public,
+redacted text and identities. Knowledge search covers its visible title and
+preview, not undisclosed source text. Arguments are never searchable. Search
+runs after access and redaction and may produce an empty page with a continuation;
+counts traverse those same pages to exhaustion. Changing `q` invalidates a cursor.
 
 ## Settle an item
 
@@ -173,19 +181,49 @@ Content-Type: application/json
 | Field | For | Meaning |
 | --- | --- | --- |
 | `decision` | all | `approve`, `deny`, `answer`, `keep` or `drop`; it must be one of the item's `decisions` (422 otherwise) |
-| `reason` | `approve`, `deny` | Why, recorded on the approval |
+| `reason` | all | Optional rationale, durably bound to the decision; returned only when its public audit policy permits |
 | `arguments` | `approve` | The changed arguments the tool runs with: approve with changes. The tool's schema and policy check them again; a refused edit leaves the approval pending (409 `conflict`). |
 | `approval_revision` | `approve` | `{"proposed_digest", "approved_digest"}` naming an edit the application stored itself |
 | `answer` | `answer` | The answer to the question |
 | `review_reference` | `approve`, `deny`, `answer` | Required when the application configures a human-review policy; read it from `GET /api/sessions/{id}/human-review`. It can't be combined with `arguments`. |
 | `task_worker_id`, `task_handoff_id` | `approve`, `deny`, `answer` | Exact task continuation authority, as on the ordinary resolve routes. `task_handoff_id` requires `task_worker_id`. |
+| `task_continuation` | `approve`, `deny`, `answer` | Optional `"claim"` explicitly delegates a workerless interrupted task continuation to the runtime. Cannot be combined with worker/handoff IDs. |
 
-For a task worker's interrupted handoff, the task orchestrator must first elect a
-continuation worker through `claim_interrupted_task_continuation`, then supply
-that worker and handoff identity. The inbox never claims a task merely because a
-person sees or settles its item. Missing, stale or foreign authority is refused
-by the same Runtime checks as the ordinary approval and user-input resolve APIs.
-The authenticated person remains the recorded decider.
+With a configured `ControlPlaneRoles` policy, changed arguments and approval
+revisions require a role in that policy's `full_access` set. The maintained server
+wrapper applies this check to proxy authentication and custom auth dependencies
+that expose the policy; a role spelling or unrelated claim does not grant access.
+
+Without `task_continuation`, task-linked decisions retain the ordinary exact
+worker/handoff authority requirements. With `"claim"`, the runtime claims its own
+receipt-backed continuation for the selected task/session incarnation and pause;
+it never borrows another worker's IDs or takes over an active lease. A competing
+worker or changed handoff returns 409. Stores without bound, cancellation-quiescent
+claims return 501. Decisions without an attached task use ordinary resolution.
+The runtime revalidates the pause and protected review before dispatch, and the
+authenticated person remains the recorded decider. Generated worker authority is
+not returned to the browser. Observing an item never claims work.
+
+A successful decision response means the decision was durably accepted; execution
+may still be running. Closing the HTTP observer does not stop that continuation.
+Cancelling its execution owner fences the task and retains ownership until already
+dispatched work has drained; it does not prove a tool has stopped.
+
+Answer reasons use the documented `UserInputResponse.metadata` key
+`cayu.user_input.decision_reason`. It is included in the existing exact answer
+and recovery digests. Approval and answer operator text is published in events
+and settlement views only when the pause has positive `static` secret-scope
+evidence. Dynamic or unknown scope withholds that text, including after manual
+recovery; `settlement.reason` is null. This does not remove the private exact
+request binding: a different reason still conflicts on replay. Recovery must
+retain the answer metadata; its separate `reason` still describes the recovery.
+Knowledge keep reasons are part of the exact reviewed-approval annotations.
+Reviewed drops atomically publish an archived revision and its exact publication
+receipt, preserving chunks and source evidence. They use the same bounded source
+material limits as reviewed approval and refuse incomplete material before any
+write. Repeating the same actor and reason replays the decision; changing either
+returns a conflict. Stored annotations without matching publication evidence are
+not a reviewed rejection.
 
 The call returns once the Runtime durably accepted the decision. The agent carries on
 in the background, as it does after a dashboard client disconnects, so a settle never

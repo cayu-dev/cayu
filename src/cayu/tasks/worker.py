@@ -136,6 +136,7 @@ from cayu.tasks.cancellation import (
     _task_cancellation_requested,
     _task_retry_cancellation_requested,
 )
+from cayu.tasks.continuation_claims import TaskContinuationExpectation, TaskContinuationUnsupported
 from cayu.tasks.handoff import (
     InterruptedTaskContinuationClaimPage,
     TaskInterruptedHandoffConflict,
@@ -3607,6 +3608,8 @@ async def _run_recovered_interrupted_task_handler(
     handler: RecoveredInterruptedTaskHandler,
     *,
     worker_id: str,
+    expected: TaskContinuationExpectation | None = None,
+    apply_unproductive_backoff: bool = True,
     lease_seconds: int,
     query: TaskQuery | None,
     after: tuple[datetime, str] | None,
@@ -3617,16 +3620,44 @@ async def _run_recovered_interrupted_task_handler(
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
 
+    if expected is not None and (
+        type.__getattribute__(type(task_store), "__dict__").get(
+            "supports_bound_interrupted_task_handoffs"
+        )
+        is not True
+        or not task_store_interrupted_handoff_capability_is_complete(task_store)
+        or not task_store_mutation_is_cancellation_quiescent(
+            task_store, "claim_interrupted_task_continuation"
+        )
+    ):
+        raise TaskContinuationUnsupported("Controlled continuation requires bound atomic claims.")
     handoff_id = new_interrupted_task_continuation_handoff_id()
-    claim_outcome = await capture_task_store_operation(
-        lambda: task_store.claim_interrupted_task_continuation(
+
+    async def claim_once():
+        bound: dict[str, Any] = (
+            {} if expected is None else {"task_id": expected.task_id, "expected": expected}
+        )
+        return await task_store.claim_interrupted_task_continuation(
             worker_id,
             query,
             handoff_id=handoff_id,
             lease_seconds=lease_seconds,
             after=after,
             scan_limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
-        ),
+            **bound,
+        )
+
+    async def claim():
+        try:
+            return await claim_once()
+        except (OSError, TimeoutError):
+            if expected is None:
+                raise
+            # Same generation and expected tuple reconcile commit-before-ack loss.
+            return await claim_once()
+
+    claim_outcome = await capture_task_store_operation(
+        claim,
         operation_name="Interrupted-task continuation claim",
         redactor=app._secret_redactor,
         mutation_store=task_store,
@@ -3665,6 +3696,7 @@ async def _run_recovered_interrupted_task_handler(
             handler,
             owned_worker_id,
             max_unproductive_handoffs=max_unproductive_handoffs,
+            apply_unproductive_backoff=apply_unproductive_backoff,
             stop=stop,
         )
 
@@ -3692,6 +3724,7 @@ async def _run_bounded_interrupted_task_handler(
     worker_id: str,
     *,
     max_unproductive_handoffs: int | None,
+    apply_unproductive_backoff: bool = True,
     stop: asyncio.Event | None,
 ) -> TaskHandlerOutcome | None:
     assert task.session_id is not None
@@ -3757,7 +3790,13 @@ async def _run_bounded_interrupted_task_handler(
                     handoff_id=task.interrupted_handoff_id,
                 )
             return None
-    delay = _unproductive_continuation_backoff(unproductive_handoffs)
+    # Explicit owned human decisions do not throttle behind automated retry history.
+    # Session identity, bound claims, heartbeat, stop and quiescent cleanup still apply.
+    delay = (
+        _unproductive_continuation_backoff(unproductive_handoffs)
+        if apply_unproductive_backoff
+        else 0
+    )
     if delay > 0:
         logger.warning(
             "Interrupted-task continuation has made no progress across %d handoffs; "

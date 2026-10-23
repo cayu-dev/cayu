@@ -122,6 +122,7 @@ class InboxSettlement(_InboxModel):
     """
 
     decision: InboxSettledDecision
+    reason: str | None = None
     decided_by: InboxDecider | None = None
     decided_at: datetime | None = None
 
@@ -185,14 +186,16 @@ class InboxCounts(_InboxModel):
 class InboxSettleRequest(_InboxModel):
     """A person's decision on one inbox item.
 
-    ``approve`` and ``deny`` settle an approval, with an optional ``reason``.
+    ``approve`` and ``deny`` settle an approval. Every decision accepts an optional
+    durable ``reason``.
     ``approve`` can carry the changed ``arguments`` the tool runs with, or an
     ``approval_revision`` naming an edit the application stored itself.
     ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
     proposal. ``review_reference`` is required when the application configures
     a human-review policy; read it from ``GET /api/sessions/{id}/human-review``.
-    Worker-owned approvals and questions require the same ``task_worker_id`` and
-    ``task_handoff_id`` continuation authority as the ordinary resolve routes.
+    Task-linked approvals and questions require ordinary worker/handoff authority,
+    or explicit ``task_continuation="claim"`` to acquire a new workerless handoff.
+    Controlled claims never borrow an active worker's authority.
     """
 
     decision: InboxDecision
@@ -203,6 +206,7 @@ class InboxSettleRequest(_InboxModel):
     review_reference: HumanReviewReference | None = None
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
+    task_continuation: Literal["claim"] | None = None
 
     @field_validator("task_worker_id", "task_handoff_id")
     @classmethod
@@ -221,13 +225,16 @@ class InboxSettleRequest(_InboxModel):
 
     @model_validator(mode="after")
     def validate_decision_fields(self) -> InboxSettleRequest:
-        approval = self.decision in {"approve", "deny"}
+        if self.task_continuation is not None and (
+            self.task_worker_id is not None
+            or self.task_handoff_id is not None
+            or self.decision in {"keep", "drop"}
+        ):
+            raise ValueError("Controlled continuation is only for decisions without worker IDs.")
         if self.task_handoff_id is not None and self.task_worker_id is None:
             raise ValueError("task_handoff_id requires task_worker_id.")
         if self.task_worker_id is not None and self.decision in {"keep", "drop"}:
             raise ValueError("Task continuation authority applies to approvals and questions.")
-        if self.reason is not None and not approval:
-            raise ValueError("reason applies to approve and deny.")
         if (self.arguments is not None or self.approval_revision is not None) and (
             self.decision != "approve"
         ):

@@ -86,6 +86,7 @@ from cayu.approvals.user_input import (
     pending_user_input_interruption_payload,
     require_resolution_intent_matches_pending,
     user_input_answer_request_digest,
+    user_input_decision_reason,
     user_input_lifecycle_authority_from_checkpoint,
     user_input_resolution_request_digest,
     user_input_supersession_intent_for,
@@ -3776,6 +3777,17 @@ class RecoveryCoordinator:
                                     "input_id": pending.input_id,
                                     "tool_call_id": pending.tool_call_id,
                                     "resolved_by": resolution_actor_payload(response.resolved_by),
+                                    "reason": _public_resolution_audit_fields(
+                                        secret_resolution_scope=invocation_secrets.continuation_secret_resolution_scope(
+                                            "unknown"
+                                            if pending.assistant_publication is None
+                                            else pending.assistant_publication.secret_resolution_scope,
+                                            environment.registered_environment,
+                                        ),
+                                        reason=user_input_decision_reason(response.metadata),
+                                        metadata={},
+                                        redactor=self._secret_redactor,
+                                    )["reason"],
                                     **release_event_fields(self._event_writer.release_identity),
                                 },
                             ),
@@ -4203,6 +4215,12 @@ class RecoveryCoordinator:
                             payload={
                                 "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
                                 "transition": "answered",
+                                "reason": _public_resolution_audit_fields(
+                                    secret_resolution_scope=pause_secret_resolution_scope,
+                                    reason=user_input_decision_reason(response.metadata),
+                                    metadata={},
+                                    redactor=self._secret_redactor,
+                                )["reason"],
                                 **tool_round_identity.payload(),
                                 "input_id": pending.input_id,
                                 "tool_call_id": pending.tool_call_id,
@@ -4717,6 +4735,15 @@ class RecoveryCoordinator:
                         decision=request.decision,
                         resolved_by=request.resolved_by,
                         expired=expired,
+                        reason=_public_resolution_audit_fields(
+                            secret_resolution_scope=invocation_secrets.continuation_secret_resolution_scope(
+                                pending_approval.secret_resolution_scope,
+                                environment.registered_environment,
+                            ),
+                            reason=request.reason,
+                            metadata={},
+                            redactor=self._secret_redactor,
+                        )["reason"],
                         release_identity=self._event_writer.release_identity,
                     )
                 )
@@ -4885,6 +4912,12 @@ class RecoveryCoordinator:
                 pending_approval.secret_resolution_scope,
                 environment.registered_environment,
             )
+            public_resolution_audit = _public_resolution_audit_fields(
+                secret_resolution_scope=pause_secret_resolution_scope,
+                reason=request.reason,
+                metadata=request.metadata,
+                redactor=self._secret_redactor,
+            )
             paused_round = await PausedToolRound.prepare(
                 session_store=self._session_store,
                 event_writer=self._event_writer,
@@ -4958,8 +4991,7 @@ class RecoveryCoordinator:
                         policy_evidence=policy_evidence,
                         requested_decision=request.decision,
                         resolved_by_payload=resolved_by_payload,
-                        resolution_reason=request.reason,
-                        resolution_metadata=request.metadata,
+                        public_resolution_audit=public_resolution_audit,
                     ):
                         yield event
                         if outcome is not None:
@@ -5055,8 +5087,15 @@ class RecoveryCoordinator:
                         policy_evidence is ToolPolicyEvidence.AMBIGUOUS
                         and tool_call.id == pending_approval.tool_call_id
                     )
+                    # The request stays private and digest-bound; only this
+                    # result/event projection receives public operator fields.
                     result = approval_support.approval_denied_tool_result(
-                        request,
+                        request.model_copy(
+                            update={
+                                "reason": public_resolution_audit["reason"],
+                                "metadata": public_resolution_audit["metadata"],
+                            }
+                        ),
                         approval=pending_approval,
                         tool_call=tool_call,
                         approval_required=approval_required,
@@ -5083,11 +5122,7 @@ class RecoveryCoordinator:
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
                                 "approval_required": approval_required,
-                                "reason": request.reason,
-                                **approval_support.bounded_resolution_metadata_payload(
-                                    request.metadata,
-                                    redactor=self._secret_redactor,
-                                ),
+                                **public_resolution_audit,
                                 "resolved_by": resolved_by_payload,
                                 "expired": expired,
                                 "result": result.model_dump(),
@@ -5114,8 +5149,7 @@ class RecoveryCoordinator:
                         policy_evidence=policy_evidence,
                         requested_decision=request.decision,
                         resolved_by_payload=resolved_by_payload,
-                        resolution_reason=request.reason,
-                        resolution_metadata=request.metadata,
+                        public_resolution_audit=public_resolution_audit,
                     ):
                         yield event
                         if outcome is not None:
@@ -6173,6 +6207,12 @@ class RecoveryCoordinator:
                             "input_id": pending.input_id,
                             "tool_call_id": pending.tool_call_id,
                             "resolved_by": resolution_actor_payload(request.resolved_by),
+                            "reason": _public_resolution_audit_fields(
+                                secret_resolution_scope=recovery_secret_resolution_scope,
+                                reason=user_input_decision_reason(request.metadata),
+                                metadata={},
+                                redactor=self._secret_redactor,
+                            )["reason"],
                             **release_event_fields(self._event_writer.release_identity),
                         },
                     ),
@@ -6637,6 +6677,12 @@ class RecoveryCoordinator:
                         decision=ToolApprovalDecision.APPROVE,
                         resolved_by=request.resolved_by,
                         expired=recovered_after_expiry,
+                        reason=_public_resolution_audit_fields(
+                            secret_resolution_scope=recovery_secret_resolution_scope,
+                            reason=request.reason,
+                            metadata={},
+                            redactor=self._secret_redactor,
+                        )["reason"],
                         release_identity=self._event_writer.release_identity,
                     ),
                     recovery_tool_event,

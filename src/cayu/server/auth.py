@@ -111,9 +111,22 @@ def server_auth_dependency(auth: AuthDependency) -> Callable[[Request], Awaitabl
     async def dependency(request: Request) -> AuthContext:
         cached = request.scope.get(_AUTH_CONTEXT_SCOPE_KEY)
         if type(cached) is _CachedAuthContext and cached.auth is auth:
-            return cached.context.model_copy(deep=True)
-        context = await resolve_auth_context(auth, request)
-        request.scope[_AUTH_CONTEXT_SCOPE_KEY] = _CachedAuthContext(auth=auth, context=context)
+            context = cached.context
+        else:
+            context = await resolve_auth_context(auth, request)
+            request.scope[_AUTH_CONTEXT_SCOPE_KEY] = _CachedAuthContext(auth=auth, context=context)
+        # Configured role owners have the same decision-only body contract whether
+        # authentication comes from proxy JWTs or a maintained custom dependency.
+        # Unrelated claims without a configured policy do not establish a role.
+        from cayu.server._decision_only import has_decision_overrides
+        from cayu.server.proxy_identity import ControlPlaneRoles, _role_forbidden
+
+        roles = getattr(auth, "control_plane_roles", None)
+        if isinstance(roles, ControlPlaneRoles):
+            role = context.claims.get(roles.role_claim)
+            full_access = type(role) is str and role in roles.full_access
+            if not full_access and await has_decision_overrides(request):
+                raise _role_forbidden()
         return context.model_copy(deep=True)
 
     return dependency

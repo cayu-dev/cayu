@@ -536,6 +536,8 @@ def test_sqlite_store_requires_migration_from_revision_111(tmp_path, monkeypatch
                 "123",
                 "--acknowledge-breaking",
                 "124",
+                "--acknowledge-breaking",
+                "126",
             ]
         )
         == 0
@@ -632,6 +634,8 @@ def test_cayu_storage_migrate_upgrades_postgres_to_the_product_revision(
                 "123",
                 "--acknowledge-breaking",
                 "124",
+                "--acknowledge-breaking",
+                "126",
             ]
         )
         == 0

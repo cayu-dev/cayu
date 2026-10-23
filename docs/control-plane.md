@@ -385,9 +385,18 @@ are excluded unless `include_eval=true` or `include_forks=true`. Counts traverse
 all pages before the fixed upper creation boundary, stopping before enriching
 newer rows; they never use the old capped `/sessions/summary` result. Both reads
 are available to members and use `Cache-Control: private, no-store`.
+The response also includes `tokens` (`input`, `output`, `cached`),
+`tokens_complete`, and `cost` using the ordinary overview amount/currency/complete
+shape. Usage counts events in `[since, until)` from eligible sessions, including
+sessions created before the window. Default eval/fork exclusions apply to both
+usage and session counts. Without a price book `cost` is null; token counts remain
+available. The shared accounting owner combines exact priced amounts before
+presentation, and incomplete pricing is explicitly marked. Reads are live,
+not a cross-store transaction; a changed session incarnation or unavailable
+accounting source fails the request rather than publishing a partial total.
 
 These are observational reads of current retained evidence, not an atomic
-cross-store snapshot. Sessions replaced while joining evidence are omitted;
+cross-store snapshot. Sessions replaced while joining list evidence are omitted;
 refresh to observe the replacement. Activity can change while pages are read.
 Subagent counts cover direct retained children with matching parent-run
 lineage; artifact counts use the existing session-scoped store listing and

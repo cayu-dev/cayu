@@ -205,7 +205,9 @@ def _validate_interrupted_task_handoff_schema(connection: sqlite3.Connection) ->
         )
 
 
-def _validate_interrupted_handoff_generation_column(connection: sqlite3.Connection) -> None:
+def _validate_interrupted_handoff_generation_column(
+    connection: sqlite3.Connection, *, bound_claims: bool = False
+) -> None:
     task_columns = {
         str(row[1]): (str(row[2]).upper(), int(row[3]))
         for row in connection.execute("PRAGMA table_info(cayu_tasks)")
@@ -244,6 +246,10 @@ def _validate_interrupted_handoff_generation_column(connection: sqlite3.Connecti
         ("worker_id", "TEXT", 1, 0),
         ("claimed_at", "TEXT", 1, 0),
     )
+    # Historical migration steps may be reapplied to an already-expanded table.
+    # Accept only its exact known newer shape; current126 still requires the column.
+    if bound_claims or any(row[0] == "expected_sha256" for row in claim_columns):
+        expected_claim_columns += (("expected_sha256", "TEXT", 0, 0),)
     claim_foreign_keys = connection.execute(
         "PRAGMA foreign_key_list(cayu_task_interrupted_continuation_claims)"
     ).fetchall()

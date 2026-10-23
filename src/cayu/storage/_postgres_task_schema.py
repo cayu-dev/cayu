@@ -375,7 +375,9 @@ async def _validate_interrupted_task_handoff_schema(cur: Any) -> None:
         )
 
 
-async def _validate_interrupted_handoff_generation_column(cur: Any) -> None:
+async def _validate_interrupted_handoff_generation_column(
+    cur: Any, *, bound_claims: bool = False
+) -> None:
     await cur.execute(
         """
             SELECT data_type, is_nullable
@@ -428,6 +430,10 @@ async def _validate_interrupted_handoff_generation_column(cur: Any) -> None:
         ("worker_id", "text", "NO", "C"),
         ("claimed_at", "timestamp with time zone", "NO", None),
     )
+    # Historical migration steps may be reapplied to an already-expanded table.
+    # Accept only its exact known newer shape; current126 still requires the column.
+    if bound_claims or any(row[0] == "expected_sha256" for row in claim_columns):
+        expected_claim_columns += (("expected_sha256", "text", "YES", "C"),)
     if claim_columns != expected_claim_columns or claim_ownership_constraints != (
         ("p", "PRIMARY KEY (handoff_id_sha256)"),
     ):

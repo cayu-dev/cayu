@@ -542,6 +542,8 @@ REVISIONS: tuple[Revision, ...] = (
     # A store identity row the database creates once with a random value, so a
     # reader can tell this database from another. Older binaries never read it.
     Revision(revision=125, kind=RevisionKind.ADDITIVE, compatible_from=124),
+    # Exact continuation claim replay must retain its selected operation binding.
+    Revision(revision=126, kind=RevisionKind.BREAKING, compatible_from=126),
 )
 
 #: The revision an empty database is initialized to.

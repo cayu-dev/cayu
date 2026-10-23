@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from cayu.budgets.pricing import PriceBook
+from cayu._validation import revalidate_model_input
+from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts
+from cayu.budgets.usage import SessionUsageSummary
 from cayu.releases import recorded_release_identity
 from cayu.sessions._foreground_child_checkpoint import foreground_child_state_from_checkpoint
 from cayu.sessions._run_identity import (
@@ -33,8 +36,6 @@ from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus
 
 if TYPE_CHECKING:
-    from cayu.budgets.pricing import SessionCostTotals
-    from cayu.budgets.usage import SessionUsageSummary
     from cayu.sessions.store import SessionStore
     from cayu.sessions.summaries import SessionOutcome
 
@@ -102,6 +103,12 @@ class SessionOverviewCounts:
     until: datetime
     running_now: int
     counts_by_state: dict[SessionOverviewStatus, int]
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    tokens_complete: bool
+    cost: Decimal | None
+    cost_complete: bool
 
     @property
     def total_count(self) -> int:
@@ -231,6 +238,10 @@ class SessionOverviewReader:
         if type(include_eval) is not bool or type(include_forks) is not bool:
             raise TypeError("Overview inclusion flags must be bools.")
         counts = dict.fromkeys(SessionOverviewStatus, 0)
+        input_tokens = output_tokens = cached_tokens = 0
+        tokens_complete = True
+        cost = None if self._pricing is None else Decimal(0)
+        cost_complete = True
         running = 0
         cursor = None
         cursors: set[str] = set()
@@ -247,6 +258,7 @@ class SessionOverviewReader:
             reached_until = len(eligible) != len(page.sessions)
             expected = {session.id: session.instance_id for session in eligible}
             facts = await self._read(tuple(expected), accounting=False)
+            accounting_sessions: dict[str, str | None] = {}
             for fact in facts:
                 session = fact.session
                 if session.instance_id != expected.get(session.id):
@@ -261,19 +273,72 @@ class SessionOverviewReader:
                     not include_forks and fact.forked
                 ):
                     continue
+                accounting_sessions[session.id] = session.instance_id
                 if not fact.pending_complete:
                     raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
                 if fact.status is SessionOverviewStatus.RUNNING:
                     running += 1
                 if session.created_at >= since:
                     counts[fact.status] += 1
+            if accounting_sessions:
+                accounting_query = EventQuery(
+                    session_ids=tuple(accounting_sessions), since=since, until=until
+                )
+                try:
+                    usage = await self._store.read_usage_accounting(accounting_query)
+                    summary = revalidate_model_input(usage.summary, SessionUsageSummary)
+                    if not isinstance(summary, SessionUsageSummary):
+                        raise TypeError("Invalid accounting summary.")
+                    priced = (
+                        None
+                        if self._pricing is None
+                        else await self._store.read_cost_accounting(accounting_query, self._pricing)
+                    )
+                    totals = (
+                        None
+                        if priced is None
+                        else revalidate_model_input(priced.totals, SessionCostTotals)
+                    )
+                    if totals is not None and not isinstance(totals, SessionCostTotals):
+                        raise TypeError("Invalid accounting totals.")
+                except (TypeError, ValueError):
+                    raise SessionOverviewUnavailable(
+                        "Session accounting evidence is invalid."
+                    ) from None
+                # The selection and accounting are separate snapshots. A replacement
+                # must not donate consumption to the selected incarnation.
+                for session_id, instance_id in accounting_sessions.items():
+                    current = await self._store.load(session_id)
+                    if current is None or current.instance_id != instance_id:
+                        raise SessionOverviewUnavailable("Session changed during accounting.")
+                input_tokens += summary.usage.input_tokens
+                output_tokens += summary.usage.output_tokens
+                cached_tokens += summary.usage.cache.read_tokens
+                tokens_complete = tokens_complete and summary.unmeasured_model_attempts == 0
+                if totals is not None:
+                    assert cost is not None
+                    cost = add_cost_amounts(cost, totals.total_cost)
+                    cost_complete = cost_complete and (
+                        totals.unpriced_model_steps == 0 and totals.unpriced_auxiliary_attempts == 0
+                    )
             if reached_until or page.next_cursor is None:
                 break
             if page.next_cursor in cursors:
                 raise SessionOverviewUnavailable("Session paging did not advance.")
             cursors.add(page.next_cursor)
             cursor = page.next_cursor
-        return SessionOverviewCounts(since, until, running, counts)
+        return SessionOverviewCounts(
+            since,
+            until,
+            running,
+            counts,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            tokens_complete,
+            cost,
+            cost_complete,
+        )
 
     async def _pending(self, session_id: str) -> _PendingEvidence:
         actions: list[PendingActionRecord] = []

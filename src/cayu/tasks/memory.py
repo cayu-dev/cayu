@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
 from cayu._resource_store_surface import model_store_surface
+from cayu.tasks.continuation_claims import (
+    TaskContinuationExpectation,
+    prepare_continuation_expectation,
+    require_expected_continuation,
+)
 
 if TYPE_CHECKING:
     from cayu.tasks.graphs import (
@@ -432,6 +437,7 @@ class InMemoryTaskStore(TaskStore):
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -474,7 +480,7 @@ class InMemoryTaskStore(TaskStore):
         self._session_retention_epochs: dict[str, tuple[str, int]] = {}
         self._retired_retention_instances: set[tuple[str, str]] = set()
         self._task_id_by_interrupted_handoff_id: dict[str, str] = {}
-        self._interrupted_continuation_claims: dict[str, tuple[str, str]] = {}
+        self._interrupted_continuation_claims: dict[str, tuple[str, str, str | None]] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
         self._interrupted_handoff_receipts: dict[
             tuple[str, str], TaskInterruptedHandoffReceipt
@@ -3412,6 +3418,7 @@ class InMemoryTaskStore(TaskStore):
         *,
         handoff_id: str,
         task_id: str | None = None,
+        expected: TaskContinuationExpectation | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
@@ -3421,6 +3428,7 @@ class InMemoryTaskStore(TaskStore):
         if task_id is not None:
             task_id = require_clean_nonblank(task_id, "task_id")
         handoff_id_sha256 = _interrupted_task_continuation_handoff_id_sha256(handoff_id)
+        expected, expected_sha256 = prepare_continuation_expectation(expected, task_id=task_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         lease_seconds = _validate_positive_int(lease_seconds, "lease_seconds")
@@ -3436,6 +3444,7 @@ class InMemoryTaskStore(TaskStore):
                 if (
                     existing is None
                     or prior_claim[1] != worker_id
+                    or prior_claim[2] != expected_sha256
                     or existing.interrupted_handoff_id != handoff_id
                     or existing.worker_id != worker_id
                     or existing.status is not TaskStatus.RUNNING
@@ -3494,6 +3503,7 @@ class InMemoryTaskStore(TaskStore):
                 if task.concurrency_key in active_keys:
                     filtered += 1
                     continue
+                require_expected_continuation(task, expected)
                 candidate_handoff_id = task.interrupted_handoff_id
                 if candidate_handoff_id is None:
                     rejected += 1
@@ -3514,6 +3524,7 @@ class InMemoryTaskStore(TaskStore):
                 self._interrupted_continuation_claims[handoff_id_sha256] = (
                     claimed.id,
                     worker_id,
+                    expected_sha256,
                 )
                 return InterruptedTaskContinuationClaimPage(
                     task=claimed,

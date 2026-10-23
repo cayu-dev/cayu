@@ -2223,6 +2223,9 @@ class SessionOverviewCountsResponse(ApiBaseModel):
     total_count: AggregateCount = Field(ge=0)
     failed: AggregateCount = Field(ge=0)
     counts_by_state: dict[SessionOverviewStatus, AggregateCount]
+    tokens: SessionOverviewTokens
+    tokens_complete: bool
+    cost: SessionOverviewCost | None
 
 
 class ListSessionsResponse(ApiBaseModel):

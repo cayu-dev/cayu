@@ -16,6 +16,11 @@ from cayu._resource_store_surface import model_store_surface
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import PostgresTimingScope
+from cayu.tasks.continuation_claims import (
+    TaskContinuationExpectation,
+    prepare_continuation_expectation,
+    require_expected_continuation,
+)
 
 if TYPE_CHECKING:
     from cayu.tasks.groups import (
@@ -242,7 +247,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 124
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 126
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -359,6 +364,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -2894,6 +2900,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         *,
         handoff_id: str,
         task_id: str | None = None,
+        expected: TaskContinuationExpectation | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
@@ -2902,6 +2909,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
         if task_id is not None:
             task_id = require_clean_nonblank(task_id, "task_id")
+        expected, expected_sha256 = prepare_continuation_expectation(expected, task_id=task_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
@@ -2920,6 +2928,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 query=query,
                 handoff_id=handoff_id,
                 task_id=task_id,
+                expected=expected,
+                expected_sha256=expected_sha256,
                 lease_seconds=lease_seconds,
                 after=after,
                 scan_limit=scan_limit,
@@ -2935,6 +2945,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         query: TaskQuery,
         handoff_id: str,
         task_id: str | None,
+        expected: TaskContinuationExpectation | None,
+        expected_sha256: str | None,
         lease_seconds: int,
         after: tuple[datetime, str] | None,
         scan_limit: int,
@@ -2948,7 +2960,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     (handoff_id_sha256,),
                 )
                 await cur.execute(
-                    "SELECT task_id, worker_id "
+                    "SELECT task_id, worker_id, expected_sha256 "
                     "FROM cayu_task_interrupted_continuation_claims "
                     "WHERE handoff_id_sha256 = %s",
                     (handoff_id_sha256,),
@@ -2970,6 +2982,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     now = await self._database_now(cur)
                     if (
                         prior_claim_row[1] != worker_id
+                        or prior_claim_row[2] != expected_sha256
                         or existing is None
                         or existing.interrupted_handoff_id != handoff_id
                         or existing.worker_id != worker_id
@@ -3059,6 +3072,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     if not await self._claim_concurrency_key(cur, observed):
                         filtered += 1
                         continue
+                    require_expected_continuation(observed, expected)
                     candidate_handoff_id = observed.interrupted_handoff_id
                     if candidate_handoff_id is None:
                         raise AssertionError("Continuation candidate lost its handoff generation.")
@@ -3093,9 +3107,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         continue
                     await cur.execute(
                         "INSERT INTO cayu_task_interrupted_continuation_claims ("
-                        "handoff_id_sha256, task_id, worker_id, claimed_at"
-                        ") VALUES (%s, %s, %s, transaction_timestamp())",
-                        (handoff_id_sha256, observed.id, worker_id),
+                        "handoff_id_sha256, task_id, worker_id, claimed_at, expected_sha256"
+                        ") VALUES (%s, %s, %s, transaction_timestamp(), %s)",
+                        (handoff_id_sha256, observed.id, worker_id, expected_sha256),
                     )
                     await cur.execute(
                         cast(

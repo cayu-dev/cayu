@@ -229,6 +229,7 @@ export interface InboxItem {
 }
 
 export interface InboxSettlement {
+  reason: string | null
   decision: InboxSettledDecision
   /** `null` when the Runtime has no record of the person. */
   decided_by: { subject: string; tenant: string | null; source: string | null } | null
@@ -265,7 +266,7 @@ export interface InboxPage {
 /** The body of `POST /api/inbox/{id}/settle`. */
 export interface InboxSettleRequest {
   decision: InboxDecision
-  /** For `approve` and `deny`. */
+  /** Optional durable rationale for every decision. */
   reason?: string
   /** For `approve`: the changed arguments the tool runs with. */
   arguments?: Record<string, unknown>
@@ -279,6 +280,7 @@ export interface InboxSettleRequest {
   task_worker_id?: string
   /** An elected interrupted handoff; requires task_worker_id. */
   task_handoff_id?: string
+  task_continuation?: "claim"
 }
 
 export type InboxSettleResult =
@@ -313,6 +315,8 @@ export interface InboxSnapshot {
 }
 
 export interface InboxFilters {
+  /** Search only public, redacted item text. */
+  q?: string
   session_id?: string
   agent_name?: string
   kind?: InboxItemKind

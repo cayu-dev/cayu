@@ -285,7 +285,7 @@ test("connect reads the current server contract with same-origin credentials", a
   assert.equal(server.requests.length, 1)
   assert.equal(server.requests[0].url.href, `${API}/contract`)
   assert.equal(server.requests[0].init.credentials, "same-origin")
-  assert.equal(client.contract.contract_version, CONTRACT_VERSION)
+  assert.equal(client.contract.contract_version, serverVersion)
   assert.equal(client.streamAvailable, false)
 })
 
@@ -1142,6 +1142,7 @@ test("inbox filters reach list and every watched continuation", async () => {
     session_id: "public session",
     agent_name: "specialist",
     kind: "approval",
+    q: "safe public text",
   }
   await client.listInbox({ ...filters, limit: 1 })
   const changes = []
@@ -1184,6 +1185,7 @@ test("getInboxCounts sends only scope filters to the shared count endpoint", asy
       session_id: "public/session",
       agent_name: "agent",
       kind: "approval",
+      q: "safe public text",
     }),
     counts,
   )
@@ -1191,4 +1193,5 @@ test("getInboxCounts sends only scope filters to the shared count endpoint", asy
   assert.equal(requests[0].searchParams.get("session_id"), "public/session")
   assert.equal(requests[0].searchParams.get("agent_name"), "agent")
   assert.equal(requests[0].searchParams.has("kind"), false)
+  assert.equal(requests[0].searchParams.get("q"), "safe public text")
 })

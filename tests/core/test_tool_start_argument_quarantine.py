@@ -1219,6 +1219,12 @@ async def _run_approval_resolution_scenario() -> None:
     assert resumed_tool.arguments == [arguments]
     assert resumed[-1].type is EventType.SESSION_COMPLETED, resumed[-1].payload
     approved = next(event for event in resumed if event.type is EventType.TOOL_CALL_APPROVED)
+    assert (
+        next(event for event in resumed if event.type is EventType.SESSION_RESUMED).payload[
+            "reason"
+        ]
+        is None
+    )
     assert approved.payload["reason"] is None
     assert approved.payload["metadata"] == {}
     assert secret not in repr(resumed)

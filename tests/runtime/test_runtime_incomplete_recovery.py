@@ -472,7 +472,8 @@ def test_legacy_mixed_policy_recovery_prefers_authoritative_approval_gate():
     asyncio.run(run())
 
 
-def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decision_flip():
+@pytest.mark.parametrize("scope", ["static", "dynamic", "unknown"])
+def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decision_flip(scope):
     class FailingAmbiguousApprovalCloseStore(FailingAfterPendingToolRoundCheckpointStore):
         invocation_lifecycle_command_version = 1
 
@@ -512,6 +513,17 @@ def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decisi
             enable_logging=False,
             secret_redactor=SecretRedactor(secret),
         )
+        if scope == "dynamic":
+            from cayu.environments import Environment, EnvironmentSpec
+            from cayu.vaults.static import StaticVault
+
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(name="dynamic"),
+                    vault=StaticVault({"unused": "different-secret"}),
+                ),
+                default=True,
+            )
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -532,6 +544,10 @@ def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decisi
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
         approval = PendingToolApproval.model_validate(checkpoint["pending_tool_approval"])
+
+        if scope == "unknown":
+            checkpoint["pending_tool_approval"]["secret_resolution_scope"] = "unknown"
+            await store.checkpoint(session_id, checkpoint)
 
         request = ToolApprovalRequest(
             session_id=session_id,
@@ -557,16 +573,22 @@ def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decisi
         )
         assert blocked.payload["decision"] == "ambiguous"
         assert blocked.payload["requested_decision"] == "approve"
-        assert blocked.payload["resolution_reason"] == ("Continue safely without this side effect.")
+        expected_reason = "Continue safely without this side effect." if scope == "static" else None
+        assert blocked.payload["resolution_reason"] == expected_reason
         assert blocked.payload["resolved_by"] == {
             "subject": "operator-7",
             "tenant": "tenant-1",
             "source": "request",
         }
-        assert blocked.payload["metadata_truncated"] is True
+        if scope == "static":
+            assert blocked.payload["metadata_truncated"] is True
+        else:
+            assert blocked.payload["metadata"] == {}
+            assert "metadata_truncated" not in blocked.payload
         serialized_metadata = json.dumps(blocked.payload["metadata"])
         assert secret not in serialized_metadata
-        assert "[REDACTED_SECRET]" in serialized_metadata
+        if scope == "static":
+            assert "[REDACTED_SECRET]" in serialized_metadata
         assert first[-1].type is EventType.SESSION_INTERRUPTED
 
         conflicting = await collect_tool_approval_events(
@@ -608,7 +630,7 @@ def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decisi
         assert audit[0].resolution_state is BusinessApprovalResolutionState.BLOCKED
         assert audit[0].decision is None
         assert not audit[0].pending
-        assert audit[0].reason == "Continue safely without this side effect."
+        assert audit[0].reason == expected_reason
         assert audit[0].resolved_at == blocked.timestamp
 
     asyncio.run(run())

@@ -572,6 +572,7 @@ def resumed_event(
     release_identity: ReleaseIdentity | None,
     resolved_by: ResolutionActor | None = None,
     expired: bool = False,
+    reason: str | None = None,
 ) -> Event:
     event = Event(
         type=EventType.SESSION_RESUMED,
@@ -594,6 +595,7 @@ def resumed_event(
             ),
             "resolved_by": resolution_actor_payload(resolved_by),
             "expired": expired,
+            "reason": reason,
             **release_event_fields(release_identity),
         },
     )

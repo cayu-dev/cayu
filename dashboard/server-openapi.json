@@ -20986,7 +20986,7 @@
       },
       "InboxSettleRequest": {
         "additionalProperties": false,
-        "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval, with an optional ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge\nproposal. ``review_reference`` is required when the application configures\na human-review policy; read it from ``GET /api/sessions/{id}/human-review``.\nWorker-owned approvals and questions require the same ``task_worker_id`` and\n``task_handoff_id`` continuation authority as the ordinary resolve routes.",
+        "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge\nproposal. ``review_reference`` is required when the application configures\na human-review policy; read it from ``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
         "properties": {
           "answer": {
             "anyOf": [
@@ -21054,6 +21054,18 @@
                 "type": "null"
               }
             ]
+          },
+          "task_continuation": {
+            "anyOf": [
+              {
+                "const": "claim",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Continuation"
           },
           "task_handoff_id": {
             "anyOf": [
@@ -21141,6 +21153,17 @@
             ],
             "title": "Decision",
             "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
           }
         },
         "required": [
@@ -33149,7 +33172,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "55",
+            "default": "56",
             "title": "Contract Version",
             "type": "string"
           },
@@ -34226,6 +34249,16 @@
       "SessionOverviewCountsResponse": {
         "additionalProperties": false,
         "properties": {
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionOverviewCost"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "counts_by_state": {
             "additionalProperties": {
               "pattern": "^(0|[1-9]\\d*)$",
@@ -34252,6 +34285,13 @@
             "title": "Since",
             "type": "string"
           },
+          "tokens": {
+            "$ref": "#/components/schemas/SessionOverviewTokens"
+          },
+          "tokens_complete": {
+            "title": "Tokens Complete",
+            "type": "boolean"
+          },
           "total_count": {
             "pattern": "^(0|[1-9]\\d*)$",
             "title": "Total Count",
@@ -34269,7 +34309,10 @@
           "running_now",
           "total_count",
           "failed",
-          "counts_by_state"
+          "counts_by_state",
+          "tokens",
+          "tokens_complete",
+          "cost"
         ],
         "title": "SessionOverviewCountsResponse",
         "type": "object"
@@ -40167,7 +40210,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "55",
+            "default": "56",
             "title": "Contract Version",
             "type": "string"
           }
@@ -44954,6 +44997,23 @@
               ],
               "title": "Kind"
             }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
           }
         ],
         "responses": {
@@ -45038,6 +45098,23 @@
                 }
               ],
               "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
             }
           }
         ],

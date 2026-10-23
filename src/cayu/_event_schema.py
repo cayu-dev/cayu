@@ -2569,7 +2569,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_RESUMED] = _observed_policy(
         "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_contract input_id "
-        "interruption_type model_attempt_id model_step_id parent_session_id resolved_by "
+        "interruption_type model_attempt_id model_step_id parent_session_id reason resolved_by "
         f"run_epoch task_id tool_call_id tool_round_id traceparent tracestate {RELEASE_EVENT_PAYLOAD_KEY}",
         owned_nested_paths=_resolution_actor_nested_paths("resolved_by") | _RELEASE_PATHS,
         authority_keys={"execution_profile_fingerprint", "input_contract"},

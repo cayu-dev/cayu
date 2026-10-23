@@ -12,7 +12,7 @@
 /** Version of this module's public API, advertised as `client.version` by `/api/contract`. */
 export const CLIENT_VERSION = "1"
 /** Exact server contract version this module was released with. */
-export const CONTRACT_VERSION = "55"
+export const CONTRACT_VERSION = "56"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"])
 const ACTIVE_STATUSES = new Set(["pending", "running", "interrupting"])
@@ -668,8 +668,8 @@ function startWatch(options, read) {
 function inboxFilters(options, includeKind = true) {
   const params = new URLSearchParams()
   for (const key of includeKind
-    ? ["session_id", "agent_name", "kind"]
-    : ["session_id", "agent_name"]) {
+    ? ["session_id", "agent_name", "kind", "q"]
+    : ["session_id", "agent_name", "q"]) {
     if (options[key] !== undefined) params.set(key, options[key])
   }
   return params

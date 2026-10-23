@@ -6483,7 +6483,7 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `recover_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `load_interrupted_task_handoff_receipt(task_id, handoff_id)`
 - `list_expired_interrupted_task_handoff_candidates(after=..., limit=...)`
-- `claim_interrupted_task_continuation(worker_id, query=..., handoff_id=..., lease_seconds=..., after=..., scan_limit=...)`
+- `claim_interrupted_task_continuation(worker_id, query=..., handoff_id=..., task_id=..., expected=..., lease_seconds=..., after=..., scan_limit=...)`
 - `load_active_attached_task_worker(task_id, worker_id, session_id=..., session_instance_id=...)`
 - `load_direct_attached_task_resume(task_id, session_id=..., session_instance_id=...)`
 - `reclaim_expired(query=..., max_reclaims=...)`
@@ -6495,6 +6495,18 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `request_claimed_task_cancellation(task_id, worker_id, lease_expires_at, error=...)`
 - `reconcile_task_cancellation(TaskCancellationReconciliationRequest(...))`
 - `cancel_task(task_id, error=...)`
+
+Bound claims are advertised by `supports_bound_interrupted_task_handoffs`.
+Their optional `TaskContinuationExpectation` (from `cayu.tasks.continuation_claims`)
+binds the exact task ID, session ID and incarnation, prior handoff generation, and
+selected-operation SHA-256. Supporting stores match the attachment and generation
+inside the claim transaction and persist the complete expectation digest with the
+one-use claim registry. Replaying the same worker/generation with any changed or
+omitted expectation fails closed. The operation digest binds the selecting owner's
+pause and decision; runtime pause admission still validates that evidence before
+execution. Memory, SQLite and PostgreSQL implement this contract. Persistent task
+adapters require storage revision 126, which adds the nullable expectation digest
+to the existing registry; ordinary unbound worker claims retain their null binding.
 
 An interrupted-handoff generation is not workerless direct-resume authority.
 The caller creates a fresh opaque generation with
@@ -9972,6 +9984,13 @@ forks inherit the source display metadata. Ordinary user metadata replacement
 preserves them. See [session display metadata](session-inspection.md#titles-completion-summaries-and-specialist-descriptions)
 for limits, authoring APIs, and scoped access. Migration: regenerate OpenAPI
 clients and deploy independently hosted dashboards with the matching contract.
+
+Server contract version 56 extends session overview counts with event-window
+tokens/cost and completeness, Inbox queries with public-projection `q`, settlement
+responses with durable reasons, and `task_continuation="claim"` for controlled
+workerless handoffs. The browser client and generated dashboard contract match 56.
+Storage revision 126 is required by the bound task claim owner; see the task-store
+contract above. No capped browser totals or raw hidden argument searches are used.
 
 Server contract version 55 adds the `structured_output_transcript` capability
 and a durable `StructuredOutputPart`
