@@ -28,6 +28,15 @@ from cayu.server.contracts import (
     SessionOverviewTokens,
     SessionOverviewUses,
 )
+from cayu.session_metadata import (
+    MAX_SESSION_SUMMARY_LENGTH,
+    MAX_SESSION_TITLE_LENGTH,
+    SUMMARY_METADATA_KEY,
+    SUMMARY_TONE_METADATA_KEY,
+    SUMMARY_TONES,
+    TITLE_METADATA_KEY,
+    validate_display_text,
+)
 from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.sessions._run_identity import is_eval_trial, session_run_id, session_run_lineage
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
@@ -160,30 +169,35 @@ class SessionOverviewService:
         return total
 
     def _text(self, value: object, *, limit: int) -> str | None:
-        # Reject wrong types before redaction/serialization can invoke repr/str.
-        if type(value) is not str or not value.strip() or len(value) > limit:
+        # The writer and reader share the same bounded validation boundary.
+        try:
+            text = validate_display_text(value, limit=limit)
+        except ValueError:
             return None
-        if any(
-            ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in value
-        ):
+        redacted = self.redact(text)
+        try:
+            return validate_display_text(redacted, limit=limit)
+        except ValueError:
             return None
-        redacted = self.redact(value)
-        return redacted if type(redacted) is str and len(redacted) <= limit else None
 
     def _project(
         self, facts: SessionOverviewFacts, uses: SessionOverviewUses
     ) -> SessionOverviewResponse:
         session, usage, cost = facts.session, facts.usage, facts.cost
         metrics = None if usage is None else usage.usage
-        tone = session.metadata.get("cayu:summary_tone")
+        tone = session.metadata.get(SUMMARY_TONE_METADATA_KEY)
         return SessionOverviewResponse(
             session_id=self.project_session(session.id),
             run_id=session_run_id(session),
             state=facts.status,
             reason=self._text(facts.outcome.reason, limit=1024) or "unknown",
-            title=self._text(session.metadata.get("cayu:title"), limit=256),
-            summary=self._text(session.metadata.get("cayu:summary"), limit=4096),
-            summary_tone=tone if type(tone) is str and tone in {"neutral", "attention"} else None,
+            title=self._text(
+                session.metadata.get(TITLE_METADATA_KEY), limit=MAX_SESSION_TITLE_LENGTH
+            ),
+            summary=self._text(
+                session.metadata.get(SUMMARY_METADATA_KEY), limit=MAX_SESSION_SUMMARY_LENGTH
+            ),
+            summary_tone=tone if type(tone) is str and tone in SUMMARY_TONES else None,
             started_at=session.created_at,
             ended_at=facts.ended_at,
             last_activity_at=session.last_activity_at,

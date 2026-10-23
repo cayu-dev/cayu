@@ -18,6 +18,7 @@ from cayu._validation import (
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event
 from cayu.messages import Message
+from cayu.session_metadata import validate_description
 from cayu.tools.base import Tool
 
 
@@ -67,7 +68,7 @@ class AgentSpec(BaseModel):
     @classmethod
     def copy_json_mapping(cls, value: dict[str, Any], info) -> dict[str, Any]:
         if info.field_name == "metadata":
-            return copy_durable_metadata(value, "metadata")
+            return validate_description(copy_durable_metadata(value, "metadata"))
         return copy_durable_json_object(value, info.field_name)
 
     @field_validator("name", "model")
@@ -129,4 +130,5 @@ def copy_agent_spec(spec: AgentSpec) -> AgentSpec:
 
     if type(spec) is not AgentSpec:
         raise TypeError("Agent specification copy requires an AgentSpec.")
-    return AgentSpec.model_validate(spec.model_dump(mode="python"))
+    validate_description(copy_durable_metadata(spec.metadata))
+    return AgentSpec.model_validate(spec.model_dump(mode="python", warnings=False))

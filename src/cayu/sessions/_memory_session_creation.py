@@ -13,6 +13,7 @@ from uuid import uuid4
 from cayu._validation import copy_durable_json_object
 from cayu.events import Event, EventType
 from cayu.messages import Message, MessageRole, copy_message
+from cayu.session_metadata import inherited_display_metadata
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _checkpoint_publication as checkpoint_publication
 from cayu.sessions import _closure_records as closure_records
@@ -722,6 +723,7 @@ async def create_fork(
             expected_source_run_epoch=expected_source_run_epoch,
             profile_relationship=profile_relationship,
         )
+        fork.metadata.update(inherited_display_metadata(source_session.metadata))
         fork.metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
         fork.metadata.update(run_marks_for_creation(source_session))
         if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in state.session_operation_records.get(

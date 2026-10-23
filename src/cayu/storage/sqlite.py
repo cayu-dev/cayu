@@ -20,6 +20,7 @@ from cayu.collaboration.peer_content import (
 )
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.session_metadata import SummaryTone, summary_metadata
 from cayu.sessions import creation_fence
 from cayu.sessions._access_rules import runtime_session_mutation, runtime_session_query
 from cayu.sessions._closure_records import (
@@ -40,6 +41,7 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
     SessionMessageSource,
 )
+from cayu.sessions.records import update_session_annotations
 from cayu.storage import _creation_fence
 from cayu.storage import _sqlite_context_views as context_view_ops
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
@@ -324,7 +326,6 @@ from cayu.sessions.records import (
     _validate_status_set,
     copy_session_runtime_identity,
     copy_session_user_metadata,
-    replace_session_user_metadata,
 )
 from cayu.sessions.recovery import (
     _active_unexpired_incomplete_recovery_claim_id,
@@ -2940,6 +2941,25 @@ class SQLiteSessionStore(
             return loaded
 
     @runtime_session_mutation
+    async def set_summary(
+        self,
+        session_id: str,
+        summary: str,
+        *,
+        tone: SummaryTone = "neutral",
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
+        return await self._update_display_or_user_metadata(
+            session_id,
+            None,
+            summary_patch=summary_metadata(summary, tone),
+            _access_bounds=_access_bounds,
+        )
+
+    async def _access_set_summary(self, bounds, session_id, summary, tone):
+        return await self.set_summary(session_id, summary, tone=tone, _access_bounds=bounds)
+
+    @runtime_session_mutation
     async def update_metadata(
         self,
         session_id: str,
@@ -2947,8 +2967,22 @@ class SQLiteSessionStore(
         *,
         _access_bounds: _SessionAccessBounds | None = None,
     ) -> Session:
+        return await self._update_display_or_user_metadata(
+            session_id,
+            metadata,
+            _access_bounds=_access_bounds,
+        )
+
+    async def _update_display_or_user_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any] | None,
+        *,
+        summary_patch: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        user_metadata = copy_session_user_metadata(metadata)
+        user_metadata = None if metadata is None else copy_session_user_metadata(metadata)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -2964,9 +2998,10 @@ class SQLiteSessionStore(
                 _assert_session_run_epoch_value(session_id, row["run_epoch"])
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
-                new_metadata = replace_session_user_metadata(
+                new_metadata = update_session_annotations(
                     json.loads(row["metadata_json"]),
                     user_metadata,
+                    summary_patch,
                 )
                 self._connection.execute(
                     "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",

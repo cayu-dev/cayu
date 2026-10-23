@@ -17,6 +17,7 @@ from uuid import uuid4
 from cayu._validation import copy_durable_json_object
 from cayu.events import Event
 from cayu.messages import Message
+from cayu.session_metadata import inherited_display_metadata
 from cayu.sessions import creation_fence
 from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
@@ -544,6 +545,7 @@ async def create_fork(
                 expected_source_run_epoch=expected_source_run_epoch,
                 profile_relationship=profile_relationship,
             )
+            fork.metadata.update(inherited_display_metadata(source_session.metadata))
             fork.metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
             fork.metadata.update(run_marks_for_creation(source_session))
             active_stage = connection.execute(

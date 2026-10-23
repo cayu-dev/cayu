@@ -4133,6 +4133,7 @@ export type ControlPlaneSurfaceCapabilities = {
     inbox?: OptionalSurfaceCapability | null;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
+    session_display_metadata?: OptionalSurfaceCapability | null;
     session_follow?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
@@ -15705,6 +15706,10 @@ export type RunBody = {
     structured_output?: StructuredOutputSpec | null;
     target?: ModelTarget | null;
     thinking?: ThinkingConfig | null;
+    /**
+     * Title
+     */
+    title?: string | null;
     tool_completion?: ToolCompletionPolicy | null;
 };
 

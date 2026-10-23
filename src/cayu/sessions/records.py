@@ -654,3 +654,25 @@ def replace_session_user_metadata(
         key: value for key, value in current.items() if is_runtime_owned_session_metadata_key(key)
     }
     return copy_session_metadata({**replacement, **runtime_metadata})
+
+
+def update_session_annotations(
+    current: dict[str, Any],
+    replacement: dict[str, Any] | None,
+    summary_patch: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply one annotation operation within the existing store write owner."""
+    if summary_patch is not None:
+        from cayu.session_metadata import (
+            SUMMARY_METADATA_KEY,
+            SUMMARY_TONE_METADATA_KEY,
+            summary_metadata,
+        )
+
+        patch = summary_metadata(
+            summary_patch[SUMMARY_METADATA_KEY], summary_patch[SUMMARY_TONE_METADATA_KEY]
+        )
+        return copy_session_metadata({**current, **patch})
+    if replacement is None:
+        raise ValueError("Annotation replacement is required.")
+    return replace_session_user_metadata(current, replacement)

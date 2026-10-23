@@ -194,6 +194,7 @@ from cayu.server.sse import (
     SseErrorCode,
     SseErrorKind,
 )
+from cayu.session_metadata import MAX_SESSION_SUMMARY_LENGTH, MAX_SESSION_TITLE_LENGTH, SummaryTone
 from cayu.sessions._execution_profile_checkpoint import SessionExecutionProfiles
 from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.interactions import InteractionSummaryEvidence
@@ -2200,9 +2201,9 @@ class SessionOverviewResponse(ApiBaseModel):
     run_id: str
     state: SessionOverviewStatus
     reason: str
-    title: str | None
-    summary: str | None
-    summary_tone: Literal["neutral", "attention"] | None
+    title: str | None = Field(max_length=MAX_SESSION_TITLE_LENGTH)
+    summary: str | None = Field(max_length=MAX_SESSION_SUMMARY_LENGTH)
+    summary_tone: SummaryTone | None
     started_at: datetime
     ended_at: datetime | None
     last_activity_at: datetime

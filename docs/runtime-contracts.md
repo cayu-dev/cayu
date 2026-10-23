@@ -9961,6 +9961,18 @@ and never changes authorization on another route. Migration: regenerate
 OpenAPI clients and deploy independently hosted dashboards with their matching
 server contract version.
 
+Server contract version 52 adds `RunRequest.title`, the optional `title` field on
+`POST /api/run`, and `capabilities.surfaces.session_display_metadata`. The
+`app.run(request)` signature is unchanged. Session titles, summaries and explicit
+summary tone use the reserved keys defined in `cayu.session_metadata`;
+`SessionStore.set_summary` atomically updates summary and tone under the existing
+annotation ownership checks. `AgentSpec.metadata["cayu:description"]` carries a
+bounded specialist description. These fields survive persistence and continuation;
+forks inherit the source display metadata. Ordinary user metadata replacement
+preserves them. See [session display metadata](session-inspection.md#titles-completion-summaries-and-specialist-descriptions)
+for limits, authoring APIs, and scoped access. Migration: regenerate OpenAPI
+clients and deploy independently hosted dashboards with the matching contract.
+
 The protected `GET /api/contract` response also carries the server-authoritative
 control-plane capability projection. It reports whether Workflow topology,
 the read-only session follow stream, Tasks, reviewed

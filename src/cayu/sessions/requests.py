@@ -51,6 +51,11 @@ from cayu.messages import Message, detach_message
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
+from cayu.session_metadata import (
+    MAX_SESSION_TITLE_LENGTH,
+    reject_session_display_metadata,
+    validate_title,
+)
 from cayu.sessions import records as session_record_rules
 from cayu.sessions import transcript_input as session_transcript_input
 from cayu.sessions._execution_profile_checkpoint import EXECUTION_PROFILE_METADATA_KEY
@@ -253,6 +258,8 @@ class RunRequest(BaseModel):
 
     agent_name: str
     messages: list[Message]
+    title: str | None = Field(default=None, max_length=MAX_SESSION_TITLE_LENGTH)
+
     execution_deadline: ExecutionDeadline = Field(
         default_factory=current_execution_deadline,
         exclude_if=lambda boundary: boundary.expires_at is None,
@@ -310,6 +317,11 @@ class RunRequest(BaseModel):
     _runtime_task_invocation: TaskInvocationSnapshot | None = PrivateAttr(default=None)
     _runtime_prepared_session_authority: object | None = PrivateAttr(default=None)
 
+    @field_validator("title", mode="before")
+    @classmethod
+    def validate_display_title(cls, value: object) -> str | None:
+        return validate_title(value)
+
     @field_validator("failover", mode="before")
     @classmethod
     def copy_failover(cls, value: object) -> ModelFailoverPolicy | None:
@@ -324,6 +336,7 @@ class RunRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         copied = copy_durable_metadata(value)
+        reject_session_display_metadata(copied)
         reserved_key = next(
             (
                 key
@@ -583,6 +596,7 @@ class ResumeRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         copied = copy_durable_metadata(value)
+        reject_session_display_metadata(copied)
         if EXECUTION_DEADLINE_METADATA_KEY in copied:
             raise ValueError("Session metadata contains runtime-owned deadline authority.")
         return copied
@@ -740,7 +754,7 @@ class InterruptSessionRequest(BaseModel):
 
 
 class ForkSessionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     source_session_id: str
     session_id: str | None = None
@@ -797,6 +811,7 @@ class ForkSessionRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         copied = copy_durable_metadata(value)
+        reject_session_display_metadata(copied)
         reserved_authority_kinds = {
             EXECUTION_DEADLINE_METADATA_KEY: "execution-deadline authority",
             MODEL_TARGET_PROJECTION_METADATA_KEY: "model-target authority",
@@ -995,6 +1010,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         raise ValueError("RunRequest messages must be a list.")
     copied = RunRequest(
         agent_name=request.agent_name,
+        title=validate_title(request.title),
         messages=[detach_message(message) for message in messages],
         session_id=request.session_id,
         execution_deadline=request.execution_deadline,

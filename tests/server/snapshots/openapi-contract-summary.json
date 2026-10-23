@@ -5714,6 +5714,16 @@
         "reviewed_knowledge": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
+        "session_display_metadata": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_follow": {
           "anyOf": [
             {
@@ -11068,6 +11078,18 @@
             }
           ]
         },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
         "tool_completion": {
           "anyOf": [
             {
@@ -11363,7 +11385,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "51",
+          "default": "52",
           "title": "Contract Version",
           "type": "string"
         },
@@ -12554,6 +12576,7 @@
         "summary": {
           "anyOf": [
             {
+              "maxLength": 4096,
               "type": "string"
             },
             {
@@ -12580,6 +12603,7 @@
         "title": {
           "anyOf": [
             {
+              "maxLength": 256,
               "type": "string"
             },
             {
@@ -17221,7 +17245,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "51",
+          "default": "52",
           "title": "Contract Version",
           "type": "string"
         }

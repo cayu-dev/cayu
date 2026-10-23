@@ -10,6 +10,7 @@ _SESSION_OPERATIONS = frozenset(
         "list_sessions",
         "update_labels",
         "update_metadata",
+        "set_summary",
         "delete_session",
         "summarize_events",
         "summarize_outcome",

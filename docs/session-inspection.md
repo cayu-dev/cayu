@@ -7,6 +7,66 @@ without requiring operators to know Cayu table names or JSON paths. The
 resolution command talks to the authenticated Cayu server; it never mutates the
 store directly.
 
+## Titles, completion summaries, and specialist descriptions
+
+Set a session title on its typed request. The `app.run(request)` signature is
+unchanged; HTTP `POST /api/run` accepts the same optional `title` field.
+
+```python
+from cayu import Message, RunRequest
+
+request = RunRequest(
+    agent_name="assistant",
+    session_id="quarterly-review",
+    title="Review quarterly accounts",
+    messages=[Message.text("user", "Review the quarterly accounts.")],
+)
+async for event in app.run(request):
+    pass
+
+# Set this from agent code once its outcome is known. It does not end a run.
+await app.session_store.set_summary(
+    "quarterly-review", "Two entries need review", tone="attention"
+)
+```
+
+`set_summary` atomically replaces only the summary and tone; concurrent user
+annotations are retained. It uses the same run-epoch and closure-owner fences
+as other annotation writes. A scoped `access.sessions.set_summary(...)` also
+requires current visibility and `modify` permission. The tone defaults to
+`neutral`; only `neutral` and `attention` are accepted. Readers never infer tone
+from text. Like other annotation writes, it updates `updated_at`, not runtime
+`last_activity_at`. An adapter without this optional method raises
+`NotImplementedError`; the memory, SQLite and PostgreSQL stores implement it.
+
+The reserved conventions are defined once in `cayu.session_metadata`:
+
+| Key | Owner and meaning |
+| --- | --- |
+| `cayu:title` | Session title from `RunRequest.title`, at most 256 characters. |
+| `cayu:summary` | Agent-authored outcome from `set_summary`, at most 4096 characters. |
+| `cayu:summary_tone` | Explicit `neutral` or `attention`, written with the summary. |
+| `cayu:description` | One-line specialist description in `AgentSpec.metadata`, at most 1024 characters. |
+| `cayu:eval_trial` | Runtime-owned eval-trial marker, inherited by descendants. |
+| `cayu:attention_handoff` | Caller-set `False` opts out of human-attention handoff, inherited by descendants. |
+| `cayu:run_lineage` | Runtime-owned original run ancestry. |
+
+Display text must be an exact string, nonblank, without control characters or
+surrogates. Validation rejects rather than truncates. Titles pass through the
+run's secret redactor before persistence. Direct store annotation APIs retain
+the supplied text, as with existing user metadata; supply publication-safe
+summaries. Session requests and metadata replacement cannot write title,
+summary, or tone directly; use their typed APIs. Existing runtime authority
+keys remain protected. Ordinary metadata replacement preserves these fields.
+
+Titles and summaries survive storage reopen and session continuation. Forks
+inherit the source title, summary and tone; a fork's agent may replace its own
+summary when its outcome changes. Independent child runs receive their own
+optional title. Display metadata does not change execution or session status.
+The `session_display_metadata` surface capability advertises these conventions;
+the existing session reads expose their metadata, and this adds no summary
+HTTP mutation route.
+
 ## Configure the session store
 
 New local projects use one SQLite database at `data/cayu.db`:

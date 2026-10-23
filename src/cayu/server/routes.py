@@ -40,6 +40,8 @@ from pydantic import (
 from sse_starlette.event import ServerSentEvent
 from sse_starlette.sse import EventSourceResponse
 
+from cayu.session_metadata import MAX_SESSION_TITLE_LENGTH, validate_title
+
 if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
@@ -1899,6 +1901,13 @@ class _BoundedControlPlanePromptBody(BaseModel):
 
 
 class RunBody(_BoundedControlPlanePromptBody):
+    title: str | None = Field(default=None, max_length=MAX_SESSION_TITLE_LENGTH)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def validate_display_title(cls, value: object) -> str | None:
+        return validate_title(value)
+
     prompt: NonBlankString
     session_id: ReplaySafeSessionId | None = Field(
         default=None,
@@ -5771,6 +5780,7 @@ def create_router(
 
         request = RunRequest(
             agent_name=body.agent,
+            title=body.title,
             session_id=session_id,
             target=body.target,
             failover=body.failover,

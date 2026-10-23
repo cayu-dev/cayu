@@ -220,6 +220,7 @@ def prepare_run_request(
     prepared = request.model_copy(
         update={
             "messages": redacted_messages,
+            "title": None if request.title is None else redactor.redact_text(request.title),
             "metadata": redact_json_object(
                 request.metadata,
                 field_name="metadata",

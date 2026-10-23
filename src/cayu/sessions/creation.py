@@ -21,6 +21,11 @@ from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
     direct_tool_capability_ceiling_component,
 )
+from cayu.session_metadata import (
+    TITLE_METADATA_KEY,
+    reject_session_display_metadata,
+    validate_title,
+)
 from cayu.sessions import records as session_record_rules
 from cayu.sessions import requests as session_request_contracts
 from cayu.sessions._execution_profile_checkpoint import (
@@ -116,6 +121,9 @@ def session_metadata_for_creation(
     """Combine caller metadata with runtime-owned creation authority."""
 
     copied = copy_durable_metadata(metadata)
+    reject_session_display_metadata(copied)
+    if prepared_request is not None and prepared_request.title is not None:
+        copied[TITLE_METADATA_KEY] = validate_title(prepared_request.title)
     if EXECUTION_DEADLINE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned deadline authority.")
     boundary = effective_deadline(

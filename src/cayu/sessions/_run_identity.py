@@ -9,17 +9,15 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from cayu._validation import canonical_durable_json_bytes
+from cayu.session_metadata import (
+    ATTENTION_HANDOFF_METADATA_KEY,
+    EVAL_TRIAL_METADATA_KEY,
+    RUN_LINEAGE_METADATA_KEY,
+)
 
 if TYPE_CHECKING:
     from cayu.sessions.records import Session
 
-RUN_LINEAGE_METADATA_KEY = "cayu:run_lineage"
-#: Runtime-owned session metadata, ``True`` on every session created while the eval
-#: runner runs a trial and on every session created under one. Callers cannot set it.
-EVAL_TRIAL_METADATA_KEY = "cayu:eval_trial"
-#: Session metadata that, set to ``False``, keeps the session and the sessions created
-#: under it from the human-attention receiver.
-ATTENTION_HANDOFF_METADATA_KEY = "cayu:attention_handoff"
 _EVAL_TRIAL: ContextVar[bool] = ContextVar("cayu_eval_trial", default=False)
 
 

@@ -68,6 +68,7 @@ from cayu.runtime.public_authority import (
     _public_authority_alias_store_key,
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
+from cayu.session_metadata import SummaryTone, summary_metadata
 from cayu.sessions import _checkpoint_mutations as checkpoint_mutation_rules
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _child_lifecycle_rules as child_lifecycle_rules
@@ -230,7 +231,7 @@ from cayu.sessions.records import (
     TranscriptRecord,
     copy_session_runtime_identity,
     copy_session_user_metadata,
-    replace_session_user_metadata,
+    update_session_annotations,
 )
 from cayu.sessions.recovery import (
     _INTERRUPTION_CASCADE_MISSING,
@@ -2828,6 +2829,25 @@ class InMemorySessionStore(
             return updated.model_copy(deep=True)
 
     @runtime_session_mutation
+    async def set_summary(
+        self,
+        session_id: str,
+        summary: str,
+        *,
+        tone: SummaryTone = "neutral",
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
+        return await self._update_display_or_user_metadata(
+            session_id,
+            None,
+            summary_patch=summary_metadata(summary, tone),
+            _access_bounds=_access_bounds,
+        )
+
+    async def _access_set_summary(self, bounds, session_id, summary, tone):
+        return await self.set_summary(session_id, summary, tone=tone, _access_bounds=bounds)
+
+    @runtime_session_mutation
     async def update_metadata(
         self,
         session_id: str,
@@ -2835,8 +2855,22 @@ class InMemorySessionStore(
         *,
         _access_bounds: _SessionAccessBounds | None = None,
     ) -> Session:
+        return await self._update_display_or_user_metadata(
+            session_id,
+            metadata,
+            _access_bounds=_access_bounds,
+        )
+
+    async def _update_display_or_user_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any] | None,
+        *,
+        summary_patch: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        user_metadata = copy_session_user_metadata(metadata)
+        user_metadata = None if metadata is None else copy_session_user_metadata(metadata)
         async with self._lock:
             session = self._sessions.get(session_id)
             if _access_bounds is not None:
@@ -2846,7 +2880,9 @@ class InMemorySessionStore(
             invocation_scope._assert_session_run_epoch(session_id, session)
             for owner in self._session_closure_progress.owners((session_id,)):
                 closure_records._check_closure_lineage_owner(owner, (session_id,))
-            new_metadata = replace_session_user_metadata(session.metadata, user_metadata)
+            new_metadata = update_session_annotations(
+                session.metadata, user_metadata, summary_patch
+            )
             now = self._ownership_clock()
             updated = session.model_copy(update={"metadata": new_metadata, "updated_at": now})
             from cayu.sessions._invocation_lifecycle import (

@@ -10,6 +10,8 @@ from pathlib import Path
 from types import FunctionType, MethodType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, overload
 
+from cayu.session_metadata import SummaryTone
+
 if TYPE_CHECKING:
     from cayu.sessions._invocation_lifecycle import InvocationLifecycleCommand
 from uuid import uuid4
@@ -427,6 +429,9 @@ class SessionStore(ABC):
 
     async def _access_create_session(self, bounds, request, identity):
         raise NotImplementedError("Atomic scoped session creation is unsupported.")
+
+    async def _access_set_summary(self, bounds, session_id, summary, tone):
+        raise NotImplementedError("Atomic scoped summary mutation is unsupported.")
 
     async def _access_update_metadata(self, bounds, session_id, metadata):
         raise NotImplementedError("Atomic scoped metadata mutation is unsupported.")
@@ -1254,6 +1259,7 @@ class SessionStore(ABC):
             "transform_checkpoint",
             "update_labels",
             "update_metadata",
+            "set_summary",
             "load_interaction_transition_receipt",
             "load_invocation_settlement_transition",
             "_load_interaction_transition_receipt_by_event_id",
@@ -5356,6 +5362,20 @@ class SessionStore(ABC):
         ``NotImplementedError`` so out-of-tree stores keep working.
         """
         raise NotImplementedError("This SessionStore does not support update_labels.")
+
+    async def set_summary(
+        self,
+        session_id: str,
+        summary: str,
+        *,
+        tone: SummaryTone = "neutral",
+    ) -> Session:
+        """Atomically replace summary and tone, retaining all other metadata.
+
+        Uses the same run/closure ownership fences as annotation writes. Call
+        from agent code when its outcome is known; this does not end the run.
+        """
+        raise NotImplementedError("This SessionStore does not support set_summary.")
 
     async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
         """Replace a session's user metadata and return the updated session.

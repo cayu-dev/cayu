@@ -124,6 +124,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMigrationRequired,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.session_metadata import inherited_display_metadata
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
@@ -1927,6 +1928,7 @@ class SessionFork:
             request_metadata=source_session.metadata,
         )
         fork_metadata = copy_durable_metadata(request.metadata)
+        fork_metadata.update(inherited_display_metadata(source_session.metadata))
         if inherited_taint_labels:
             fork_metadata = metadata_with_taint_labels(
                 fork_metadata,

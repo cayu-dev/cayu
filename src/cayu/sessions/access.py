@@ -11,6 +11,12 @@ from typing import Literal
 
 from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu._validation import copy_label_map
+from cayu.session_metadata import (
+    SUMMARY_METADATA_KEY,
+    SUMMARY_TONE_METADATA_KEY,
+    SummaryTone,
+    summary_metadata,
+)
 from cayu.sessions import _access_rules as session_access_rules
 from cayu.sessions._access_rules import Action as Action
 from cayu.sessions._access_rules import SessionAccessDenied as SessionAccessDenied
@@ -27,7 +33,7 @@ from cayu.sessions.queries import (
     copy_session_query,
 )
 from cayu.sessions.records import Session, SessionIdentity
-from cayu.sessions.requests import RunRequest
+from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.sessions.store import SessionStore
 from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
 
@@ -123,9 +129,20 @@ class ScopedSessionAccess:
     async def create(self, request: RunRequest, *, identity: SessionIdentity) -> Session:
         if type(request) is not RunRequest or type(identity) is not SessionIdentity:
             raise TypeError("Creation requires RunRequest and SessionIdentity.")
-        request = request.model_copy(deep=True)
+        request = copy_run_request(request)
         identity = identity.model_copy(deep=True)
         return await self.__store._access_create_session(await self._bounds(), request, identity)
+
+    async def set_summary(
+        self, session_id: str, summary: str, *, tone: SummaryTone = "neutral"
+    ) -> Session:
+        patch = summary_metadata(summary, tone)
+        return await self.__store._access_set_summary(
+            await self._bounds(),
+            session_id,
+            patch[SUMMARY_METADATA_KEY],
+            patch[SUMMARY_TONE_METADATA_KEY],
+        )
 
     async def update_metadata(self, session_id: str, metadata: dict) -> Session:
         from cayu.sessions.records import copy_session_user_metadata

@@ -334,11 +334,11 @@ class ScopedCayuAccess:
         from contextlib import aclosing
         from uuid import uuid4
 
-        from cayu.sessions.requests import RunRequest
+        from cayu.sessions.requests import RunRequest, copy_run_request
 
         if type(request) is not RunRequest:
             raise TypeError("Scoped runs require RunRequest.")
-        request = request.model_copy(deep=True)
+        request = copy_run_request(request)
         if request.session_id is None:
             request = request.model_copy(update={"session_id": str(uuid4())})
         async with aclosing(
