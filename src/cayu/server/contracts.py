@@ -2093,6 +2093,15 @@ class VersioningContract(ApiBaseModel):
     ] = ("openapi_snapshot_update", "client_regeneration", "migration_note")
 
 
+class AppInfoResponse(ApiBaseModel):
+    """Agent display identity and viewer access; never an authorization token."""
+
+    name: StrictStr = Field(max_length=MAX_SYSTEM_DEPLOYMENT_NAME_CHARS)
+    runtime_version: StrictStr = Field(max_length=128)
+    role: StrictStr | None
+    full_access: StrictBool
+
+
 class ServerContractResponse(ApiBaseModel):
     api_prefix: str = SERVER_API_PREFIX
     contract_version: str = SERVER_CONTRACT_VERSION

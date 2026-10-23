@@ -3,13 +3,13 @@
  * captured from `cayu serve --dev`, with pricing turned on because the seeds carry costs.
  * Today's pages gate themselves on its capabilities.
  */
-import type { ServerContract } from "@/lib/api"
+import { type ServerContract, SUPPORTED_SERVER_CONTRACT_VERSION } from "@/lib/api"
 
 export const CONTRACT: ServerContract = {
   api_prefix: "/api",
-  contract_version: "49",
+  contract_version: SUPPORTED_SERVER_CONTRACT_VERSION,
   versioning: {
-    contract_version: "49",
+    contract_version: SUPPORTED_SERVER_CONTRACT_VERSION,
     compatibility: "additive-with-explicit-breaking-review",
     breaking_change_requires: ["openapi_snapshot_update", "client_regeneration", "migration_note"],
   },

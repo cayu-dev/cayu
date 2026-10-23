@@ -160,6 +160,7 @@ from cayu.runtime.request_costs import (
     disabled_request_cost_summary,
 )
 from cayu.runtime.tool_completion import ToolCompletionPolicy
+from cayu.server._app_info_routes import register_app_info_routes
 from cayu.server._browser_client import (
     BROWSER_CLIENT_MODULE,
     BROWSER_CLIENT_TYPES,
@@ -286,6 +287,7 @@ from cayu.server.evals_registry import (
 )
 from cayu.server.evals_worker import EvalRunCoordinator
 from cayu.server.inbox import InboxAccess, InboxItemKind
+from cayu.server.proxy_identity import ControlPlaneRoles
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_OBSERVER_MAX_BYTES,
@@ -4601,6 +4603,16 @@ def create_router(
         return await auth_dependency(request)
 
     optional_auth_context = Depends(_optional_auth_context)
+
+    role_policy = getattr(auth, "control_plane_roles", None)
+    register_app_info_routes(
+        router,
+        project_name=None if _project_context is None else _project_context.project_id,
+        deployment_name=diagnostics_snapshot.deployment_name,
+        runtime_version=capability_snapshot.cayu_version,
+        roles=role_policy if isinstance(role_policy, ControlPlaneRoles) else None,
+        optional_auth_context=optional_auth_context,
+    )
 
     async def _session_message_context(request: Request) -> SessionMessageAccessContext:
         context = await _optional_auth_context(request)

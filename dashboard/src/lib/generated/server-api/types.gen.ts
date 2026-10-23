@@ -2350,6 +2350,30 @@ export type ApiWorkspaceBranchLifecycle = {
 };
 
 /**
+ * AppInfoResponse
+ *
+ * Agent display identity and viewer access; never an authorization token.
+ */
+export type AppInfoResponse = {
+    /**
+     * Full Access
+     */
+    full_access: boolean;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Role
+     */
+    role: string | null;
+    /**
+     * Runtime Version
+     */
+    runtime_version: string;
+};
+
+/**
  * AppManifest
  */
 export type AppManifest = {
@@ -4100,6 +4124,7 @@ export type ControlPlaneMutationCapabilities = {
  * ControlPlaneSurfaceCapabilities
  */
 export type ControlPlaneSurfaceCapabilities = {
+    app_info?: OptionalSurfaceCapability | null;
     artifacts: OptionalSurfaceCapability;
     browser_recordings?: OptionalSurfaceCapability | null;
     dashboard: OptionalSurfaceCapability;
@@ -20540,6 +20565,22 @@ export type GetAgentApiAgentsAgentNameGetResponses = {
 };
 
 export type GetAgentApiAgentsAgentNameGetResponse = GetAgentApiAgentsAgentNameGetResponses[keyof GetAgentApiAgentsAgentNameGetResponses];
+
+export type GetAppInfoApiAppGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/app';
+};
+
+export type GetAppInfoApiAppGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: AppInfoResponse;
+};
+
+export type GetAppInfoApiAppGetResponse = GetAppInfoApiAppGetResponses[keyof GetAppInfoApiAppGetResponses];
 
 export type ListArtifactsApiArtifactsGetData = {
     body?: never;

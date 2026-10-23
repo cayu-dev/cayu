@@ -4397,6 +4397,45 @@
       "title": "ApiWorkspaceBranchLifecycle",
       "type": "object"
     },
+    "AppInfoResponse": {
+      "additionalProperties": false,
+      "description": "Agent display identity and viewer access; never an authorization token.",
+      "properties": {
+        "full_access": {
+          "title": "Full Access",
+          "type": "boolean"
+        },
+        "name": {
+          "maxLength": 128,
+          "title": "Name",
+          "type": "string"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Role"
+        },
+        "runtime_version": {
+          "maxLength": 128,
+          "title": "Runtime Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "runtime_version",
+        "role",
+        "full_access"
+      ],
+      "title": "AppInfoResponse",
+      "type": "object"
+    },
     "ApprovalArgumentsRevision": {
       "additionalProperties": false,
       "description": "Runtime evidence that a person approved a call with changed arguments.\n\n``changed_fields`` names only top-level properties the tool's schema\ndeclares; it never carries argument values. The digests identify the\nproposed and approved versions with HMAC-SHA256 under the session store's\npublic-authority alias key ``digest_key_id``, so they cannot be confirmed\nby guessing; all three are ``None`` when the store has no alias keyring.",
@@ -5627,6 +5666,16 @@
     "ControlPlaneSurfaceCapabilities": {
       "additionalProperties": false,
       "properties": {
+        "app_info": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "artifacts": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
@@ -11290,7 +11339,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "49",
+          "default": "50",
           "title": "Contract Version",
           "type": "string"
         },
@@ -16872,7 +16921,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "49",
+          "default": "50",
           "title": "Contract Version",
           "type": "string"
         }
@@ -17071,6 +17120,24 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/app": {
+      "get": {
+        "operation_id": "get_app_info_api_app_get",
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/AppInfoResponse"
               }
             }
           }

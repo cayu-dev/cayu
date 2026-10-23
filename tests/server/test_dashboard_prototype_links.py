@@ -85,6 +85,9 @@ def test_prototype_artifact_native_links_stay_inside_fake_data(prototype_url, tm
             page.goto(f"{prototype_url}#/artifacts")
             raw = page.get_by_role("link", name="Open raw", exact=True)
             download = page.get_by_role("link", name="Download", exact=True)
+            playwright.expect(
+                page.get_by_text("This Cayu server's contract isn't supported.", exact=True)
+            ).not_to_be_visible()
             playwright.expect(raw).to_be_visible(timeout=15000)
             playwright.expect(download).to_be_visible()
 

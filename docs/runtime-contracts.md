@@ -9947,6 +9947,20 @@ and causal-budget summaries—parse that canonical JSON representation back to
 Python integers, while direct Python construction remains strict and does not
 accept string counters.
 
+Server contract version 50 adds the protected, read-only `GET /api/app` endpoint
+and `capabilities.surfaces.app_info`. Its response contains `name`,
+`runtime_version`, `role` and `full_access`. The display name uses the normalized
+public project identity (`[project].name`), then deployment name, then `Cayu`, omitting names outside the existing
+128-character diagnostic bound. Runtime version comes from installed package
+metadata, or `unknown` when unavailable. A configured `ControlPlaneRoles`
+supplies its authenticated role claim (including custom roles) and decides
+`full_access`; role spelling alone is not authority. Without a configured role
+policy, an admitted caller receives `role: null` and `full_access: true`.
+Members can read this endpoint. It returns `Cache-Control: private, no-store`
+and never changes authorization on another route. Migration: regenerate
+OpenAPI clients and deploy independently hosted dashboards with their matching
+server contract version.
+
 The protected `GET /api/contract` response also carries the server-authoritative
 control-plane capability projection. It reports whether Workflow topology,
 the read-only session follow stream, Tasks, reviewed

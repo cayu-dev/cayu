@@ -215,6 +215,7 @@ class EvalsReadiness(_DiagnosticsModel):
 
 
 class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
+    app_info: OptionalSurfaceCapability | None = None
     dashboard: OptionalSurfaceCapability
     workflow: OptionalSurfaceCapability | None = None
     browser_recordings: OptionalSurfaceCapability | None = None

@@ -80,6 +80,7 @@ class ControlPlaneCapabilitySnapshot:
                 else ServerContractActor(subject=actor.subject, tenant=actor.tenant)
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
+                app_info=_optional_surface(True, mutation_supported=False),
                 browser_recordings=_optional_surface(
                     self.browser_recordings_configured,
                     mutation_supported=False,

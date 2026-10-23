@@ -4805,6 +4805,45 @@
         "title": "ApiWorkspaceBranchLifecycle",
         "type": "object"
       },
+      "AppInfoResponse": {
+        "additionalProperties": false,
+        "description": "Agent display identity and viewer access; never an authorization token.",
+        "properties": {
+          "full_access": {
+            "title": "Full Access",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 128,
+            "title": "Name",
+            "type": "string"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
+          "runtime_version": {
+            "maxLength": 128,
+            "title": "Runtime Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "runtime_version",
+          "role",
+          "full_access"
+        ],
+        "title": "AppInfoResponse",
+        "type": "object"
+      },
       "AppManifest": {
         "additionalProperties": false,
         "properties": {
@@ -8319,6 +8358,16 @@
       "ControlPlaneSurfaceCapabilities": {
         "additionalProperties": false,
         "properties": {
+          "app_info": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "artifacts": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -32904,7 +32953,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "49",
+            "default": "50",
             "title": "Contract Version",
             "type": "string"
           },
@@ -39612,7 +39661,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "49",
+            "default": "50",
             "title": "Contract Version",
             "type": "string"
           }
@@ -40411,6 +40460,24 @@
           }
         },
         "summary": "Get Agent"
+      }
+    },
+    "/api/app": {
+      "get": {
+        "operationId": "get_app_info_api_app_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppInfoResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get App Info"
       }
     },
     "/api/artifacts": {

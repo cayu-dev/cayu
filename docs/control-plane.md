@@ -14,6 +14,28 @@ All three modes expose a Developer dashboard surface. Public deployment requires
 and authorization; unauthenticated `ServerConfig.local_development()` access is for trusted
 loopback development only.
 
+## Agent identity and viewer access
+
+`GET /api/app` returns `name`, `runtime_version`, `role` and `full_access`.
+The name comes from the project's normalized public identity (`[project].name`),
+then the server deployment name, then `Cayu`; names outside the existing 128-character diagnostic bound are
+omitted before choosing the next fallback. The runtime version is `unknown`
+when installed package metadata is unavailable.
+
+With proxy identity, the response carries the authenticated role (`admin`,
+`developer`, `member`, or a configured custom role). `full_access` follows the
+configured `ControlPlaneRoles`, so clients must use it instead of inferring
+permission from the role's spelling. The proxy's default Basic-auth fallback
+reports `admin`. Without a configured role policy, callers admitted by the
+server's access dependency receive `role: null` and `full_access: true`.
+Authentication claims on their own do not enable a role policy.
+
+The read is available to members, advertises `capabilities.surfaces.app_info`,
+and uses `Cache-Control: private, no-store`. This is presentation information:
+each API route still enforces its own authorization and runtime preconditions.
+Server contract 50 adds this read; independently hosted dashboards must
+regenerate their client and upgrade their supported contract version together.
+
 ## Project-owned Evals assembly
 
 `cayu serve` assembles the durable, non-executable Evals foundation without

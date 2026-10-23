@@ -1,6 +1,7 @@
 // Behavior tests for the browser client served by mount_cayu at {path}/client.js.
 // Run with: node --test tests/browser_client/*.test.mjs
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { afterEach, beforeEach, mock, test } from "node:test"
 
 import {
@@ -269,8 +270,16 @@ afterEach(() => {
   delete globalThis.document
 })
 
-test("connect reads the contract with same-origin credentials", async () => {
-  const server = new FakeServer()
+test("connect reads the current server contract with same-origin credentials", async () => {
+  // Read the server authority, not the client's own constant: mirroring the latter
+  // in a fixture would let an obsolete client reject every real server unnoticed.
+  const authority = readFileSync(
+    new URL("../../src/cayu/_server_contract_version.py", import.meta.url),
+    "utf8",
+  )
+  const serverVersion = authority.match(/^SERVER_CONTRACT_VERSION = "([^"\n]+)"/m)?.[1]
+  assert.ok(serverVersion)
+  const server = new FakeServer(makeContract({ contractVersion: serverVersion }))
   const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
 
   assert.equal(server.requests.length, 1)

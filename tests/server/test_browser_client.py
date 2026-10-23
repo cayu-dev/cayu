@@ -131,13 +131,31 @@ def test_create_server_serves_the_client_next_to_its_api() -> None:
     assert other.get("/client.js").status_code == 404
 
 
-def test_browser_client_is_versioned_with_the_server_contract() -> None:
-    module = (_CLIENT_DIR / "client.js").read_text(encoding="utf-8")
-    types = (_CLIENT_DIR / "client.d.ts").read_text(encoding="utf-8")
+@pytest.mark.parametrize("entrance", ["server", "mount"])
+def test_browser_client_is_versioned_with_the_server_contract(entrance: str) -> None:
+    if entrance == "server":
+        app = create_server(CayuApp(), config=ServerConfig.local_development())
+        prefix = ""
+    else:
+        app = FastAPI()
+        mount_cayu(app, CayuApp(), path="/ops", access=OpenAccess())
+        prefix = "/ops"
+    client = TestClient(app)
+    contract = client.get(f"{prefix}/api/contract").json()
+    module_response = client.get(contract["client"]["module_url"])
+    types_response = client.get(contract["client"]["types_url"])
+    assert module_response.status_code == types_response.status_code == 200
+    module, types = module_response.text, types_response.text
 
-    assert _exported_constant(module, "CONTRACT_VERSION") == SERVER_CONTRACT_VERSION, (
-        "Update CONTRACT_VERSION in client.js with the server contract version."
+    assert (
+        _exported_constant(module, "CONTRACT_VERSION")
+        == contract["contract_version"]
+        == SERVER_CONTRACT_VERSION
+    ), "Update CONTRACT_VERSION in served client.js with the server contract version."
+    assert (
+        _exported_constant(module, "CLIENT_VERSION")
+        == contract["client"]["version"]
+        == BROWSER_CLIENT_VERSION
     )
-    assert _exported_constant(module, "CLIENT_VERSION") == BROWSER_CLIENT_VERSION
     assert _exported_constant(types, "CLIENT_VERSION") == BROWSER_CLIENT_VERSION
     assert "cayu guide app-ui" in module
