@@ -48,6 +48,11 @@ from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,
 )
+from cayu.sessions._browser_usage import (
+    BROWSER_USAGE_KEY,
+    browser_usage_publication_scope,
+    browser_usage_receipt,
+)
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.fork_overlays import fork_overlay_record_from_metadata
@@ -361,6 +366,11 @@ class ToolInvocationResources:
                 }
                 if storage_key in secondary_copy:
                     raise ValueError("A durable tool operation cannot duplicate its primary key.")
+                native_browser_used = type(registered_tool.tool) is BrowserSessionTool and any(
+                    record.get("record_type") == "cayu.browser-session"
+                    and record.get("parent_session_id") == session.id
+                    for record in (desired_copy, *secondary_copy.values())
+                )
                 control_mutation = None
                 if type(
                     registered_tool.tool
@@ -385,6 +395,7 @@ class ToolInvocationResources:
                     if (
                         current_session.id != session.id
                         or current_session.run_epoch != session.run_epoch
+                        or current_session.instance_id != session.instance_id
                     ):
                         raise SessionRunFenced(
                             "Durable tool operation lost its parent run authority."
@@ -401,6 +412,10 @@ class ToolInvocationResources:
                             operation_records=records,
                             operation_name=effective_tool_call.arguments.get("operation"),
                         )
+                    if native_browser_used:
+                        records[BROWSER_USAGE_KEY] = browser_usage_receipt(
+                            current_session.id, current_session.instance_id
+                        )
                     published_checkpoint = {} if checkpoint is None else dict(checkpoint)
                     if control_mutation is not None:
                         from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
@@ -414,6 +429,9 @@ class ToolInvocationResources:
                     )
 
                 with (
+                    browser_usage_publication_scope(session.id, session.instance_id)
+                    if native_browser_used
+                    else nullcontext(),
                     browser_control_checkpoint_read_scope(session.id),
                     browser_control_checkpoint_mutation_scope(control_mutation)
                     if control_mutation is not None

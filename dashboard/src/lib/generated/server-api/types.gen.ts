@@ -4134,6 +4134,7 @@ export type ControlPlaneSurfaceCapabilities = {
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     session_follow?: OptionalSurfaceCapability | null;
+    session_overview?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
@@ -10587,6 +10588,10 @@ export type ListSessionsResponse = {
      * Next Cursor
      */
     next_cursor: string | null;
+    /**
+     * Overviews
+     */
+    overviews?: Array<SessionOverviewResponse> | null;
     /**
      * Sessions
      */
@@ -17063,6 +17068,161 @@ export type SessionOperationalSnapshot = {
  * SessionOrder
  */
 export type SessionOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc' | 'last_activity_at_asc' | 'last_activity_at_desc';
+
+/**
+ * SessionOverviewCost
+ */
+export type SessionOverviewCost = {
+    /**
+     * Amount
+     */
+    amount: string;
+    /**
+     * Complete
+     */
+    complete: boolean;
+    /**
+     * Currency
+     */
+    currency: string;
+};
+
+/**
+ * SessionOverviewCountsResponse
+ */
+export type SessionOverviewCountsResponse = {
+    /**
+     * Counts By State
+     */
+    counts_by_state: {
+        [key in SessionOverviewStatus]?: string;
+    };
+    /**
+     * Failed
+     */
+    failed: string;
+    /**
+     * Running Now
+     */
+    running_now: string;
+    /**
+     * Since
+     */
+    since: string;
+    /**
+     * Total Count
+     */
+    total_count: string;
+    /**
+     * Until
+     */
+    until: string;
+};
+
+/**
+ * SessionOverviewResponse
+ */
+export type SessionOverviewResponse = {
+    cost: SessionOverviewCost | null;
+    /**
+     * Ended At
+     */
+    ended_at: string | null;
+    /**
+     * Eval
+     */
+    eval: boolean;
+    /**
+     * Forked
+     */
+    forked: boolean;
+    /**
+     * Last Activity At
+     */
+    last_activity_at: string;
+    /**
+     * Model Steps
+     */
+    model_steps: string;
+    /**
+     * Reason
+     */
+    reason: string;
+    /**
+     * Run Id
+     */
+    run_id: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Started At
+     */
+    started_at: string;
+    state: SessionOverviewStatus;
+    /**
+     * Summary
+     */
+    summary: string | null;
+    /**
+     * Summary Tone
+     */
+    summary_tone: 'neutral' | 'attention' | null;
+    /**
+     * Title
+     */
+    title: string | null;
+    tokens: SessionOverviewTokens;
+    /**
+     * Tool Calls
+     */
+    tool_calls: string;
+    uses: SessionOverviewUses;
+};
+
+/**
+ * SessionOverviewStatus
+ *
+ * Where a run is. A new status needs a new contract version.
+ */
+export type SessionOverviewStatus = 'running' | 'waiting_approval' | 'waiting_input' | 'needs_recovery' | 'completed' | 'failed' | 'interrupted';
+
+/**
+ * SessionOverviewTokens
+ */
+export type SessionOverviewTokens = {
+    /**
+     * Cached
+     */
+    cached: string;
+    /**
+     * Input
+     */
+    input: string;
+    /**
+     * Output
+     */
+    output: string;
+};
+
+/**
+ * SessionOverviewUses
+ */
+export type SessionOverviewUses = {
+    /**
+     * Artifacts
+     */
+    artifacts: string;
+    /**
+     * Browser
+     */
+    browser: boolean;
+    /**
+     * Subagents
+     */
+    subagents: string;
+};
 
 /**
  * SessionQueuedMessage
@@ -23899,6 +24059,10 @@ export type ListSessionsApiSessionsGetData = {
     path?: never;
     query?: {
         /**
+         * Ids
+         */
+        ids?: Array<string> | null;
+        /**
          * Limit
          */
         limit?: number;
@@ -23958,7 +24122,7 @@ export type ListSessionsApiSessionsGetData = {
         /**
          * Include
          */
-        include?: Array<'usage' | 'execution_profile'> | null;
+        include?: Array<'usage' | 'execution_profile' | 'overview'> | null;
     };
     url: '/api/sessions';
 };
@@ -23980,6 +24144,48 @@ export type ListSessionsApiSessionsGetResponses = {
 };
 
 export type ListSessionsApiSessionsGetResponse = ListSessionsApiSessionsGetResponses[keyof ListSessionsApiSessionsGetResponses];
+
+export type GetSessionOverviewCountsApiSessionsOverviewCountsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Since
+         */
+        since?: string | null;
+        /**
+         * Until
+         */
+        until?: string | null;
+        /**
+         * Include Eval
+         */
+        include_eval?: boolean;
+        /**
+         * Include Forks
+         */
+        include_forks?: boolean;
+    };
+    url: '/api/sessions/overview/counts';
+};
+
+export type GetSessionOverviewCountsApiSessionsOverviewCountsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionOverviewCountsApiSessionsOverviewCountsGetError = GetSessionOverviewCountsApiSessionsOverviewCountsGetErrors[keyof GetSessionOverviewCountsApiSessionsOverviewCountsGetErrors];
+
+export type GetSessionOverviewCountsApiSessionsOverviewCountsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionOverviewCountsResponse;
+};
+
+export type GetSessionOverviewCountsApiSessionsOverviewCountsGetResponse = GetSessionOverviewCountsApiSessionsOverviewCountsGetResponses[keyof GetSessionOverviewCountsApiSessionsOverviewCountsGetResponses];
 
 export type GetSessionsSummaryApiSessionsSummaryPostData = {
     /**

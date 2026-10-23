@@ -202,6 +202,7 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
+from cayu.sessions.overview import SessionOverviewStatus
 from cayu.sessions.pending_action_contracts import DelegatedActionReference
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.summaries import SessionOperationalSnapshot
@@ -2176,7 +2177,55 @@ class ApiSessionDetail(ApiSession):
     invocation: ApiSessionInvocation
 
 
+class SessionOverviewTokens(ApiBaseModel):
+    input: AggregateCount = Field(ge=0)
+    output: AggregateCount = Field(ge=0)
+    cached: AggregateCount = Field(ge=0)
+
+
+class SessionOverviewUses(ApiBaseModel):
+    browser: StrictBool
+    subagents: AggregateCount = Field(ge=0)
+    artifacts: AggregateCount = Field(ge=0)
+
+
+class SessionOverviewCost(ApiBaseModel):
+    amount: Decimal
+    currency: str
+    complete: StrictBool
+
+
+class SessionOverviewResponse(ApiBaseModel):
+    session_id: str
+    run_id: str
+    state: SessionOverviewStatus
+    reason: str
+    title: str | None
+    summary: str | None
+    summary_tone: Literal["neutral", "attention"] | None
+    started_at: datetime
+    ended_at: datetime | None
+    last_activity_at: datetime
+    model_steps: AggregateCount = Field(ge=0)
+    tool_calls: AggregateCount = Field(ge=0)
+    tokens: SessionOverviewTokens
+    cost: SessionOverviewCost | None
+    uses: SessionOverviewUses
+    eval: StrictBool
+    forked: StrictBool
+
+
+class SessionOverviewCountsResponse(ApiBaseModel):
+    since: datetime
+    until: datetime
+    running_now: AggregateCount = Field(ge=0)
+    total_count: AggregateCount = Field(ge=0)
+    failed: AggregateCount = Field(ge=0)
+    counts_by_state: dict[SessionOverviewStatus, AggregateCount]
+
+
 class ListSessionsResponse(ApiBaseModel):
+    overviews: list[SessionOverviewResponse] | None = None
     sessions: list[ApiSessionBase]
     next_cursor: str | None
     total_count: StrictInt | None = Field(default=None, ge=0)

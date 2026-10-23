@@ -26,7 +26,6 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import Decimal
-from enum import StrEnum
 from functools import cache
 from hashlib import sha256
 from typing import TYPE_CHECKING, cast
@@ -38,9 +37,7 @@ from cayu._version import __version__
 from cayu.approvals.actors import ResolutionActorSource
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, default_price_book
 from cayu.events import EventType
-from cayu.releases import recorded_release_identity
 from cayu.runtime._cost_accounting import COST_EVENT_TYPES
-from cayu.sessions._foreground_child_checkpoint import foreground_child_state_from_checkpoint
 from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     is_eval_trial,
@@ -48,19 +45,16 @@ from cayu.sessions._run_identity import (
     session_run_lineage,
 )
 from cayu.sessions._supervision_projection import (
-    RELEASE_MARKER_EVENT_TYPES,
     SUPERVISION_ANCHOR_EVENT_TYPES,
     classify_supervision_anchors,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.fork_overlays import resolve_fork_lineage_async
-from cayu.sessions.invocation import SessionExecutionSource
+from cayu.sessions.overview import SessionOverviewFacts, SessionOverviewReader
+from cayu.sessions.overview import SessionOverviewStatus as CloudRunStatus
 from cayu.sessions.pending_action_contracts import (
-    MAX_PENDING_ACTION_RESULT_BYTES,
-    PendingActionQuery,
     PendingActionRecord,
 )
-from cayu.sessions.records import PendingActionKind, Session, SessionStatus
+from cayu.sessions.records import Session
 from cayu.sessions.supervision_events import (
     SupervisionEvent,
     SupervisionEventKind,
@@ -69,9 +63,7 @@ from cayu.sessions.supervision_events import (
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
-    from cayu.budgets.usage import SessionUsageSummary
     from cayu.sessions.records import EventRecord
-    from cayu.sessions.summaries import SessionOutcome
 
 CLOUD_AGENT_CONTRACT = "cayu.cloud-agent"
 #: The contract versions this Runtime serves, oldest first.
@@ -82,9 +74,6 @@ _ACTIVITY_CONTRACT = f"{CLOUD_AGENT_CONTRACT}/v1"
 # Events read per store query, and per page, while collecting changes.
 _SCAN_BATCH = 200
 _SCAN_BUDGET = 2_000
-# How many waiting subagents deep a delegated action is followed to the action a
-# person settles, and so how many sessions above a change can depend on it.
-_MAX_DELEGATION_DEPTH = 8
 # A cursor is ``{store_id}.0`` before any event, else ``{store_id}.{sequence}.{mark}``,
 # the mark naming the exact event at that sequence.
 _STORE_IDENTITY = re.compile(r"[0-9a-f]{32}")
@@ -114,10 +103,6 @@ _ACTIVITY_EVENT_TYPES = tuple(
     )
 )
 _ANCHOR_EVENT_TYPES = frozenset(SUPERVISION_ANCHOR_EVENT_TYPES)
-# Statuses whose session can hold a pending action.
-_PENDING_ACTION_STATUSES = frozenset(
-    {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}
-)
 
 
 class CloudActivityCursorInvalid(ValueError):
@@ -151,18 +136,6 @@ class CloudContract(_ContractModel):
     runtime_version: str = __version__
     features: tuple[str, ...] = ("activity", "tool_knowledge_registration", "tool_knowledge_usage")
     store_id: str | None = None
-
-
-class CloudRunStatus(StrEnum):
-    """Where a run is. A new status needs a new contract version."""
-
-    RUNNING = "running"
-    WAITING_APPROVAL = "waiting_approval"
-    WAITING_INPUT = "waiting_input"
-    NEEDS_RECOVERY = "needs_recovery"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    INTERRUPTED = "interrupted"
 
 
 class CloudPrincipal(_ContractModel):
@@ -395,7 +368,7 @@ async def read_cloud_activity(
     position, mark = await _cursor_position(app, store_id, cursor)
     last: EventRecord | None = None
     store = app.session_store
-    reader = _RunReader(app)
+    reader = SessionOverviewReader(store, pricing=_bundled_price_book())
     changed: dict[str, None] = {}
     anchors: list[EventRecord] = []
     scanned = 0
@@ -429,7 +402,7 @@ async def read_cloud_activity(
             break
     touches = await classify_supervision_anchors(store, anchors)
     return CloudActivityPage(
-        runs=await reader.runs(tuple(changed)),
+        runs=tuple(_project_run(app, facts) for facts in await reader.read(tuple(changed))),
         touches=tuple(_touch(app, session, event) for session, event in touches),
         next_cursor=_cursor(store_id, position, mark if last is None else _event_mark(last)),
         has_more=has_more,
@@ -441,261 +414,46 @@ def _bundled_price_book() -> PriceBook:
     return default_price_book()
 
 
-class _RunReader:
-    """Summarizes the sessions of one page, sharing session loads among them."""
-
-    def __init__(self, app: CayuApp) -> None:
-        self._app = app
-        self._store = app.session_store
-        self._loaded: dict[str, Session | None] = {}
-
-    async def _load(self, session_id: str) -> Session | None:
-        if session_id not in self._loaded:
-            self._loaded[session_id] = await self._store.load(session_id)
-        return self._loaded[session_id]
-
-    async def affected_by(self, session_id: str) -> list[str]:
-        """The session and the sessions above it whose summaries a change in it can alter.
-
-        A session waiting on a subagent reports what the subagent waits on, as
-        deep as ``_waiting_kinds`` follows it, so a change in the subagent can
-        change every summary above it. A fork's source never waits on the fork.
-        """
-
-        affected = [session_id]
-        session = await self._load(session_id)
-        for _depth in range(_MAX_DELEGATION_DEPTH):
-            if (
-                session is None
-                or session.parent_session_id is None
-                or session.invocation.source is SessionExecutionSource.FORK
-            ):
-                break
-            parent = await self._load(session.parent_session_id)
-            if parent is None:
-                break
-            if RUN_LINEAGE_METADATA_KEY not in session.metadata:
-                # Legacy rows lack retained ancestry, but the parent's current
-                # foreground wait can still prove this exact dependency. This
-                # refreshes a summary; it does not invent historical run links.
-                follows = await self._retained_wait_matches(parent, session)
-            else:
-                follows = session_run_lineage(session)[1] == session_run_id(parent)
-            if not follows:
-                break
-            affected.append(parent.id)
-            session = parent
-        return affected
-
-    async def runs(self, session_ids: tuple[str, ...]) -> tuple[CloudRun, ...]:
-        """Summarize the sessions from reads made after the scan.
-
-        The scan read session rows only to find their verified parents,
-        and kept reading events after it read them. Reading again now
-        means every summary reflects at least every event up to the page's
-        cursor, and any later change has a later sequence, so a later page
-        reports the session again.
-        """
-
-        self._loaded.clear()
-        sessions = [
-            session
-            for session_id in session_ids
-            if (session := await self._load(session_id)) is not None
-        ]
-        if not sessions:
-            return ()
-        query = EventQuery(session_ids=tuple(session.id for session in sessions))
-        usage = await self._store.read_usage_accounting(query, by_session=True)
-        cost = await self._store.read_cost_accounting(query, _bundled_price_book(), by_session=True)
-        usage_by_session = {summary.session_id: summary for summary in usage.session_summaries}
-        cost_by_session = {totals.session_id: totals for totals in cost.session_totals}
-        runs = []
-        for session in sessions:
-            run = await self._run(
-                session, usage_by_session.get(session.id), cost_by_session.get(session.id)
-            )
-            # Accounting and outcome reads are separate store snapshots. A
-            # replacement must never donate its cost or status to the old run.
-            current = await self._store.load(session.id)
-            if (
-                run is not None
-                and current is not None
-                and current.instance_id == session.instance_id
-            ):
-                runs.append(run)
-        return tuple(runs)
-
-    async def _pending(self, session_id: str) -> list[PendingActionRecord]:
-        page = await self._store.query_pending_actions(
-            PendingActionQuery(
-                session_id=session_id, limit=200, max_result_bytes=MAX_PENDING_ACTION_RESULT_BYTES
-            )
-        )
-        return page.actions
-
-    async def _waiting_kinds(
-        self, session: Session, actions: list[PendingActionRecord], depth: int
-    ) -> set[PendingActionKind]:
-        """The kinds a person settles, following delegated actions to their children.
-
-        A delegated action names the kind its child waited on when the parent
-        recorded the wait, which can lag the child: a child whose answer finds an
-        unfinished call needs manual recovery while its parent still names the
-        question. So each child's own pending actions are read now.
-        """
-
-        kinds: set[PendingActionKind] = set()
-        for action in actions:
-            reference = action.delegated_action
-            if reference is None:
-                kinds.add(action.kind)
-            elif (
-                depth < _MAX_DELEGATION_DEPTH
-                and (child := await self._delegated_child(session, action)) is not None
-            ):
-                kinds |= await self._waiting_kinds(child, await self._pending(child.id), depth + 1)
-        return kinds
-
-    async def _delegated_child(
-        self, parent: Session, action: PendingActionRecord
-    ) -> Session | None:
-        reference = action.delegated_action
-        child = None if reference is None else await self._load(reference.child_session_id)
-        if child is None:
-            return None
-        return child if await self._retained_wait_matches(parent, child) else None
-
-    async def _retained_wait_matches(self, parent: Session, child: Session) -> bool:
-        # A reused child ID can have the same parent. Verify the exact wait's
-        # retained incarnation as well as the relationship, never just names.
-        wait, _ = foreground_child_state_from_checkpoint(
-            await self._store.load_checkpoint(parent.id)
-        )
-        return (
-            wait is not None
-            and wait.parent_effect.session_id == parent.id
-            and wait.parent_effect.session_instance_id == parent.instance_id
-            and wait.child_session_id == child.id
-            and wait.child_session_instance_id == child.instance_id
-        )
-
-    async def _release_id(self, session_id: str) -> str | None:
-        markers = await self._store.query_events(
-            EventQuery(
-                session_id=session_id,
-                event_types=RELEASE_MARKER_EVENT_TYPES,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=1,
-            )
-        )
-        release = None if not markers else recorded_release_identity(markers[0].event.payload)
-        return None if release is None else release.id
-
-    async def _run(
-        self,
-        session: Session,
-        usage: SessionUsageSummary | None,
-        cost: SessionCostTotals | None,
-    ) -> CloudRun | None:
-        app = self._app
-        try:
-            outcome = await self._store.summarize_outcome(session.id)
-        except KeyError:
-            # A row can disappear during the preceding accounting reads or
-            # inside this read. Only a confirmed missing/replaced incarnation
-            # explains the error; an unrelated store failure must propagate.
-            current = await self._store.load(session.id)
-            if current is None or current.instance_id != session.instance_id:
-                return None
-            raise
-        waiting = (
-            await self._pending(session.id) if session.status in _PENDING_ACTION_STATUSES else []
-        )
-        status = _run_status(
-            session.status,
-            await self._waiting_kinds(session, waiting, 0),
-            delegated=any(action.delegated_action is not None for action in waiting),
-        )
-        lineage = await resolve_fork_lineage_async(session, self._load)
-        origin = session.invocation.origin
-        release_id = await self._release_id(session.id)
-        root_run_id, parent_run_id = session_run_lineage(session)
-        marker = session.metadata.get(RUN_LINEAGE_METADATA_KEY)
-        parent_session_id = (
-            marker["parent_session_id"] if isinstance(marker, dict) else session.parent_session_id
-        )
-        return CloudRun(
-            run_id=session_run_id(session),
-            root_run_id=root_run_id,
-            parent_run_id=parent_run_id,
-            session_id=app.project_session_id_for_exposure(session.id),
-            root_session_id=app.project_session_id_for_exposure(session.invocation.root_session_id),
-            parent_session_id=(
-                None
-                if parent_session_id is None
-                else app.project_session_id_for_exposure(parent_session_id)
-            ),
-            source=session.invocation.source.value,
-            forked=lineage.forked,
-            fork_controller=_text(app, lineage.owner()) if lineage.settled else None,
-            eval=is_eval_trial(session),
-            agent_name=_redacted(app, session.agent_name),
-            status=status,
-            reason=_redacted(app, outcome.reason),
-            started_by=(
-                None
-                if origin.subject is None
-                else CloudPrincipal(
-                    subject=_redacted(app, origin.subject), trust=origin.trust.value
-                )
-            ),
-            started_at=session.created_at,
-            ended_at=_ended_at(status, outcome),
-            release_id=_text(app, release_id),
-            model_steps=0 if usage is None else usage.model_steps,
-            tool_calls=0 if usage is None else usage.tool_calls,
-            cost=_cost(cost),
-            waiting_for=tuple(
-                [
-                    _waiting_item(app, action, await self._delegated_child(session, action))
-                    for action in waiting
-                ]
-            ),
-        )
-
-
-# A run waiting on several items reports the first of these it waits on.
-_WAITING_STATUSES = (
-    (PendingActionKind.MANUAL_RECOVERY, CloudRunStatus.NEEDS_RECOVERY),
-    (PendingActionKind.TOOL_APPROVAL, CloudRunStatus.WAITING_APPROVAL),
-    (PendingActionKind.USER_INPUT, CloudRunStatus.WAITING_INPUT),
-)
-_ENDED_STATUSES = {
-    SessionStatus.COMPLETED: CloudRunStatus.COMPLETED,
-    SessionStatus.FAILED: CloudRunStatus.FAILED,
-    SessionStatus.INTERRUPTED: CloudRunStatus.INTERRUPTED,
-}
-
-
-def _run_status(
-    status: SessionStatus, waiting: set[PendingActionKind], *, delegated: bool
-) -> CloudRunStatus:
-    for kind, run_status in _WAITING_STATUSES:
-        if kind in waiting:
-            return run_status
-    if delegated:
-        # Its subagent waits on no person: the work goes on below it, and the
-        # session continues when the subagent ends.
-        return CloudRunStatus.RUNNING
-    return _ENDED_STATUSES.get(status, CloudRunStatus.RUNNING)
-
-
-def _ended_at(status: CloudRunStatus, outcome: SessionOutcome) -> datetime | None:
-    terminal = outcome.terminal_event
-    if status not in _ENDED_STATUSES.values() or terminal is None:
-        return None
-    return terminal.event.timestamp
+def _project_run(app: CayuApp, facts: SessionOverviewFacts) -> CloudRun:
+    session, outcome, status = facts.session, facts.outcome, facts.status
+    usage, cost, release_id = facts.usage, facts.cost, facts.release_id
+    origin = session.invocation.origin
+    root_run_id, parent_run_id = session_run_lineage(session)
+    marker = session.metadata.get(RUN_LINEAGE_METADATA_KEY)
+    parent_session_id = (
+        marker["parent_session_id"] if isinstance(marker, dict) else session.parent_session_id
+    )
+    return CloudRun(
+        run_id=session_run_id(session),
+        root_run_id=root_run_id,
+        parent_run_id=parent_run_id,
+        session_id=app.project_session_id_for_exposure(session.id),
+        root_session_id=app.project_session_id_for_exposure(session.invocation.root_session_id),
+        parent_session_id=(
+            None
+            if parent_session_id is None
+            else app.project_session_id_for_exposure(parent_session_id)
+        ),
+        source=session.invocation.source.value,
+        forked=facts.forked,
+        fork_controller=_text(app, facts.fork_controller),
+        eval=is_eval_trial(session),
+        agent_name=_redacted(app, session.agent_name),
+        status=status,
+        reason=_redacted(app, outcome.reason),
+        started_by=(
+            None
+            if origin.subject is None
+            else CloudPrincipal(subject=_redacted(app, origin.subject), trust=origin.trust.value)
+        ),
+        started_at=session.created_at,
+        ended_at=facts.ended_at,
+        release_id=_text(app, release_id),
+        model_steps=0 if usage is None else usage.model_steps,
+        tool_calls=0 if usage is None else usage.tool_calls,
+        cost=_cost(cost),
+        waiting_for=tuple(_waiting_item(app, action, child) for action, child in facts.waiting),
+    )
 
 
 def _cost(totals: SessionCostTotals | None) -> CloudRunCost:

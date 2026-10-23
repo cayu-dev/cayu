@@ -41,6 +41,7 @@ class ControlPlaneCapabilitySnapshot:
     eval_project_identity_configured: bool
     eval_captured_results_supported: bool
     browser_recordings_configured: bool = False
+    session_overview_supported: bool = False
 
     @property
     def evaluation_promotion_supported(self) -> bool:
@@ -81,6 +82,9 @@ class ControlPlaneCapabilitySnapshot:
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
                 app_info=_optional_surface(True, mutation_supported=False),
+                session_overview=_optional_surface(
+                    True, read_supported=self.session_overview_supported, mutation_supported=False
+                ),
                 browser_recordings=_optional_surface(
                     self.browser_recordings_configured,
                     mutation_supported=False,
@@ -169,6 +173,7 @@ def inspect_control_plane_capabilities(
     eval_project_identity_configured: bool | None = None,
     eval_captured_results_supported: bool = False,
     browser_recordings_configured: bool = False,
+    session_overview_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -190,6 +195,7 @@ def inspect_control_plane_capabilities(
         ("knowledge_configured", knowledge_configured),
         ("dashboard_pricing_configured", dashboard_pricing_configured),
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
+        ("session_overview_supported", session_overview_supported),
         ("session_topology_supported", session_topology_supported),
         ("evaluation_promotion_configured", evaluation_promotion_configured),
         ("terminal_session_evidence_supported", terminal_session_evidence_supported),
@@ -211,6 +217,7 @@ def inspect_control_plane_capabilities(
         raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
         browser_recordings_configured=browser_recordings_configured,
+        session_overview_supported=session_overview_supported,
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,
         tasks_configured=tasks_configured,

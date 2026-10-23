@@ -306,3 +306,51 @@ routes and existing authentication configuration remain unchanged. In particular
 `CAYU_OPERATOR_USERNAME`, `CAYU_OPERATOR_PASSWORD` and
 `cayu.server.environment_auth:OPERATOR_BASIC_AUTH` still configure the Developer
 dashboard login. This naming change does not remove authentication outside Cloud.
+
+### Session overview
+
+Server contract 51 adds `GET /api/sessions?include=overview`. Its `overviews`
+array aligns with `sessions` and uses the same seven merged states as Cloud:
+`running`, `waiting_approval`, `waiting_input`, `needs_recovery`, `completed`,
+`failed`, and `interrupted`. Waiting states include current delegated child
+work. Rows include the stable `run_id`, timestamps, bounded redacted
+`cayu:title`/`cayu:summary` metadata, `cayu:summary_tone` (`neutral` or
+`attention`), own-session usage, browser/subagent/artifact use, and trusted
+`eval`/`forked` flags. Missing or invalid display metadata is null. Cost is null
+without configured dashboard pricing; otherwise `complete` identifies whether
+all recorded usage was priced. Aggregate counts use decimal strings on the wire.
+
+Repeated `ids` parameters select up to 200 public session IDs, preserving first
+occurrence order and omitting missing sessions. IDs cannot be combined with
+listing filters or nondefault pagination. Include `overview` to fetch the same
+facts for detail views without making separate status and usage requests.
+
+`GET /api/sessions/overview/counts` returns all-scope `running_now`,
+`total_count`, `failed`, and `counts_by_state`. The creation window is
+`[since, until)`, defaulting to the last 24 hours. `running_now` includes older
+running sessions before `until`. Evaluation trials and fork-lineage sessions
+are excluded unless `include_eval=true` or `include_forks=true`. Counts traverse
+all pages before the fixed upper creation boundary, stopping before enriching
+newer rows; they never use the old capped `/sessions/summary` result. Both reads
+are available to members and use `Cache-Control: private, no-store`.
+
+These are observational reads of current retained evidence, not an atomic
+cross-store snapshot. Sessions replaced while joining evidence are omitted;
+refresh to observe the replacement. Activity can change while pages are read.
+Subagent counts cover direct retained children with matching parent-run
+lineage; artifact counts use the existing session-scoped store listing and
+deduplicate shared registrations by store identity. No configured artifact store
+means zero; a configured store without a complete count returns 503 rather than
+a partial total. Unsupported store operations return 501; unavailable evidence
+returns 503, including incomplete pending-action evidence on an eligible session
+or its delegated child. Cloud v1 retains its existing best-available summaries
+and advances past pending-action issues; control-plane overviews and exact counts
+require complete pending evidence, including for terminal sessions whose pending
+state cannot be materialized. Check
+`capabilities.surfaces.session_overview.read.enabled` before using the overview include. The capability describes session accounting support;
+individual reads can still fail when a backing service is unavailable.
+
+For migration, regenerate typed clients from the contract-51 OpenAPI schema;
+existing session listing and Cloud v1 fields remain available. Display metadata
+writes are a separate API; this read does not infer titles from messages or
+change the session metadata mutation contract.

@@ -5724,6 +5724,16 @@
             }
           ]
         },
+        "session_overview": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "supervision": {
           "anyOf": [
             {
@@ -8682,6 +8692,20 @@
           ],
           "title": "Next Cursor"
         },
+        "overviews": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/SessionOverviewResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Overviews"
+        },
         "sessions": {
           "items": {
             "$ref": "#/components/schemas/ApiSessionBase"
@@ -11339,7 +11363,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "50",
+          "default": "51",
           "title": "Contract Version",
           "type": "string"
         },
@@ -12388,6 +12412,282 @@
       ],
       "title": "SessionOrder",
       "type": "string"
+    },
+    "SessionOverviewCost": {
+      "additionalProperties": false,
+      "properties": {
+        "amount": {
+          "title": "Amount",
+          "type": "string"
+        },
+        "complete": {
+          "title": "Complete",
+          "type": "boolean"
+        },
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        }
+      },
+      "required": [
+        "amount",
+        "currency",
+        "complete"
+      ],
+      "title": "SessionOverviewCost",
+      "type": "object"
+    },
+    "SessionOverviewCountsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "counts_by_state": {
+          "additionalProperties": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "type": "string"
+          },
+          "propertyNames": {
+            "$ref": "#/components/schemas/SessionOverviewStatus"
+          },
+          "title": "Counts By State",
+          "type": "object"
+        },
+        "failed": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Failed",
+          "type": "string"
+        },
+        "running_now": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Running Now",
+          "type": "string"
+        },
+        "since": {
+          "format": "date-time",
+          "title": "Since",
+          "type": "string"
+        },
+        "total_count": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Total Count",
+          "type": "string"
+        },
+        "until": {
+          "format": "date-time",
+          "title": "Until",
+          "type": "string"
+        }
+      },
+      "required": [
+        "since",
+        "until",
+        "running_now",
+        "total_count",
+        "failed",
+        "counts_by_state"
+      ],
+      "title": "SessionOverviewCountsResponse",
+      "type": "object"
+    },
+    "SessionOverviewResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/SessionOverviewCost"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ended At"
+        },
+        "eval": {
+          "title": "Eval",
+          "type": "boolean"
+        },
+        "forked": {
+          "title": "Forked",
+          "type": "boolean"
+        },
+        "last_activity_at": {
+          "format": "date-time",
+          "title": "Last Activity At",
+          "type": "string"
+        },
+        "model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Model Steps",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/components/schemas/SessionOverviewStatus"
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Summary"
+        },
+        "summary_tone": {
+          "anyOf": [
+            {
+              "enum": [
+                "neutral",
+                "attention"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Summary Tone"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "tokens": {
+          "$ref": "#/components/schemas/SessionOverviewTokens"
+        },
+        "tool_calls": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Tool Calls",
+          "type": "string"
+        },
+        "uses": {
+          "$ref": "#/components/schemas/SessionOverviewUses"
+        }
+      },
+      "required": [
+        "session_id",
+        "run_id",
+        "state",
+        "reason",
+        "title",
+        "summary",
+        "summary_tone",
+        "started_at",
+        "ended_at",
+        "last_activity_at",
+        "model_steps",
+        "tool_calls",
+        "tokens",
+        "cost",
+        "uses",
+        "eval",
+        "forked"
+      ],
+      "title": "SessionOverviewResponse",
+      "type": "object"
+    },
+    "SessionOverviewStatus": {
+      "description": "Where a run is. A new status needs a new contract version.",
+      "enum": [
+        "running",
+        "waiting_approval",
+        "waiting_input",
+        "needs_recovery",
+        "completed",
+        "failed",
+        "interrupted"
+      ],
+      "title": "SessionOverviewStatus",
+      "type": "string"
+    },
+    "SessionOverviewTokens": {
+      "additionalProperties": false,
+      "properties": {
+        "cached": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Cached",
+          "type": "string"
+        },
+        "input": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Input",
+          "type": "string"
+        },
+        "output": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Output",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "cached"
+      ],
+      "title": "SessionOverviewTokens",
+      "type": "object"
+    },
+    "SessionOverviewUses": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Artifacts",
+          "type": "string"
+        },
+        "browser": {
+          "title": "Browser",
+          "type": "boolean"
+        },
+        "subagents": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Subagents",
+          "type": "string"
+        }
+      },
+      "required": [
+        "browser",
+        "subagents",
+        "artifacts"
+      ],
+      "title": "SessionOverviewUses",
+      "type": "object"
     },
     "SessionQueuedMessage": {
       "additionalProperties": false,
@@ -16921,7 +17221,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "50",
+          "default": "51",
           "title": "Contract Version",
           "type": "string"
         }
@@ -19091,6 +19391,26 @@
           },
           {
             "in": "query",
+            "name": "ids",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 200,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ids"
+            }
+          },
+          {
+            "in": "query",
             "name": "include",
             "required": false,
             "schema": {
@@ -19099,7 +19419,8 @@
                   "items": {
                     "enum": [
                       "usage",
-                      "execution_profile"
+                      "execution_profile",
+                      "overview"
                     ],
                     "type": "string"
                   },
@@ -19271,6 +19592,86 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ListSessionsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/overview/counts": {
+      "get": {
+        "operation_id": "get_session_overview_counts_api_sessions_overview_counts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_eval",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Eval",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_forks",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Forks",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionOverviewCountsResponse"
               }
             }
           },

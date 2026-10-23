@@ -195,6 +195,11 @@ from cayu.server._scenario_routes import (
     register_scenario_authoring_routes,
     register_scenario_launch_routes,
 )
+from cayu.server._session_overview import (
+    SessionOverviewService,
+    overview_http_error,
+    register_session_overview_counts,
+)
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server.auth import (
@@ -344,6 +349,7 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
     SessionMessageSource,
 )
+from cayu.sessions.overview import SessionOverviewUnavailable
 from cayu.sessions.pending_action_contracts import (
     PendingActionListResult,
     PendingActionQuery,
@@ -354,6 +360,7 @@ from cayu.sessions.queries import (
     LabelSelectorOperator,
     LabelSelectorRequirement,
     SessionDebugState,
+    SessionListResult,
     SessionOrder,
     SessionQuery,
     decode_session_cursor,
@@ -4530,6 +4537,8 @@ def create_router(
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
         browser_recordings_configured=browser_recordings_configured,
+        session_overview_supported=type(session_store).read_usage_accounting
+        is not SessionStore.read_usage_accounting,
         dashboard_configured=dashboard_configured,
         tasks_configured=task_store is not None,
         knowledge_configured=knowledge_store is not None,
@@ -7301,8 +7310,19 @@ def create_router(
             return unavailable("session_unavailable")
         return await cayu_app.get_human_attention_state(reference)
 
+    overview_service = SessionOverviewService(
+        store=session_store,
+        pricing=generated_evals_pricing,
+        project_session=cayu_app.project_session_id_for_exposure,
+        redact=cayu_app.redact_json,
+        artifact_stores=lambda: _artifact_stores_by_id(cayu_app),
+    )
+    register_session_overview_counts(router, service=overview_service, protected=protected)
+
     @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)
     async def list_sessions(
+        response: Response,
+        ids: Annotated[list[str] | None, Query(max_length=200)] = None,
         limit: Annotated[int, Query(ge=1, le=1000)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
         cursor: Annotated[str | None, Query()] = None,
@@ -7318,7 +7338,9 @@ def create_router(
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
         label_selector: Annotated[list[str] | None, Query()] = None,
-        include: Annotated[list[Literal["usage", "execution_profile"]] | None, Query()] = None,
+        include: Annotated[
+            list[Literal["usage", "execution_profile", "overview"]] | None, Query()
+        ] = None,
     ):
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
@@ -7329,32 +7351,79 @@ def create_router(
             parent_session_id=parent_session_id,
             causal_budget_id=causal_budget_id,
         )
-        try:
-            result = await session_store.list_sessions(
-                SessionQuery(
-                    q=_clean_optional_query_value(q, "q"),
-                    status=status,
-                    debug_state=debug_state,
-                    agent_name=_clean_optional_query_value(agent_name, "agent_name"),
-                    provider_name=_clean_optional_query_value(provider_name, "provider_name"),
-                    model=_clean_optional_query_value(model, "model"),
-                    environment_name=_clean_optional_query_value(
-                        environment_name,
-                        "environment_name",
-                    ),
-                    parent_session_id=private_parent_session_id,
-                    causal_budget_id=private_causal_budget_id,
-                    labels=labels,
-                    label_selectors=label_selectors,
-                    limit=limit,
-                    offset=offset,
-                    cursor=cursor,
-                    include_total_count=True,
-                    order_by=order_by,
-                )
+        if ids is not None and (
+            offset
+            or cursor is not None
+            or q is not None
+            or status is not None
+            or debug_state is not None
+            or agent_name is not None
+            or provider_name is not None
+            or model is not None
+            or environment_name is not None
+            or parent_session_id is not None
+            or causal_budget_id is not None
+            or label
+            or label_selector
+            or limit != 50
+            or order_by != SessionOrder.UPDATED_AT_DESC
+        ):
+            raise HTTPException(
+                422, detail="Session IDs cannot be combined with listing filters or pagination."
             )
+        try:
+            if ids is not None:
+                selected = []
+                for public_id in dict.fromkeys(ids):
+                    try:
+                        private_id = await cayu_app._resolve_public_session_id(public_id)
+                    except PublicSessionAliasNotFound:
+                        continue
+                    except ValueError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    session = await session_store.load(private_id)
+                    if session is not None:
+                        selected.append(session)
+                result = SessionListResult(sessions=selected, total_count=len(selected))
+            else:
+                result = await session_store.list_sessions(
+                    SessionQuery(
+                        q=_clean_optional_query_value(q, "q"),
+                        status=status,
+                        debug_state=debug_state,
+                        agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                        provider_name=_clean_optional_query_value(provider_name, "provider_name"),
+                        model=_clean_optional_query_value(model, "model"),
+                        environment_name=_clean_optional_query_value(
+                            environment_name,
+                            "environment_name",
+                        ),
+                        parent_session_id=private_parent_session_id,
+                        causal_budget_id=private_causal_budget_id,
+                        labels=labels,
+                        label_selectors=label_selectors,
+                        limit=limit,
+                        offset=offset,
+                        cursor=cursor,
+                        include_total_count=True,
+                        order_by=order_by,
+                    )
+                )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        overviews = None
+        if include is not None and "overview" in include:
+            try:
+                sessions, overviews = await overview_service.read(result.sessions)
+                result = result.model_copy(update={"sessions": sessions})
+            except (
+                SessionOverviewUnavailable,
+                NotImplementedError,
+                OSError,
+                ArtifactStoreUnavailableError,
+            ) as exc:
+                raise overview_http_error(exc) from exc
+            response.headers["Cache-Control"] = "private, no-store"
         usage = None
         if include is not None and "usage" in include:
             # Each read is incremental in the session store, so a polled page
@@ -7384,8 +7453,25 @@ def create_router(
                 )
                 for session in result.sessions
             ]
+        if overviews is not None:
+            # Optional sibling reads can await after overview enrichment. Keep
+            # every parallel representation aligned to the same incarnation.
+            retained = []
+            for index, session in enumerate(result.sessions):
+                current = await session_store.load(session.id)
+                if current is not None and current.instance_id == session.instance_id:
+                    retained.append(index)
+            result = result.model_copy(
+                update={"sessions": [result.sessions[index] for index in retained]}
+            )
+            overviews = [overviews[index] for index in retained]
+            if usage is not None:
+                usage = [usage[index] for index in retained]
+            if execution_profiles is not None:
+                execution_profiles = [execution_profiles[index] for index in retained]
         return {
             "sessions": [_serialize_session_base(cayu_app, session) for session in result.sessions],
+            "overviews": overviews,
             "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
             "total_count": result.total_count,
             "usage": usage,

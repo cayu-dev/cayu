@@ -19979,3 +19979,26 @@ Within v1 the proxy only adds claims, and the server ignores claims it doesn't
 use. A change a v1 server would misread, such as a new meaning for a role, uses a
 new `typ`, so a server that predates it refuses the token instead of misreading
 it.
+
+### Shared session overview (server contract 51)
+
+`cayu.sessions.overview.SessionOverviewReader` owns the merged status algorithm
+and batched current-incarnation reads used by Cloud reporting and the control
+plane. `CloudRunStatus` remains an alias of `SessionOverviewStatus`; Cloud v1
+projection, redaction, authority and feed cursors remain Cloud-owned. The shared
+reader depends on session-store contracts and pricing, not the application
+facade. Its counts traverse bounded pages across the complete retained
+population and reject failed or non-progressing pages before publishing a total.
+Pending-action pages likewise must be complete to establish waiting state.
+
+The control-plane `include=overview`, repeated `ids`, and overview counts API
+are described in [Session overview](control-plane.md#session-overview).
+Overview counts and rows preserve existing observational consistency: no new
+cross-store transaction or historical snapshot is implied. Stable session
+incarnation and parent-run identities prevent joins across replacement or
+reused session IDs. Browser usage requires private typed control evidence or a
+native publication receipt bound to the session incarnation; generic browser
+operation records and matching tool names are not evidence. The exact built-in
+browser tool owner publishes that reserved receipt atomically with its durable
+operation. Generic operation publishers cannot create or replace it.
+Cloud's existing content-free summaries do not gain display metadata.

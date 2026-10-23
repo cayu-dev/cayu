@@ -92,6 +92,7 @@ def _reject_reserved_runtime_publication_key(
     from cayu.collaboration._session_export_store import require_operation_key_access
     from cayu.sessions._argument_continuity import require_private_key_access
     from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.sessions._browser_usage import require_browser_usage_owner
     from cayu.sessions._producer_checkpoint import (
         require_operation_key_access as require_producer_key_access,
     )
@@ -110,6 +111,7 @@ def _reject_reserved_runtime_publication_key(
     require_replay_key_access(value, read=browser_control_read)
     if not browser_control_read:
         require_browser_control_operation_owner(value)
+        require_browser_usage_owner(value)
     if value == ZERO_WORK_INTERRUPTION_OPERATION_KEY:
         raise ValueError(f"{field_name} cannot use the reserved zero-work interruption key.")
     if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
@@ -128,6 +130,7 @@ def _reject_reserved_runtime_publication_key(
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
     from cayu.collaboration._session_export_store import require_operation_record_owner
     from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.sessions._browser_usage import require_browser_usage_owner
     from cayu.sessions._session_continuation_store import (
         require_operation_record_owner as require_continuation_record_owner,
     )
@@ -135,6 +138,7 @@ def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")
         require_browser_control_operation_owner(key, records[key])
+        require_browser_usage_owner(key, records[key])
         require_operation_record_owner(key, records[key])
         require_continuation_record_owner(key, records[key])
 
