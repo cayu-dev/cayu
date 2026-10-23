@@ -3157,11 +3157,22 @@ class _LambdaPortForward(RunnerPortForward):
             try:
                 response = await self._call("close_forward")
             except LambdaMicroVMOwnershipSuperseded:
-                # The takeover closed every forward of earlier owners, and a
-                # delayed open under this claim is refused, so nothing remains.
-                self._closed = True
-                return
-            if response.get("closed") is not True:
+                # A bare refusal does not say whether the takeover's teardown
+                # of this forward finished, so it is not proof of closure.
+                raise LambdaMicroVMError(
+                    "Lambda MicroVM could not confirm the forward closed after a newer owner "
+                    "claimed it; rebuild the image from this Cayu release's sidecar."
+                ) from None
+            superseded = response.get("owner_superseded") is True
+            if superseded:
+                self._runner._mark_superseded()
+            closed = response.get("closed")
+            if closed is not True:
+                if superseded and closed is False:
+                    raise LambdaMicroVMError(
+                        "Lambda MicroVM could not confirm the forward closed: the newer "
+                        "owner's takeover has not finished tearing it down."
+                    )
                 raise LambdaMicroVMProtocolError(
                     "Lambda MicroVM did not confirm the forward closed."
                 )

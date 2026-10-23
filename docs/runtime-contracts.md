@@ -14420,8 +14420,12 @@ runner relays each connection to a host `host:port` over the owner-fenced endpoi
 by offset in both directions. A newer owner claim, suspension, termination or the forward's
 `timeout_s` closes it, and `close()` returns only after the sidecar confirms the listener closed.
 The sidecar closes every earlier owner's forward before a newer claim completes and refuses a
-delayed open under the old claim, so `close()` after a takeover counts the forward as closed
-instead of raising `LambdaMicroVMOwnershipSuperseded`.
+delayed open under the old claim. After a takeover, the old owner's close is answered from the
+sidecar's forward registry: `closed` is true only once the forward is neither admitted nor
+retained for teardown, and the response says a newer owner exists. Only that positive answer
+lets `close()` count the forward as closed; a takeover whose teardown has not finished, or a
+bare ownership refusal from an older sidecar image, makes `close()` raise
+`LambdaMicroVMError` and leaves the forward open for a later `close()`.
 Duplicate closes and lifecycle shutdowns wait for the same retained teardown of the listener
 and its accepted connections, including an expiry-driven close already in progress. Admission
 is fenced immediately, but a socket-close failure or accept-thread join timeout does not
@@ -14431,7 +14435,8 @@ teardown attempts every independently reachable connection and forward before re
 first failure, retaining uncertain resources for an explicit successful close.
 An owner takeover interrupted by relay teardown retains its original cleanup callback.
 Neither the previous nor the pending owner can pass an ownership check, admit commands, or
-acquire a lifecycle lease until that callback succeeds. Retrying the same claim settles the
+acquire a lifecycle lease until that callback succeeds, and the previous owner's `close()` is
+not confirmed until then. Retrying the same claim settles the
 existing generation; a different claim first settles the pending cleanup, then advances the
 generation. Supplying a different callback or omitting it cannot skip that retained cleanup.
 A failed open that cannot confirm closure retains its cleanup handle on the original error

@@ -225,10 +225,14 @@ CA has to be installed in the image. Only the current owner may use a forward:
 - `POST /v1/forwards/{forward_id}/connections/{connection}/close` ends one connection.
 - `POST /v1/forwards/{forward_id}/close` closes the listener and every connection. Closing an
   unknown forward leaves a short-lived tombstone, so an open that arrives after its own cleanup is
-  refused with HTTP 409 instead of leaving a listener behind.
+  refused with HTTP 409 instead of leaving a listener behind. A superseded owner's close changes
+  nothing and is answered from the registry with `{"forward_id", "closed", "owner_superseded":
+  true}`: `closed` is true only once the forward is neither admitted nor retained for teardown,
+  so the owner never counts a forward closed while a failed takeover teardown still holds it.
 
 A forward accepts at most 32 connections at a time. A superseding owner claim, the suspend and
-terminate hooks, and the forward's `timeout_s` all close it. Forward requests run on their own
+terminate hooks, and the forward's `timeout_s` all close it. The hooks close forwards even when
+command cancellation fails, and then report the first failure. Forward requests run on their own
 thread pools, as stdio requests do: accept and read long polls on one pool with room for every
 poll the 64 ports and 32 connections per forward allow, and writes and connection closes on
 another, so host bytes never wait behind a long poll.

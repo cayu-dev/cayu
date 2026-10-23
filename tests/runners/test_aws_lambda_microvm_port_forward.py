@@ -20,9 +20,12 @@ from examples.aws.lambda_microvm_sidecar.supervisor import (
     CommandNotFoundError,
     CommandRequestError,
     CommandSupervisor,
+    OwnerLifecycleLeasedError,
+    OwnerSupersededError,
 )
 from tests.runners.lambda_microvm_harness import ConformanceLambdaClient
 from tests.runners.test_aws_lambda_microvm_interactive import InteractiveTransport
+from tests.runners.test_aws_lambda_microvm_sidecar_forwards import _SocketCloseFault
 
 from cayu.runners import (
     HttpxLambdaMicroVMEndpointTransport,
@@ -33,6 +36,7 @@ from cayu.runners import (
 from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMEndpointTransientError,
     LambdaMicroVMError,
+    LambdaMicroVMLifecycleInProgress,
 )
 
 
@@ -46,8 +50,9 @@ class ForwardingTransport(InteractiveTransport):
         self.fail_next_open = 0
         self.forward_writes: list[int] = []
 
-    def on_owner_superseded(self, generation: int) -> None:
-        super().on_owner_superseded(generation)
+    def on_supersede(self) -> None:
+        # As the sidecar route does, close every forward under the fence before
+        # the new owner is admitted. A failed teardown leaves the takeover pending.
         self.forwards.close_all()
 
     async def _forward(self, owner_claim: str, operation, *arguments, **keywords) -> Any:
@@ -111,7 +116,12 @@ class ForwardingTransport(InteractiveTransport):
         )
 
     async def close_forward(self, *, forward_id, owner_claim, **_) -> dict[str, Any]:
-        self.admit_start({"owner_claim": owner_claim})
+        try:
+            self.owner_fence.require(owner_claim)
+        except OwnerSupersededError:
+            return self.forwards.superseded_close(forward_id)
+        except OwnerLifecycleLeasedError as exc:
+            raise LambdaMicroVMLifecycleInProgress(str(exc)) from exc
         return await asyncio.to_thread(self.forwards.close, forward_id)
 
 
@@ -180,6 +190,7 @@ def test_forward_relays_guest_connections_to_the_host_service(tmp_path: Path) ->
                     _guest_exchange, forward.guest_host, forward.guest_port, b"late\n"
                 )
             assert transport.forwards._forwards == {}
+            assert transport.forwards._closing == {}
 
     asyncio.run(scenario())
 
@@ -236,7 +247,62 @@ def test_a_successor_owner_closes_the_forward(tmp_path: Path) -> None:
             await forward.close()
             assert forward._closed
             assert transport.forwards._forwards == {}
+            assert transport.forwards._closing == {}
             assert runner.owner_fence_generation is None
+
+    asyncio.run(scenario())
+
+
+def test_close_after_a_failed_takeover_teardown_is_not_confirmed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        transport = ForwardingTransport(tmp_path)
+        runner = _runner(tmp_path, transport)
+        forward = await runner.port_forward_capability().open_port_forward(host="127.0.0.1", port=1)
+        retained = transport.forwards._forwards[forward.forward_id]
+        fault = _SocketCloseFault(retained.listener)
+        retained.listener = fault
+        try:
+            with pytest.raises(OSError, match="injected socket close failure"):
+                await transport.claim_owner(claim_id="s" * 40)
+            assert forward.forward_id in transport.forwards._closing
+            # The old owner is fenced, but the listener is still open, so its
+            # close must not count the forward as closed.
+            with pytest.raises(LambdaMicroVMError, match="not finished tearing it down"):
+                await forward.close()
+            assert not forward._closed
+            assert runner.owner_fence_generation is None
+            assert fault.original.fileno() != -1
+
+            # Retrying the claim completes the retained teardown; now it is closed.
+            fault.fail = False
+            await transport.claim_owner(claim_id="s" * 40)
+            assert transport.forwards._closing == {}
+            assert fault.original.fileno() == -1
+            await forward.close()
+            assert forward._closed
+        finally:
+            fault.fail = False
+            transport.forwards.close_all()
+
+    asyncio.run(scenario())
+
+
+def test_a_bare_superseded_refusal_does_not_confirm_close(tmp_path: Path) -> None:
+    class BareRefusalTransport(ForwardingTransport):
+        # A sidecar built before the registry answer refused with HTTP 412 only.
+        async def close_forward(self, *, owner_claim, **kwargs):
+            self.admit_start({"owner_claim": owner_claim})
+            return await super().close_forward(owner_claim=owner_claim, **kwargs)
+
+    async def scenario() -> None:
+        transport = BareRefusalTransport(tmp_path)
+        runner = _runner(tmp_path, transport)
+        forward = await runner.port_forward_capability().open_port_forward(host="127.0.0.1", port=1)
+        await transport.claim_owner(claim_id="s" * 40)
+        with pytest.raises(LambdaMicroVMError, match="could not confirm the forward closed"):
+            await forward.close()
+        assert not forward._closed
+        assert runner.owner_fence_generation is None
 
     asyncio.run(scenario())
 
@@ -255,6 +321,7 @@ def test_a_takeover_keeps_the_runs_own_error(tmp_path: Path) -> None:
                 await transport.claim_owner(claim_id="s" * 40)
                 raise RunFailed()
         assert transport.forwards._forwards == {}
+        assert transport.forwards._closing == {}
 
     asyncio.run(scenario())
 
@@ -270,6 +337,7 @@ def test_an_open_refused_by_a_successor_owner_retains_no_cleanup(tmp_path: Path)
             await capability.open_port_forward(host="127.0.0.1", port=1)
         assert capability.failed_open_forward(caught.value) is None
         assert transport.forwards._forwards == {}
+        assert transport.forwards._closing == {}
 
     asyncio.run(scenario())
 

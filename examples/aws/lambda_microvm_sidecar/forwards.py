@@ -460,6 +460,20 @@ class PortForwardRegistry:
             self._finish_close(identifier, closing)
         return {"forward_id": identifier, "closed": True}
 
+    def superseded_close(self, forward_id: object) -> dict[str, Any]:
+        """Answer a superseded owner's close from the registry, without acting.
+
+        The takeover that fenced the owner closes its forwards and refuses a
+        delayed open under its claim, so a forward that is neither admitted nor
+        retained for teardown is closed. One a failed takeover teardown still
+        retains is not, until a later teardown completes.
+        """
+
+        identifier = _forward_id(forward_id)
+        with self._lock:
+            retained = identifier in self._forwards or identifier in self._closing
+        return {"forward_id": identifier, "closed": not retained, "owner_superseded": True}
+
     def close_all(self) -> None:
         with self._lock:
             for identifier in tuple(self._forwards):

@@ -1,7 +1,7 @@
 {
   "artifact_version": 1,
   "cayu_version": "0.13.0",
-  "content_digest": "sha256:7a8e58d6ddefc4cd46b1a5e650487e8844f1d2db3e2355512e97369e0ab6f3f1",
+  "content_digest": "sha256:dc8397ff194af66f3b5da4fb14c962418df76af4c4e050c33d90c49761cb94f5",
   "files": [
     {
       "path": "Dockerfile",
@@ -10,8 +10,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "sha256:163c27790bba20b71f37d7fc8738836413d0888f9eb17fc1309c22ec0f5e5c94",
-      "size": 17852
+      "sha256": "sha256:c08ff06697f7b1fb6f19bb34c423fdfac03f1be059c8e5b61e46ca93f3e25ad5",
+      "size": 18270
     },
     {
       "path": "__init__.py",
@@ -20,8 +20,8 @@
     },
     {
       "path": "app.py",
-      "sha256": "sha256:2522873014b39f1b123cf711507e5f5f201aadf978eade67ae2e8ce40f246bba",
-      "size": 17224
+      "sha256": "sha256:0e2d9c776f843d6c58e537e90ad8f6c307b1ea0ad8609e5c9d84818fb39c37c5",
+      "size": 18040
     },
     {
       "path": "browser/Dockerfile",
@@ -40,8 +40,8 @@
     },
     {
       "path": "forwards.py",
-      "sha256": "sha256:5a5e44667a13b083b0b6df9d1d0191b18479300b800ac8898b51bdfe62b0267e",
-      "size": 23160
+      "sha256": "sha256:4ef599acdff272994101eaeb408a76329e0df7a75b008465a4c2f75486b34d23",
+      "size": 23863
     },
     {
       "path": "requirements.txt",

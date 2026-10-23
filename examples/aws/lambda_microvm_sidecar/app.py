@@ -280,10 +280,19 @@ async def close_forward_connection(
 
 @app.post("/v1/forwards/{forward_id}/close")
 async def close_forward(forward_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Close a forward and its connections; an unknown ID leaves a tombstone."""
+    """Close a forward and its connections; an unknown ID leaves a tombstone.
+
+    A superseded owner cannot close anything. It learns instead whether the
+    takeover's teardown of the forward finished: ``closed`` is true only once
+    the forward is neither admitted nor retained, and ``owner_superseded``
+    tells it a newer owner exists.
+    """
 
     def close() -> dict[str, Any]:
-        OWNER.require(payload.get("owner_claim"))
+        try:
+            OWNER.require(payload.get("owner_claim"))
+        except OwnerSupersededError:
+            return FORWARDS.superseded_close(forward_id)
         return FORWARDS.close(forward_id)
 
     return await _forward_call(close, executor=None)
@@ -412,12 +421,30 @@ async def resume_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     return {"status": "ok"}
 
 
+async def _stop_guest_work() -> None:
+    """Cancel every command and close every forward, attempting both.
+
+    A failed cancellation must not leave forwards admitted, so the forward
+    teardown runs regardless and the first failure is reported.
+    """
+    failure: Exception | None = None
+    try:
+        await asyncio.to_thread(SUPERVISOR.cancel_all)
+    except Exception as exc:
+        failure = exc
+    try:
+        await asyncio.to_thread(FORWARDS.close_all)
+    except Exception as exc:
+        failure = failure or exc
+    if failure is not None:
+        raise failure
+
+
 @app.post("/aws/lambda-microvms/runtime/v1/suspend")
 async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     try:
-        await asyncio.to_thread(SUPERVISOR.cancel_all)
-        await asyncio.to_thread(FORWARDS.close_all)
+        await _stop_guest_work()
     finally:
         # The provider applied the leased suspend even if cleanup failed.
         # Retained forward custody is settled separately by its next close.
@@ -429,8 +456,7 @@ async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
 async def terminate_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     try:
-        await asyncio.to_thread(SUPERVISOR.cancel_all)
-        await asyncio.to_thread(FORWARDS.close_all)
+        await _stop_guest_work()
     finally:
         OWNER.settle_lifecycle("terminate")
     return {"status": "ok"}

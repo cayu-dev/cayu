@@ -688,9 +688,17 @@ def test_sidecar_routes_fence_forwards_to_the_current_owner(
         # A superseding claim closes every forward of the earlier owner.
         asyncio.run(app.claim_owner({"claim_id": successor}))
         assert client.recv(16) == b""
+        assert app.FORWARDS._forwards == {}
+        assert app.FORWARDS._closing == {}
         with pytest.raises(HTTPException) as gone:
             asyncio.run(app.accept_forward("fwd", {"owner_claim": successor, "after": 0}))
         assert gone.value.status_code == 404
+        # The earlier owner cannot close anything, but learns the takeover closed it.
+        assert asyncio.run(app.close_forward("fwd", {"owner_claim": claim})) == {
+            "forward_id": "fwd",
+            "closed": True,
+            "owner_superseded": True,
+        }
 
         asyncio.run(app.open_forward({"forward_id": "next", "owner_claim": successor}))
         asyncio.run(app.suspend_hook())
@@ -731,6 +739,15 @@ def test_owner_route_cannot_acknowledge_an_incomplete_forward_close(
             with pytest.raises(OSError, match="injected socket close failure"):
                 asyncio.run(app.claim_owner({"claim_id": pending_claim}))
             assert forward.listener.fileno() == -1
+            # The earlier owner's close is answered from the registry: the
+            # forward is still retained for teardown, so it is not closed.
+            assert asyncio.run(app.close_forward("fwd", {"owner_claim": first_claim})) == {
+                "forward_id": "fwd",
+                "closed": False,
+                "owner_superseded": True,
+            }
+            assert "fwd" in registry._closing
+            assert fault.original.fileno() != -1
             for claim in (first_claim, pending_claim):
                 assert asyncio.run(app.check_owner({"claim_id": claim})) == {"current": False}
                 with pytest.raises(HTTPException) as refused:
@@ -757,6 +774,11 @@ def test_owner_route_cannot_acknowledge_an_incomplete_forward_close(
             assert not registry._closing
             assert connection.socket.fileno() == -1
             assert client.recv(1) == b""
+            assert asyncio.run(app.close_forward("fwd", {"owner_claim": first_claim})) == {
+                "forward_id": "fwd",
+                "closed": True,
+                "owner_superseded": True,
+            }
         finally:
             fault.fail = False
             registry.close_all()
@@ -818,6 +840,42 @@ def test_failed_forward_teardown_still_settles_matching_lifecycle_hook(
             registry.close_all()
             app.SUPERVISOR.cancel_all()
             sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
+
+
+@pytest.mark.parametrize("hook_action", ["suspend", "terminate"])
+def test_lifecycle_hook_closes_forwards_when_command_cancellation_fails(
+    tmp_path, monkeypatch, hook_action
+):
+    monkeypatch.setenv("CAYU_MICROVM_WORKSPACE_ROOT", str(tmp_path))
+    sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
+    app = importlib.import_module("examples.aws.lambda_microvm_sidecar.app")
+    registry = _registry()
+    monkeypatch.setattr(app, "FORWARDS", registry)
+    supervisor = CommandSupervisor(root=tmp_path)
+    monkeypatch.setattr(app, "SUPERVISOR", supervisor)
+
+    def failing_cancel_all(**_):
+        raise RuntimeError("injected cancellation failure")
+
+    monkeypatch.setattr(supervisor, "cancel_all", failing_cancel_all)
+    claim = "a" * 40
+    try:
+        asyncio.run(app.claim_owner({"claim_id": claim}))
+        opened = asyncio.run(app.open_forward({"forward_id": "fwd", "owner_claim": claim}))
+        asyncio.run(app.acquire_lifecycle({"claim_id": claim, "action": hook_action}))
+        with _connect(opened) as client:
+            [_identifier] = _accept(registry, "fwd")
+            with pytest.raises(RuntimeError, match="injected cancellation failure"):
+                asyncio.run(getattr(app, f"{hook_action}_hook")())
+            # The hook still answers with the cancellation error, but every
+            # forward was torn down and the lease settled.
+            assert registry._forwards == {}
+            assert registry._closing == {}
+            assert client.recv(1) == b""
+            assert app.OWNER.require(claim) == 1
+    finally:
+        registry.close_all()
+        sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
 
 
 def test_idle_receive_timeout_keeps_connection_open(monkeypatch) -> None:

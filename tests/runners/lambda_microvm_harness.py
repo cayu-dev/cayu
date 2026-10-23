@@ -51,9 +51,14 @@ class OwnerFencedTransport:
     def on_owner_superseded(self, generation: int) -> None:
         """Cancel earlier owners' commands, as the sidecar does on a new claim."""
 
+    def on_supersede(self) -> None:
+        """Run under the fence before a new owner is admitted, as the sidecar's relay teardown."""
+
     async def claim_owner(self, *, claim_id: str, **_kwargs: Any) -> dict[str, Any]:
         try:
-            generation, superseded = self.owner_fence.claim(claim_id)
+            generation, superseded = self.owner_fence.claim(
+                claim_id, on_supersede=self.on_supersede
+            )
         except OwnerLifecycleLeasedError as exc:
             raise LambdaMicroVMLifecycleInProgress(str(exc)) from exc
         if superseded:
