@@ -190,10 +190,43 @@ def human_attention_id(
     )
 
 
+_SOURCE_LINKAGE_FIELDS = ("approval_id", "input_id", "tool_round_id", "tool_call_id")
+
+
+class _PendingActionSourceLinkage(BaseModel):
+    """Private, read-local proof of one schema-owned event field."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: StrictStr
+    session_instance_id: StrictStr
+    sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    value: StrictStr = Field(repr=False)
+
+    @field_validator("session_id", "session_instance_id", "value")
+    @classmethod
+    def nonblank(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+    def matches(self, session: PendingActionSession, value: object) -> bool:
+        """Recheck copied or mutated private references before public alias preparation."""
+        return (
+            type(self.sequence) is int
+            and 1 <= self.sequence <= MAX_DURABLE_JSON_INTEGER
+            and type(self.value) is str
+            and type(value) is str
+            and self.value == value
+            and type(self.session_id) is str
+            and self.session_id == session.id
+            and type(self.session_instance_id) is str
+            and self.session_instance_id == session.instance_id
+        )
+
+
 class PendingActionRecord(BaseModel):
     """One current action derived from a session checkpoint and its source event."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     id: str
     kind: PendingActionKind
@@ -206,7 +239,9 @@ class PendingActionRecord(BaseModel):
     input_id: str | None = None
     round_id: str | None = None
     tool_call_id: str | None = None
-    source_linkage: dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
+    source_linkage: dict[str, _PendingActionSourceLinkage] = Field(
+        default_factory=dict, exclude=True, repr=False
+    )
     policy_evidence: ToolPolicyEvidence | None = None
     question: str | None = None
     options: list[str] = Field(default_factory=list)
@@ -294,18 +329,33 @@ class PendingActionRecord(BaseModel):
 
     @field_validator("source_linkage", mode="before")
     @classmethod
-    def copy_source_linkage(cls, value: Any) -> dict[str, str]:
+    def copy_source_linkage(cls, value: Any) -> dict[str, _PendingActionSourceLinkage]:
         if value is None:
             return {}
         if type(value) is not dict:
-            raise TypeError("source_linkage must be a mapping of event fields to strings.")
-        allowed = {"approval_id", "input_id", "tool_round_id", "tool_call_id"}
-        if not set(value) <= allowed:
+            raise TypeError(
+                "source_linkage must be a mapping of event fields to private source references."
+            )
+        if not set(value) <= set(_SOURCE_LINKAGE_FIELDS):
             raise ValueError("source_linkage contains an unsupported event field.")
-        return {
-            field_name: require_nonblank(field_value, f"source_linkage.{field_name}")
-            for field_name, field_value in value.items()
-        }
+        if any(type(reference) is not _PendingActionSourceLinkage for reference in value.values()):
+            raise TypeError("source_linkage requires private source references.")
+        copied: dict[str, _PendingActionSourceLinkage] = {}
+        for field, reference in value.items():
+            # A typed reference can still be altered by model_copy(update=...).
+            # Validate scalar fields before copying any caller-owned object.
+            if type(reference.sequence) is not int or any(
+                type(item) is not str
+                for item in (reference.session_id, reference.session_instance_id, reference.value)
+            ):
+                raise TypeError("source_linkage contains an invalid private source reference.")
+            copied[field] = _PendingActionSourceLinkage(
+                session_id=reference.session_id,
+                session_instance_id=reference.session_instance_id,
+                sequence=reference.sequence,
+                value=reference.value,
+            )
+        return copied
 
     @field_validator("options", mode="before")
     @classmethod

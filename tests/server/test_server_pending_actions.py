@@ -398,6 +398,9 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
             PendingActionQuery(session_id="pending_approval", limit=1)
         )
     ).actions[0]
+    copied_payload = _serialize_pending_action(app, pending_approval.model_copy(deep=True))
+    assert copied_payload["approval_id"] == actions_by_session["pending_approval"]["approval_id"]
+    assert "source_linkage" not in copied_payload
     checkpoint_only_approval = pending_approval.model_copy(
         update={
             "source_linkage": {},

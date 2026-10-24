@@ -362,6 +362,7 @@ from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,
     PendingActionRecord,
     PendingActionResultTooLarge,
+    _PendingActionSourceLinkage,
 )
 from cayu.sessions.queries import (
     LabelSelectorOperator,
@@ -2564,18 +2565,20 @@ def _serialize_pending_action(
         if private_value is None:
             payload[response_field] = None
             continue
-        durable_value = action.source_linkage.get(event_field)
-        if durable_value is None:
+        reference = action.source_linkage.get(event_field)
+        if reference is None:
             # Checkpoint-derived recovery state can lack schema-owned linkage in
             # its bounded source event. It remains visible for diagnosis, but is
             # intentionally non-actionable rather than exposing private linkage.
             payload[response_field] = None
             continue
-        if durable_value != private_value:
+        if type(reference) is not _PendingActionSourceLinkage or not reference.matches(
+            action.session, private_value
+        ):
             raise RuntimeError(
                 f"Pending action {response_field} disagrees with its durable event authority."
             )
-        payload[response_field] = public_event_linkage_id(action.event.sequence, event_field)
+        payload[response_field] = public_event_linkage_id(reference.sequence, event_field)
     payload["session"] = _serialize_session_base(cayu_app, action.session)
     payload["event"] = _serialize_event_record(cayu_app, action.event)
     return payload

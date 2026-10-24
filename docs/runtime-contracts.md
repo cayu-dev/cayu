@@ -5837,6 +5837,28 @@ empty object. Action-specific display and resolution fields live on the pending
 action itself, avoiding a second copy of arbitrary tool arguments or lifecycle
 payload data in the list response.
 
+HTTP recovery references can originate from different events within the same
+current checkpoint. A manual-recovery source event may identify an input or
+approval while an exact sibling `tool.call.started` event identifies the call
+whose result must be reconciled. Native pending-action reads retain private,
+read-local field references binding the session incarnation, original event
+sequence, and schema-owned value. Missing call/round references are supplied
+only by one start matching the checkpoint's complete model-step, model-attempt,
+tool-round, and unresolved call identity. Conflicting scope or multiple matching
+starts do not produce an inferred reference. The action's source event and
+attention identity remain unchanged. HTTP projects each reference using its own
+original event sequence; clients submit those returned references through the
+existing recovery endpoint and authorization checks. These private references
+are excluded from serialized SDK read models; reconstructing such a model does
+not restore the private evidence needed for HTTP alias projection. Persistent
+stores reconstruct them from their current native checkpoint/event snapshot,
+including after reopening storage. Each native event write resolves the four
+linkage fields against the original event before compacting its payload; nested
+conflicts and malformed values remain unavailable independently for each field.
+This fixed-field private evidence shares the compact projection's byte ceiling.
+A caller payload cannot supply it. Projections without this evidence do not
+supply HTTP references; reading a reduced payload never restores lost proof.
+
 Schema revision 17 adds checkpoint-side query metrics—projected source bytes,
 tool-call count, pending-key flags, and an explicit metrics-ready marker—updated
 atomically with every checkpoint write. Relevant event writes atomically persist

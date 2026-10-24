@@ -36,12 +36,14 @@ from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.pending_action_contracts import (
+    _SOURCE_LINKAGE_FIELDS,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PENDING_ACTION_EVENT_TYPE_VALUES,
     DelegatedActionReference,
     PendingActionRecord,
+    _PendingActionSourceLinkage,
 )
 from cayu.sessions.records import (
     EventRecord,
@@ -124,6 +126,7 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
 _OVERSIZED_EVENT_PROJECTION_BYTES_KEY = "__cayu_pending_action_projection_bytes__"
 _OVERSIZED_EVENT_PROJECTION_REFERENCE = "cayu_oversized_pending_action_projection"
 _TERMINAL_RESULT_VALID_KEY = "__cayu_terminal_result_valid__"
+_SOURCE_LINKAGE_KEY = "__cayu_pending_source_linkage__"
 _TERMINAL_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_COMPLETED,
@@ -597,6 +600,13 @@ def _pending_action_event_payload_view(event: Event) -> dict[str, Any]:
                 payload[key] = projected
         else:
             payload[key] = value
+    # Resolve against the original event before dropping arbitrary result data.
+    # Recompute this internal projection field; caller payload markers are never
+    # evidence. The fixed field set shares the projection's existing byte bound.
+    payload[_SOURCE_LINKAGE_KEY] = {
+        field: private_event_linkage_value(event, field_name=field)
+        for field in _SOURCE_LINKAGE_FIELDS
+    }
     if event.type in _TERMINAL_EVENT_TYPES:
         payload[_TERMINAL_RESULT_VALID_KEY] = _terminal_result_payload_is_valid(event.payload)
     return payload
@@ -747,14 +757,26 @@ def _pending_action_source_reference(record: EventRecord) -> EventRecord:
     )
 
 
-def _pending_action_source_linkage(record: EventRecord) -> dict[str, str]:
+def _pending_action_source_linkage(
+    session: PendingActionSession, record: EventRecord
+) -> dict[str, _PendingActionSourceLinkage]:
     """Retain only schema-proven linkage before bounding the source event."""
 
-    linkage: dict[str, str] = {}
-    for field_name in ("approval_id", "input_id", "tool_round_id", "tool_call_id"):
-        value = private_event_linkage_value(record.event, field_name=field_name)
-        if value is not None:
-            linkage[field_name] = value
+    linkage: dict[str, _PendingActionSourceLinkage] = {}
+    if record.event.session_id != session.id or session.instance_id is None:
+        return linkage
+    proof = record.event.payload.get(_SOURCE_LINKAGE_KEY)
+    if type(proof) is not dict:
+        return linkage
+    for field_name in _SOURCE_LINKAGE_FIELDS:
+        value = proof.get(field_name)
+        if type(value) is str and value.strip():
+            linkage[field_name] = _PendingActionSourceLinkage(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                sequence=record.sequence,
+                value=value,
+            )
     return linkage
 
 
@@ -913,6 +935,7 @@ def _action_from_record(
     options: list[str] | None = None,
     arguments: dict[str, Any] | None = None,
     delegated_action: DelegatedActionReference | None = None,
+    source_linkage: dict[str, _PendingActionSourceLinkage] | None = None,
 ) -> PendingActionRecord:
     # Pending actions are public control-plane projections. Their private
     # checkpoints retain executable arguments, but no invocation has yet
@@ -937,7 +960,11 @@ def _action_from_record(
         input_id=input_id,
         round_id=round_id,
         tool_call_id=tool_call_id,
-        source_linkage=_pending_action_source_linkage(record),
+        source_linkage=(
+            _pending_action_source_linkage(session, record)
+            if source_linkage is None
+            else source_linkage
+        ),
         policy_evidence=policy_evidence,
         question=question,
         options=options or [],
@@ -1115,6 +1142,48 @@ def _pending_tool_round_evidence(
     )
 
 
+def _manual_recovery_source_linkage(
+    session: PendingActionSession,
+    source: EventRecord,
+    records_desc: list[EventRecord],
+    checkpoint: dict[str, Any] | None,
+    *,
+    tool_call_id: str | None,
+    round_id: str | None,
+) -> dict[str, _PendingActionSourceLinkage]:
+    """Bind missing recovery fields to one exact durable start, never display order."""
+    linkage = _pending_action_source_linkage(session, source)
+    try:
+        pending_round = pending_action_evidence_round_from_checkpoint(checkpoint)
+    except (TypeError, ValueError, ValidationError):
+        return linkage
+    if pending_round is None or pending_round.tool_round_id != round_id:
+        return linkage
+    evidence = _pending_tool_round_evidence(records_desc, pending_round)
+    if evidence.scope_conflicting or tool_call_id not in evidence.started_without_terminal_ids:
+        return linkage
+    identity = pending_rounds.pending_tool_round_identity(pending_round)
+    starts = [
+        record
+        for record in records_desc
+        if record.event.session_id == session.id
+        and record.event.type is EventType.TOOL_CALL_STARTED
+        and identity.matches_payload(record.event.payload)
+        and record.event.payload.get("tool_call_id") == tool_call_id
+    ]
+    if len(starts) != 1:
+        return linkage
+    start_linkage = _pending_action_source_linkage(session, starts[0])
+    for field, expected in (("tool_call_id", tool_call_id), ("tool_round_id", round_id)):
+        reference = linkage.get(field)
+        if reference is not None and reference.value == expected:
+            continue
+        candidate = start_linkage.get(field)
+        if candidate is not None and candidate.value == expected:
+            linkage[field] = candidate
+    return linkage
+
+
 def _tool_round_manual_recovery_action(
     session: PendingActionSession,
     records_desc: list[EventRecord],
@@ -1184,6 +1253,14 @@ def _tool_round_manual_recovery_action(
         round_id=pending_round.tool_round_id,
         tool_call_id=pending_call.tool_call_id,
         arguments=pending_call.arguments,
+        source_linkage=_manual_recovery_source_linkage(
+            session,
+            source_record,
+            records_desc,
+            checkpoint,
+            tool_call_id=pending_call.tool_call_id,
+            round_id=pending_round.tool_round_id,
+        ),
     )
 
 
@@ -1343,6 +1420,14 @@ def pending_action_from_records(
                     question=_optional_payload_string(checkpoint_call, "question"),
                     options=_payload_string_list(checkpoint_call, "options"),
                     arguments=arguments,
+                    source_linkage=_manual_recovery_source_linkage(
+                        session,
+                        record,
+                        records_desc,
+                        checkpoint,
+                        tool_call_id=tool_call_id,
+                        round_id=round_id,
+                    ),
                 )
 
             if interruption_type == "tool_approval_required":

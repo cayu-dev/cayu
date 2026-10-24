@@ -1312,6 +1312,7 @@ def test_assigned_sibling_recovery_keeps_scope_and_decider(store_kind, tmp_path)
         assert expected_scope.attention_id == item["attention_id"]
         seen.clear()
         [public_action] = client.get("/api/pending-actions", headers=_as("priya")).json()["actions"]
+        assert public_action["tool_call_id"] == sibling_alias
         attention_id, attention_params = _reference_params(app, client, "crashed")
         assert (
             client.get(
@@ -1325,9 +1326,7 @@ def test_assigned_sibling_recovery_keeps_scope_and_decider(store_kind, tmp_path)
             "session_id": public_action["session"]["id"],
             "input_id": public_action["input_id"],
             "answer": "staging",
-            # The handoff also names ask_user's call, so use the sibling's
-            # unambiguous tool-start alias for this exact recovery request.
-            "tool_call_id": sibling_alias,
+            "tool_call_id": public_action["tool_call_id"],
             "outcome": "completed",
             "message": "Verified externally.",
         }

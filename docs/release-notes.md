@@ -79,6 +79,8 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
 
 ### Changes
 
+- Pending-action recovery reads now expose the exact sibling tool-call reference when the interruption event itself cannot name it unambiguously. References come from matching durable start evidence, retain the same attention identity, and reconstruct after store reopen; recovery authorization is unchanged.
+
 The Developer dashboard Home and Inbox now use the shared session overview and
 unified runtime Inbox. Home shows exact daily usage and attention; Inbox supports
 server filters, counts, protected inline decisions and explicit task continuation.
