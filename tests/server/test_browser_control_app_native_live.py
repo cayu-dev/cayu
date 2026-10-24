@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -31,11 +32,16 @@ from cayu.browser_profiles import (
     BrowserProfileScope,
     SQLiteBrowserProfileStore,
 )
+from cayu.environments.admission import (
+    ExecutionExecutableEvidence,
+    ExecutionToolRequirementEvidence,
+)
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecResult, Runner
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.server import (
     BasicAuth,
     BrowserControlServerConfig,
@@ -52,6 +58,7 @@ from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import _browser_guest
 from cayu.tools._browser_control_transport import open_guest_control_channel
 from cayu.tools._redaction import active_secret_redactor
+from cayu.tools.base import ToolExecutableRequirement
 from cayu.tools.browser_control import BrowserControlCheckpoint
 from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
@@ -83,6 +90,7 @@ def test_app_allocates_and_bootstraps_native_browser(
     racing_loss_poll=False,
     keyboard_only=False,
     terminal_disconnect=None,
+    conversation_detail=False,
 ):
     from playwright.async_api import async_playwright
 
@@ -143,6 +151,34 @@ def test_app_allocates_and_bootstraps_native_browser(
 
             class NativeRunner(_WireRunner, Runner):
                 preflight_exec = Runner.preflight_exec
+
+                def execution_admission_candidate(self):
+                    candidate = super().execution_admission_candidate()
+                    # This fixture dispatches the pinned worker protocol into the
+                    # live Chromium daemon above, including its private channel.
+                    executable = PINNED_BROWSER_SESSION_WORKLOAD.command[0]
+                    fingerprint = "sha256:" + "1" * 64
+                    now = datetime.now(UTC)
+                    evidence = candidate.evidence.model_copy(
+                        update={
+                            "environment_fingerprint": fingerprint,
+                            "tool_requirements": ExecutionToolRequirementEvidence(
+                                environment_fingerprint=fingerprint,
+                                executables=(
+                                    ExecutionExecutableEvidence(
+                                        executable=executable,
+                                        state="live_verified",
+                                        observed_at=now,
+                                        valid_until=now + timedelta(seconds=60),
+                                        requirement_fingerprint=ToolExecutableRequirement(
+                                            executable=executable,
+                                        ).fingerprint,
+                                    ),
+                                ),
+                            ),
+                        }
+                    )
+                    return candidate.model_copy(update={"evidence": evidence})
 
                 async def _exec_private_browser_profile(self, command, **kwargs):
                     return await self.exec(command, **kwargs)
@@ -209,6 +245,9 @@ def test_app_allocates_and_bootstraps_native_browser(
             runner = NativeRunner()
 
             class Factory(_FakeRemoteFactory):
+                def execution_admission_candidate(self, request):
+                    return runner.execution_admission_candidate()
+
                 def _result(self, request, resource, *, allocation=None):
                     result = super()._result(request, resource, allocation=allocation)
                     return replace(
@@ -381,7 +420,12 @@ def test_app_allocates_and_bootstraps_native_browser(
                                         assert current.settled_input_sequence == 0
                                         assert race.dispatched == ["open", "held-model"]
                                     else:
-                                        assert not current.fresh_observation_required
+                                        assert not current.fresh_observation_required, [
+                                            part.content
+                                            for message in request.messages
+                                            for part in message.content
+                                            if part.type == "tool_result" and part.is_error
+                                        ]
                                         assert current.settled_input_sequence == 2
                                         assert race.dispatched == ["open", "held-model", "fresh"]
                                     yield ModelStreamEvent.text_delta(
@@ -471,6 +515,7 @@ def test_app_allocates_and_bootstraps_native_browser(
                                             daemons[current.identity.browser_session_id],
                                             mounted_api=True,
                                             keyboard_only=keyboard_only,
+                                            conversation_detail=conversation_detail,
                                             failures=rendering_failures,
                                             clock_ms=None,
                                             session_id=current.identity.session_id,
@@ -539,7 +584,12 @@ def test_app_allocates_and_bootstraps_native_browser(
                                 yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
                                 return
                             assert self.count == 3
-                            assert not current.fresh_observation_required
+                            assert not current.fresh_observation_required, [
+                                part.content
+                                for message in request.messages
+                                for part in message.content
+                                if part.type == "tool_result" and part.is_error
+                            ]
                             assert current.checkpoint_consent == (profile_consent or "deny")
                             assert current.settled_input_sequence == 2
                             if profile_consent is not None:
@@ -584,7 +634,10 @@ def test_app_allocates_and_bootstraps_native_browser(
                                     agent_name="agent", messages=[Message.text("user", "open")]
                                 ),
                             )
-                        assert not rendering_failures, rendering_failures
+                        if rendering_failures:
+                            raise BaseExceptionGroup(
+                                "Native operator rendering failed", rendering_failures
+                            )
                         assert outcome.ok, outcome.error
                         assert len(verified) == 1
                         with browser_control_checkpoint_read_scope(outcome.session_id):
@@ -790,4 +843,5 @@ def test_rendered_operator_controls_app_created_native_browser(
         viewer_only=False,
         rendered=True,
         keyboard_only=keyboard_only,
+        conversation_detail=bool(os.environ.get("CAYU_BROWSER_DASHBOARD_BUILD")),
     )

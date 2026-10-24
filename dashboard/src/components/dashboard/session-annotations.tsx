@@ -23,7 +23,13 @@ type EditorState = {
   error: string | null
 }
 
-export function SessionAnnotations({ session }: { session: SessionDetail }) {
+export function SessionAnnotations({
+  session,
+  showRuntimeMetadata = true,
+}: {
+  session: SessionDetail
+  showRuntimeMetadata?: boolean
+}) {
   const queryClient = useQueryClient()
   const annotationCapability = useDashboardCapability({
     kind: "mutation",
@@ -367,7 +373,7 @@ export function SessionAnnotations({ session }: { session: SessionDetail }) {
             </div>
           )}
 
-          {Object.keys(runtimeMetadata).length > 0 && (
+          {showRuntimeMetadata && Object.keys(runtimeMetadata).length > 0 && (
             <div className="mt-4 border-t border-border pt-4">
               <h3 className="text-xs font-semibold">Runtime-managed metadata</h3>
               <p className="mt-1 text-xs text-muted-foreground">

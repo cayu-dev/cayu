@@ -6,13 +6,17 @@ import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-quer
 import { useEffect, useMemo, useRef } from "react"
 import { ApiClientError } from "@/lib/api"
 import { activityPollInterval } from "@/lib/polling"
+import {
+  loadTranscriptWindow,
+  type TranscriptHistoryQuery,
+  type TranscriptPageParam,
+} from "@/lib/session-history"
 import { overviewForDisplay } from "../api/overview"
 import {
   EVENT_WAIT_SECONDS,
   type EventHistory,
   loadEventHistory,
   loadEventTail,
-  TRANSCRIPT_PAGE_MAX,
 } from "../api/paging"
 import type { InboxQuery, Session, SessionOverview, SessionTranscriptPage } from "../api/types"
 import { isLive as isLiveRun } from "./eval-model"
@@ -71,34 +75,31 @@ export function useSessionDetail(id: string) {
   return useQuery({ queryKey: ["session", id], queryFn: () => api.session(id) })
 }
 
-export function useOverview(id: string) {
+export function useOverview(id: string, poll = true) {
   const api = useApi()
   return useQuery({
     queryKey: ["overview", id],
     queryFn: async () => (await api.overviews([id]))[0] ?? null,
-    refetchInterval: (query) => (isActive(query.state.data?.state) ? ACTIVE_POLL_MS : false),
+    refetchInterval: (query) =>
+      poll && isActive(query.state.data?.state) ? ACTIVE_POLL_MS : false,
   })
 }
 
-/** Transcript pages one read follows; a longer conversation shows its first pages. */
-const TRANSCRIPT_MAX_PAGES = 10
-
-/** The whole transcript, in pages of the server's maximum; polled while the session is active. */
-export function useTranscript(id: string, active: boolean) {
+/** One bounded window, using the same tail owner as the runtime history page. */
+export function useTranscript(
+  id: string,
+  active: boolean,
+  page: TranscriptPageParam = null,
+  filters: TranscriptHistoryQuery = { include_thinking: true },
+) {
   const api = useApi()
   return useQuery({
-    queryKey: ["transcript", id],
-    queryFn: async (): Promise<SessionTranscriptPage> => {
-      let page = await api.transcript(id, { limit: TRANSCRIPT_PAGE_MAX })
-      const messages = [...page.messages]
-      for (let n = 1; page.has_more && n < TRANSCRIPT_MAX_PAGES; n++) {
-        page = await api.transcript(id, { limit: TRANSCRIPT_PAGE_MAX, offset: page.next_offset })
-        if (!page.messages.length) break
-        messages.push(...page.messages)
-      }
-      return { ...page, offset: 0, messages }
-    },
-    refetchInterval: active ? ACTIVE_POLL_MS : false,
+    queryKey: ["transcript", id, filters, page],
+    queryFn: ({ signal }): Promise<SessionTranscriptPage> =>
+      loadTranscriptWindow(page, 100, 3, (window) =>
+        api.transcript(id, { ...filters, ...window }, signal),
+      ),
+    refetchInterval: active && page === null ? ACTIVE_POLL_MS : false,
   })
 }
 
@@ -145,7 +146,7 @@ export function useEvents(id: string, enabled: boolean, active = false) {
   return query
 }
 
-export function useInbox(query: InboxQuery = {}) {
+export function useInbox(query: InboxQuery = {}, poll = true) {
   const api = useApi()
   const client = useQueryClient()
   const key = useMemo(
@@ -174,7 +175,7 @@ export function useInbox(query: InboxQuery = {}) {
     getNextPageParam: (page, _pages, _cursor, cursors) =>
       page.next_cursor && !cursors.includes(page.next_cursor) ? page.next_cursor : undefined,
     retry: false,
-    refetchInterval: 5000,
+    refetchInterval: poll ? 5000 : false,
   })
   const last = result.data?.pages.at(-1)
   // Only the completed current fetch pass can prove a cycle. Cached cursors from

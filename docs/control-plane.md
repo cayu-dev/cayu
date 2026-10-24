@@ -60,6 +60,35 @@ rows, not a matching population count; sidebar and Home counts remain separate r
 The sidebar can be collapsed on desktop or opened as a drawer on mobile.
 Escape closes the mobile drawer and returns focus to its opener.
 
+Session detail opens a bounded Conversation view. Authored titles and summaries use
+the same overview as the session index; tool calls start collapsed and structured
+outputs retain their native result shape. Older/Newer controls and role/thinking
+filters preserve transcript history. Live updates follow the tail only while it is
+pinned; reading an older window does not move it. Tool links use exact transcript
+message and part positions to open Trace. Trace contains event filters, runtime
+and transport diagnostics, the session tree, and causal usage. Existing Workflow
+URLs redirect there while retaining their filters and expansion state. Workflow
+specialist/environment filters use `workflow_agent_name` and `workflow_environment_name`
+in Session URLs, separately from the event log's exact filters. Hiding thinking
+changes its presentation without changing native tool positions used by Trace.
+
+The details panel starts closed and contains usage, labels, user metadata,
+artifacts and browser controls when applicable. Runtime-owned metadata stays
+read-only. Browser takeover, private input and handback use the existing browser
+control authority. Evaluation promotion continues to use captured session evidence.
+
+Full-access operators can follow up, stop with confirmation, resolve provider
+operations, and recover pending actions using their public exact source references.
+A running session accepts queued messages only when the deployment has both an
+authenticated identity and a `SessionMessageAccessPolicy` granting the operation;
+otherwise the composer explains its unavailability. Queue withdrawal uses the
+record's current incarnation and revision. Unconfirmed writes retain their exact
+request for observation or receipt reconciliation instead of enabling another write.
+Run again creates a new direct session from a supported first text prompt; task-origin
+sessions instead use declared task replay and navigate to the returned task, whose
+worker may attach a session later. Member decisions retain protected human review
+when configured and do not acquire execution permission.
+
 Use the theme button to cycle System, Light and Dark. The choice is saved in
 this browser; System follows the operating system appearance. The external
 initialization script applies the choice before styles load under the existing

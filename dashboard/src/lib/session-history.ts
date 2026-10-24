@@ -470,6 +470,20 @@ export function mergeLatestTranscriptWindow<T extends IndexedRecord>(
   }
 }
 
+export async function loadTranscriptWindow<T extends TranscriptTailPage>(
+  page: TranscriptPageParam,
+  pageSize: number,
+  readLimit: number,
+  loadPage: (page: NonNullable<TranscriptPageParam>) => Promise<T>,
+): Promise<T> {
+  if (page !== null) return loadPage(page)
+  const probe = await loadPage({ offset: 0, limit: 1 })
+  if (probe.total_messages <= 1) return probe
+  return loadStableTranscriptTailPage(probe.total_messages, pageSize, readLimit, (offset) =>
+    loadPage({ offset, limit: pageSize }),
+  )
+}
+
 export async function loadStableTranscriptTailPage<T extends TranscriptTailPage>(
   totalMessages: number,
   pageSize: number,

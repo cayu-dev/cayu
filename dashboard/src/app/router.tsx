@@ -12,7 +12,7 @@ import { dashboardConfig } from "../lib/config"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "../lib/dashboard-capabilities"
 import { validateEvalsSearch } from "../lib/evals-search"
 import { parseDashboardSearch, stringifyDashboardSearch } from "../lib/search-params"
-import { validateSessionHistorySearch } from "../lib/session-history-search"
+import { validateSessionDetailSearch, workflowSearchPatch } from "../lib/session-detail-search"
 import { validateSessionIndexSearch } from "../lib/session-index-search"
 import { validateUsageRollupSearch } from "../lib/usage-rollup-search"
 import { validateWorkflowSearch } from "../lib/workflow-search"
@@ -32,8 +32,8 @@ const PendingActionsPage = lazyRouteComponent(
   "InboxPage",
 )
 const SessionDetailPage = lazyRouteComponent(
-  () => import("../routes/session-detail"),
-  "SessionDetailPage",
+  () => import("../next/routes/session/session-entry"),
+  "SessionEntry",
 )
 const SessionsPage = lazyRouteComponent(
   () => import("../next/routes/sessions-entry"),
@@ -41,7 +41,6 @@ const SessionsPage = lazyRouteComponent(
 )
 const TasksPage = lazyRouteComponent(() => import("../routes/tasks"), "TasksPage")
 const UsagePage = lazyRouteComponent(() => import("../routes/usage"), "UsagePage")
-const WorkflowPage = lazyRouteComponent(() => import("../routes/workflow"), "WorkflowPage")
 const SystemPage = lazyRouteComponent(() => import("../routes/system"), "SystemPage")
 
 function RoutePending() {
@@ -150,7 +149,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   const sessionDetailRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/sessions/$sessionId",
-    validateSearch: validateSessionHistorySearch,
+    validateSearch: validateSessionDetailSearch,
     remountDeps: ({ params }) => ({ sessionId: params.sessionId }),
     component: SessionDetailPage,
   })
@@ -160,14 +159,14 @@ export function createDashboardRouter(history?: RouterHistory) {
     path: "/sessions/$sessionId/workflow",
     validateSearch: validateWorkflowSearch,
     remountDeps: ({ params }) => ({ sessionId: params.sessionId }),
-    component: () => (
-      <CapabilityRoute
-        requirement={DASHBOARD_ROUTE_REQUIREMENTS["/sessions/$sessionId/workflow"]}
-        title="Workflow"
-      >
-        <WorkflowPage />
-      </CapabilityRoute>
-    ),
+    beforeLoad: ({ params, search }) => {
+      throw redirect({
+        to: "/sessions/$sessionId",
+        params: { sessionId: params.sessionId },
+        search: { ...workflowSearchPatch(search), view: "trace", span: "session", workflow: "1" },
+        replace: true,
+      })
+    },
   })
 
   const knowledgeRoute = createRoute({

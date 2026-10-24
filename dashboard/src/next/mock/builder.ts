@@ -292,7 +292,7 @@ export function buildSession(
       push("tool", [
         {
           type: "tool_result",
-          tool_call_id: id,
+          ...ids,
           tool_name: item.tool,
           content: item.result,
           is_error: item.error === true,
@@ -304,27 +304,8 @@ export function buildSession(
         item.tool,
       )
     } else if ("output" in item) {
-      const id = nextId("call")
       const ids = toolIds()
-      push("assistant", [
-        {
-          type: "tool_call",
-          tool_call_id: id,
-          tool_name: "__cayu_submit_structured_output",
-          arguments: {},
-          arguments_state: "unavailable",
-        },
-      ])
-      push("tool", [
-        {
-          type: "tool_result",
-          tool_call_id: id,
-          tool_name: "__cayu_submit_structured_output",
-          content: "Structured output accepted.",
-          structured: { output: item.output },
-          is_error: false,
-        },
-      ])
+      push("assistant", [{ type: "structured_output", name: "output", output: item.output }])
       emit("structured_output.validating", { ...ids, name: "output", attempt: 1 })
       pause(20, 60)
       emit("structured_output.validated", {

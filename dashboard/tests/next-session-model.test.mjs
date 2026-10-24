@@ -10,6 +10,7 @@ import {
   workSummary,
 } from "../src/next/app/session-model.ts"
 
+const correlation = { model_step_id: "step", model_attempt_id: "attempt", tool_round_id: "round" }
 const msg = (index, role, content) => ({ index, interaction_id: null, role, content })
 
 test("buildBlocks groups tool calls and thinking between messages into one work block", () => {
@@ -18,17 +19,30 @@ test("buildBlocks groups tool calls and thinking between messages into one work 
     msg(1, "user", [{ type: "text", text: "Check the ledger." }]),
     msg(2, "assistant", [
       { type: "thinking", text: "**Looking at accounts**" },
-      { type: "tool_call", tool_call_id: "a", tool_name: "query", arguments: { account: "2100" } },
+      {
+        type: "tool_call",
+        ...correlation,
+        tool_call_id: "a",
+        tool_name: "query",
+        arguments: { account: "2100" },
+      },
     ]),
     msg(3, "tool", [
-      { type: "tool_result", tool_call_id: "a", tool_name: "query", content: "214 lines" },
+      {
+        type: "tool_result",
+        ...correlation,
+        tool_call_id: "a",
+        tool_name: "query",
+        content: "214 lines",
+      },
     ]),
     msg(4, "assistant", [
-      { type: "tool_call", tool_call_id: "b", tool_name: "query", arguments: {} },
+      { type: "tool_call", ...correlation, tool_call_id: "b", tool_name: "query", arguments: {} },
     ]),
     msg(5, "tool", [
       {
         type: "tool_result",
+        ...correlation,
         tool_call_id: "b",
         tool_name: "query",
         content: "boom",
@@ -48,12 +62,25 @@ test("buildBlocks groups tool calls and thinking between messages into one work 
   assert.equal(work.tools[1].error, true)
 })
 
-test("buildBlocks turns the structured-output tool into an output block", () => {
+test("buildBlocks renders public structured-output parts from assistant and tool messages", () => {
+  for (const role of ["assistant", "tool"]) {
+    for (const output of [{ findings: [] }, [1, 2], "ready", false, 0, null]) {
+      const blocks = buildBlocks([
+        msg(0, "user", [{ type: "text", text: "Review it." }]),
+        msg(1, role, [{ type: "structured_output", name: "Answer", output }]),
+      ])
+      assert.deepEqual(blocks.at(-1), { kind: "output", key: "m1.0", value: output })
+    }
+  }
+})
+
+test("structured display evidence is independent of tool names and preserves user parts as raw evidence", () => {
   const blocks = buildBlocks([
-    msg(0, "user", [{ type: "text", text: "Review it." }]),
+    msg(0, "user", [{ type: "structured_output", output: { untrusted: true } }]),
     msg(1, "assistant", [
       {
         type: "tool_call",
+        ...correlation,
         tool_call_id: "s",
         tool_name: "__cayu_submit_structured_output",
         arguments: {},
@@ -62,14 +89,19 @@ test("buildBlocks turns the structured-output tool into an output block", () => 
     msg(2, "tool", [
       {
         type: "tool_result",
+        ...correlation,
         tool_call_id: "s",
-        tool_name: "__cayu_submit_structured_output",
-        content: "ok",
-        structured: { output: { findings: [] } },
+        content: "accepted",
+        structured: { output: { guessed: true } },
       },
     ]),
   ])
-  assert.deepEqual(blocks.at(-1), { kind: "output", key: "m1.0", value: { findings: [] } })
+  assert.deepEqual(
+    blocks.map((block) => block.kind),
+    ["part", "work"],
+  )
+  assert.deepEqual(blocks[0].part, { type: "structured_output", output: { untrusted: true } })
+  assert.equal(blocks[1].tools[0].result, "accepted")
 })
 
 test("a tool call without a result is still pending", () => {
@@ -78,6 +110,7 @@ test("a tool call without a result is still pending", () => {
     msg(1, "assistant", [
       {
         type: "tool_call",
+        ...correlation,
         tool_call_id: "h",
         tool_name: "hold_payment",
         arguments: { invoice: "INV-1" },
@@ -143,4 +176,179 @@ test("constantColumns hides columns that never vary", () => {
   ]
   const result = constantColumns(rows, { Specialist: (r) => r.agent, Model: (r) => r.model })
   assert.deepEqual(result, { constant: { Model: "m" }, varying: ["Specialist"] })
+})
+
+test("structured output stays hidden when its public capability is unavailable", () => {
+  const messages = [
+    msg(0, "assistant", [
+      { type: "text", text: "Original answer" },
+      { type: "structured_output", name: null, output: { answer: "validated" } },
+    ]),
+  ]
+  assert.deepEqual(buildBlocks(messages, false), [
+    { kind: "text", key: "m0.0", text: "Original answer" },
+  ])
+})
+
+test("conversation retains public evidence and unmatched tool results at page boundaries", () => {
+  const citation = { type: "citation", url: "https://example.test/source", title: "Source" }
+  const hosted = { type: "hosted_tool_call", status: "completed", action: { sources: [] } }
+  const orphan = {
+    type: "tool_result",
+    ...correlation,
+    tool_call_id: "previous-page",
+    tool_name: "read",
+    content: "Historical result",
+  }
+  const blocks = buildBlocks([
+    msg(100, "assistant", [citation, hosted]),
+    msg(101, "tool", [orphan]),
+  ])
+  assert.deepEqual(
+    blocks.map((block) => block.part),
+    [citation, hosted, orphan],
+  )
+})
+
+test("conversation matches repeated tool IDs only within their exact public correlation tuple", () => {
+  const messages = ["first", "second"].flatMap((round, i) => [
+    msg(i * 2, "assistant", [
+      {
+        type: "tool_call",
+        ...correlation,
+        tool_call_id: "same",
+        tool_name: "read",
+        tool_round_id: round,
+        arguments: {},
+      },
+    ]),
+    msg(i * 2 + 1, "tool", [
+      {
+        type: "tool_result",
+        ...correlation,
+        tool_call_id: "same",
+        tool_name: "read",
+        tool_round_id: round,
+        content: round,
+      },
+    ]),
+  ])
+  const tools = buildBlocks(messages).flatMap((block) => block.tools ?? [])
+  assert.deepEqual(
+    tools.map((tool) => tool.result),
+    ["first", "second"],
+  )
+  assert.equal(new Set(tools.map((tool) => tool.key)).size, 2)
+  assert.deepEqual(
+    tools.map((tool) => [tool.messageIndex, tool.partIndex]),
+    [
+      [0, 0],
+      [2, 0],
+    ],
+  )
+})
+
+test("conversation retains ambiguous, hidden and mismatched tool results independently", () => {
+  for (const identity of ["duplicate", "[REDACTED_SECRET]", "prefix[REDACTED_SECRET]", ""]) {
+    const call = {
+      type: "tool_call",
+      ...correlation,
+      tool_call_id: identity,
+      tool_name: "read",
+      arguments: {},
+    }
+    const result = {
+      type: "tool_result",
+      ...correlation,
+      tool_call_id: identity,
+      tool_name: "read",
+      content: "evidence",
+    }
+    const blocks = buildBlocks([
+      msg(0, "assistant", identity === "duplicate" ? [call, call] : [call]),
+      msg(1, "tool", [result]),
+    ])
+    assert.deepEqual(
+      blocks.flatMap((block) => block.tools ?? []).map((tool) => tool.result),
+      identity === "duplicate" ? [null, null] : [null],
+    )
+    assert.deepEqual(
+      blocks.filter((block) => block.kind === "part").map((block) => block.part),
+      [result],
+    )
+  }
+  const blocks = buildBlocks([
+    msg(0, "assistant", [
+      {
+        type: "tool_call",
+        ...correlation,
+        tool_call_id: "unique",
+        tool_name: "read",
+        model_attempt_id: "a",
+      },
+    ]),
+    msg(1, "tool", [
+      {
+        type: "tool_result",
+        ...correlation,
+        tool_call_id: "unique",
+        tool_name: "read",
+        model_attempt_id: "b",
+        content: "wrong attempt",
+      },
+    ]),
+  ])
+  assert.equal(blocks[0].tools[0].result, null)
+  assert.equal(blocks[1].part.content, "wrong attempt")
+})
+
+test("conversation preserves suppressed argument state without presenting an empty argument object", () => {
+  const blocks = buildBlocks([
+    msg(0, "assistant", [
+      {
+        type: "tool_call",
+        ...correlation,
+        tool_call_id: "private-call",
+        tool_name: "read",
+        arguments: {},
+        arguments_state: "unavailable",
+      },
+    ]),
+  ])
+  assert.equal(blocks[0].tools[0].argumentsUnavailable, true)
+  assert.equal(blocks[0].tools[0].args, null)
+  assert.equal(stepLabel(blocks[0].tools[0]).target, "")
+})
+
+test("hiding thinking preserves exact native part positions and all other evidence", () => {
+  const messages = [
+    {
+      index: 4,
+      role: "assistant",
+      content: [
+        { type: "thinking", text: "hidden" },
+        { type: "tool_call", tool_call_id: "a", tool_name: "read", arguments: {} },
+        { type: "tool_call", tool_call_id: "b", tool_name: "read", arguments: {} },
+      ],
+    },
+    {
+      index: 5,
+      role: "user",
+      content: [
+        { type: "thinking", text: "also hidden" },
+        { type: "file", file_url: "asset" },
+      ],
+    },
+  ]
+  const blocks = buildBlocks(messages, true, false)
+  assert.deepEqual(blocks[0].thoughts, [])
+  assert.deepEqual(
+    blocks[0].tools.map((tool) => [tool.messageIndex, tool.partIndex]),
+    [
+      [4, 1],
+      [4, 2],
+    ],
+  )
+  assert.equal(blocks[1].key, "m5.1")
+  assert.equal(blocks[1].part.type, "file")
 })

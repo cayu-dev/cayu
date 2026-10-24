@@ -12,6 +12,7 @@ import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import { fetchPendingKnowledgeEntry, type KnowledgeEntryDetail } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
+import { fetchSessionRecovery } from "@/lib/session-recovery"
 import { cn } from "@/lib/utils"
 import type { InboxItem, InboxSettleRequest, RecoveryRequest } from "../../api/types"
 import { useApi, useNow, useServices } from "../../app/services"
@@ -28,10 +29,16 @@ const KIND = {
 export function InboxCard({
   item,
   context,
+  onRecover,
+  mutationBlocked = false,
+  recoveryEnabled = false,
 }: {
   item: InboxItem
   /** On the Inbox page, the session the item belongs to. */
   context?: { title: string; sessionId: string }
+  onRecover?: (body: RecoveryRequest) => Promise<"observed" | "unknown">
+  mutationBlocked?: boolean
+  recoveryEnabled?: boolean
 }) {
   const api = useApi()
   const { prototype, decisionsEnabled, knowledgeReviewEnabled } = useServices()
@@ -48,6 +55,18 @@ export function InboxCard({
     (!!knowledgeSource.data &&
       !knowledgeSource.error &&
       knowledgeSource.data.revision === item.knowledge?.revision)
+  const recoveryEvidence = useQuery({
+    queryKey: ["session-recovery", item.session_id, item.attention_id],
+    queryFn: ({ signal }) => fetchSessionRecovery(item.session_id!, item.attention_id!, signal),
+    enabled:
+      !prototype &&
+      !context &&
+      item.kind === "recovery" &&
+      !!item.session_id &&
+      recoveryEnabled &&
+      !mutationBlocked,
+    retry: false,
+  })
   const now = useNow()
   const queryClient = useQueryClient()
   const [answer, setAnswer] = useState("")
@@ -57,34 +76,38 @@ export function InboxCard({
   const [argumentsText, setArgumentsText] = useState("{}")
   const [argumentError, setArgumentError] = useState<string | null>(null)
   const viewer = useViewer()
-  const refresh = () => {
-    for (const key of [
-      "inbox",
-      "inbox-counts",
-      "child-actions",
-      "home",
-      "sessions",
-      "session-list",
-      "overview",
-      "transcript",
-      "knowledge",
-      "tool-usage",
-    ])
-      void queryClient.invalidateQueries({ queryKey: [key] })
-  }
+  const refresh = () =>
+    Promise.all(
+      [
+        "inbox",
+        "inbox-counts",
+        "child-actions",
+        "home",
+        "sessions",
+        "session-list",
+        "overview",
+        "transcript",
+        "knowledge",
+        "tool-usage",
+      ].map((key) => queryClient.invalidateQueries({ queryKey: [key] })),
+    )
   const settleItem = useMutation({
     mutationFn: (body: InboxSettleRequest) => api.settle(item.id, body),
     onSuccess: refresh,
   })
   const recover = useMutation({
-    mutationFn: (body: RecoveryRequest) => {
+    mutationFn: async (body: RecoveryRequest) => {
       if (!item.session_id) throw new Error("This recovery item names no session.")
-      return api.recover(item.session_id, body)
+      if (onRecover) return await onRecover(body)
+      else if (prototype) await api.recover(item.session_id, body)
+      else throw new Error("Open the session to observe this recovery safely.")
     },
     onSuccess: refresh,
   })
   // Whichever action this card took: settling, or recovering on the session page.
   const settle = item.kind === "recovery" ? recover : settleItem
+  // A real pending recovery remains unresolved until the authoritative Inbox read removes it.
+  const decided = item.kind === "recovery" ? !!prototype && recover.isSuccess : settleItem.isSuccess
   const decide = (
     decision: InboxSettleRequest["decision"],
     extra: Partial<InboxSettleRequest> = {},
@@ -114,9 +137,10 @@ export function InboxCard({
   }
   const { icon: Icon, label } = KIND[item.kind]
   const busy =
+    mutationBlocked ||
     !available ||
     settle.isPending ||
-    settle.isSuccess ||
+    decided ||
     (item.kind === "knowledge" && !knowledgeReady)
 
   let body: ReactNode
@@ -222,10 +246,32 @@ export function InboxCard({
             This item names no session, so it can't be recovered here.
           </p>
         )
+      ) : !prototype && (viewer?.full_access !== true || !recoveryEnabled) ? (
+        <p className="text-xs text-muted-foreground">
+          Manual recovery requires full access and recovery capability.
+        </p>
+      ) : !prototype &&
+        (recoveryEvidence.isPending ||
+          recoveryEvidence.error ||
+          !recoveryEvidence.data?.tool_call_id ||
+          (!recoveryEvidence.data.approval_id &&
+            !recoveryEvidence.data.input_id &&
+            !recoveryEvidence.data.round_id)) ? (
+        <p className="text-xs text-muted-foreground">
+          {recoveryEvidence.isPending
+            ? "Checking recovery evidence…"
+            : "Recovery is unavailable because its exact tool-call authority is not exposed. Inspect the recovery evidence before proceeding."}
+        </p>
       ) : (
         <RecoveryForm
           id={item.id}
-          question={item.question ?? null}
+          question={
+            prototype
+              ? (item.question ?? null)
+              : recoveryEvidence.data?.input_id
+                ? (recoveryEvidence.data.question ?? "The person's answer")
+                : null
+          }
           busy={busy}
           onRecover={(body) => recover.mutate({ ...body, attention_id: item.attention_id })}
         />
@@ -302,12 +348,12 @@ export function InboxCard({
       data-inbox-item={item.id}
       className={cn(
         "min-w-0 break-words rounded-xl border bg-card",
-        settle.isSuccess ? "border-border opacity-70" : "border-warning/50 shadow-xs",
+        decided ? "border-border opacity-70" : "border-warning/50 shadow-xs",
       )}
     >
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-2 text-xs">
         <Icon className="size-3.5 text-warning" aria-hidden="true" />
-        <span className="font-medium text-warning">{settle.isSuccess ? "Decided" : label}</span>
+        <span className="font-medium text-warning">{decided ? "Decided" : label}</span>
         {context && (
           <>
             <span className="text-muted-foreground">·</span>
@@ -336,7 +382,7 @@ export function InboxCard({
             prototype={!!prototype}
           />
         )}
-        {(item.kind === "approval" || item.kind === "question") && !settle.isSuccess && (
+        {(item.kind === "approval" || item.kind === "question") && !decided && (
           <label className="flex items-start gap-2 text-xs">
             <input
               type="checkbox"
@@ -355,7 +401,7 @@ export function InboxCard({
         {item.kind === "approval" &&
           !protectedDecision &&
           (!!prototype || viewer?.full_access === true) &&
-          !settle.isSuccess && (
+          !decided && (
             <div className="space-y-2">
               <label className="flex items-center gap-2 text-xs">
                 <input
@@ -385,7 +431,7 @@ export function InboxCard({
           )}
         {item.kind !== "recovery" &&
           (!protectedDecision || item.kind === "question") &&
-          !settle.isSuccess && (
+          !decided && (
             <label className="block text-xs">
               Reason (optional)
               <input
@@ -398,7 +444,7 @@ export function InboxCard({
             </label>
           )}
       </div>
-      {!settle.isSuccess && (
+      {!decided && (
         <div className="flex flex-wrap gap-2 border-t border-border px-3.5 py-2.5">{actions}</div>
       )}
       {settle.error && (
@@ -411,7 +457,7 @@ export function InboxCard({
 }
 
 /**
- * Today's manual recovery form (session-detail.tsx): the outcome, the externally verified
+ * The shared manual recovery form: the outcome, the externally verified
  * result or failure reason, and the person's answer again when the call was a question.
  */
 function RecoveryForm({

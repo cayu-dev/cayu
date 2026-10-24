@@ -237,18 +237,30 @@ export type Api = {
   /**
    * Settle the session's manual recovery: `POST /api/user-input/recover`,
    * `/api/tool-approvals/recover` or `/api/tool-rounds/recover`, whichever the pending
-   * recovery names, as today's session page does.
+   * recovery names from the exact public pending-action projection.
    */
-  recover(sessionId: string, body: RecoveryRequest): Promise<void>
+  recover(
+    sessionId: string,
+    body: RecoveryRequest,
+    options?: MutationExecutionOptions,
+  ): Promise<MutationTransportSnapshot | undefined>
   /** `POST /api/run`: start a session with one specialist. Returns the new session's ID. */
   start(
     body: { agent: string; prompt: string },
     options?: MutationExecutionOptions,
   ): Promise<{ session_id: string; snapshot?: MutationTransportSnapshot }>
-  /** `POST /api/sessions/{id}/resume` with a new prompt (backend item 5 for completed sessions). */
-  reply(id: string, prompt: string): Promise<void>
+  /** `POST /api/resume`; the caller retains uncertain observation through options. */
+  reply(
+    id: string,
+    prompt: string,
+    options?: MutationExecutionOptions,
+  ): Promise<MutationTransportSnapshot | undefined>
   /** `POST /api/sessions/{id}/interrupt`, with an optional reason. */
-  interrupt(id: string, reason?: string): Promise<void>
+  interrupt(
+    id: string,
+    reason?: string,
+    options?: MutationExecutionOptions,
+  ): Promise<MutationTransportSnapshot | undefined>
   /** `GET /api/sessions/{id}/state`: execution state, snapshots, interruption cascade. */
   state(id: string): Promise<SessionStateRecord>
   /** Proposed (backend item 7): `GET /api/task-types`. */
@@ -259,10 +271,13 @@ export type Api = {
     session_id: string | null
   }>
   /**
-   * Replay a session's original input through the same path: rerun its task, or start the
-   * same specialist with the same first message and labels (`POST /api/run`, available today).
+   * Start the same specialist with its first user text and labels (`POST /api/run`).
+   * Task-origin sessions require the separate server-owned task replay operation.
    */
-  runAgain(sessionId: string): Promise<{ session_id: string }>
+  runAgain(
+    sessionId: string,
+    options?: MutationExecutionOptions,
+  ): Promise<{ session_id: string; snapshot?: MutationTransportSnapshot }>
   /** Proposed (backend item 11). */
   toolUsage(): Promise<ToolUsage[]>
   /** Proposed (backend item 12): `GET /api/knowledge`, active entries. */

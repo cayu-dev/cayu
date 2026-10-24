@@ -47,3 +47,26 @@ def test_prototype_session_population_filters_and_native_links(prototype_url):
             playwright.expect(page.get_by_label("State", exact=True)).to_have_value("waiting")
         finally:
             browser.close()
+
+
+@pytest.mark.parametrize("session_id", ["close-a1f0c27d9e31", "close-537587ecae8f"])
+def test_prototype_terminal_session_keeps_mock_evaluation_dialog(prototype_url, session_id):
+    playwright = pytest.importorskip("playwright.sync_api")
+    with playwright.sync_playwright() as driver:
+        browser = driver.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"{prototype_url}#/sessions/{session_id}")
+            playwright.expect(
+                page.get_by_role("tab", name="Conversation", exact=True)
+            ).to_be_visible()
+            page.get_by_role("button", name="More actions", exact=True).click()
+            page.get_by_role("button", name="Add to evals", exact=True).click()
+            playwright.expect(
+                page.get_by_role("form", name="Add to evals", exact=True)
+            ).to_be_visible()
+            assert errors == []
+        finally:
+            browser.close()

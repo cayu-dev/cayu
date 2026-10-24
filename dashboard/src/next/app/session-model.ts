@@ -52,13 +52,14 @@ export function shouldFollowRowClick(click: {
   )
 }
 
-/** The structured-output tool the runtime adds; its result is the session's answer. */
-export const STRUCTURED_OUTPUT_TOOL = "__cayu_submit_structured_output"
-
 export type ToolUse = {
+  key: string
+  messageIndex: number
+  partIndex: number
   id: string
   name: string
   args: unknown
+  argumentsUnavailable: boolean
   result: string | null
   structured: unknown
   error: boolean
@@ -70,6 +71,7 @@ export type Block =
   | { kind: "text"; key: string; text: string }
   | { kind: "work"; key: string; tools: ToolUse[]; thoughts: string[] }
   | { kind: "output"; key: string; value: unknown }
+  | { kind: "part"; key: string; part: Record<string, unknown>; user?: boolean }
 
 type Part = { [key: string]: unknown }
 const str = (v: unknown) => (typeof v === "string" ? v : "")
@@ -87,13 +89,60 @@ function resultText(part: Part): string {
  * Group a transcript into conversation blocks: user messages, assistant text, and one
  * "work" block for each run of tool calls and thinking between them.
  */
-export function buildBlocks(messages: TranscriptMessage[]): Block[] {
-  const results = new Map<string, Part>()
-  for (const m of messages) {
-    if (m.role !== "tool") continue
-    for (const p of m.content) {
-      if (p.type === "tool_result" && typeof p.tool_call_id === "string")
-        results.set(p.tool_call_id, p)
+export function buildBlocks(
+  messages: TranscriptMessage[],
+  structuredOutputEnabled = true,
+  includeThinking = true,
+): Block[] {
+  // Correlation fields are public display evidence, not mutation authority. A
+  // redacted or ambiguous tuple cannot attach a result to a particular call.
+  const identity = (part: Part): string | null => {
+    const fields = [
+      part.tool_call_id,
+      part.model_step_id,
+      part.model_attempt_id,
+      part.tool_round_id,
+    ]
+    if (typeof fields[0] !== "string" || !fields[0].trim()) return null
+    if (
+      fields.some(
+        (field) =>
+          typeof field !== "string" ||
+          !field.trim() ||
+          field.includes("[REDACTED_SECRET]") ||
+          field.includes("[PRIVATE_EVENT_AUTHORITY]"),
+      )
+    )
+      return null
+    return JSON.stringify(fields)
+  }
+  const positions = new Map<Part, number>()
+  const calls = new Map<string, Part[]>()
+  const results = new Map<string, Part[]>()
+  for (const message of messages) {
+    for (const part of message.content) {
+      positions.set(part, positions.size)
+      const collection =
+        message.role === "assistant" && part.type === "tool_call"
+          ? calls
+          : message.role === "tool" && part.type === "tool_result"
+            ? results
+            : null
+      const key = collection && identity(part)
+      if (collection && key) collection.set(key, [...(collection.get(key) ?? []), part])
+    }
+  }
+  const matched = new Map<Part, Part>()
+  const consumed = new Set<Part>()
+  for (const [key, candidates] of calls) {
+    const outcomes = results.get(key)
+    if (
+      candidates.length === 1 &&
+      outcomes?.length === 1 &&
+      positions.get(candidates[0]!)! < positions.get(outcomes[0]!)!
+    ) {
+      matched.set(candidates[0]!, outcomes[0]!)
+      consumed.add(outcomes[0]!)
     }
   }
   const blocks: Block[] = []
@@ -106,47 +155,59 @@ export function buildBlocks(messages: TranscriptMessage[]): Block[] {
     return work
   }
   for (const m of messages) {
-    if (m.role === "system" || m.role === "tool") continue
+    if (m.role === "system") continue
     const key = `m${m.index}`
     if (m.role === "user") {
-      const text = m.content.map((p) => str(p.text)).join("")
-      if (!text) continue
       work = null
-      blocks.push({ kind: "user", key, text })
+      m.content.forEach((part, index) => {
+        if (part.type === "thinking" && !includeThinking) return
+        const partKey = `${key}.${index}`
+        if (part.type === "text") {
+          blocks.push({ kind: "user", key: partKey, text: str(part.text) })
+        } else {
+          blocks.push({ kind: "part", key: partKey, part, user: true })
+        }
+      })
       continue
     }
     m.content.forEach((p, i) => {
+      if (p.type === "thinking" && !includeThinking) return
       const pkey = `${key}.${i}`
-      if (p.type === "text" && str(p.text).trim()) {
+      if (p.type === "structured_output" && structuredOutputEnabled) {
+        work = null
+        blocks.push({ kind: "output", key: pkey, value: p.output })
+      } else if (m.role === "tool") {
+        if (p.type === "tool_result" && !consumed.has(p)) {
+          work = null
+          blocks.push({ kind: "part", key: pkey, part: p })
+        }
+        return
+      } else if (p.type === "text" && str(p.text).trim()) {
         work = null
         blocks.push({ kind: "text", key: pkey, text: str(p.text) })
-      } else if (p.type === "thinking" && str(p.text).trim()) {
+      } else if (p.type === "thinking" && includeThinking && str(p.text).trim()) {
         ensureWork(pkey).thoughts.push(
           str(p.text).replaceAll("****", " · ").replaceAll("**", "").trim(),
         )
       } else if (p.type === "tool_call") {
         const id = str(p.tool_call_id)
-        const r = results.get(id)
-        if (p.tool_name === STRUCTURED_OUTPUT_TOOL) {
-          const output =
-            r && typeof r.structured === "object" && r.structured
-              ? (r.structured as Part).output
-              : undefined
-          if (output !== undefined) {
-            work = null
-            blocks.push({ kind: "output", key: pkey, value: output })
-          }
-          return
-        }
+        const r = matched.get(p)
         ensureWork(pkey).tools.push({
+          key: pkey,
+          messageIndex: m.index,
+          partIndex: i,
           id,
           name: str(p.tool_name),
-          args: p.arguments ?? {},
+          args: p.arguments_state === "unavailable" ? null : (p.arguments ?? {}),
+          argumentsUnavailable: p.arguments_state === "unavailable",
           result: r ? resultText(r) : null,
           structured: r?.structured ?? null,
           error: r?.is_error === true,
           running: !r,
         })
+      } else if (p.type !== "structured_output" && p.type !== "text" && p.type !== "thinking") {
+        work = null
+        blocks.push({ kind: "part", key: pkey, part: p })
       }
     })
   }
@@ -184,7 +245,10 @@ export function stepLabel(
   displays: ToolDisplays = {},
 ): { verb: string; target: string } {
   const display = displays[tool.name]
-  return { verb: display ? upperFirst(display.verb) : tool.name, target: argPreview(tool.args) }
+  return {
+    verb: display ? upperFirst(display.verb) : tool.name,
+    target: tool.argumentsUnavailable ? "" : argPreview(tool.args),
+  }
 }
 
 /** A short one-line view of tool arguments: the first string value, else compact JSON. */

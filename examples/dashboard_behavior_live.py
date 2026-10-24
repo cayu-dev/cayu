@@ -18,7 +18,7 @@ from importlib.metadata import version
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import uvicorn
 from playwright.async_api import (
@@ -389,6 +389,7 @@ class MutationDisconnectFaults:
         self.initial_run_requests = 0
         self.initial_mutation_ids: list[str] = []
         self.initial_mutation_requests: dict[str, int] = {}
+        self.inbox_settle_requests: list[str] = []
         self.replay_requests: list[tuple[str, str]] = []
         self.slow_summary_started = asyncio.Event()
 
@@ -403,6 +404,12 @@ class MutationDisconnectFaults:
         if is_session_list and query.get("q") == [SLOW_SESSION_QUERY]:
             self.slow_summary_started.set()
             await asyncio.sleep(1)
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and re.fullmatch(r"/api/inbox/[^/]+/settle", str(scope.get("path", "")))
+        ):
+            self.inbox_settle_requests.append(str(scope["path"]))
         is_run_post = (
             scope["type"] == "http"
             and scope.get("method") == "POST"
@@ -625,11 +632,15 @@ async def main() -> None:
             {
                 "/api/run": 2,
                 "/api/resume": 2,
-                "/api/tool-approvals/resolve": 1,
                 f"/api/sessions/{INTERRUPT_SESSION_ID}/interrupt": 1,
                 f"/api/sessions/{RESUME_INTERRUPT_SESSION_ID}/interrupt": 1,
             },
             "browser session mutations must each be submitted exactly once",
+        )
+        require_equal(
+            len(server_app.inbox_settle_requests),
+            1,
+            "the Session approval must settle exactly once through the canonical Inbox owner",
         )
         require_equal(
             len(server_app.replay_requests),
@@ -1263,6 +1274,8 @@ async def _run_browser_contract(
     expected_edit_console_errors: list[str] = []
     expected_usage_rejections: list[str] = []
     expected_usage_console_errors: list[str] = []
+    expected_queue_rejections: list[str] = []
+    expected_queue_console_errors: list[str] = []
     expected_observer_abort_paths = {
         "/api/run",
         "/api/resume",
@@ -1299,6 +1312,8 @@ async def _run_browser_contract(
             expected_edit_console_errors,
             expected_usage_rejections,
             expected_usage_console_errors,
+            expected_queue_rejections,
+            expected_queue_console_errors,
         )
         try:
             await _exercise_contract_version_gate(page, base_url)
@@ -1361,6 +1376,11 @@ async def _run_browser_contract(
                 len(expected_edit_console_errors),
                 len(expected_edit_rejections),
                 "each expected edit rejection must produce one classified Chromium resource error",
+            )
+            require_equal(
+                len(expected_queue_console_errors),
+                len(expected_queue_rejections),
+                "each denied queue inspection must have one classified resource error",
             )
             require_equal(
                 len(expected_usage_rejections),
@@ -1458,23 +1478,6 @@ async def _exercise_dashboard(
     task_store: InMemoryTaskStore,
     expected_query_aborts: list[str],
 ) -> None:
-    session_event_records = await session_store.query_events(
-        EventQuery(session_id=SESSION_ID, limit=100)
-    )
-
-    def projected_event_id(event_type: EventType) -> str:
-        matches = [record for record in session_event_records if record.event.type is event_type]
-        require_equal(
-            len(matches),
-            1,
-            f"the dashboard fixture must contain one {event_type} event",
-        )
-        record = matches[0]
-        return f"cayu_event_{record.sequence}"
-
-    model_completed_event_id = projected_event_id(EventType.MODEL_COMPLETED)
-    tool_failed_event_id = projected_event_id(EventType.TOOL_CALL_FAILED)
-
     await _exercise_operational_scope(page, base_url)
     await _exercise_dashboard_inbox(page, base_url)
     await _exercise_run_agent_inventory(page, base_url)
@@ -1491,66 +1494,10 @@ async def _exercise_dashboard(
     await session_link.click()
 
     await expect(page).to_have_url(re.compile(rf"/cayu/sessions/{SESSION_ID}$"))
-    await expect(page.get_by_role("heading", name=SESSION_ID)).to_be_visible()
-    token_stat = page.get_by_text("Tokens", exact=True).locator("..")
-    await expect(token_stat.get_by_text("15", exact=True)).to_be_visible()
-    await _exercise_session_annotations(page)
-
-    completed_event = page.get_by_role("button", name=re.compile(r"model\.completed"))
-    await expect(completed_event).to_be_visible()
-    await completed_event.click()
-
-    await expect(page.get_by_text("Event Detail", exact=True)).to_be_visible()
-    await expect(page.get_by_text("model.completed", exact=True).last).to_be_visible()
-    await expect(page.locator("pre").filter(has_text=PAYLOAD_MARKER)).to_be_visible()
-
-    event_type_filter = page.get_by_label("Filter events by exact event type")
-    await event_type_filter.fill("model.completed")
-    await page.get_by_role("button", name="Apply filters").click()
-    await expect(page).to_have_url(re.compile(r"[?&]event_type=model\.completed(?:&|$)"))
-    await expect(page.get_by_role("button", name=re.compile(r"model\.completed"))).to_be_visible()
-    await expect(page.get_by_role("button", name=re.compile(r"model\.started"))).to_have_count(0)
-    await expect(page.get_by_text("Tool failed: browser_contract_tool", exact=True)).to_be_visible()
-    await page.get_by_role("button", name="Inspect event").click()
-    await expect(page).to_have_url(
-        re.compile(rf"[?&]event_id={re.escape(tool_failed_event_id)}(?:&|$)")
+    await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_have_attribute(
+        "aria-selected", "true"
     )
-    await expect(page.get_by_text(tool_failed_event_id, exact=True)).to_be_visible()
-
-    event_id_filter = page.get_by_label("Filter events by exact event ID")
-    await event_id_filter.fill(model_completed_event_id)
-    await event_type_filter.fill("model.completed")
-    await page.get_by_role("button", name="Apply filters").click()
-    await expect(page).to_have_url(
-        re.compile(rf"[?&]event_id={re.escape(model_completed_event_id)}(?:&|$)")
-    )
-    await expect(page.get_by_text(model_completed_event_id, exact=True)).to_be_visible()
-
-    transcript_role_filter = page.get_by_label("Filter transcript by role")
-    await transcript_role_filter.select_option("assistant")
-    await expect(page).to_have_url(re.compile(r"[?&]transcript_role=assistant(?:&|$)"))
-    await page.reload(wait_until="networkidle")
-    await expect(event_type_filter).to_have_value("model.completed")
-    await expect(event_id_filter).to_have_value(model_completed_event_id)
-    await expect(transcript_role_filter).to_have_value("assistant")
-    await expect(
-        page.get_by_text("dashboard transcript assistant marker", exact=True)
-    ).to_be_visible()
-    await expect(page.get_by_text("dashboard transcript user marker", exact=True)).to_have_count(0)
-    thinking_payload = page.locator("pre").filter(has_text="dashboard transcript thinking marker")
-    await expect(thinking_payload).to_be_visible()
-
-    include_thinking = page.get_by_label("Include thinking")
-    await include_thinking.uncheck()
-    await expect(page).to_have_url(re.compile(r"[?&]include_thinking=false(?:&|$)"))
-    await expect(thinking_payload).to_have_count(0)
-    await expect(
-        page.get_by_text("dashboard transcript assistant marker", exact=True)
-    ).to_be_visible()
-
-    await page.go_back()
-    await expect(include_thinking).to_be_checked()
-    await expect(thinking_payload).to_be_visible()
+    await _exercise_session_observation(page, base_url, session_store)
     await _exercise_existing_session_mutations(page, base_url, provider)
     await _exercise_captured_evaluation(
         page,
@@ -1583,6 +1530,7 @@ async def _exercise_captured_evaluation(
         f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}",
         wait_until="networkidle",
     )
+    await page.get_by_role("button", name="More actions", exact=True).click()
     evaluate = page.get_by_test_id("evaluate-session")
     await expect(evaluate).to_be_visible()
     await evaluate.focus()
@@ -2868,8 +2816,94 @@ async def _exercise_local_eval_acceptance(
         )
 
 
+async def _exercise_session_observation(
+    page: Page, base_url: str, session_store: InMemorySessionStore
+) -> None:
+    session_event_records = await session_store.query_events(
+        EventQuery(session_id=SESSION_ID, limit=100)
+    )
+
+    def projected_event_id(event_type: EventType) -> str:
+        matches = [record for record in session_event_records if record.event.type is event_type]
+        require_equal(
+            len(matches),
+            1,
+            f"the dashboard fixture must contain one {event_type} event",
+        )
+        record = matches[0]
+        return f"cayu_event_{record.sequence}"
+
+    model_completed_event_id = projected_event_id(EventType.MODEL_COMPLETED)
+    tool_failed_event_id = projected_event_id(EventType.TOOL_CALL_FAILED)
+
+    await expect(page.get_by_text("15 tokens", exact=True)).to_be_visible()
+    await _exercise_session_annotations(page)
+
+    await _exercise_trace(page, base_url, SESSION_ID)
+    # Known historical evidence need not be present on the newest bounded page.
+    # Exact lookup remains available while the live tail is paused.
+    event_type_filter = page.get_by_label("Event type", exact=True)
+    event_id_filter = page.get_by_label("Event ID", exact=True)
+    await event_id_filter.fill(model_completed_event_id)
+    await page.get_by_role("button", name="Apply filters").click()
+    completed_event = page.get_by_role("button", name=re.compile(r"model\.completed"))
+    await completed_event.click()
+    detail = page.get_by_role("complementary", name="Event detail")
+    await expect(detail.get_by_text("model.completed", exact=True)).to_be_visible()
+    await expect(detail.locator("pre").filter(has_text=PAYLOAD_MARKER)).to_be_visible()
+    await event_id_filter.fill("")
+    await event_type_filter.fill("model.completed")
+    await page.get_by_role("button", name="Apply filters").click()
+    await expect(page).to_have_url(re.compile(r"[?&]event_type=model\.completed(?:&|$)"))
+    await expect(page.get_by_role("button", name=re.compile(r"model\.started"))).to_have_count(0)
+    await event_type_filter.fill("")
+    await event_id_filter.fill(tool_failed_event_id)
+    await page.get_by_role("button", name="Apply filters").click()
+    await expect(page).to_have_url(
+        re.compile(rf"[?&]event_id={re.escape(tool_failed_event_id)}(?:&|$)")
+    )
+    await expect(detail.locator("pre").filter(has_text=tool_failed_event_id)).to_be_visible()
+    await event_id_filter.fill(model_completed_event_id)
+    await event_type_filter.fill("model.completed")
+    await page.get_by_role("button", name="Apply filters").click()
+    await expect(detail.locator("pre").filter(has_text=model_completed_event_id)).to_be_visible()
+    await page.get_by_role("tab", name="Conversation", exact=True).click()
+
+    transcript_role_filter = page.get_by_label("Message role", exact=True)
+    await transcript_role_filter.select_option("assistant")
+    await expect(page).to_have_url(re.compile(r"[?&]transcript_role=assistant(?:&|$)"))
+    await page.reload(wait_until="networkidle")
+    await expect(page).to_have_url(re.compile(r"[?&]event_type=model\.completed(?:&|$)"))
+    await expect(page).to_have_url(
+        re.compile(rf"[?&]event_id={re.escape(model_completed_event_id)}(?:&|$)")
+    )
+    await expect(transcript_role_filter).to_have_value("assistant")
+    await expect(
+        page.get_by_text("dashboard transcript assistant marker", exact=True)
+    ).to_be_visible()
+    await expect(
+        page.get_by_text("dashboard transcript user marker", exact=True).and_(page.locator("p"))
+    ).to_have_count(0)
+    thinking_payload = page.get_by_text("dashboard transcript thinking marker", exact=True)
+    await page.get_by_role("button", name="Thought it through", exact=True).click()
+    await expect(thinking_payload).to_be_visible()
+
+    include_thinking = page.get_by_label("Include thinking")
+    await include_thinking.uncheck()
+    await expect(page).to_have_url(re.compile(r"[?&]include_thinking=false(?:&|$)"))
+    await expect(thinking_payload).to_have_count(0)
+    await expect(
+        page.get_by_text("dashboard transcript assistant marker", exact=True)
+    ).to_be_visible()
+
+    await page.go_back()
+    await expect(include_thinking).to_be_checked()
+    await page.get_by_role("button", name="Thought it through", exact=True).click()
+    await expect(thinking_payload).to_be_visible()
+
+
 async def _exercise_trace(page: Page, base_url: str, session_id: str) -> None:
-    """Acceptance entry for the dependent Session activation (not mounted here yet)."""
+    """Acceptance entry for the production Session Trace view."""
     await page.goto(f"{base_url}/cayu/sessions/{session_id}?view=trace")
     await expect(page.get_by_role("tree", name="Session trace")).to_be_visible()
     await expect(page.get_by_text("Linked by event order", exact=False)).to_have_count(0)
@@ -2948,15 +2982,10 @@ async def _exercise_workflow(
 
     page.on("request", record_workflow_request)
     try:
-        await page.goto(
-            f"{base_url}/cayu/sessions/{WORKFLOW_FOCUS_SESSION_ID}",
-            wait_until="networkidle",
+        await page.goto(workflow_url, wait_until="domcontentloaded")
+        await expect(page).to_have_url(
+            re.compile(rf"/cayu/sessions/{WORKFLOW_FOCUS_SESSION_ID}\?.*view=trace")
         )
-        workflow_link = page.get_by_role("link", name="Workflow", exact=True)
-        await expect(workflow_link).to_be_visible()
-        observed_requests.clear()
-        await workflow_link.click()
-        await expect(page).to_have_url(re.compile(rf"{re.escape(workflow_url)}$"))
         await expect(page.get_by_role("heading", name="Workflow", exact=True)).to_be_visible()
         await expect(
             page.get_by_text(
@@ -3318,12 +3347,30 @@ async def _exercise_workflow(
             "routine Workflow refresh must advance the retained child-session cursor chain",
         )
 
+        relation_ids = {
+            WORKFLOW_PARENT_SESSION_ID,
+            WORKFLOW_ACTIVE_SESSION_ID,
+            WORKFLOW_FAILED_SESSION_ID,
+            WORKFLOW_INTERRUPTED_SESSION_ID,
+            *(
+                f"{WORKFLOW_CHILD_SESSION_PREFIX}-{index:03d}"
+                for index in range(WORKFLOW_CHILD_SESSION_COUNT - 3)
+            ),
+        }
         allowed_workflow_requests = {
             ("GET", "/api/contract"),
             ("GET", "/api/app"),  # Shell identity and role refresh.
             ("GET", "/api/inbox/counts"),  # Shared sidebar badge; no item scan.
             ("POST", topology_path),
             ("POST", "/api/usage/rollup"),
+            ("GET", "/api/agents"),
+            ("GET", "/api/inbox"),
+            ("GET", "/api/sessions"),
+            *(
+                ("GET", f"/api/sessions/{WORKFLOW_FOCUS_SESSION_ID}{suffix}")
+                for suffix in ("", "/state", "/transcript", "/events", "/trace", "/messages")
+            ),
+            *(("GET", f"/api/sessions/{session_id}/transcript") for session_id in relation_ids),
         }
         unexpected_workflow_requests = [
             f"{method} {path}"
@@ -3333,7 +3380,7 @@ async def _exercise_workflow(
         require_equal(
             unexpected_workflow_requests,
             [],
-            "the Workflow route must use only its bounded topology, usage, contract, and shared shell APIs",
+            "embedded Workflow must use only bounded topology/usage and the exact Session shell reads",
         )
 
         exact_task_path = f"/api/tasks/{WORKFLOW_PARENT_TASK_ID}"
@@ -3445,9 +3492,13 @@ async def _exercise_workflow(
         await page.route("**/api/contract", serve_workflow_unavailable_contract)
         try:
             await page.goto(workflow_url, wait_until="networkidle")
-            await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
-                "Workflow is unavailable"
-            )
+            await expect(
+                page.get_by_text(
+                    "Workflow is unavailable for this deployment or role. Session trace remains available.",
+                    exact=True,
+                )
+            ).to_be_visible()
+            await expect(page.get_by_role("heading", name="Workflow", exact=True)).to_have_count(0)
             require(
                 not workflow_topology_requested,
                 "an unavailable Workflow route must not probe the topology endpoint",
@@ -3673,7 +3724,10 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
 
         observed_requests.clear()
         await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="networkidle")
-        await expect(page.get_by_role("heading", name=SESSION_ID)).to_be_visible()
+        await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_have_attribute(
+            "aria-selected", "true"
+        )
+        await page.get_by_role("button", name="Session details", exact=True).click()
         require(
             not any(request.startswith("GET /api/artifacts") for request in observed_requests),
             f"the session page probed unavailable artifacts: {observed_requests!r}",
@@ -3772,9 +3826,9 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await page.goto(
             f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="networkidle"
         )
-        interrupt = page.get_by_role("button", name="Interrupt session", exact=True)
-        await expect(interrupt).to_be_disabled()
-        await expect(page.get_by_test_id("session-interruption-unavailable")).to_be_visible()
+        await expect(page.get_by_role("button", name="Stop", exact=True)).to_have_count(0)
+        await expect(page.locator("#session-composer")).to_have_count(0)
+        await page.get_by_role("button", name="Session details", exact=True).click()
         await expect(page.get_by_role("button", name="Edit labels", exact=True)).to_be_disabled()
         await expect(page.get_by_test_id("annotations-unavailable")).to_be_visible()
         await expect(page.get_by_role("link", name="New Run", exact=True)).to_have_count(0)
@@ -3782,7 +3836,9 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await page.goto(f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}", wait_until="networkidle")
         await expect(page.get_by_role("button", name="Approve", exact=True)).to_be_disabled()
         await expect(page.get_by_role("button", name="Deny", exact=True)).to_be_disabled()
-        await expect(page.get_by_test_id("pending-action-unavailable")).to_be_visible()
+        await expect(
+            page.get_by_text("Decisions are unavailable for this deployment.", exact=True)
+        ).to_be_visible()
 
         await _assert_unavailable_run_page(page, base_url)
     finally:
@@ -4096,74 +4152,94 @@ async def _exercise_session_annotations(page: Page) -> None:
 
     await page.route(labels_path, reject_first_label_save)
     await page.route(metadata_path, count_metadata_saves)
+    panel = page.get_by_test_id("session-annotations")
     try:
-        await expect(page.get_by_text("stage=initial", exact=True)).to_be_visible()
-        await expect(page.locator("pre").filter(has_text="dashboard-customer")).to_be_visible()
+        await page.get_by_role("button", name="Session details", exact=True).click()
+        await expect(panel.get_by_text("stage=initial", exact=True)).to_be_visible()
+        await expect(panel.locator("pre").filter(has_text="dashboard-customer")).to_be_visible()
         await expect(
-            page.locator("pre").filter(has_text="runtime-dashboard-marker")
-        ).to_be_visible()
+            panel.locator("pre").filter(has_text="runtime-dashboard-marker")
+        ).to_have_count(0)
 
-        await page.get_by_role("button", name="Edit labels", exact=True).click()
-        labels_editor = page.get_by_label("Session labels JSON")
+        await panel.get_by_role("button", name="Edit labels", exact=True).click()
+        labels_editor = panel.get_by_label("Session labels JSON")
         pending_labels = '{"stage":"draft-preserved-across-metadata-save"}'
         await labels_editor.fill(pending_labels)
 
         # A confirmed metadata response replaces the detail cache. The independently
         # active labels editor must retain its draft across that parent re-render.
-        await page.get_by_role("button", name="Edit metadata", exact=True).click()
-        metadata_editor = page.get_by_label("Session metadata JSON")
+        await panel.get_by_role("button", name="Edit metadata", exact=True).click()
+        metadata_editor = panel.get_by_label("Session metadata JSON")
         await metadata_editor.fill(
             '{"customer":{"id":"dashboard-customer"},"marker":"metadata-browser-marker"}'
         )
-        await page.get_by_role("button", name="Save metadata", exact=True).click()
-        await expect(page.locator("pre").filter(has_text="metadata-browser-marker")).to_be_visible()
+        await panel.get_by_role("button", name="Save metadata", exact=True).click()
+        await expect(
+            panel.locator("pre").filter(has_text="metadata-browser-marker")
+        ).to_be_visible()
         await expect(labels_editor).to_have_value(pending_labels)
         require_equal(metadata_saves, 1, "saving metadata must send exactly one PATCH")
 
-        await page.get_by_role("button", name="Cancel label editing", exact=True).click()
-        await expect(page.get_by_role("button", name="Edit labels", exact=True)).to_be_focused()
-        await page.get_by_role("button", name="Edit labels", exact=True).click()
-        labels_editor = page.get_by_label("Session labels JSON")
+        await panel.get_by_role("button", name="Cancel label editing", exact=True).click()
+        await expect(panel.get_by_role("button", name="Edit labels", exact=True)).to_be_focused()
+        await panel.get_by_role("button", name="Edit labels", exact=True).click()
+        labels_editor = panel.get_by_label("Session labels JSON")
         await expect(labels_editor).to_have_value(re.compile(r'"stage": "initial"'))
 
         await labels_editor.fill('{"stage":1}')
-        await page.get_by_role("button", name="Save labels", exact=True).click()
-        await expect(page.get_by_text('Label "stage" must have a string value.')).to_be_visible()
+        await panel.get_by_role("button", name="Save labels", exact=True).click()
+        await expect(panel.get_by_text('Label "stage" must have a string value.')).to_be_visible()
         require_equal(label_saves, 0, "client-invalid labels must not reach the server")
 
         valid_labels = '{"stage":"review","tenant":"acme"}'
         await labels_editor.fill(valid_labels)
-        await page.get_by_role("button", name="Save labels", exact=True).click()
+        await panel.get_by_role("button", name="Save labels", exact=True).click()
         await expect(
-            page.get_by_text("Injected session label validation failure.", exact=True)
+            panel.get_by_text("Injected session label validation failure.", exact=True)
         ).to_be_visible()
         await expect(labels_editor).to_have_value(valid_labels)
-        await page.get_by_role("button", name="Save labels", exact=True).evaluate(
+        await panel.get_by_role("button", name="Save labels", exact=True).evaluate(
             "button => { button.click(); button.click(); }"
         )
-        await expect(page.get_by_text("stage=review", exact=True)).to_be_visible()
-        await expect(page.get_by_text("tenant=acme", exact=True)).to_be_visible()
+        await expect(panel.get_by_text("stage=review", exact=True)).to_be_visible()
+        await expect(panel.get_by_text("tenant=acme", exact=True)).to_be_visible()
         require_equal(label_saves, 2, "duplicate save activation must send one retry PATCH")
 
-        await page.get_by_role("button", name="Edit metadata", exact=True).click()
-        metadata_editor = page.get_by_label("Session metadata JSON")
+        await panel.get_by_role("button", name="Edit metadata", exact=True).click()
+        metadata_editor = panel.get_by_label("Session metadata JSON")
         await metadata_editor.fill('{"cancelled":true}')
-        cancel_metadata = page.get_by_role("button", name="Cancel metadata editing", exact=True)
+        cancel_metadata = panel.get_by_role("button", name="Cancel metadata editing", exact=True)
         await cancel_metadata.click()
-        await expect(page.get_by_role("button", name="Edit metadata", exact=True)).to_be_focused()
+        await expect(panel.get_by_role("button", name="Edit metadata", exact=True)).to_be_focused()
         require_equal(metadata_saves, 1, "cancelling metadata editing must not send a PATCH")
 
-        await page.get_by_role("button", name="Edit labels", exact=True).click()
-        await page.get_by_label("Session labels JSON").fill("{}")
-        await page.get_by_role("button", name="Save labels", exact=True).click()
-        await expect(page.get_by_text("No labels.", exact=True)).to_be_visible()
+        await panel.get_by_role("button", name="Edit labels", exact=True).click()
+        await panel.get_by_label("Session labels JSON").fill("{}")
+        await panel.get_by_role("button", name="Save labels", exact=True).click()
+        await expect(panel.get_by_text("No labels.", exact=True)).to_be_visible()
 
-        await page.reload(wait_until="networkidle")
-        await expect(page.get_by_text("No labels.", exact=True)).to_be_visible()
-        await expect(page.locator("pre").filter(has_text="metadata-browser-marker")).to_be_visible()
+        await page.reload(wait_until="domcontentloaded")
+        details_button = page.get_by_role("button", name="Session details", exact=True)
+        await expect(details_button).to_be_visible()
+        if await details_button.get_attribute("aria-pressed") != "true":
+            await details_button.click()
+        await expect(panel.get_by_text("No labels.", exact=True)).to_be_visible()
         await expect(
-            page.locator("pre").filter(has_text="runtime-dashboard-marker")
+            panel.locator("pre").filter(has_text="metadata-browser-marker")
         ).to_be_visible()
+        await expect(
+            panel.locator("pre").filter(has_text="runtime-dashboard-marker")
+        ).to_have_count(0)
+        response = await page.request.get(
+            f"{urlsplit(page.url).scheme}://{urlsplit(page.url).netloc}/api/sessions/{SESSION_ID}"
+        )
+        require_equal(response.status, 200, "saved session metadata must remain readable")
+        payload = await response.json()
+        require_equal(
+            payload["metadata"]["cayu:dashboard_fixture"]["marker"],
+            "runtime-dashboard-marker",
+            "editing user metadata must preserve runtime-owned metadata",
+        )
     finally:
         await page.unroute(labels_path, reject_first_label_save)
         await page.unroute(metadata_path, count_metadata_saves)
@@ -4404,8 +4480,10 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
             await expect(run_button).to_be_enabled()
             await run_button.click()
             await expect(page).to_have_url(re.compile(r"/cayu/sessions/[^/?]+$"), timeout=15_000)
-            session_id = unquote(urlsplit(page.url).path.rsplit("/", 1)[-1])
-            await expect(page.get_by_role("heading", name=session_id)).to_be_visible()
+            await expect(
+                page.get_by_role("tab", name="Conversation", exact=True)
+            ).to_have_attribute("aria-selected", "true")
+            await expect(page.get_by_role("heading", level=1)).to_contain_text(prompt)
             session_urls.append(page.url)
     finally:
         page.remove_listener("request", record_run_request)
@@ -4423,74 +4501,76 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
 async def _exercise_existing_session_mutations(
     page: Page, base_url: str, provider: DashboardContractProvider
 ) -> None:
-    await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="networkidle")
-    resume_input = page.get_by_placeholder("Continue with a new prompt...")
+    await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="domcontentloaded")
+    resume_input = page.locator("#session-composer")
     await expect(resume_input).to_be_visible()
     await resume_input.fill("Resume through the dashboard browser contract.")
-    resume_button = page.get_by_role("button", name="Resume", exact=True)
+    resume_button = page.get_by_role("button", name="Send", exact=True)
     await resume_button.click()
     await provider.wait_for_direct_requests(1)
-    await expect(page.get_by_role("button", name="Interrupt session", exact=True)).to_be_visible(
-        timeout=10_000
-    )
-    await expect(resume_button).to_have_count(0)
+    await expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible(timeout=10_000)
+    await expect(resume_button).to_be_disabled()
     provider.release_direct()
-    await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
+    await expect(page.locator('[data-mutation-transport-phase="terminal"]').last).to_be_visible(
         timeout=15_000
     )
-    await expect(page.get_by_role("button", name=re.compile(r"session\.resumed"))).to_be_visible()
+    await expect(
+        page.get_by_text("Resume through the dashboard browser contract.", exact=True)
+    ).to_be_visible()
 
-    await page.goto(f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}", wait_until="networkidle")
-    await expect(page.get_by_text("Awaiting approval", exact=True)).to_be_visible()
+    await page.goto(
+        f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}", wait_until="domcontentloaded"
+    )
+    await expect(page.get_by_text("Needs your approval", exact=True).first).to_be_visible()
     deny_button = page.get_by_role("button", name="Deny", exact=True)
     await deny_button.click()
     await provider.wait_for_direct_requests(2)
-    await expect(page.get_by_role("button", name="Interrupt session", exact=True)).to_be_visible(
-        timeout=10_000
-    )
+    await expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible(timeout=10_000)
     await expect(deny_button).to_have_count(0)
     provider.release_direct()
-    await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
-        timeout=15_000
-    )
-    await expect(page.get_by_text("Awaiting approval", exact=True)).to_have_count(0)
+    await expect(page.get_by_text("Completed", exact=True).first).to_be_visible(timeout=15_000)
+    await expect(page.get_by_text("Needs your approval", exact=True)).to_have_count(0)
 
-    await page.goto(f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="networkidle")
-    await page.get_by_role("button", name="Interrupt session", exact=True).click()
+    await page.goto(
+        f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="domcontentloaded"
+    )
+    await page.get_by_role("button", name="Stop", exact=True).click()
     interrupt_sheet = page.get_by_role("dialog")
-    await expect(interrupt_sheet.get_by_text("Interrupt session?", exact=True)).to_be_visible()
+    await expect(interrupt_sheet.get_by_text("Stop this session?", exact=True)).to_be_visible()
     await expect(interrupt_sheet.get_by_role("button", name="Keep running")).to_be_visible()
-    await interrupt_sheet.get_by_label("Reason (optional)").fill("browser contract interruption")
-    await interrupt_sheet.get_by_role("button", name="Interrupt session", exact=True).click()
-    await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
+    await interrupt_sheet.locator("#stop-reason").fill("browser contract interruption")
+    await interrupt_sheet.get_by_role("button", name="Stop session", exact=True).click()
+    await expect(page.locator('[data-mutation-transport-phase="terminal"]').last).to_be_visible(
         timeout=15_000
     )
     await expect(interrupt_sheet).to_be_hidden()
-    await expect(page.get_by_text("interrupted", exact=True).first).to_be_visible()
+    await expect(
+        page.get_by_text("This session was stopped. Send a message to continue it.", exact=True)
+    ).to_be_visible()
 
     await page.goto(
         f"{base_url}/cayu/sessions/{RESUME_INTERRUPT_SESSION_ID}",
-        wait_until="networkidle",
+        wait_until="domcontentloaded",
     )
-    interrupted_resume_input = page.get_by_placeholder("Continue with a new prompt...")
+    interrupted_resume_input = page.locator("#session-composer")
     await interrupted_resume_input.fill("Interrupt this resume while its provider is active.")
-    interrupted_resume_button = page.get_by_role("button", name="Resume", exact=True)
+    interrupted_resume_button = page.get_by_role("button", name="Send", exact=True)
     await interrupted_resume_button.click()
     await provider.wait_for_direct_requests(3)
-    active_interrupt_button = page.get_by_role("button", name="Interrupt session", exact=True)
+    active_interrupt_button = page.get_by_role("button", name="Stop", exact=True)
     await expect(active_interrupt_button).to_be_visible(timeout=10_000)
-    await expect(interrupted_resume_button).to_have_count(0)
+    await expect(interrupted_resume_button).to_be_disabled()
     await active_interrupt_button.click()
     active_interrupt_sheet = page.get_by_role("dialog")
-    await active_interrupt_sheet.get_by_label("Reason (optional)").fill(
-        "interrupt an active resumed run"
-    )
-    await active_interrupt_sheet.get_by_role("button", name="Interrupt session", exact=True).click()
-    await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
+    await active_interrupt_sheet.locator("#stop-reason").fill("interrupt an active resumed run")
+    await active_interrupt_sheet.get_by_role("button", name="Stop session", exact=True).click()
+    await expect(page.locator('[data-mutation-transport-phase="terminal"]').last).to_be_visible(
         timeout=15_000
     )
     await expect(active_interrupt_sheet).to_be_hidden()
-    await expect(page.get_by_text("interrupted", exact=True).first).to_be_visible()
+    await expect(
+        page.get_by_text("This session was stopped. Send a message to continue it.", exact=True)
+    ).to_be_visible()
 
     failure_path = f"**/api/sessions/{INTERRUPT_FAILURE_SESSION_ID}/interrupt"
 
@@ -4514,17 +4594,16 @@ async def _exercise_existing_session_mutations(
     try:
         await page.goto(
             f"{base_url}/cayu/sessions/{INTERRUPT_FAILURE_SESSION_ID}",
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
         )
-        await page.get_by_role("button", name="Interrupt session", exact=True).click()
+        await page.get_by_role("button", name="Stop", exact=True).click()
         failure_sheet = page.get_by_role("dialog")
-        await failure_sheet.get_by_role("button", name="Interrupt session", exact=True).click()
+        await failure_sheet.get_by_role("button", name="Stop session", exact=True).click()
         await expect(
             page.locator('[data-mutation-transport-phase="runtime_failed"]')
         ).to_be_visible(timeout=15_000)
-        close_action = failure_sheet.get_by_role("button", name="Close", exact=True).first
+        close_action = failure_sheet.get_by_role("button", name="Keep running", exact=True)
         await expect(close_action).to_be_visible()
-        await expect(failure_sheet.get_by_role("button", name="Keep running")).to_have_count(0)
         await close_action.click()
         await expect(failure_sheet).to_be_hidden()
     finally:
@@ -4692,19 +4771,19 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
     await page.route(events_path, expose_recovered_events)
     try:
         await page.goto(
-            f"{base_url}/cayu/sessions/{REOBSERVE_SESSION_ID}", wait_until="networkidle"
+            f"{base_url}/cayu/sessions/{REOBSERVE_SESSION_ID}", wait_until="domcontentloaded"
         )
-        resume_input = page.get_by_placeholder("Continue with a new prompt...")
+        resume_input = page.locator("#session-composer")
         await resume_input.fill("Recover this dashboard observation without resubmitting.")
-        await page.get_by_role("button", name="Resume", exact=True).click()
+        await page.get_by_role("button", name="Send", exact=True).click()
         await expect(
             page.locator('[data-mutation-transport-phase="transport_failed"]')
         ).to_be_visible(timeout=25_000)
-        await expect(resume_input).to_have_count(0)
+        await expect(resume_input).to_be_disabled()
         retry_observation = page.get_by_role("button", name="Retry observation", exact=True)
         await expect(retry_observation).to_be_visible()
         await retry_observation.click()
-        await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
+        await expect(page.locator('[data-mutation-transport-phase="terminal"]').last).to_be_visible(
             timeout=15_000
         )
         await expect(retry_observation).to_have_count(0)
@@ -4751,6 +4830,8 @@ class _ApiRequestLog:
         self._page = page
         self.started: list[tuple[str, str]] = []
         self.settled = 0
+        self.pending: set[Request] = set()
+        self.urls: list[str] = []
         self._handled_page_reads = 0
         page.on("request", self._record_start)
         page.on("requestfinished", self._record_settled)
@@ -4765,10 +4846,13 @@ class _ApiRequestLog:
         path = self._api_path(request)
         if path is not None:
             self.started.append((request.method, path))
+            self.pending.add(request)
+            self.urls.append(request.url)
 
     def _record_settled(self, request: Request) -> None:
         if self._api_path(request) is not None:
             self.settled += 1
+            self.pending.discard(request)
 
     def count(self, method: str, path: str) -> int:
         return self.started.count((method, path))
@@ -4782,14 +4866,21 @@ class _ApiRequestLog:
         ]
 
     async def settle(self) -> None:
-        """Wait until the page has sent, received, and handled every API read."""
+        """Drain ordinary reads, allowing the shared follower to hold its declared wait."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 10
         while True:
             page_reads = await self._page.evaluate("window.__cayuApiReads.length")
             if page_reads == self._handled_page_reads:
                 return
-            while len(self.started) < page_reads or self.settled < len(self.started):
+            while len(self.started) < page_reads or any(
+                not (
+                    request.method == "GET"
+                    and urlsplit(request.url).path.endswith("/events")
+                    and parse_qs(urlsplit(request.url).query).get("wait_seconds") == ["10"]
+                )
+                for request in self.pending
+            ):
                 if loop.time() >= deadline:
                     raise AssertionError(f"dashboard API reads did not settle: {self.started!r}")
                 await asyncio.sleep(0.02)
@@ -4963,6 +5054,7 @@ async def _polling_budget_page(
             lambda message: (
                 failures.append(f"console error: {message.text}")
                 if message.type == "error"
+                and not message.text.startswith("Failed to load resource:")
                 else None
             ),
         )
@@ -4971,6 +5063,9 @@ async def _polling_budget_page(
             lambda response: (
                 failures.append(f"HTTP {response.status} {response.url}")
                 if response.status >= 400
+                and not (
+                    response.status == 403 and urlsplit(response.url).path.endswith("/messages")
+                )
                 else None
             ),
         )
@@ -4980,101 +5075,73 @@ async def _polling_budget_page(
         await context.close()
 
 
+async def _exercise_session_progress_budget(
+    new_context: Callable[..., Awaitable[BrowserContext]], base_url: str, session_id: str
+) -> dict[str, int]:
+    """Real long-poll remains single-flight while browser time advances independently."""
+    state_path = f"/api/sessions/{session_id}/state"
+    event_path = f"/api/sessions/{session_id}/events"
+    async with _polling_budget_page(new_context) as (page, requests, _failures):
+        await page.goto(f"{base_url}/cayu/sessions/{session_id}", wait_until="domcontentloaded")
+        await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
+        await _pause_page_clock(page, requests)
+        await _advance_page_clock(page, requests, 7_000, step_ms=1_000)
+        before = len(requests.started)
+        await _advance_page_clock(page, requests, 180_000, step_ms=1_000)
+        later = requests.started[before:]
+        require_equal(
+            [
+                read
+                for read in later
+                if read not in {("GET", "/api/inbox/counts"), ("GET", event_path)}
+            ],
+            [],
+            "unchanged progress must not poll independent state/action resources",
+        )
+        event_reads = later.count(("GET", event_path))
+        require(event_reads <= 6, "idle sequence probes must back off instead of polling rapidly")
+        scans = [
+            parse_qs(urlsplit(url).query)
+            for url in requests.urls
+            if urlsplit(url).path == event_path
+            and "after_sequence" in parse_qs(urlsplit(url).query)
+        ]
+        require(bool(scans), "the shared follower must continue from its sequence cursor")
+        for query in scans:
+            require_equal(query.get("limit"), ["1000"], "live scans must remain bounded")
+            require_equal(
+                query.get("order_by"), ["sequence_asc"], "live scans must advance sequence"
+            )
+            require_equal(
+                query.get("wait_seconds"), ["10"], "live scans must request a bounded server wait"
+            )
+        initial_events = requests.count("GET", event_path)
+        await _refocus_page(page, requests)
+        require_equal(
+            requests.count("GET", event_path),
+            initial_events + 1,
+            "visibility restoration must issue one fresh latest progress probe",
+        )
+        return {
+            "state_reads": requests.count("GET", state_path),
+            "event_reads": requests.count("GET", event_path),
+        }
+
+
 async def _exercise_terminal_session_polling(
     new_context: Callable[..., Awaitable[BrowserContext]], base_url: str
 ) -> dict[str, int]:
-    state_path = f"/api/sessions/{POLLING_TERMINAL_SESSION_ID}/state"
-    async with _polling_budget_page(new_context) as (page, requests, _failures):
-        await page.goto(
-            f"{base_url}/cayu/sessions/{POLLING_TERMINAL_SESSION_ID}",
-            wait_until="networkidle",
-        )
-        await expect(page.get_by_role("heading", name=POLLING_TERMINAL_SESSION_ID)).to_be_visible()
-        refresh_button = page.get_by_role("button", name="Refresh session", exact=True)
-        await expect(refresh_button).to_be_enabled()
-        await _pause_page_clock(page, requests)
-        await _advance_page_clock(page, requests, 5_000)
-        settled_reads = len(requests.started)
-        await _advance_page_clock(page, requests, 10 * 60_000)
-        idle_reads = requests.started[settled_reads:]
-        require_equal(
-            [read for read in idle_reads if read != ("GET", "/api/inbox/counts")],
-            [],
-            "a settled terminal session must not poll its resources for ten minutes",
-        )
-        require(
-            len(idle_reads) <= 21,
-            "the shared Inbox badge must remain bounded to one read per thirty seconds",
-        )
-
-        state_reads = requests.count("GET", state_path)
-        await _refocus_page(page, requests)
-        focus_state_reads = requests.count("GET", state_path)
-        require_equal(
-            focus_state_reads,
-            state_reads + 1,
-            "focusing a terminal session page must refresh its state exactly once",
-        )
-        await refresh_button.click()
-        await requests.settle()
-        require_equal(
-            requests.count("GET", state_path),
-            focus_state_reads + 1,
-            "refreshing a terminal session page must read its state exactly once",
-        )
-        refreshed_reads = len(requests.started)
-        await _advance_page_clock(page, requests, 5 * 60_000)
-        after_refresh = requests.started[refreshed_reads:]
-        require_equal(
-            [read for read in after_refresh if read != ("GET", "/api/inbox/counts")],
-            [],
-            "a refreshed terminal session must not resume polling its resources",
-        )
-        require(
-            len(after_refresh) <= 11,
-            "refreshing a session must not accelerate the shared Inbox badge",
-        )
-        return {"requests_in_ten_idle_minutes": 0, "state_reads": requests.count("GET", state_path)}
+    return await _exercise_session_progress_budget(
+        new_context, base_url, POLLING_TERMINAL_SESSION_ID
+    )
 
 
 async def _exercise_waiting_session_backoff(
     new_context: Callable[..., Awaitable[BrowserContext]], base_url: str
-) -> dict[str, list[int]]:
-    endpoints = (
-        ("GET", f"/api/sessions/{POLLING_WAITING_SESSION_ID}/state"),
-        ("GET", "/api/pending-actions"),
+) -> dict[str, int]:
+    return await _exercise_session_progress_budget(
+        new_context, base_url, POLLING_WAITING_SESSION_ID
     )
-    async with _polling_budget_page(new_context) as (page, requests, _failures):
-        await page.goto(
-            f"{base_url}/cayu/sessions/{POLLING_WAITING_SESSION_ID}",
-            wait_until="networkidle",
-        )
-        await expect(page.get_by_text("Awaiting approval", exact=True)).to_be_visible()
-        await _pause_page_clock(page, requests)
-
-        observed: dict[str, list[int]] = {}
-        # A focus refetch restarts the backoff, so each cycle starts at five seconds.
-        for cycle in range(2):
-            await _refocus_page(page, requests)
-            focus_reads = {
-                endpoint: len(await requests.read_times(*endpoint)) for endpoint in endpoints
-            }
-            await _advance_page_clock(
-                page,
-                requests,
-                sum(POLLING_WAITING_BACKOFF_MS) + 5_000,
-                step_ms=1_000,
-            )
-            for endpoint in endpoints:
-                times = await requests.read_times(*endpoint)
-                gaps = _require_read_gaps(
-                    times[focus_reads[endpoint] - 1 :],
-                    POLLING_WAITING_BACKOFF_MS,
-                    f"a waiting session page {endpoint[1]} (cycle {cycle + 1})",
-                )
-                if cycle == 0:
-                    observed[endpoint[1]] = gaps
-        return observed
 
 
 async def _exercise_idle_overview_polling(
@@ -5128,6 +5195,8 @@ def _record_browser_failures(
     expected_edit_console_errors: list[str],
     expected_usage_rejections: list[str],
     expected_usage_console_errors: list[str],
+    expected_queue_rejections: list[str],
+    expected_queue_console_errors: list[str],
 ) -> None:
     def record_request_failure(request: Request) -> None:
         path = urlsplit(request.url).path
@@ -5214,6 +5283,15 @@ def _record_browser_failures(
         if response.status == 501 and request.method == "POST" and path == "/api/usage/rollup":
             expected_usage_rejections.append(detail)
             return
+        # This fixture intentionally has no SessionMessageAccessPolicy. Inspection
+        # is the authenticated admission probe; mutation must remain unavailable.
+        if (
+            response.status == 403
+            and request.method == "GET"
+            and re.fullmatch(r"/api/sessions/[^/]+/messages", path)
+        ):
+            expected_queue_rejections.append(detail)
+            return
         if "/api/" in response.url and response.status >= 400:
             failures["api_errors"].append(detail)
 
@@ -5231,6 +5309,15 @@ def _record_browser_failures(
             == "Failed to load resource: the server responded with a status of 501 (Not Implemented)"
         ):
             expected_usage_console_errors.append(message.text)
+            return
+        if (
+            message.text
+            == "Failed to load resource: the server responded with a status of 403 (Forbidden)"
+            and re.fullmatch(
+                r"/api/sessions/[^/]+/messages", urlsplit(message.location.get("url", "")).path
+            )
+        ):
+            expected_queue_console_errors.append(message.text)
             return
         failures["console_errors"].append(message.text)
 

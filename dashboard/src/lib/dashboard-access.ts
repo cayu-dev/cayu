@@ -42,6 +42,7 @@ const MEMBER_READ_SURFACES = new Set([
   "task_index",
   "task_creation",
   "session_display_metadata",
+  "structured_output_transcript",
   "supervision",
   "tasks",
   "usage",

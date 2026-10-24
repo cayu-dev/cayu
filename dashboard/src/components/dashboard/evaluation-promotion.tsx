@@ -104,9 +104,11 @@ const DEFAULT_FRESH_EXECUTION: FreshExecutionDraft = Object.freeze({
 export function EvaluationPromotionAction({
   sessionId,
   status,
+  label = "Evaluate",
 }: {
   sessionId: string
   status: string
+  label?: string
 }) {
   const readiness = useServerContract().capabilities.evals_readiness
   const capturedReadiness = readiness.captured_evaluation
@@ -467,7 +469,7 @@ export function EvaluationPromotionAction({
     <>
       <Button size="sm" variant="outline" data-testid="evaluate-session" onClick={openPromotion}>
         <FlaskConical className="h-4 w-4" />
-        Evaluate
+        {label}
       </Button>
       <Sheet open={open} onOpenChange={changeOpen}>
         <SheetContent

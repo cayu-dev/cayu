@@ -226,11 +226,7 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
     )
     for (const m of [...s.transcript]) {
       for (const p of m.content) {
-        if (
-          p.type === "tool_call" &&
-          !answered.has(p.tool_call_id) &&
-          p.tool_name !== "__cayu_submit_structured_output"
-        ) {
+        if (p.type === "tool_call" && !answered.has(p.tool_call_id)) {
           record(
             s,
             isError ? "tool.call.failed" : "tool.call.completed",
@@ -409,6 +405,8 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
             (row.session.status === "active" ? "running" : row.session.status) === query.status,
         )
       if (query.agent_name) rows = rows.filter((s) => s.session.agent_name === query.agent_name)
+      if (query.parent_session_id)
+        rows = rows.filter((s) => s.session.parent_session_id === query.parent_session_id)
       if (query.q) {
         const q = query.q.toLowerCase()
         rows = rows.filter((s) =>
@@ -787,7 +785,7 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
       for (const s of data.sessions) {
         for (const e of s.events) {
           const tool = e.tool_name
-          if (!tool || tool === "__cayu_submit_structured_output") continue
+          if (!tool) continue
           const u = get(tool)
           const at = (e as { timestamp: string }).timestamp
           if (e.type === "tool.call.started") u.calls++

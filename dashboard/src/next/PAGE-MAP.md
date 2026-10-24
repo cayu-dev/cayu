@@ -17,6 +17,16 @@ links remain supported; eval trials and forks are off by default. The footer sho
 loaded rows because filtered totals are intentionally null. The shared prototype
 continues to use its fake API; other areas below remain separate ports.
 
+## Session detail production port
+
+The Session route now uses the Conversation page with native bounded transcript windows,
+structured results, inline decisions and exact recovery, follow-ups, interruption,
+provider resolution, and task-aware replay. Trace and its event log share one incremental
+sequence follower; the former Workflow URL opens the embedded tree and causal usage.
+The details panel retains annotations, artifacts, and browser takeover/recordings.
+Queued messages remain available only with authenticated identity and the deployment's
+message access policy. Existing evaluation promotion remains available in the menu.
+
 ## Run it
 
 ```bash
@@ -162,9 +172,11 @@ exact status counts with cursor pages, server internal-task exclusion, dependent
 and native cancellation. Schedule-history reads follow task read authority. The
 Tasks page port remains separate; retry attempts retain predecessor/successor reads.
 
-### Trace components
+### Trace activation
 
-The exact Trace components share one Session progress observer.
+The exact Trace components and shared progress owner are mounted by the production
+Session page. The old Workflow URL redirects into this view, retaining its filters
+and expansion state.
 `TraceWorkflow` contains the existing full topology, task relations, filters,
 expansion state and causal usage. The activation owner forwards `WorkflowSearch`
 and maps old workflow links to the session span. No third Tree view is introduced.

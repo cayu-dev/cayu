@@ -11,6 +11,8 @@ export function Composer({
   id,
   placeholder,
   onSend,
+  value: text,
+  onChange,
   running = false,
   onStop,
   disabled = false,
@@ -18,18 +20,18 @@ export function Composer({
   id: string
   placeholder: string
   onSend: (text: string) => void
+  value: string
+  onChange: (text: string) => void
   running?: boolean
   onStop?: () => void
   disabled?: boolean
 }) {
-  const [text, setText] = useState("")
   const [focused, setFocused] = useState(false)
   const open = focused || text.length > 0
   const send = () => {
     const value = text.trim()
     if (!value || disabled) return
     onSend(value)
-    setText("")
   }
   return (
     <div
@@ -48,7 +50,8 @@ export function Composer({
         placeholder={placeholder}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
             e.preventDefault()
@@ -57,21 +60,20 @@ export function Composer({
         }}
         className="block max-h-40 min-w-0 flex-1 resize-none bg-transparent py-1 text-sm outline-none placeholder:text-muted-foreground"
       />
-      {running && onStop ? (
+      {running && onStop && (
         <Button size="icon-sm" className="rounded-full" aria-label="Stop" onClick={onStop}>
           <Square className="size-3 fill-current" />
         </Button>
-      ) : (
-        <Button
-          size="icon-sm"
-          className="rounded-full"
-          aria-label="Send"
-          disabled={!text.trim() || disabled}
-          onClick={send}
-        >
-          <ArrowUp />
-        </Button>
       )}
+      <Button
+        size="icon-sm"
+        className="rounded-full"
+        aria-label="Send"
+        disabled={!text.trim() || disabled}
+        onClick={send}
+      >
+        <ArrowUp />
+      </Button>
     </div>
   )
 }

@@ -3,7 +3,7 @@
 import asyncio
 import json
 import os
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from tests.server.test_browser_operator_dashboard_live import _OPERATOR_HTML
 
@@ -22,6 +22,7 @@ async def rendered_native_operator_journey(
     network_socket_origin=None,
     network_tls=None,
     dashboard_path=None,
+    conversation_detail=False,
     expected_page_origin=None,
     changed_page_origin=None,
     keyboard_only=False,
@@ -40,6 +41,8 @@ async def rendered_native_operator_journey(
     hold_purge = False
     initial_operations = daemon.total_operations
     phase = "discovery"
+    closing = False
+    polling_reads = set()
 
     def api_path(path):
         return path if mounted_api else path.removeprefix("/api")
@@ -137,15 +140,37 @@ async def rendered_native_operator_journey(
         sockets.append(asyncio.create_task(api(scope, incoming.get, send)))
 
     async def forward(route):
+        url = urlsplit(route.request.url)
+        polling = (
+            route.request.method == "GET"
+            and url.path.endswith("/events")
+            and "wait_seconds" in parse_qs(url.query)
+        )
+        task = asyncio.current_task()
+        if polling:
+            polling_reads.add(task)
+        try:
+            await forward_request(route)
+        except asyncio.CancelledError:
+            if not (closing and polling):
+                raise
+        finally:
+            polling_reads.discard(task)
+
+    async def forward_request(route):
         nonlocal token
-        path = urlsplit(route.request.url).path
+        url = urlsplit(route.request.url)
+        path = url.path
         if path.startswith("/api/"):
             assert private_text.encode() not in (route.request.post_data_buffer or b"")
             result = await client.request(
                 route.request.method,
-                api_path(path),
+                api_path(path) + (f"?{url.query}" if url.query else ""),
                 headers=await route.request.all_headers(),
                 content=route.request.post_data_buffer,
+                # Native event reads intentionally wait beyond HTTPX's default
+                # five seconds; keep the declared server wait plus transport margin.
+                timeout=5 + float(parse_qs(url.query).get("wait_seconds", ["0"])[0]),
             )
             assert private_text.encode() not in result.content
             if path.endswith("/operator-session") and result.status_code == 200:
@@ -209,6 +234,11 @@ async def rendered_native_operator_journey(
             if dashboard_path is None
             else f"https://operator.test{dashboard_path}/sessions/{session_id}"
         )
+        if conversation_detail:
+            await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
+            await expect(page.get_by_role("tab", name="Browser", exact=True)).to_have_count(0)
+            await activate(page.get_by_role("button", name="Session details", exact=True))
+            await activate(page.get_by_role("tab", name="Browser", exact=True))
         await activate(page.get_by_role("button", name="Discover browsers"))
         await activate(page.get_by_role("button", name="Browser 1 · agent_controlled"))
         identity = owner.bound.record.identity
@@ -306,6 +336,7 @@ async def rendered_native_operator_journey(
         await expect(send).to_be_disabled()
         await activate(page.get_by_role("button", name="Browser 1 · operator_controlled"))
         await expect(send).to_be_enabled()
+        phase = "private input Tab acknowledgement"
         await activate(page.get_by_role("button", name="Next field", exact=True))
         try:
             async with asyncio.timeout(5):
@@ -315,7 +346,18 @@ async def rendered_native_operator_journey(
             raise AssertionError((responses, protocol)) from None
         await expect(send).to_be_disabled()
         await activate(page.get_by_role("button", name="Browser 1 · operator_controlled"))
-        await expect(send).to_be_enabled()
+        try:
+            await expect(send).to_be_enabled()
+        except AssertionError as error:
+            error.add_note(
+                str(
+                    await send.evaluate(
+                        "node => ({buttonDisabled:node.disabled,fieldsetDisabled:node.closest('fieldset').disabled})"
+                    )
+                )
+            )
+            error.add_note(str(responses))
+            raise
         if keyboard is not None:
             await keyboard.type_private(private_value, private_text)
         else:
@@ -357,6 +399,14 @@ async def rendered_native_operator_journey(
         raise
     finally:
         release_purge.set()
+        closing = True
+        # The browser and native daemon share Playwright's connection. Drain
+        # only the owned event reads before closing their HTTP client/page so
+        # an expected disconnect cannot surface in a later native CDP command.
+        reads = list(polling_reads)
+        for task in reads:
+            task.cancel()
+        await asyncio.gather(*reads, return_exceptions=True)
         try:
             await context.close()
         finally:

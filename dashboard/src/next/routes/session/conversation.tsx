@@ -1,5 +1,6 @@
 import { ChevronRight, CornerDownRight, LoaderCircle } from "lucide-react"
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
+import { TranscriptPart } from "@/components/dashboard/transcript-part"
 import { cn } from "@/lib/utils"
 import type { SessionRow } from "../../app/queries"
 import {
@@ -14,8 +15,13 @@ import { ValueView } from "./value-view"
 
 const LONG_MESSAGE = 1200
 
-export type Pending = "running" | "approval" | "recovery" | "stopped"
+export type Pending = "running" | "approval" | "recovery" | "stopped" | "unknown"
 const PENDING: Record<Pending, { row: string; tone: string; block: (tool: string) => string }> = {
+  unknown: {
+    row: "result not loaded",
+    tone: "text-muted-foreground",
+    block: (tool) => `${tool} — result not loaded`,
+  },
   running: { row: "running", tone: "text-info", block: (t) => `Running ${t}…` },
   approval: {
     row: "waiting for approval",
@@ -63,17 +69,26 @@ function ToolRow({
   pending,
   displays,
   onTrace,
+  position,
 }: {
   tool: ToolUse
   pending: Pending
   displays: ToolDisplays
-  onTrace?: (toolCallId: string) => void
+  onTrace?: (tool: ToolUse) => void
+  position?: { messageIndex: number; partIndex: number }
 }) {
   const [open, setOpen] = useState(false)
+  const node = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (position?.messageIndex === tool.messageIndex && position.partIndex === tool.partIndex) {
+      setOpen(true)
+      node.current?.scrollIntoView({ block: "center" })
+    }
+  }, [position, tool.messageIndex, tool.partIndex])
   const { verb, target } = stepLabel(tool, displays)
   const named = verb !== tool.name
   return (
-    <div>
+    <div ref={node} id={`transcript-tool-${tool.messageIndex}-${tool.partIndex}`}>
       <button
         type="button"
         aria-expanded={open}
@@ -105,15 +120,22 @@ function ToolRow({
           {onTrace && (
             <button
               type="button"
-              onClick={() => onTrace(tool.id)}
+              onClick={() => onTrace(tool)}
               className="text-xs text-muted-foreground hover:text-foreground hover:underline"
             >
               View in trace
             </button>
           )}
-          <pre className="overflow-x-auto rounded-md bg-muted p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words">
-            {JSON.stringify(tool.args, null, 2)}
-          </pre>
+          {tool.argumentsUnavailable ? (
+            <p className="text-xs text-muted-foreground">
+              Original tool arguments are unavailable. Read the result for recovery guidance.
+            </p>
+          ) : (
+            <pre className="overflow-x-auto rounded-md bg-muted p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words">
+              {JSON.stringify(tool.args, null, 2)}
+            </pre>
+          )}
+          {tool.structured != null && <ValueView value={tool.structured} label="Tool output" />}
           {tool.result != null && (
             <pre
               className={cn(
@@ -141,13 +163,25 @@ function WorkBlock({
   pending,
   displays,
   onTrace,
+  position,
 }: {
   block: Extract<Block, { kind: "work" }>
   pending: Pending
   displays: ToolDisplays
-  onTrace?: (toolCallId: string) => void
+  onTrace?: (tool: ToolUse) => void
+  position?: { messageIndex: number; partIndex: number }
 }) {
   const [open, setOpen] = useState(false)
+  useEffect(() => {
+    if (
+      position &&
+      block.tools.some(
+        (tool) =>
+          tool.messageIndex === position.messageIndex && tool.partIndex === position.partIndex,
+      )
+    )
+      setOpen(true)
+  }, [position, block.tools])
   const failed = block.tools.filter((t) => t.error).length
   const running = block.tools.find((t) => t.running)
   const label = running
@@ -182,7 +216,7 @@ function WorkBlock({
             title="Show the failed call in the trace"
             onClick={() => {
               const first = block.tools.find((t) => t.error)
-              if (first && onTrace) onTrace(first.id)
+              if (first && onTrace) onTrace(first)
               else setOpen(true)
             }}
             className="shrink-0 rounded bg-destructive/10 px-1.5 text-xs font-medium tabular-nums text-destructive hover:bg-destructive/20"
@@ -199,7 +233,14 @@ function WorkBlock({
             </p>
           )}
           {block.tools.map((t) => (
-            <ToolRow key={t.id} tool={t} pending={pending} displays={displays} onTrace={onTrace} />
+            <ToolRow
+              key={t.key}
+              tool={t}
+              pending={pending}
+              displays={displays}
+              onTrace={onTrace}
+              position={position}
+            />
           ))}
         </div>
       )}
@@ -209,17 +250,19 @@ function WorkBlock({
 
 export function Conversation({
   blocks,
-  pending = "running",
+  pending = "unknown",
   displays = {},
   onTrace,
+  position,
   children,
 }: {
   blocks: Block[]
   /** Display labels for the specialist's tools. */
   displays?: ToolDisplays
   /** Opens the trace at a tool call's span. */
-  onTrace?: (toolCallId: string) => void
-  /** What a tool call without a result means, from the session's state. */
+  onTrace?: (tool: ToolUse) => void
+  position?: { messageIndex: number; partIndex: number }
+  /** Use a stronger label only when the caller has evidence for this call. */
   pending?: Pending
   children?: React.ReactNode
 }) {
@@ -241,7 +284,25 @@ export function Conversation({
               pending={pending}
               displays={displays}
               onTrace={onTrace}
+              position={position}
             />
+          )
+        if (b.kind === "part")
+          return (
+            <div
+              key={b.key}
+              data-transcript-part={b.key}
+              data-transcript-role={b.user ? "user" : undefined}
+              className={b.user ? "flex justify-end" : undefined}
+            >
+              <div
+                className={
+                  b.user ? "max-w-[85%] min-w-0 rounded-2xl bg-muted px-4 py-2.5" : undefined
+                }
+              >
+                <TranscriptPart part={b.part} />
+              </div>
+            </div>
           )
         return <ValueView key={b.key} value={b.value} />
       })}
@@ -255,7 +316,7 @@ export function SubagentRows({ rows }: { rows: SessionRow[] }) {
   if (!rows.length) return null
   return (
     <div className="space-y-1">
-      {rows.map(({ session, overview }) => (
+      {rows.map(({ session, overview, title }) => (
         <NavLink
           key={session.id}
           to={sessionPath(session.id)}
@@ -263,7 +324,7 @@ export function SubagentRows({ rows }: { rows: SessionRow[] }) {
         >
           <CornerDownRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="shrink-0 text-muted-foreground">Subagent {session.agent_name}</span>
-          <span className="min-w-0 flex-1 truncate">{overview?.title ?? session.id}</span>
+          <span className="min-w-0 flex-1 truncate">{title ?? overview?.title ?? session.id}</span>
           <StateBadge overview={overview} />
         </NavLink>
       ))}

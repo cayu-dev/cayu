@@ -96,7 +96,7 @@ def test_dashboard_serves_lazy_route_chunks_under_nested_asgi_mount() -> None:
         pending_assets.extend(f"assets/{chunk}" for chunk in chunks)
 
     assert entry_chunks is not None
-    assert any(chunk.startswith("session-detail-") for chunk in entry_chunks)
+    assert any(chunk.startswith("session-entry-") for chunk in entry_chunks)
     assert any(chunk.startswith("sessions-entry-") for chunk in entry_chunks)
     assert any(chunk.startswith("artifacts-") for chunk in entry_chunks)
 

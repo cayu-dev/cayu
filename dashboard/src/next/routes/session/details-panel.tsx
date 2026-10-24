@@ -1,8 +1,15 @@
+import { useQuery } from "@tanstack/react-query"
 import { X } from "lucide-react"
+import { BrowserOperator } from "@/components/dashboard/browser-operator"
+import { BrowserRecordings } from "@/components/dashboard/browser-recordings"
+import { SessionAnnotations } from "@/components/dashboard/session-annotations"
+import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
+import { fetchArtifacts } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { SessionDetail, SessionOverview } from "../../api/types"
 import type { SessionRow } from "../../app/queries"
+import { useServices } from "../../app/services"
 import { formatDuration } from "../../app/session-model"
 import { LabelChips, NavLink, sessionPath } from "../common"
 
@@ -39,6 +46,7 @@ function Row({ k, children, mono }: { k: string; children: React.ReactNode; mono
 
 export function DetailsPanel({
   tab,
+  artifactsEnabled = true,
   setTab,
   onClose,
   session,
@@ -47,6 +55,7 @@ export function DetailsPanel({
   onOpenTrace,
 }: {
   tab: PanelTab
+  artifactsEnabled?: boolean
   setTab: (tab: PanelTab) => void
   onClose: () => void
   session: SessionDetail
@@ -55,7 +64,16 @@ export function DetailsPanel({
   /** Events, workflow and debug detail live in the session's trace. */
   onOpenTrace: () => void
 }) {
-  const tabs = PANEL_TABS.filter((t) => t !== "browser" || overview?.uses.browser)
+  const { prototype } = useServices()
+  const viewer = useViewer()
+  const artifacts = useQuery({
+    queryKey: ["session-artifacts", session.id],
+    queryFn: () => fetchArtifacts({ session_id: session.id, limit: 6 }),
+    enabled: tab === "artifacts" && artifactsEnabled,
+  })
+  const tabs = PANEL_TABS.filter(
+    (t) => (t !== "browser" || overview?.uses.browser) && (t !== "artifacts" || artifactsEnabled),
+  )
   const seconds = overview?.ended_at
     ? (Date.parse(overview.ended_at) - Date.parse(overview.started_at)) / 1000
     : null
@@ -98,7 +116,11 @@ export function DetailsPanel({
             <Row k="Session ID" mono>
               {session.id}
             </Row>
-            <Row k="Specialist">{session.agent_name}</Row>
+            <Row k="Specialist">
+              <NavLink to="/agents" className="hover:underline">
+                {session.agent_name}
+              </NavLink>
+            </Row>
             <Row k="Title">{overview?.title ?? "–"}</Row>
             <Row k="Summary">{overview?.summary ?? "–"}</Row>
             <Row k="Started">{when(session.created_at)}</Row>
@@ -107,7 +129,27 @@ export function DetailsPanel({
               {session.model ?? "–"}
               {session.provider_name ? ` via ${session.provider_name}` : ""}
             </Row>
-            <Row k="Environment">{session.environment_name ?? "–"}</Row>
+            <Row k="Runtime">
+              {session.runtime_name} {session.runtime_version}
+            </Row>
+            <Row k="Build" mono>
+              {session.runtime_build_provenance.fingerprint ??
+                session.runtime_build_provenance.availability}
+              <span className="block text-muted-foreground">
+                {session.runtime_build_provenance.availability} ·{" "}
+                {session.runtime_build_provenance.origin} ·{" "}
+                {session.runtime_build_provenance.strength}
+              </span>
+            </Row>
+            <Row k="Environment">
+              {session.environment_name ? (
+                <NavLink to="/environments" className="hover:underline">
+                  {session.environment_name}
+                </NavLink>
+              ) : (
+                "–"
+              )}
+            </Row>
             <Row k="Started by">{session.invocation.source.replaceAll("_", " ")}</Row>
             {parent && (
               <Row k="Parent session">
@@ -119,28 +161,73 @@ export function DetailsPanel({
             <Row k="Labels">
               {Object.keys(session.labels).length ? <LabelChips labels={session.labels} /> : "–"}
             </Row>
-            {metadata.map(([k, v]) => (
-              <Row key={k} k={k} mono>
-                {typeof v === "object" ? JSON.stringify(v) : String(v)}
-              </Row>
-            ))}
+            {prototype &&
+              metadata.map(([k, v]) => (
+                <Row key={k} k={k} mono>
+                  {typeof v === "object" ? JSON.stringify(v) : String(v)}
+                </Row>
+              ))}
           </dl>
+        )}
+        {tab === "overview" && !prototype && (
+          <SessionAnnotations session={session} showRuntimeMetadata={false} />
         )}
 
         {tab === "artifacts" && (
-          <p className="text-sm text-muted-foreground">
-            {overview?.uses.artifacts
-              ? `${overview.uses.artifacts} artifacts.`
-              : "This session saved no artifacts."}
-          </p>
+          <div className="space-y-3">
+            {artifacts.isPending && (
+              <p className="text-sm text-muted-foreground">Loading artifacts…</p>
+            )}
+            {artifacts.error && (
+              <p role="alert" className="text-sm text-destructive">
+                Artifacts could not be loaded.
+              </p>
+            )}
+            {artifacts.data?.artifacts.map((artifact) => (
+              <NavLink
+                key={`${artifact.artifact_store_id}:${artifact.id}`}
+                to="/artifacts"
+                search={{
+                  session_id: session.id,
+                  artifact_store_id: artifact.artifact_store_id,
+                  q: artifact.id,
+                }}
+                className="block rounded-md border border-border p-2 text-sm hover:bg-muted"
+              >
+                {artifact.filename}
+                <span className="block text-xs text-muted-foreground">{artifact.content_type}</span>
+              </NavLink>
+            ))}
+            {artifacts.data?.artifacts.length === 0 && (
+              <p className="text-sm text-muted-foreground">This session saved no artifacts.</p>
+            )}
+            <NavLink
+              to="/artifacts"
+              search={{ session_id: session.id }}
+              className="text-sm underline"
+            >
+              Open artifacts
+            </NavLink>
+          </div>
         )}
 
-        {tab === "browser" && (
-          <p className="text-sm text-muted-foreground">
-            This session used a browser. Today's browser view and recordings render here instead of
-            above every session.
-          </p>
-        )}
+        {tab === "browser" &&
+          (overview?.uses.browser ? (
+            <div className="space-y-4">
+              {!prototype && viewer?.full_access === true ? (
+                <BrowserOperator sessionId={session.id} />
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Browser control requires full access and application authorization.
+                </p>
+              )}
+              {!prototype && <BrowserRecordings sessionId={session.id} />}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              No browser use is recorded for this session.
+            </p>
+          ))}
 
         {tab === "usage" && (
           <dl className="divide-y divide-border">

@@ -120,11 +120,18 @@ import type {
   PendingKnowledgeListResponse,
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
   ResumeTaskApiTasksTaskIdResumePostResponse,
+  SessionMessageActionBody,
+  SessionMessageActionResult,
+  SessionMessageCursor,
+  SessionMessageInspection,
   SessionsSummaryBody,
   SessionTopologyRequest,
   SessionTraceResponse,
   SseEventEnvelope,
+  TaskCreationResponse,
   TaskHoldBody,
+  TaskReplayAvailability,
+  TaskReplayBody,
   ToolApprovalDecision,
   ToolApprovalRecoveryBody,
   ToolApprovalRecoveryOutcome,
@@ -505,8 +512,8 @@ export async function fetchSessionTopology(
   })
 }
 
-export async function fetchSession(id: string): Promise<SessionDetail> {
-  return requestJson<SessionDetail>(`/sessions/${encodeURIComponent(id)}`)
+export async function fetchSession(id: string, signal?: AbortSignal): Promise<SessionDetail> {
+  return requestJson<SessionDetail>(`/sessions/${encodeURIComponent(id)}`, { signal })
 }
 
 export async function previewEvaluationPromotion(
@@ -1094,6 +1101,24 @@ export async function fetchSessionSummary(id: string): Promise<SessionSummary> {
   return requestJson<SessionSummary>(`/sessions/${encodeURIComponent(id)}/summary`)
 }
 
+export async function fetchSessionTaskReplay(
+  id: string,
+  signal?: AbortSignal,
+): Promise<TaskReplayAvailability> {
+  return requestJson(`/sessions/${encodeURIComponent(id)}/task-replay`, { signal })
+}
+
+export async function replayTask(
+  body: TaskReplayBody,
+  signal?: AbortSignal,
+): Promise<TaskCreationResponse> {
+  return requestJson(`/tasks/${encodeURIComponent(body.source.task_id)}/replay`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
 export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
   const tasks = await requestJson<unknown>(`/tasks${queryString(query)}`)
   if (!Array.isArray(tasks)) {
@@ -1102,14 +1127,17 @@ export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
   return tasks as Task[]
 }
 
-export async function fetchTask(taskId: string): Promise<TaskDetail> {
-  return requestJson<GetTaskApiTasksTaskIdGetResponse>(`/tasks/${encodeURIComponent(taskId)}`)
+export async function fetchTask(taskId: string, signal?: AbortSignal): Promise<TaskDetail> {
+  return requestJson<GetTaskApiTasksTaskIdGetResponse>(`/tasks/${encodeURIComponent(taskId)}`, {
+    signal,
+  })
 }
 
 export async function fetchPendingActions(
   query: PendingActionsQuery = {},
+  signal?: AbortSignal,
 ): Promise<PendingActionsPage> {
-  const page = await requestJson<unknown>(`/pending-actions${queryString(query)}`)
+  const page = await requestJson<unknown>(`/pending-actions${queryString(query)}`, { signal })
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.actions)) {
     throw new Error("Unexpected /pending-actions response.")
@@ -1177,5 +1205,36 @@ export async function fetchSessionTrace(
   return requestJson<SessionTracePage>(
     `/sessions/${encodeURIComponent(id)}/trace${queryString(query)}`,
     { signal },
+  )
+}
+
+export function inspectSessionMessages(
+  sessionId: string,
+  cursor?: SessionMessageCursor,
+  signal?: AbortSignal,
+): Promise<SessionMessageInspection> {
+  const query = new URLSearchParams({ limit: "100" })
+  if (cursor) {
+    query.set("cursor_session_instance_id", cursor.session_instance_id)
+    query.set("cursor_through_ordering_key", String(cursor.through_ordering_key))
+    query.set("cursor_after_priority", String(cursor.after_priority))
+    query.set("cursor_after_ordering_key", String(cursor.after_ordering_key))
+  }
+  return requestJson(`/sessions/${encodeURIComponent(sessionId)}/messages?${query}`, { signal })
+}
+
+export function withdrawSessionMessage(
+  sessionId: string,
+  queueId: string,
+  body: SessionMessageActionBody,
+  signal?: AbortSignal,
+): Promise<SessionMessageActionResult> {
+  return requestJson(
+    `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(queueId)}/withdraw`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal,
+    },
   )
 }

@@ -3,12 +3,10 @@
  * client; the proposed reads fall back to what today's server can answer, so this can
  * replace the fake API before the backend items land.
  */
-import { mutationTransportErrorMessage } from "@/components/dashboard/mutation-transport-status"
 import {
   blockTask,
   fetchAgents,
   fetchDashboardIdentity,
-  fetchPendingActions,
   fetchSession,
   fetchSessionEvents,
   fetchSessionState,
@@ -33,6 +31,7 @@ import {
   executeRunMutation,
 } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
+import { fetchSessionRecovery } from "@/lib/session-recovery"
 import { overviewForDisplay } from "./overview"
 import type { Api, InboxPage, SessionOverview, TaskScheduleEvent } from "./types"
 
@@ -48,12 +47,6 @@ async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
   })
   if (!response.ok) await throwResponseError(response)
   return (await response.json()) as T
-}
-
-/** A mutation that didn't reach its terminal outcome becomes an error the page can show. */
-function requireTerminal(snapshot: MutationTransportSnapshot, fallback: string) {
-  if (snapshot.phase !== "terminal")
-    throw new Error(mutationTransportErrorMessage(snapshot) ?? fallback)
 }
 
 const query = (params: Record<string, string | number | null | undefined>) => {
@@ -110,19 +103,15 @@ export const realApi: Api = {
     const snapshot = await executeRunMutation({ agent, prompt }, options)
     return { session_id: snapshot.sessionId, snapshot }
   },
-  async reply(id, prompt) {
-    await executeResumeMutation({ session_id: id, prompt })
+  async reply(id, prompt, options) {
+    return executeResumeMutation({ session_id: id, prompt }, options)
   },
   /**
    * The session's pending manual recovery, settled through the endpoint its identity
-   * names, as today's session page does (`handleManualRecovery`).
+   * names from the exact public pending-action projection.
    */
-  async recover(sessionId, body) {
-    const page = await fetchPendingActions({ session_id: sessionId, limit: 50 })
-    const recoveries = page.actions.filter((a) => a.kind === "manual_recovery" && a.tool_call_id)
-    const action =
-      recoveries.find((a) => body.attention_id && a.attention_id === body.attention_id) ??
-      (body.attention_id ? undefined : recoveries[0])
+  async recover(sessionId, body, options) {
+    const action = await fetchSessionRecovery(sessionId, body.attention_id, options?.signal)
     if (!action?.tool_call_id)
       throw new Error("This recovery is no longer pending. Refresh the session.")
     const common = {
@@ -134,29 +123,37 @@ export const realApi: Api = {
     let snapshot: MutationTransportSnapshot
     if (action.input_id) {
       if (!body.answer) throw new Error("Recovering a question needs the person's answer.")
-      snapshot = await executeRecoverUserInputMutation({
-        ...common,
-        input_id: action.input_id,
-        answer: body.answer,
-      })
+      snapshot = await executeRecoverUserInputMutation(
+        {
+          ...common,
+          input_id: action.input_id,
+          answer: body.answer,
+        },
+        options,
+      )
     } else if (action.approval_id) {
       if (!action.round_id)
         throw new Error("Recovering an approval needs the tool round, which wasn't reported.")
-      snapshot = await executeRecoverToolApprovalMutation({
-        ...common,
-        approval_id: action.approval_id,
-        tool_round_id: action.round_id,
-      })
+      snapshot = await executeRecoverToolApprovalMutation(
+        {
+          ...common,
+          approval_id: action.approval_id,
+          tool_round_id: action.round_id,
+        },
+        options,
+      )
     } else if (action.round_id) {
-      snapshot = await executeRecoverToolRoundMutation({ ...common, round_id: action.round_id })
+      snapshot = await executeRecoverToolRoundMutation(
+        { ...common, round_id: action.round_id },
+        options,
+      )
     } else {
       throw new Error("Manual recovery needs an approval, question or tool round to settle.")
     }
-    requireTerminal(snapshot, "The recovery outcome is unavailable.")
+    return snapshot
   },
-  async interrupt(id, reason) {
-    const snapshot = await executeInterruptMutation(id, reason ? { reason } : {})
-    requireTerminal(snapshot, "The interruption outcome is unavailable.")
+  async interrupt(id, reason, options) {
+    return executeInterruptMutation(id, reason ? { reason } : {}, options)
   },
   state: (id) => fetchSessionState(id),
   // Proposed (backend item 7): no task types or task creation on today's server.
@@ -164,22 +161,39 @@ export const realApi: Api = {
   async createTask() {
     throw new Error("Creating a task needs the runtime's task API (backend item 7).")
   },
-  /** Today: rerun the same specialist with the session's first message and labels. */
-  async runAgain(sessionId) {
-    const [session, transcript] = await Promise.all([
-      fetchSession(sessionId),
-      fetchSessionTranscript(sessionId, { limit: 10 }),
-    ])
-    const first = transcript.messages.find((m) => m.role === "user")
-    const prompt = (first?.content ?? [])
-      .map((p) => (typeof p.text === "string" ? p.text : ""))
-      .join("")
-    const snapshot = await executeRunMutation({
-      agent: session.agent_name,
-      prompt,
-      labels: session.labels,
-    })
-    return { session_id: snapshot.sessionId }
+  /** Direct specialist replay; task replay belongs to the task creation owner. */
+  async runAgain(sessionId, options) {
+    const session = await fetchSession(sessionId, options?.signal)
+    if (
+      !["http_run", "sdk_run", "fork", "subagent", "workflow_step"].includes(
+        session.invocation.source,
+      )
+    )
+      throw new Error("This session requires its task's replay action.")
+    const transcript = await fetchSessionTranscript(
+      sessionId,
+      { role: "user", offset: 0, limit: 1 },
+      options?.signal,
+    )
+    const first = transcript.messages[0]
+    if (
+      first?.role !== "user" ||
+      !first.content.length ||
+      first.content.some((part) => part.type !== "text" || typeof part.text !== "string")
+    )
+      throw new Error(
+        "Run again requires a first user message supported by the text run API. Start a session with explicit input instead.",
+      )
+    const prompt = first.content.map((part) => part.text as string).join("")
+    const snapshot = await executeRunMutation(
+      {
+        agent: session.agent_name,
+        prompt,
+        labels: session.labels,
+      },
+      options,
+    )
+    return { session_id: snapshot.sessionId, snapshot }
   },
   // Proposed reads: until backend items 11 and 12 land there is nothing to show.
   toolUsage: async () => [],
