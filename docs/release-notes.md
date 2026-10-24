@@ -7,11 +7,13 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 protocol 7 and refuses an image built from an earlier release at readiness.
 
 Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
-confirm revision 126. Task adapters require revision 126: bound continuation
+confirm revision 127. Task adapters require revision 127: exact declared task
+creation receipts and deletion-surviving identity fences are now persisted. Bound continuation
 claims now persist their expected attachment and selected-operation digest in the
-existing claim registry. The compatibility floor is 126; stop older workers before
+existing claim registry. The compatibility floor is 127; stop older workers before
 migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
-store identity. Server contract 57 adds session follow-ups alongside exact daily
+store identity. Server contract 58 adds declared task catalog/create/replay, including exact
+session-origin replay selection. Contract 57 added session follow-ups alongside exact daily
 accounting in overview counts, public-projection Inbox search, durable decision
 reasons, and explicit controlled continuation claims. Regenerate API clients and use the matching browser client
 and dashboard assets. Manifest schema 17 is unchanged.

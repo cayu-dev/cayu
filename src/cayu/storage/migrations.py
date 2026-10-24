@@ -544,6 +544,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=125, kind=RevisionKind.ADDITIVE, compatible_from=124),
     # Exact continuation claim replay must retain its selected operation binding.
     Revision(revision=126, kind=RevisionKind.BREAKING, compatible_from=126),
+    # Exact creation receipts survive task deletion; writers must not reuse fenced IDs.
+    Revision(revision=127, kind=RevisionKind.BREAKING, compatible_from=127),
 )
 
 #: The revision an empty database is initialized to.

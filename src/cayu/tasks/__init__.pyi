@@ -226,6 +226,10 @@ from cayu.tasks.handoff import (
     new_interrupted_task_continuation_handoff_id as new_interrupted_task_continuation_handoff_id,
 )
 from cayu.tasks.memory import InMemoryTaskStore as InMemoryTaskStore
+from cayu.tasks.operations import TaskCreationConflict as TaskCreationConflict
+from cayu.tasks.operations import TaskCreationOperation as TaskCreationOperation
+from cayu.tasks.operations import TaskCreationResultDeleted as TaskCreationResultDeleted
+from cayu.tasks.operations import TaskReplaySource as TaskReplaySource
 from cayu.tasks.queries import TaskAggregateFilter as TaskAggregateFilter
 from cayu.tasks.queries import TaskOperationalSnapshot as TaskOperationalSnapshot
 from cayu.tasks.queries import TaskOrder as TaskOrder
@@ -278,6 +282,7 @@ from cayu.tasks.topology import TaskTopologyStoreResult as TaskTopologyStoreResu
 from cayu.tasks.topology import (
     TaskTopologyTraversalLimitExceeded as TaskTopologyTraversalLimitExceeded,
 )
+from cayu.tasks.types import TaskTypeSpec as TaskTypeSpec
 from cayu.tasks.work_receipts import (
     CompletionDecisionApplicationReceipt as CompletionDecisionApplicationReceipt,
 )

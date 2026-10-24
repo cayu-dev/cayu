@@ -442,3 +442,54 @@ async def _validate_interrupted_handoff_generation_column(
             "revision-76 durability contract. Run `cayu storage migrate` or restore "
             "the database from a known-good backup."
         )
+
+
+async def _validate_task_creation_operations(cur: Any, *, expected_guard_sql: str) -> None:
+    await cur.execute("""
+        SELECT column_name, data_type, is_nullable, collation_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'cayu_task_creation_operations'
+        ORDER BY ordinal_position
+    """)
+    if tuple(await cur.fetchall()) != (
+        ("task_id", "text", "NO", "C"),
+        ("request_sha256", "text", "NO", "C"),
+    ):
+        raise RuntimeError(
+            "Required Cayu task creation receipt columns are missing or conflicting."
+        )
+    await cur.execute("""
+        SELECT contype, pg_get_constraintdef(oid)
+        FROM pg_constraint WHERE conrelid = 'cayu_task_creation_operations'::regclass
+          AND contype IN ('c', 'p', 'u', 'f')
+        ORDER BY contype
+    """)
+    constraints = tuple(await cur.fetchall())
+    if constraints != (
+        ("c", "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))"),
+        ("p", "PRIMARY KEY (task_id)"),
+    ):
+        raise RuntimeError(
+            "Required Cayu task creation receipt constraints are missing or conflicting."
+        )
+    await cur.execute("""
+        SELECT t.tgtype, t.tgenabled, t.tgqual, t.tgattr::text, t.tgnargs,
+               p.prosrc, p.prosecdef, pn.nspname
+        FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_proc p ON p.oid = t.tgfoid JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        WHERE n.nspname = current_schema() AND c.relname = 'cayu_tasks'
+          AND t.tgname = 'cayu_task_creation_identity_fence' AND NOT t.tgisinternal
+    """)
+    row = await cur.fetchone()
+    await cur.execute("SELECT current_schema()")
+    schema = await cur.fetchone()
+    if (
+        row is None
+        or row[:5] != (7, "O", None, "", 0)
+        or " ".join(row[5].split()) != " ".join(expected_guard_sql.split("$$")[1].split())
+        or row[6] is not False
+        or schema is None
+        or row[7] != schema[0]
+    ):
+        raise RuntimeError("Required Cayu task creation identity fence is missing or conflicting.")

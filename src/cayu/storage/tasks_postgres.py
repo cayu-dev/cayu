@@ -31,6 +31,7 @@ if TYPE_CHECKING:
         TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
+    from cayu.tasks.operations import TaskCreationOperation
 try:
     from psycopg import AsyncConnection, sql
     from psycopg.errors import UniqueViolation
@@ -247,7 +248,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 126
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 127
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -280,6 +281,28 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     """
 
     task_access_version: ClassVar[int | None] = 1
+
+    @runtime_collection_read
+    async def task_replay_sources_for_session(
+        self,
+        session_id: str,
+        session_instance_id: str,
+        root_invocation_id: str,
+    ) -> list[Task]:
+        from cayu.tasks.operations import checked_replay_sources
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                "WHERE session_id = %s AND session_instance_id = %s "
+                "AND invocation->>'root_invocation_id' = %s ORDER BY id LIMIT 2",
+                (session_id, session_instance_id, root_invocation_id),
+            )
+            rows = await cur.fetchall()
+            return checked_replay_sources([pg_support.task_from_row(row) for row in rows])
+
+    supports_task_creation_operations: ClassVar[bool] = True
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
@@ -998,6 +1021,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         return await self._run_verified_work_mutation(mutation)
 
     @runtime_task_creation
+    async def create_task_operation(
+        self, request: TaskCreate, operation: TaskCreationOperation
+    ) -> Task:
+        from cayu.tasks.operations import copy_creation_operation
+
+        request = copy_task_create(request)
+        operation = copy_creation_operation(operation)
+        await self._ensure_ready()
+        return await self._insert_task(request, running=False, creation_operation=operation)
+
+    @runtime_task_creation
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         if request.schedule_policy is not None and not self.supports_task_scheduling:
@@ -1029,18 +1063,50 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         *,
         running: bool,
         session_invocation: SessionInvocationBinding | None = None,
+        creation_operation: TaskCreationOperation | None = None,
     ) -> Task:
+        from cayu.tasks.operations import (
+            creation_operation_digest,
+            prepare_creation_operation,
+            verify_creation_receipt,
+        )
+
+        digest = (
+            None
+            if creation_operation is None
+            else creation_operation_digest(request, creation_operation)
+        )
         task_id = request.task_id or str(uuid4())
         notification_sender_pid: int | None = None
         notification_sender_connection: Any | None = None
 
         async def operation(conn: Any, cur: Any) -> tuple[Task, bool]:
             nonlocal notification_sender_connection, notification_sender_pid
+            selected_request = request
             await self._lock_verified_work_task(cur, task_id)
+            await cur.execute(
+                "SELECT request_sha256 FROM cayu_task_creation_operations WHERE task_id = %s",
+                (task_id,),
+            )
+            retained = await cur.fetchone()
+            if retained is not None:
+                return verify_creation_receipt(
+                    retained[0], digest, await self._load_task(cur, task_id)
+                ), False
+            if creation_operation is not None:
+                source = None
+                if creation_operation.replay_source is not None:
+                    source_id = creation_operation.replay_source.task_id
+                    await cur.execute(
+                        "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE", (source_id,)
+                    )
+                    await cur.fetchone()
+                    source = await self._load_task(cur, source_id)
+                selected_request = prepare_creation_operation(request, creation_operation, source)
             from cayu.storage._postgres_task_graphs import require_unreserved_identity
 
             await require_unreserved_identity(cur, task_id)
-            if request.schedule_policy is not None:
+            if selected_request.schedule_policy is not None:
                 existing = await self._load_task(cur, task_id)
                 if existing is not None:
                     if (
@@ -1051,8 +1117,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     return existing, False
             retry_started_at = await self._verified_evidence_now(cur)
             parent: TaskInvocationSnapshot | None = None
-            if request.parent_task_id is not None:
-                if request.parent_task_id == task_id:
+            if selected_request.parent_task_id is not None:
+                if selected_request.parent_task_id == task_id:
                     raise ValueError("Task cannot be its own parent.")
                 await cur.execute(
                     """
@@ -1061,11 +1127,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     WHERE id = %s
                     FOR KEY SHARE
                     """,
-                    (request.parent_task_id,),
+                    (selected_request.parent_task_id,),
                 )
                 row = await cur.fetchone()
                 if row is None:
-                    raise ValueError(f"Parent task not found: {request.parent_task_id}")
+                    raise ValueError(f"Parent task not found: {selected_request.parent_task_id}")
                 invocation_value = row[3]
                 if isinstance(invocation_value, str):
                     invocation_value = json.loads(invocation_value)
@@ -1075,20 +1141,20 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     session_instance_id=row[2],
                     invocation=TaskInvocation.model_validate(invocation_value),
                 )
-            if request.work_contract is not None:
+            if selected_request.work_contract is not None:
                 contract = await self._load_work_contract_row(
                     cur,
-                    request.work_contract,
+                    selected_request.work_contract,
                     for_update=True,
                 )
                 verified_work_support.require_contract_reference(
                     contract,
-                    request.work_contract,
+                    selected_request.work_contract,
                 )
-                if request.session_id is not None:
+                if selected_request.session_id is not None:
                     await self._ensure_session_authority(
                         cur,
-                        request.session_id,
+                        selected_request.session_id,
                         "contracted",
                     )
             if running:
@@ -1097,7 +1163,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         "Running task insertion requires session invocation provenance."
                     )
                 task = _running_task_from_create(
-                    request,
+                    selected_request,
                     task_id=task_id,
                     parent_task=parent,
                     session_invocation=session_invocation,
@@ -1106,7 +1172,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 )
             else:
                 task = _task_from_create(
-                    request,
+                    selected_request,
                     task_id=task_id,
                     parent_task=parent,
                     retry_started_at=retry_started_at,
@@ -1125,6 +1191,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 pg_support.task_insert_values(task),
             )
             await self._record_task_transition(cur, None, task)
+            if creation_operation is not None:
+                await cur.execute(
+                    "INSERT INTO cayu_task_creation_operations (task_id, request_sha256) VALUES (%s, %s)",
+                    (task_id, digest),
+                )
             publish_admission_wakeup = not running and (
                 task.available_at is None or task.available_at <= retry_started_at
             )

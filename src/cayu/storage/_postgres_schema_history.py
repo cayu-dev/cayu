@@ -689,6 +689,25 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    127: (
+        """CREATE TABLE IF NOT EXISTS cayu_task_creation_operations (
+        task_id TEXT COLLATE "C" PRIMARY KEY,
+        request_sha256 TEXT COLLATE "C" NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$')
+    )""",
+        """
+    CREATE OR REPLACE FUNCTION cayu_task_creation_identity_fence() RETURNS trigger AS $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM cayu_task_creation_operations WHERE task_id = NEW.id) THEN
+            RAISE EXCEPTION 'Task creation identity is retained.';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+        "DROP TRIGGER IF EXISTS cayu_task_creation_identity_fence ON cayu_tasks",
+        """CREATE TRIGGER cayu_task_creation_identity_fence BEFORE INSERT ON cayu_tasks
+    FOR EACH ROW EXECUTE FUNCTION cayu_task_creation_identity_fence()""",
+    ),
     126: (
         "ALTER TABLE cayu_task_interrupted_continuation_claims "
         'ADD COLUMN IF NOT EXISTS expected_sha256 TEXT COLLATE "C"',

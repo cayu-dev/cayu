@@ -670,6 +670,17 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    127: """CREATE TABLE IF NOT EXISTS cayu_task_creation_operations (
+        task_id TEXT COLLATE BINARY PRIMARY KEY,
+        request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+            length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    CREATE TRIGGER IF NOT EXISTS cayu_task_creation_identity_fence
+    BEFORE INSERT ON cayu_tasks
+    WHEN EXISTS (SELECT 1 FROM cayu_task_creation_operations WHERE task_id = NEW.id)
+    BEGIN SELECT RAISE(ABORT, 'Task creation identity is retained.'); END;
+    """,
     125: """CREATE TABLE IF NOT EXISTS cayu_store_identity (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         store_id TEXT NOT NULL CHECK (

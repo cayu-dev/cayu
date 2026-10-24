@@ -27,6 +27,7 @@ from cayu._application_environment_registry import ApplicationEnvironmentRegistr
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
 from cayu._application_session_deletion import delete_app_session, export_app_session_closure
+from cayu._application_task_types import ApplicationTaskTypes
 from cayu._event_schema import private_event_linkage_value
 from cayu._task_wait import collect_failures, combine_drain_results, wait_until_idle
 from cayu._validation import (
@@ -732,6 +733,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleReceipt,
 )
 from cayu.tasks.store import TaskStore
+from cayu.tasks.types import TaskTypeSpec
 from cayu.tasks.worker import abandoned_task_lease_operations
 from cayu.tools.base import (
     Tool,
@@ -841,6 +843,7 @@ if TYPE_CHECKING:
         TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
+    from cayu.tasks.operations import TaskCreationOperation
 
 
 _CAYU_CONFIG_FIELD_OWNERS = {
@@ -1375,6 +1378,7 @@ class CayuApp:
             notification_refresh=self._refresh_mcp_toolset_after_notification,
             admission=self._admission,
         )
+        self._task_types = ApplicationTaskTypes(self._secret_redactor)
         self._knowledge_publication_scope = KnowledgePublicationScope()
         self._provider_registry = ApplicationProviderRegistry(secret_redactor=self._secret_redactor)
         # Idle-resource releases still running after a drain or close deadline.
@@ -5972,6 +5976,18 @@ class CayuApp:
     def _agents(self) -> dict[str, runtime_records.RegisteredAgentState]:
         return self._agent_registry._agents
 
+    def register_task_type(self, spec: TaskTypeSpec) -> TaskTypeSpec:
+        """Declare a public task type without starting or scheduling work."""
+        return self._task_types.register(spec)
+
+    def get_task_type(self, name: str) -> TaskTypeSpec:
+        """Return a detached host declaration, or raise KeyError."""
+        return self._task_types.get(name)
+
+    def list_task_types(self) -> list[TaskTypeSpec]:
+        """Return detached public task declarations."""
+        return self._task_types.list_types()
+
     def register_agent(
         self,
         spec: AgentSpec,
@@ -8443,6 +8459,19 @@ class CayuApp:
         return await operation
 
     @_tracked_entrance
+    async def create_task_operation(
+        self, request: TaskCreate, operation: TaskCreationOperation
+    ) -> Task:
+        """Create declared work with a durable exact-operation receipt."""
+        return await self._task_types.create_operation(
+            request,
+            operation,
+            agent_lookup=self.get_agent,
+            task_store=self.task_store,
+            session_store=self.session_store,
+        )
+
+    @_tracked_entrance
     async def create_task(self, request: TaskCreate) -> Task:
         operation = task_creation.create_task(
             request,
@@ -9418,7 +9447,7 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
-        request = _validate_tool_approval_request(request)
+        request = copy_tool_approval_request(request)
         session = await self.session_store.load(request.session_id)
         if session is not None:
             await self._require_participant_execution(session, participant_context)
@@ -9543,7 +9572,7 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
-        request = _validate_tool_approval_recovery_request(request)
+        request = copy_tool_approval_recovery_request(request)
         session = await self.session_store.load(request.session_id)
         deadline_settlement = session is not None and session.execution_deadline.expired
         if session is not None:
@@ -9943,16 +9972,6 @@ class CayuApp:
         event_batches.validate_workflow_event_batch(events, allow_cayu_internal=False)
         emitted = await self._event_writer.emit_many(session_id, events)
         return [await self._project_emitted_event_for_public_api(event) for event in emitted]
-
-
-def _validate_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
-    return copy_tool_approval_request(request)
-
-
-def _validate_tool_approval_recovery_request(
-    request: ToolApprovalRecoveryRequest,
-) -> ToolApprovalRecoveryRequest:
-    return copy_tool_approval_recovery_request(request)
 
 
 def _artifact_store(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:

@@ -47,6 +47,7 @@ class TaskExecutionSource(StrEnum):
     """The trusted boundary that created one durable task."""
 
     HTTP_RUN = "http_run"
+    HTTP_TASK = "http_task"
     PRODUCT_OPERATION = "product_operation"
     SCHEDULED = "scheduled"
     SDK_TASK = "sdk_task"

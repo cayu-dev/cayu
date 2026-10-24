@@ -205,6 +205,7 @@ from cayu.server._session_overview import (
 from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
+from cayu.server._task_catalog_routes import register_task_catalog_routes
 from cayu.server.auth import (
     AuthContext,
     AuthDependency,
@@ -4568,6 +4569,8 @@ def create_router(
     )
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
+        task_creation_supported=task_store is not None
+        and task_store.supports_task_creation_operations,
         browser_recordings_configured=browser_recordings_configured,
         session_overview_supported=type(session_store).read_usage_accounting
         is not SessionStore.read_usage_accounting,
@@ -4690,6 +4693,15 @@ def create_router(
             return await cayu_app._resolve_public_session_id(value)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    register_task_catalog_routes(
+        router,
+        mutation_router=bounded_control_plane_router,
+        cayu_app=cayu_app,
+        protected=protected,
+        optional_auth_context=optional_auth_context,
+        resolve_public_session_id=_resolve_public_session_id,
+    )
 
     async def _continuation_loop_policies(session_id: str) -> tuple[LoopPolicy, ...]:
         if continuation_loop_policy_provider is None:

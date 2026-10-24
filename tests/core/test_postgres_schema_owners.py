@@ -54,7 +54,8 @@ def _arguments(validator):
     if "expected_guard_sql" in parameters:
         from cayu.storage import _postgres_schema_history
 
-        arguments["expected_guard_sql"] = _postgres_schema_history._MIGRATION_STEPS[88][1]
+        revision = 127 if validator.__name__ == "_validate_task_creation_operations" else 88
+        arguments["expected_guard_sql"] = _postgres_schema_history._MIGRATION_STEPS[revision][1]
     if "tokenizer_version" in parameters:
         from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 

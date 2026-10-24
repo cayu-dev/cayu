@@ -445,3 +445,68 @@ issues remain visible, with an inspection link when the source identifies a
 session. Child delegated actions have a separate read-only panel.
 Knowledge proposals retain their source fields. Optional reasons are durably bound
 to decisions; runtime audit privacy may withhold them from the public response.
+
+### Declared task creation and replay
+
+Hosts opt in by registering `TaskTypeSpec` values on `CayuApp` before serving:
+
+```python
+from cayu.tasks import TaskTypeSpec
+
+app.register_task_type(TaskTypeSpec(
+    name="report",
+    description="Build a report",
+    agent_name="researcher",
+    input_schema={
+        "type": "object",
+        "properties": {"topic": {"type": "string"}},
+        "required": ["topic"],
+        "additionalProperties": False,
+    },
+))
+```
+
+The specialist must be currently registered when work is admitted. A declaration
+with `agent_name=None` leaves execution to the configured task worker. Schemas
+use Draft 2020-12 with local references only. Registration copies declarations;
+mutating the caller's schema does not change the catalog. Known secret-bearing
+declarations are rejected, rather than redacted into a different input contract.
+
+`GET /api/task-types` returns `{task_types: [...]}`. An empty list means the host
+has declared no dashboard-createable types. The `task_creation` capability reports
+whether the configured task store supports exact creation and source selection.
+Members may read the catalog and replay availability; creation and replay require
+full access under the existing control-plane role policy.
+
+`POST /api/tasks` accepts `{operation_id, type, input}` and returns `{task_id}`.
+Workers execute the pending task separately; this response does not promise a
+session. Reuse the same nonblank `operation_id` after a lost response. Its identity
+is scoped to the authenticated subject and tenant; incidental refreshed-token
+claims do not change it. Exact duplicate requests return the same task identity;
+changed input or declaration conflicts. A deleted result stays fenced and returns
+`task_creation_result_deleted`, rather than silently creating new work.
+
+`GET /api/tasks/{task_id}/replay` returns `{available, unavailable_reason, source}`.
+The source binds task ID, creation time, root invocation, restart count and exact
+session attachment (ID and instance). `POST /api/tasks/{task_id}/replay` accepts
+`{operation_id, type, source}` with that exact source. The native transaction
+revalidates the source and copies its original stored input; the browser neither
+resubmits redacted input nor overrides it. The new task has a fresh root and no
+copied session, lease, schedule, retry policy or graph relationships. Source changes
+conflict before creation. Already committed exact retries reconcile their retained
+receipt before looking at the source, so deleting the source does not defeat retry.
+
+For Session detail, `GET /api/sessions/{session_id}/task-replay` resolves a unique
+task from the session's authoritative task invocation and exact current instance.
+Missing or ambiguous bindings are unavailable; display metadata never grants replay
+authority. Unavailable reasons also distinguish unsupported stores, undeclared
+types, missing specialists, invalid input and identities that cannot cross the
+configured redaction boundary. Task creation records the `http_task` source;
+authenticated origin is server-derived, never a body field.
+
+SDK callers use `CayuApp.create_task_operation(TaskCreate(...),
+TaskCreationOperation(...))` with a stable task ID and the current declaration.
+Native Memory, SQLite and PostgreSQL stores implement atomic creation/receipt
+publication and retain deletion fences. Custom stores must explicitly implement
+`create_task_operation` and `task_replay_sources_for_session` before advertising
+support; falling back to ordinary `create_task` would lose these guarantees.

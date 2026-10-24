@@ -38,6 +38,7 @@ const MEMBER_READ_SURFACES = new Set([
   "session_follow",
   "session_overview",
   "session_overview_queries",
+  "task_creation",
   "session_display_metadata",
   "supervision",
   "tasks",

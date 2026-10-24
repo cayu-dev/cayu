@@ -280,3 +280,29 @@ def _validate_interrupted_handoff_generation_column(
             "revision-76 durability contract. Run `cayu storage migrate` or restore "
             "the database from a known-good backup."
         )
+
+
+def _validate_task_creation_operations(
+    connection: sqlite3.Connection, *, revision_sql: str
+) -> None:
+    for (name, kind), expected in zip(
+        (
+            ("cayu_task_creation_operations", "table"),
+            ("cayu_task_creation_identity_fence", "trigger"),
+        ),
+        sqlite_catalog._iter_statements(revision_sql),
+        strict=True,
+    ):
+        row = connection.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone()
+        if (
+            row is None
+            or row[0] != kind
+            or row[1] is None
+            or sqlite_catalog._normalize_sqlite_schema_definition(row[1])
+            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
+        ):
+            raise RuntimeError(
+                "Required Cayu task creation receipt or identity fence is missing or conflicting."
+            )

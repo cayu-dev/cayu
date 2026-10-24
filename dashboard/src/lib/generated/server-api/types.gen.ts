@@ -4160,6 +4160,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_overview_queries?: OptionalSurfaceCapability | null;
     structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
+    task_creation?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
@@ -4845,6 +4846,26 @@ export type CostSessionTotals = {
      */
     session_id: string;
     totals: CostAccountingTotals;
+};
+
+/**
+ * DeclaredTaskCreateBody
+ */
+export type DeclaredTaskCreateBody = {
+    /**
+     * Input
+     */
+    input: {
+        [key: string]: unknown;
+    };
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Type
+     */
+    type: string;
 };
 
 /**
@@ -18413,11 +18434,21 @@ export type TaskAggregateFilter = {
 };
 
 /**
+ * TaskCreationResponse
+ */
+export type TaskCreationResponse = {
+    /**
+     * Task Id
+     */
+    task_id: string;
+};
+
+/**
  * TaskExecutionSource
  *
  * The trusted boundary that created one durable task.
  */
-export type TaskExecutionSource = 'http_run' | 'product_operation' | 'scheduled' | 'sdk_task' | 'task_dispatch' | 'webhook';
+export type TaskExecutionSource = 'http_run' | 'http_task' | 'product_operation' | 'scheduled' | 'sdk_task' | 'task_dispatch' | 'webhook';
 
 /**
  * TaskHoldBody
@@ -18470,6 +18501,68 @@ export type TaskOperationalSnapshot = {
  * TaskOrder
  */
 export type TaskOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
+
+/**
+ * TaskReplayAvailability
+ */
+export type TaskReplayAvailability = {
+    /**
+     * Available
+     */
+    available: boolean;
+    source?: TaskReplaySource | null;
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: 'unsupported' | 'task_type_not_declared' | 'specialist_unavailable' | 'input_invalid' | 'source_identity_unavailable' | 'not_task_session' | 'task_source_unavailable' | 'task_source_ambiguous' | null;
+};
+
+/**
+ * TaskReplayBody
+ */
+export type TaskReplayBody = {
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    source: TaskReplaySource;
+    /**
+     * Type
+     */
+    type: string;
+};
+
+/**
+ * TaskReplaySource
+ *
+ * Public incarnation proof; never a digest of private task input.
+ */
+export type TaskReplaySource = {
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Restart Count
+     */
+    restart_count: number;
+    /**
+     * Root Invocation Id
+     */
+    root_invocation_id: string;
+    /**
+     * Session Id
+     */
+    session_id: string | null;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string | null;
+    /**
+     * Task Id
+     */
+    task_id: string;
+};
 
 /**
  * TaskRescheduleRequest
@@ -18601,6 +18694,42 @@ export type TaskStatusCounts = {
      * Waiting Group
      */
     waiting_group?: string;
+};
+
+/**
+ * TaskTypeSpec
+ *
+ * A host-declared task input contract; execution remains worker-owned.
+ */
+export type TaskTypeSpec = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Description
+     */
+    description?: string;
+    /**
+     * Input Schema
+     */
+    input_schema: {
+        [key: string]: unknown;
+    };
+    /**
+     * Name
+     */
+    name: string;
+};
+
+/**
+ * TaskTypesResponse
+ */
+export type TaskTypesResponse = {
+    /**
+     * Task Types
+     */
+    task_types: Array<TaskTypeSpec>;
 };
 
 /**
@@ -25420,6 +25549,36 @@ export type GetSessionSummaryApiSessionsSessionIdSummaryGetResponses = {
 
 export type GetSessionSummaryApiSessionsSessionIdSummaryGetResponse = GetSessionSummaryApiSessionsSessionIdSummaryGetResponses[keyof GetSessionSummaryApiSessionsSessionIdSummaryGetResponses];
 
+export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/task-replay';
+};
+
+export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetError = SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetErrors[keyof SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetErrors];
+
+export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskReplayAvailability;
+};
+
+export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponse = SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses[keyof SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses];
+
 export type GetSessionToolViewApiSessionsSessionIdToolViewGetData = {
     body?: never;
     path: {
@@ -25659,6 +25818,22 @@ export type GetSystemDiagnosticsApiSystemDiagnosticsGetResponses = {
 
 export type GetSystemDiagnosticsApiSystemDiagnosticsGetResponse = GetSystemDiagnosticsApiSystemDiagnosticsGetResponses[keyof GetSystemDiagnosticsApiSystemDiagnosticsGetResponses];
 
+export type TaskTypesApiTaskTypesGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/task-types';
+};
+
+export type TaskTypesApiTaskTypesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskTypesResponse;
+};
+
+export type TaskTypesApiTaskTypesGetResponse = TaskTypesApiTaskTypesGetResponses[keyof TaskTypesApiTaskTypesGetResponses];
+
 export type ListTasksApiTasksGetData = {
     body?: never;
     path?: never;
@@ -25719,6 +25894,31 @@ export type ListTasksApiTasksGetResponses = {
 };
 
 export type ListTasksApiTasksGetResponse = ListTasksApiTasksGetResponses[keyof ListTasksApiTasksGetResponses];
+
+export type CreateTaskApiTasksPostData = {
+    body: DeclaredTaskCreateBody;
+    path?: never;
+    query?: never;
+    url: '/api/tasks';
+};
+
+export type CreateTaskApiTasksPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateTaskApiTasksPostError = CreateTaskApiTasksPostErrors[keyof CreateTaskApiTasksPostErrors];
+
+export type CreateTaskApiTasksPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskCreationResponse;
+};
+
+export type CreateTaskApiTasksPostResponse = CreateTaskApiTasksPostResponses[keyof CreateTaskApiTasksPostResponses];
 
 export type CancelScheduledTaskApiTasksScheduleCancelPostData = {
     body: TaskScheduleCancelRequest;
@@ -25898,6 +26098,66 @@ export type PauseTaskApiTasksTaskIdPausePostResponses = {
 };
 
 export type PauseTaskApiTasksTaskIdPausePostResponse = PauseTaskApiTasksTaskIdPausePostResponses[keyof PauseTaskApiTasksTaskIdPausePostResponses];
+
+export type ReplayAvailabilityApiTasksTaskIdReplayGetData = {
+    body?: never;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: never;
+    url: '/api/tasks/{task_id}/replay';
+};
+
+export type ReplayAvailabilityApiTasksTaskIdReplayGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ReplayAvailabilityApiTasksTaskIdReplayGetError = ReplayAvailabilityApiTasksTaskIdReplayGetErrors[keyof ReplayAvailabilityApiTasksTaskIdReplayGetErrors];
+
+export type ReplayAvailabilityApiTasksTaskIdReplayGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskReplayAvailability;
+};
+
+export type ReplayAvailabilityApiTasksTaskIdReplayGetResponse = ReplayAvailabilityApiTasksTaskIdReplayGetResponses[keyof ReplayAvailabilityApiTasksTaskIdReplayGetResponses];
+
+export type ReplayTaskApiTasksTaskIdReplayPostData = {
+    body: TaskReplayBody;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: never;
+    url: '/api/tasks/{task_id}/replay';
+};
+
+export type ReplayTaskApiTasksTaskIdReplayPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ReplayTaskApiTasksTaskIdReplayPostError = ReplayTaskApiTasksTaskIdReplayPostErrors[keyof ReplayTaskApiTasksTaskIdReplayPostErrors];
+
+export type ReplayTaskApiTasksTaskIdReplayPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskCreationResponse;
+};
+
+export type ReplayTaskApiTasksTaskIdReplayPostResponse = ReplayTaskApiTasksTaskIdReplayPostResponses[keyof ReplayTaskApiTasksTaskIdReplayPostResponses];
 
 export type ResumeTaskApiTasksTaskIdResumePostData = {
     body?: never;

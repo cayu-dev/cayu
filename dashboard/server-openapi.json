@@ -8524,6 +8524,16 @@
               }
             ]
           },
+          "task_creation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tasks": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -9911,6 +9921,35 @@
           "totals"
         ],
         "title": "CostSessionTotals",
+        "type": "object"
+      },
+      "DeclaredTaskCreateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "additionalProperties": true,
+            "title": "Input",
+            "type": "object"
+          },
+          "operation_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "type",
+          "input"
+        ],
+        "title": "DeclaredTaskCreateBody",
         "type": "object"
       },
       "DelegatedActionReference": {
@@ -33214,7 +33253,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "57",
+            "default": "58",
             "title": "Contract Version",
             "type": "string"
           },
@@ -36535,10 +36574,24 @@
         "title": "TaskAggregateFilter",
         "type": "object"
       },
+      "TaskCreationResponse": {
+        "properties": {
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "title": "TaskCreationResponse",
+        "type": "object"
+      },
       "TaskExecutionSource": {
         "description": "The trusted boundary that created one durable task.",
         "enum": [
           "http_run",
+          "http_task",
           "product_operation",
           "scheduled",
           "sdk_task",
@@ -36637,6 +36690,133 @@
         ],
         "title": "TaskOrder",
         "type": "string"
+      },
+      "TaskReplayAvailability": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskReplaySource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unsupported",
+                  "task_type_not_declared",
+                  "specialist_unavailable",
+                  "input_invalid",
+                  "source_identity_unavailable",
+                  "not_task_session",
+                  "task_source_unavailable",
+                  "task_source_ambiguous"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Reason"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "TaskReplayAvailability",
+        "type": "object"
+      },
+      "TaskReplayBody": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/TaskReplaySource"
+          },
+          "type": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "type",
+          "source"
+        ],
+        "title": "TaskReplayBody",
+        "type": "object"
+      },
+      "TaskReplaySource": {
+        "additionalProperties": false,
+        "description": "Public incarnation proof; never a digest of private task input.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "restart_count": {
+            "minimum": 0.0,
+            "title": "Restart Count",
+            "type": "integer"
+          },
+          "root_invocation_id": {
+            "title": "Root Invocation Id",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "session_instance_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Instance Id"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "created_at",
+          "root_invocation_id",
+          "restart_count",
+          "session_id",
+          "session_instance_id"
+        ],
+        "title": "TaskReplaySource",
+        "type": "object"
       },
       "TaskRescheduleRequest": {
         "additionalProperties": false,
@@ -36851,6 +37031,62 @@
           "cancelled"
         ],
         "title": "TaskStatusCounts",
+        "type": "object"
+      },
+      "TaskTypeSpec": {
+        "additionalProperties": false,
+        "description": "A host-declared task input contract; execution remains worker-owned.",
+        "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4096,
+            "title": "Description",
+            "type": "string"
+          },
+          "input_schema": {
+            "additionalProperties": true,
+            "title": "Input Schema",
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "input_schema"
+        ],
+        "title": "TaskTypeSpec",
+        "type": "object"
+      },
+      "TaskTypesResponse": {
+        "properties": {
+          "task_types": {
+            "items": {
+              "$ref": "#/components/schemas/TaskTypeSpec"
+            },
+            "title": "Task Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "task_types"
+        ],
+        "title": "TaskTypesResponse",
         "type": "object"
       },
       "TerminalSessionEvidenceErrorCode": {
@@ -40252,7 +40488,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "57",
+            "default": "58",
             "title": "Contract Version",
             "type": "string"
           }
@@ -49197,6 +49433,45 @@
         "summary": "Get Session Summary"
       }
     },
+    "/api/sessions/{session_id}/task-replay": {
+      "get": {
+        "operationId": "session_replay_availability_api_sessions__session_id__task_replay_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskReplayAvailability"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Replay Availability"
+      }
+    },
     "/api/sessions/{session_id}/tool-view": {
       "get": {
         "description": "Inspect one tenant-bound current view without callable authority.",
@@ -49748,6 +50023,24 @@
         }
       }
     },
+    "/api/task-types": {
+      "get": {
+        "operationId": "task_types_api_task_types_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskTypesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Task Types"
+      }
+    },
     "/api/tasks": {
       "get": {
         "operationId": "list_tasks_api_tasks_get",
@@ -49905,6 +50198,42 @@
           }
         },
         "summary": "List Tasks"
+      },
+      "post": {
+        "operationId": "create_task_api_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeclaredTaskCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskCreationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Task"
       }
     },
     "/api/tasks/schedule/cancel": {
@@ -50192,6 +50521,92 @@
           }
         },
         "summary": "Pause Task"
+      }
+    },
+    "/api/tasks/{task_id}/replay": {
+      "get": {
+        "operationId": "replay_availability_api_tasks__task_id__replay_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskReplayAvailability"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replay Availability"
+      },
+      "post": {
+        "operationId": "replay_task_api_tasks__task_id__replay_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskReplayBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskCreationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replay Task"
       }
     },
     "/api/tasks/{task_id}/resume": {

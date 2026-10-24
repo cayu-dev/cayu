@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
+    from cayu.tasks.operations import TaskCreationOperation
 from cayu._clock import normalize_utc_datetime, utc_clock
 from cayu._validation import copy_durable_json_object, revalidate_model_input
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
@@ -354,6 +355,29 @@ class InMemoryTaskStore(TaskStore):
 
     task_access_version: ClassVar[int | None] = 1
 
+    @runtime_collection_read
+    async def task_replay_sources_for_session(
+        self,
+        session_id: str,
+        session_instance_id: str,
+        root_invocation_id: str,
+    ) -> list[Task]:
+        from cayu.tasks.operations import checked_replay_sources
+
+        async with self._lock:
+            matches = []
+            for _, task_id in self._task_keys_by_session.get(session_id, ()):
+                task = self._tasks[task_id]
+                if task.session_instance_id == session_instance_id and (
+                    task.invocation.root_invocation_id == root_invocation_id
+                ):
+                    matches.append(task)
+                    if len(matches) == 2:
+                        break
+            return checked_replay_sources(matches)
+
+    supports_task_creation_operations: ClassVar[bool] = True
+
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
     supports_task_groups: ClassVar[bool] = True
@@ -462,6 +486,7 @@ class InMemoryTaskStore(TaskStore):
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
+        self._creation_operation_receipts: dict[str, str] = {}
         self._tasks: dict[str, Task] = {}
         self._retired_task_sessions: set[str] = set()
         self._task_groups: dict[str, TaskGroupSnapshot] = {}
@@ -2209,10 +2234,40 @@ class InMemoryTaskStore(TaskStore):
             )
 
     @runtime_task_creation
+    async def create_task_operation(
+        self, request: TaskCreate, operation: TaskCreationOperation
+    ) -> Task:
+        from cayu.tasks.operations import copy_creation_operation
+
+        return await self._create_task(request, operation=copy_creation_operation(operation))
+
+    @runtime_task_creation
     async def create_task(self, request: TaskCreate) -> Task:
+        return await self._create_task(request)
+
+    async def _create_task(
+        self, request: TaskCreate, *, operation: TaskCreationOperation | None = None
+    ) -> Task:
+        from cayu.tasks.operations import (
+            creation_operation_digest,
+            prepare_creation_operation,
+            verify_creation_receipt,
+        )
+
         request = copy_task_create(request)
+        digest = None if operation is None else creation_operation_digest(request, operation)
         async with self._lock:
             task_id = request.task_id or str(uuid4())
+            retained = self._creation_operation_receipts.get(task_id)
+            if retained is not None:
+                return verify_creation_receipt(retained, digest, self._tasks.get(task_id))
+            if operation is not None:
+                source = (
+                    None
+                    if operation.replay_source is None
+                    else self._tasks.get(operation.replay_source.task_id)
+                )
+                request = prepare_creation_operation(request, operation, source)
             if request.schedule_policy is not None and task_id in self._tasks:
                 existing = self._require_task(task_id)
                 if (
@@ -2241,6 +2296,9 @@ class InMemoryTaskStore(TaskStore):
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._store_task(task)
+            if operation is not None:
+                assert digest is not None
+                self._creation_operation_receipts[task_id] = digest
             created = task.model_copy(deep=True)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
@@ -4926,6 +4984,10 @@ class InMemoryTaskStore(TaskStore):
         self, task: Task, *, schedule_operation_id: str | None = None
     ) -> _PreparedMemoryTaskWrite:
         prior = self._tasks.get(task.id)
+        if prior is None and task.id in self._creation_operation_receipts:
+            from cayu.tasks.operations import TaskCreationConflict
+
+            raise TaskCreationConflict("Task creation identity is retained.")
         for session_id in (task.session_id, None if prior is None else prior.session_id):
             if session_id is not None and session_id in self._session_closure_claims:
                 raise ValueError("Task session is owned by closure.")

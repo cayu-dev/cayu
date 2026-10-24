@@ -7,7 +7,10 @@ cancellation-quiescent boundary for contract-bound mutations.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from cayu.tasks.operations import TaskCreationOperation
 
 from cayu.runtime._public_task_scheduling import create_scheduled_task
 from cayu.runtime._task_store_operation_boundary import (
@@ -205,11 +208,14 @@ async def create_task(
     task_store: TaskStore | None,
     session_store: SessionStore,
     redactor: SecretRedactor,
+    creation_operation: TaskCreationOperation | None = None,
 ) -> Task:
     try:
         if type(request) is not TaskCreate:
             del request
             raise TypeError("Task creation requires a TaskCreate request.")
+        if creation_operation is not None and request.work_contract is not None:
+            raise ValueError("Declared creation must create an ordinary task.")
         if request.work_contract is None:
             # Preserve the established ordinary-task validation contract,
             # including actionable Pydantic field diagnostics. Contract-bound
@@ -310,6 +316,8 @@ async def create_task(
                 f"{type(task_store).__name__} does not support task retry series."
             )
         if request.work_contract is None:
+            if creation_operation is not None:
+                return await task_store.create_task_operation(request, creation_operation)
             if request.schedule_policy is not None:
                 return await create_scheduled_task(task_store, request, redactor=redactor)
             return await task_store.create_task(request)

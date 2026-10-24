@@ -407,7 +407,11 @@ def _task_invocation_for_create_unscoped(
     if source is TaskExecutionSource.TASK_DISPATCH:
         raise ValueError("Task dispatch provenance requires a parent task or session.")
     if verified_origin is not None:
-        if source not in {TaskExecutionSource.HTTP_RUN, TaskExecutionSource.PRODUCT_OPERATION}:
+        if source not in {
+            TaskExecutionSource.HTTP_RUN,
+            TaskExecutionSource.HTTP_TASK,
+            TaskExecutionSource.PRODUCT_OPERATION,
+        }:
             raise ValueError("Verified task origins require a server-owned task source.")
         origin = copy_invocation_origin(verified_origin)
     elif request.invocation_origin is not None:
@@ -424,6 +428,7 @@ def _task_invocation_for_create_unscoped(
         )
     else:
         if source not in {
+            TaskExecutionSource.HTTP_TASK,
             TaskExecutionSource.SDK_TASK,
             TaskExecutionSource.SCHEDULED,
             TaskExecutionSource.WEBHOOK,

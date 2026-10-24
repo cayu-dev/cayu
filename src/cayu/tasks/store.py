@@ -26,6 +26,7 @@ if TYPE_CHECKING:
         TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
+    from cayu.tasks.operations import TaskCreationOperation
 from cayu._clock import normalize_utc_datetime
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerDemandPolicy,
@@ -148,6 +149,32 @@ class TaskStore(ABC):
     """
 
     _task_group_maintenance: TaskGroupMaintenance
+
+    async def create_task_operation(
+        self, request: TaskCreate, operation: TaskCreationOperation
+    ) -> Task:
+        """Atomically create/replay declared work and retain its exact creation receipt.
+
+        The receipt survives task deletion. Resolve an existing exact receipt
+        before reading the replay source; new source validation and insertion
+        share the transaction. Unsupported stores must not fall back to create.
+        """
+        raise NotImplementedError("This TaskStore does not support exact task creation.")
+
+    async def task_replay_sources_for_session(
+        self,
+        session_id: str,
+        session_instance_id: str,
+        root_invocation_id: str,
+    ) -> list[Task]:
+        """Return at most two positively bound tasks from one native read snapshot.
+
+        Zero means unavailable, one permits selection, two proves ambiguity.
+        Filter before limiting; never derive uniqueness from a capped task page.
+        """
+        raise NotImplementedError("This TaskStore cannot resolve exact task replay sources.")
+
+    supports_task_creation_operations: ClassVar[bool] = False
 
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_graphs: ClassVar[bool] = False

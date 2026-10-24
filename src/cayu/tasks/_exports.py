@@ -1,6 +1,11 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskTypeSpec": ("cayu.tasks.types", "TaskTypeSpec"),
+    "TaskCreationOperation": ("cayu.tasks.operations", "TaskCreationOperation"),
+    "TaskCreationConflict": ("cayu.tasks.operations", "TaskCreationConflict"),
+    "TaskCreationResultDeleted": ("cayu.tasks.operations", "TaskCreationResultDeleted"),
+    "TaskReplaySource": ("cayu.tasks.operations", "TaskReplaySource"),
     "requeue_restartable_task": ("cayu.tasks.restart", "requeue_restartable_task"),
     "TaskGroupInvocationSettlementPending": (
         "cayu.runtime._task_group_invocation",
@@ -415,6 +420,11 @@ PUBLIC_NAMES = [
     "TaskClaimLost",
     "TaskCompletionDecisionRequired",
     "TaskCreate",
+    "TaskTypeSpec",
+    "TaskCreationOperation",
+    "TaskCreationConflict",
+    "TaskCreationResultDeleted",
+    "TaskReplaySource",
     "TaskMisfirePolicy",
     "TaskRescheduleRequest",
     "TaskScheduleCancelRequest",

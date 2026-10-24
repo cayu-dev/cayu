@@ -937,6 +937,11 @@ class _PostgresStoreBase:
                             await validate_postgres_wait_discovery(cur)
                         if current_state.revision >= 112:
                             await validate_postgres_product_operation_schema(cur)
+                        if current_state.revision >= 127:
+                            await postgres_task_schema._validate_task_creation_operations(
+                                cur,
+                                expected_guard_sql=postgres_schema_history._MIGRATION_STEPS[127][1],
+                            )
                         if current_state.revision >= 120:
                             await validate_postgres_agent_snapshot_schema(cur)
                         if self._min_required_revision >= 36:
@@ -1329,6 +1334,10 @@ class _PostgresStoreBase:
             await validate_postgres_wait_discovery(cur)
         if state.revision >= 112:
             await validate_postgres_product_operation_schema(cur)
+        if state.revision >= 127:
+            await postgres_task_schema._validate_task_creation_operations(
+                cur, expected_guard_sql=postgres_schema_history._MIGRATION_STEPS[127][1]
+            )
         if state.revision >= 120:
             await validate_postgres_agent_snapshot_schema(cur)
         if state.revision >= 93:
@@ -1483,6 +1492,10 @@ class _PostgresStoreBase:
             await validate_postgres_wait_discovery(cur)
         if revision.revision == 112:
             await validate_postgres_product_operation_schema(cur)
+        if revision.revision == 127:
+            await postgres_task_schema._validate_task_creation_operations(
+                cur, expected_guard_sql=postgres_schema_history._MIGRATION_STEPS[127][1]
+            )
         if revision.revision == 120:
             await validate_postgres_agent_snapshot_schema(cur)
         if revision.revision == 102:
