@@ -17,7 +17,6 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote, urlsplit
@@ -31,11 +30,31 @@ from cayu.events import EventType
 from cayu.knowledge.records import KnowledgeActorType, KnowledgeStatus, KnowledgeVisibility
 from cayu.knowledge.search import KnowledgeListQuery, encode_knowledge_list_cursor
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.tool_inventory import (
+    APPROVALS as _APPROVALS,
+)
+from cayu.tool_inventory import (
+    EFFECTS as _EFFECTS,
+)
+from cayu.tool_inventory import (
+    TOOL_USAGE_EVENT_TYPES,
+    ToolSourceMetadata,
+    classify_tool_source,
+    tool_usage_contribution,
+)
+from cayu.tool_inventory import (
+    ToolApproval as _Approval,
+)
+from cayu.tool_inventory import (
+    ToolEffect as _Effect,
+)
+from cayu.tool_inventory import (
+    ToolSource as CloudToolSource,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
-    from cayu.runtime.manifest import ToolManifest
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -71,27 +90,7 @@ _SHARED_VISIBILITIES = (
 # Application-authored entries that Cayu's curator or maintenance pipeline wrote from
 # conversation evidence or a model's proposal carry these metadata keys.
 _DERIVED_KNOWLEDGE_METADATA_KEYS = frozenset({"cayu_curator", "cayu_knowledge_maintenance"})
-_SourceKind = Literal["agent", "package", "mcp", "cayu", "provider", "unknown"]
-_Effect = Literal["none", "idempotent", "external"]
-_Approval = Literal["never", "always", "sometimes", "blocked", "unknown"]
-_SOURCE_KINDS: dict[str, _SourceKind] = {"project": "agent", "built_in": "cayu"}
-_APPROVALS: dict[str, _Approval] = {
-    "allowed": "never",
-    "approval_required": "always",
-    "conditional": "sometimes",
-    "denied": "blocked",
-}
-_EFFECTS: dict[str, _Effect] = {"none": "none", "idempotent": "idempotent", "external": "external"}
-_HOSTED_WEB_SEARCH = "openai_web_search"
-_HOSTED_TERMINAL_STATUSES = frozenset({"completed", "failed", "incomplete", "outcome_unknown"})
-_USAGE_EVENT_TYPES = (
-    EventType.TOOL_CALL_COMPLETED,
-    EventType.TOOL_CALL_FAILED,
-    EventType.TOOL_CALL_APPROVED,
-    EventType.TOOL_CALL_APPROVAL_DENIED,
-    EventType.KNOWLEDGE_LOOKUP,
-    EventType.MODEL_HOSTED_TOOL_CALL,
-)
+_USAGE_EVENT_TYPES = (*TOOL_USAGE_EVENT_TYPES, EventType.KNOWLEDGE_LOOKUP)
 # Cloud allows newlines and tabs in descriptions and titles, never other control characters.
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _LINE_BREAKS = re.compile(r"[\x00-\x1f\x7f]")
@@ -99,14 +98,6 @@ _LINE_BREAKS = re.compile(r"[\x00-\x1f\x7f]")
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-
-class CloudToolSource(_Model):
-    kind: _SourceKind
-    package: str | None = None
-    version: str | None = None
-    server: str | None = None
-    provider: str | None = None
 
 
 class CloudTool(_Model):
@@ -198,36 +189,6 @@ def _line(value: str | None, limit: int) -> str | None:
         return None
     cleaned = _LINE_BREAKS.sub(" ", value).strip()
     return cleaned if cleaned and len(cleaned) <= limit else None
-
-
-def _tool_source(
-    tool: ToolManifest, registered: object, sanitize: Callable[[str | None], str | None]
-) -> CloudToolSource:
-    from cayu.mcp.tools import McpToolAdapter
-
-    if isinstance(registered, McpToolAdapter):
-        server = _line(sanitize(registered.server.name), MAX_NAME)
-        return (
-            CloudToolSource(kind="unknown")
-            if server is None
-            else CloudToolSource(kind="mcp", server=server)
-        )
-    provenance = tool.implementation_provenance
-    if provenance.kind == "external":
-        module = provenance.symbol.partition(":")[0]
-        for package in sorted(metadata.packages_distributions().get(module.split(".")[0], ())):
-            try:
-                version = metadata.version(package)
-            except metadata.PackageNotFoundError:
-                continue
-            name, version = (
-                _line(sanitize(package), MAX_NAME),
-                _line(sanitize(version), MAX_VERSION),
-            )
-            if name is not None and version is not None:
-                return CloudToolSource(kind="package", package=name, version=version)
-        return CloudToolSource(kind="unknown")
-    return CloudToolSource(kind=_SOURCE_KINDS.get(provenance.kind, "unknown"))
 
 
 @dataclass(frozen=True)
@@ -333,6 +294,7 @@ async def _build_registration(
     replaces_cursor: int | None = None,
 ) -> tuple[CloudRegistration, _Registered]:
     from cayu.mcp.tools import McpToolAdapter
+    from cayu.runtime.manifest import describe_inventory_tools
 
     def sanitize(value: str | None) -> str | None:
         if value is None:
@@ -341,18 +303,19 @@ async def _build_registration(
         assert isinstance(redacted, str)
         return transport_redactor.redact_text(redacted) if transport_redactor else redacted
 
-    manifest = app.describe(project_root=project_root)
+    source_metadata = ToolSourceMetadata()
+    declarations = describe_inventory_tools(app, project_root=project_root)
     agents: list[str] = []
     tools: dict[str, CloudTool] = {}
     registrations = sorted(app._agent_registry.registrations.items())
-    for specialist, (agent_name, registration) in zip(manifest.agents, registrations, strict=True):
+    for agent_name, registration in registrations:
         name = _line(sanitize(agent_name), MAX_NAME)
         if name is None or len(agents) == MAX_AGENTS:
             continue
         agents.append(name)
         declared: list[tuple[str, CloudTool]] = []
         for tool, (tool_name, registered) in zip(
-            specialist.tools, sorted(registration.tools.items()), strict=True
+            declarations[agent_name], sorted(registration.tools.items()), strict=True
         ):
             description = (
                 registered.tool.definition.description
@@ -366,13 +329,20 @@ async def _build_registration(
                         name=tool_name,
                         description=description,
                         agents=(name,),
-                        source=_tool_source(tool, registered.tool, sanitize),
+                        source=classify_tool_source(
+                            tool,
+                            registered.tool,
+                            sanitize,
+                            source_metadata=source_metadata,
+                            name_limit=MAX_NAME,
+                            version_limit=MAX_VERSION,
+                        ),
                         effect=_EFFECTS.get(tool.effect, "external"),
                         approval=_APPROVALS.get(tool.policy_coverage, "unknown"),
                     ),
                 )
             )
-        for hosted in specialist.hosted_tools:
+        for hosted in registration.hosted_tools:
             declared.append(
                 (
                     hosted.type,
@@ -600,30 +570,16 @@ async def _cloud_usage_report(
                     totals.lookups += 1
                     totals.used(event.timestamp)
             continue
-        if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
-            status = event.payload.get("status")
-            if (
-                event.payload.get("tool_type") != "web_search"
-                or status not in _HOSTED_TERMINAL_STATUSES
-                or _HOSTED_WEB_SEARCH not in registered.tools
-            ):
-                continue
-            totals = tools.setdefault(_HOSTED_WEB_SEARCH, _Totals())
-            totals.calls += 1
-            totals.failures += status == "failed"
-            totals.used(event.timestamp)
+        contribution = tool_usage_contribution(event)
+        if contribution is None or contribution.name not in registered.tools:
             continue
-        if event.tool_name is None or event.tool_name not in registered.tools:
-            continue
-        totals = tools.setdefault(event.tool_name, _Totals())
-        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
-            totals.calls += 1
-            totals.failures += event.type == EventType.TOOL_CALL_FAILED
+        totals = tools.setdefault(contribution.name, _Totals())
+        totals.calls += contribution.calls
+        totals.failures += contribution.failures
+        totals.approved += contribution.approved
+        totals.rejected += contribution.rejected
+        if contribution.calls:
             totals.used(event.timestamp)
-        elif event.type == EventType.TOOL_CALL_APPROVED:
-            totals.approved += 1
-        else:
-            totals.rejected += 1
     report = CloudUsageReport(
         after=after,
         through=events[-1].sequence,

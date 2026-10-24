@@ -133,6 +133,8 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
         for route in (
             "/app",
             "/agents",
+            "/tools/usage",
+            "/tools/calls",
             "/agents/{agent_name}",
             "/artifacts",
             "/artifacts/{artifact_id}",

@@ -11,7 +11,7 @@ import type { SessionDetail, SessionOverview } from "../../api/types"
 import type { SessionRow } from "../../app/queries"
 import { useServices } from "../../app/services"
 import { formatDuration } from "../../app/session-model"
-import { LabelChips, NavLink, sessionPath } from "../common"
+import { LabelChips, NavLink, SessionSummary, sessionPath } from "../common"
 
 export const PANEL_TABS = ["overview", "usage", "artifacts", "browser"] as const
 export type PanelTab = (typeof PANEL_TABS)[number]
@@ -122,7 +122,13 @@ export function DetailsPanel({
               </NavLink>
             </Row>
             <Row k="Title">{overview?.title ?? "–"}</Row>
-            <Row k="Summary">{overview?.summary ?? "–"}</Row>
+            <Row k="Summary">
+              {overview?.summary ? (
+                <SessionSummary text={overview.summary} tone={overview.summary_tone} />
+              ) : (
+                "–"
+              )}
+            </Row>
             <Row k="Started">{when(session.created_at)}</Row>
             <Row k="Last activity">{when(overview?.last_activity_at ?? session.updated_at)}</Row>
             <Row k="Model">
@@ -158,9 +164,11 @@ export function DetailsPanel({
                 </NavLink>
               </Row>
             )}
-            <Row k="Labels">
-              {Object.keys(session.labels).length ? <LabelChips labels={session.labels} /> : "–"}
-            </Row>
+            {prototype && (
+              <Row k="Labels">
+                {Object.keys(session.labels).length ? <LabelChips labels={session.labels} /> : "–"}
+              </Row>
+            )}
             {prototype &&
               metadata.map(([k, v]) => (
                 <Row key={k} k={k} mono>
@@ -170,7 +178,7 @@ export function DetailsPanel({
           </dl>
         )}
         {tab === "overview" && !prototype && (
-          <SessionAnnotations session={session} showRuntimeMetadata={false} />
+          <SessionAnnotations session={session} showRuntimeMetadata={false} compact />
         )}
 
         {tab === "artifacts" && (

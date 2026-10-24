@@ -1139,6 +1139,40 @@ export type ApiProviderOperationInspection = {
 };
 
 /**
+ * ApiRecentToolCall
+ */
+export type ApiRecentToolCall = {
+    /**
+     * Event Id
+     */
+    event_id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Outcome
+     */
+    outcome: 'completed' | 'failed' | 'interrupted' | 'incomplete' | 'outcome_unknown';
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+    /**
+     * Timestamp
+     */
+    timestamp: string;
+};
+
+/**
  * ApiReviewedKnowledgeEntry
  */
 export type ApiReviewedKnowledgeEntry = {
@@ -2304,6 +2338,10 @@ export type ApiTaskTopologySessionBranch = {
  */
 export type ApiToolSummary = {
     /**
+     * Approval
+     */
+    approval: 'never' | 'always' | 'sometimes' | 'blocked' | 'unknown';
+    /**
      * Description
      */
     description: string;
@@ -2325,10 +2363,41 @@ export type ApiToolSummary = {
      * Parallel Safe
      */
     parallel_safe: boolean;
+    source: ToolSource;
     /**
      * Workspace Mutation
      */
     workspace_mutation: boolean;
+};
+
+/**
+ * ApiToolUsage
+ */
+export type ApiToolUsage = {
+    /**
+     * Approved
+     */
+    approved: number;
+    /**
+     * Calls
+     */
+    calls: number;
+    /**
+     * Failures
+     */
+    failures: number;
+    /**
+     * Last Used At
+     */
+    last_used_at: string | null;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Rejected
+     */
+    rejected: number;
 };
 
 /**
@@ -4263,6 +4332,8 @@ export type ControlPlaneSurfaceCapabilities = {
     task_creation?: OptionalSurfaceCapability | null;
     task_index?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
+    tool_inventory?: OptionalSurfaceCapability | null;
+    tool_usage?: OptionalSurfaceCapability | null;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
 };
@@ -19313,6 +19384,24 @@ export type ToolCalledAssertionSpec = {
 };
 
 /**
+ * ToolCallsResponse
+ */
+export type ToolCallsResponse = {
+    /**
+     * Calls
+     */
+    calls: Array<ApiRecentToolCall>;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
+     * Through Sequence
+     */
+    through_sequence: number;
+};
+
+/**
  * ToolCompletionPolicy
  *
  * Complete a single-call round from a designated successful tool.
@@ -19778,6 +19867,46 @@ export type ToolRunnerCapabilityRequirement = {
      * Minimum Evidence
      */
     minimum_evidence?: 'available' | 'live_verified';
+};
+
+/**
+ * ToolSource
+ */
+export type ToolSource = {
+    /**
+     * Kind
+     */
+    kind: 'agent' | 'package' | 'mcp' | 'cayu' | 'provider' | 'unknown';
+    /**
+     * Package
+     */
+    package?: string | null;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+    /**
+     * Server
+     */
+    server?: string | null;
+    /**
+     * Version
+     */
+    version?: string | null;
+};
+
+/**
+ * ToolUsageResponse
+ */
+export type ToolUsageResponse = {
+    /**
+     * Through Sequence
+     */
+    through_sequence: number;
+    /**
+     * Tools
+     */
+    tools: Array<ApiToolUsage>;
 };
 
 /**
@@ -26665,6 +26794,89 @@ export type RecoverToolRoundApiToolRoundsRecoverPostResponses = {
 };
 
 export type RecoverToolRoundApiToolRoundsRecoverPostResponse = RecoverToolRoundApiToolRoundsRecoverPostResponses[keyof RecoverToolRoundApiToolRoundsRecoverPostResponses];
+
+export type ToolCallsApiToolsCallsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Name
+         */
+        name?: string | null;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/tools/calls';
+};
+
+export type ToolCallsApiToolsCallsGetErrors = {
+    /**
+     * The retained source or cursor binding changed; restart the listing.
+     */
+    409: ApiErrorResponse;
+    /**
+     * An individual event exceeds the bounded read size.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The store does not implement the required bounded reads.
+     */
+    501: ApiErrorResponse;
+};
+
+export type ToolCallsApiToolsCallsGetError = ToolCallsApiToolsCallsGetErrors[keyof ToolCallsApiToolsCallsGetErrors];
+
+export type ToolCallsApiToolsCallsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ToolCallsResponse;
+};
+
+export type ToolCallsApiToolsCallsGetResponse = ToolCallsApiToolsCallsGetResponses[keyof ToolCallsApiToolsCallsGetResponses];
+
+export type ToolUsageApiToolsUsageGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/tools/usage';
+};
+
+export type ToolUsageApiToolsUsageGetErrors = {
+    /**
+     * The retained source or cursor binding changed; restart the listing.
+     */
+    409: ApiErrorResponse;
+    /**
+     * An individual event exceeds the bounded read size.
+     */
+    413: ApiErrorResponse;
+    /**
+     * The store does not implement the required bounded reads.
+     */
+    501: ApiErrorResponse;
+};
+
+export type ToolUsageApiToolsUsageGetError = ToolUsageApiToolsUsageGetErrors[keyof ToolUsageApiToolsUsageGetErrors];
+
+export type ToolUsageApiToolsUsageGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ToolUsageResponse;
+};
+
+export type ToolUsageApiToolsUsageGetResponse = ToolUsageApiToolsUsageGetResponses[keyof ToolUsageApiToolsUsageGetResponses];
 
 export type GetUsageRollupApiUsageRollupPostData = {
     body: UsageRollupRequest;

@@ -4772,6 +4772,26 @@ class SessionStore(ABC):
         """
         raise NotImplementedError("This SessionStore has no store identity.")
 
+    async def fold_event_snapshot(
+        self,
+        query: EventQuery,
+        consume: Callable[[list[EventRecord]], None],
+        *,
+        max_bytes: int,
+        max_pages: int | None = None,
+    ) -> int:
+        """Consume byte-bounded pages from one stable retained-event snapshot.
+
+        Optional native capability. The synchronous consumer must only mutate
+        request-local state; it may run on a worker thread. Publish its state
+        only after this method succeeds. Exceptions/cancellation invalidate the
+        accumulator, and implementations must quiesce owned work before return.
+        Return the snapshot's unfiltered maximum sequence (zero when empty),
+        not a committed-prefix watermark. Each call takes a fresh snapshot.
+        ``query.limit`` bounds each page; ``max_pages`` optionally bounds work.
+        """
+        raise NotImplementedError("This SessionStore has no exact event snapshot fold.")
+
     async def query_events_bounded(
         self,
         query: EventQuery,

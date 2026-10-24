@@ -34,6 +34,7 @@ from cayu.sessions._child_lifecycle_rules import (
     _child_session_lifecycle_entry_sort_key,
     _child_session_lifecycle_occurrence,
 )
+from cayu.sessions._event_snapshot import EventSnapshotConsumer, EventSnapshotFold, fold_snapshot
 from cayu.sessions._runtime_publication import _tool_round_lifecycle_event_limit
 from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
@@ -732,66 +733,93 @@ async def read_cost_accounting(
 async def query_events_bounded(
     run_read: SQLiteOperationRunner, query: EventQuery, *, max_bytes: int
 ) -> list[EventRecord]:
-    query = copy_event_query(query)
-    if type(max_bytes) is not int or max_bytes < 1:
-        raise ValueError("max_bytes must be a positive integer.")
+    fold = EventSnapshotFold(query, max_bytes=max_bytes, max_pages=1)
+
+    def read(connection: sqlite3.Connection) -> list[EventRecord]:
+        connection.execute("BEGIN")
+        try:
+            return _query_events_bounded_snapshot(connection, fold.query, max_bytes=max_bytes)
+        finally:
+            connection.rollback()
+
+    return await run_read(read)
+
+
+@runtime_session_query
+async def fold_event_snapshot(
+    run_read: SQLiteOperationRunner,
+    query: EventQuery,
+    consume: EventSnapshotConsumer,
+    *,
+    max_bytes: int,
+    max_pages: int | None = None,
+) -> int:
+    fold = EventSnapshotFold(query, max_bytes=max_bytes, max_pages=max_pages)
+
+    def read(connection: sqlite3.Connection) -> int:
+        connection.execute("BEGIN")
+        try:
+            return fold_snapshot(
+                fold,
+                lambda page: _query_events_bounded_snapshot(connection, page, max_bytes=max_bytes),
+                consume,
+            )
+        finally:
+            connection.rollback()
+
+    return await run_read(read)
+
+
+def _query_events_bounded_snapshot(
+    connection: sqlite3.Connection, query: EventQuery, *, max_bytes: int
+) -> list[EventRecord]:
     if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
         raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
     plan = session_store_sql.build_event_query_sql(query, dialect=SQL_DIALECT)
     params = [*plan.params, query.limit]
     source = _event_query_source(query)
-
-    def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
-        event_columns = ", ".join(
-            f"cayu_events.{name}" for name in sqlite_records.EVENT_COLUMN_NAMES
+    event_columns = ", ".join(f"cayu_events.{name}" for name in sqlite_records.EVENT_COLUMN_NAMES)
+    serialized_bytes = " + ".join(
+        [
+            "256",
+            *(
+                f"COALESCE(length(CAST(cayu_events.{name} AS BLOB)), 0)"
+                for name in sqlite_records.EVENT_COLUMN_NAMES
+            ),
+        ]
+    )
+    size_row = connection.execute(
+        f"""
+        WITH bounded_candidates AS (
+            SELECT {serialized_bytes} AS serialized_bytes
+            FROM {source}
+            JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+            {plan.where_sql}
+            ORDER BY cayu_events.sequence {plan.order_direction}
+            LIMIT ?
         )
-        serialized_bytes = " + ".join(
-            [
-                "256",
-                *(
-                    f"COALESCE(length(CAST(cayu_events.{name} AS BLOB)), 0)"
-                    for name in sqlite_records.EVENT_COLUMN_NAMES
-                ),
-            ]
-        )
-        connection.execute("BEGIN")
-        try:
-            size_row = connection.execute(
-                f"""
-                WITH bounded_candidates AS (
-                    SELECT {serialized_bytes} AS serialized_bytes
-                    FROM {source}
-                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                    {plan.where_sql}
-                    ORDER BY cayu_events.sequence {plan.order_direction}
-                    LIMIT ?
-                )
-                SELECT COALESCE(SUM(serialized_bytes), 0)
-                FROM bounded_candidates
-                """,
-                params,
-            ).fetchone()
-            if size_row is None or int(size_row[0]) > max_bytes:
-                raise EventQueryResultTooLarge(max_bytes)
-            rows = connection.execute(
-                f"""
-                SELECT cayu_events.sequence, {event_columns}
-                FROM {source}
-                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                {plan.where_sql}
-                ORDER BY cayu_events.sequence {plan.order_direction}
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            return [
-                EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
-                for row in rows
-            ]
-        finally:
-            connection.rollback()
-
-    return await run_read(run_query)
+        SELECT COALESCE(SUM(serialized_bytes), 0)
+        FROM bounded_candidates
+        """,
+        params,
+    ).fetchone()
+    if size_row is None or int(size_row[0]) > max_bytes:
+        raise EventQueryResultTooLarge(max_bytes)
+    rows = connection.execute(
+        f"""
+        SELECT cayu_events.sequence, {event_columns}
+        FROM {source}
+        JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+        {plan.where_sql}
+        ORDER BY cayu_events.sequence {plan.order_direction}
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
+        for row in rows
+    ]
 
 
 async def query_latest_interaction_events(

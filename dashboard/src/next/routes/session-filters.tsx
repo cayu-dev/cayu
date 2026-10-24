@@ -1,5 +1,5 @@
 import { Search, SlidersHorizontal } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { type ReactNode, useEffect, useRef, useState } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -147,16 +147,21 @@ export function SessionSearchInput({
 export function AdvancedFilters({
   search,
   onApply,
+  secondary,
 }: {
   search: SessionIndexSearch
   onApply: (patch: SessionIndexFilterPatch) => void
+  secondary?: ReactNode
 }) {
   const confirmedDraft = advancedFilterDraft(search)
   const [draft, setDraft] = useState(confirmedDraft)
-  const [open, setOpen] = useState(activeAdvancedFilterCount(search) > 0)
+  const [open, setOpen] = useState(
+    activeAdvancedFilterCount(search) > 0 || !!search.status || !!search.debug_state,
+  )
   const confirmedKey = advancedFilterDraftKey(confirmedDraft)
   const dirty = advancedFilterDraftKey(draft) !== confirmedKey
-  const activeCount = activeAdvancedFilterCount(search)
+  const activeCount =
+    activeAdvancedFilterCount(search) + Number(!!search.status) + Number(!!search.debug_state)
 
   function setField<Key extends keyof AdvancedFilterDraft>(
     field: Key,
@@ -167,7 +172,7 @@ export function AdvancedFilters({
 
   return (
     <details
-      className="min-w-full border-t border-border pt-3"
+      className="min-w-full"
       open={open}
       onToggle={(event) => setOpen(event.currentTarget.open)}
     >
@@ -183,6 +188,7 @@ export function AdvancedFilters({
           onApply(advancedFilterPatch(draft))
         }}
       >
+        {secondary && <div className="flex flex-wrap gap-2">{secondary}</div>}
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <label htmlFor="session-agent-filter" className="text-sm text-muted-foreground">
             Specialist

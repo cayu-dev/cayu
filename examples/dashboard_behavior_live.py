@@ -4356,6 +4356,9 @@ async def _exercise_session_discovery(
         response = await response_info.value
         require_equal(response.status, 200, f"{label} session overview response")
 
+    advanced_filters = page.get_by_text("Advanced filters", exact=True)
+    if not await page.get_by_label("Raw status", exact=True).is_visible():
+        await advanced_filters.click()
     await select_session_filter(
         "Raw status",
         "completed",

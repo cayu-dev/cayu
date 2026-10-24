@@ -43,6 +43,7 @@ class ControlPlaneCapabilitySnapshot:
     browser_recordings_configured: bool = False
     task_index_supported: bool = False
     task_creation_supported: bool = False
+    tool_usage_supported: bool = False
     session_overview_supported: bool = False
 
     @property
@@ -92,6 +93,10 @@ class ControlPlaneCapabilitySnapshot:
                     self.tasks_configured,
                     read_supported=self.task_creation_supported,
                     mutation_supported=self.task_creation_supported,
+                ),
+                tool_inventory=_optional_surface(True, mutation_supported=False),
+                tool_usage=_optional_surface(
+                    True, read_supported=self.tool_usage_supported, mutation_supported=False
                 ),
                 session_trace=_optional_surface(True, mutation_supported=False),
                 session_followups=_optional_surface(True, mutation_supported=True),
@@ -195,6 +200,7 @@ def inspect_control_plane_capabilities(
     browser_recordings_configured: bool = False,
     task_index_supported: bool = False,
     task_creation_supported: bool = False,
+    tool_usage_supported: bool = False,
     session_overview_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
@@ -219,6 +225,7 @@ def inspect_control_plane_capabilities(
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
         ("task_index_supported", task_index_supported),
         ("task_creation_supported", task_creation_supported),
+        ("tool_usage_supported", tool_usage_supported),
         ("session_overview_supported", session_overview_supported),
         ("session_topology_supported", session_topology_supported),
         ("evaluation_promotion_configured", evaluation_promotion_configured),
@@ -243,6 +250,7 @@ def inspect_control_plane_capabilities(
         browser_recordings_configured=browser_recordings_configured,
         task_index_supported=task_index_supported,
         task_creation_supported=task_creation_supported,
+        tool_usage_supported=tool_usage_supported,
         session_overview_supported=session_overview_supported,
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,

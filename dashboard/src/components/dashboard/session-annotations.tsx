@@ -26,9 +26,11 @@ type EditorState = {
 export function SessionAnnotations({
   session,
   showRuntimeMetadata = true,
+  compact = false,
 }: {
   session: SessionDetail
   showRuntimeMetadata?: boolean
+  compact?: boolean
 }) {
   const queryClient = useQueryClient()
   const annotationCapability = useDashboardCapability({
@@ -166,8 +168,16 @@ export function SessionAnnotations({
           {announcement}
         </p>
       </CardHeader>
-      <CardContent className="grid grid-cols-1 p-0 xl:grid-cols-2">
-        <section className="min-w-0 border-b border-border p-4 xl:border-r xl:border-b-0">
+      <CardContent
+        className={compact ? "grid grid-cols-1 p-0" : "grid grid-cols-1 p-0 xl:grid-cols-2"}
+      >
+        <section
+          className={
+            compact
+              ? "min-w-0 border-b border-border p-4"
+              : "min-w-0 border-b border-border p-4 xl:border-r xl:border-b-0"
+          }
+        >
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <h2

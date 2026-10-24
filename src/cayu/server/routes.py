@@ -3395,26 +3395,13 @@ def _redact_control_plane_values(
     return redact(copied)
 
 
-def _serialize_tool(cayu_app: Any, tool: Any) -> dict[str, Any]:
-    effect = getattr(tool.effect, "value", str(tool.effect))
-    return {
-        "name": tool.name,
-        "description": _redact_control_plane_json(cayu_app, tool.description, "description"),
-        "input_schema": _redact_control_plane_json(cayu_app, tool.schema, "input_schema"),
-        "parallel_safe": tool.parallel_safe,
-        "effect": effect,
-        "workspace_mutation": tool.workspace_mutation,
-    }
-
-
-def _serialize_agent(cayu_app: Any, agent: Any) -> dict[str, Any]:
+def _serialize_agent(cayu_app: Any, agent: Any, tools: list[dict[str, Any]]) -> dict[str, Any]:
     spec = agent.spec
     thinking = (
         None
         if spec.thinking is None
         else _redact_control_plane_json(cayu_app, spec.thinking.model_dump(mode="json"), "thinking")
     )
-    tools = [_serialize_tool(cayu_app, tool) for tool in agent.tools.values()]
     return {
         "name": spec.name,
         "provider_name": spec.provider_name,
@@ -4580,6 +4567,10 @@ def create_router(
     )
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
+        tool_usage_supported=type(session_store).fold_event_snapshot
+        is not SessionStore.fold_event_snapshot
+        and type(session_store).query_events_bounded is not SessionStore.query_events_bounded
+        and type(session_store).read_store_identity is not SessionStore.read_store_identity,
         task_index_supported=task_store is not None
         and inspect.unwrap(type(task_store).query_task_index) is not TaskStore.query_task_index,
         task_creation_supported=task_store is not None
@@ -6813,10 +6804,36 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
+    from cayu.server._tool_usage import register_tool_usage
+    from cayu.server.tool_inventory import public_tool_names
+    from cayu.sessions.tool_usage import ToolUsageReader
+
+    register_tool_usage(
+        router,
+        protected=protected,
+        reader=lambda: ToolUsageReader(
+            session_store,
+            names=public_tool_names(cayu_app),
+            project_event=lambda record: _serialize_event_record(cayu_app, record),
+        ),
+    )
+
+    def inventory_tools():
+        from cayu.server.tool_inventory import tool_declarations
+
+        return tool_declarations(
+            cayu_app,
+            project_root=(
+                None if _project_context is None else _project_context.app_manifest_project_root
+            ),
+        )
+
     @router.get("/agents", response_model=AgentsResponse, dependencies=protected)
     async def list_agents():
+        tools = inventory_tools()
         agents = [
-            _serialize_agent(cayu_app, cayu_app.get_agent(name)) for name in cayu_app.list_agents()
+            _serialize_agent(cayu_app, cayu_app.get_agent(name), tools[name])
+            for name in cayu_app.list_agents()
         ]
         return {"agents": agents, "total_count": len(agents)}
 
@@ -6826,7 +6843,7 @@ def create_router(
             agent = cayu_app.get_agent(agent_name)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Agent not found") from exc
-        serialized = _serialize_agent(cayu_app, agent)
+        serialized = _serialize_agent(cayu_app, agent, inventory_tools()[agent_name])
         return {"agents": [serialized], "total_count": 1}
 
     @router.get(

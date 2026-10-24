@@ -652,6 +652,39 @@ def _tool_result_projection_policy_manifest(
     return ToolResultProjectionPolicyManifest(identity=policy.identity)
 
 
+def describe_inventory_tools(
+    app: CayuApp, *, project_root: str | Path | None = None
+) -> dict[str, tuple[ToolManifest, ...]]:
+    """Internal typed declarations for inventory projectors, before public redaction.
+
+    The caller must project and sanitize its allowlisted fields. Do not serialize
+    this mapping as a public manifest: its keys and provenance retain authority.
+    Both inventory consumers share the manifest's policy and provenance owners
+    without materializing unrelated providers, environments or application defaults.
+    """
+    root = Path(project_root).resolve() if project_root is not None else None
+    result = {}
+    for name, registration in sorted(app._agent_registry.registrations.items()):
+        provenance = _registration_provenance(
+            registration.registration_source,
+            registration.registration_symbol,
+            root,
+            fallback=registration.spec,
+        )
+        result[name] = tuple(
+            _describe_tool(
+                app,
+                tool_name=tool_name,
+                tool=tool,
+                tool_policy=registration.tool_policy,
+                registration_provenance=provenance,
+                project_root=root,
+            )
+            for tool_name, tool in sorted(registration.tools.items())
+        )
+    return result
+
+
 def _describe_agent(
     app: CayuApp,
     *,

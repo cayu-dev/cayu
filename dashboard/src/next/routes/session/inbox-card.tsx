@@ -382,67 +382,74 @@ export function InboxCard({
             prototype={!!prototype}
           />
         )}
-        {(item.kind === "approval" || item.kind === "question") && !decided && (
-          <label className="flex items-start gap-2 text-xs">
-            <input
-              type="checkbox"
-              checked={claimTask}
-              onChange={(event) => setClaimTask(event.target.checked)}
-              disabled={busy}
-            />
-            Continue an interrupted task with this decision. Active workers remain protected.
-          </label>
-        )}
         {item.arguments_unavailable_reason === "quarantined" && (
           <p className="text-xs text-muted-foreground">
             Arguments are withheld. Use protected human review when this agent provides it.
           </p>
         )}
-        {item.kind === "approval" &&
-          !protectedDecision &&
-          (!!prototype || viewer?.full_access === true) &&
-          !decided && (
-            <div className="space-y-2">
-              <label className="flex items-center gap-2 text-xs">
-                <input
-                  type="checkbox"
-                  checked={override}
-                  onChange={(event) => setOverride(event.target.checked)}
-                  disabled={busy}
-                />
-                Approve with changed arguments
-              </label>
-              {override && (
-                <label className="block text-xs">
-                  Changed arguments
-                  <textarea
-                    aria-label="Changed arguments"
-                    value={argumentsText}
-                    onChange={(event) => setArgumentsText(event.target.value)}
+        {!decided && item.kind !== "recovery" && (
+          <details className="text-xs" open={override || !!argumentError}>
+            <summary className="cursor-pointer text-muted-foreground">Decision options</summary>
+            <div className="mt-3 space-y-3">
+              {(item.kind === "approval" || item.kind === "question") && !decided && (
+                <label className="flex items-start gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={claimTask}
+                    onChange={(event) => setClaimTask(event.target.checked)}
                     disabled={busy}
-                    rows={4}
-                    className="mt-1 block w-full rounded border border-input bg-background px-2 py-1 font-mono"
                   />
-                  <span>The proposed arguments remain withheld. This object replaces them.</span>
+                  Continue an interrupted task with this decision. Active workers remain protected.
                 </label>
               )}
-              {argumentError && <p role="alert">{argumentError}</p>}
+              {item.kind === "approval" &&
+                !protectedDecision &&
+                (!!prototype || viewer?.full_access === true) &&
+                !decided && (
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={override}
+                        onChange={(event) => setOverride(event.target.checked)}
+                        disabled={busy}
+                      />
+                      Approve with changed arguments
+                    </label>
+                    {override && (
+                      <label className="block text-xs">
+                        Changed arguments
+                        <textarea
+                          aria-label="Changed arguments"
+                          value={argumentsText}
+                          onChange={(event) => setArgumentsText(event.target.value)}
+                          disabled={busy}
+                          rows={4}
+                          className="mt-1 block w-full rounded border border-input bg-background px-2 py-1 font-mono"
+                        />
+                        <span>
+                          The proposed arguments remain withheld. This object replaces them.
+                        </span>
+                      </label>
+                    )}
+                    {argumentError && <p role="alert">{argumentError}</p>}
+                  </div>
+                )}
+              {(!protectedDecision || item.kind === "question") && !decided && (
+                <label className="block text-xs">
+                  Reason (optional)
+                  <input
+                    value={reason}
+                    onChange={(event) => setReason(event.target.value)}
+                    maxLength={4096}
+                    disabled={busy}
+                    className="mt-1 block w-full rounded border border-input bg-background px-2 py-1"
+                  />
+                </label>
+              )}
             </div>
-          )}
-        {item.kind !== "recovery" &&
-          (!protectedDecision || item.kind === "question") &&
-          !decided && (
-            <label className="block text-xs">
-              Reason (optional)
-              <input
-                value={reason}
-                onChange={(event) => setReason(event.target.value)}
-                maxLength={4096}
-                disabled={busy}
-                className="mt-1 block w-full rounded border border-input bg-background px-2 py-1"
-              />
-            </label>
-          )}
+          </details>
+        )}
       </div>
       {!decided && (
         <div className="flex flex-wrap gap-2 border-t border-border px-3.5 py-2.5">{actions}</div>

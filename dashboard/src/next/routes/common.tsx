@@ -5,6 +5,7 @@ import {
   createContext,
   type MouseEvent,
   type ReactNode,
+  type RefObject,
   useContext,
 } from "react"
 import { Button } from "@/components/ui/button"
@@ -142,13 +143,39 @@ export function StateBadge({ overview }: { overview: SessionOverview | null | un
   return (
     <span
       className={cn(
-        "inline-flex h-5 items-center gap-1.5 rounded-full border border-border px-2 text-xs font-medium whitespace-nowrap",
+        "inline-flex h-5 shrink-0 items-center gap-1.5 rounded-full border border-border px-2 text-xs font-medium whitespace-nowrap",
         needsAttention(overview) ? "text-warning" : state ? TEXT[state] : "text-muted-foreground",
       )}
+      title={overview?.summary || undefined}
     >
       <StateDot state={state} attention={needsAttention(overview)} />
-      {stateText(overview)}
+      {state ? STATE_LABEL[state] : "–"}
     </span>
+  )
+}
+
+/** Keep authored text readable without making long summaries dominate the page. */
+export function SessionSummary({
+  text,
+  tone,
+}: {
+  text: string
+  tone?: "neutral" | "attention" | null
+}) {
+  const color = tone === "attention" ? "text-warning" : "text-muted-foreground"
+  if (text.length <= 180) return <p className={cn("break-words text-sm", color)}>{text}</p>
+  return (
+    <details className="group">
+      <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+        <span className={cn("line-clamp-2 break-words text-sm group-open:line-clamp-none", color)}>
+          {text}
+        </span>
+        <span className="mt-1 block text-xs text-muted-foreground">
+          <span className="group-open:hidden">Show full summary</span>
+          <span className="hidden group-open:inline">Collapse summary</span>
+        </span>
+      </summary>
+    </details>
   )
 }
 
@@ -213,6 +240,10 @@ export type Shell = {
   mobileOpen: boolean
   setMobileOpen: (open: boolean) => void
   focusSearch: () => void
+  sidebarToggleRef?: RefObject<HTMLButtonElement | null>
+  desktopSidebarToggleRef?: RefObject<HTMLButtonElement | null>
+  roleLabel?: string
+  pageLayout?: boolean
 }
 export const ShellContext = createContext<Shell | null>(null)
 export function useShell() {
@@ -231,6 +262,8 @@ export function TopBar({ children, actions }: { children?: ReactNode; actions?: 
           variant="ghost"
           size="icon-sm"
           className="md:hidden"
+          ref={shell.sidebarToggleRef}
+          aria-expanded={shell.mobileOpen}
           aria-label="Open sidebar"
           onClick={() => shell.setMobileOpen(true)}
         >
@@ -242,6 +275,7 @@ export function TopBar({ children, actions }: { children?: ReactNode; actions?: 
           variant="ghost"
           size="icon-sm"
           className="hidden md:inline-flex"
+          ref={shell.desktopSidebarToggleRef}
           aria-label="Show sidebar"
           onClick={() => shell.setSidebarHidden(false)}
         >
@@ -249,6 +283,11 @@ export function TopBar({ children, actions }: { children?: ReactNode; actions?: 
         </Button>
       )}
       <h1 className="min-w-0 flex-1 truncate text-sm font-medium">{children}</h1>
+      {shell?.roleLabel && (
+        <span className="sr-only sm:not-sr-only sm:text-xs sm:text-muted-foreground">
+          {shell.roleLabel}
+        </span>
+      )}
       {actions}
     </header>
   )
@@ -263,7 +302,7 @@ export function PageBody({
   width?: string
 }) {
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto">
+    <div className="relative min-h-0 flex-1 overflow-y-auto">
       <div className={cn("mx-auto w-full px-4 py-5 sm:px-6", width)}>{children}</div>
     </div>
   )

@@ -362,12 +362,14 @@ def test_inbox_member_decides_without_arguments_and_counts_refresh(decision):
             await expect(page.get_by_label("Changed arguments", exact=True)).to_have_count(0)
             assert "/api/inbox/counts" in requests
             await expect(page.get_by_label("Inbox total")).to_have_text("2")
+            await page.get_by_text("Advanced filters", exact=True).click()
             await page.get_by_label("Inbox page size", exact=True).select_option("25")
             await expect(page.get_by_label("Inbox total")).to_have_text("2")
             await page.get_by_role("button", name=decision, exact=True).first.click()
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
             await expect(page.get_by_label("Inbox total")).to_have_text("1")
             await page.get_by_label("Your answer", exact=True).fill("Confirmed by the operator")
+            await page.get_by_text("Decision options", exact=True).click()
             await page.get_by_label("Reason (optional)", exact=True).fill("Answer reviewed")
             await page.get_by_role("button", name="Send", exact=True).click()
             await expect(page.get_by_label("Your answer", exact=True)).to_have_count(0)
@@ -404,6 +406,7 @@ def test_inbox_protected_review_uses_reference_for_member():
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
             await page.get_by_role("button", name="Refresh review").click()
             await expect(page.get_by_text("Review this exact proposal", exact=True)).to_be_visible()
+            await expect(page.get_by_label("Decision reason", exact=True)).to_be_visible()
             await page.get_by_label("Decision reason", exact=True).fill("Checked by reviewer")
             await page.get_by_role("button", name="Approve", exact=True).click()
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
@@ -433,9 +436,11 @@ def test_inbox_member_keeps_and_drops_knowledge_with_source_fields():
                 "Created by",
             ]:
                 await expect(page.get_by_text(label, exact=True).first).to_be_visible()
+            await page.get_by_text("Decision options", exact=True).first.click()
             await page.get_by_label("Reason (optional)", exact=True).first.fill("Keep reviewed")
             await page.get_by_role("button", name="Keep", exact=True).first.click()
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(1)
+            await page.get_by_text("Decision options", exact=True).first.click()
             await page.get_by_label("Reason (optional)", exact=True).first.fill("Drop reviewed")
             await page.get_by_role("button", name="Drop", exact=True).first.click()
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(0)
@@ -547,11 +552,21 @@ def test_inbox_full_access_explicit_replacement_and_reason():
                 ),
             )
             await page.goto(base + "/cayu/inbox?kind=approval", wait_until="networkidle")
+            await expect(
+                page.get_by_label("Approve with changed arguments", exact=True)
+            ).to_be_hidden()
+            await page.get_by_text("Decision options", exact=True).click()
             await page.get_by_label("Approve with changed arguments", exact=True).check()
             await page.get_by_label("Changed arguments", exact=True).fill(
                 '{"note":"reviewed replacement"}'
             )
             await page.get_by_label("Reason (optional)", exact=True).fill("Reviewed replacement")
+            await page.get_by_text("Decision options", exact=True).click()
+            await expect(page.get_by_label("Changed arguments", exact=True)).to_be_hidden()
+            await page.get_by_text("Decision options", exact=True).click()
+            await expect(page.get_by_label("Changed arguments", exact=True)).to_have_value(
+                '{"note":"reviewed replacement"}'
+            )
             await page.get_by_role("button", name="Approve", exact=True).click()
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
             assert bodies == [
@@ -720,6 +735,7 @@ def test_inbox_explicit_task_continuation_preserves_active_worker(agent, active_
             responses,
         ):
             await page.goto(base + "/cayu/inbox", wait_until="networkidle")
+            await page.get_by_text("Decision options", exact=True).click()
             await page.get_by_label(
                 "Continue an interrupted task with this decision.", exact=False
             ).check()
@@ -1112,6 +1128,7 @@ def test_inbox_periodic_refetch_recomputes_changed_phase_cursors():
             capture_runtime=lambda runtime: captured.update(runtime=runtime),
         ) as (page, base, _requests, _responses):
             await page.goto(base + "/cayu/inbox", wait_until="networkidle")
+            await page.get_by_text("Advanced filters", exact=True).click()
             await page.get_by_label("Inbox page size", exact=True).select_option("25")
             await page.get_by_role("button", name="Load more", exact=True).click()
             await expect(page.locator("[data-inbox-item]")).to_have_count(4)
@@ -1309,7 +1326,8 @@ def test_inbox_source_issues_keep_distinct_session_inspection_links(panel):
 
 
 @pytest.mark.parametrize("role", ["admin", "member"])
-def test_run_execution_is_independent_of_overview_read_support(role):
+@pytest.mark.parametrize("width", [390, 1440])
+def test_run_execution_is_independent_of_overview_read_support(role, width):
     from cayu.sessions.store import SessionStore
 
     def unsupported(runtime):
@@ -1327,8 +1345,17 @@ def test_run_execution_is_independent_of_overview_read_support(role):
             requests,
             _responses,
         ):
+            await page.set_viewport_size({"width": width, "height": 900})
             await page.goto(base + "/cayu/run", wait_until="networkidle")
             await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_be_visible()
+            await expect(page.locator("main header")).to_have_count(1)
+            await expect(page.locator("main div.overflow-y-auto")).to_have_count(1)
+            if width == 390:
+                opener = page.get_by_role("button", name="Open sidebar", exact=True)
+                await expect(opener).to_have_count(1)
+                await opener.click()
+                await page.keyboard.press("Escape")
+                await expect(opener).to_be_focused()
             if role == "admin":
                 await page.get_by_label("Specialist", exact=True).select_option("approver")
                 await page.get_by_label("Prompt", exact=True).fill("go")

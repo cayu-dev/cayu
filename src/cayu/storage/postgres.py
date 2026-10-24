@@ -29,6 +29,7 @@ from cayu.sessions._closure_records import (
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
 )
+from cayu.sessions._event_snapshot import EventSnapshotConsumer
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectHealth,
     PersistedEventSideEffectPage,
@@ -5786,6 +5787,22 @@ class PostgresSessionStore(
             cost_authority=self._cost_accounting_authority,
             fork_lineage_owner=fork_lineage_owner,
             without_reservation_for=without_reservation_for,
+        )
+
+    async def fold_event_snapshot(
+        self,
+        query: EventQuery,
+        consume: EventSnapshotConsumer,
+        *,
+        max_bytes: int,
+        max_pages: int | None = None,
+    ) -> int:
+        return await session_queries.fold_event_snapshot(
+            self._ready_connection,
+            query,
+            consume,
+            max_bytes=max_bytes,
+            max_pages=max_pages,
         )
 
     async def query_events_bounded(

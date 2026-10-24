@@ -64,7 +64,16 @@ import { useSessionMutation } from "../../app/session-mutation"
 import { useSessionProgress } from "../../app/session-progress"
 import { useSessionRelations } from "../../app/session-relations"
 import { toolSpanId } from "../../app/trace-model"
-import { ErrorState, EvalTrialTag, LabelChips, NavLink, StateBadge, TopBar, useGo } from "../common"
+import {
+  ErrorState,
+  EvalTrialTag,
+  LabelChips,
+  NavLink,
+  SessionSummary,
+  StateBadge,
+  TopBar,
+  useGo,
+} from "../common"
 import { AddToEvalsDialog } from "./add-to-evals"
 import { Composer } from "./composer"
 import { Conversation, SubagentRows } from "./conversation"
@@ -636,20 +645,6 @@ export function SessionPage({
                       Artifacts
                     </NavLink>
                   )}
-                  {detail.data && (
-                    <span
-                      title={`${detail.data.runtime_build_provenance.origin} · ${detail.data.runtime_build_provenance.strength}`}
-                      className={cn(
-                        "rounded border px-1.5 py-0.5",
-                        detail.data.runtime_build_provenance.availability !== "available" &&
-                          "text-warning border-warning/30",
-                      )}
-                    >
-                      {detail.data.runtime_name} {detail.data.runtime_version} · build{" "}
-                      {detail.data.runtime_build_provenance.fingerprint?.slice(0, 12) ??
-                        detail.data.runtime_build_provenance.availability}
-                    </span>
-                  )}
                   <StateBadge overview={o} />
                   {o?.eval_trial && <EvalTrialTag />}
                   {seconds != null && (
@@ -674,14 +669,9 @@ export function SessionPage({
                 </div>
 
                 {o?.summary && (
-                  <p
-                    className={cn(
-                      "mb-4 text-sm",
-                      o.summary_tone === "attention" ? "text-warning" : "text-muted-foreground",
-                    )}
-                  >
-                    {o.summary}
-                  </p>
+                  <div className="mb-4">
+                    <SessionSummary text={o.summary} tone={o.summary_tone} />
+                  </div>
                 )}
                 {firstUser.error && (
                   <p className="mb-4 text-xs text-muted-foreground">Message title unavailable</p>

@@ -242,6 +242,7 @@ from cayu.tasks.topology import (
     TASK_TOPOLOGY_MAX_NODES,
     TaskTopologyTruncatedField,
 )
+from cayu.tool_inventory import ToolApproval, ToolSource
 
 SERVER_API_PREFIX = "/api"
 SSE_CONTENT_TYPE = "text/event-stream"
@@ -2706,7 +2707,39 @@ HUMAN_ATTENTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
+class ApiToolUsage(ApiBaseModel):
+    name: str
+    calls: StrictInt = Field(ge=0)
+    failures: StrictInt = Field(ge=0)
+    approved: StrictInt = Field(ge=0)
+    rejected: StrictInt = Field(ge=0)
+    last_used_at: datetime | None
+
+
+class ToolUsageResponse(ApiBaseModel):
+    tools: list[ApiToolUsage]
+    through_sequence: StrictInt = Field(ge=0)
+
+
+class ApiRecentToolCall(ApiBaseModel):
+    name: str
+    session_id: str
+    session_instance_id: str
+    event_id: str
+    sequence: StrictInt = Field(ge=1)
+    timestamp: datetime
+    outcome: Literal["completed", "failed", "interrupted", "incomplete", "outcome_unknown"]
+
+
+class ToolCallsResponse(ApiBaseModel):
+    calls: list[ApiRecentToolCall]
+    through_sequence: StrictInt = Field(ge=0)
+    next_cursor: str | None
+
+
 class ApiToolSummary(ApiBaseModel):
+    source: ToolSource
+    approval: ToolApproval
     name: str
     description: str
     input_schema: dict[str, Any]

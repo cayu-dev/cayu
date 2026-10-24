@@ -39,7 +39,7 @@ export function HomePage() {
     if (search.start === "1") setStarting(true)
   }, [search.start])
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
         actions={<StartSessionButton open={starting} onToggle={() => setStarting(!starting)} />}
       >
@@ -50,7 +50,11 @@ export function HomePage() {
         {prototype ? (
           <HomeOverview />
         ) : (
-          <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/"]} title="Home overview">
+          <CapabilityRoute
+            inline
+            requirement={DASHBOARD_ROUTE_REQUIREMENTS["/"]}
+            title="Home overview"
+          >
             <HomeOverview />
           </CapabilityRoute>
         )}

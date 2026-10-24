@@ -1853,6 +1853,59 @@
       "title": "ApiProviderOperationInspection",
       "type": "object"
     },
+    "ApiRecentToolCall": {
+      "additionalProperties": false,
+      "properties": {
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "completed",
+            "failed",
+            "interrupted",
+            "incomplete",
+            "outcome_unknown"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 1.0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "session_instance_id": {
+          "title": "Session Instance Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "session_id",
+        "session_instance_id",
+        "event_id",
+        "sequence",
+        "timestamp",
+        "outcome"
+      ],
+      "title": "ApiRecentToolCall",
+      "type": "object"
+    },
     "ApiReviewedKnowledgeEntry": {
       "additionalProperties": false,
       "properties": {
@@ -4334,6 +4387,17 @@
     "ApiToolSummary": {
       "additionalProperties": false,
       "properties": {
+        "approval": {
+          "enum": [
+            "never",
+            "always",
+            "sometimes",
+            "blocked",
+            "unknown"
+          ],
+          "title": "Approval",
+          "type": "string"
+        },
         "description": {
           "title": "Description",
           "type": "string"
@@ -4355,12 +4419,17 @@
           "title": "Parallel Safe",
           "type": "boolean"
         },
+        "source": {
+          "$ref": "#/components/schemas/ToolSource"
+        },
         "workspace_mutation": {
           "title": "Workspace Mutation",
           "type": "boolean"
         }
       },
       "required": [
+        "source",
+        "approval",
         "name",
         "description",
         "input_schema",
@@ -4369,6 +4438,57 @@
         "workspace_mutation"
       ],
       "title": "ApiToolSummary",
+      "type": "object"
+    },
+    "ApiToolUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "approved": {
+          "minimum": 0.0,
+          "title": "Approved",
+          "type": "integer"
+        },
+        "calls": {
+          "minimum": 0.0,
+          "title": "Calls",
+          "type": "integer"
+        },
+        "failures": {
+          "minimum": 0.0,
+          "title": "Failures",
+          "type": "integer"
+        },
+        "last_used_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Used At"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "rejected": {
+          "minimum": 0.0,
+          "title": "Rejected",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "calls",
+        "failures",
+        "approved",
+        "rejected",
+        "last_used_at"
+      ],
+      "title": "ApiToolUsage",
       "type": "object"
     },
     "ApiTraceSpan": {
@@ -6075,6 +6195,26 @@
         },
         "tasks": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "tool_inventory": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_usage": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "usage": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -11870,7 +12010,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "60",
+          "default": "61",
           "title": "Contract Version",
           "type": "string"
         },
@@ -16019,6 +16159,41 @@
       "title": "ToolCallPart",
       "type": "object"
     },
+    "ToolCallsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "calls": {
+          "items": {
+            "$ref": "#/components/schemas/ApiRecentToolCall"
+          },
+          "title": "Calls",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "through_sequence": {
+          "minimum": 0.0,
+          "title": "Through Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "calls",
+        "through_sequence",
+        "next_cursor"
+      ],
+      "title": "ToolCallsResponse",
+      "type": "object"
+    },
     "ToolCompletionPolicy": {
       "additionalProperties": false,
       "description": "Complete a single-call round from a designated successful tool.\n\nThe host renders the tool result. Eligible application tools declare\n``NONE`` or ``IDEMPOTENT`` effects. Rounds with sibling calls continue\nthrough the ordinary model loop. Supply this policy on each new run or\nresumed turn; approval and crash recovery retain the admitted policy.",
@@ -16464,6 +16639,95 @@
         "message"
       ],
       "title": "ToolRoundRecoveryBody",
+      "type": "object"
+    },
+    "ToolSource": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "agent",
+            "package",
+            "mcp",
+            "cayu",
+            "provider",
+            "unknown"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "package": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Package"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        },
+        "server": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Server"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Version"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ToolSource",
+      "type": "object"
+    },
+    "ToolUsageResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "through_sequence": {
+          "minimum": 0.0,
+          "title": "Through Sequence",
+          "type": "integer"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/components/schemas/ApiToolUsage"
+          },
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "tools",
+        "through_sequence"
+      ],
+      "title": "ToolUsageResponse",
       "type": "object"
     },
     "TranscriptSummary": {
@@ -18036,7 +18300,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "60",
+          "default": "61",
           "title": "Contract Version",
           "type": "string"
         }
@@ -24175,6 +24439,138 @@
             }
           },
           "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/calls": {
+      "get": {
+        "operation_id": "tool_calls_api_tools_calls_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 8192,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolCallsResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/usage": {
+      "get": {
+        "operation_id": "tool_usage_api_tools_usage_get",
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ToolUsageResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "501": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"

@@ -36,6 +36,11 @@ from cayu.sessions._child_lifecycle_rules import (
     _child_session_lifecycle_entry_sort_key,
     _child_session_lifecycle_occurrence,
 )
+from cayu.sessions._event_snapshot import (
+    EventSnapshotConsumer,
+    EventSnapshotFold,
+    fold_snapshot_async,
+)
 from cayu.sessions._runtime_publication import _tool_round_lifecycle_event_limit
 from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
@@ -632,61 +637,89 @@ async def read_cost_accounting(
 async def query_events_bounded(
     connect: PostgresConnection, query: EventQuery, *, max_bytes: int
 ) -> list[EventRecord]:
-    query = copy_event_query(query)
-    if type(max_bytes) is not int or max_bytes < 1:
-        raise ValueError("max_bytes must be a positive integer.")
-    if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
-        raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
+    fold = EventSnapshotFold(query, max_bytes=max_bytes, max_pages=1)
     async with connect() as conn, conn.cursor() as cur:
         await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        needs_snapshot_cutoff = _event_query_needs_snapshot_cutoff(query)
-        safe_insert_xid = None
-        extra_clauses: tuple[session_store_sql.SqlClause, ...] = ()
-        if needs_snapshot_cutoff:
-            await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
-            snapshot_row = await cur.fetchone()
-            if snapshot_row is None:
-                raise RuntimeError("Failed to read Postgres event visibility snapshot.")
-            safe_insert_xid = snapshot_row[0]
-            extra_clauses = (
-                session_store_sql.SqlClause(
-                    "cayu_events.insert_xid < %s",
-                    (safe_insert_xid,),
-                ),
+        return await _query_events_bounded_snapshot(
+            cur, fold.query, max_bytes=max_bytes, exact_snapshot=False
+        )
+
+
+@runtime_session_query
+async def fold_event_snapshot(
+    connect: PostgresConnection,
+    query: EventQuery,
+    consume: EventSnapshotConsumer,
+    *,
+    max_bytes: int,
+    max_pages: int | None = None,
+) -> int:
+    fold = EventSnapshotFold(query, max_bytes=max_bytes, max_pages=max_pages)
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+        async def read(page: EventQuery) -> list[EventRecord]:
+            return await _query_events_bounded_snapshot(
+                cur, page, max_bytes=max_bytes, exact_snapshot=True
             )
-        plan = session_store_sql.build_event_query_sql(
-            query,
-            dialect=SQL_DIALECT,
-            extra_after_sequence_clauses=extra_clauses,
-        )
-        await cur.execute(
-            cast(
-                "LiteralString",
-                f"""
-                WITH bounded_candidates AS (
-                    SELECT octet_length(cayu_events.event::text) + 256
-                               AS serialized_bytes
-                    FROM cayu_events
-                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                    {plan.where_sql}
-                    ORDER BY cayu_events.sequence {plan.order_direction}
-                    LIMIT %s
-                )
-                SELECT COALESCE(SUM(serialized_bytes), 0)
-                FROM bounded_candidates
-                """,
+
+        return await fold_snapshot_async(fold, read, consume)
+
+
+async def _query_events_bounded_snapshot(
+    cur: Any, query: EventQuery, *, max_bytes: int, exact_snapshot: bool
+) -> list[EventRecord]:
+    if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+        raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
+    needs_snapshot_cutoff = not exact_snapshot and _event_query_needs_snapshot_cutoff(query)
+    safe_insert_xid = None
+    extra_clauses: tuple[session_store_sql.SqlClause, ...] = ()
+    if needs_snapshot_cutoff:
+        await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
+        snapshot_row = await cur.fetchone()
+        if snapshot_row is None:
+            raise RuntimeError("Failed to read Postgres event visibility snapshot.")
+        safe_insert_xid = snapshot_row[0]
+        extra_clauses = (
+            session_store_sql.SqlClause(
+                "cayu_events.insert_xid < %s",
+                (safe_insert_xid,),
             ),
-            (*plan.params, query.limit),
         )
-        size_row = await cur.fetchone()
-        if size_row is None or int(size_row[0]) > max_bytes:
-            raise EventQueryResultTooLarge(max_bytes)
-        return await _query_events(
-            cur,
-            query,
-            safe_insert_xid=safe_insert_xid,
-            force_snapshot_cutoff=needs_snapshot_cutoff,
-        )
+    plan = session_store_sql.build_event_query_sql(
+        query,
+        dialect=SQL_DIALECT,
+        extra_after_sequence_clauses=extra_clauses,
+    )
+    await cur.execute(
+        cast(
+            "LiteralString",
+            f"""
+            WITH bounded_candidates AS (
+                SELECT octet_length(cayu_events.event::text) + 256
+                           AS serialized_bytes
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {plan.where_sql}
+                ORDER BY cayu_events.sequence {plan.order_direction}
+                LIMIT %s
+            )
+            SELECT COALESCE(SUM(serialized_bytes), 0)
+            FROM bounded_candidates
+            """,
+        ),
+        (*plan.params, query.limit),
+    )
+    size_row = await cur.fetchone()
+    if size_row is None or int(size_row[0]) > max_bytes:
+        raise EventQueryResultTooLarge(max_bytes)
+    return await _query_events(
+        cur,
+        query,
+        safe_insert_xid=safe_insert_xid,
+        force_snapshot_cutoff=needs_snapshot_cutoff,
+        exact_snapshot=exact_snapshot,
+    )
 
 
 async def query_latest_interaction_events(
@@ -1386,9 +1419,16 @@ async def list_sessions(
 
 
 async def _query_events(
-    cur: Any, query: EventQuery, *, safe_insert_xid: Any, force_snapshot_cutoff: bool = False
+    cur: Any,
+    query: EventQuery,
+    *,
+    safe_insert_xid: Any,
+    force_snapshot_cutoff: bool = False,
+    exact_snapshot: bool = False,
 ) -> list[EventRecord]:
-    needs_snapshot_cutoff = force_snapshot_cutoff or _event_query_needs_snapshot_cutoff(query)
+    needs_snapshot_cutoff = not exact_snapshot and (
+        force_snapshot_cutoff or _event_query_needs_snapshot_cutoff(query)
+    )
     if needs_snapshot_cutoff and safe_insert_xid is None:
         await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
         row = await cur.fetchone()

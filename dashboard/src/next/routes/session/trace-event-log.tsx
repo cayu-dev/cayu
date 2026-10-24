@@ -101,7 +101,7 @@ function TraceEventLogPage({
             onSearch(draft)
           }}
         >
-          {fields.map(([key, label]) => (
+          {fields.slice(0, 2).map(([key, label]) => (
             <label key={key} className="text-xs">
               {label}
               <input
@@ -125,6 +125,33 @@ function TraceEventLogPage({
           >
             Clear filters
           </button>
+          <details
+            className="w-full text-xs"
+            open={
+              !!(
+                search.tool_name ||
+                search.agent_name ||
+                search.environment_name ||
+                search.workflow_name
+              )
+            }
+          >
+            <summary className="cursor-pointer text-muted-foreground">Advanced filters</summary>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {fields.slice(2).map(([key, label]) => (
+                <label key={key} className="text-xs">
+                  {label}
+                  <input
+                    className="mt-1 block w-36 rounded border bg-background px-2 py-1"
+                    value={draft[key] ?? ""}
+                    onChange={(event) =>
+                      setDraft({ ...draft, [key]: event.target.value || undefined })
+                    }
+                  />
+                </label>
+              ))}
+            </div>
+          </details>
         </form>
         <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
           <label>

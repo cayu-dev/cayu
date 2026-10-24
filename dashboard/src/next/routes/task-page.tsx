@@ -156,7 +156,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
 
   if (detail.error) {
     return (
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <TopBar>Task</TopBar>
         <div className="p-6">
           <ErrorState error={detail.error} />
@@ -166,7 +166,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
   }
   if (!task)
     return (
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <TopBar>Task</TopBar>
         <p role="status" className="p-6">
           Loading task…
@@ -196,7 +196,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
   const holdLabel = HOLDS.find((h) => h.hold === holding)
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
         actions={
           <>

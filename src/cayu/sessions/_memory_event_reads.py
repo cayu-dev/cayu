@@ -26,6 +26,7 @@ from cayu.sessions import interactions as interaction_contracts
 from cayu.sessions import terminal_evidence as terminal_session_evidence
 from cayu.sessions._access_rules import runtime_session_query
 from cayu.sessions._checkpoint_publication import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
+from cayu.sessions._event_snapshot import EventSnapshotConsumer, EventSnapshotFold, fold_snapshot
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -435,6 +436,22 @@ def reserved_attempts(records, budget_limit_id: str) -> frozenset[str]:
         and record.event.payload.get("accepted") is True
         and type(attempt := record.event.payload.get("model_attempt_id")) is str
     )
+
+
+@runtime_session_query
+async def fold_event_snapshot(
+    read: LockedEventRead,
+    query: EventQuery,
+    consume: EventSnapshotConsumer,
+    *,
+    max_bytes: int,
+    max_pages: int | None = None,
+) -> int:
+    fold = EventSnapshotFold(query, max_bytes=max_bytes, max_pages=max_pages)
+    async with read() as state:
+        return fold_snapshot(
+            fold, lambda page: _query_events_unlocked(state, page, max_bytes=max_bytes), consume
+        )
 
 
 @runtime_session_query

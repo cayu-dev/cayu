@@ -20192,3 +20192,58 @@ completed model's durable transcript call set and each call's terminal evidence,
 not the subset of calls visible on the current event page. Missing linkage remains
 unlinked rather than being matched by event order. User-input and approval waits
 retain their request identity when answered or decided.
+
+## Local tool inventory and usage
+
+Server contract 61 exposes `source` and `approval` on every `/api/agents`
+tool declaration, including provider-hosted tools. Classification shares Cloud's
+manifest provenance and static policy coverage: sources are `agent`, `cayu`,
+`package`, `mcp`, `provider`, or `unknown`; approval is `never`, `always`,
+`sometimes`, `blocked`, or `unknown`. Custom policies remain unknown unless the
+existing manifest classifier understands them. Discovery never executes a policy
+or tool. Local declarations retain each specialist's schema and metadata without
+Cloud's transport cardinality limits.
+
+`GET /api/tools/usage` returns one row per public tool name: `calls`, `failures`,
+`approved`, `rejected`, and `last_used_at`, plus the read's `through_sequence`.
+Counts cover retained events for currently registered tools across all sessions,
+including evals and forks. They use the same event contribution rules as Cloud:
+completed and failed native calls count as calls; approval decisions are separate.
+Terminal provider web searches count as calls; `failed` contributes a failure,
+while `incomplete` and `outcome_unknown` retain their distinct outcomes without
+claiming a proven failure. In-progress events do not count as completed calls.
+Historical deletion removes retained evidence; these are current-read totals,
+not lifetime counters. Each read traverses bounded batches from one stable native
+event snapshot without a history-count cap. Its `through_sequence` is that
+snapshot’s maximum retained sequence, not a committed-prefix watermark: on
+PostgreSQL, a later commit can become visible below that maximum.
+
+`GET /api/tools/calls?name=...&limit=20` returns bounded recent terminal calls in
+descending durable sequence order. `name` is optional and compares only against
+the public projected name. Names collapsed by redaction share a usage group;
+that group does not identify one private declaration. Raw secret names are never
+used as an event-query filter. Each call contains its public session ID, session
+incarnation, public event ID, sequence, timestamp and outcome. It contains no
+arguments, results or private provider correlation IDs. Consumers must retain the
+incarnation when opening the exact Trace event.
+
+Follow `next_cursor`, including after an empty filtered page. A page scans at most
+100 matching event-family records and returns at most `limit` calls (1–100).
+Continuations bind the store identity, fixed upper sequence and public name
+filter; records with higher sequences do not enter that continuation. A later
+commit below the bound may become visible on a subsequent page. A mismatched store/filter or
+replaced session during exact-link lookup returns 409; malformed cursors return
+422. Restart the listing after a conflict. Current registrations and retained
+records still govern each read; the cursor is not a retained database snapshot.
+An individual event exceeding the bounded read budget returns 413 rather than a
+partial total. Unsupported store read capabilities return 501.
+
+Members may read both endpoints. The `tool_inventory` and `tool_usage` capability
+surfaces are read-only; usage availability requires an exact native event snapshot fold, bounded
+event reads and a stable store identity. `SessionStore.fold_event_snapshot` is
+an optional trusted-operator capability: a synchronous consumer receives bounded
+pages inside one owned read snapshot and must only accumulate request-local
+state. SQLite can invoke it on a worker thread. Publish accumulated state only
+after successful return; failure or cancellation invalidates it. Native stores
+finish owned read cleanup before propagating cancellation. Cloud registration limits, payload fitting and reporting
+windows are unchanged.

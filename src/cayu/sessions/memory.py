@@ -110,6 +110,7 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationMutation,
     SessionRuntimePublicationConflict,
 )
+from cayu.sessions._event_snapshot import EventSnapshotConsumer
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
 from cayu.sessions._execution_profile_rules import SessionModelTransition
 from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
@@ -6670,6 +6671,22 @@ class InMemorySessionStore(
             previous=previous,
             fork_lineage_owner=fork_lineage_owner,
             without_reservation_for=without_reservation_for,
+        )
+
+    async def fold_event_snapshot(
+        self,
+        query: EventQuery,
+        consume: EventSnapshotConsumer,
+        *,
+        max_bytes: int,
+        max_pages: int | None = None,
+    ) -> int:
+        return await memory_event_reads.fold_event_snapshot(
+            self._read_event_state,
+            query,
+            consume,
+            max_bytes=max_bytes,
+            max_pages=max_pages,
         )
 
     async def query_events_bounded(

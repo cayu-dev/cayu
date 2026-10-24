@@ -54,7 +54,7 @@ export function InboxPage() {
     all.data?.complete === true ? (kind ? all.data.counts?.[kind] : all.data.total_count) : null
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar>Inbox</TopBar>
       <PageBody width="max-w-3xl">
         <p className="text-sm text-muted-foreground">
@@ -83,41 +83,46 @@ export function InboxPage() {
               className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
             />
           </label>
-          <label className="text-xs">
-            Session
-            <input
-              name="session_id"
-              defaultValue={search.session_id}
-              className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
-            />
-          </label>
-          <label className="text-xs">
-            Specialist
-            <input
-              name="agent_name"
-              defaultValue={search.agent_name}
-              className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
-            />
-          </label>
           <button type="submit" className="rounded border border-border px-3 text-sm">
             Filter
           </button>
+          <details className="w-full text-sm" open={!!search.session_id || !!search.agent_name}>
+            <summary className="cursor-pointer text-muted-foreground">Advanced filters</summary>
+            <div className="mt-3 flex flex-wrap items-end gap-3">
+              <label className="text-xs">
+                Session
+                <input
+                  name="session_id"
+                  defaultValue={search.session_id}
+                  className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
+                />
+              </label>
+              <label className="text-xs">
+                Specialist
+                <input
+                  name="agent_name"
+                  defaultValue={search.agent_name}
+                  className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
+                />
+              </label>
+              <label className="mt-3 block text-xs">
+                Inbox page size
+                <select
+                  aria-label="Inbox page size"
+                  value={pageSize}
+                  onChange={(event) => setPageSize(Number(event.target.value))}
+                  className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
+                >
+                  {[25, 50, 100].map((size) => (
+                    <option key={size} value={size}>
+                      {size}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </details>
         </form>
-        <label className="mt-3 block text-xs">
-          Inbox page size
-          <select
-            aria-label="Inbox page size"
-            value={pageSize}
-            onChange={(event) => setPageSize(Number(event.target.value))}
-            className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
-          >
-            {[25, 50, 100].map((size) => (
-              <option key={size} value={size}>
-                {size}
-              </option>
-            ))}
-          </select>
-        </label>
         <fieldset className="mt-4 flex min-w-0 flex-wrap gap-1.5">
           <legend className="sr-only">Filter by kind</legend>
           {KINDS.map(([kind, label]) => (

@@ -296,10 +296,10 @@ def test_an_oversized_registration_is_fit_under_cloud_body_limit():
 def test_external_package_and_mcp_server_provenance(monkeypatch):
     monkeypatch.setattr(_Tool, "__module__", "invoice_tools.lookup")
     monkeypatch.setattr(
-        "cayu.cloud_inventory.metadata.packages_distributions",
+        "cayu.tool_inventory.metadata.packages_distributions",
         lambda: {"invoice_tools": ["invoice-tools"]},
     )
-    monkeypatch.setattr("cayu.cloud_inventory.metadata.version", lambda name: "1.2.3")
+    monkeypatch.setattr("cayu.tool_inventory.metadata.version", lambda name: "1.2.3")
 
     async def scenario():
         definitions = _fake_tool_definitions("echo")

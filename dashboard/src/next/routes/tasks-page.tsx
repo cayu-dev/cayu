@@ -114,7 +114,7 @@ export function TasksPage() {
     "h-8 rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
         actions={
           canCreate ? (

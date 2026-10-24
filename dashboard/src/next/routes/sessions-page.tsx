@@ -73,7 +73,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
   const paused = sessions.data?.searchPaused
   const hasFilters = sessionIndexFilterCount(search) > 0
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
         actions={
           canStart ? (
@@ -113,38 +113,6 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
             <option value="completed">Completed</option>
             <option value="failed">Failed</option>
             <option value="interrupted">Stopped</option>
-          </select>
-          <select
-            aria-label="Raw status"
-            className={selectClassName}
-            value={search.status ?? ""}
-            onChange={(event) =>
-              set({ status: (event.target.value || undefined) as SessionIndexSearch["status"] })
-            }
-          >
-            <option value="">Any raw status</option>
-            {SESSION_INDEX_STATUSES.map((status) => (
-              <option key={status} value={status}>
-                {status}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="Debug state"
-            className={selectClassName}
-            value={search.debug_state ?? ""}
-            onChange={(event) =>
-              set({
-                debug_state: (event.target.value || undefined) as SessionIndexSearch["debug_state"],
-              })
-            }
-          >
-            <option value="">Any debug state</option>
-            {SESSION_INDEX_DEBUG_STATES.map((state) => (
-              <option key={state} value={state}>
-                {DEBUG_LABELS[state]}
-              </option>
-            ))}
           </select>
           <select
             aria-label="Sort sessions"
@@ -192,6 +160,45 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
             key={sessionIndexAdvancedFilterKey(search)}
             search={search}
             onApply={set}
+            secondary={
+              <>
+                <select
+                  aria-label="Raw status"
+                  className={selectClassName}
+                  value={search.status ?? ""}
+                  onChange={(event) =>
+                    set({
+                      status: (event.target.value || undefined) as SessionIndexSearch["status"],
+                    })
+                  }
+                >
+                  <option value="">Any raw status</option>
+                  {SESSION_INDEX_STATUSES.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  aria-label="Debug state"
+                  className={selectClassName}
+                  value={search.debug_state ?? ""}
+                  onChange={(event) =>
+                    set({
+                      debug_state: (event.target.value ||
+                        undefined) as SessionIndexSearch["debug_state"],
+                    })
+                  }
+                >
+                  <option value="">Any debug state</option>
+                  {SESSION_INDEX_DEBUG_STATES.map((state) => (
+                    <option key={state} value={state}>
+                      {DEBUG_LABELS[state]}
+                    </option>
+                  ))}
+                </select>
+              </>
+            }
           />
         </div>
         {Object.keys(constant).length > 0 && (
@@ -314,8 +321,21 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                           {COLUMNS[column]?.(row) ?? "–"}
                         </td>
                       ))}
-                      <td className="max-w-sm px-3 py-2 [&>span]:h-auto [&>span]:max-w-80 [&>span]:whitespace-normal [&>span]:break-words [&>span]:py-1">
+                      <td className="max-w-sm px-3 py-2">
                         <StateBadge overview={overviewForDisplay(o)} />
+                        {o.summary && (
+                          <p
+                            className={cn(
+                              "mt-1 max-w-64 truncate text-xs",
+                              o.summary_tone === "attention"
+                                ? "text-warning"
+                                : "text-muted-foreground",
+                            )}
+                            title={o.summary}
+                          >
+                            {o.summary}
+                          </p>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums">
                         {formatDuration(duration)}

@@ -29,6 +29,7 @@ from cayu.sessions._closure_records import (
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
 )
+from cayu.sessions._event_snapshot import EventSnapshotConsumer
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectHealth,
     PersistedEventSideEffectPage,
@@ -119,7 +120,11 @@ from cayu.runtime._child_session_notifications import (
     ChildSessionLifecyclePage,
     ChildSessionLifecycleQuery,
 )
-from cayu.runtime.evidence_spool import EvidenceSpool, _settled_evidence_reads_required
+from cayu.runtime.evidence_spool import (
+    EvidenceSpool,
+    _settled_evidence_reads,
+    _settled_evidence_reads_required,
+)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.sessions._checkpoint_mutations import (
@@ -6263,6 +6268,23 @@ class SQLiteSessionStore(
                 "This database has no store identity; run `cayu storage migrate`."
             )
         return identity
+
+    async def fold_event_snapshot(
+        self,
+        query: EventQuery,
+        consume: EventSnapshotConsumer,
+        *,
+        max_bytes: int,
+        max_pages: int | None = None,
+    ) -> int:
+        with _settled_evidence_reads():
+            return await session_queries.fold_event_snapshot(
+                self._run_read,
+                query,
+                consume,
+                max_bytes=max_bytes,
+                max_pages=max_pages,
+            )
 
     async def query_events_bounded(
         self,

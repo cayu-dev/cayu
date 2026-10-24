@@ -1,3 +1,4 @@
+import "./route-layout"
 import {
   createRootRoute,
   createRoute,
@@ -6,6 +7,7 @@ import {
   type RouterHistory,
   redirect,
 } from "@tanstack/react-router"
+import { useContext } from "react"
 import { CapabilityRoute } from "../components/dashboard/server-contract"
 import { FullAccessRoute } from "../components/dashboard/viewer"
 import { dashboardConfig } from "../lib/config"
@@ -16,6 +18,7 @@ import { validateSessionDetailSearch, workflowSearchPatch } from "../lib/session
 import { validateSessionIndexSearch } from "../lib/session-index-search"
 import { validateUsageRollupSearch } from "../lib/usage-rollup-search"
 import { validateWorkflowSearch } from "../lib/workflow-search"
+import { PageBody, ShellContext, TopBar } from "../next/routes/common"
 import { Layout } from "./layout"
 
 const AgentsPage = lazyRouteComponent(() => import("../routes/agents"), "AgentsPage")
@@ -45,12 +48,21 @@ const UsagePage = lazyRouteComponent(() => import("../routes/usage"), "UsagePage
 const SystemPage = lazyRouteComponent(() => import("../routes/system"), "SystemPage")
 
 function RoutePending() {
-  return (
+  const pageLayout = useContext(ShellContext)?.pageLayout
+  const placeholder = (
     <div className="space-y-4" role="status" aria-live="polite">
       <div className="h-8 w-48 animate-pulse rounded bg-muted" />
       <div className="h-32 animate-pulse rounded-lg border border-border bg-muted/40" />
       <span className="sr-only">Loading page</span>
     </div>
+  )
+  return pageLayout ? (
+    <>
+      <TopBar>Loading page</TopBar>
+      <PageBody>{placeholder}</PageBody>
+    </>
+  ) : (
+    placeholder
   )
 }
 
@@ -58,6 +70,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   const rootRoute = createRootRoute({ component: Layout })
 
   const dashboardRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/",
     validateSearch: (search: Record<string, unknown>): { start?: string } => ({
@@ -67,6 +80,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const sessionsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/sessions",
     validateSearch: validateSessionIndexSearch,
@@ -98,6 +112,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const tasksRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/tasks",
     validateSearch: (search: Record<string, unknown>) =>
@@ -114,6 +129,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const taskRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/tasks/$taskId",
     component: () => (
@@ -124,6 +140,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const pendingActionsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/inbox",
     validateSearch: (
@@ -164,6 +181,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const sessionDetailRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/sessions/$sessionId",
     validateSearch: validateSessionDetailSearch,
