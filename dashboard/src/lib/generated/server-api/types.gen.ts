@@ -1761,6 +1761,10 @@ export type ApiTaskDetail = {
         [key: string]: unknown;
     } | null;
     /**
+     * Graph Id
+     */
+    graph_id: string | null;
+    /**
      * Id
      */
     id: string;
@@ -1785,6 +1789,10 @@ export type ApiTaskDetail = {
      * Parent Task Id
      */
     parent_task_id: string | null;
+    /**
+     * Prerequisite Task Ids
+     */
+    prerequisite_task_ids: Array<string>;
     /**
      * Result
      */
@@ -1831,6 +1839,29 @@ export type ApiTaskDetail = {
      * Worker Id
      */
     worker_id: string | null;
+};
+
+/**
+ * ApiTaskIndex
+ */
+export type ApiTaskIndex = {
+    /**
+     * As Of
+     */
+    as_of: string;
+    counts_by_status: TaskStatusCounts;
+    /**
+     * Items
+     */
+    items: Array<ApiTaskListItem>;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
+     * Total Count
+     */
+    total_count: string;
 };
 
 /**
@@ -1882,6 +1913,10 @@ export type ApiTaskListItem = {
      */
     description: string | null;
     /**
+     * Graph Id
+     */
+    graph_id: string | null;
+    /**
      * Id
      */
     id: string;
@@ -1893,6 +1928,10 @@ export type ApiTaskListItem = {
      * Parent Task Id
      */
     parent_task_id: string | null;
+    /**
+     * Prerequisite Task Ids
+     */
+    prerequisite_task_ids: Array<string>;
     retry_series: ApiTaskRetrySeries | null;
     schedule: ApiTaskScheduleState | null;
     /**
@@ -4222,6 +4261,7 @@ export type ControlPlaneSurfaceCapabilities = {
     structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     task_creation?: OptionalSurfaceCapability | null;
+    task_index?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
@@ -25985,6 +26025,18 @@ export type ListTasksApiTasksGetData = {
     path?: never;
     query?: {
         /**
+         * Include
+         */
+        include?: 'counts' | null;
+        /**
+         * Include Internal
+         */
+        include_internal?: boolean;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
          * Q
          */
         q?: string | null;
@@ -25992,6 +26044,10 @@ export type ListTasksApiTasksGetData = {
          * Status
          */
         status?: TaskStatus | null;
+        /**
+         * Statuses
+         */
+        statuses?: Array<TaskStatus> | null;
         /**
          * Type
          */
@@ -26036,7 +26092,7 @@ export type ListTasksApiTasksGetResponses = {
      *
      * Successful Response
      */
-    200: Array<ApiTaskListItem>;
+    200: Array<ApiTaskListItem> | ApiTaskIndex;
 };
 
 export type ListTasksApiTasksGetResponse = ListTasksApiTasksGetResponses[keyof ListTasksApiTasksGetResponses];
@@ -26178,6 +26234,75 @@ export type BlockTaskApiTasksTaskIdBlockPostResponses = {
 };
 
 export type BlockTaskApiTasksTaskIdBlockPostResponse = BlockTaskApiTasksTaskIdBlockPostResponses[keyof BlockTaskApiTasksTaskIdBlockPostResponses];
+
+export type CancelTaskApiTasksTaskIdCancelPostData = {
+    body?: never;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: never;
+    url: '/api/tasks/{task_id}/cancel';
+};
+
+export type CancelTaskApiTasksTaskIdCancelPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CancelTaskApiTasksTaskIdCancelPostError = CancelTaskApiTasksTaskIdCancelPostErrors[keyof CancelTaskApiTasksTaskIdCancelPostErrors];
+
+export type CancelTaskApiTasksTaskIdCancelPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskDetail;
+};
+
+export type CancelTaskApiTasksTaskIdCancelPostResponse = CancelTaskApiTasksTaskIdCancelPostResponses[keyof CancelTaskApiTasksTaskIdCancelPostResponses];
+
+export type DependentsApiTasksTaskIdDependentsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: {
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/tasks/{task_id}/dependents';
+};
+
+export type DependentsApiTasksTaskIdDependentsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DependentsApiTasksTaskIdDependentsGetError = DependentsApiTasksTaskIdDependentsGetErrors[keyof DependentsApiTasksTaskIdDependentsGetErrors];
+
+export type DependentsApiTasksTaskIdDependentsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskIndex;
+};
+
+export type DependentsApiTasksTaskIdDependentsGetResponse = DependentsApiTasksTaskIdDependentsGetResponses[keyof DependentsApiTasksTaskIdDependentsGetResponses];
 
 export type MarkTaskNeedsAttentionApiTasksTaskIdNeedsAttentionPostData = {
     /**

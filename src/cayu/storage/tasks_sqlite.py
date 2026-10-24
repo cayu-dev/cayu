@@ -284,6 +284,7 @@ from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
 )
+from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -4576,6 +4577,13 @@ class SQLiteTaskStore(TaskStore):
             except Exception:
                 self._connection.rollback()
                 raise
+
+    async def query_task_index(
+        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+    ) -> TaskIndexResult:
+        from cayu.storage._sqlite_task_index import query_index
+
+        return await query_index(self, query, matches=matches)
 
     async def aggregate_operational_snapshot(
         self,

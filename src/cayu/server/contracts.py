@@ -229,7 +229,7 @@ from cayu.sessions.topology import (
     SESSION_TOPOLOGY_MAX_NODES,
 )
 from cayu.sessions.usage import MAX_USAGE_ROLLUP_WINDOW
-from cayu.tasks.queries import TaskAggregateFilter, TaskOperationalSnapshot
+from cayu.tasks.queries import TaskAggregateFilter, TaskOperationalSnapshot, TaskStatusCounts
 from cayu.tasks.scheduling import TaskScheduleEventType
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
@@ -3066,6 +3066,8 @@ class ApiTaskScheduleEvent(ApiBaseModel):
 
 
 class ApiTaskListItem(ApiBaseModel):
+    graph_id: str | None
+    prerequisite_task_ids: list[str]
     concurrency_key: str | None = None
     id: str
     type: str
@@ -3085,6 +3087,14 @@ class ApiTaskListItem(ApiBaseModel):
     completed_at: str | None
     retry_series: ApiTaskRetrySeries | None
     schedule: ApiTaskScheduleState | None
+
+
+class ApiTaskIndex(ApiBaseModel):
+    items: list[ApiTaskListItem]
+    total_count: AggregateCount
+    counts_by_status: TaskStatusCounts
+    next_cursor: str | None
+    as_of: datetime
 
 
 class ApiTaskInvocation(ApiBaseModel):

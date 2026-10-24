@@ -214,6 +214,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["capabilities"]["configured_store_roles"] == ["session"]
     assert body["capabilities"]["actor"] is None
     assert body["capabilities"]["surfaces"] == {
+        "task_index": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "task_creation": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},

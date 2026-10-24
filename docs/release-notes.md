@@ -12,7 +12,9 @@ creation receipts and deletion-surviving identity fences are now persisted. Boun
 claims now persist their expected attachment and selected-operation digest in the
 existing claim registry. The compatibility floor is 127; stop older workers before
 migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
-store identity. Server contract 59 adds exact, paged session trace reads and read-only
+store identity. Server contract 60 adds exact task index counts, filter-bound paging, graph
+relations and general cancellation, with member-readable schedule history.
+Contract 59 added exact, paged session trace reads and read-only
 `session_trace` capability. Contract 58 added declared task catalog/create/replay, including exact
 session-origin replay selection. Contract 57 added session follow-ups alongside exact daily
 accounting in overview counts, public-projection Inbox search, durable decision

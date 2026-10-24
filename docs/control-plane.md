@@ -472,6 +472,65 @@ use Draft 2020-12 with local references only. Registration copies declarations;
 mutating the caller's schema does not change the catalog. Known secret-bearing
 declarations are rejected, rather than redacted into a different input contract.
 
+### Task pages, relations, and cancellation
+
+Task list and detail records include `graph_id` and `prerequisite_task_ids`.
+`GET /api/tasks?include=counts` returns `{items, total_count, counts_by_status,
+next_cursor, as_of}`. The `task_index.read` capability reports native snapshot
+support. Counts cover all eligible records in one store read snapshot, without
+a page cap; only `items` is bounded by `limit` (maximum 1,000). `total_count`
+includes the selected `status` and repeated `statuses` filters, while the twelve
+`counts_by_status` entries ignore status selection so all chips remain useful.
+Counts use the existing exact aggregate decimal-string representation.
+Both honor type, specialist (`assigned_agent_name`), session, parent, public text
+search and `include_internal`. Pass `include_internal=false` to exclude `cayu.*`
+types before counting and paging. Search matches public redacted text, never
+private input, result, metadata or a secret removed from the displayed fields.
+
+Follow `next_cursor` with the same filters; do not send `offset` with
+`include=counts`. These are keyset pages, not offsets disguised as cursors.
+Each response has fresh counts and an observation time; pages do not retain a
+historical multi-request snapshot, so updated sort fields may move a task.
+Cursors are sealed, bound to the authenticated subject/tenant and filters, and
+expire after 15 minutes. The deployment's existing `inbox_cursor_key` also seals
+task cursors with a distinct purpose. Share that key across server workers; a
+server-generated key lasts only for that server instance. Invalid, expired or
+wrong-filter cursors return 422 and require restarting the listing. Unsupported
+stores return 501; an incomplete/failed read returns 503, never a subtotal.
+Without `include=counts`, the existing bare list response remains available,
+including offset paging. Text and scalar filters on either shape match the
+current displayed public values, including redacted scalar values; hidden raw
+strings do not grant membership. Native SDK list filters retain their native
+semantics. Resource access bounds are always applied independently. A custom
+store without native index support still serves filtered bare lists by scanning
+bounded native list pages and applying public matching before offset/limit;
+these pages do not claim snapshot counts. A request examines at most 4,096
+records across at most 16 native pages. Exhausting that budget or seeing repeated
+identities while pages shift returns 503 without partial items. Exact counts
+remain unavailable for these custom stores; native exact-count scans are uncapped.
+
+`GET /api/tasks/{task_id}/dependents` returns the same bounded envelope for tasks
+whose authoritative prerequisites contain that task. It includes internal task
+types because they can be real dependencies. Unknown source tasks return 404.
+Members may read tasks, dependents and `GET /api/tasks/{task_id}/schedule/events`;
+schedule history retains the same public redaction as other task reads.
+
+`POST /api/tasks/{task_id}/cancel` requires full access. Idle work becomes
+cancelled. Live worker work instead retains its worker/lease and a durable
+cancellation request until the owner drains and commits terminal cancellation;
+a 200 response does not promise that dispatched effects have already stopped.
+The returned task distinguishes these outcomes. Lifecycle conflicts return 409.
+Managed schedules retain their revision fence: use the existing
+`POST /api/tasks/schedule/cancel` with `operation_id` and `expected_revision`;
+the general endpoint refuses them. Holds and resume retain their existing rules.
+
+Native extensions may implement `TaskStore.query_task_index` using
+`TaskIndexQuery` / `TaskIndexResult` from `cayu.tasks`. The operation must visit
+all eligible records in one snapshot, apply the supplied public search predicate
+before counting and pagination, preserve resource bounds, and fail without a
+successful result on incomplete traversal. It is a trusted operator surface,
+not a new model-tool access grant. The default implementation is unsupported.
+
 `GET /api/task-types` returns `{task_types: [...]}`. An empty list means the host
 has declared no dashboard-createable types. The `task_creation` capability reports
 whether the configured task store supports exact creation and source selection.

@@ -172,6 +172,7 @@ from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
 )
+from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -2118,6 +2119,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 await conn.rollback()
                 raise
         return result
+
+    async def query_task_index(
+        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+    ) -> TaskIndexResult:
+        from cayu.storage._postgres_task_index import query_index
+
+        return await query_index(self, query, matches=matches)
 
     async def aggregate_operational_snapshot(
         self,

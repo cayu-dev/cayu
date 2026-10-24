@@ -1,10 +1,12 @@
-"""Sealed, principal-bound positions for bounded inbox scans.
+"""Sealed, principal-bound positions for inbox scans and task keysets.
 
 A caller an inbox access rule limits must not learn where other people's items
 are, so a scan that ends among them continues from a sealed position: encrypted
 and authenticated with AES-256-GCM, bound to the caller and the listing, and
 valid for 15 minutes. A caller no rule limits may see every item, so its
 positions stay plain keysets and need no key.
+
+Task keysets use the same seal with a separate authenticated purpose.
 
 The key is the deployment's ``inbox_cursor_key`` when one is configured, shared
 by every worker. Without one, each server generates its own key, so an inbox
@@ -30,8 +32,9 @@ from fastapi import HTTPException
 
 from cayu.knowledge.search import decode_knowledge_list_cursor
 from cayu.sessions.queries import decode_session_cursor
+from cayu.tasks.index import decode_task_index_cursor
 
-SealedPurpose = Literal["knowledge", "actions", "pending-actions"]
+SealedPurpose = Literal["knowledge", "actions", "pending-actions", "tasks"]
 
 _LIFETIME_SECONDS = 900
 _CLOCK_SKEW_SECONDS = 60
@@ -44,6 +47,7 @@ _NO_STORE = {"Cache-Control": "private, no-store"}
 # What each sealed position names: a knowledge list position, or a session-store
 # position among pending actions the caller may not see.
 _PURPOSES: dict[SealedPurpose, tuple[str, Callable[[str], object]]] = {
+    "tasks": ("cayu.tasks.index.v1", decode_task_index_cursor),
     "knowledge": ("cayu.inbox.knowledge.v1", decode_knowledge_list_cursor),
     "actions": ("cayu.inbox.actions.v1", decode_session_cursor),
     "pending-actions": ("cayu.pending-actions.v1", decode_session_cursor),
@@ -99,4 +103,6 @@ class InboxCursorSeal:
             return position
         except (ValueError, TypeError, binascii.Error, InvalidTag):
             detail = _INVALID if self.configured else _INVALID_GENERATED
+            if purpose == "tasks":
+                detail = "Invalid or expired task cursor. Restart the task listing."
             raise HTTPException(status_code=422, detail=detail, headers=_NO_STORE) from None

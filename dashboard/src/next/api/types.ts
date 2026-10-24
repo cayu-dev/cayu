@@ -63,12 +63,10 @@ export type TaskScheduleEvent = ApiTaskScheduleEvent
 export type * from "./eval-types"
 
 /**
- * Proposed (backend item 13): the graph a task belongs to and the tasks it waits on. The
- * store keeps both, but the API doesn't serialize them yet.
+ * Runtime task relations are carried by the generated list/detail contracts.
  */
-export type TaskRelations = { graph_id?: string | null; prerequisite_task_ids?: string[] }
-export type TaskItem = Task & TaskRelations
-export type TaskInfo = TaskDetail & TaskRelations
+export type TaskItem = Task
+export type TaskInfo = TaskDetail
 /** The holds `POST /api/tasks/{id}/pause | block | needs-attention` put on a task. */
 export type TaskHold = "pause" | "block" | "needs-attention"
 

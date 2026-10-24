@@ -692,6 +692,8 @@ function sessionTask(seed: AppSeed, s: SeedSession, now: number): Task {
     status_reason: reason,
     status_payload: null,
     session_id: s.session.id,
+    graph_id: null,
+    prerequisite_task_ids: [],
     parent_task_id: null,
     assigned_agent_name: s.session.agent_name,
     available_at: iso(created),

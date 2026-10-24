@@ -156,3 +156,8 @@ existing event log filtered by `session.failed` until Trace is ported. Child act
 remain a separate read-only panel. `/pending-actions` redirects to `/inbox` with
 filters; `/run` redirects to `/?start=1`. Shared Start and title/query owners are
 those used by the Sessions production page. Counts are never inferred from samples.
+
+Task runtime contract60 supplies backend item13: graph/prerequisite fields,
+exact status counts with cursor pages, server internal-task exclusion, dependents
+and native cancellation. Schedule-history reads follow task read authority. The
+Tasks page port remains separate; retry attempts retain predecessor/successor reads.

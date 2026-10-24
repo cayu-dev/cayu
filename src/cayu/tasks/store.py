@@ -100,6 +100,7 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
 )
+from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -986,6 +987,18 @@ class TaskStore(ABC):
         """Delete a quiescent session task set owned by this store."""
 
         raise NotImplementedError("This TaskStore does not support session task closure deletion.")
+
+    async def query_task_index(
+        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+    ) -> TaskIndexResult:
+        """Page and count authorized tasks in one read snapshot.
+
+        Trusted operator read; model execution remains outside this surface.
+        Visit all eligible records; apply the caller's public search predicate
+        before counts and pagination. Preserve resource access bounds. A partial
+        or failed traversal must never return successful counts.
+        """
+        raise NotImplementedError("Task index snapshots are unavailable.")
 
     async def aggregate_operational_snapshot(
         self,

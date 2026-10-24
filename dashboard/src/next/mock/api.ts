@@ -693,6 +693,8 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
         status_reason: null,
         status_payload: null,
         session_id: sessionId,
+        graph_id: null,
+        prerequisite_task_ids: [],
         parent_task_id: null,
         assigned_agent_name: agent,
         available_at: null,

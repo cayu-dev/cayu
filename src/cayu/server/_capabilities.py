@@ -41,6 +41,7 @@ class ControlPlaneCapabilitySnapshot:
     eval_project_identity_configured: bool
     eval_captured_results_supported: bool
     browser_recordings_configured: bool = False
+    task_index_supported: bool = False
     task_creation_supported: bool = False
     session_overview_supported: bool = False
 
@@ -82,6 +83,11 @@ class ControlPlaneCapabilitySnapshot:
                 else ServerContractActor(subject=actor.subject, tenant=actor.tenant)
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
+                task_index=_optional_surface(
+                    self.tasks_configured,
+                    read_supported=self.task_index_supported,
+                    mutation_supported=False,
+                ),
                 task_creation=_optional_surface(
                     self.tasks_configured,
                     read_supported=self.task_creation_supported,
@@ -187,6 +193,7 @@ def inspect_control_plane_capabilities(
     eval_project_identity_configured: bool | None = None,
     eval_captured_results_supported: bool = False,
     browser_recordings_configured: bool = False,
+    task_index_supported: bool = False,
     task_creation_supported: bool = False,
     session_overview_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
@@ -210,6 +217,7 @@ def inspect_control_plane_capabilities(
         ("knowledge_configured", knowledge_configured),
         ("dashboard_pricing_configured", dashboard_pricing_configured),
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
+        ("task_index_supported", task_index_supported),
         ("task_creation_supported", task_creation_supported),
         ("session_overview_supported", session_overview_supported),
         ("session_topology_supported", session_topology_supported),
@@ -233,6 +241,7 @@ def inspect_control_plane_capabilities(
         raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
         browser_recordings_configured=browser_recordings_configured,
+        task_index_supported=task_index_supported,
         task_creation_supported=task_creation_supported,
         session_overview_supported=session_overview_supported,
         cayu_version=_cayu_distribution_version(),

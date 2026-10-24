@@ -169,6 +169,8 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/tasks",
             "/tasks/{task_id}",
             "/tasks/{task_id}/replay",
+            "/tasks/{task_id}/schedule/events",
+            "/tasks/{task_id}/dependents",
         )
     }
     | {

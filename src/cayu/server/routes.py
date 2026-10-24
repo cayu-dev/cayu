@@ -207,6 +207,8 @@ from cayu.server._session_trace import register_session_trace
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
+from cayu.server._task_controls_routes import register_task_controls_routes
+from cayu.server._task_index import read_task_index
 from cayu.server.auth import (
     AuthContext,
     AuthDependency,
@@ -255,6 +257,7 @@ from cayu.server.contracts import (
     ApiSession,
     ApiSessionDetail,
     ApiTaskDetail,
+    ApiTaskIndex,
     ApiTaskListItem,
     ApiTaskScheduleEvent,
     ApiTaskScheduleReceipt,
@@ -423,6 +426,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleReceipt,
     TaskScheduleState,
 )
+from cayu.tasks.store import TaskStore
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TaskTopologyCycle,
@@ -3994,6 +3998,8 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
         cayu_app,
         {
             "id": task.id,
+            "graph_id": task.graph_id,
+            "prerequisite_task_ids": list(task.prerequisite_task_ids),
             "concurrency_key": task.concurrency_key,
             "type": task.type,
             "title": task.title,
@@ -4382,8 +4388,8 @@ def create_router(
             or settles them, not only the inbox routes. Without it, every caller the
             auth dependency admits may. It requires an auth dependency.
         inbox_cursor_key: Optional deployment-owned 32-byte key, shared by all
-            workers, that seals the inbox and pending-action cursors of callers
-            ``inbox_access`` limits. Without it the router generates its own key.
+            workers, that seals task index cursors and the inbox and pending-action
+            cursors of callers ``inbox_access`` limits. Without it the router generates its own key.
     """
 
     if continuation_loop_policy_provider is not None and not callable(
@@ -4574,6 +4580,8 @@ def create_router(
     )
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
+        task_index_supported=task_store is not None
+        and inspect.unwrap(type(task_store).query_task_index) is not TaskStore.query_task_index,
         task_creation_supported=task_store is not None
         and task_store.supports_task_creation_operations,
         browser_recordings_configured=browser_recordings_configured,
@@ -4721,6 +4729,15 @@ def create_router(
     inbox_gate = InboxAccessGate(cayu_app, cayu_app._runtime_session_store, inbox_access)
     # Seals the scan positions of callers that rule limits; see _inbox_cursor.
     inbox_cursor = InboxCursorSeal(inbox_cursor_key)
+    register_task_controls_routes(
+        bounded_control_plane_router,
+        cayu_app=cayu_app,
+        protected=protected,
+        serialize_task=_serialize_task_detail,
+        serialize_list=_serialize_task_list_item,
+        cursor_seal=inbox_cursor,
+        optional_auth_context=optional_auth_context,
+    )
 
     async def _require_settle_access(
         auth_context: AuthContext | None,
@@ -8854,10 +8871,18 @@ def create_router(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _serialize_session(cayu_app, session)
 
-    @router.get("/tasks", response_model=list[ApiTaskListItem], dependencies=protected)
+    @router.get(
+        "/tasks", response_model=list[ApiTaskListItem] | ApiTaskIndex, dependencies=protected
+    )
     async def list_tasks(
+        response: Response,
+        auth_context: AuthContext | None = optional_auth_context,
+        include: Literal["counts"] | None = None,
+        include_internal: bool = True,
+        cursor: str | None = None,
         q: str | None = None,
         status: TaskStatus | None = None,
+        statuses: Annotated[list[TaskStatus] | None, Query()] = None,
         task_type: str | None = Query(default=None, alias="type"),
         session_id: str | None = None,
         parent_task_id: str | None = None,
@@ -8866,7 +8891,10 @@ def create_router(
         limit: int = 50,
         offset: int = 0,
     ):
+        response.headers["Cache-Control"] = "private, no-store"
         if task_store is None:
+            if include == "counts":
+                raise HTTPException(501, "Task index is unavailable.")
             return []
         try:
             query = TaskQuery(
@@ -8882,6 +8910,31 @@ def create_router(
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        if cursor is not None and include is None:
+            raise HTTPException(422, "Task cursors require include=counts.")
+        if (
+            include == "counts"
+            or q is not None
+            or not include_internal
+            or statuses
+            or any(
+                value is not None
+                for value in (task_type, session_id, parent_task_id, assigned_agent_name)
+            )
+        ):
+            page = await read_task_index(
+                cayu_app,
+                query,
+                include_internal=include_internal,
+                cursor=cursor,
+                prerequisite_task_id=None,
+                serialize=_serialize_task_list_item,
+                seal=inbox_cursor,
+                actor=auth_context,
+                statuses=tuple(statuses or ()),
+                allow_offset=include is None,
+            )
+            return page if include == "counts" else page["items"]
         tasks = await task_store.list_tasks(query)
         return [_serialize_task_list_item(cayu_app, t) for t in tasks]
 

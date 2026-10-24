@@ -3163,6 +3163,17 @@
           ],
           "title": "Error"
         },
+        "graph_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Graph Id"
+        },
         "id": {
           "title": "Id",
           "type": "string"
@@ -3201,6 +3212,13 @@
             }
           ],
           "title": "Parent Task Id"
+        },
+        "prerequisite_task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Prerequisite Task Ids",
+          "type": "array"
         },
         "result": {
           "anyOf": [
@@ -3315,6 +3333,8 @@
         }
       },
       "required": [
+        "graph_id",
+        "prerequisite_task_ids",
         "id",
         "type",
         "title",
@@ -3341,6 +3361,51 @@
         "started_at"
       ],
       "title": "ApiTaskDetail",
+      "type": "object"
+    },
+    "ApiTaskIndex": {
+      "additionalProperties": false,
+      "properties": {
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "counts_by_status": {
+          "$ref": "#/components/schemas/TaskStatusCounts"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskListItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "total_count": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Total Count",
+          "type": "string"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "counts_by_status",
+        "next_cursor",
+        "as_of"
+      ],
+      "title": "ApiTaskIndex",
       "type": "object"
     },
     "ApiTaskInvocation": {
@@ -3446,6 +3511,17 @@
           ],
           "title": "Description"
         },
+        "graph_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Graph Id"
+        },
         "id": {
           "title": "Id",
           "type": "string"
@@ -3471,6 +3547,13 @@
             }
           ],
           "title": "Parent Task Id"
+        },
+        "prerequisite_task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Prerequisite Task Ids",
+          "type": "array"
         },
         "retry_series": {
           "anyOf": [
@@ -3562,6 +3645,8 @@
         }
       },
       "required": [
+        "graph_id",
+        "prerequisite_task_ids",
         "id",
         "type",
         "title",
@@ -5969,6 +6054,16 @@
           ]
         },
         "task_creation": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_index": {
           "anyOf": [
             {
               "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -11775,7 +11870,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "59",
+          "default": "60",
           "title": "Contract Version",
           "type": "string"
         },
@@ -17941,7 +18036,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "59",
+          "default": "60",
           "title": "Contract Version",
           "type": "string"
         }
@@ -23061,6 +23156,49 @@
           },
           {
             "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "counts",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_internal",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Internal",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
@@ -23154,6 +23292,25 @@
           },
           {
             "in": "query",
+            "name": "statuses",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/TaskStatus"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Statuses"
+            }
+          },
+          {
+            "in": "query",
             "name": "type",
             "required": false,
             "schema": {
@@ -23176,11 +23333,18 @@
           "200": {
             "content": {
               "application/json": {
-                "items": {
-                  "$ref": "#/components/schemas/ApiTaskListItem"
-                },
-                "title": "Response List Tasks Api Tasks Get",
-                "type": "array"
+                "anyOf": [
+                  {
+                    "items": {
+                      "$ref": "#/components/schemas/ApiTaskListItem"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ApiTaskIndex"
+                  }
+                ],
+                "title": "Response List Tasks Api Tasks Get"
               }
             }
           },
@@ -23353,6 +23517,106 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/cancel": {
+      "post": {
+        "operation_id": "cancel_task_api_tasks__task_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/dependents": {
+      "get": {
+        "operation_id": "dependents_api_tasks__task_id__dependents_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskIndex"
               }
             }
           },

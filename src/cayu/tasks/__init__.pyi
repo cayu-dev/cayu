@@ -225,6 +225,8 @@ from cayu.tasks.handoff import interrupted_task_handoff_request as interrupted_t
 from cayu.tasks.handoff import (
     new_interrupted_task_continuation_handoff_id as new_interrupted_task_continuation_handoff_id,
 )
+from cayu.tasks.index import TaskIndexQuery as TaskIndexQuery
+from cayu.tasks.index import TaskIndexResult as TaskIndexResult
 from cayu.tasks.memory import InMemoryTaskStore as InMemoryTaskStore
 from cayu.tasks.operations import TaskCreationConflict as TaskCreationConflict
 from cayu.tasks.operations import TaskCreationOperation as TaskCreationOperation
