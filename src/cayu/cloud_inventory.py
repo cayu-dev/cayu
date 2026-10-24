@@ -29,6 +29,7 @@ from cayu.cloud_reporting import _store_identity
 from cayu.events import EventType
 from cayu.knowledge.records import KnowledgeActorType, KnowledgeStatus, KnowledgeVisibility
 from cayu.knowledge.search import KnowledgeListQuery, encode_knowledge_list_cursor
+from cayu.knowledge.usage import knowledge_usage_contribution
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.tool_inventory import (
     APPROVALS as _APPROVALS,
@@ -560,11 +561,11 @@ async def _cloud_usage_report(
     for record in events:
         event = record.event
         if event.type == EventType.KNOWLEDGE_LOOKUP:
-            namespace = event.payload.get("namespace")
-            ids = event.payload.get("entry_ids")
-            if not isinstance(namespace, str) or not isinstance(ids, list):
+            contribution = knowledge_usage_contribution(event)
+            if contribution is None:
                 continue
-            for entry_id in dict.fromkeys(value for value in ids if isinstance(value, str)):
+            namespace, ids = contribution
+            for entry_id in ids:
                 if (namespace, entry_id) in registered.knowledge:
                     totals = knowledge.setdefault(entry_id, _Totals())
                     totals.lookups += 1

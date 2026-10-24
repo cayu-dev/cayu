@@ -844,6 +844,134 @@ export type ApiInvocationOrigin = {
 };
 
 /**
+ * ApiKeptKnowledgeItem
+ */
+export type ApiKeptKnowledgeItem = {
+    /**
+     * Aspects
+     */
+    aspects: Array<string>;
+    /**
+     * Attribution Unavailable Reason
+     */
+    attribution_unavailable_reason: 'not_recorded' | 'unsupported' | null;
+    /**
+     * Chunk Count
+     */
+    chunk_count: number;
+    /**
+     * Confidence
+     */
+    confidence: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string | null;
+    /**
+     * Created By Type
+     */
+    created_by_type: string;
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Impact Targets
+     */
+    impact_targets: Array<string>;
+    /**
+     * Importance
+     */
+    importance: string | null;
+    /**
+     * Importance Source
+     */
+    importance_source: string | null;
+    /**
+     * Kept At
+     */
+    kept_at: string | null;
+    /**
+     * Kept By
+     */
+    kept_by: string | null;
+    /**
+     * Kept By Kind
+     */
+    kept_by_kind: 'reviewer' | 'policy' | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Last Used At
+     */
+    last_used_at: string | null;
+    /**
+     * Lookups
+     */
+    lookups: string | null;
+    /**
+     * Namespace
+     */
+    namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Source Id
+     */
+    source_id: string | null;
+    /**
+     * Source Session Id
+     */
+    source_session_id: string | null;
+    /**
+     * Source Type
+     */
+    source_type: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri: string | null;
+    /**
+     * Specialist
+     */
+    specialist: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Text Preview
+     */
+    text_preview: string;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Visibility
+     */
+    visibility: string;
+};
+
+/**
  * ApiKnowledgeChunk
  */
 export type ApiKnowledgeChunk = {
@@ -4319,6 +4447,7 @@ export type ControlPlaneSurfaceCapabilities = {
     evaluation_promotion: OptionalSurfaceCapability;
     inbox?: OptionalSurfaceCapability | null;
     inbox_queries?: OptionalSurfaceCapability | null;
+    kept_knowledge?: OptionalSurfaceCapability | null;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     session_display_metadata?: OptionalSurfaceCapability | null;
@@ -10741,6 +10870,32 @@ export type JudgeProfileIdentityV1 = {
 };
 
 /**
+ * KeptKnowledgeListResponse
+ */
+export type KeptKnowledgeListResponse = {
+    /**
+     * Entries
+     */
+    entries: Array<ApiKeptKnowledgeItem>;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
+     * Total Count
+     */
+    total_count?: null;
+    /**
+     * Usage Through Sequence
+     */
+    usage_through_sequence: number | null;
+    /**
+     * Usage Unavailable Reason
+     */
+    usage_unavailable_reason: 'access_limited' | 'unsupported' | 'source_incomplete' | null;
+};
+
+/**
  * KnowledgeVisibility
  */
 export type KnowledgeVisibility = 'global' | 'organization' | 'project' | 'workspace' | 'user' | 'session' | 'task';
@@ -15847,6 +16002,34 @@ export type ResumeBody = {
     task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
     tool_completion?: ToolCompletionPolicy | null;
+};
+
+/**
+ * RetireKnowledgeRequest
+ */
+export type RetireKnowledgeRequest = {
+    /**
+     * Expected Revision
+     */
+    expected_revision: number;
+};
+
+/**
+ * RetireKnowledgeResponse
+ */
+export type RetireKnowledgeResponse = {
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Status
+     */
+    status: 'archived';
 };
 
 /**
@@ -24205,6 +24388,44 @@ export type SettleInboxItemApiInboxItemIdSettlePostResponses = {
 
 export type SettleInboxItemApiInboxItemIdSettlePostResponse = SettleInboxItemApiInboxItemIdSettlePostResponses[keyof SettleInboxItemApiInboxItemIdSettlePostResponses];
 
+export type KeptKnowledgeApiKnowledgeGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Bytes
+         */
+        max_bytes?: number;
+    };
+    url: '/api/knowledge';
+};
+
+export type KeptKnowledgeApiKnowledgeGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type KeptKnowledgeApiKnowledgeGetError = KeptKnowledgeApiKnowledgeGetErrors[keyof KeptKnowledgeApiKnowledgeGetErrors];
+
+export type KeptKnowledgeApiKnowledgeGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: KeptKnowledgeListResponse;
+};
+
+export type KeptKnowledgeApiKnowledgeGetResponse = KeptKnowledgeApiKnowledgeGetResponses[keyof KeptKnowledgeApiKnowledgeGetResponses];
+
 export type ListPendingKnowledgeApiKnowledgePendingGetData = {
     body?: never;
     path?: never;
@@ -24371,6 +24592,36 @@ export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses = {
 };
 
 export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse = RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses[keyof RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses];
+
+export type RetireKnowledgeApiKnowledgeEntryIdRetirePostData = {
+    body: RetireKnowledgeRequest;
+    path: {
+        /**
+         * Entry Id
+         */
+        entry_id: string;
+    };
+    query?: never;
+    url: '/api/knowledge/{entry_id}/retire';
+};
+
+export type RetireKnowledgeApiKnowledgeEntryIdRetirePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RetireKnowledgeApiKnowledgeEntryIdRetirePostError = RetireKnowledgeApiKnowledgeEntryIdRetirePostErrors[keyof RetireKnowledgeApiKnowledgeEntryIdRetirePostErrors];
+
+export type RetireKnowledgeApiKnowledgeEntryIdRetirePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: RetireKnowledgeResponse;
+};
+
+export type RetireKnowledgeApiKnowledgeEntryIdRetirePostResponse = RetireKnowledgeApiKnowledgeEntryIdRetirePostResponses[keyof RetireKnowledgeApiKnowledgeEntryIdRetirePostResponses];
 
 export type GetOperationalSnapshotApiOperationsSnapshotPostData = {
     body: OperationalSnapshotRequest;

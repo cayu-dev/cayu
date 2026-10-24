@@ -1473,6 +1473,29 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         return copy_knowledge_publication_receipt(receipt)
 
     @runtime_knowledge_operation("read")
+    async def load_entry_activation_receipt(
+        self,
+        entry_id: str,
+        *,
+        revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry_id)
+        _validate_knowledge_revision(revision, "revision")
+        matches = [
+            receipt.operation_id
+            for receipt in self._activation_receipts.values()
+            if receipt.entry_id == entry_id and receipt.entry_revision == revision
+        ]
+        if len(matches) > 1:
+            raise KnowledgeActivationConflict("malformed_receipt")
+        if not matches:
+            return None
+        receipt = self._load_activation_receipt_in_scope(matches[0], scope, deny_inaccessible=False)
+        return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
     async def load_activation_receipt(
         self,
         operation_id: str,

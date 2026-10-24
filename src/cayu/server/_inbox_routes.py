@@ -48,6 +48,7 @@ from cayu.runtime.human_attention import (
 from cayu.server._inbox_access import PENDING_KINDS, InboxAccessGate
 from cayu.server._inbox_counts import count_inbox
 from cayu.server._inbox_cursor import InboxCursorSeal
+from cayu.server._knowledge_preview import knowledge_preview
 from cayu.server.contracts import ApiErrorResponse
 from cayu.server.inbox import (
     INBOX_DECISIONS,
@@ -120,7 +121,6 @@ _CLAIM_SCAN_PAGES = 20
 _PENDING_SCAN_LIMIT = 200
 _KNOWLEDGE_PAGE_MAX_BYTES = 262_144
 _KNOWLEDGE_SCAN_PAGES = 10
-_KNOWLEDGE_PREVIEW_CHARS = 500
 _KNOWLEDGE_REVIEWER_VERSION = "1"
 _NO_STORE = {"Cache-Control": "private, no-store"}
 _NOT_FOUND = "Inbox item not found."
@@ -361,11 +361,7 @@ def _state_conflict(state: InboxItemState) -> HTTPException:
 
 
 def _knowledge_item(entry: KnowledgeEntry, cayu_app: Any) -> InboxItem:
-    # Redact before truncating: a secret crossing the preview boundary must not
-    # leave its prefix in the response.
-    preview = cayu_app.redact_json(entry.text).strip()
-    if len(preview) > _KNOWLEDGE_PREVIEW_CHARS:
-        preview = preview[: _KNOWLEDGE_PREVIEW_CHARS - 1].rstrip() + "…"
+    preview = knowledge_preview(entry.text, cayu_app.redact_json)
     return InboxItem(
         id=_knowledge_item_id(_KnowledgeLocator(entry.id, entry.revision)),
         kind="knowledge",

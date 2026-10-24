@@ -920,6 +920,33 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     @runtime_knowledge_operation("read")
+    async def load_entry_activation_receipt(
+        self,
+        entry_id: str,
+        *,
+        revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry_id)
+        _validate_knowledge_revision(revision, "revision")
+        async with self._lock:
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
+                rows = self._connection.execute(
+                    "SELECT operation_id FROM cayu_knowledge_activation_receipts "
+                    "WHERE entry_id = ? AND entry_revision = ? LIMIT 2",
+                    (entry_id, revision),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise KnowledgeActivationConflict("malformed_receipt")
+                if not rows:
+                    return None
+                receipt = self._load_activation_receipt_unlocked(
+                    rows[0][0], access_scope=scope, deny_inaccessible=False
+                )
+        return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
     async def load_activation_receipt(
         self,
         operation_id: str,

@@ -280,6 +280,21 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support attributed knowledge review approval."
         )
 
+    async def load_entry_activation_receipt(
+        self,
+        entry_id: str,
+        *,
+        revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        """Read exact revision attribution under the existing receipt access policy.
+
+        None means no accessible activation receipt; unsupported stores must raise
+        NotImplementedError so callers can distinguish unavailable attribution.
+        This read never treats caller metadata as activation evidence.
+        """
+        raise NotImplementedError("This KnowledgeStore cannot discover activation attribution.")
+
     async def load_activation_receipt(
         self,
         operation_id: str,

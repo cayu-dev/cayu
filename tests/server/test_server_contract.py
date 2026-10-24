@@ -309,6 +309,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
             "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
         },
+        "kept_knowledge": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+        },
         "reviewed_knowledge": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -697,6 +702,9 @@ def test_contract_keeps_optional_capability_combinations_independent(
         if name in optional_surface_names and capability["configured"]
     }
     assert configured_surfaces == {configured_feature}
+    assert (
+        capabilities["surfaces"]["kept_knowledge"] == capabilities["surfaces"]["reviewed_knowledge"]
+    )
     expected_roles = {
         "tasks": ["session", "task"],
         "reviewed_knowledge": ["session", "knowledge"],

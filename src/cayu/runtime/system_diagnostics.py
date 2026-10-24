@@ -235,6 +235,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     inbox_queries: OptionalSurfaceCapability | None = None
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability
+    kept_knowledge: OptionalSurfaceCapability | None = None
     artifacts: OptionalSurfaceCapability
     usage: OptionalSurfaceCapability
     pricing: OptionalSurfaceCapability

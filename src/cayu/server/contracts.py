@@ -3179,6 +3179,35 @@ class ApiReviewedKnowledgeEntry(ApiKnowledgeEntryBase):
     text_preview: str
 
 
+class ApiKeptKnowledgeItem(ApiKnowledgeListItem):
+    specialist: str | None
+    source_session_id: str | None
+    kept_by: str | None
+    kept_at: datetime | None
+    kept_by_kind: Literal["reviewer", "policy"] | None
+    attribution_unavailable_reason: Literal["not_recorded", "unsupported"] | None
+    lookups: str | None
+    last_used_at: datetime | None
+
+
+class KeptKnowledgeListResponse(ApiBaseModel):
+    entries: list[ApiKeptKnowledgeItem]
+    next_cursor: str | None
+    total_count: None = None
+    usage_through_sequence: StrictInt | None
+    usage_unavailable_reason: Literal["access_limited", "unsupported", "source_incomplete"] | None
+
+
+class RetireKnowledgeResponse(ApiBaseModel):
+    entry_id: str
+    revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)
+    status: Literal["archived"]
+
+
+class RetireKnowledgeRequest(ApiBaseModel):
+    expected_revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)
+
+
 class PendingKnowledgeListResponse(ApiBaseModel):
     entries: list[ApiKnowledgeListItem]
     truncated: StrictBool

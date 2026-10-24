@@ -625,3 +625,47 @@ Native Memory, SQLite and PostgreSQL stores implement atomic creation/receipt
 publication and retain deletion fences. Custom stores must explicitly implement
 `create_task_operation` and `task_replay_sources_for_session` before advertising
 support; falling back to ordinary `create_task` would lose these guarantees.
+
+### Kept knowledge
+
+`GET /api/knowledge` lists active, unexpired entries within the application's
+configured knowledge namespace, labels and access scope. Members can read this
+route. Pending proposals still use `/api/knowledge/pending` and the existing
+Keep/Drop decisions.
+
+Each entry includes its existing provenance fields and a public preview. A
+registered model actor supplies `specialist`; a matching retained source session
+supplies `source_session_id`. Missing or conflicting evidence leaves these fields
+null. `kept_by`, `kept_at` and `kept_by_kind` come from the native activation
+receipt for the exact entry revision, never from entry metadata. The kind is
+`reviewer` for a reviewed approval or `policy` for another governed activation.
+Entries without a receipt report `attribution_unavailable_reason: not_recorded`;
+stores without receipt discovery report `unsupported`.
+
+`limit` is 1–100 and `max_bytes` bounds the native listing page (default 100,000,
+maximum 1,048,576 bytes). Follow the opaque `next_cursor` until it is null. Cursors
+are bound to the authenticated subject, tenant and configured knowledge scope.
+An access-filtered page can be empty and still have a continuation. `total_count`
+is always null; a page is not a total or a stable cross-request snapshot. An entry
+that cannot fit or a response exceeding the public metadata bound returns 413
+instead of an incomplete successful page.
+
+`lookups` is a decimal string counting each namespace/entry identity once per
+retained `knowledge.lookup` event. `last_used_at` is the latest such timestamp.
+The native reader holds one stable retained-event snapshot while traversing
+byte-bounded event pages completely. `usage_through_sequence` describes that
+snapshot's maximum sequence; it is not a globally committed insertion frontier. Counts describe retained history, not events pruned from storage.
+They are null with `usage_unavailable_reason` when access is limited, the event
+reader is unsupported, or a source cannot be read completely. No capped subtotal
+is presented as an exact count.
+
+Full-access callers can retire an entry with
+`POST /api/knowledge/{entry_id}/retire` and
+`{"expected_revision": <the displayed revision>}`. The native lifecycle owner
+atomically transitions that exact active revision to archived, preserving its
+content and durable evidence. A stale revision or incompatible lifecycle returns
+409. The response contains the entry ID, new revision and archived status. This
+operation does not promise idempotent acknowledgement replay: after a lost
+response, inspect canonical state; repeating the old revision can return 409.
+Members cannot retire entries. Retirement does not replace Keep or Drop for
+pending proposals.

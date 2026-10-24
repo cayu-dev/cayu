@@ -140,6 +140,10 @@ class ControlPlaneCapabilitySnapshot:
                     self.tasks_configured,
                     mutation_supported=True,
                 ),
+                kept_knowledge=_optional_surface(
+                    self.knowledge_configured,
+                    mutation_supported=True,
+                ),
                 reviewed_knowledge=_optional_surface(
                     self.knowledge_configured,
                     mutation_supported=True,

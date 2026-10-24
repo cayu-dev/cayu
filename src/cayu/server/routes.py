@@ -191,6 +191,7 @@ from cayu.server._inbox_access import InboxAccessGate
 from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
+from cayu.server._kept_knowledge import register_kept_knowledge
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._request_timing import RequestTimingRecorder
 from cayu.server._scenario_routes import (
@@ -9312,6 +9313,17 @@ def create_router(
         workflow = _knowledge_review_workflow()
         await _require_knowledge_access(auth_context, workflow, entry_id)
         return await _apply_knowledge_review_action(workflow.reject, entry_id)
+
+    register_kept_knowledge(
+        bounded_control_plane_router,
+        app=cayu_app,
+        protected=protected,
+        workflow=_knowledge_review_workflow,
+        gate=inbox_gate,
+        seal=inbox_cursor,
+        optional_auth_context=optional_auth_context,
+        serialize_item=_serialize_knowledge_list_item,
+    )
 
     register_inbox_routes(
         router,

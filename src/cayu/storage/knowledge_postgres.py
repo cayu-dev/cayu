@@ -1144,6 +1144,35 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     @runtime_knowledge_operation("read")
+    async def load_entry_activation_receipt(
+        self,
+        entry_id: str,
+        *,
+        revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry_id)
+        _validate_knowledge_revision(revision, "revision")
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            await cur.execute(
+                "SELECT operation_id FROM cayu_knowledge_activation_receipts "
+                "WHERE entry_id = %s AND entry_revision = %s LIMIT 2",
+                (entry_id, revision),
+            )
+            rows = await cur.fetchall()
+            if len(rows) > 1:
+                raise KnowledgeActivationConflict("malformed_receipt")
+            if not rows:
+                return None
+            receipt = await self._load_activation_receipt(
+                cur, rows[0][0], access_scope=scope, deny_inaccessible=False
+            )
+        return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
     async def load_activation_receipt(
         self,
         operation_id: str,

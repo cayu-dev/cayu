@@ -1605,6 +1605,299 @@
         "title": "ApiInvocationOrigin",
         "type": "object"
       },
+      "ApiKeptKnowledgeItem": {
+        "additionalProperties": false,
+        "properties": {
+          "aspects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Aspects",
+            "type": "array"
+          },
+          "attribution_unavailable_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_recorded",
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attribution Unavailable Reason"
+          },
+          "chunk_count": {
+            "minimum": 0.0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "created_by_type": {
+            "title": "Created By Type",
+            "type": "string"
+          },
+          "entry_id": {
+            "title": "Entry Id",
+            "type": "string"
+          },
+          "impact_targets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Impact Targets",
+            "type": "array"
+          },
+          "importance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Importance"
+          },
+          "importance_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Importance Source"
+          },
+          "kept_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kept At"
+          },
+          "kept_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kept By"
+          },
+          "kept_by_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "reviewer",
+                  "policy"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kept By Kind"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "lookups": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lookups"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "revision": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Session Id"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "specialist": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Specialist"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "text_preview": {
+            "title": "Text Preview",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "visibility": {
+            "title": "Visibility",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_id",
+          "revision",
+          "namespace",
+          "kind",
+          "visibility",
+          "status",
+          "title",
+          "labels",
+          "aspects",
+          "impact_targets",
+          "source_type",
+          "source_uri",
+          "source_id",
+          "created_by_type",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "importance",
+          "importance_source",
+          "confidence",
+          "chunk_count",
+          "text_preview",
+          "specialist",
+          "source_session_id",
+          "kept_by",
+          "kept_at",
+          "kept_by_kind",
+          "attribution_unavailable_reason",
+          "lookups",
+          "last_used_at"
+        ],
+        "title": "ApiKeptKnowledgeItem",
+        "type": "object"
+      },
       "ApiKnowledgeChunk": {
         "additionalProperties": false,
         "properties": {
@@ -8770,6 +9063,16 @@
             ]
           },
           "inbox_queries": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kept_knowledge": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -21826,6 +22129,68 @@
         "title": "JudgeProfileIdentityV1",
         "type": "object"
       },
+      "KeptKnowledgeListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ApiKeptKnowledgeItem"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "total_count": {
+            "title": "Total Count",
+            "type": "null"
+          },
+          "usage_through_sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Through Sequence"
+          },
+          "usage_unavailable_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "access_limited",
+                  "unsupported",
+                  "source_incomplete"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Unavailable Reason"
+          }
+        },
+        "required": [
+          "entries",
+          "next_cursor",
+          "usage_through_sequence",
+          "usage_unavailable_reason"
+        ],
+        "title": "KeptKnowledgeListResponse",
+        "type": "object"
+      },
       "KnowledgeVisibility": {
         "enum": [
           "global",
@@ -31881,6 +32246,49 @@
         "title": "ResumeBody",
         "type": "object"
       },
+      "RetireKnowledgeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "RetireKnowledgeRequest",
+        "type": "object"
+      },
+      "RetireKnowledgeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "entry_id": {
+            "title": "Entry Id",
+            "type": "string"
+          },
+          "revision": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "status": {
+            "const": "archived",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_id",
+          "revision",
+          "status"
+        ],
+        "title": "RetireKnowledgeResponse",
+        "type": "object"
+      },
       "RetryPolicy": {
         "additionalProperties": false,
         "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default permits five total\nattempts for classified transient provider failures. Unknown provider\nfailures retain the stricter `max_unknown_attempts` ceiling.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
@@ -33624,7 +34032,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "61",
+            "default": "62",
             "title": "Contract Version",
             "type": "string"
           },
@@ -41040,7 +41448,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "61",
+            "default": "62",
             "title": "Contract Version",
             "type": "string"
           }
@@ -46135,6 +46543,77 @@
         "summary": "Settle Inbox Item"
       }
     },
+    "/api/knowledge": {
+      "get": {
+        "operationId": "kept_knowledge_api_knowledge_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 6144,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_bytes",
+            "required": false,
+            "schema": {
+              "default": 100000,
+              "maximum": 1048576,
+              "minimum": 1,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeptKnowledgeListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Kept Knowledge"
+      }
+    },
     "/api/knowledge/pending": {
       "get": {
         "operationId": "list_pending_knowledge_api_knowledge_pending_get",
@@ -46469,6 +46948,56 @@
           }
         },
         "summary": "Reject Knowledge"
+      }
+    },
+    "/api/knowledge/{entry_id}/retire": {
+      "post": {
+        "operationId": "retire_knowledge_api_knowledge__entry_id__retire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Entry Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireKnowledgeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetireKnowledgeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retire Knowledge"
       }
     },
     "/api/operations/snapshot": {
