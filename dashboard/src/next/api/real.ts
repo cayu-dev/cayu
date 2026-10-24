@@ -13,6 +13,7 @@ import {
   fetchSessionEvents,
   fetchSessionState,
   fetchSessionsPage,
+  fetchSessionTrace,
   fetchSessionTranscript,
   fetchTask,
   fetchTasks,
@@ -82,7 +83,8 @@ export const realApi: Api = {
   inboxCounts: (q = {}) => json(`/inbox/counts${query(q)}`),
   overviewCounts: (q) => json(`/sessions/overview/counts${query(q)}`),
   transcript: (id, q, signal) => fetchSessionTranscript(id, q, signal),
-  events: (id, q) => fetchSessionEvents(id, q),
+  trace: (id, q, signal) => fetchSessionTrace(id, q, signal),
+  events: (id, q, signal) => fetchSessionEvents(id, q, signal),
   tasks: () => fetchTasks({ limit: 200, order_by: "updated_at_desc" }),
   task: (id) => fetchTask(id),
   taskScheduleEvents: (id) =>

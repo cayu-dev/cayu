@@ -90,6 +90,7 @@ import type {
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
   GetSessionTopologyApiSessionsSessionIdTopologyPostResponse,
+  GetSessionTraceApiSessionsSessionIdTraceGetData,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetData,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse,
   GetSystemDiagnosticsApiSystemDiagnosticsGetResponse,
@@ -121,6 +122,7 @@ import type {
   ResumeTaskApiTasksTaskIdResumePostResponse,
   SessionsSummaryBody,
   SessionTopologyRequest,
+  SessionTraceResponse,
   SseEventEnvelope,
   TaskHoldBody,
   ToolApprovalDecision,
@@ -1160,5 +1162,20 @@ export async function approveKnowledge(entryId: string): Promise<KnowledgeEntry>
 export async function rejectKnowledge(entryId: string): Promise<KnowledgeEntry> {
   return postJson<RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse>(
     `/knowledge/${encodeURIComponent(entryId)}/reject`,
+  )
+}
+
+export type SessionTracePage = SessionTraceResponse
+export type SessionTraceQuery = NonNullable<
+  GetSessionTraceApiSessionsSessionIdTraceGetData["query"]
+>
+export async function fetchSessionTrace(
+  id: string,
+  query: SessionTraceQuery = {},
+  signal?: AbortSignal,
+): Promise<SessionTracePage> {
+  return requestJson<SessionTracePage>(
+    `/sessions/${encodeURIComponent(id)}/trace${queryString(query)}`,
+    { signal },
   )
 }

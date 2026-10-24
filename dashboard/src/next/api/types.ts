@@ -13,6 +13,8 @@ import type {
   SessionListQuery,
   SessionState as SessionStateRecord,
   SessionsPage,
+  SessionTracePage,
+  SessionTraceQuery,
   SessionTranscriptPage,
   SessionTranscriptQuery,
   Task,
@@ -55,6 +57,8 @@ export type {
   SessionListQuery,
   SessionStateRecord,
   SessionsPage,
+  SessionTracePage,
+  SessionTraceQuery,
   SessionTranscriptPage,
   Task,
   TaskDetail,
@@ -214,7 +218,8 @@ export type Api = {
     query?: SessionTranscriptQuery,
     signal?: AbortSignal,
   ): Promise<SessionTranscriptPage>
-  events(id: string, query?: SessionEventsQuery): Promise<SessionEventsPage>
+  trace?(id: string, query?: SessionTraceQuery, signal?: AbortSignal): Promise<SessionTracePage>
+  events(id: string, query?: SessionEventsQuery, signal?: AbortSignal): Promise<SessionEventsPage>
   /** `GET /api/tasks`, every task including Cayu's own (`cayu.*` types). */
   tasks(): Promise<TaskItem[]>
   /** `GET /api/tasks/{id}`. */

@@ -79,7 +79,7 @@ It is the **developer's** tool for looking deeply into the whole agent. Cayu age
 ## Decisions
 
 - **The dashboard is for developers to dive into the whole agent.** End users have the agent's own UI. Home is an overview of the agent, not a chat composer; starting a session is a small test action.
-- **Trace is the deep view.** Every session can be read as a conversation or as a trace. Until backend item 10 lands, spans are linked by event order and the UI says so.
+- **Trace is the deep view.** Every session can be read as a conversation or as a trace. The real Trace component uses backend item 10 and exact transcript positions. Event-order linkage remains only in the explicit prototype fixture.
 
 - **Audience:** developers. Customer operators use Cloud and the agent's own UI.
 - **The word "Agent":** the UI calls the whole thing an agent ("this agent", "Agent code"), never an app. "App" is the code's internal name (`app.run`, `AppInfo`). The agents it registers are Specialists.
@@ -105,7 +105,7 @@ It is the **developer's** tool for looking deeply into the whole agent. Cayu age
 - **`mock/api.ts`** answers those calls from an in-memory seed. Writes play out a short simulated run.
 - **`api/real.ts`** makes the same calls against the server. Switching to it is the port.
 - **`app/`** holds the query hooks, routes, services, theme and `session-model.ts`, which contains the pure helpers that `tests/next-session-model.test.mjs` covers.
-- **`app/trace-model.ts`** builds the trace from events, including linking by order when the server hides IDs; `tests/next-trace-model.test.mjs` covers it.
+- **`app/trace-runtime.ts`** consumes server span identities and exact transcript positions; `app/trace-history.ts` keeps separate bounded historical and live cursors. `app/trace-model.ts` retains event-order construction only for the prototype fixture. `app/session-progress.ts` mounts once in Session and shares visibility-aware, cancellable sequence progress with Conversation and Trace.
 - **`routes/`** holds the pages. `legacy-page.tsx` mounts today's unchanged pages from `src/routes/` in a second router that shares the history, so the new router picks up their links.
 - **`mock/legacy/`** is a fake server for those pages: it answers their `/api` calls through `fetch`, from the same seed. `contract.ts` is a real 0.13.0 capture. `legacy-config.ts` points their links into the hash.
 - **`mock/seeds/`** holds the made-up agents: Month-end close (three specialists, every state) and New agent (empty).
@@ -161,3 +161,18 @@ Task runtime contract60 supplies backend item13: graph/prerequisite fields,
 exact status counts with cursor pages, server internal-task exclusion, dependents
 and native cancellation. Schedule-history reads follow task read authority. The
 Tasks page port remains separate; retry attempts retain predecessor/successor reads.
+
+### Trace components
+
+The exact Trace components share one Session progress observer.
+`TraceWorkflow` contains the existing full topology, task relations, filters,
+expansion state and causal usage. The activation owner forwards `WorkflowSearch`
+and maps old workflow links to the session span. No third Tree view is introduced.
+
+`useSessionProgress` mounts once per Session. Its callback invalidates current
+reads, preserves older transcript windows, and follows the latest transcript only
+while pinned to the tail. Event-log invalidation respects
+`query.meta.sessionProgress !== false`, so Pause and older pages retain their
+position while explicit history/filter reads remain available. Focused trace
+reads bind to the loaded session incarnation; conflicts require reloading the
+session. Tool links use absolute message and part positions, never provider IDs.

@@ -6,8 +6,23 @@
  */
 import type { SessionEvent } from "../api/types.ts"
 
-export type SpanKind = "session" | "interaction" | "model" | "round" | "tool" | "exec" | "wait"
-export type SpanStatus = "ok" | "error" | "running" | "waiting"
+export type SpanKind =
+  | "session"
+  | "interaction"
+  | "model"
+  | "round"
+  | "tool"
+  | "exec"
+  | "wait"
+  | "knowledge"
+export type SpanStatus =
+  | "ok"
+  | "error"
+  | "running"
+  | "waiting"
+  | "interrupted"
+  | "blocked"
+  | "unknown"
 
 export type Span = {
   id: string
@@ -15,6 +30,8 @@ export type Span = {
   name: string
   detail: string
   start: number
+  startKnown?: boolean
+  transcriptLinks?: { message_index: number; part_index: number; tool_call_id: string }[]
   end: number | null
   status: SpanStatus
   events: SessionEvent[]

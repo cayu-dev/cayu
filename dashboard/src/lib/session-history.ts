@@ -548,3 +548,89 @@ export function durationDetail(status: string, usesTerminalEvent: boolean): stri
   if (status === "interrupted") return "started to interruption"
   return "started to final activity"
 }
+
+export type SessionProgress = {
+  afterSequence: number
+  throughSequence: number
+  terminalDrain: boolean
+}
+
+/** Shared sequence follower; visible windows and their pin state remain caller-owned. */
+export async function followSessionProgress({
+  signal,
+  active,
+  read,
+  onProgress,
+  sleep = progressDelay,
+}: {
+  signal: AbortSignal
+  active: () => boolean
+  read: (
+    query: {
+      order_by: "sequence_asc" | "sequence_desc"
+      limit: number
+      after_sequence?: number
+      wait_seconds?: number
+    },
+    signal: AbortSignal,
+  ) => Promise<EventScanPage & { has_more: boolean }>
+  onProgress: (progress: SessionProgress) => Promise<void>
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>
+}): Promise<void> {
+  let cursor: number | null = null
+  let backlog = false
+  let unchanged = 0
+  let wasActive = active()
+  while (!signal.aborted) {
+    try {
+      const initial = cursor === null
+      const previous = cursor ?? 0
+      const page = await read(
+        initial
+          ? { order_by: "sequence_desc", limit: 1 }
+          : {
+              order_by: "sequence_asc",
+              limit: 1000,
+              after_sequence: previous,
+              wait_seconds: backlog ? 0 : 10,
+            },
+        signal,
+      )
+      if (signal.aborted) return
+      cursor = eventScanCursor(page, previous)
+      const running = active()
+      const more = !initial && page.has_more
+      const terminalDrain = !running && (initial || wasActive) && !more
+      if (initial || cursor > previous || terminalDrain) {
+        await onProgress({ afterSequence: previous, throughSequence: cursor, terminalDrain })
+        if (signal.aborted) return
+      }
+      // A terminal transition must survive a multi-page backlog until its final read.
+      if (!more) wasActive = running
+      backlog = more
+      unchanged = cursor === previous && !initial ? unchanged + 1 : 0
+      if (!backlog) {
+        await sleep(running ? 1000 : waitingPollInterval(unchanged), signal)
+      }
+    } catch (error) {
+      if (signal.aborted) return
+      throw error
+    }
+  }
+}
+
+function progressDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const finish = () => {
+      clearTimeout(timer)
+      signal.removeEventListener("abort", finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ms)
+    signal.addEventListener("abort", finish, { once: true })
+  })
+}

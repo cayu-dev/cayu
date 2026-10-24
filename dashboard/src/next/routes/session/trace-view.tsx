@@ -3,15 +3,23 @@
  * session's events (turns, model steps, tool rounds, tool calls, commands, waits), the
  * selected span's detail, and the flat event log with the server's filters.
  */
+import { useQuery } from "@tanstack/react-query"
 import { ChevronRight, Copy, Radio, X } from "lucide-react"
-import { type ReactNode, useMemo, useState } from "react"
+import { type ReactNode, useEffect, useMemo, useState } from "react"
+import { MutationTransportStatus } from "@/components/dashboard/mutation-transport-status"
+import { useDashboardCapability } from "@/components/dashboard/server-contract"
+import { ApiClientError } from "@/lib/api"
+import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
+import type { SessionHistorySearch } from "@/lib/session-history-search"
 import { cn } from "@/lib/utils"
+import type { WorkflowSearch } from "@/lib/workflow-search"
 import { EVENT_CAP } from "../../api/paging"
 import type { SessionDetail, SessionEvent, SessionState } from "../../api/types"
 import type { SessionRow } from "../../app/queries"
 import { useEvents, useSessionState } from "../../app/queries"
-import { useNow } from "../../app/services"
+import { useApi, useNow, useServices } from "../../app/services"
 import { argPreview, isActive, type ToolDisplays } from "../../app/session-model"
+import { useTraceHistory } from "../../app/trace-history"
 import {
   buildTrace,
   findSpan,
@@ -22,8 +30,28 @@ import {
   type Span,
   type SpanStatus,
 } from "../../app/trace-model"
+import {
+  buildRuntimeTrace,
+  displayTraceValue,
+  mergeTracePages,
+  type TranscriptPosition,
+  traceSpanForPosition,
+} from "../../app/trace-runtime"
 import { ErrorState, NavLink, needsAttention, StateDot, sessionPath } from "../common"
+import { TraceEventLog } from "./trace-event-log"
+import { TraceWorkflow } from "./trace-workflow"
 
+export type TraceMutationObservation = {
+  label: string
+  snapshot: MutationTransportSnapshot | null
+  retryObservation?: () => void
+  retrying?: boolean
+}
+type TraceControls = {
+  mutationSnapshots?: TraceMutationObservation[]
+  onRetryInterruption?: () => void
+  retryInterruptionBusy?: boolean
+}
 type Payload = Record<string, unknown>
 const payload = (e: SessionEvent) => (e.payload ?? {}) as Payload
 const ts = (e: SessionEvent) => Date.parse((e as { timestamp: string }).timestamp)
@@ -49,6 +77,7 @@ const BAR: Record<Span["kind"], string> = {
   tool: "bg-foreground/45",
   exec: "bg-foreground/30",
   wait: "bg-warning/40",
+  knowledge: "bg-success/40",
 }
 const KIND_LABEL: Record<Span["kind"], string> = {
   session: "Session",
@@ -58,18 +87,25 @@ const KIND_LABEL: Record<Span["kind"], string> = {
   tool: "Tool call",
   exec: "Command",
   wait: "Waiting",
+  knowledge: "Knowledge lookup",
 }
 const STATUS_TEXT: Record<SpanStatus, string> = {
   ok: "text-success",
   error: "text-destructive",
   running: "text-info",
   waiting: "text-warning",
+  interrupted: "text-warning",
+  blocked: "text-warning",
+  unknown: "text-muted-foreground",
 }
 const STATUS_LABEL: Record<SpanStatus, string> = {
   ok: "OK",
   error: "Failed",
   running: "Running",
   waiting: "Waiting",
+  interrupted: "Interrupted",
+  blocked: "Blocked",
+  unknown: "Unknown",
 }
 
 /** A span's label in the waterfall: tool calls read like the conversation does. */
@@ -88,7 +124,40 @@ function spanLabel(s: Span, displays: ToolDisplays): { name: string; detail: str
   return { name: s.name, detail: s.detail }
 }
 
-export function TraceView({
+type TraceViewProps = Omit<
+  Parameters<typeof TraceViewContent>[0],
+  "traceEnabled" | "workflowEnabled" | "retryEnabled"
+>
+
+export function TraceView(props: TraceViewProps) {
+  const { prototype } = useServices()
+  return prototype ? (
+    <TraceViewContent
+      {...props}
+      traceEnabled={false}
+      workflowEnabled={false}
+      retryEnabled={false}
+    />
+  ) : (
+    <RuntimeTraceView {...props} />
+  )
+}
+
+function RuntimeTraceView(props: TraceViewProps) {
+  const trace = useDashboardCapability({ kind: "surface", surface: "session_trace" })
+  const workflow = useDashboardCapability({ kind: "surface", surface: "workflow" })
+  const retry = useDashboardCapability({ kind: "mutation", mutation: "session_interruption" })
+  return (
+    <TraceViewContent
+      {...props}
+      traceEnabled={trace.enabled}
+      workflowEnabled={workflow.enabled}
+      retryEnabled={retry.enabled}
+    />
+  )
+}
+
+function TraceViewContent({
   session,
   state,
   displays,
@@ -101,7 +170,24 @@ export function TraceView({
   onShowSpan,
   onLog,
   toolCallOrder,
-}: {
+  transcriptPosition,
+  onConversation,
+  historySearch = {},
+  onHistorySearch,
+  workflowSearch = {},
+  onWorkflowSearch,
+  mutationSnapshots,
+  onRetryInterruption,
+  retryInterruptionBusy,
+  traceEnabled,
+  workflowEnabled,
+  retryEnabled,
+  workflowOpen,
+}: TraceControls & {
+  traceEnabled: boolean
+  workflowEnabled: boolean
+  retryEnabled: boolean
+  workflowOpen?: boolean
   session: SessionDetail
   state: SessionState | undefined
   displays: ToolDisplays
@@ -117,21 +203,91 @@ export function TraceView({
   onLog: (log: boolean) => void
   /** The conversation's tool call IDs in order, to find a call when the server hides IDs. */
   toolCallOrder: string[]
+  historySearch?: SessionHistorySearch
+  onHistorySearch?: (search: SessionHistorySearch) => void
+  workflowSearch?: WorkflowSearch
+  onWorkflowSearch?: (search: WorkflowSearch) => void
+  transcriptPosition?: TranscriptPosition
+  onConversation?: (position: TranscriptPosition) => void
 }) {
   const now = useNow()
+  const api = useApi()
+  const { prototype } = useServices()
+  const runtime = useTraceHistory(session.id, traceEnabled)
+  const focusSequence = spanId?.match(
+    /^(?:interaction|model|round|tool|exec|wait|knowledge):(\d+)$/,
+  )?.[1]
+  const focused = useQuery({
+    queryKey: ["trace-focus", session.id, spanId, runtime.data?.page.session_instance_id],
+    enabled: traceEnabled && !!focusSequence && !!runtime.data?.page,
+    queryFn: ({ signal }) =>
+      api.trace!(
+        session.id,
+        {
+          after_sequence: Math.max(0, Number(focusSequence) - 1),
+          limit: 1,
+          session_instance_id: runtime.data?.page.session_instance_id,
+        },
+        signal,
+      ),
+  })
+  const runtimePage = useMemo(
+    () =>
+      runtime.data?.page && focused.data
+        ? mergeTracePages(runtime.data.page, focused.data)
+        : runtime.data?.page,
+    [runtime.data?.page, focused.data],
+  )
+  useEffect(() => {
+    if (
+      runtime.data?.hasMore &&
+      !runtime.loadingMore &&
+      !runtime.pageError &&
+      ((transcriptPosition && !traceSpanForPosition(runtime.data.page, transcriptPosition)) ||
+        (spanId &&
+          spanId !== "session" &&
+          !focused.isFetching &&
+          !runtimePage?.spans.some((span) => span.id === spanId)))
+    )
+      void runtime.loadMore()
+  }, [
+    transcriptPosition,
+    spanId,
+    runtime.data,
+    runtime.loadingMore,
+    runtime.pageError,
+    runtime.loadMore,
+    runtimePage,
+    focused.isFetching,
+  ])
+
   const active = isActive(state)
-  const events = useEvents(session.id, true, active)
+  const prototypeEvents = useEvents(session.id, !!prototype, active)
+  const events = prototype
+    ? prototypeEvents
+    : {
+        ...runtime,
+        data: runtime.data ? { events: runtimePage?.events ?? [], truncated: false } : undefined,
+      }
   const all = events.data?.events ?? []
   const trace = useMemo(
-    () => buildTrace(session.id, all, now(), state ? (TERMINAL[state] ?? null) : null),
-    [session.id, all, now, state],
+    () =>
+      runtimePage && !prototype
+        ? buildRuntimeTrace(runtimePage)
+        : buildTrace(session.id, all, now(), state ? (TERMINAL[state] ?? null) : null),
+    [session.id, all, now, state, runtimePage, prototype],
   )
   const selected = useMemo(() => {
+    if (transcriptPosition && runtime.data && !prototype) {
+      const exact = traceSpanForPosition(runtime.data.page, transcriptPosition)
+      if (exact) return findSpan(trace, exact) ?? trace
+    }
     if (!spanId) return trace
     const found = findSpan(trace, spanId)
     if (found) return found
     // Hidden IDs: the n-th tool call in the conversation is the n-th tool span.
-    const index = spanId.startsWith("tool:") ? toolCallOrder.indexOf(spanId.slice(5)) : -1
+    const index =
+      prototype && spanId.startsWith("tool:") ? toolCallOrder.indexOf(spanId.slice(5)) : -1
     if (index >= 0) {
       const tools: Span[] = []
       const walk = (s: Span) => {
@@ -143,7 +299,7 @@ export function TraceView({
       if (tools[index]) return tools[index]
     }
     return trace
-  }, [trace, spanId, toolCallOrder])
+  }, [trace, spanId, toolCallOrder, transcriptPosition, runtime.data, prototype])
   const spanOf = useMemo(() => {
     const map = new Map<string, Span>()
     const walk = (s: Span) => {
@@ -154,6 +310,13 @@ export function TraceView({
     return map
   }, [trace])
   const selectedEvent = eventId ? all.find((e) => e.id === eventId) : undefined
+
+  if (!prototype && !traceEnabled)
+    return (
+      <p className="p-6 text-sm text-muted-foreground">
+        Exact session traces are unavailable in this deployment.
+      </p>
+    )
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -185,7 +348,7 @@ export function TraceView({
           ))}
         </div>
         <span className="text-xs text-muted-foreground tabular-nums">
-          {all.length.toLocaleString()} events
+          {all.length.toLocaleString()} loaded events
           {trace.end ? ` · ${formatSpanDuration(trace.end - trace.start)}` : ""}
         </span>
         {events.data?.truncated && (
@@ -214,13 +377,69 @@ export function TraceView({
           </span>
         )}
       </div>
+      {!prototype && runtime.data?.hasMore && (
+        <button
+          type="button"
+          className="m-2 rounded border px-3 py-2 text-sm"
+          disabled={runtime.loadingMore}
+          onClick={() => void runtime.loadMore()}
+        >
+          {runtime.loadingMore ? "Loading history…" : "Load more trace history"}
+        </button>
+      )}
+      {!prototype && runtime.pageError != null && <ErrorState error={runtime.pageError} />}
+      {focused.error && <ErrorState error={focused.error} />}
+      {transcriptPosition &&
+        runtime.data &&
+        !traceSpanForPosition(runtime.data.page, transcriptPosition) && (
+          <p className="p-3 text-sm">
+            {runtime.data.hasMore
+              ? "Loading the linked transcript step…"
+              : "No retained exact span matches this transcript part."}
+          </p>
+        )}
       {events.error && (
         <div className="p-4">
           <ErrorState error={events.error} />
+          <button
+            type="button"
+            className="mt-2 rounded border px-3 py-2 text-sm"
+            onClick={() =>
+              events.error instanceof ApiClientError && events.error.status === 409
+                ? window.location.reload()
+                : void events.refetch()
+            }
+          >
+            {events.error instanceof ApiClientError && events.error.status === 409
+              ? "Reload session trace"
+              : "Retry trace update"}
+          </button>
         </div>
       )}
       {events.isPending && <p className="p-6 text-sm text-muted-foreground">Loading events…</p>}
-      {events.isSuccess && (
+      {!prototype && log && (
+        <TraceEventLog
+          key={session.id}
+          sessionId={session.id}
+          search={historySearch}
+          onSearch={onHistorySearch ?? (() => {})}
+          selected={eventId ?? historySearch.event_id}
+          onSelect={onSelectEvent}
+          renderDetail={(event, observedAt) => (
+            <RuntimeEventDetail
+              sessionId={session.id}
+              event={event}
+              sessionInstanceId={runtimePage?.session_instance_id}
+              observedAt={observedAt}
+              traceUnavailable={!!(runtime.error || runtime.pageError || focused.error)}
+              displays={displays}
+              onClose={() => onSelectEvent(undefined)}
+              onShowSpan={onShowSpan}
+            />
+          )}
+        />
+      )}
+      {events.data && (prototype || !log) && (
         <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
           <div className="min-h-0 min-w-0 flex-1 overflow-auto">
             {log ? (
@@ -253,6 +472,23 @@ export function TraceView({
                   session={session}
                   displays={displays}
                   subagents={subagents}
+                  onConversation={onConversation}
+                  controls={{
+                    mutationSnapshots,
+                    onRetryInterruption: retryEnabled ? onRetryInterruption : undefined,
+                    retryInterruptionBusy,
+                  }}
+                  workflowOpen={workflowOpen || !!workflowSearch.expanded_session_id?.length}
+                  workflow={
+                    !prototype && workflowEnabled && onWorkflowSearch ? (
+                      <TraceWorkflow
+                        key={session.id}
+                        sessionId={session.id}
+                        search={workflowSearch}
+                        onSearch={onWorkflowSearch}
+                      />
+                    ) : undefined
+                  }
                 />
               )}
             </aside>
@@ -274,9 +510,18 @@ function Waterfall({
   displays: ToolDisplays
   onSelect: (id: string) => void
 }) {
+  const now = useNow()
+  const [, tick] = useState(0)
+  useEffect(() => {
+    if (trace.status !== "running" && trace.status !== "waiting") return
+    const timer = setInterval(() => tick((value) => value + 1), 1000)
+    return () => clearInterval(timer)
+  }, [trace.status])
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set())
   const rows = flatten(trace, collapsed)
-  const total = Math.max(1, (trace.end ?? trace.start) - trace.start)
+  const displayEnd = (span: Span) =>
+    span.end ?? (span.status === "running" || span.status === "waiting" ? now() : span.start)
+  const total = Math.max(1, displayEnd(trace) - trace.start)
   const toggle = (id: string) =>
     setCollapsed((c) => {
       const next = new Set(c)
@@ -298,7 +543,7 @@ function Waterfall({
       {rows.map(({ span, depth }) => {
         const { name, detail } = spanLabel(span, displays)
         const left = ((span.start - trace.start) / total) * 100
-        const width = Math.max(0.4, (((span.end ?? span.start) - span.start) / total) * 100)
+        const width = Math.max(0.4, ((displayEnd(span) - span.start) / total) * 100)
         return (
           <div
             key={span.id}
@@ -349,15 +594,24 @@ function Waterfall({
               )}
             </span>
             <span className="relative h-3.5">
-              <span
-                className={cn(
-                  "absolute top-0 h-full rounded-sm",
-                  span.status === "error" ? "bg-destructive/70" : BAR[span.kind],
-                  span.status === "waiting" &&
-                    "bg-[repeating-linear-gradient(45deg,var(--warning)_0_4px,transparent_4px_8px)] opacity-60",
-                )}
-                style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}
-              />
+              {span.startKnown !== false && (
+                <span
+                  className={cn(
+                    "absolute top-0 h-full rounded-sm",
+                    span.status === "error"
+                      ? "bg-destructive/70"
+                      : span.status === "interrupted" || span.status === "blocked"
+                        ? "bg-warning/70"
+                        : BAR[span.kind],
+                    span.status === "waiting" &&
+                      "bg-[repeating-linear-gradient(45deg,var(--warning)_0_4px,transparent_4px_8px)] opacity-60",
+                  )}
+                  style={{
+                    left: `${Math.max(0, left)}%`,
+                    width: `${Math.max(0, Math.min(width, 100 - left))}%`,
+                  }}
+                />
+              )}
             </span>
             <span
               className={cn(
@@ -369,7 +623,9 @@ function Waterfall({
                     : "text-muted-foreground",
               )}
             >
-              {formatSpanDuration((span.end ?? span.start) - span.start)}
+              {span.startKnown === false
+                ? "Unknown"
+                : formatSpanDuration(displayEnd(span) - span.start)}
             </span>
           </div>
         )
@@ -388,9 +644,10 @@ function Fact({ k, children }: { k: string; children: ReactNode }) {
 }
 
 function Json({ value }: { value: unknown }) {
+  const shown = displayTraceValue(value)
   return (
     <pre className="max-h-72 overflow-auto rounded-md bg-muted p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words">
-      {typeof value === "string" ? value : JSON.stringify(value, null, 2)}
+      {typeof shown === "string" ? shown : JSON.stringify(shown, null, 2)}
     </pre>
   )
 }
@@ -409,16 +666,27 @@ function SpanDetail({
   session,
   displays,
   subagents,
+  onConversation,
+  workflow,
+  controls,
+  workflowOpen,
 }: {
+  workflowOpen?: boolean
   span: Span
+  controls?: TraceControls
+  workflow?: ReactNode
   session: SessionDetail
   displays: ToolDisplays
   subagents: SessionRow[]
+  onConversation?: (position: TranscriptPosition) => void
 }) {
   const of = (type: string) => span.events.find((e) => e.type === type)
   const facts: ReactNode[] = []
   const sections: ReactNode[] = []
-  const duration = formatSpanDuration((span.end ?? span.start) - span.start)
+  const duration =
+    span.startKnown === false
+      ? "Start not retained"
+      : formatSpanDuration((span.end ?? span.start) - span.start)
 
   if (span.kind === "session") {
     const started = payload(of("session.started") ?? ({} as SessionEvent))
@@ -452,6 +720,12 @@ function SpanDetail({
         </Section>,
       )
     }
+    if (workflow)
+      sections.push(
+        <WorkflowSection key="workflow" initiallyOpen={workflowOpen}>
+          {workflow}
+        </WorkflowSection>,
+      )
     sections.push(
       <Section key="subagents" title="Parent and subagent sessions">
         {session.parent_session_id && (
@@ -479,7 +753,7 @@ function SpanDetail({
           </NavLink>
         ))}
       </Section>,
-      <RuntimeInternals key="internals" sessionId={session.id} />,
+      <RuntimeInternals key="internals" sessionId={session.id} {...controls} />,
       <Section key="side" title="Side effects">
         <p className="text-sm text-muted-foreground">
           Outbox deliveries for these events come from{" "}
@@ -603,8 +877,21 @@ function SpanDetail({
           <Json value={p.result} />
         </Section>,
       )
+  } else if (span.kind === "knowledge") {
+    sections.push(
+      <Section key="knowledge" title="Knowledge lookup">
+        <Json value={payload(span.events[0] ?? ({} as SessionEvent))} />
+      </Section>,
+    )
   } else if (span.kind === "exec") {
     const done = payload(of("runner.exec.completed") ?? ({} as SessionEvent))
+    sections.push(
+      <Section key="command" title="Command evidence">
+        <Json
+          value={done.command ?? payload(of("runner.exec.started") ?? ({} as SessionEvent)).command}
+        />
+      </Section>,
+    )
     facts.push(
       <Fact key="cmd" k="Command">
         <span className="font-mono text-xs">{span.detail || "–"}</span>
@@ -628,7 +915,9 @@ function SpanDetail({
   }
 
   const copy = () => {
-    void navigator.clipboard?.writeText(JSON.stringify(span.events, null, 2)).catch(() => undefined)
+    void navigator.clipboard
+      ?.writeText(JSON.stringify(displayTraceValue(span.events), null, 2))
+      .catch(() => undefined)
   }
 
   return (
@@ -642,14 +931,29 @@ function SpanDetail({
           </span>
           <span className="tabular-nums">{duration}</span>
           <span className="tabular-nums">started {clock(span.start)}</span>
-          {span.kind === "tool" && (
-            <NavLink
-              to={sessionPath(session.id)}
-              search={{ view: "conversation" }}
-              className="text-foreground hover:underline"
+          {span.kind === "tool" && onConversation && span.transcriptLinks?.[0] ? (
+            <button
+              type="button"
+              className="underline"
+              onClick={() =>
+                onConversation({
+                  messageIndex: span.transcriptLinks![0]!.message_index,
+                  partIndex: span.transcriptLinks![0]!.part_index,
+                })
+              }
             >
               Show in conversation
-            </NavLink>
+            </button>
+          ) : (
+            span.kind === "tool" && (
+              <NavLink
+                to={sessionPath(session.id)}
+                search={{ view: "conversation" }}
+                className="text-foreground hover:underline"
+              >
+                Show in conversation
+              </NavLink>
+            )
           )}
         </p>
       </div>
@@ -683,7 +987,35 @@ function SpanDetail({
  * execution state and owner, snapshots, the interruption cascade, the provider operation,
  * and the mutation transport when the state reports it. Read from `/sessions/{id}/state`.
  */
-function RuntimeInternals({ sessionId }: { sessionId: string }) {
+function WorkflowSection({
+  initiallyOpen,
+  children,
+}: {
+  initiallyOpen?: boolean
+  children: ReactNode
+}) {
+  const [open, setOpen] = useState(!!initiallyOpen)
+  useEffect(() => {
+    if (initiallyOpen) setOpen(true)
+  }, [initiallyOpen])
+  return (
+    <details
+      className="rounded border"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="cursor-pointer p-3 text-sm">Session tree and causal usage</summary>
+      {open && children}
+    </details>
+  )
+}
+
+function RuntimeInternals({
+  sessionId,
+  mutationSnapshots = [],
+  onRetryInterruption,
+  retryInterruptionBusy,
+}: { sessionId: string } & TraceControls) {
   const [open, setOpen] = useState(false)
   const state = useSessionState(sessionId, open)
   const data = state.data
@@ -718,8 +1050,32 @@ function RuntimeInternals({ sessionId }: { sessionId: string }) {
                   ? `${data.execution.owner_kind}${data.execution.owner_label ? ` (${data.execution.owner_label})` : ""}`
                   : "none"}
               </Fact>
-              <Fact k="Mutation transport">{mutationTransport(data)}</Fact>
+              <Fact k="Mutation transport">
+                {mutationSnapshots.some((item) => item.snapshot)
+                  ? "Observed in this browser"
+                  : "No action observed in this browser"}
+              </Fact>
             </dl>
+            {mutationSnapshots.map((item) => (
+              <section key={item.label} aria-label={item.label}>
+                <h4 className="text-xs font-medium">{item.label}</h4>
+                <MutationTransportStatus
+                  snapshot={item.snapshot}
+                  onRetryObservation={item.retryObservation}
+                  retryingObservation={item.retrying}
+                />
+              </section>
+            ))}
+            {(cascade === "pending" || cascade === "failed") && onRetryInterruption && (
+              <button
+                type="button"
+                className="rounded border px-3 py-2 text-sm"
+                disabled={retryInterruptionBusy}
+                onClick={onRetryInterruption}
+              >
+                {retryInterruptionBusy ? "Retrying interruption…" : "Retry background interruption"}
+              </button>
+            )}
             <Section title="Execution">
               <Json value={data.execution} />
             </Section>
@@ -730,6 +1086,9 @@ function RuntimeInternals({ sessionId }: { sessionId: string }) {
                 <p className="text-xs text-muted-foreground">None recorded.</p>
               )}
             </Section>
+            <Section title="Complete runtime state">
+              <Json value={data} />
+            </Section>
             <Section title="Provider operation">
               <Json value={data.provider_operation} />
             </Section>
@@ -738,19 +1097,6 @@ function RuntimeInternals({ sessionId }: { sessionId: string }) {
       </div>
     </details>
   )
-}
-
-/**
- * The mutation transport phase, when the state read reports one. Today's
- * `/sessions/{id}/state` doesn't: the phase lives in the browser that submitted the
- * mutation, which this view doesn't track.
- */
-function mutationTransport(state: object): string {
-  const value = (state as { mutation_transport?: unknown }).mutation_transport
-  if (typeof value === "string" && value) return value
-  if (value && typeof value === "object" && "phase" in value && typeof value.phase === "string")
-    return value.phase
-  return "Unknown (not reported by the session state)"
 }
 
 function Section({
@@ -837,6 +1183,54 @@ function EventRow({ event }: { event: SessionEvent }) {
 }
 
 /** The event selected in the log: its fields, the span it belongs to, and its raw payload. */
+function RuntimeEventDetail({
+  sessionId,
+  sessionInstanceId,
+  observedAt,
+  traceUnavailable,
+  ...props
+}: Omit<Parameters<typeof EventDetail>[0], "span"> & {
+  sessionId: string
+  sessionInstanceId?: string
+  observedAt: number
+  traceUnavailable: boolean
+}) {
+  const api = useApi()
+  // /events has no incarnation field. Every fresh event observation must be
+  // verified by the bound trace read, including events already in the cached tree.
+  const query = useQuery({
+    queryKey: ["trace-event-span", sessionId, sessionInstanceId, props.event.id, observedAt],
+    enabled: !!sessionInstanceId && !traceUnavailable,
+    retry: false,
+    queryFn: ({ signal }) =>
+      api.trace!(
+        sessionId,
+        {
+          after_sequence: Math.max(0, props.event.sequence - 1),
+          session_instance_id: sessionInstanceId,
+          limit: 1,
+        },
+        signal,
+      ),
+  })
+  const verified =
+    !traceUnavailable &&
+    !query.isFetching &&
+    !query.error &&
+    query.data?.session_instance_id === sessionInstanceId
+      ? query.data
+      : undefined
+  const event = verified?.events.find((event) => event.id === props.event.id)
+  const exact = event && verified?.spans.find((span) => span.event_ids.includes(event.id))
+  const span = verified && exact ? findSpan(buildRuntimeTrace(verified), exact.id) : null
+  return (
+    <>
+      {query.error && <ErrorState error={query.error} />}
+      <EventDetail {...props} event={event ?? props.event} span={span} />
+    </>
+  )
+}
+
 function EventDetail({
   event,
   span,
@@ -859,7 +1253,9 @@ function EventDetail({
       (typeof v === "string" || typeof v === "number" || typeof v === "boolean"),
   )
   const copy = () => {
-    void navigator.clipboard?.writeText(JSON.stringify(event, null, 2)).catch(() => undefined)
+    void navigator.clipboard
+      ?.writeText(JSON.stringify(displayTraceValue(event), null, 2))
+      .catch(() => undefined)
   }
   return (
     <div className="space-y-4 p-4">

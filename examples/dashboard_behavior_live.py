@@ -2868,6 +2868,17 @@ async def _exercise_local_eval_acceptance(
         )
 
 
+async def _exercise_trace(page: Page, base_url: str, session_id: str) -> None:
+    """Acceptance entry for the dependent Session activation (not mounted here yet)."""
+    await page.goto(f"{base_url}/cayu/sessions/{session_id}?view=trace")
+    await expect(page.get_by_role("tree", name="Session trace")).to_be_visible()
+    await expect(page.get_by_text("Linked by event order", exact=False)).to_have_count(0)
+    await page.get_by_role("tab", name="Event log", exact=True).click()
+    await expect(page.get_by_label("Event ID", exact=True)).to_be_visible()
+    await page.get_by_role("button", name="Pause live tail", exact=True).click()
+    await expect(page.get_by_role("button", name="Resume live tail", exact=True)).to_be_visible()
+
+
 async def _exercise_workflow(
     page: Page,
     base_url: str,

@@ -10,3 +10,8 @@ When redistributing Cayu-derived source or compiled dashboard assets:
 - clearly mark Cayu-derived files that you modify.
 
 This guidance summarizes the normal dashboard workflow and does not replace the license terms.
+
+Dashboard modification note: the Trace implementation now includes exact server
+span identities, bounded event history, shared incremental observation, and the
+full workflow inspector as an embeddable component. Production Session activation
+is a separate dependent change; the existing routes remain available here.
