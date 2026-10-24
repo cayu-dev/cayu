@@ -87,6 +87,7 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.task_creation_supported,
                     mutation_supported=self.task_creation_supported,
                 ),
+                session_trace=_optional_surface(True, mutation_supported=False),
                 session_followups=_optional_surface(True, mutation_supported=True),
                 structured_output_transcript=_optional_surface(True, mutation_supported=False),
                 session_display_metadata=_optional_surface(True, mutation_supported=False),

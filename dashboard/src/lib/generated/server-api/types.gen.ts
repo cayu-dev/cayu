@@ -2293,6 +2293,66 @@ export type ApiToolSummary = {
 };
 
 /**
+ * ApiTraceSpan
+ */
+export type ApiTraceSpan = {
+    /**
+     * Ended At
+     */
+    ended_at: string | null;
+    /**
+     * Event Ids
+     */
+    event_ids: Array<string>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind: 'session' | 'interaction' | 'model' | 'round' | 'tool' | 'exec' | 'wait' | 'knowledge';
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Parent Id
+     */
+    parent_id: string | null;
+    /**
+     * Started At
+     */
+    started_at: string | null;
+    /**
+     * Status
+     */
+    status: 'unknown' | 'running' | 'waiting' | 'completed' | 'failed' | 'interrupted' | 'blocked';
+    /**
+     * Transcript Links
+     */
+    transcript_links: Array<ApiTraceTranscriptLink>;
+};
+
+/**
+ * ApiTraceTranscriptLink
+ */
+export type ApiTraceTranscriptLink = {
+    /**
+     * Message Index
+     */
+    message_index: number;
+    /**
+     * Part Index
+     */
+    part_index: number;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+};
+
+/**
  * ApiTranscriptMessage
  */
 export type ApiTranscriptMessage = {
@@ -4158,6 +4218,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_followups?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
     session_overview_queries?: OptionalSurfaceCapability | null;
+    session_trace?: OptionalSurfaceCapability | null;
     structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     task_creation?: OptionalSurfaceCapability | null;
@@ -17588,6 +17649,44 @@ export type SessionTopologyResponse = {
 };
 
 /**
+ * SessionTraceResponse
+ */
+export type SessionTraceResponse = {
+    /**
+     * Events
+     */
+    events: Array<ApiEventRecord>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Sequence
+     */
+    next_sequence: number;
+    /**
+     * Root Span Id
+     */
+    root_span_id: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+    /**
+     * Spans
+     */
+    spans: Array<ApiTraceSpan>;
+    /**
+     * Through Sequence
+     */
+    through_sequence: number;
+};
+
+/**
  * SessionTrajectoryBounds
  *
  * Global retained-evidence limits for one production-session trajectory.
@@ -25679,6 +25778,53 @@ export type GetSessionTopologyApiSessionsSessionIdTopologyPostResponses = {
 };
 
 export type GetSessionTopologyApiSessionsSessionIdTopologyPostResponse = GetSessionTopologyApiSessionsSessionIdTopologyPostResponses[keyof GetSessionTopologyApiSessionsSessionIdTopologyPostResponses];
+
+export type GetSessionTraceApiSessionsSessionIdTraceGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Session Instance Id
+         */
+        session_instance_id?: string | null;
+        /**
+         * After Sequence
+         */
+        after_sequence?: number;
+        /**
+         * Through Sequence
+         */
+        through_sequence?: number | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/sessions/{session_id}/trace';
+};
+
+export type GetSessionTraceApiSessionsSessionIdTraceGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionTraceApiSessionsSessionIdTraceGetError = GetSessionTraceApiSessionsSessionIdTraceGetErrors[keyof GetSessionTraceApiSessionsSessionIdTraceGetErrors];
+
+export type GetSessionTraceApiSessionsSessionIdTraceGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionTraceResponse;
+};
+
+export type GetSessionTraceApiSessionsSessionIdTraceGetResponse = GetSessionTraceApiSessionsSessionIdTraceGetResponses[keyof GetSessionTraceApiSessionsSessionIdTraceGetResponses];
 
 export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetData = {
     body?: never;

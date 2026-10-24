@@ -4694,6 +4694,132 @@
         "title": "ApiToolSummary",
         "type": "object"
       },
+      "ApiTraceSpan": {
+        "additionalProperties": false,
+        "properties": {
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "event_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Event Ids",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "session",
+              "interaction",
+              "model",
+              "round",
+              "tool",
+              "exec",
+              "wait",
+              "knowledge"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Id"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "enum": [
+              "unknown",
+              "running",
+              "waiting",
+              "completed",
+              "failed",
+              "interrupted",
+              "blocked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "transcript_links": {
+            "items": {
+              "$ref": "#/components/schemas/ApiTraceTranscriptLink"
+            },
+            "title": "Transcript Links",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "parent_id",
+          "kind",
+          "name",
+          "started_at",
+          "ended_at",
+          "status",
+          "event_ids",
+          "transcript_links"
+        ],
+        "title": "ApiTraceSpan",
+        "type": "object"
+      },
+      "ApiTraceTranscriptLink": {
+        "additionalProperties": false,
+        "properties": {
+          "message_index": {
+            "minimum": 0.0,
+            "title": "Message Index",
+            "type": "integer"
+          },
+          "part_index": {
+            "minimum": 0.0,
+            "title": "Part Index",
+            "type": "integer"
+          },
+          "tool_call_id": {
+            "title": "Tool Call Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_index",
+          "part_index",
+          "tool_call_id"
+        ],
+        "title": "ApiTraceTranscriptLink",
+        "type": "object"
+      },
       "ApiTranscriptMessage": {
         "additionalProperties": false,
         "properties": {
@@ -8495,6 +8621,16 @@
             ]
           },
           "session_overview_queries": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_trace": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -33253,7 +33389,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "58",
+            "default": "59",
             "title": "Contract Version",
             "type": "string"
           },
@@ -35083,6 +35219,63 @@
           "edges"
         ],
         "title": "SessionTopologyResponse",
+        "type": "object"
+      },
+      "SessionTraceResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ApiEventRecord"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_sequence": {
+            "minimum": 0.0,
+            "title": "Next Sequence",
+            "type": "integer"
+          },
+          "root_span_id": {
+            "title": "Root Span Id",
+            "type": "string"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_instance_id": {
+            "title": "Session Instance Id",
+            "type": "string"
+          },
+          "spans": {
+            "items": {
+              "$ref": "#/components/schemas/ApiTraceSpan"
+            },
+            "title": "Spans",
+            "type": "array"
+          },
+          "through_sequence": {
+            "minimum": 0.0,
+            "title": "Through Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_instance_id",
+          "root_span_id",
+          "through_sequence",
+          "next_sequence",
+          "has_more",
+          "events",
+          "spans"
+        ],
+        "title": "SessionTraceResponse",
         "type": "object"
       },
       "SessionTrajectoryBounds": {
@@ -40488,7 +40681,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "58",
+            "default": "59",
             "title": "Contract Version",
             "type": "string"
           }
@@ -49740,6 +49933,105 @@
           }
         },
         "summary": "Get Session Topology"
+      }
+    },
+    "/api/sessions/{session_id}/trace": {
+      "get": {
+        "operationId": "get_session_trace_api_sessions__session_id__trace_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_instance_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Instance Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "After Sequence",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "through_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Through Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTraceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Trace"
       }
     },
     "/api/sessions/{session_id}/transcript": {

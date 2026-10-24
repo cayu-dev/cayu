@@ -36,6 +36,7 @@ const MEMBER_READ_SURFACES = new Set([
   "pricing",
   "reviewed_knowledge",
   "session_follow",
+  "session_trace",
   "session_overview",
   "session_overview_queries",
   "task_creation",

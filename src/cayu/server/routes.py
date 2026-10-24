@@ -203,6 +203,7 @@ from cayu.server._session_overview import (
     register_session_overview_counts,
 )
 from cayu.server._session_overview_query import SessionOverviewSelection
+from cayu.server._session_trace import register_session_trace
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
@@ -407,6 +408,7 @@ from cayu.sessions.topology import (
     SessionTopologyStoreResult,
     decode_session_topology_cursor,
 )
+from cayu.sessions.trace import SessionTraceReader
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
@@ -8344,6 +8346,18 @@ def create_router(
         if not records:
             raise HTTPException(status_code=404, detail="Interaction not found")
         return _serialize_interaction_record(cayu_app, records[0])
+
+    register_session_trace(
+        router,
+        protected=protected,
+        resolve_session=_resolve_public_session_id,
+        reader=SessionTraceReader(
+            session_store,
+            project_event=lambda record: _serialize_event_record(cayu_app, record),
+            project_part=lambda part: _serialize_message_part(cayu_app, part),
+            project_session=cayu_app.project_session_id_for_exposure,
+        ),
+    )
 
     @router.get(
         "/sessions/{session_id}/events",

@@ -2903,6 +2903,37 @@ CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
+class ApiTraceTranscriptLink(ApiBaseModel):
+    message_index: StrictInt = Field(ge=0)
+    part_index: StrictInt = Field(ge=0)
+    tool_call_id: str
+
+
+class ApiTraceSpan(ApiBaseModel):
+    id: str
+    parent_id: str | None
+    kind: Literal["session", "interaction", "model", "round", "tool", "exec", "wait", "knowledge"]
+    name: str
+    started_at: str | None
+    ended_at: str | None
+    status: Literal[
+        "unknown", "running", "waiting", "completed", "failed", "interrupted", "blocked"
+    ]
+    event_ids: list[str]
+    transcript_links: list[ApiTraceTranscriptLink]
+
+
+class SessionTraceResponse(ApiBaseModel):
+    session_id: str
+    session_instance_id: str
+    root_span_id: str
+    through_sequence: StrictInt = Field(ge=0)
+    next_sequence: StrictInt = Field(ge=0)
+    has_more: StrictBool
+    events: list[ApiEventRecord]
+    spans: list[ApiTraceSpan]
+
+
 class ListSessionEventsResponse(ApiBaseModel):
     session_id: str
     events: list[ApiEventRecord]

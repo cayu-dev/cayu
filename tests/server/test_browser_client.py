@@ -199,6 +199,9 @@ const {connect} = await import(pathToFileURL(process.argv[1]));
 const contract = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 const options = {apiBaseUrl:'http://localhost/api', fetch:async()=>new Response(JSON.stringify(contract), {headers:{'content-type':'application/json'}})};
 const connected = await connect(options);
+if (connected.contract.capabilities.surfaces.session_trace?.read?.enabled !== true || connected.contract.capabilities.surfaces.session_trace?.mutate?.enabled !== false) {
+  throw new Error('Shipped client must retain the read-only trace capability');
+}
 if (connected.contract.capabilities.surfaces.session_followups?.mutate?.enabled !== true) {
   throw new Error('Shipped client must retain the follow-up capability');
 }

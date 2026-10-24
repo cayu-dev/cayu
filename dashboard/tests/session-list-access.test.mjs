@@ -5,6 +5,7 @@ import { applyViewerAccess } from "../src/lib/dashboard-access.ts"
 test("members read canonical session list surfaces but cannot start", () => {
   const member = { role: "member", full_access: false }
   for (const surface of [
+    "session_trace",
     "session_overview",
     "session_overview_queries",
     "session_display_metadata",

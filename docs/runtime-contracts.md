@@ -20132,3 +20132,41 @@ The HTTP filtered count is always null, including an exhausted or empty page.
 See [Session overview](control-plane.md#session-overview) for public pagination
 and capability behavior. No store extension method or new persistent index is
 required.
+
+### Exact session trace reads
+
+Server contract 59 advertises `capabilities.surfaces.session_trace`.
+`GET /api/sessions/{session_id}/trace` is a read-only control-plane projection,
+including for the member role. It reconstructs span relationships from durable
+private model, tool-round, tool-call and command identities. The response contains
+public span IDs, projected event records and transcript tool-call links; none of
+these add mutation authority. Event content uses the same projection as the
+session events endpoint, including withheld values.
+
+A trace page contains at most 1,000 events. Pass `after_sequence` to advance and
+retain `through_sequence` to traverse the same upper sequence boundary. The
+response's `has_more` and `next_sequence` describe event traversal, not a claim
+that the page contains the whole session. Ancestor spans accompany selected
+spans; clients merge spans by ID and event records by durable sequence. A later
+page can update a span's outcome and end time. There is no 10,000-event history
+cap. A cursor at or beyond the chosen/current cutoff returns an empty event page
+with `has_more=false` and retains the requested `next_sequence`, including after
+retained history shrinks. Event-log filters and live long-polling continue to use the session events
+endpoint's existing filter and `wait_seconds` contracts.
+
+Span IDs are public durable sequence anchors scoped to the session incarnation.
+Clients retain `session_instance_id` and pass it on continuation reads; a changed
+incarnation returns 409 rather than joining histories from reused session names.
+An incarnation change during a read also returns 409. Anchors survive storage
+reopen without requiring an authority-alias keyring. They describe retained
+history: removing their source records removes that evidence. An absent non-session start
+record produces a null start time rather than inventing an exact duration.
+
+The tree includes session, interaction, model, tool-round, tool-call, command and
+human-wait spans. `knowledge.lookup` is an instantaneous knowledge span. Tool-call
+transcript links contain the message index, content-part index and the projected
+tool-call ID used by transcript reads. Tool rounds are completed only using the
+completed model's durable transcript call set and each call's terminal evidence,
+not the subset of calls visible on the current event page. Missing linkage remains
+unlinked rather than being matched by event order. User-input and approval waits
+retain their request identity when answered or decided.
