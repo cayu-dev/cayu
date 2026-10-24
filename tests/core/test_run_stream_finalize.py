@@ -11,10 +11,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -779,3 +778,38 @@ def test_completed_run_stream_close_is_a_no_op() -> None:
     assert session.status == SessionStatus.COMPLETED
     events = asyncio.run(h.store.load_events("sess_completed_close"))
     assert not [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
+
+
+@pytest.mark.parametrize("operation", ["materialize_deferred_interaction_input", "load"])
+def test_setup_stream_close_propagates_interruption_store_failure(monkeypatch, operation):
+    h = _build([_batch("unreached")])
+
+    async def scenario():
+        stream = h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="setup-close-store-failure",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        assert (await anext(stream)).type is EventType.INTERACTION_STARTED
+        failure = RuntimeError("setup interruption store failed")
+        calls = 0
+        original = getattr(h.store, operation)
+
+        async def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise failure
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(h.store, operation, fail_once)
+        with pytest.raises(RuntimeError, match="setup interruption store failed") as caught:
+            await stream.aclose()
+        assert caught.value is failure
+        assert isinstance(caught.value.__cause__, GeneratorExit)
+        assert calls >= 1
+        assert h.provider.requests == []
+
+    asyncio.run(scenario())

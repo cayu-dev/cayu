@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -1415,5 +1415,227 @@ def test_worker_default_does_not_tighten_subagents_or_workflow_anchors(bounded):
         anchor = await app.session_store.load("anchor")
         assert anchor.execution_deadline.expires_at == boundary.expires_at
         await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("late_cancellation", [False, True])
+def test_setup_interruption_cleanup_preserves_deadline_stream_cancellation(late_cancellation):
+    from cayu.deadlines import _TIMERS, deadline_stream
+    from cayu.runtime._session_engine import _settle_setup_interruption
+
+    async def scenario():
+        boundary = ExecutionDeadline.after(60)
+        cleaned = False
+        caller = asyncio.current_task()
+
+        async def producer():
+            nonlocal cleaned
+            try:
+                # Expiry observed between producer events adds a checkpoint.
+                # Caller cancellation arrives there, while the producer is suspended.
+                boundary._expired_observed = True
+                if not late_cancellation:
+                    caller.cancel("caller")
+                yield "setup"
+            finally:
+
+                async def finalize():
+                    nonlocal cleaned
+                    # Interruption finalization normalizes its own task's state.
+                    task = asyncio.current_task()
+                    while task.cancelling():
+                        task.uncancel()
+                    if late_cancellation:
+                        caller.cancel("caller")
+                    # The run timer fires while that finalization is in progress.
+                    timer, _ = _TIMERS.get()[-1]
+                    timer.reschedule(asyncio.get_running_loop().time())
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    cleaned = True
+
+                await _settle_setup_interruption(finalize)
+
+        with pytest.raises(asyncio.CancelledError, match="caller"):
+            async for _ in deadline_stream(producer(), boundary):
+                pass
+        assert cleaned
+
+    asyncio.run(scenario())
+
+
+def test_run_setup_cancellation_survives_deadline_during_finalization(monkeypatch):
+    from cayu.deadlines import _TIMERS
+    from cayu.sessions.outcomes import run_to_completion
+
+    async def scenario():
+        app, _ = _app()
+        boundary = ExecutionDeadline.after(60)
+        run = app._session_engine.run
+        finalize = app._session_finalization.handle_session_interrupted
+        finalized = False
+
+        async def cancel_after_setup(**kwargs):
+            injected = False
+            async with aclosing(run(**kwargs)) as stream:
+                async for event in stream:
+                    if not injected:
+                        injected = True
+                        current_execution_deadline()._expired_observed = True
+                        asyncio.current_task().cancel("setup caller")
+                    yield event
+
+        async def finalize_with_run_expiry(**kwargs):
+            nonlocal finalized
+            timer, _ = _TIMERS.get()[-1]
+            timer.reschedule(asyncio.get_running_loop().time())
+            async for event in finalize(**kwargs):
+                yield event
+            finalized = True
+
+        monkeypatch.setattr(app._session_engine, "run", cancel_after_setup)
+        monkeypatch.setattr(
+            app._session_finalization, "handle_session_interrupted", finalize_with_run_expiry
+        )
+        try:
+            task = asyncio.create_task(
+                run_to_completion(
+                    app,
+                    RunRequest(
+                        agent_name="worker",
+                        session_id="setup-cancel",
+                        messages=[],
+                        execution_deadline=boundary,
+                    ),
+                )
+            )
+            with pytest.raises(asyncio.CancelledError, match="setup caller"):
+                await task
+            assert finalized
+            session = await app.session_store.load("setup-cancel")
+            assert session.status is SessionStatus.INTERRUPTED
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("prestarted", [False, True])
+@pytest.mark.parametrize("exit_kind", ["deadline", "close"])
+def test_deadline_stream_keeps_producer_context_and_task_through_cleanup(prestarted, exit_kind):
+    from contextvars import ContextVar
+
+    from cayu.deadlines import deadline_stream
+
+    async def scenario():
+        state = ContextVar("workflow_state", default="outside")
+        boundary = ExecutionDeadline.after(60)
+        owner = asyncio.current_task()
+        cleaned = False
+
+        async def producer():
+            nonlocal cleaned
+            token = state.set("inside")
+            try:
+                yield "first"
+                assert asyncio.current_task() is owner
+                assert state.get() == "inside"
+                yield "second"
+            finally:
+                assert asyncio.current_task() is owner
+                state.reset(token)
+                cleaned = True
+
+        source = producer()
+        if prestarted:
+            assert await anext(source) == "first"
+        stream = deadline_stream(source, boundary)
+        if not prestarted:
+            assert await anext(stream) == "first"
+        assert await anext(stream) == "second"
+        if exit_kind == "deadline":
+            boundary._expired_observed = True
+            with pytest.raises(ExecutionDeadlineExceeded):
+                await anext(stream)
+        else:
+            await stream.aclose()
+        assert cleaned
+        assert state.get() == "outside"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("external_cancellation", [False, True])
+def test_deadline_stream_cleanup_error_keeps_primary_failure_catchable(external_cancellation):
+    from cayu.deadlines import deadline_stream
+
+    async def scenario():
+        boundary = ExecutionDeadline.after(60)
+        cleanup_error = RuntimeError("cleanup store write failed")
+
+        async def producer():
+            try:
+                yield "first"
+                if external_cancellation:
+                    boundary._expired_observed = True
+                    asyncio.current_task().cancel("caller")
+                yield "second"
+            finally:
+                raise cleanup_error
+
+        stream = deadline_stream(producer(), boundary)
+        assert await anext(stream) == "first"
+        if external_cancellation:
+            expected = asyncio.CancelledError
+        else:
+            boundary._expired_observed = True
+            expected = ExecutionDeadlineExceeded
+        with pytest.raises(expected) as caught:
+            await anext(stream)
+        if external_cancellation:
+            assert str(caught.value) == "caller"
+        else:
+            assert isinstance(caught.value, Exception)
+            assert asyncio.current_task().cancelling() == 0
+        causes = []
+        cause = caught.value
+        while cause is not None and cause not in causes:
+            causes.append(cause)
+            cause = cause.__cause__
+        assert cleanup_error in causes
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_setup_interruption_preserves_concurrent_cancellation_and_cleanup_failure(fatal):
+    from cayu._exception_groups import iter_exception_tree
+    from cayu.runtime._session_engine import _settle_setup_interruption
+
+    async def scenario():
+        caller = asyncio.current_task()
+        failure = SystemExit("cleanup control") if fatal else RuntimeError("cleanup failed")
+        cleaned = False
+
+        async def finalize():
+            nonlocal cleaned
+            caller.cancel("caller")
+            await asyncio.sleep(0)
+            cleaned = True
+            raise failure
+
+        expected = BaseExceptionGroup if fatal else asyncio.CancelledError
+        with pytest.raises(expected) as caught:
+            await _settle_setup_interruption(finalize)
+        assert cleaned
+        assert caller.cancelling() == 1
+        if fatal:
+            leaves = list(iter_exception_tree(caught.value))
+            assert failure in leaves
+            assert any(isinstance(part, asyncio.CancelledError) for part in leaves)
+        else:
+            assert str(caught.value) == "caller"
+            assert caught.value.__cause__ is failure
 
     asyncio.run(scenario())

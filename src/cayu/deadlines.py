@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -484,12 +484,12 @@ async def deadline_stream(
                         current_execution_deadline().require_admission("execution_completion")
                 except StopAsyncIteration:
                     return
-                except BaseException:
+                except BaseException as failure:
                     # Producer cleanup classifies an owned deadline while its
                     # timer is still live, including expiry between phases.
                     close = getattr(iterator, "aclose", None)
                     if close is not None:
-                        await close()
+                        await _close_after_deadline_failure(close, failure)
                     raise
             yield item
     finally:
@@ -497,6 +497,26 @@ async def deadline_stream(
         if close is not None:
             with bind_execution_deadline(deadline):
                 await close()
+
+
+async def _close_after_deadline_failure(
+    close: Callable[[], Awaitable[None]], failure: BaseException
+) -> None:
+    # The iterator may hold ContextVar tokens or task-bound context managers
+    # across yields, so close it in the same task that advanced it. Runtime
+    # interruption settlement isolates its fresh cleanup work separately.
+    try:
+        await close()
+    except BaseException as cleanup_failure:
+        if isinstance(cleanup_failure, Exception) or (
+            isinstance(failure, asyncio.CancelledError)
+            and isinstance(cleanup_failure, asyncio.CancelledError)
+        ):
+            # Keep the primary cancellation bare so an owning asyncio.timeout
+            # can translate it. Ordinary cleanup failures remain as evidence,
+            # not a synthetic process-control group that skips except Exception.
+            raise failure from cleanup_failure
+        raise
 
 
 def resumed_execution_deadline(stored: ExecutionDeadline) -> ExecutionDeadline:

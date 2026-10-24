@@ -570,6 +570,28 @@ from cayu.workspaces.observation_recovery import (
 logger = logging.getLogger(__name__)
 
 
+async def _settle_setup_interruption(operation: Callable[[], Awaitable[None]]) -> None:
+    """Join fresh interruption work without normalizing its caller's requests."""
+    cleanup = asyncio.create_task(
+        capture_awaitable_outcome(operation), name="cayu-setup-interruption-cleanup"
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            await asyncio.wait((cleanup,))
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+    failure = cleanup.result().error
+    if cancellation is not None:
+        if failure is not None and not isinstance(failure, (Exception, asyncio.CancelledError)):
+            raise BaseExceptionGroup(
+                "Setup interruption failure and caller cancellation.", [failure, cancellation]
+            )
+        raise cancellation from failure
+    if failure is not None:
+        raise failure
+
+
 @dataclass(frozen=True, slots=True)
 class _QueuedCompletionResult:
     outcome: Literal["continue", "complete", "stopped"]
@@ -2507,30 +2529,54 @@ class SessionEngine:
                 raise propagated_failure from None
             raise
         except GeneratorExit as abandonment:
-            # This window is outside _run_session's own finalizer. Publish the
-            # interaction closure and session interruption through the same
-            # atomic boundary used by ordinary interruption.
-            await self.session_store.materialize_deferred_interaction_input(session.id)
-            current_session = await self.session_store.load(session.id)
-            if current_session is not None:
-                try:
-                    async for _ in self._session_finalization.handle_session_interrupted(
-                        session=current_session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=_environment_name(registered_environment),
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                    ):
-                        pass
-                except Exception as finalization_failure:
-                    _raise_primary_with_secondary_failure(
-                        abandonment,
-                        finalization_failure,
-                        group_message=(
-                            "Setup stream abandonment and interaction terminalization failure."
-                        ),
-                    )
+            # The producer closes in its original task and Context. Only this
+            # fresh interruption operation runs separately: its cancellation
+            # normalization must not consume the stream caller's requests.
+            source_task = asyncio.current_task()
+            terminal_events: list[Event] = []
+            setup_prepared = False
+
+            async def finalize_closed_setup() -> None:
+                nonlocal setup_prepared
+                await self.session_store.materialize_deferred_interaction_input(session.id)
+                current_session = await self.session_store.load(session.id)
+                if current_session is None:
+                    return
+                setup_prepared = True
+                async for event in self._session_finalization.handle_session_interrupted(
+                    session=current_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    terminal_finalization_handoff_source_task=source_task,
+                ):
+                    if event.type in {
+                        EventType.SESSION_COMPLETED,
+                        EventType.SESSION_FAILED,
+                        EventType.SESSION_INTERRUPTED,
+                    }:
+                        terminal_events.append(event)
+
+            try:
+                await _settle_setup_interruption(finalize_closed_setup)
+            except Exception as finalization_failure:
+                if not setup_prepared:
+                    # aclose() suppresses GeneratorExit, including its cause.
+                    # Preparation errors must escape if interruption was never
+                    # attempted; retain the existing finalization contract below.
+                    raise finalization_failure from abandonment
+                _raise_primary_with_secondary_failure(
+                    abandonment,
+                    finalization_failure,
+                    group_message=(
+                        "Setup stream abandonment and interaction terminalization failure."
+                    ),
+                )
+            finally:
+                for event in terminal_events:
+                    _mark_session_invocation_terminal_event(event)
             raise
         finally:
             finalizer_failure = sys.exception()
