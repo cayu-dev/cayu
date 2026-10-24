@@ -30,7 +30,7 @@ export function ChildActions({ sessionId, agentName }: { sessionId?: string; age
       <label className="block text-sm">
         Search child actions
         <input
-          className="mt-1 block w-full rounded border border-input bg-background px-2 py-1"
+          className="mt-1 block h-8 w-full rounded-lg border border-input bg-background px-2.5 text-sm"
           value={search}
           onChange={(event) => {
             setSearch(event.target.value)
@@ -40,7 +40,11 @@ export function ChildActions({ sessionId, agentName }: { sessionId?: string; age
       </label>
       {query.error && <ErrorState error={query.error} />}
       {query.data?.issues?.map((issue) => (
-        <p key={`${issue.code}-${issue.session_id ?? ""}-${issue.detail}`} role="status">
+        <p
+          key={`${issue.code}-${issue.session_id ?? ""}-${issue.detail}`}
+          role="status"
+          className="[overflow-wrap:anywhere]"
+        >
           {issue.detail}
           {issue.session_id && (
             <NavLink to={sessionPath(issue.session_id)} className="ml-2 underline">
@@ -53,7 +57,7 @@ export function ChildActions({ sessionId, agentName }: { sessionId?: string; age
         <NavLink
           key={`${action.session.id}-${action.attention_id}-${action.tool_call_id}`}
           to={sessionPath(action.delegated_action?.child_session_id ?? action.session.id)}
-          className="block rounded border border-border p-3 text-sm hover:bg-muted/60"
+          className="block [overflow-wrap:anywhere] rounded border border-border p-3 text-sm hover:bg-muted/60"
         >
           {action.session.id} · {action.tool_name ?? action.kind} · Open child
         </NavLink>

@@ -58,7 +58,7 @@ export function Composer({
             send()
           }
         }}
-        className="block max-h-40 min-w-0 flex-1 resize-none bg-transparent py-1 text-sm outline-none placeholder:text-muted-foreground"
+        className="grouped-field-input block max-h-40 min-w-0 flex-1 resize-none bg-transparent py-1 text-sm outline-none placeholder:text-muted-foreground"
       />
       {running && onStop && (
         <Button size="icon-sm" className="rounded-full" aria-label="Stop" onClick={onStop}>

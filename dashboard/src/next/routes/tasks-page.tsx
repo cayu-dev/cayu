@@ -172,7 +172,7 @@ export function TasksPage() {
         </fieldset>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <label className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-background px-2.5 text-sm focus-within:border-ring sm:max-w-sm">
+          <label className="flex h-8 w-full min-w-0 flex-none items-center gap-2 rounded-lg border border-input bg-background px-2.5 text-sm focus-within:border-ring sm:max-w-sm sm:min-w-56 sm:flex-[1_1_14rem]">
             <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
             <span className="sr-only">Search tasks</span>
             <input
@@ -184,7 +184,7 @@ export function TasksPage() {
               }}
               onBlur={(e) => set({ q: e.currentTarget.value || undefined })}
               placeholder="Search by title, ID, session or reason"
-              className="w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
+              className="grouped-field-input w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
             />
           </label>
           {

@@ -116,7 +116,7 @@ export function ToolsPage() {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search by name, description or specialist"
-            className="w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
+            className="grouped-field-input w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
           />
         </label>
         {(specialists.error || usage.error) && (

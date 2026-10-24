@@ -5,7 +5,7 @@
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { useParams } from "@tanstack/react-router"
-import { ChevronRight, Copy, Ellipsis, Flag, Hand, Pause, Play } from "lucide-react"
+import { ChevronRight, Copy, Flag, Hand, Pause, Play } from "lucide-react"
 import { type ReactNode, useState } from "react"
 import { useViewer } from "@/components/dashboard/viewer"
 import { Button, buttonVariants } from "@/components/ui/button"
@@ -23,7 +23,16 @@ import {
   when,
 } from "../app/task-model"
 import { useTaskAttempts, useTaskLinks, useTaskRelationPage } from "../app/task-queries"
-import { ErrorState, NavLink, PageBody, StateBadge, sessionPath, TopBar, taskPath } from "./common"
+import {
+  ActionsMenu,
+  ErrorState,
+  NavLink,
+  PageBody,
+  StateBadge,
+  sessionPath,
+  TopBar,
+  taskPath,
+} from "./common"
 import { ValueView } from "./session/value-view"
 import { TaskActions } from "./task-actions"
 import { GROUP_DOT, GROUP_TEXT } from "./tasks-page"
@@ -219,61 +228,45 @@ function TaskPageView({ taskId }: { taskId: string }) {
                 Open session
               </NavLink>
             )}
-            <div className="relative">
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                aria-label="More actions"
-                aria-expanded={menuOpen}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") setMenuOpen(false)
-                }}
-                onClick={() => setMenuOpen(!menuOpen)}
-              >
-                <Ellipsis />
-              </Button>
-              {menuOpen && (
-                <div className="absolute top-9 right-0 z-20 w-60 rounded-lg border border-border bg-popover p-1 text-sm shadow-lg">
-                  {writable &&
-                    HOLDS.map(({ hold: h, label, icon: Icon }) => (
-                      <button
-                        key={h}
-                        type="button"
-                        disabled={!holdable(task)}
-                        onClick={() => {
-                          setHolding(h)
-                          setMenuOpen(false)
-                        }}
-                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-                      >
-                        <Icon className="size-4" aria-hidden="true" />
-                        {label}
-                      </button>
-                    ))}
-                  {writable && !holdable(task) && (
-                    <p className="px-2 py-1 text-xs text-muted-foreground">
-                      {held
-                        ? "Already held. Resume it first."
-                        : task.status === "running"
-                          ? "A running session can't be held; stop the session instead."
-                          : "Finished tasks can't be held."}
-                    </p>
-                  )}
-                  <div className="my-1 border-t border-border" />
+            <ActionsMenu open={menuOpen} onOpenChange={setMenuOpen}>
+              {writable &&
+                HOLDS.map(({ hold: h, label, icon: Icon }) => (
                   <button
+                    key={h}
                     type="button"
+                    disabled={!holdable(task)}
                     onClick={() => {
-                      void navigator.clipboard?.writeText(task.id).catch(() => undefined)
+                      setHolding(h)
                       setMenuOpen(false)
                     }}
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
                   >
-                    <Copy className="size-4" aria-hidden="true" />
-                    Copy task ID
+                    <Icon className="size-4" aria-hidden="true" />
+                    {label}
                   </button>
-                </div>
+                ))}
+              {writable && !holdable(task) && (
+                <p className="px-2 py-1 text-xs text-muted-foreground">
+                  {held
+                    ? "Already held. Resume it first."
+                    : task.status === "running"
+                      ? "A running session can't be held; stop the session instead."
+                      : "Finished tasks can't be held."}
+                </p>
               )}
-            </div>
+              <div className="my-1 border-t border-border" />
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(task.id).catch(() => undefined)
+                  setMenuOpen(false)
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+              >
+                <Copy className="size-4" aria-hidden="true" />
+                Copy task ID
+              </button>
+            </ActionsMenu>
           </>
         }
       >

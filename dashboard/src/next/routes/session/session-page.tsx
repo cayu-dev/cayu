@@ -3,7 +3,6 @@ import { useParams, useSearch } from "@tanstack/react-router"
 import {
   ChevronRight,
   Copy,
-  Ellipsis,
   FlaskConical,
   GitBranch,
   PanelRight,
@@ -65,6 +64,7 @@ import { useSessionProgress } from "../../app/session-progress"
 import { useSessionRelations } from "../../app/session-relations"
 import { toolSpanId } from "../../app/trace-model"
 import {
+  ActionsMenu,
   ErrorState,
   EvalTrialTag,
   LabelChips,
@@ -74,6 +74,7 @@ import {
   TopBar,
   useGo,
 } from "../common"
+import { selectClassName } from "../session-filters"
 import { AddToEvalsDialog } from "./add-to-evals"
 import { Composer } from "./composer"
 import { Conversation, SubagentRows } from "./conversation"
@@ -156,6 +157,7 @@ export function SessionPage({
   const relations = useSessionRelations(sessionId, detail.data?.parent_session_id)
   const specialists = useSpecialists()
   const [menuOpen, setMenuOpen] = useState(false)
+  const detailsOpener = useRef<HTMLButtonElement>(null)
   const [prototypeEvals, setPrototypeEvals] = useState(false)
   const endRef = useRef<HTMLDivElement>(null)
 
@@ -401,6 +403,26 @@ export function SessionPage({
                 className="mr-1 flex rounded-lg border border-border p-0.5"
                 role="tablist"
                 aria-label="Session view"
+                onKeyDown={(event) => {
+                  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return
+                  const tabs = Array.from(
+                    event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                      'button[role="tab"]:not(:disabled)',
+                    ),
+                  )
+                  const current = tabs.indexOf(event.target as HTMLButtonElement)
+                  if (current < 0) return
+                  event.preventDefault()
+                  const next =
+                    event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? tabs.length - 1
+                        : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) %
+                          tabs.length
+                  tabs[next]?.click()
+                  tabs[next]?.focus()
+                }}
               >
                 {(
                   [
@@ -413,6 +435,7 @@ export function SessionPage({
                     type="button"
                     role="tab"
                     aria-selected={(value === "trace") === trace}
+                    tabIndex={(value === "trace") === trace ? 0 : -1}
                     onClick={() =>
                       setSearch({
                         view: value,
@@ -432,6 +455,7 @@ export function SessionPage({
               <Button
                 variant="ghost"
                 size="icon-sm"
+                ref={detailsOpener}
                 aria-label="Session details"
                 aria-pressed={!!panel}
                 className={cn(panel && "bg-muted")}
@@ -439,70 +463,56 @@ export function SessionPage({
               >
                 <PanelRight />
               </Button>
-              <div className="relative">
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label="More actions"
-                  aria-expanded={menuOpen}
-                  onClick={() => setMenuOpen(!menuOpen)}
-                >
-                  <Ellipsis />
-                </Button>
-                <div
-                  hidden={!menuOpen}
-                  className="absolute top-9 right-0 z-20 w-56 rounded-lg border border-border bg-popover p-1 text-sm shadow-lg"
-                >
-                  {canExecute && (
-                    <MenuItem
-                      icon={RotateCw}
-                      label={
-                        runAgain.isPending
-                          ? "Starting…"
-                          : replayAcceptance?.phase === "unknown"
-                            ? "Retry task replay"
-                            : "Run again"
-                      }
-                      disabled={runAgain.isPending}
-                      onClick={() => runAgain.mutate()}
-                    />
-                  )}
+              <ActionsMenu open={menuOpen} onOpenChange={setMenuOpen}>
+                {canExecute && (
                   <MenuItem
-                    icon={Copy}
-                    label="Copy session ID"
-                    onClick={() => {
-                      void navigator.clipboard?.writeText(sessionId).catch(() => undefined)
-                      setMenuOpen(false)
-                    }}
+                    icon={RotateCw}
+                    label={
+                      runAgain.isPending
+                        ? "Starting…"
+                        : replayAcceptance?.phase === "unknown"
+                          ? "Retry task replay"
+                          : "Run again"
+                    }
+                    disabled={runAgain.isPending}
+                    onClick={() => runAgain.mutate()}
                   />
+                )}
+                <MenuItem
+                  icon={Copy}
+                  label="Copy session ID"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(sessionId).catch(() => undefined)
+                    setMenuOpen(false)
+                  }}
+                />
+                <MenuItem
+                  icon={GitBranch}
+                  label="Open trace"
+                  onClick={() => {
+                    setMenuOpen(false)
+                    openTrace()
+                  }}
+                />
+                {!!services.prototype && finished && (
                   <MenuItem
-                    icon={GitBranch}
-                    label="Open trace"
+                    icon={FlaskConical}
+                    label="Add to evals"
                     onClick={() => {
                       setMenuOpen(false)
-                      openTrace()
+                      setPrototypeEvals(true)
                     }}
                   />
-                  {!!services.prototype && finished && (
-                    <MenuItem
-                      icon={FlaskConical}
-                      label="Add to evals"
-                      onClick={() => {
-                        setMenuOpen(false)
-                        setPrototypeEvals(true)
-                      }}
-                    />
-                  )}
-                  {!services.prototype && viewer?.full_access === true && detail.data && (
-                    <EvaluationPromotionAction
-                      key={`${sessionId}:${detail.data.status}`}
-                      sessionId={sessionId}
-                      status={detail.data.status}
-                      label="Add to evals"
-                    />
-                  )}
-                </div>
-              </div>
+                )}
+                {!services.prototype && viewer?.full_access === true && detail.data && (
+                  <EvaluationPromotionAction
+                    key={`${sessionId}:${detail.data.status}`}
+                    sessionId={sessionId}
+                    status={detail.data.status}
+                    label="Add to evals"
+                  />
+                )}
+              </ActionsMenu>
             </>
           }
         >
@@ -606,7 +616,7 @@ export function SessionPage({
         ) : (
           <>
             <div
-              className="min-h-0 flex-1 overflow-y-auto"
+              className="relative min-h-0 flex-1 overflow-y-auto"
               onScroll={(event) => {
                 const node = event.currentTarget
                 const atTail = node.scrollHeight - node.scrollTop - node.clientHeight <= 32
@@ -689,7 +699,7 @@ export function SessionPage({
                             event.target.value === "all" ? undefined : event.target.value,
                         })
                       }
-                      className="rounded-md border border-input bg-background p-1.5"
+                      className={selectClassName}
                     >
                       <option value="all">All roles</option>
                       <option value="user">User</option>
@@ -1050,6 +1060,7 @@ export function SessionPage({
             onClick={() => setPanel(undefined)}
           />
           <DetailsPanel
+            returnFocus={detailsOpener}
             tab={panel === "artifacts" && !artifactsEnabled ? "overview" : panel}
             artifactsEnabled={artifactsEnabled}
             setTab={(t) => setPanel(t)}

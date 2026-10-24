@@ -197,6 +197,13 @@ def test_task_pages_share_the_single_header_and_member_gates(width):
                 await expect(
                     page.get_by_role("button", name="Create a task", exact=True)
                 ).to_have_count(0)
+                if route == "tasks":
+                    search = page.get_by_role("textbox", name="Search tasks", exact=True)
+                    group = search.locator("xpath=..")
+                    border = await group.evaluate("e => getComputedStyle(e).borderColor")
+                    await search.focus()
+                    assert await search.evaluate("e => getComputedStyle(e).outlineStyle") == "none"
+                    assert await group.evaluate("e => getComputedStyle(e).borderColor") != border
                 if width == 390:
                     await page.get_by_role("button", name="Open sidebar", exact=True).click()
                     await expect(page.get_by_role("dialog", name="Sidebar")).to_be_visible()
@@ -313,5 +320,91 @@ def test_sidebar_focus_handoff_tracks_visible_opener_across_routes_and_resize():
             await expect(
                 page.get_by_role("button", name="Hide sidebar", exact=True)
             ).to_be_visible()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("width", [390, 1440])
+@pytest.mark.parametrize("field", ["sidebar", "list"])
+def test_session_search_controls_match_prototype_geometry_and_focus(width, field):
+    async def run():
+        async with search_browser(runtime=await _runtime()) as (page, base, *_):
+            await page.set_viewport_size({"width": width, "height": 900})
+            await page.goto(f"{base}/cayu/sessions")
+            await expect(page.get_by_role("heading", name="Sessions", exact=True)).to_be_visible()
+            if field == "sidebar":
+                if width == 390:
+                    await page.get_by_role("button", name="Open sidebar", exact=True).click()
+                search = page.locator("#sidebar-search")
+                group = search.locator("xpath=ancestor::form")
+                assert await group.evaluate("e => e.getBoundingClientRect().height") == 32
+                await search.focus()
+                assert await search.evaluate("e => getComputedStyle(e).outlineStyle") == "none"
+                assert await group.evaluate("e => getComputedStyle(e).backgroundColor") not in [
+                    "rgba(0, 0, 0, 0)",
+                    "transparent",
+                ]
+                assert (
+                    await group.locator("kbd").evaluate("e => getComputedStyle(e).borderTopWidth")
+                    == "1px"
+                )
+                await search.fill("release")
+                await search.press("Enter")
+                await expect(page).to_have_url(re.compile(r"[?&]q=release"))
+            else:
+                search = page.locator("main").get_by_role(
+                    "textbox", name="Search sessions", exact=True
+                )
+                group = search.locator("xpath=..")
+                box = await group.bounding_box()
+                assert box and box["height"] == 32
+                if width == 1440:
+                    assert box["width"] <= 384
+                else:
+                    assert box["width"] >= 300
+                assert await search.evaluate("e => getComputedStyle(e).fontSize") == "14px"
+                unfocused_border = await group.evaluate("e => getComputedStyle(e).borderColor")
+                await search.focus()
+                assert (
+                    await group.evaluate("e => getComputedStyle(e).borderColor") != unfocused_border
+                )
+                assert await search.evaluate("e => getComputedStyle(e).outlineStyle") == "none"
+                assert await search.evaluate("e => getComputedStyle(e).boxShadow") == "none"
+                await page.keyboard.type("rele")
+                await expect(page).to_have_url(re.compile(r"[?&]q=rele"))
+                await expect(search).to_be_focused()
+                await page.keyboard.type("ase")
+                await expect(page).to_have_url(re.compile(r"[?&]q=release"))
+                await expect(search).to_be_focused()
+                details = page.get_by_role("button", name="Clear filters", exact=True)
+                await details.focus()
+                await expect(details).to_have_css("outline-style", "solid")
+                await expect(details).to_have_css("outline-width", "2px")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("width", [390, 1440])
+@pytest.mark.parametrize("area", ["inbox", "trace", "conversation"])
+def test_added_filter_controls_follow_prototype_field_geometry(width, area):
+    async def run():
+        async with search_browser(runtime=await _runtime()) as (page, base, *_):
+            await page.set_viewport_size({"width": width, "height": 900})
+            path = {
+                "inbox": "inbox",
+                "trace": "sessions/visual-session?view=trace&log=1",
+                "conversation": "sessions/visual-session",
+            }[area]
+            await page.goto(f"{base}/cayu/{path}")
+            label = {"inbox": "Search Inbox", "trace": "Event ID", "conversation": "Message role"}[
+                area
+            ]
+            field = page.get_by_label(label, exact=True)
+            await expect(field).to_be_visible()
+            height = 28 if area == "trace" else 32
+            assert await field.evaluate("e => e.getBoundingClientRect().height") == height
+            assert await field.evaluate("e => getComputedStyle(e).borderTopLeftRadius") == (
+                "8px" if area == "trace" else "10px"
+            )
 
     asyncio.run(run())

@@ -481,6 +481,18 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
 }
 
 export function StartSession(props: { onClose: () => void; initialMode?: Mode }) {
+  useEffect(() => {
+    const previous = document.activeElement
+    return () => {
+      if (
+        previous instanceof HTMLElement &&
+        previous !== document.body &&
+        previous.isConnected &&
+        previous.getClientRects().length
+      )
+        previous.focus()
+    }
+  }, [])
   const unavailable = useStartUnavailableReason(props.initialMode)
   if (unavailable) return <p role="status">{unavailable}</p>
   return <StartSessionForm {...props} />

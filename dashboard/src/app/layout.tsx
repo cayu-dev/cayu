@@ -44,7 +44,7 @@ import { cn } from "../lib/utils"
 import { realApi } from "../next/api/real"
 import { useInboxCounts } from "../next/app/queries"
 import { ServicesProvider } from "../next/app/services"
-import { ShellContext } from "../next/routes/common"
+import { Kbd, ShellContext } from "../next/routes/common"
 
 /** Compatibility gates must finish before any page or authenticated identity reads mount. */
 export function Layout() {
@@ -278,7 +278,14 @@ function DashboardShell() {
       if (main) main.inert = false
       document.removeEventListener("keydown", onKey)
       desktop.removeEventListener("change", resized)
-      previous?.focus()
+      const target =
+        previous &&
+        previous !== document.body &&
+        previous.isConnected &&
+        previous.getClientRects().length > 0
+          ? previous
+          : openRef.current
+      target?.focus()
     }
   }, [mobileOpen])
   useEffect(() => {
@@ -376,7 +383,7 @@ function DashboardShell() {
             {viewer.name}
           </p>
           <form
-            className="mx-3 flex items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-sm text-muted-foreground focus-within:border-ring"
+            className="mx-3 flex h-8 items-center gap-2 rounded-lg px-2.5 text-sm text-muted-foreground focus-within:bg-sidebar-accent hover:bg-sidebar-accent"
             onSubmit={(event) => {
               event.preventDefault()
               void navigate({ to: "/sessions", search: query.trim() ? { q: query.trim() } : {} })
@@ -393,9 +400,9 @@ function DashboardShell() {
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search sessions"
-              className="min-w-0 w-full bg-transparent text-foreground outline-none placeholder:text-muted-foreground"
+              className="grouped-field-input min-w-0 w-full bg-transparent text-foreground outline-none placeholder:text-muted-foreground"
             />
-            <kbd className="text-xs">⌘K</kbd>
+            <Kbd>⌘K</Kbd>
           </form>
           <nav className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" aria-label="Main">
             {sections.map((section, index) => (

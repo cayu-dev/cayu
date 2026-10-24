@@ -1,5 +1,6 @@
+import { Popover } from "@base-ui/react/popover"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Menu, PanelLeft } from "lucide-react"
+import { Ellipsis, Menu, PanelLeft } from "lucide-react"
 import {
   type ComponentProps,
   createContext,
@@ -225,7 +226,7 @@ export function ErrorState({ error }: { error: unknown }) {
   return (
     <p
       role="alert"
-      className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+      className="min-w-0 [overflow-wrap:anywhere] rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive"
     >
       {error instanceof Error ? error.message : "Something went wrong loading this page."}
     </p>
@@ -305,5 +306,34 @@ export function PageBody({
     <div className="relative min-h-0 flex-1 overflow-y-auto">
       <div className={cn("mx-auto w-full px-4 py-5 sm:px-6", width)}>{children}</div>
     </div>
+  )
+}
+
+/** Shared dismissal/focus owner for compact action disclosures. */
+export function ActionsMenu({
+  open,
+  onOpenChange,
+  children,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  children: ReactNode
+}) {
+  return (
+    <Popover.Root open={open} onOpenChange={onOpenChange}>
+      <Popover.Trigger render={<Button variant="ghost" size="icon-sm" aria-label="More actions" />}>
+        <Ellipsis />
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Positioner align="end" sideOffset={4} className="z-50">
+          <Popover.Popup
+            initialFocus={false}
+            className="w-60 max-w-[calc(100vw-2rem)] rounded-lg border border-border bg-popover p-1 text-sm shadow-lg"
+          >
+            {children}
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
+    </Popover.Root>
   )
 }

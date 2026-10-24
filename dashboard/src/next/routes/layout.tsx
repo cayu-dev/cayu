@@ -243,7 +243,7 @@ function Sidebar({ searchRef }: { searchRef: React.RefObject<HTMLInputElement | 
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search sessions"
-            className="w-full min-w-0 bg-transparent text-foreground outline-none placeholder:text-muted-foreground"
+            className="grouped-field-input w-full min-w-0 bg-transparent text-foreground outline-none placeholder:text-muted-foreground"
           />
           <Kbd>⌘K</Kbd>
         </form>

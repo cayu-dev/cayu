@@ -8,6 +8,7 @@ import { useApi } from "../app/services"
 import { ChildActions } from "./child-actions"
 import { EmptyState, ErrorState, NavLink, PageBody, sessionPath, TopBar, useGo } from "./common"
 import { InboxCard } from "./session/inbox-card"
+import { selectClassName } from "./session-filters"
 
 const KINDS: [InboxItem["kind"] | undefined, string][] = [
   [undefined, "All"],
@@ -77,13 +78,12 @@ export function InboxPage() {
         >
           <label className="text-xs">
             Search Inbox
-            <input
-              name="q"
-              defaultValue={search.q}
-              className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
-            />
+            <input name="q" defaultValue={search.q} className={cn("ml-2", selectClassName)} />
           </label>
-          <button type="submit" className="rounded border border-border px-3 text-sm">
+          <button
+            type="submit"
+            className="h-8 rounded-lg border border-border px-3 text-sm hover:bg-muted focus-visible:outline-ring"
+          >
             Filter
           </button>
           <details className="w-full text-sm" open={!!search.session_id || !!search.agent_name}>
@@ -94,7 +94,7 @@ export function InboxPage() {
                 <input
                   name="session_id"
                   defaultValue={search.session_id}
-                  className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
+                  className={cn("ml-2", selectClassName)}
                 />
               </label>
               <label className="text-xs">
@@ -102,7 +102,7 @@ export function InboxPage() {
                 <input
                   name="agent_name"
                   defaultValue={search.agent_name}
-                  className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
+                  className={cn("ml-2", selectClassName)}
                 />
               </label>
               <label className="mt-3 block text-xs">
@@ -111,7 +111,7 @@ export function InboxPage() {
                   aria-label="Inbox page size"
                   value={pageSize}
                   onChange={(event) => setPageSize(Number(event.target.value))}
-                  className="ml-2 rounded border border-input bg-background px-2 py-1 text-sm"
+                  className={cn("ml-2", selectClassName)}
                 >
                   {[25, 50, 100].map((size) => (
                     <option key={size} value={size}>
@@ -153,6 +153,11 @@ export function InboxPage() {
           ))}
         </fieldset>
         <div className="mt-4 space-y-3">
+          {inbox.isPending && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Loading inbox…
+            </p>
+          )}
           {inbox.error && <ErrorState error={inbox.error} />}
           {all.error && <ErrorState error={all.error} />}
           {all.data && all.data.complete !== true && (
@@ -170,7 +175,7 @@ export function InboxPage() {
             <p
               key={`${issue.code}-${issue.session_id ?? ""}-${issue.detail}`}
               role="status"
-              className="text-sm text-warning"
+              className="text-sm text-warning [overflow-wrap:anywhere]"
             >
               {issue.detail}
               {issue.session_id && (

@@ -234,8 +234,10 @@ export function SessionAnnotations({
                     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
                       event.preventDefault()
                       void saveLabels()
-                    } else if (event.key === "Escape" && !labelsSaving) {
-                      setLabelsEditor(null)
+                    } else if (event.key === "Escape") {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      if (!labelsSaving) setLabelsEditor(null)
                     }
                   }}
                   rows={10}
@@ -334,8 +336,10 @@ export function SessionAnnotations({
                     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
                       event.preventDefault()
                       void saveMetadata()
-                    } else if (event.key === "Escape" && !metadataSaving) {
-                      setMetadataEditor(null)
+                    } else if (event.key === "Escape") {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      if (!metadataSaving) setMetadataEditor(null)
                     }
                   }}
                   rows={10}

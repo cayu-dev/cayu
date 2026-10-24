@@ -105,18 +105,21 @@ function TraceEventLogPage({
             <label key={key} className="text-xs">
               {label}
               <input
-                className="mt-1 block w-36 rounded border bg-background px-2 py-1"
+                className="mt-1 block h-7 w-36 rounded-md border border-input bg-background px-2 text-xs outline-none focus:border-ring"
                 value={draft[key] ?? ""}
                 onChange={(event) => setDraft({ ...draft, [key]: event.target.value || undefined })}
               />
             </label>
           ))}
-          <button type="submit" className="rounded border px-3 py-1 text-sm">
+          <button
+            type="submit"
+            className="h-7 rounded-md border border-border px-3 text-xs hover:bg-muted focus-visible:outline-ring"
+          >
             Apply filters
           </button>
           <button
             type="button"
-            className="rounded border px-3 py-1 text-sm"
+            className="h-7 rounded-md border border-border px-3 text-xs hover:bg-muted focus-visible:outline-ring"
             onClick={() => {
               setDraft({})
               setNavigation(initialPageNavigation(null))
@@ -142,7 +145,7 @@ function TraceEventLogPage({
                 <label key={key} className="text-xs">
                   {label}
                   <input
-                    className="mt-1 block w-36 rounded border bg-background px-2 py-1"
+                    className="mt-1 block h-7 w-36 rounded-md border border-input bg-background px-2 text-xs outline-none focus:border-ring"
                     value={draft[key] ?? ""}
                     onChange={(event) =>
                       setDraft({ ...draft, [key]: event.target.value || undefined })
@@ -164,7 +167,7 @@ function TraceEventLogPage({
           </label>
           <button
             type="button"
-            className="rounded border px-2 py-1"
+            className="h-7 rounded-md border border-border px-2 text-xs hover:bg-muted focus-visible:outline-ring"
             onClick={() => {
               // Pause freezes an observed page. Let its initial explicit read finish;
               // otherwise cancelling it leaves a paused view with no snapshot.
@@ -204,7 +207,7 @@ function TraceEventLogPage({
         <div className="mt-3 flex gap-2">
           <button
             type="button"
-            className="rounded border px-3 py-1 text-sm"
+            className="h-7 rounded-md border border-border px-3 text-xs hover:bg-muted focus-visible:outline-ring"
             disabled={navigation.newer.length === 0}
             onClick={() => setNavigation(navigateToNewerPage(navigation))}
           >
@@ -212,7 +215,7 @@ function TraceEventLogPage({
           </button>
           <button
             type="button"
-            className="rounded border px-3 py-1 text-sm"
+            className="h-7 rounded-md border border-border px-3 text-xs hover:bg-muted focus-visible:outline-ring"
             disabled={!query.data?.has_more || query.isFetching}
             onClick={() => {
               const next = query.data?.next_sequence
@@ -224,7 +227,7 @@ function TraceEventLogPage({
           {navigation.current !== null && (
             <button
               type="button"
-              className="rounded border px-3 py-1 text-sm"
+              className="h-7 rounded-md border border-border px-3 text-xs hover:bg-muted focus-visible:outline-ring"
               onClick={() => setNavigation(initialPageNavigation(null))}
             >
               Latest events

@@ -24,7 +24,7 @@ type AdvancedFilterDraft = {
 }
 
 export const selectClassName =
-  "h-8 min-w-32 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+  "h-8 rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
 
 const advancedInputClassName = "mt-1.5"
 
@@ -129,18 +129,18 @@ export function SessionSearchInput({
   }, [input, onCommit, value, resetVersion])
 
   return (
-    <div className="relative min-w-56 flex-[2_1_18rem]">
-      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-      <Input
+    <label className="flex h-8 w-full min-w-0 items-center gap-2 rounded-lg border border-input bg-background px-2.5 text-sm focus-within:border-ring sm:w-auto sm:min-w-56 sm:flex-[1_1_14rem] sm:max-w-sm">
+      <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <span className="sr-only">Search sessions</span>
+      <input
         value={input.draft}
         onChange={(event) =>
           setInput({ committed: value, draft: event.target.value, resetVersion })
         }
         placeholder="Search by title, ID or label"
-        className="pl-8"
-        aria-label="Search sessions"
+        className="grouped-field-input w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
       />
-    </div>
+    </label>
   )
 }
 
