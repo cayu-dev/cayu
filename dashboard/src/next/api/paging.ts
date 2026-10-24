@@ -1,9 +1,8 @@
 /**
- * Pure paging helpers for the reads that span several server pages: a session's events
- * and the inbox. They take the page reader as an argument, so real.ts and the tests use
- * the same code.
+ * Pure event paging helpers and prototype Inbox filtering. Event readers are injected
+ * so runtime consumers and focused tests use the same bounded traversal.
  */
-import type { InboxItem, InboxPage, InboxQuery, SessionEvent, SessionEventsPage } from "./types.ts"
+import type { InboxItem, InboxQuery, SessionEvent, SessionEventsPage } from "./types.ts"
 
 /** The server's page caps (`_EVENT_PAGE_LIMIT_MAX`, `_TRANSCRIPT_PAGE_LIMIT_MAX` in routes.py). */
 export const EVENT_PAGE_MAX = 1000
@@ -111,53 +110,16 @@ export async function loadEventTail(
   return next
 }
 
-/** Keep the items an inbox query asks for, for servers that ignore the filters. */
+/** Filter synthetic prototype items only; real API eligibility belongs to the server. */
 export function filterInboxItems(items: InboxItem[], query: InboxQuery): InboxItem[] {
   return items.filter(
     (i) =>
       (!query.session_id || i.session_id === query.session_id) &&
       (!query.agent_name || i.agent_name === query.agent_name) &&
-      (!query.kind || i.kind === query.kind),
+      (!query.kind || i.kind === query.kind) &&
+      (!query.q ||
+        [i.title, i.detail, i.question, i.session_id, i.agent_name, i.tool_name].some((value) =>
+          value?.toLocaleLowerCase().includes(query.q!.toLocaleLowerCase()),
+        )),
   )
-}
-
-/** The most inbox pages one read follows before it stops and reports `has_more`. */
-export const INBOX_MAX_PAGES = 50
-
-/**
- * Read the whole inbox: follow `next_cursor` until it is null, including across empty
- * pages (a caller the inbox access rule limits gets those, with sealed cursors). A 422
- * means the cursor expired or can't be opened; restart once from no cursor, dropping
- * the pages read so far, as `client.watchInbox` does. `issues` from every page are kept.
- */
-export async function readAllInbox(
-  read: (cursor: string | null) => Promise<InboxPage>,
-  options: { maxPages?: number; isStaleCursor?: (error: unknown) => boolean } = {},
-): Promise<InboxPage> {
-  const maxPages = options.maxPages ?? INBOX_MAX_PAGES
-  const stale = options.isStaleCursor ?? (() => false)
-  let restarted = false
-  for (;;) {
-    const items: InboxItem[] = []
-    const issues: NonNullable<InboxPage["issues"]> = []
-    let cursor: string | null = null
-    try {
-      for (let page = 0; page < maxPages; page++) {
-        const result: InboxPage = await read(cursor)
-        items.push(...result.items)
-        issues.push(...(result.issues ?? []))
-        cursor = result.next_cursor
-        if (cursor === null) break
-      }
-    } catch (error) {
-      if (cursor !== null && !restarted && stale(error)) {
-        restarted = true
-        continue
-      }
-      throw error
-    }
-    const seen = new Set<string>()
-    const unique = items.filter((i) => !seen.has(i.id) && seen.add(i.id))
-    return { items: unique, issues, next_cursor: cursor, has_more: cursor !== null }
-  }
 }

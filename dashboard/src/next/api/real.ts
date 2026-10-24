@@ -5,7 +5,6 @@
  */
 import { mutationTransportErrorMessage } from "@/components/dashboard/mutation-transport-status"
 import {
-  ApiClientError,
   blockTask,
   fetchAgents,
   fetchDashboardIdentity,
@@ -20,11 +19,10 @@ import {
   markTaskNeedsAttention,
   pauseTask,
   resumeTask,
-  type Session as SessionRecord,
   throwResponseError,
 } from "@/lib/api"
 import { apiUrl } from "@/lib/config"
-import type { SessionUsageSummary } from "@/lib/generated/server-api"
+import type { InboxSettleResponse } from "@/lib/generated/server-api"
 import {
   executeInterruptMutation,
   executeRecoverToolApprovalMutation,
@@ -34,16 +32,8 @@ import {
   executeRunMutation,
 } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
-import { isEvalTrialMetadata } from "../app/session-model"
-import { filterInboxItems, readAllInbox } from "./paging"
-import type {
-  Api,
-  InboxItemState,
-  InboxPage,
-  SessionOverview,
-  SessionState,
-  TaskScheduleEvent,
-} from "./types"
+import { overviewForDisplay } from "./overview"
+import type { Api, InboxPage, SessionOverview, TaskScheduleEvent } from "./types"
 
 /** Proposed (backend item 14): the suite-centred eval calls have no endpoint yet. */
 async function needsEvalReads(): Promise<never> {
@@ -72,134 +62,25 @@ const query = (params: Record<string, string | number | null | undefined>) => {
   return text ? `?${text}` : ""
 }
 
-/** Today's server has no overview; derive what the session record says. */
-function fallbackState(status: string): SessionState {
-  if (status === "active" || status === "running") return "running"
-  if (status === "failed") return "failed"
-  if (status === "interrupted") return "interrupted"
-  return "completed"
-}
-
-/** What today's session record says, in the overview's shape. */
-function fallbackOverview(
-  s: SessionRecord,
-  usage: SessionUsageSummary | undefined,
-  metadata: Record<string, unknown> | undefined,
-): SessionOverview {
-  const tokens = usage?.usage
-  const count = (v: unknown) => (v == null ? 0 : Number(v) || 0)
-  return {
-    session_id: s.id,
-    // No titles today: fall back to the labels, as the prototype's switch shows.
-    title:
-      Object.entries(s.labels)
-        .map(([k, v]) => `${k}=${v}`)
-        .join(" · ") || null,
-    summary: null,
-    summary_tone: null,
-    state: fallbackState(s.status),
-    reason: null,
-    started_at: s.created_at,
-    ended_at: null,
-    last_activity_at: s.updated_at,
-    model_steps: usage?.model_steps ?? 0,
-    tool_calls: usage?.tool_calls ?? 0,
-    tokens: {
-      input: count(tokens?.input_tokens),
-      output: count(tokens?.output_tokens),
-      cached: count(tokens?.cache?.cached_input_tokens),
-    },
-    cost: null,
-    uses: { browser: false, subagents: 0, artifacts: 0 },
-    // The session list doesn't return metadata, so only sessions read one by one are known.
-    eval_trial: isEvalTrialMetadata(metadata),
-  }
-}
-
-/** Run `work` over `items`, at most `limit` at a time. */
-async function mapLimited<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>) {
-  const results: R[] = new Array(items.length)
-  let next = 0
-  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++
-      results[i] = await work(items[i] as T)
-    }
-  })
-  await Promise.all(lanes)
-  return results
-}
-
-/** Above this many IDs, overviews reads a page of recent sessions before reading one by one. */
-const OVERVIEW_DIRECT_READS = 3
-
-/**
- * Sessions the last list reads returned, so `overviews` right after `sessions` (as every
- * list page does) needs no second request. Entries go stale after a few seconds.
- */
-const LISTED_FRESH_MS = 5000
-const LISTED_MAX = 2000
-const listed = new Map<
-  string,
-  { session: SessionRecord; usage?: SessionUsageSummary; at: number }
->()
-function rememberListed(sessions: SessionRecord[], usage: SessionUsageSummary[]) {
-  const at = Date.now()
-  const byId = new Map(usage.map((u) => [u.session_id, u]))
-  for (const session of sessions) {
-    listed.delete(session.id)
-    listed.set(session.id, { session, usage: byId.get(session.id), at })
-  }
-  for (const id of listed.keys()) {
-    if (listed.size <= LISTED_MAX) break
-    listed.delete(id)
-  }
-}
-
 export const realApi: Api = {
   app: fetchDashboardIdentity,
   specialists: () => fetchAgents(),
   sessions: (q, signal) => fetchSessionsPage({ include: ["overview"], ...q }, signal),
   session: (id) => fetchSession(id),
-  /**
-   * The sessions asked for, not the first N: a page of recent sessions covers most lists,
-   * and any ID not on it is read with `fetchSession`. A few IDs are read directly.
-   */
   async overviews(ids) {
     const wanted = [...new Set(ids)]
-    if (!wanted.length) return []
-    const found = new Map<string, SessionOverview>()
-    // The list a page just read usually holds every ID it then asks about.
-    const fresh = Date.now() - LISTED_FRESH_MS
-    for (const id of wanted) {
-      const hit = listed.get(id)
-      if (hit && hit.at >= fresh) found.set(id, fallbackOverview(hit.session, hit.usage, undefined))
-    }
-    if (wanted.length - found.size > OVERVIEW_DIRECT_READS) {
+    const result: SessionOverview[] = []
+    for (let offset = 0; offset < wanted.length; offset += 200) {
       const page = await fetchSessionsPage({
-        limit: Math.min(1000, Math.max(wanted.length * 2, 100)),
-        include: ["usage"],
+        ids: wanted.slice(offset, offset + 200),
+        include: ["overview"],
       })
-      const usage = new Map((page.usage ?? []).map((u) => [u.session_id, u]))
-      rememberListed(page.sessions, page.usage ?? [])
-      const ask = new Set(wanted)
-      for (const s of page.sessions)
-        if (ask.has(s.id) && !found.has(s.id))
-          found.set(s.id, fallbackOverview(s, usage.get(s.id), undefined))
+      result.push(...(page.overviews ?? []).map(overviewForDisplay))
     }
-    const missing = wanted.filter((id) => !found.has(id))
-    const details = await mapLimited(missing, 6, (id) =>
-      fetchSession(id).catch((error: unknown) => {
-        if (error instanceof ApiClientError && error.status === 404) return null
-        throw error
-      }),
-    )
-    for (const d of details) if (d) found.set(d.id, fallbackOverview(d, undefined, d.metadata))
-    return wanted.flatMap((id) => {
-      const o = found.get(id)
-      return o ? [o] : []
-    })
+    return result
   },
+  inboxCounts: (q = {}) => json(`/inbox/counts${query(q)}`),
+  overviewCounts: (q) => json(`/sessions/overview/counts${query(q)}`),
   transcript: (id, q, signal) => fetchSessionTranscript(id, q, signal),
   events: (id, q) => fetchSessionEvents(id, q),
   tasks: () => fetchTasks({ limit: 200, order_by: "updated_at_desc" }),
@@ -215,25 +96,14 @@ export const realApi: Api = {
     return markTaskNeedsAttention(id, body)
   },
   resumeTask: (id) => resumeTask(id),
-  /**
-   * The whole inbox, every page (see `readAllInbox`). The filters are sent for servers
-   * that support them, and applied here too until today's server does.
-   */
-  async inbox(q = {}) {
-    const page = await readAllInbox(
-      (cursor) =>
-        json<InboxPage>(
-          `/inbox${query({ limit: q.limit, cursor, session_id: q.session_id, agent_name: q.agent_name, kind: q.kind })}`,
-        ),
-      { isStaleCursor: (e) => e instanceof ApiClientError && e.status === 422 },
-    )
-    return { ...page, items: filterInboxItems(page.items, q) }
-  },
-  settle: (id, body) =>
-    json<InboxItemState>(`/inbox/${encodeURIComponent(id)}/settle`, {
+  inbox: (q = {}, signal) => json<InboxPage>(`/inbox${query(q)}`, { signal }),
+  settle: async (id, body) => {
+    const result = await json<InboxSettleResponse>(`/inbox/${encodeURIComponent(id)}/settle`, {
       method: "POST",
       body: JSON.stringify(body),
-    }),
+    })
+    return result.item
+  },
   async start({ agent, prompt }, options) {
     const snapshot = await executeRunMutation({ agent, prompt }, options)
     return { session_id: snapshot.sessionId, snapshot }

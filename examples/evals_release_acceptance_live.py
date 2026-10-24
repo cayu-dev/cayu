@@ -187,19 +187,8 @@ async def _run_browser_journey(base_url: str, project_root: Path) -> dict[str, o
         )
         try:
             await _require_declared_judge_profile(page, base_url)
-            await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
-            await expect(page.get_by_role("heading", name="New Run", exact=True)).to_be_visible()
-            await page.get_by_label("Specialist", exact=True).select_option(AGENT_NAME)
-            await page.get_by_label("Prompt", exact=True).fill(
-                f"Reply with exactly {EXPECTED_MARKER} and no other text."
-            )
-            await page.get_by_role("button", name="Run", exact=True).click()
-            await _require_source_session_completed(page)
+            session_id = await _start_source_session(page, base_url)
             journey_state["source_session_terminal"] = True
-            session_id = (await page.get_by_test_id("run-session-reference").inner_text()).strip()
-            require(bool(session_id), "the Control Plane run must publish a session reference")
-            await page.get_by_role("button", name="View Session →", exact=True).click()
-            await expect(page).to_have_url(re.compile(r"/cayu/sessions/[^/?]+$"))
 
             await page.get_by_test_id("evaluate-session").click()
             sheet = page.get_by_test_id("promotion-sheet")
@@ -474,15 +463,24 @@ async def _require_completed_result(page: Page) -> None:
     await expect(output_assertion.get_by_text("passed", exact=True)).to_be_visible()
 
 
-async def _require_source_session_completed(page: Page) -> None:
-    terminal = page.locator('[data-mutation-transport-phase="terminal"]')
-    await expect(terminal).to_be_visible(timeout=330_000)
-    completed = page.get_by_text("Session completed", exact=True)
-    if await completed.count() == 1 and await completed.is_visible():
-        return
-    failure = page.get_by_text(re.compile(r"^Session failed:"))
-    detail = await failure.first.inner_text() if await failure.count() else "unknown terminal state"
-    raise AssertionError(f"generated-project source session did not complete: {detail}")
+async def _start_source_session(page: Page, base_url: str) -> str:
+    await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
+    await expect(page.get_by_role("heading", name="Home", exact=True)).to_be_visible()
+    await page.get_by_label("Specialist", exact=True).select_option(AGENT_NAME)
+    await page.get_by_label("Prompt", exact=True).fill(
+        f"Reply with exactly {EXPECTED_MARKER} and no other text."
+    )
+    await page.get_by_role("button", name="Start", exact=True).click()
+    await expect(page).to_have_url(re.compile(r"/cayu/sessions/[^/?]+$"), timeout=330_000)
+    session_id = urlsplit(page.url).path.rsplit("/", 1)[1]
+    require(bool(session_id), "the Control Plane run must navigate to its session")
+    # Start navigates on both runtime completion and runtime failure. Confirm the
+    # authoritative public state before treating the source as a completed run.
+    response = await page.request.get(f"{base_url}/api/sessions/{session_id}/state")
+    require(response.ok, "the source session state must be readable")
+    state = await response.json()
+    require_equal(state["status"], "completed", "generated-project source session must complete")
+    return session_id
 
 
 async def _download_fresh_result(page: Page, run_id: str) -> Path:

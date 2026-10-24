@@ -20,10 +20,12 @@ import type {
 } from "@/lib/api"
 import type {
   ApiTaskScheduleEvent,
+  InboxCounts,
   InboxItem,
   InboxItemState,
   InboxPage,
   InboxSettleRequest,
+  SessionOverviewCountsResponse,
 } from "@/lib/generated/server-api"
 import type { MutationExecutionOptions } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
@@ -176,10 +178,10 @@ export type SessionOverview = {
 }
 
 /**
- * Proposed (backend item 3): inbox filters. `/api/inbox` itself exists; today's server
- * ignores these, so real.ts filters what it reads.
+ * Public server-side Inbox filters; query and cursor share the same access scope.
  */
 export type InboxQuery = {
+  q?: string
   limit?: number
   cursor?: string | null
   session_id?: string
@@ -224,7 +226,9 @@ export type Api = {
   holdTask(id: string, hold: TaskHold, reason?: string): Promise<TaskInfo>
   /** `POST /api/tasks/{id}/resume`: back to pending. */
   resumeTask(id: string): Promise<TaskInfo>
-  inbox(query?: InboxQuery): Promise<InboxPage>
+  inbox(query?: InboxQuery, signal?: AbortSignal): Promise<InboxPage>
+  inboxCounts(query?: Pick<InboxQuery, "session_id" | "agent_name" | "q">): Promise<InboxCounts>
+  overviewCounts(query: { since: string; until: string }): Promise<SessionOverviewCountsResponse>
   /** `POST /api/inbox/{id}/settle`. Recovery items can't be settled here (409 `not_settleable`). */
   settle(itemId: string, body: InboxSettleRequest): Promise<InboxItemState>
   /**

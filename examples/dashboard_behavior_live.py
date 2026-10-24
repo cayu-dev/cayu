@@ -18,7 +18,7 @@ from importlib.metadata import version
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 import uvicorn
 from playwright.async_api import (
@@ -129,10 +129,10 @@ POLLING_TERMINAL_SESSION_ID = "dashboard-polling-terminal"
 POLLING_WAITING_SESSION_ID = "dashboard-polling-waiting"
 POLLING_WAITING_BACKOFF_MS = (5_000, 10_000, 30_000, 60_000, 60_000)
 POLLING_IDLE_OVERVIEW_PATHS = (
-    ("POST", "/api/operations/snapshot"),
-    ("POST", "/api/sessions/summary"),
+    ("GET", "/api/sessions/overview/counts"),
+    ("GET", "/api/sessions"),
     ("GET", "/api/tasks"),
-    ("GET", "/api/pending-actions"),
+    ("GET", "/api/inbox/counts"),
 )
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _LIVE_CREDENTIAL_ENV = (
@@ -1476,6 +1476,7 @@ async def _exercise_dashboard(
     tool_failed_event_id = projected_event_id(EventType.TOOL_CALL_FAILED)
 
     await _exercise_operational_scope(page, base_url)
+    await _exercise_dashboard_inbox(page, base_url)
     await _exercise_run_agent_inventory(page, base_url)
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
@@ -3309,6 +3310,7 @@ async def _exercise_workflow(
         allowed_workflow_requests = {
             ("GET", "/api/contract"),
             ("GET", "/api/app"),  # Shell identity and role refresh.
+            ("GET", "/api/inbox/counts"),  # Shared sidebar badge; no item scan.
             ("POST", topology_path),
             ("POST", "/api/usage/rollup"),
         }
@@ -3320,7 +3322,7 @@ async def _exercise_workflow(
         require_equal(
             unexpected_workflow_requests,
             [],
-            "the Workflow route must use only its bounded topology, usage, contract, and shell identity APIs",
+            "the Workflow route must use only its bounded topology, usage, contract, and shared shell APIs",
         )
 
         exact_task_path = f"/api/tasks/{WORKFLOW_PARENT_TASK_ID}"
@@ -3744,8 +3746,12 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
     await page.route("**/api/contract", serve_read_only_contract)
     try:
         await page.goto(f"{base_url}/cayu/", wait_until="networkidle")
-        await expect(page.get_by_role("button", name="New Run", exact=True)).to_be_disabled()
-        await expect(page.get_by_test_id("overview-session-execution-unavailable")).to_be_visible()
+        await expect(page.get_by_role("button", name="Start a session", exact=True)).to_have_count(
+            0
+        )
+        await expect(
+            page.get_by_text("Starting sessions is unavailable for this deployment.", exact=True)
+        ).to_be_visible()
 
         await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
         await expect(page.get_by_role("button", name="Start a session", exact=True)).to_have_count(
@@ -3774,10 +3780,10 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
 
 async def _assert_unavailable_run_page(page: Page, base_url: str) -> None:
     await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
-    await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
-        "New Run is unavailable"
-    )
-    await expect(page.get_by_role("main").get_by_role("textbox")).to_have_count(0)
+    await expect(
+        page.get_by_text("Starting sessions is unavailable for this deployment.", exact=True).first
+    ).to_be_visible()
+    await expect(page.get_by_label("Prompt", exact=True)).to_have_count(0)
 
 
 async def _exercise_system_page(page: Page, base_url: str) -> None:
@@ -3818,72 +3824,34 @@ async def _exercise_system_page(page: Page, base_url: str) -> None:
         page.remove_listener("request", count_diagnostics_requests)
 
 
+async def _exercise_dashboard_home(page: Page, base_url: str) -> None:
+    await page.goto(f"{base_url}/cayu/", wait_until="networkidle")
+    await expect(page.get_by_role("heading", name="Home", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Last 24 hours:", exact=False)).to_be_visible()
+    for label in ("Needs attention", "Recent sessions", "Tasks needing attention", "Recent tasks"):
+        await expect(page.get_by_role("heading", name=label, exact=True)).to_be_visible()
+    await expect(page.get_by_text("Active Sessions", exact=True)).to_have_count(0)
+    await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
+    await expect(page.get_by_role("tab", name="Run a specialist", exact=True)).to_be_visible()
+    await expect(page.get_by_role("tab", name="Create a task", exact=True)).to_have_attribute(
+        "aria-disabled", "true"
+    )
+
+
+async def _exercise_dashboard_inbox(page: Page, base_url: str) -> None:
+    await page.goto(f"{base_url}/cayu/pending-actions", wait_until="networkidle")
+    await expect(page).to_have_url(f"{base_url}/cayu/inbox")
+    await expect(page.get_by_role("heading", name="Inbox", exact=True)).to_be_visible()
+    await expect(page.get_by_label("Search Inbox", exact=True)).to_be_visible()
+    for kind in ("Approvals", "Questions", "Recovery", "Knowledge"):
+        await expect(
+            page.get_by_role("button", name=re.compile(rf"^{kind}(?: \d+)?$"))
+        ).to_be_visible()
+    await expect(page.get_by_role("heading", name="Child actions", exact=True)).to_be_visible()
+
+
 async def _exercise_operational_scope(page: Page, base_url: str) -> None:
-    snapshot_path = "**/api/operations/snapshot"
-    snapshot_started = asyncio.Event()
-    release_snapshot = asyncio.Event()
-    snapshot_continued = asyncio.Event()
-
-    async def delay_operational_snapshot(route) -> None:
-        snapshot_started.set()
-        await release_snapshot.wait()
-        try:
-            await route.continue_()
-        finally:
-            snapshot_continued.set()
-
-    await page.route(snapshot_path, delay_operational_snapshot)
-    try:
-        await page.goto(f"{base_url}/cayu/", wait_until="domcontentloaded")
-        await asyncio.wait_for(snapshot_started.wait(), timeout=5)
-        active_metric = page.get_by_text("Active Sessions", exact=True).locator("..").locator("..")
-        await expect(active_metric.get_by_text("—", exact=True)).to_be_visible()
-        await expect(
-            active_metric.get_by_text(re.compile(r"Loading the operational session snapshot\."))
-        ).to_be_visible()
-        await expect(
-            page.get_by_text("Loading configured-store metrics...", exact=True)
-        ).to_be_visible()
-    finally:
-        release_snapshot.set()
-        if snapshot_started.is_set():
-            await asyncio.wait_for(snapshot_continued.wait(), timeout=5)
-        await page.unroute(snapshot_path, delay_operational_snapshot)
-
-    await page.wait_for_load_state("networkidle")
-    await expect(page.get_by_role("heading", name="Dashboard", exact=True)).to_be_visible()
-    operational_scope = page.get_by_test_id("overview-operational-scope")
-    await expect(operational_scope).to_be_visible()
-    await expect(
-        operational_scope.get_by_text("Configured-store operational snapshot", exact=True)
-    ).to_be_visible()
-    await expect(
-        operational_scope.get_by_text(
-            re.compile(
-                r"Exact session counts as of .* independent, not one cross-store atomic read\."
-            )
-        )
-    ).to_be_visible()
-    recent_scope = page.get_by_test_id("overview-sample-scope")
-    await expect(recent_scope).to_be_visible()
-    await expect(
-        recent_scope.get_by_text("Recent lists — bounded drill-down", exact=True)
-    ).to_be_visible()
-    await expect(
-        recent_scope.get_by_text(
-            re.compile(r"latest 25 of \d+ sessions by updated time \(25-session limit\)")
-        )
-    ).to_be_visible()
-    for label in (
-        "Active Sessions",
-        "Completed Sessions",
-        "Failed Sessions",
-        "Tasks Needing Attention",
-    ):
-        await expect(page.get_by_text(label, exact=True)).to_be_visible()
-    await expect(page.get_by_text("Session Tokens", exact=True)).to_have_count(0)
-    await expect(page.get_by_text("Active Work", exact=True)).to_have_count(0)
-    await expect(page.get_by_text("Recent Needs Attention", exact=True)).to_be_visible()
+    await _exercise_dashboard_home(page, base_url)
 
     await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
     await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
@@ -4385,14 +4353,14 @@ async def _exercise_run_agent_inventory(page: Page, base_url: str) -> None:
             page.get_by_text("No specialists are registered.", exact=False)
         ).to_be_visible()
         await page.get_by_label("Prompt", exact=True).fill("This run must remain disabled.")
-        await expect(page.get_by_role("button", name="Run", exact=True)).to_be_disabled()
+        await expect(page.get_by_role("button", name="Start", exact=True)).to_be_disabled()
 
         inventory_mode = "single"
         await page.reload(wait_until="networkidle")
         agent_select = page.get_by_label("Specialist", exact=True)
         await expect(agent_select).to_have_value(AGENT_NAME)
         await page.get_by_label("Prompt", exact=True).fill("This run has one unambiguous agent.")
-        await expect(page.get_by_role("button", name="Run", exact=True)).to_be_enabled()
+        await expect(page.get_by_role("button", name="Start", exact=True)).to_be_enabled()
     finally:
         await page.unroute("**/api/agents", serve_agent_inventory)
 
@@ -4415,32 +4383,17 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
             "recover after the first durable event",
         ):
             await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
-            await expect(page.get_by_role("heading", name="New Run")).to_be_visible()
+            await expect(page.get_by_role("heading", name="Home")).to_be_visible()
             agent_select = page.get_by_label("Specialist", exact=True)
             await expect(agent_select).to_have_value("")
             await page.get_by_label("Prompt", exact=True).fill(prompt)
-            run_button = page.get_by_role("button", name="Run", exact=True)
+            run_button = page.get_by_role("button", name="Start", exact=True)
             await expect(run_button).to_be_disabled()
             await agent_select.select_option(AGENT_NAME)
             await expect(run_button).to_be_enabled()
             await run_button.click()
-            await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
-                timeout=15_000
-            )
-            await expect(
-                page.get_by_text("dashboard mutation recovery completed", exact=True)
-            ).to_be_visible()
-            session_reference = page.get_by_test_id("run-session-reference")
-            await expect(session_reference).to_be_visible()
-            session_id = await session_reference.inner_text()
-            copy_button = page.get_by_role("button", name="Copy", exact=True)
-            await expect(copy_button).to_be_visible()
-            await copy_button.click()
-            await expect(page.get_by_role("button", name="Copied", exact=True)).to_be_visible()
-            session_button = page.get_by_role("button", name="View Session →")
-            await expect(session_button).to_be_visible()
-            await session_button.click()
-            await expect(page).to_have_url(f"{base_url}/cayu/sessions/{session_id}")
+            await expect(page).to_have_url(re.compile(r"/cayu/sessions/[^/?]+$"), timeout=15_000)
+            session_id = unquote(urlsplit(page.url).path.rsplit("/", 1)[-1])
             await expect(page.get_by_role("heading", name=session_id)).to_be_visible()
             session_urls.append(page.url)
     finally:
@@ -4855,8 +4808,8 @@ async def _refocus_page(page: Page, requests: _ApiRequestLog) -> None:
 
 async def _pause_page_clock(page: Page, requests: _ApiRequestLog) -> None:
     await requests.settle()
-    now = await page.evaluate("Date.now()")
-    await page.clock.pause_at(now + 50)
+    pause_at = await page.evaluate("new Date(Date.now() + 50).toISOString()")
+    await page.clock.pause_at(pause_at)
     await requests.settle()
 
 
@@ -5032,10 +4985,15 @@ async def _exercise_terminal_session_polling(
         await _advance_page_clock(page, requests, 5_000)
         settled_reads = len(requests.started)
         await _advance_page_clock(page, requests, 10 * 60_000)
+        idle_reads = requests.started[settled_reads:]
         require_equal(
-            requests.started[settled_reads:],
+            [read for read in idle_reads if read != ("GET", "/api/inbox/counts")],
             [],
-            "a settled terminal session page must make no requests for ten minutes",
+            "a settled terminal session must not poll its resources for ten minutes",
+        )
+        require(
+            len(idle_reads) <= 21,
+            "the shared Inbox badge must remain bounded to one read per thirty seconds",
         )
 
         state_reads = requests.count("GET", state_path)
@@ -5055,10 +5013,15 @@ async def _exercise_terminal_session_polling(
         )
         refreshed_reads = len(requests.started)
         await _advance_page_clock(page, requests, 5 * 60_000)
+        after_refresh = requests.started[refreshed_reads:]
         require_equal(
-            requests.started[refreshed_reads:],
+            [read for read in after_refresh if read != ("GET", "/api/inbox/counts")],
             [],
-            "a refreshed terminal session page must not resume polling",
+            "a refreshed terminal session must not resume polling its resources",
+        )
+        require(
+            len(after_refresh) <= 11,
+            "refreshing a session must not accelerate the shared Inbox badge",
         )
         return {"requests_in_ten_idle_minutes": 0, "state_reads": requests.count("GET", state_path)}
 
@@ -5108,8 +5071,8 @@ async def _exercise_idle_overview_polling(
 ) -> dict[str, list[int]]:
     async with _polling_budget_page(new_context) as (page, requests, _failures):
         await page.goto(f"{base_url}/cayu/", wait_until="networkidle")
-        await expect(page.get_by_role("heading", name="Dashboard")).to_be_visible()
-        await expect(page.get_by_text("Awaiting approval", exact=True).first).to_be_visible()
+        await expect(page.get_by_role("heading", name="Home")).to_be_visible()
+        await expect(page.get_by_text("Needs your approval", exact=True).first).to_be_visible()
         await _pause_page_clock(page, requests)
         await _refocus_page(page, requests)
         focus_reads = {
@@ -5120,8 +5083,23 @@ async def _exercise_idle_overview_polling(
         observed: dict[str, list[int]] = {}
         for endpoint in POLLING_IDLE_OVERVIEW_PATHS:
             times = await requests.read_times(*endpoint)
+            batches: list[list[int]] = []
+            for stamp in times[focus_reads[endpoint] - 1 :]:
+                if not batches or stamp - batches[-1][0] > 1000:
+                    batches.append([stamp])
+                else:
+                    batches[-1].append(stamp)
+            # Home has three independently filtered session reads and four task
+            # reads. Check bounded batches as well as the idle cadence.
+            maximum = (
+                4 if endpoint[1] == "/api/tasks" else 3 if endpoint[1] == "/api/sessions" else 2
+            )
+            require(
+                all(len(batch) <= maximum for batch in batches),
+                "Home repeated a read within one polling batch",
+            )
             observed[endpoint[1]] = _require_read_gaps(
-                times[focus_reads[endpoint] - 1 :],
+                [batch[0] for batch in batches],
                 (30_000, 30_000),
                 f"an idle dashboard home {endpoint[1]}",
             )

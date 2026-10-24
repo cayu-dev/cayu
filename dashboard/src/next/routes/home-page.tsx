@@ -1,3 +1,4 @@
+import { keepPreviousData, useQuery } from "@tanstack/react-query"
 /**
  * The developer's overview of the agent: a line about the last day, what needs
  * attention, and the latest sessions. Cayu agents work on their own; end users reach them
@@ -5,10 +6,13 @@
  */
 import { useSearch } from "@tanstack/react-router"
 import { type ReactNode, useEffect, useState } from "react"
+import { CapabilityRoute } from "@/components/dashboard/server-contract"
+import { DASHBOARD_ROUTE_REQUIREMENTS } from "@/lib/dashboard-capabilities"
+import { activityPollInterval } from "@/lib/polling"
 import { cn } from "@/lib/utils"
-import { type SessionRow, useInbox, useSessionRows, withoutEvalTrials } from "../app/queries"
-import { useNow } from "../app/services"
-import { formatTokens, isWaiting, relativeTime } from "../app/session-model"
+import { type SessionRow, useHomeSessionRows, useInboxCounts } from "../app/queries"
+import { useApi, useNow, useServices } from "../app/services"
+import { isWaiting, relativeTime } from "../app/session-model"
 import {
   ErrorState,
   NavLink,
@@ -19,6 +23,7 @@ import {
   stateText,
   TopBar,
 } from "./common"
+import { HomeTasks } from "./home-tasks"
 import { StartSession, StartSessionButton } from "./start-session"
 
 const DAY = 24 * 3600_000
@@ -27,35 +32,12 @@ const activity = (r: SessionRow) => Date.parse(r.overview?.last_activity_at ?? r
 const failed = (r: SessionRow) => r.overview?.state === "failed"
 
 export function HomePage() {
-  const now = useNow()
+  const { prototype } = useServices()
   const search = useSearch({ strict: false }) as { start?: string }
-  const sessions = useSessionRows()
-  const inbox = useInbox()
   const [starting, setStarting] = useState(search.start === "1")
   useEffect(() => {
     if (search.start === "1") setStarting(true)
   }, [search.start])
-
-  // Eval trials are the eval runner's, not the agent's work: Home leaves them out, as Cloud does.
-  const rows = withoutEvalTrials(sessions.data?.rows ?? [])
-  const day = rows.filter((r) => activity(r) > now() - DAY)
-  // What a developer should look at: anything waiting on a person, and failures from the last day.
-  const attention = rows.filter(
-    (r) => isWaiting(r.overview?.state) || (failed(r) && activity(r) > now() - DAY),
-  )
-  const recent = rows.filter((r) => !attention.includes(r)).slice(0, RECENT)
-  const cost = day.reduce((n, r) => n + (r.overview?.cost?.amount ?? 0), 0)
-  const tokens = day.reduce(
-    (n, r) => n + (r.overview ? r.overview.tokens.input + r.overview.tokens.output : 0),
-    0,
-  )
-  const knowledge = (inbox.data?.items ?? []).filter((i) => i.kind === "knowledge").length
-  const summary = [
-    `${day.length} ${day.length === 1 ? "session" : "sessions"}`,
-    `${day.filter(failed).length} failed`,
-    cost ? `$${cost.toFixed(2)}` : `${formatTokens(tokens)} tokens`,
-  ].join(" · ")
-
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       <TopBar
@@ -65,59 +47,168 @@ export function HomePage() {
       </TopBar>
       <PageBody width="max-w-3xl">
         {starting && <StartSession onClose={() => setStarting(false)} />}
-        {sessions.error && <ErrorState error={sessions.error} />}
-        {sessions.isSuccess && (
-          <p className="text-sm text-muted-foreground">
-            Last 24 hours: <span className="text-foreground tabular-nums">{summary}</span>
-          </p>
+        {prototype ? (
+          <HomeOverview />
+        ) : (
+          <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/"]} title="Home overview">
+            <HomeOverview />
+          </CapabilityRoute>
         )}
-
-        <Section
-          title="Needs attention"
-          link={
-            knowledge ? (
-              <NavLink to="/inbox">{knowledge} knowledge to review in the inbox</NavLink>
-            ) : null
-          }
-        >
-          {attention.length === 0 ? (
-            <p className="px-3.5 py-5 text-sm text-muted-foreground">Nothing needs attention.</p>
-          ) : (
-            attention.map((r) => (
-              <Row
-                key={r.session.id}
-                row={r}
-                now={now()}
-                trace={failed(r)}
-                right={
-                  <span className={cn(failed(r) ? "text-destructive" : "text-warning")}>
-                    {failed(r) ? (r.overview?.reason ?? "Failed") : stateText(r.overview)}
-                  </span>
-                }
-              />
-            ))
-          )}
-        </Section>
-
-        <Section title="Recent sessions" link={<NavLink to="/sessions">All sessions</NavLink>}>
-          {recent.length === 0 ? (
-            <p className="px-3.5 py-5 text-sm text-muted-foreground">
-              No sessions yet. They appear when the agent runs, from its own UI, a task, Cayu Cloud,
-              or Start a session.
-            </p>
-          ) : (
-            recent.map((r) => (
-              <Row
-                key={r.session.id}
-                row={r}
-                now={now()}
-                right={<span className="text-muted-foreground">{stateText(r.overview)}</span>}
-              />
-            ))
-          )}
-        </Section>
       </PageBody>
     </div>
+  )
+}
+
+function HomeOverview() {
+  const now = useNow()
+  const sessions = useHomeSessionRows("recent")
+  const waiting = useHomeSessionRows("waiting")
+  const failures = useHomeSessionRows("failed")
+  const inbox = useInboxCounts()
+  const api = useApi()
+  const [window, setWindow] = useState(() => ({
+    since: new Date(now() - DAY).toISOString(),
+    until: new Date(now()).toISOString(),
+  }))
+  useEffect(() => {
+    const timer = setInterval(
+      () =>
+        setWindow({
+          since: new Date(now() - DAY).toISOString(),
+          until: new Date(now()).toISOString(),
+        }),
+      60_000,
+    )
+    return () => clearInterval(timer)
+  }, [now])
+  const counts = useQuery({
+    queryKey: ["home", "counts", window],
+    placeholderData: keepPreviousData,
+    queryFn: () => api.overviewCounts(window),
+    refetchInterval: (query) =>
+      activityPollInterval(Number(query.state.data?.running_now ?? 0) > 0, 5000),
+  })
+
+  const attention = [...waiting.rows, ...failures.rows.filter((row) => activity(row) > now() - DAY)]
+  const recent = sessions.rows
+    .filter(
+      (row) => !isWaiting(row.overview?.state) && !(failed(row) && activity(row) > now() - DAY),
+    )
+    .slice(0, RECENT)
+  const attentionPending = waiting.isPending || failures.isPending
+  const attentionError = waiting.error || failures.error
+  const attentionMore = waiting.hasNextPage || failures.hasNextPage
+  const attentionEmpty = attentionPending
+    ? "Loading sessions needing attention…"
+    : attentionError
+      ? "Attention could not be fully checked."
+      : attentionMore
+        ? "No matching attention sessions on the pages checked. Continue scanning."
+        : "No sessions need attention."
+  const recentEmpty = sessions.isPending
+    ? "Loading recent sessions…"
+    : sessions.error
+      ? "Recent sessions could not be fully checked."
+      : sessions.hasNextPage
+        ? "No recent sessions outside Needs attention on the pages loaded. Continue scanning."
+        : sessions.rows.length > 0
+          ? "The loaded recent sessions need attention."
+          : "No recent sessions found."
+  const knowledge = inbox.data?.complete === true ? (inbox.data.counts?.knowledge ?? 0) : 0
+  const summary = counts.data
+    ? `${counts.data.total_count} sessions · ${counts.data.failed} failed · ${counts.data.cost ? `${counts.data.cost.amount} ${counts.data.cost.currency}${counts.data.cost.complete ? "" : " (partial cost)"}` : `${BigInt(counts.data.tokens.input) + BigInt(counts.data.tokens.output)} tokens${counts.data.tokens_complete ? "" : " (partial usage)"}`}`
+    : null
+
+  return (
+    <>
+      {sessions.error && <ErrorState error={sessions.error} />}
+      {waiting.error && <ErrorState error={waiting.error} />}
+      {failures.error && <ErrorState error={failures.error} />}
+      {counts.error && <ErrorState error={counts.error} />}
+      {counts.isSuccess && (
+        <p className="text-sm text-muted-foreground">
+          Last 24 hours: <span className="text-foreground tabular-nums">{summary}</span>
+        </p>
+      )}
+
+      <Section
+        title="Needs attention"
+        link={
+          knowledge ? (
+            <NavLink to="/inbox">{knowledge} knowledge to review in the inbox</NavLink>
+          ) : null
+        }
+      >
+        {attention.length > 0 && (attentionPending || attentionError) && (
+          <p role="status" className="px-3.5 py-2 text-sm text-muted-foreground">
+            {attentionError
+              ? "Attention could not be fully checked."
+              : "Checking more attention sessions…"}
+          </p>
+        )}
+        {attention.length === 0 ? (
+          <p role="status" className="px-3.5 py-5 text-sm text-muted-foreground">
+            {attentionEmpty}
+          </p>
+        ) : (
+          attention.map((r) => (
+            <Row
+              key={r.session.id}
+              row={r}
+              now={now()}
+              trace={failed(r)}
+              right={
+                <span className={cn(failed(r) ? "text-destructive" : "text-warning")}>
+                  {failed(r) ? (r.overview?.reason ?? "Failed") : stateText(r.overview)}
+                </span>
+              }
+            />
+          ))
+        )}
+      </Section>
+
+      {(waiting.hasNextPage || failures.hasNextPage) && (
+        <button
+          type="button"
+          className="mt-2 text-sm underline"
+          disabled={waiting.isFetching || failures.isFetching}
+          onClick={() => {
+            if (waiting.hasNextPage) void waiting.fetchNextPage()
+            if (failures.hasNextPage) void failures.fetchNextPage()
+          }}
+        >
+          Load more attention sessions
+        </button>
+      )}
+
+      <Section title="Recent sessions" link={<NavLink to="/sessions">All sessions</NavLink>}>
+        {recent.length === 0 ? (
+          <p role="status" className="px-3.5 py-5 text-sm text-muted-foreground">
+            {recentEmpty}
+          </p>
+        ) : (
+          recent.map((r) => (
+            <Row
+              key={r.session.id}
+              row={r}
+              now={now()}
+              right={<span className="text-muted-foreground">{stateText(r.overview)}</span>}
+            />
+          ))
+        )}
+      </Section>
+      {sessions.hasNextPage && recent.length < RECENT && (
+        <button
+          type="button"
+          className="mt-2 text-sm underline"
+          disabled={sessions.isFetching}
+          onClick={() => void sessions.fetchNextPage()}
+        >
+          Load more recent sessions
+        </button>
+      )}
+      <HomeTasks />
+    </>
   )
 }
 
@@ -160,12 +251,14 @@ function Row({
   return (
     <NavLink
       to={sessionPath(row.session.id)}
-      search={trace ? { view: "trace" } : undefined}
+      search={trace ? { event_type: "session.failed" } : undefined}
       className="flex items-center gap-3 px-3.5 py-2.5 hover:bg-muted/60"
     >
       <StateDot state={row.overview?.state} attention={needsAttention(row.overview)} />
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm">{row.overview?.title ?? row.session.id}</span>
+        <span className="block truncate text-sm">
+          {row.title ?? row.overview?.title ?? row.session.id}
+        </span>
         <span className="block truncate text-xs text-muted-foreground">
           {row.session.agent_name} · {relativeTime(activity(row), now)}
         </span>

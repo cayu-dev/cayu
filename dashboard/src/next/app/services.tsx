@@ -17,6 +17,9 @@ type Services = {
   now: () => number
   prototype?: PrototypeControls
   executionEnabled?: boolean
+  inboxEnabled?: boolean
+  decisionsEnabled?: boolean
+  knowledgeReviewEnabled?: boolean
 }
 
 const ServicesContext = createContext<Services | null>(null)

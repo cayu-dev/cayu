@@ -76,6 +76,13 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
 
 ### Changes
 
+The Developer dashboard Home and Inbox now use the shared session overview and
+unified runtime Inbox. Home shows exact daily usage and attention; Inbox supports
+server filters, counts, protected inline decisions and explicit task continuation.
+`/run` and `/pending-actions` redirect to their new homes. Custom dashboard owners
+should port `src/next/routes/home-page.tsx` and `inbox-page.tsx`; the old Dashboard,
+Run and Pending route modules have been removed. Runtime contract56 is unchanged.
+
 The Developer dashboard Sessions page now leads with agent-authored titles and
 summaries, canonical merged state, and usage. It preserves existing filters and cursor
 links, excludes eval trials and forks by default, and lets readers include them.

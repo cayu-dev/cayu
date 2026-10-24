@@ -50,8 +50,8 @@ regenerate their client and upgrade their supported contract version together.
 The dashboard sidebar groups Home, Inbox, Sessions and Tasks, with Evals and
 Usage under Improve and Specialists, Knowledge, Environments, Artifacts and
 System under Agent. Items depend on the server capabilities and viewer access.
-Existing URLs remain valid: Inbox uses `/pending-actions`
-and Specialists uses `/agents`. Search sessions from the sidebar; `Ctrl+K` or
+Existing URLs remain valid: `/pending-actions` redirects to Inbox at `/inbox`,
+`/run` opens Home with the shared Start form, and Specialists uses `/agents`. Search sessions from the sidebar; `Ctrl+K` or
 `Cmd+K` focuses search, and Enter opens the session index with its `q` filter.
 The Sessions page uses `GET /api/sessions?include=overview`, displays authored titles
 and completion summaries, and preserves the existing filter links. Eval trials and
@@ -71,10 +71,15 @@ The authenticated `/api/app` response drives the shell's access presentation.
 Members can browse sessions and pending work, approve or deny a pending tool
 approval, answer a pending question, and approve or reject knowledge proposals
 when the corresponding server capability is available. Open Inbox and follow
-a pending item's session link to make its decision.
+settle permitted decisions inline with an optional reason. Recovery links to its
+session for the existing evidence-based workflow. Arguments remain withheld;
+protected human review is used when configured. Members cannot replace arguments.
+For an interrupted task, explicitly select task continuation before deciding;
+this requests a new owned claim and never borrows an active worker's authority.
 
-Evals, System and Run are omitted for members; opening those URLs directly
-shows an access explanation before their page requests start. Full-access
+Evals and System are omitted for members; opening those URLs directly
+shows an access explanation before their page requests start. Home and Sessions
+hide execution controls for members, including after an old `/run` redirect. Full-access
 mutation controls elsewhere are hidden or disabled with an explanation.
 Browser-control and evaluation-authoring panels do not mount for members.
 These presentation rules also follow custom role policies; they do not grant
@@ -419,3 +424,24 @@ Generate typed clients from the current OpenAPI schema;
 existing session listing and Cloud v1 fields remain available. Display metadata
 writes are a separate API; this read does not infer titles from messages or
 change the session metadata mutation contract.
+
+
+### Home and Inbox
+
+Home reads its last-day sessions, failures, tokens and cost from the authoritative
+server counts/accounting endpoint. Eval trials and forks are excluded. Cost is
+shown when pricing is configured, with an explicit partial marker when incomplete;
+otherwise the summary shows input plus output tokens. Needs attention, recent
+sessions and task samples are lists, never population totals. Failure links open
+the existing session event log filtered to `session.failed` until the Trace port.
+Starting a session uses its own execution permission and remains available to
+full-access users even when a custom store cannot supply Home overview reads.
+
+Inbox search, kind, session and specialist filters are server-side. Count chips
+and the sidebar use exact server counts; access-limited or incomplete sources show
+unavailable counts rather than guessed totals. Empty cursor pages are followed;
+a long scan pauses with a continuation control, stale cursors restart, and source
+issues remain visible, with an inspection link when the source identifies a
+session. Child delegated actions have a separate read-only panel.
+Knowledge proposals retain their source fields. Optional reasons are durably bound
+to decisions; runtime audit privacy may withhold them from the public response.

@@ -5,7 +5,6 @@ import {
   loadEventHistory,
   loadEventTail,
   mergeEvents,
-  readAllInbox,
 } from "../src/next/api/paging.ts"
 import { isEvalTrialMetadata, shouldFollowRowClick } from "../src/next/app/session-model.ts"
 
@@ -112,89 +111,6 @@ test("loadEventTail with nothing new keeps the history", async () => {
 
 const item = (id, extra = {}) => ({ id, kind: "approval", session_id: "s1", ...extra })
 
-test("readAllInbox follows cursors across empty pages and keeps issues", async () => {
-  const pages = {
-    "": { items: [item("a")], next_cursor: "sealed_1", has_more: true, issues: [{ code: "x" }] },
-    sealed_1: { items: [], next_cursor: "sealed_2", has_more: true },
-    sealed_2: { items: [item("b"), item("a")], next_cursor: null, has_more: false },
-  }
-  const seen = []
-  const page = await readAllInbox(async (cursor) => {
-    seen.push(cursor)
-    return pages[cursor ?? ""]
-  })
-  assert.deepEqual(seen, [null, "sealed_1", "sealed_2"])
-  assert.deepEqual(
-    page.items.map((i) => i.id),
-    ["a", "b"],
-  )
-  assert.deepEqual(page.issues, [{ code: "x" }])
-  assert.equal(page.next_cursor, null)
-  assert.equal(page.has_more, false)
-})
-
-test("readAllInbox stops at the page cap and reports more", async () => {
-  let n = 0
-  const page = await readAllInbox(
-    async () => ({ items: [item(`i${++n}`)], next_cursor: `c${n}`, has_more: true }),
-    { maxPages: 3 },
-  )
-  assert.equal(page.items.length, 3)
-  assert.equal(page.has_more, true)
-  assert.equal(page.next_cursor, "c3")
-})
-
-test("readAllInbox restarts once from no cursor on a stale cursor", async () => {
-  const stale = Object.assign(new Error("422"), { status: 422 })
-  let attempt = 0
-  const seen = []
-  const page = await readAllInbox(
-    async (cursor) => {
-      seen.push(cursor)
-      if (cursor === null) {
-        attempt++
-        return { items: [item(`first${attempt}`)], next_cursor: "c", has_more: true }
-      }
-      if (attempt === 1) throw stale
-      return { items: [item("second")], next_cursor: null, has_more: false }
-    },
-    { isStaleCursor: (e) => e.status === 422 },
-  )
-  assert.deepEqual(seen, [null, "c", null, "c"])
-  // The pages read before the restart are dropped.
-  assert.deepEqual(
-    page.items.map((i) => i.id),
-    ["first2", "second"],
-  )
-})
-
-test("readAllInbox gives up after one restart and on errors without a cursor", async () => {
-  const stale = Object.assign(new Error("422"), { status: 422 })
-  const isStaleCursor = (e) => e.status === 422
-  await assert.rejects(
-    readAllInbox(
-      async (cursor) => {
-        if (cursor) throw stale
-        return { items: [], next_cursor: "c", has_more: true }
-      },
-      { isStaleCursor },
-    ),
-    /422/,
-  )
-  let calls = 0
-  await assert.rejects(
-    readAllInbox(
-      async () => {
-        calls++
-        throw stale
-      },
-      { isStaleCursor },
-    ),
-    /422/,
-  )
-  assert.equal(calls, 1)
-})
-
 test("filterInboxItems keeps only the session, agent and kind asked for", () => {
   const items = [
     item("a", { session_id: "s1", agent_name: "x", kind: "approval" }),
@@ -231,4 +147,16 @@ test("shouldFollowRowClick leaves modified clicks and clicks on controls to the 
   assert.equal(shouldFollowRowClick({ ...plain, button: 1 }), false)
   assert.equal(shouldFollowRowClick({ ...plain, onControl: true }), false)
   assert.equal(shouldFollowRowClick({ ...plain, defaultPrevented: true }), false)
+})
+
+test("prototype Inbox text search intersects the same kind filter", () => {
+  const items = [
+    { id: "a", kind: "approval", title: "Review invoice", detail: "Accounting" },
+    { id: "b", kind: "question", title: "Review invoice" },
+    { id: "c", kind: "approval", title: "Other task" },
+  ]
+  assert.deepEqual(
+    filterInboxItems(items, { q: "INVOICE", kind: "approval" }).map((item) => item.id),
+    ["a"],
+  )
 })

@@ -4,6 +4,7 @@ import {
   createRouter,
   lazyRouteComponent,
   type RouterHistory,
+  redirect,
 } from "@tanstack/react-router"
 import { CapabilityRoute } from "../components/dashboard/server-contract"
 import { FullAccessRoute } from "../components/dashboard/viewer"
@@ -19,7 +20,7 @@ import { Layout } from "./layout"
 
 const AgentsPage = lazyRouteComponent(() => import("../routes/agents"), "AgentsPage")
 const ArtifactsPage = lazyRouteComponent(() => import("../routes/artifacts"), "ArtifactsPage")
-const DashboardPage = lazyRouteComponent(() => import("../routes/dashboard"), "DashboardPage")
+const DashboardPage = lazyRouteComponent(() => import("../next/routes/home-page"), "HomePage")
 const EnvironmentsPage = lazyRouteComponent(
   () => import("../routes/environments"),
   "EnvironmentsPage",
@@ -27,10 +28,9 @@ const EnvironmentsPage = lazyRouteComponent(
 const EvalsPage = lazyRouteComponent(() => import("../routes/evals"), "EvalsPage")
 const KnowledgePage = lazyRouteComponent(() => import("../routes/knowledge"), "KnowledgePage")
 const PendingActionsPage = lazyRouteComponent(
-  () => import("../routes/pending-actions"),
-  "PendingActionsPage",
+  () => import("../next/routes/inbox-page"),
+  "InboxPage",
 )
-const RunPage = lazyRouteComponent(() => import("../routes/run"), "RunPage")
 const SessionDetailPage = lazyRouteComponent(
   () => import("../routes/session-detail"),
   "SessionDetailPage",
@@ -60,11 +60,10 @@ export function createDashboardRouter(history?: RouterHistory) {
   const dashboardRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/",
-    component: () => (
-      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/"]} title="Dashboard">
-        <DashboardPage />
-      </CapabilityRoute>
-    ),
+    validateSearch: (search: Record<string, unknown>): { start?: string } => ({
+      start: search.start == null ? undefined : String(search.start),
+    }),
+    component: DashboardPage,
   })
 
   const sessionsRoute = createRoute({
@@ -110,8 +109,20 @@ export function createDashboardRouter(history?: RouterHistory) {
 
   const pendingActionsRoute = createRoute({
     getParentRoute: () => rootRoute,
-    path: "/pending-actions",
-    component: PendingActionsPage,
+    path: "/inbox",
+    validateSearch: (
+      search: Record<string, unknown>,
+    ): { kind?: string; q?: string; session_id?: string; agent_name?: string } => ({
+      kind: typeof search.kind === "string" ? search.kind : undefined,
+      q: typeof search.q === "string" ? search.q : undefined,
+      session_id: typeof search.session_id === "string" ? search.session_id : undefined,
+      agent_name: typeof search.agent_name === "string" ? search.agent_name : undefined,
+    }),
+    component: () => (
+      <CapabilityRoute requirement={{ kind: "surface", surface: "inbox_queries" }} title="Inbox">
+        <PendingActionsPage />
+      </CapabilityRoute>
+    ),
   })
 
   const agentsRoute = createRoute({
@@ -172,11 +183,16 @@ export function createDashboardRouter(history?: RouterHistory) {
   const runRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/run",
-    component: () => (
-      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/run"]} title="New Run">
-        <RunPage />
-      </CapabilityRoute>
-    ),
+    beforeLoad: () => {
+      throw redirect({ to: "/", search: { start: "1" } })
+    },
+  })
+  const oldPendingRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/pending-actions",
+    beforeLoad: ({ search }) => {
+      throw redirect({ to: "/inbox", search })
+    },
   })
 
   const systemRoute = createRoute({
@@ -196,6 +212,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     usageRoute,
     tasksRoute,
     pendingActionsRoute,
+    oldPendingRoute,
     agentsRoute,
     environmentsRoute,
     artifactsRoute,

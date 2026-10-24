@@ -2,8 +2,11 @@
  * Every read the pages make, as hooks over TanStack Query. Sessions that are running
  * or waiting keep their queries polling; finished ones don't.
  */
-import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { useEffect, useRef } from "react"
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useEffect, useMemo, useRef } from "react"
+import { ApiClientError } from "@/lib/api"
+import { activityPollInterval } from "@/lib/polling"
+import { overviewForDisplay } from "../api/overview"
 import {
   EVENT_WAIT_SECONDS,
   type EventHistory,
@@ -13,12 +16,13 @@ import {
 } from "../api/paging"
 import type { InboxQuery, Session, SessionOverview, SessionTranscriptPage } from "../api/types"
 import { isLive as isLiveRun } from "./eval-model"
-import { useApi } from "./services"
+import { useApi, useServices } from "./services"
+import { loadSessionList } from "./session-list-loader"
 import { isActive } from "./session-model"
 
 const ACTIVE_POLL_MS = 1500
 
-export type SessionRow = { session: Session; overview: SessionOverview | null }
+export type SessionRow = { session: Session; overview: SessionOverview | null; title?: string }
 
 /** Rows without eval-trial sessions, which counts and attention leave out (as Cloud does). */
 export const withoutEvalTrials = (rows: SessionRow[]) => rows.filter((r) => !r.overview?.eval_trial)
@@ -143,11 +147,94 @@ export function useEvents(id: string, enabled: boolean, active = false) {
 
 export function useInbox(query: InboxQuery = {}) {
   const api = useApi()
-  return useQuery({
-    queryKey: ["inbox", query],
-    queryFn: () => api.inbox({ limit: 200, ...query }),
+  const client = useQueryClient()
+  const key = useMemo(
+    () => [
+      "inbox",
+      {
+        session_id: query.session_id,
+        agent_name: query.agent_name,
+        q: query.q,
+        kind: query.kind,
+        limit: query.limit,
+      },
+    ],
+    [query.session_id, query.agent_name, query.q, query.kind, query.limit],
+  )
+  const restarted = useRef<string | null>(null)
+  const result = useInfiniteQuery({
+    queryKey: key,
+    initialPageParam: null as string | null,
+    queryFn: async ({ pageParam, signal }) => {
+      const page = await api.inbox({ limit: 50, ...query, cursor: pageParam }, signal)
+      if (page.next_cursor && page.next_cursor === pageParam)
+        throw new Error("The Inbox source did not advance. Refresh the list.")
+      return page
+    },
+    getNextPageParam: (page, _pages, _cursor, cursors) =>
+      page.next_cursor && !cursors.includes(page.next_cursor) ? page.next_cursor : undefined,
+    retry: false,
     refetchInterval: 5000,
   })
+  const last = result.data?.pages.at(-1)
+  // Only the completed current fetch pass can prove a cycle. Cached cursors from
+  // an older pass may legitimately reappear after newly arrived action pages.
+  const cycleError =
+    last?.next_cursor && result.data?.pageParams.includes(last.next_cursor)
+      ? new Error("The Inbox source did not advance. Refresh the list.")
+      : null
+  useEffect(() => {
+    if (
+      last?.next_cursor &&
+      last.items.length === 0 &&
+      (result.data?.pages.length ?? 0) % 25 !== 0 &&
+      !result.isFetching &&
+      !result.error &&
+      !cycleError
+    )
+      void result.fetchNextPage()
+  }, [
+    last,
+    result.data?.pages.length,
+    result.isFetching,
+    result.error,
+    cycleError,
+    result.fetchNextPage,
+  ])
+  useEffect(() => {
+    if (
+      result.error instanceof ApiClientError &&
+      result.error.status === 422 &&
+      last?.next_cursor &&
+      restarted.current !== JSON.stringify([key, last.next_cursor])
+    ) {
+      restarted.current = JSON.stringify([key, last.next_cursor])
+      void client.resetQueries({ queryKey: key, exact: true })
+    }
+  }, [result.error, client, key, last?.next_cursor])
+  const pages = result.data?.pages
+  const byId = new Map(pages?.flatMap((page) => page.items).map((item) => [item.id, item]))
+  return {
+    ...result,
+    error: result.error ?? cycleError,
+    isError: result.isError || !!cycleError,
+    isSuccess: result.isSuccess && !cycleError,
+    hasNextPage: result.hasNextPage && !cycleError,
+    data: pages
+      ? {
+          items: [...byId.values()],
+          issues: [
+            ...new Map(
+              pages
+                .flatMap((page) => page.issues ?? [])
+                .map((issue) => [JSON.stringify(issue), issue]),
+            ).values(),
+          ],
+          next_cursor: last?.next_cursor ?? null,
+          has_more: !!last?.next_cursor,
+        }
+      : undefined,
+  }
 }
 
 export function useTaskTypes() {
@@ -247,4 +334,71 @@ export function useEvalRun(id: string, compareWith?: string) {
 export function useEvalSettings() {
   const api = useApi()
   return useQuery({ queryKey: ["evals", "settings"], queryFn: () => api.evalSettings() })
+}
+
+/** Exact counts are separate from list pagination and may deliberately be unavailable. */
+export function useInboxCounts(query: Pick<InboxQuery, "session_id" | "agent_name" | "q"> = {}) {
+  const api = useApi()
+  const { prototype, inboxEnabled } = useServices()
+  return useQuery({
+    enabled: !!prototype || inboxEnabled === true,
+    queryKey: ["inbox-counts", query],
+    queryFn: () => api.inboxCounts(query),
+    refetchInterval: 30000,
+  })
+}
+
+/** Home lists use the server's bounded filtered pages; their lengths are never totals. */
+export function useHomeSessionRows(scope: "waiting" | "failed" | "recent") {
+  const api = useApi()
+  const query = useInfiniteQuery({
+    queryKey: ["home", "sessions", scope],
+    initialPageParam: null as string | null,
+    queryFn: async ({ pageParam, signal }) => {
+      const result = await loadSessionList(
+        {
+          include: ["overview"],
+          include_eval: false,
+          include_forks: false,
+          overview_state:
+            scope === "waiting"
+              ? ["waiting_approval", "waiting_input", "needs_recovery"]
+              : scope === "failed"
+                ? ["failed"]
+                : undefined,
+          limit: 20,
+          cursor: pageParam,
+          order_by: "updated_at_desc",
+        },
+        (params, signal) => api.sessions(params, signal),
+        (id, params, signal) => api.transcript(id, params, signal),
+        signal,
+      )
+      return {
+        rows: result.rows.map((row) => ({
+          session: row.session,
+          overview: overviewForDisplay(row.overview),
+          title: row.title,
+        })),
+        next_cursor: result.page.next_cursor,
+        searchPaused: result.searchPaused,
+      }
+    },
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+    refetchInterval: (query) =>
+      activityPollInterval(
+        query.state.data?.pages.some((page) =>
+          page.rows.some((row) => row.overview?.state === "running"),
+        ) ?? false,
+        5000,
+      ),
+  })
+  return {
+    ...query,
+    rows: [
+      ...new Map(
+        (query.data?.pages.flatMap((page) => page.rows) ?? []).map((row) => [row.session.id, row]),
+      ).values(),
+    ],
+  }
 }

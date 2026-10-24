@@ -21,6 +21,11 @@ function capabilities() {
     configured_store_roles: ["session"],
     actor: null,
     surfaces: {
+      session_overview_queries: {
+        configured: true,
+        read: operation(true),
+        mutate: operation(false, "unsupported"),
+      },
       dashboard: {
         configured: true,
         read: operation(true),
@@ -218,4 +223,10 @@ test("recording reads require the optional server capability", () => {
     mutate: operation(false, "unsupported"),
   }
   assert.equal(dashboardCapabilityEnabled(snapshot, requirement), true)
+})
+
+test("Home requires canonical overview queries even when store metrics are available", () => {
+  const snapshot = capabilities()
+  snapshot.surfaces.session_overview_queries.read = operation(false, "not_configured")
+  assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/"]), false)
 })

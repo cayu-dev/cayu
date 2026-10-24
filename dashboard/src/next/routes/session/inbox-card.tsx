@@ -4,13 +4,17 @@
  * Recovery is the exception: the server only takes it on the session page, with the
  * evidence of what happened, so on the Inbox page a recovery item links to its session.
  */
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { CircleHelp, Lightbulb, RotateCcw, ShieldCheck } from "lucide-react"
 import { type ReactNode, useState } from "react"
+import { ProtectedHumanReview } from "@/components/dashboard/protected-human-review"
+import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
+import { fetchPendingKnowledgeEntry, type KnowledgeEntryDetail } from "@/lib/api"
+import { dashboardConfig } from "@/lib/config"
 import { cn } from "@/lib/utils"
 import type { InboxItem, InboxSettleRequest, RecoveryRequest } from "../../api/types"
-import { useApi, useNow } from "../../app/services"
+import { useApi, useNow, useServices } from "../../app/services"
 import { relativeTime } from "../../app/session-model"
 import { ErrorState, NavLink, sessionPath } from "../common"
 
@@ -30,11 +34,42 @@ export function InboxCard({
   context?: { title: string; sessionId: string }
 }) {
   const api = useApi()
+  const { prototype, decisionsEnabled, knowledgeReviewEnabled } = useServices()
+  const available =
+    !!prototype ||
+    (item.kind === "knowledge" ? knowledgeReviewEnabled === true : decisionsEnabled === true)
+  const knowledgeSource = useQuery({
+    queryKey: ["knowledge-source", item.knowledge?.entry_id, item.knowledge?.revision],
+    queryFn: () => fetchPendingKnowledgeEntry(item.knowledge!.entry_id),
+    enabled: !prototype && item.kind === "knowledge" && !!item.knowledge,
+  })
+  const knowledgeReady =
+    !!prototype ||
+    (!!knowledgeSource.data &&
+      !knowledgeSource.error &&
+      knowledgeSource.data.revision === item.knowledge?.revision)
   const now = useNow()
   const queryClient = useQueryClient()
   const [answer, setAnswer] = useState("")
+  const [reason, setReason] = useState("")
+  const [claimTask, setClaimTask] = useState(false)
+  const [override, setOverride] = useState(false)
+  const [argumentsText, setArgumentsText] = useState("{}")
+  const [argumentError, setArgumentError] = useState<string | null>(null)
+  const viewer = useViewer()
   const refresh = () => {
-    for (const key of ["inbox", "sessions", "overview", "transcript", "knowledge", "tool-usage"])
+    for (const key of [
+      "inbox",
+      "inbox-counts",
+      "child-actions",
+      "home",
+      "sessions",
+      "session-list",
+      "overview",
+      "transcript",
+      "knowledge",
+      "tool-usage",
+    ])
       void queryClient.invalidateQueries({ queryKey: [key] })
   }
   const settleItem = useMutation({
@@ -53,9 +88,36 @@ export function InboxCard({
   const decide = (
     decision: InboxSettleRequest["decision"],
     extra: Partial<InboxSettleRequest> = {},
-  ) => settleItem.mutate({ decision, ...extra })
+  ) => {
+    if (!available || !item.decisions.includes(decision)) return
+    let argumentsValue: Record<string, unknown> | undefined
+    if (decision === "approve" && override) {
+      if (!prototype && viewer?.full_access !== true) return
+      try {
+        const parsed: unknown = JSON.parse(argumentsText)
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          throw new Error("Expected an object")
+        argumentsValue = parsed as Record<string, unknown>
+        setArgumentError(null)
+      } catch {
+        setArgumentError("Changed arguments must be a JSON object.")
+        return
+      }
+    }
+    settleItem.mutate({
+      decision,
+      ...(argumentsValue ? { arguments: argumentsValue } : {}),
+      reason: reason.trim() || null,
+      ...(claimTask ? { task_continuation: "claim" as const } : {}),
+      ...extra,
+    })
+  }
   const { icon: Icon, label } = KIND[item.kind]
-  const busy = settle.isPending || settle.isSuccess
+  const busy =
+    !available ||
+    settle.isPending ||
+    settle.isSuccess ||
+    (item.kind === "knowledge" && !knowledgeReady)
 
   let body: ReactNode
   let actions: ReactNode
@@ -71,10 +133,19 @@ export function InboxCard({
     )
     actions = (
       <>
-        <Button size="sm" disabled={busy} onClick={() => decide("approve")}>
+        <Button
+          size="sm"
+          disabled={busy || !item.decisions.includes("approve")}
+          onClick={() => decide("approve")}
+        >
           Approve
         </Button>
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => decide("deny")}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || !item.decisions.includes("deny")}
+          onClick={() => decide("deny")}
+        >
           Deny
         </Button>
       </>
@@ -170,20 +241,67 @@ export function InboxCard({
     )
     actions = (
       <>
-        <Button size="sm" disabled={busy} onClick={() => decide("keep")}>
+        <Button
+          size="sm"
+          disabled={busy || !item.decisions.includes("keep")}
+          onClick={() => decide("keep")}
+        >
           Keep
         </Button>
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => decide("drop")}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || !item.decisions.includes("drop")}
+          onClick={() => decide("drop")}
+        >
           Drop
         </Button>
       </>
     )
   }
 
+  const protectedDecision =
+    dashboardConfig.humanReviewPurpose &&
+    item.session_id &&
+    (item.kind === "approval" || item.kind === "question")
+  if (protectedDecision) {
+    actions = (
+      <ProtectedHumanReview
+        sessionId={item.session_id!}
+        purpose={dashboardConfig.humanReviewPurpose!}
+        kind={item.kind === "approval" ? "tool_approval" : "user_input"}
+        disabled={busy || item.decisions.length === 0}
+        unavailableReason={null}
+        onDecision={async (decision) => {
+          const body: InboxSettleRequest =
+            "answer" in decision
+              ? {
+                  decision: "answer",
+                  answer: decision.answer,
+                  reason: reason.trim() || null,
+                  review_reference: decision.review_reference,
+                }
+              : {
+                  decision: decision.decision,
+                  reason: decision.reason,
+                  review_reference: decision.review_reference,
+                }
+          if (!item.decisions.includes(body.decision))
+            throw new Error("This decision is no longer available.")
+          await settleItem.mutateAsync({
+            ...body,
+            ...(claimTask ? { task_continuation: "claim" as const } : {}),
+          })
+        }}
+      />
+    )
+  }
+
   return (
     <div
+      data-inbox-item={item.id}
       className={cn(
-        "rounded-xl border bg-card",
+        "min-w-0 break-words rounded-xl border bg-card",
         settle.isSuccess ? "border-border opacity-70" : "border-warning/50 shadow-xs",
       )}
     >
@@ -205,7 +323,81 @@ export function InboxCard({
           {relativeTime(Date.parse(item.created_at), now())}
         </span>
       </div>
-      <div className="space-y-2 px-3.5 py-3 text-sm">{body}</div>
+      <div className="space-y-2 px-3.5 py-3 text-sm">
+        {body}
+        {!available && item.kind !== "recovery" && (
+          <p role="status">Decisions are unavailable for this deployment.</p>
+        )}
+        {item.kind === "knowledge" && item.knowledge && (
+          <KnowledgeSource
+            entry={knowledgeSource.data}
+            error={knowledgeSource.error}
+            revision={item.knowledge.revision}
+            prototype={!!prototype}
+          />
+        )}
+        {(item.kind === "approval" || item.kind === "question") && !settle.isSuccess && (
+          <label className="flex items-start gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={claimTask}
+              onChange={(event) => setClaimTask(event.target.checked)}
+              disabled={busy}
+            />
+            Continue an interrupted task with this decision. Active workers remain protected.
+          </label>
+        )}
+        {item.arguments_unavailable_reason === "quarantined" && (
+          <p className="text-xs text-muted-foreground">
+            Arguments are withheld. Use protected human review when this agent provides it.
+          </p>
+        )}
+        {item.kind === "approval" &&
+          !protectedDecision &&
+          (!!prototype || viewer?.full_access === true) &&
+          !settle.isSuccess && (
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={override}
+                  onChange={(event) => setOverride(event.target.checked)}
+                  disabled={busy}
+                />
+                Approve with changed arguments
+              </label>
+              {override && (
+                <label className="block text-xs">
+                  Changed arguments
+                  <textarea
+                    aria-label="Changed arguments"
+                    value={argumentsText}
+                    onChange={(event) => setArgumentsText(event.target.value)}
+                    disabled={busy}
+                    rows={4}
+                    className="mt-1 block w-full rounded border border-input bg-background px-2 py-1 font-mono"
+                  />
+                  <span>The proposed arguments remain withheld. This object replaces them.</span>
+                </label>
+              )}
+              {argumentError && <p role="alert">{argumentError}</p>}
+            </div>
+          )}
+        {item.kind !== "recovery" &&
+          (!protectedDecision || item.kind === "question") &&
+          !settle.isSuccess && (
+            <label className="block text-xs">
+              Reason (optional)
+              <input
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                maxLength={4096}
+                disabled={busy}
+                className="mt-1 block w-full rounded border border-input bg-background px-2 py-1"
+              />
+            </label>
+          )}
+      </div>
       {!settle.isSuccess && (
         <div className="flex flex-wrap gap-2 border-t border-border px-3.5 py-2.5">{actions}</div>
       )}
@@ -304,5 +496,50 @@ function RecoveryForm({
         </Button>
       </div>
     </form>
+  )
+}
+
+function KnowledgeSource({
+  entry,
+  error,
+  revision,
+  prototype,
+}: {
+  entry: KnowledgeEntryDetail | undefined
+  error: unknown
+  revision: number
+  prototype: boolean
+}) {
+  if (prototype) return null
+  if (error) return <p className="text-xs text-muted-foreground">Source details are unavailable.</p>
+  if (!entry) return <p role="status">Loading source details…</p>
+  if (entry.revision !== revision)
+    return <p role="status">This proposal changed. Refresh the Inbox before deciding.</p>
+  return (
+    <>
+      <h3 className="text-xs font-medium">Full proposal</h3>
+      <p className="whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2">{entry.text}</p>
+      <dl className="grid gap-1 break-words text-xs text-muted-foreground">
+        <dt>Namespace</dt>
+        <dd>{entry.namespace}</dd>
+        <dt>Labels</dt>
+        <dd>
+          {Object.entries(entry.labels)
+            .map(([key, value]) => `${key}=${value}`)
+            .join(", ") || "None"}
+        </dd>
+        <dt>Aspects</dt>
+        <dd>{entry.aspects.join(", ") || "None"}</dd>
+        <dt>Impact targets</dt>
+        <dd>{entry.impact_targets.join(", ") || "None"}</dd>
+        <dt>Source URI</dt>
+        <dd>{entry.source_uri || "None"}</dd>
+        <dt>Created by</dt>
+        <dd>
+          {entry.created_by_type}
+          {entry.created_by ? `: ${entry.created_by}` : ""}
+        </dd>
+      </dl>
+    </>
   )
 }

@@ -32,6 +32,7 @@ const MEMBER_READ_SURFACES = new Set([
   "artifacts",
   "dashboard",
   "inbox",
+  "inbox_queries",
   "pricing",
   "reviewed_knowledge",
   "session_follow",

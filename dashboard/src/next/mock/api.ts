@@ -572,9 +572,40 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
         ),
       ),
     resumeTask: async (id) => wait(resumeTask(tasksContext, id)),
+    async inboxCounts(query = {}) {
+      const items = filterInboxItems(data.inbox, query)
+      const counts = { approval: 0, question: 0, recovery: 0, knowledge: 0 }
+      for (const item of items) counts[item.kind]++
+      return wait({ counts, total_count: items.length, complete: true, unavailable_reason: null })
+    },
+    async overviewCounts(query) {
+      const rows = data.sessions.filter(
+        (row) => !isEvalTrialMetadata(row.metadata) && !row.overview.forked,
+      )
+      const day = rows.filter(
+        (row) => row.overview.started_at >= query.since && row.overview.started_at < query.until,
+      )
+      const counts: Record<string, string> = {}
+      for (const row of day)
+        counts[row.overview.state] = String(Number(counts[row.overview.state] ?? 0) + 1)
+      return wait({
+        ...query,
+        tokens: {
+          input: String(day.reduce((total, row) => total + row.overview.tokens.input, 0)),
+          output: String(day.reduce((total, row) => total + row.overview.tokens.output, 0)),
+          cached: String(day.reduce((total, row) => total + row.overview.tokens.cached, 0)),
+        },
+        tokens_complete: true,
+        cost: null,
+        counts_by_state: counts,
+        total_count: String(day.length),
+        failed: counts.failed ?? "0",
+        running_now: String(rows.filter((row) => row.overview.state === "running").length),
+      })
+    },
     async inbox(query = {}) {
       const items = filterInboxItems(data.inbox, query)
-      // The whole inbox, as real.ts returns it after following every page.
+      // The prototype returns all its synthetic items in one page.
       return wait({
         items: items.sort((a, b) => b.created_at.localeCompare(a.created_at)),
         next_cursor: null,

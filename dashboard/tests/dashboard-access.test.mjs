@@ -102,3 +102,18 @@ test("only a structured role_forbidden403 becomes the useful role reason", () =>
   assert.equal(roleForbiddenMessage(401, { code: "role_forbidden" }), null)
   assert.equal(roleForbiddenMessage(403, { code: "other" }), null)
 })
+
+test("members read Inbox query counts without mutation authority", () => {
+  assert.equal(
+    applyViewerAccess(available, { kind: "surface", surface: "inbox_queries" }, member).enabled,
+    true,
+  )
+  assert.equal(
+    applyViewerAccess(
+      available,
+      { kind: "surface", surface: "inbox_queries", operation: "mutate" },
+      member,
+    ).enabled,
+    false,
+  )
+})

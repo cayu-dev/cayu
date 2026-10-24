@@ -40,6 +40,9 @@ import {
 import { fetchDashboardIdentitySnapshot } from "../lib/dashboard-identity-query"
 import { useTheme } from "../lib/theme"
 import { cn } from "../lib/utils"
+import { realApi } from "../next/api/real"
+import { useInboxCounts } from "../next/app/queries"
+import { ServicesProvider } from "../next/app/services"
 
 /** Compatibility gates must finish before any page or authenticated identity reads mount. */
 export function Layout() {
@@ -89,7 +92,8 @@ export function Layout() {
 }
 
 function IdentityGate() {
-  const capability = resolveDashboardCapability(useServerContract().capabilities, {
+  const serverContract = useServerContract()
+  const capability = resolveDashboardCapability(serverContract.capabilities, {
     kind: "surface",
     surface: "app_info",
   })
@@ -134,7 +138,18 @@ function IdentityGate() {
       >
         Identity refresh is temporarily unavailable. Your current page is preserved.
       </div>
-      <DashboardShell />
+      <ServicesProvider
+        value={{
+          api: realApi,
+          now: Date.now,
+          executionEnabled: serverContract.capabilities.mutations.session_execution.enabled,
+          inboxEnabled: serverContract.capabilities.surfaces.inbox_queries?.read.enabled === true,
+          decisionsEnabled: serverContract.capabilities.mutations.pending_action_resolution.enabled,
+          knowledgeReviewEnabled: serverContract.capabilities.mutations.knowledge_review.enabled,
+        }}
+      >
+        <DashboardShell />
+      </ServicesProvider>
     </ViewerProvider>
   )
 }
@@ -144,7 +159,7 @@ const sections = [
     label: null,
     items: [
       { to: "/", label: "Home", icon: House, capability: DASHBOARD_ROUTE_REQUIREMENTS["/"] },
-      { to: "/pending-actions", label: "Inbox", icon: Inbox },
+      { to: "/inbox", label: "Inbox", icon: Inbox },
       { to: "/sessions", label: "Sessions", icon: MessagesSquare },
       {
         to: "/tasks",
@@ -205,6 +220,7 @@ function DashboardShell() {
   const [query, setQuery] = useState("")
   const searchRef = useRef<HTMLInputElement>(null)
   const sidebarRef = useRef<HTMLElement>(null)
+  const inboxCounts = useInboxCounts()
   const mainRef = useRef<HTMLElement>(null)
   const openRef = useRef<HTMLButtonElement>(null)
   const { theme, cycle } = useTheme()
@@ -375,6 +391,7 @@ function DashboardShell() {
                     <Link
                       key={to}
                       to={to}
+                      aria-label={label}
                       aria-current={active ? "page" : undefined}
                       className={cn(
                         "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-sidebar-accent",
@@ -383,6 +400,17 @@ function DashboardShell() {
                     >
                       <Icon className="size-4 text-muted-foreground" aria-hidden="true" />
                       <span>{label}</span>
+                      {to === "/inbox" &&
+                        inboxCounts.data?.complete === true &&
+                        (inboxCounts.data.total_count ?? 0) > 0 && (
+                          <span
+                            role="status"
+                            aria-label="Inbox total"
+                            className="ml-auto rounded-full bg-warning/15 px-1.5 text-xs tabular-nums"
+                          >
+                            {inboxCounts.data?.total_count}
+                          </span>
+                        )}
                     </Link>
                   )
                 })}

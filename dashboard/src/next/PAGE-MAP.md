@@ -143,3 +143,16 @@ Every area follows the shared rules for roles, the contract check, the transitio
 2. Port area by area, each against today's server with the fallbacks the prototype already has, and switch each to the runtime change it needs as it lands. Evals is the exception: it needs suite-centred eval reads first.
 3. Move Usage, Environments, Artifacts and System in unchanged, wrapped in `TopBar`/`PageBody`. The browser operator and recordings go into the session's Browser tab, and execution snapshots into the trace's session span.
 4. Remove the old routes, `Layout.tsx` and their tests once their area has landed. Rewrite each area's part of `examples/dashboard_behavior_live.py`, and update the chunk-name assertions in `tests/server/test_server.py`.
+
+
+### Home/Inbox production port
+
+Home and Inbox now use runtime contract56: exact daily accounting (excluding eval
+trials/forks), server-side public Inbox search and counts, durable optional decision
+reasons, and explicit owned task continuation. Proposed arguments stay withheld;
+configured protected review owns their disclosure. Members read and decide without
+argument overrides. Recovery opens its session; failures temporarily open the
+existing event log filtered by `session.failed` until Trace is ported. Child actions
+remain a separate read-only panel. `/pending-actions` redirects to `/inbox` with
+filters; `/run` redirects to `/?start=1`. Shared Start and title/query owners are
+those used by the Sessions production page. Counts are never inferred from samples.
