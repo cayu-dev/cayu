@@ -5,13 +5,15 @@
  */
 import { useSearch } from "@tanstack/react-router"
 import { Plus, Search } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useEffect, useState } from "react"
+import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { TaskItem } from "../api/types"
-import { useTasks } from "../app/queries"
-import { useNow } from "../app/services"
+import { useSpecialists, useTaskTypes } from "../app/queries"
+import { useNow, useServices } from "../app/services"
 import { constantColumns, relativeTime } from "../app/session-model"
+import { taskGroupCount } from "../app/task-index-model"
 import {
   groupOf,
   isCayuTask,
@@ -20,6 +22,7 @@ import {
   type TaskGroup,
   taskName,
 } from "../app/task-model"
+import { type TaskFilters, useTaskIndex, useTaskLinks } from "../app/task-queries"
 import {
   EmptyState,
   ErrorState,
@@ -34,7 +37,7 @@ import {
 } from "./common"
 import { StartSession } from "./start-session"
 
-type Filters = { group?: string; q?: string; type?: string; agent?: string; cayu?: string }
+type Filters = TaskFilters
 
 export const GROUP_DOT: Record<TaskGroup, string> = {
   active: "bg-info animate-pulse motion-reduce:animate-none",
@@ -60,33 +63,53 @@ export function TasksPage() {
   const go = useGo()
   const rowClick = useRowClick()
   const now = useNow()
-  const tasks = useTasks()
+  const tasks = useTaskIndex(search)
+  const services = useServices()
+  const viewer = useViewer()
+  const specialists = useSpecialists()
+  const catalog = useTaskTypes()
   const [creating, setCreating] = useState(false)
-  const set = (patch: Partial<Filters>) => go("/tasks", { ...search, ...patch })
-  const all = tasks.data ?? []
+  const [draft, setDraft] = useState(search.q ?? "")
+  useEffect(() => setDraft(search.q ?? ""), [search.q])
+  useEffect(() => {
+    if (search.task_id) go(taskPath(search.task_id), undefined, { replace: true })
+  }, [search.task_id, go])
+  const set = (patch: Partial<Filters>) =>
+    go("/tasks", { ...search, ...patch }, { replace: true, resetScroll: false })
+  const all = [
+    ...new Map(
+      (tasks.data?.pages.flatMap((page) => page.items) ?? []).map((task) => [task.id, task]),
+    ).values(),
+  ]
+  const failedDetails = useTaskLinks(
+    all.filter((task) => task.status === "failed").map((task) => task.id),
+  )
+  const failedById = new Map((failedDetails.data?.rows ?? []).map((task) => [task.id, task]))
+  const rows = all
   const showCayu = search.cayu === "1"
-  const cayuCount = all.filter(isCayuTask).length
-
-  // Every filter but the group, so the chips count what they'd show.
-  const filtered = useMemo(() => {
-    const q = search.q?.toLowerCase()
-    return all.filter(
-      (t) =>
-        (showCayu || !isCayuTask(t)) &&
-        (!search.type || t.type === search.type) &&
-        (!search.agent || t.assigned_agent_name === search.agent) &&
-        (!q ||
-          [t.id, t.title, t.type, t.session_id, t.status_reason]
-            .join(" ")
-            .toLowerCase()
-            .includes(q)),
-    )
-  }, [all, showCayu, search.type, search.agent, search.q])
-  const rows = search.group ? filtered.filter((t) => groupOf(t.status) === search.group) : filtered
-  const count = (group: TaskGroup) => filtered.filter((t) => groupOf(t.status) === group).length
+  const counts = tasks.data?.pages[0]?.counts_by_status
+  const total = tasks.data?.pages[0]?.total_count
   const { constant, varying } = constantColumns(rows, COLUMNS)
-  const types = [...new Set(all.filter((t) => showCayu || !isCayuTask(t)).map((t) => t.type))]
-  const agents = [...new Set(all.map((t) => t.assigned_agent_name).filter((a): a is string => !!a))]
+  const types = [
+    ...new Set([
+      ...(catalog.data ?? []).map((type) => type.name),
+      ...all.map((task) => task.type),
+      ...(search.type ? [search.type] : []),
+    ]),
+  ]
+  const agents = [
+    ...new Set([
+      ...(specialists.data?.agents ?? []).map((agent) => agent.name),
+      ...(search.assigned_agent_name || search.agent
+        ? [search.assigned_agent_name ?? search.agent!]
+        : []),
+    ]),
+  ]
+  const canCreate =
+    !!services.prototype || (viewer?.full_access === true && services.taskCreationEnabled === true)
+  const cycle =
+    !!tasks.data?.pages.at(-1)?.next_cursor &&
+    tasks.data.pageParams.includes(tasks.data.pages.at(-1)!.next_cursor!)
   const field =
     "h-8 rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
 
@@ -94,15 +117,17 @@ export function TasksPage() {
     <div className="flex min-w-0 flex-1 flex-col">
       <TopBar
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setCreating(!creating)}
-            aria-expanded={creating}
-          >
-            <Plus />
-            Create a task
-          </Button>
+          canCreate ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCreating(!creating)}
+              aria-expanded={creating}
+            >
+              <Plus />
+              Create a task
+            </Button>
+          ) : undefined
         }
       >
         Tasks
@@ -112,7 +137,7 @@ export function TasksPage() {
         <fieldset className="flex min-w-0 flex-wrap gap-1.5">
           <legend className="sr-only">Filter by status</legend>
           {[{ id: undefined, label: "All" }, ...TASK_GROUPS].map((g) => {
-            const n = g.id ? count(g.id) : filtered.length
+            const n = counts ? taskGroupCount(counts, g.id) : "—"
             const on = search.group === g.id
             return (
               <button
@@ -131,7 +156,7 @@ export function TasksPage() {
                   <span className={cn("size-2 rounded-full", GROUP_DOT[g.id])} aria-hidden="true" />
                 )}
                 {g.label}
-                {n > 0 && (
+                {
                   <span
                     className={cn(
                       "rounded-full px-1.5 text-xs font-medium tabular-nums",
@@ -140,7 +165,7 @@ export function TasksPage() {
                   >
                     {n}
                   </span>
-                )}
+                }
               </button>
             )
           })}
@@ -152,7 +177,8 @@ export function TasksPage() {
             <span className="sr-only">Search tasks</span>
             <input
               id="tasks-search"
-              defaultValue={search.q ?? ""}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") set({ q: e.currentTarget.value || undefined })
               }}
@@ -161,7 +187,7 @@ export function TasksPage() {
               className="w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
             />
           </label>
-          {types.length > 1 && (
+          {
             <select
               id="tasks-type"
               aria-label="Task type"
@@ -176,14 +202,16 @@ export function TasksPage() {
                 </option>
               ))}
             </select>
-          )}
-          {agents.length > 1 && (
+          }
+          {
             <select
               id="tasks-agent"
               aria-label="Specialist"
               className={field}
-              value={search.agent ?? ""}
-              onChange={(e) => set({ agent: e.target.value || undefined })}
+              value={search.assigned_agent_name ?? search.agent ?? ""}
+              onChange={(e) =>
+                set({ assigned_agent_name: e.target.value || undefined, agent: undefined })
+              }
             >
               <option value="">All specialists</option>
               {agents.map((a) => (
@@ -192,8 +220,8 @@ export function TasksPage() {
                 </option>
               ))}
             </select>
-          )}
-          {cayuCount > 0 && (
+          }
+          {
             <label className="ml-auto flex items-center gap-2 text-[13px] text-muted-foreground">
               <input
                 id="tasks-cayu"
@@ -202,9 +230,9 @@ export function TasksPage() {
                 onChange={(e) => set({ cayu: e.target.checked ? "1" : undefined })}
                 className="size-3.5 accent-foreground"
               />
-              Show Cayu's own tasks ({cayuCount})
+              Show Cayu's own tasks
             </label>
-          )}
+          }
         </div>
 
         {Object.keys(constant).length > 0 && rows.length > 1 && (
@@ -213,6 +241,21 @@ export function TasksPage() {
           </p>
         )}
 
+        <Button
+          className="mt-2"
+          variant="ghost"
+          onClick={() => {
+            setDraft("")
+            go("/tasks", {}, { replace: true, resetScroll: false })
+          }}
+        >
+          Clear filters
+        </Button>
+        {!!failedDetails.data?.issues.length && (
+          <p role="status">
+            Some task details are unavailable; their status lines omit detail-specific information.
+          </p>
+        )}
         {tasks.error && (
           <div className="mt-3">
             <ErrorState error={tasks.error} />
@@ -220,10 +263,8 @@ export function TasksPage() {
         )}
         {tasks.isSuccess && rows.length === 0 ? (
           <div className="mt-4">
-            <EmptyState title={all.length ? "No tasks match these filters" : "No tasks yet"}>
-              {all.length
-                ? undefined
-                : "Tasks appear when the agent's code creates them, for example from a schedule or an incoming request."}
+            <EmptyState title="No tasks match these filters">
+              Tasks appear when the agent’s code creates them. Try changing the filters.
             </EmptyState>
           </div>
         ) : (
@@ -266,7 +307,9 @@ export function TasksPage() {
                         </div>
                       </td>
                       <td className={cn("max-w-[22rem] px-3 py-2", GROUP_TEXT[group])}>
-                        <span className="line-clamp-2">{statusLine(t, all, now())}</span>
+                        <span className="line-clamp-2">
+                          {statusLine(failedById.get(t.id) ?? t, all, now(), undefined, false)}
+                        </span>
                       </td>
                       {varying.map((c) => (
                         <td key={c} className="px-3 py-2 whitespace-nowrap text-muted-foreground">
@@ -282,6 +325,32 @@ export function TasksPage() {
               </tbody>
             </table>
           </div>
+        )}
+        {tasks.isPending && (
+          <p role="status" className="mt-4">
+            Loading tasks…
+          </p>
+        )}
+        {tasks.isSuccess && !counts && (
+          <p role="status" className="mt-3 text-sm text-muted-foreground">
+            Exact counts are unavailable for this task store. This list shows loaded records only.
+          </p>
+        )}
+        {cycle && <p role="alert">Task paging did not advance. Refresh the list to continue.</p>}
+        {tasks.hasNextPage && (
+          <Button
+            className="mt-4"
+            variant="outline"
+            disabled={tasks.isFetching}
+            onClick={() => void tasks.fetchNextPage()}
+          >
+            Load more tasks
+          </Button>
+        )}
+        {tasks.isSuccess && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            {rows.length} loaded{total !== null && total !== undefined ? ` of ${total}` : ""}
+          </p>
         )}
       </PageBody>
     </div>

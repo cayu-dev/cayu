@@ -503,6 +503,33 @@ declarations are rejected, rather than redacted into a different input contract.
 
 ### Task pages, relations, and cancellation
 
+The Tasks page groups exact server counts into Active, Waiting, Held, Failed and
+Done. Search, type and specialist filters apply on the server; Cayu's internal
+tasks are hidden unless requested. Load more follows the server cursor, while
+custom stores without native counts show counts as unavailable. Existing
+`/tasks?assigned_agent_name=...` links keep their filter; old `task_id` links open
+the canonical `/tasks/{id}` detail page.
+
+Each task shows its authorized session links, retry attempts, prerequisites,
+dependents, parent and subtasks, with explicit continuation controls. Schedule
+history, input, result/error and collapsed Debug retain their public task fields.
+Members can read these sections, including schedule history, but cannot create,
+replay, hold, resume or cancel tasks. Cancellation of a scheduled task uses its
+current schedule revision; cancelling a running task does not prove previously
+dispatched effects stopped.
+
+Create a task uses a currently declared type and its input schema. A lost response
+retains the exact operation and body in the current tab; reopen the form and
+recover that operation before creating another. A rejected recovery request does
+not establish that the original mutation failed; its exact identity stays fenced.
+Specialist sessions remain independently available while a task is unresolved,
+and a known task result can be dismissed. Run again similarly uses the
+server's freshly read exact replay source for a new operation, while uncertain
+retries retain their original source. Reloading the
+browser loses this in-memory observation handle: inspect the task list before
+submitting new work. Missing task declarations or replay authority are explained
+in the UI. Handler deadline failures say "Task handler ran out of time".
+
 Task list and detail records include `graph_id` and `prerequisite_task_ids`.
 `GET /api/tasks?include=counts` returns `{items, total_count, counts_by_status,
 next_cursor, as_of}`. The `task_index.read` capability reports native snapshot

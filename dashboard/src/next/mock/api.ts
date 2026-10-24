@@ -558,8 +558,78 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
     },
     // Tasks come from the same records as today's Tasks page (legacy/core.ts), so both agree.
     tasks: () => wait(taskList(tasksContext)),
+    taskList: async (query) =>
+      (await api.taskIndex({ ...query, cursor: String(query.offset ?? 0) })).items,
+    async taskIndex(query) {
+      const all = taskList(tasksContext).filter(
+        (task) =>
+          (query.include_internal !== false || !task.type.startsWith("cayu.")) &&
+          (!query.type || task.type === query.type) &&
+          (!query.assigned_agent_name || task.assigned_agent_name === query.assigned_agent_name) &&
+          (!query.parent_task_id || task.parent_task_id === query.parent_task_id) &&
+          (!query.session_id || task.session_id === query.session_id) &&
+          (!query.q ||
+            [task.id, task.title, task.type, task.status_reason]
+              .join(" ")
+              .toLowerCase()
+              .includes(query.q.toLowerCase())),
+      )
+      const statuses = [
+        "pending",
+        "claimed",
+        "running",
+        "waiting_dependencies",
+        "waiting_group",
+        "paused",
+        "blocked",
+        "needs_attention",
+        "failed",
+        "dependency_skipped",
+        "completed",
+        "cancelled",
+      ]
+      const counts = Object.fromEntries(
+        statuses.map((status) => [
+          status,
+          String(all.filter((task) => task.status === status).length),
+        ]),
+      )
+      const selected = all.filter(
+        (task) =>
+          (!query.status || task.status === query.status) &&
+          (!query.statuses?.length ||
+            query.statuses.includes(
+              task.status as import("@/lib/generated/server-api").TaskStatus,
+            )),
+      )
+      const offset = Number(query.cursor ?? "0"),
+        limit = query.limit ?? 50
+      return wait({
+        items: selected.slice(offset, offset + limit),
+        total_count: String(selected.length),
+        counts_by_status: counts as import("@/lib/generated/server-api").TaskStatusCounts,
+        next_cursor: offset + limit < selected.length ? String(offset + limit) : null,
+        as_of: iso(),
+      })
+    },
+    async taskDependents(id, cursor) {
+      const rows = taskList(tasksContext).filter((task) => task.prerequisite_task_ids.includes(id))
+      const page = await api.taskIndex({ include_internal: true })
+      const offset = Number(cursor ?? "0")
+      return {
+        ...page,
+        items: rows.slice(offset, offset + 50),
+        total_count: String(rows.length),
+        next_cursor: offset + 50 < rows.length ? String(offset + 50) : null,
+      }
+    },
     task: async (id) => wait(taskInfo(tasksContext, id)),
-    taskScheduleEvents: async (id) => wait(scheduleEvents(tasksContext, id)),
+    taskScheduleEvents: async (id, afterSequence) =>
+      wait(
+        scheduleEvents(tasksContext, id)
+          .filter((event) => afterSequence == null || event.sequence > afterSequence)
+          .slice(0, 100),
+      ),
     holdTask: async (id, hold, reason) =>
       wait(
         holdTask(

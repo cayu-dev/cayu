@@ -23,6 +23,7 @@ import { isLive as isLiveRun } from "./eval-model"
 import { useApi, useServices } from "./services"
 import { loadSessionList } from "./session-list-loader"
 import { isActive } from "./session-model"
+import { LIVE_TASK, TASK_POLL_MS } from "./task-polling"
 
 const ACTIVE_POLL_MS = 1500
 
@@ -258,15 +259,6 @@ export function useKnowledge() {
   return useQuery({ queryKey: ["knowledge"], queryFn: () => api.knowledge() })
 }
 
-const TASK_POLL_MS = 5000
-const LIVE_TASK = new Set([
-  "pending",
-  "claimed",
-  "running",
-  "waiting_dependencies",
-  "waiting_group",
-])
-
 /** Every task; polls while any is live, as today's Tasks page does. */
 export function useTasks() {
   const api = useApi()
@@ -282,18 +274,28 @@ export function useTask(id: string) {
   const api = useApi()
   return useQuery({
     queryKey: ["tasks", id],
-    queryFn: () => api.task(id),
+    queryFn: ({ signal }) => api.task(id, signal),
+    retry: (count, error) => count < 2 && !(error instanceof ApiClientError && error.status < 500),
     refetchInterval: (query) =>
-      query.state.data && LIVE_TASK.has(query.state.data.status) ? TASK_POLL_MS : false,
+      activityPollInterval(
+        !!query.state.data && LIVE_TASK.has(query.state.data.status),
+        TASK_POLL_MS,
+      ),
   })
 }
 
 export function useTaskScheduleEvents(id: string, enabled: boolean) {
   const api = useApi()
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ["tasks", id, "schedule"],
-    queryFn: () => api.taskScheduleEvents(id),
+    initialPageParam: undefined as number | undefined,
+    queryFn: ({ pageParam, signal }) => api.taskScheduleEvents(id, pageParam, signal),
+    getNextPageParam: (page, _pages, _param, params) => {
+      const next = page.at(-1)?.sequence
+      return page.length === 100 && next != null && !params.includes(next) ? next : undefined
+    },
     enabled,
+    refetchInterval: 20_000,
   })
 }
 

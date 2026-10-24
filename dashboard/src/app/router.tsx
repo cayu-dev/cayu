@@ -39,7 +39,8 @@ const SessionsPage = lazyRouteComponent(
   () => import("../next/routes/sessions-entry"),
   "SessionsEntry",
 )
-const TasksPage = lazyRouteComponent(() => import("../routes/tasks"), "TasksPage")
+const TasksPage = lazyRouteComponent(() => import("../next/routes/tasks-page"), "TasksPage")
+const TaskPage = lazyRouteComponent(() => import("../next/routes/task-page"), "TaskPage")
 const UsagePage = lazyRouteComponent(() => import("../routes/usage"), "UsagePage")
 const SystemPage = lazyRouteComponent(() => import("../routes/system"), "SystemPage")
 
@@ -99,9 +100,25 @@ export function createDashboardRouter(history?: RouterHistory) {
   const tasksRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/tasks",
+    validateSearch: (search: Record<string, unknown>) =>
+      Object.fromEntries(
+        ["q", "group", "type", "agent", "assigned_agent_name", "session_id", "cayu", "task_id"]
+          .filter((key) => typeof search[key] === "string" && search[key] !== "")
+          .map((key) => [key, search[key]]),
+      ),
     component: () => (
       <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/tasks"]} title="Tasks">
         <TasksPage />
+      </CapabilityRoute>
+    ),
+  })
+
+  const taskRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/tasks/$taskId",
+    component: () => (
+      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/tasks"]} title="Task">
+        <TaskPage />
       </CapabilityRoute>
     ),
   })
@@ -210,6 +227,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     evalsRoute,
     usageRoute,
     tasksRoute,
+    taskRoute,
     pendingActionsRoute,
     oldPendingRoute,
     agentsRoute,

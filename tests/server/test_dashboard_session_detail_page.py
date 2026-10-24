@@ -1094,13 +1094,14 @@ def test_detail_task_run_again_uses_exact_replay_and_receipt(lost_ack):
                     page.get_by_text("Task creation is unconfirmed.", exact=False)
                 ).to_be_visible()
                 await page.get_by_role("button", name="Retry task replay", exact=True).click()
-            await expect(page).to_have_url(__import__("re").compile(r"/cayu/tasks\?task_id=.+$"))
-            from urllib.parse import parse_qs, urlsplit
+            # Session replay keeps its existing destination contract; the Tasks
+            # router resolves that old query link to the canonical detail page.
+            await expect(page).to_have_url(__import__("re").compile(r"/cayu/tasks/[^?]+$"))
+            from urllib.parse import unquote, urlsplit
 
-            new_id = parse_qs(urlsplit(page.url).query)["task_id"][0]
-            await expect(page.get_by_role("heading", name="Tasks", exact=True)).to_be_visible()
-            await expect(page.get_by_text("Task Details", exact=True)).to_be_visible()
-            await expect(page.get_by_text(new_id, exact=True).last).to_be_visible()
+            new_id = unquote(urlsplit(page.url).path.rsplit("/", 1)[1])
+            await expect(page.get_by_role("heading", name="report", exact=True)).to_be_visible()
+            await expect(page.get_by_text("Debug", exact=True)).to_be_visible()
             assert new_id != "source-task"
             fresh = await tasks.load_task(new_id)
             assert fresh is not None

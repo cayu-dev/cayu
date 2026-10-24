@@ -142,6 +142,10 @@ function IdentityGate() {
         value={{
           api: realApi,
           now: Date.now,
+          taskIndexEnabled: serverContract.capabilities.surfaces.task_index?.read.enabled === true,
+          taskCreationEnabled:
+            serverContract.capabilities.surfaces.task_creation?.mutate.enabled === true,
+          taskMutationsEnabled: serverContract.capabilities.mutations.task_lifecycle.enabled,
           executionEnabled: serverContract.capabilities.mutations.session_execution.enabled,
           inboxEnabled: serverContract.capabilities.surfaces.inbox_queries?.read.enabled === true,
           decisionsEnabled: serverContract.capabilities.mutations.pending_action_resolution.enabled,

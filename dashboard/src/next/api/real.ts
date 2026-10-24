@@ -13,14 +13,11 @@ import {
   fetchSessionsPage,
   fetchSessionTrace,
   fetchSessionTranscript,
-  fetchTask,
   fetchTasks,
   markTaskNeedsAttention,
   pauseTask,
   resumeTask,
-  throwResponseError,
 } from "@/lib/api"
-import { apiUrl } from "@/lib/config"
 import type { InboxSettleResponse } from "@/lib/generated/server-api"
 import {
   executeInterruptMutation,
@@ -32,21 +29,14 @@ import {
 } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import { fetchSessionRecovery } from "@/lib/session-recovery"
+import { json } from "./http"
 import { overviewForDisplay } from "./overview"
+import { createDeclaredTask, fetchTaskDependents, fetchTaskIndex, taskQueryString } from "./tasks"
 import type { Api, InboxPage, SessionOverview, TaskScheduleEvent } from "./types"
 
 /** Proposed (backend item 14): the suite-centred eval calls have no endpoint yet. */
 async function needsEvalReads(): Promise<never> {
   throw new Error("Needs backend item 14 (suite-centred eval reads).")
-}
-
-async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(apiUrl(path), {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init.headers },
-  })
-  if (!response.ok) await throwResponseError(response)
-  return (await response.json()) as T
 }
 
 const query = (params: Record<string, string | number | null | undefined>) => {
@@ -79,10 +69,14 @@ export const realApi: Api = {
   trace: (id, q, signal) => fetchSessionTrace(id, q, signal),
   events: (id, q, signal) => fetchSessionEvents(id, q, signal),
   tasks: () => fetchTasks({ limit: 200, order_by: "updated_at_desc" }),
-  task: (id) => fetchTask(id),
-  taskScheduleEvents: (id) =>
+  task: (id, signal) => json(`/tasks/${encodeURIComponent(id)}`, { signal }),
+  taskIndex: fetchTaskIndex,
+  taskList: (query, signal) => json(`/tasks${taskQueryString(query)}`, { signal }),
+  taskDependents: fetchTaskDependents,
+  taskScheduleEvents: (id, afterSequence, signal) =>
     json<TaskScheduleEvent[]>(
-      `/tasks/${encodeURIComponent(id)}/schedule/events${query({ limit: 100 })}`,
+      `/tasks/${encodeURIComponent(id)}/schedule/events${query({ limit: 100, after_sequence: afterSequence })}`,
+      { signal },
     ),
   holdTask: (id, hold, reason) => {
     const body = reason ? { reason } : {}
@@ -156,10 +150,20 @@ export const realApi: Api = {
     return executeInterruptMutation(id, reason ? { reason } : {}, options)
   },
   state: (id) => fetchSessionState(id),
-  // Proposed (backend item 7): no task types or task creation on today's server.
-  taskTypes: async () => [],
-  async createTask() {
-    throw new Error("Creating a task needs the runtime's task API (backend item 7).")
+  taskTypes: async () => {
+    const result = await json<{ task_types: import("@/lib/generated/server-api").TaskTypeSpec[] }>(
+      "/task-types",
+    )
+    return result.task_types.map((type) => ({
+      ...type,
+      description: type.description ?? "",
+      agent_name: type.agent_name ?? null,
+    }))
+  },
+  async createTask(body, operationId) {
+    if (!operationId) throw new Error("Task creation requires an operation identity.")
+    const result = await createDeclaredTask({ ...body, operation_id: operationId })
+    return { task_id: result.task_id, session_id: null }
   },
   /** Direct specialist replay; task replay belongs to the task creation owner. */
   async runAgain(sessionId, options) {

@@ -2913,6 +2913,32 @@ async def _exercise_trace(page: Page, base_url: str, session_id: str) -> None:
     await expect(page.get_by_role("button", name="Resume live tail", exact=True)).to_be_visible()
 
 
+async def _exercise_workflow_task_pages(page, observed_requests) -> None:
+    """Workflow links retain exact task identity through the canonical task routes."""
+    await expect(page).to_have_url(
+        re.compile(rf"/cayu/tasks/{re.escape(WORKFLOW_PARENT_TASK_ID)}$")
+    )
+    await expect(page.get_by_text("Debug", exact=True)).to_be_visible()
+    require(
+        any(
+            method == "GET" and path == f"/api/tasks/{WORKFLOW_PARENT_TASK_ID}"
+            for method, path, _body in observed_requests
+        ),
+        "a Workflow task deep link must load the exact task detail resource",
+    )
+    await page.get_by_role("link", name="Tasks", exact=True).last.click()
+    await expect(page.get_by_role("heading", name="Tasks", exact=True)).to_be_visible()
+    await page.get_by_role("textbox", name="Search tasks", exact=True).fill(
+        WORKFLOW_BLOCKED_TASK_ID
+    )
+    await page.get_by_role("textbox", name="Search tasks", exact=True).press("Enter")
+    await page.locator(f'a[href$="/tasks/{WORKFLOW_BLOCKED_TASK_ID}"]').click()
+    await expect(page).to_have_url(
+        re.compile(rf"/cayu/tasks/{re.escape(WORKFLOW_BLOCKED_TASK_ID)}$")
+    )
+    await expect(page.get_by_text("Debug", exact=True)).to_be_visible()
+
+
 async def _exercise_workflow(
     page: Page,
     base_url: str,
@@ -3383,46 +3409,8 @@ async def _exercise_workflow(
             "embedded Workflow must use only bounded topology/usage and the exact Session shell reads",
         )
 
-        exact_task_path = f"/api/tasks/{WORKFLOW_PARENT_TASK_ID}"
         await task_detail_link.click()
-        await expect(page).to_have_url(
-            re.compile(
-                rf"/cayu/tasks\?q={re.escape(WORKFLOW_PARENT_TASK_ID)}&task_id={re.escape(WORKFLOW_PARENT_TASK_ID)}$"
-            )
-        )
-        await expect(page.get_by_role("heading", name="Tasks", exact=True)).to_be_visible()
-        task_details_header = page.get_by_text("Task Details", exact=True).locator("..")
-        await expect(
-            task_details_header.get_by_text(WORKFLOW_PARENT_TASK_ID, exact=True)
-        ).to_be_visible()
-        require(
-            any(
-                method == "GET" and path == exact_task_path
-                for method, path, _body in observed_requests
-            ),
-            "a Workflow task deep link must load the exact task detail resource",
-        )
-
-        await page.get_by_role("button", name="Clear", exact=True).click()
-        fallback_source_row = page.get_by_role("row").filter(has_text=WORKFLOW_BLOCKED_TASK_ID)
-        await expect(fallback_source_row).to_have_count(1)
-        await fallback_source_row.click()
-        await expect(page).to_have_url(
-            re.compile(rf"[?&]task_id={re.escape(WORKFLOW_BLOCKED_TASK_ID)}(?:&|$)")
-        )
-        await page.get_by_label("Filter by task status", exact=True).select_option("failed")
-        await expect(page).not_to_have_url(
-            re.compile(rf"[?&]task_id={re.escape(WORKFLOW_BLOCKED_TASK_ID)}(?:&|$)")
-        )
-        fallback_task_ids = parse_qs(urlsplit(page.url).query).get("task_id", [])
-        require_equal(
-            len(fallback_task_ids),
-            1,
-            "an automatic task fallback must keep one selected task in the URL",
-        )
-        await expect(
-            task_details_header.get_by_text(fallback_task_ids[0], exact=True)
-        ).to_be_visible()
+        await _exercise_workflow_task_pages(page, observed_requests)
 
         usage_without_pricing = False
 

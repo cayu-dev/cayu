@@ -5,7 +5,7 @@
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { Play, X } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, useSyncExternalStore } from "react"
 import { MutationTransportStatus } from "@/components/dashboard/mutation-transport-status"
 import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
@@ -17,16 +17,21 @@ import type {
 } from "@/lib/mutation-transport"
 import { reconcileRunAgentSelection } from "@/lib/run-agent-selection"
 import { cn } from "@/lib/utils"
-import type { TaskType } from "../api/types"
+import type { Api, TaskType } from "../api/types"
 import { useSpecialists, useTaskTypes } from "../app/queries"
 import { useApi, useServices } from "../app/services"
+import { TaskOperation } from "../app/task-operation"
 import { ErrorState, sessionPath, taskPath, useGo } from "./common"
 
-function useStartUnavailableReason(): string | null {
+const taskOperations = new WeakMap<Api, TaskOperation>()
+
+function useStartUnavailableReason(mode?: "task" | "specialist"): string | null {
   const viewer = useViewer()
-  const { prototype, executionEnabled } = useServices()
+  const { prototype, executionEnabled, taskCreationEnabled } = useServices()
   if (prototype) return null
   if (viewer?.full_access !== true) return ROLE_FORBIDDEN_REASON
+  if (mode === "task")
+    return taskCreationEnabled === true ? null : "Task creation is unavailable for this deployment."
   return executionEnabled === true ? null : "Starting sessions is unavailable for this deployment."
 }
 
@@ -58,7 +63,8 @@ function schemaFields(schema: Record<string, unknown>): Field[] | null {
   const required = new Set(Array.isArray(schema.required) ? (schema.required as string[]) : [])
   const fields: Field[] = []
   for (const [name, raw] of Object.entries(properties as Record<string, Record<string, unknown>>)) {
-    const type = typeof raw.type === "string" ? raw.type : "string"
+    if (!raw || typeof raw !== "object" || typeof raw.type !== "string") return null
+    const type = raw.type
     const items = raw.items as Record<string, unknown> | undefined
     if (
       !["string", "integer", "number"].includes(type) &&
@@ -70,7 +76,10 @@ function schemaFields(schema: Record<string, unknown>): Field[] | null {
       type,
       description: typeof raw.description === "string" ? raw.description : "",
       required: required.has(name),
-      options: Array.isArray(raw.enum) ? (raw.enum as string[]) : null,
+      options:
+        Array.isArray(raw.enum) && raw.enum.every((value) => typeof value === "string")
+          ? (raw.enum as string[])
+          : null,
     })
   }
   return fields
@@ -94,25 +103,32 @@ function inputFrom(fields: Field[], values: Record<string, string>): Record<stri
 
 function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initialMode?: Mode }) {
   const api = useApi()
+  const taskOperation =
+    taskOperations.get(api) ?? new TaskOperation((body, id) => api.createTask(body, id))
+  taskOperations.set(api, taskOperation)
+  const taskSnapshot = useSyncExternalStore(taskOperation.subscribe, taskOperation.snapshot)
+  const { prototype, taskCreationEnabled } = useServices()
+  const mounted = useRef(true)
   const abort = useRef<AbortController | null>(null)
   const transport = useRef<MutationTransportController | null>(null)
   const [snapshot, setSnapshot] = useState<MutationTransportSnapshot | null>(null)
   const [retrying, setRetrying] = useState(false)
   const [observationError, setObservationError] = useState<unknown>(null)
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
       abort.current?.abort()
       transport.current?.dispose()
-    },
-    [],
-  )
+    }
+  }, [])
   const go = useGo()
   const queryClient = useQueryClient()
   const specialists = useSpecialists()
   const taskTypes = useTaskTypes()
   const types = taskTypes.data ?? []
   const [mode, setMode] = useState<Mode | null>(initialMode ?? null)
-  const current: Mode = mode === "task" && types.length ? "task" : "specialist"
+  const current: Mode = mode === "task" ? "task" : "specialist"
   const [agent, setAgent] = useState("")
   const [prompt, setPrompt] = useState("")
   const [typeName, setTypeName] = useState("")
@@ -167,7 +183,16 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
       const input = fields
         ? inputFrom(fields, values)
         : (JSON.parse(json) as Record<string, unknown>)
-      return taskPath((await api.createTask({ type: typeName, input })).task_id)
+      if (typeof input !== "object" || input === null || Array.isArray(input))
+        throw new Error("Task input must be a JSON object.")
+      await taskOperation.submit({ type: typeName, input })
+      if (!mounted.current) return null
+      if (taskOperation.state.phase === "succeeded") {
+        const path = taskPath(taskOperation.state.taskId!)
+        taskOperation.clear()
+        return path
+      }
+      return null
     },
     onSuccess: (path) => {
       if (path) done(path)
@@ -179,6 +204,53 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
   const field =
     "h-8 w-full rounded-lg border border-input bg-background px-2.5 text-sm outline-none focus:border-ring"
 
+  if (
+    current === "task" &&
+    (taskSnapshot.phase === "pending" ||
+      taskSnapshot.phase === "unknown" ||
+      taskSnapshot.phase === "succeeded")
+  )
+    return (
+      <div className="mb-6 space-y-3 rounded-xl border p-4" role="status">
+        <p>
+          {taskSnapshot.phase === "pending"
+            ? "Creating task…"
+            : taskSnapshot.phase === "unknown"
+              ? "The creation outcome is unknown. Retry the same operation to recover its result; no second task will be created."
+              : "Task created."}
+        </p>
+        {taskSnapshot.error != null && <ErrorState error={taskSnapshot.error} />}
+        {taskSnapshot.phase === "unknown" && (
+          <Button onClick={() => void taskOperation.submit()}>Retry task creation</Button>
+        )}
+        {taskSnapshot.phase === "succeeded" && (
+          <Button
+            onClick={() => {
+              const id = taskSnapshot.taskId!
+              taskOperation.clear()
+              done(taskPath(id))
+            }}
+          >
+            Open created task
+          </Button>
+        )}
+        <Button
+          variant="outline"
+          disabled={taskSnapshot.phase === "pending"}
+          onClick={() => setMode("specialist")}
+        >
+          Run a specialist
+        </Button>
+        {taskSnapshot.phase === "succeeded" && (
+          <Button variant="ghost" onClick={() => taskOperation.clear()}>
+            Dismiss task result
+          </Button>
+        )}
+        <Button variant="ghost" onClick={onClose}>
+          Close
+        </Button>
+      </div>
+    )
   return (
     <form
       className="mb-8 space-y-4 rounded-xl border border-border bg-card p-4"
@@ -199,7 +271,9 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
               ["task", "Create a task"],
             ] as const
           ).map(([value, label]) => {
-            const unavailable = value === "task" && types.length === 0
+            const unavailable =
+              value === "task" &&
+              (types.length === 0 || (!prototype && taskCreationEnabled !== true))
             const tab = (
               <button
                 key={value}
@@ -361,6 +435,16 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
       )}
 
       {start.error && <ErrorState error={start.error} />}
+      {taskSnapshot.phase === "rejected" && taskSnapshot.error != null && (
+        <ErrorState error={taskSnapshot.error} />
+      )}
+      {taskTypes.error && <ErrorState error={taskTypes.error} />}
+      {current === "task" && taskTypes.isSuccess && types.length === 0 && (
+        <p role="status">
+          This agent does not declare task types. Declare the tasks your worker handles to create
+          them here.
+        </p>
+      )}
       {observationError !== null && <ErrorState error={observationError} />}
       <MutationTransportStatus
         snapshot={snapshot}
@@ -397,7 +481,7 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
 }
 
 export function StartSession(props: { onClose: () => void; initialMode?: Mode }) {
-  const unavailable = useStartUnavailableReason()
+  const unavailable = useStartUnavailableReason(props.initialMode)
   if (unavailable) return <p role="status">{unavailable}</p>
   return <StartSessionForm {...props} />
 }

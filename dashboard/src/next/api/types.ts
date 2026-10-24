@@ -21,6 +21,7 @@ import type {
   TaskDetail,
 } from "@/lib/api"
 import type {
+  ApiTaskIndex,
   ApiTaskScheduleEvent,
   InboxCounts,
   InboxItem,
@@ -39,6 +40,7 @@ import type {
   EvalSuiteSummary,
   NewEvalSuite,
 } from "./eval-types"
+import type { TaskIndexQuery } from "./tasks"
 
 export type {
   ApiAgentSummary as Specialist,
@@ -222,10 +224,17 @@ export type Api = {
   events(id: string, query?: SessionEventsQuery, signal?: AbortSignal): Promise<SessionEventsPage>
   /** `GET /api/tasks`, every task including Cayu's own (`cayu.*` types). */
   tasks(): Promise<TaskItem[]>
+  taskList(query: TaskIndexQuery & { offset?: number }, signal?: AbortSignal): Promise<TaskItem[]>
+  taskIndex(query: TaskIndexQuery, signal?: AbortSignal): Promise<ApiTaskIndex>
+  taskDependents(id: string, cursor?: string, signal?: AbortSignal): Promise<ApiTaskIndex>
   /** `GET /api/tasks/{id}`. */
-  task(id: string): Promise<TaskInfo>
+  task(id: string, signal?: AbortSignal): Promise<TaskInfo>
   /** `GET /api/tasks/{id}/schedule/events`; empty for tasks without a schedule. */
-  taskScheduleEvents(id: string): Promise<TaskScheduleEvent[]>
+  taskScheduleEvents(
+    id: string,
+    afterSequence?: number,
+    signal?: AbortSignal,
+  ): Promise<TaskScheduleEvent[]>
   holdTask(id: string, hold: TaskHold, reason?: string): Promise<TaskInfo>
   /** `POST /api/tasks/{id}/resume`: back to pending. */
   resumeTask(id: string): Promise<TaskInfo>
@@ -263,10 +272,13 @@ export type Api = {
   ): Promise<MutationTransportSnapshot | undefined>
   /** `GET /api/sessions/{id}/state`: execution state, snapshots, interruption cascade. */
   state(id: string): Promise<SessionStateRecord>
-  /** Proposed (backend item 7): `GET /api/task-types`. */
+  /** Declared task types from the current worker-owned runtime catalog. */
   taskTypes(): Promise<TaskType[]>
-  /** Proposed (backend item 7): `POST /api/tasks`; the app's worker picks it up. */
-  createTask(body: { type: string; input: Record<string, unknown> }): Promise<{
+  /** Exact operation identity is retained by the creating form across retries. */
+  createTask(
+    body: { type: string; input: Record<string, unknown> },
+    operationId?: string,
+  ): Promise<{
     task_id: string
     session_id: string | null
   }>

@@ -107,3 +107,44 @@ test("failed retries increment the predecessor only when the successor has no at
   }
   assert.equal(statusLine(task({ status: "failed", retry_series: null }), [], NOW), "Failed")
 })
+
+test("handler deadline failure is explicit without inferring from ordinary text", () => {
+  assert.equal(
+    statusLine(
+      task({
+        status: "failed",
+        error: { error: "ExecutionDeadlineExceeded", scope: "task_handler" },
+      }),
+      [],
+      NOW,
+    ),
+    "Task handler ran out of time",
+  )
+  assert.equal(
+    statusLine(
+      task({ status: "failed", error: { error: "ExecutionDeadlineExceeded", scope: "other" } }),
+      [],
+      NOW,
+    ),
+    "Failed",
+  )
+})
+
+test("missing prerequisite observations never become an exact unfinished count", () => {
+  const waiting = task({ status: "waiting_dependencies", prerequisite_task_ids: ["done", "open"] })
+  const open = task({ id: "open" })
+  assert.equal(
+    statusLine(waiting, [waiting, open], NOW, undefined, false),
+    "Waiting on prerequisites",
+  )
+  assert.equal(
+    statusLine(
+      waiting,
+      [waiting, open, task({ id: "done", status: "completed" })],
+      NOW,
+      undefined,
+      false,
+    ),
+    "Waiting on 1 task",
+  )
+})

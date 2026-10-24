@@ -63,15 +63,16 @@ const HOLD_WORD: Record<string, string> = {
  * for Nov 1, 6:00 AM", "Blocked: vendor file late", "Retry 2 of 3 in 6m".
  */
 export function statusLine(
-  task: TaskItem,
+  task: TaskItem & { error?: Record<string, unknown> | null },
   all: TaskItem[],
   now: number,
   timeZone = viewerTimeZone(),
+  relationsComplete = true,
 ): string {
   const byId = new Map(all.map((t) => [t.id, t]))
   const retry = task.retry_series
   const reason = task.status_reason ? `: ${task.status_reason}` : ""
-  const children = all.filter((t) => t.parent_task_id === task.id).length
+  const children = relationsComplete ? all.filter((t) => t.parent_task_id === task.id).length : 0
   const subtasks = children ? ` · ${children} subtask${children === 1 ? "" : "s"}` : ""
   switch (task.status) {
     case "running":
@@ -89,9 +90,10 @@ export function statusLine(
       return time ? `Starts${phrase}` : "Queued"
     }
     case "waiting_dependencies": {
-      const open = (task.prerequisite_task_ids ?? []).filter(
-        (id) => byId.get(id)?.status !== "completed",
-      ).length
+      const prerequisites = task.prerequisite_task_ids ?? []
+      if (!prerequisites.length || prerequisites.some((id) => !byId.has(id)))
+        return "Waiting on prerequisites"
+      const open = prerequisites.filter((id) => byId.get(id)!.status !== "completed").length
       return open ? `Waiting on ${open} task${open === 1 ? "" : "s"}` : "Waiting on other tasks"
     }
     case "waiting_group":
@@ -103,6 +105,8 @@ export function statusLine(
     case "completed":
       return `Completed${subtasks}`
     case "failed": {
+      if (task.error?.error === "ExecutionDeadlineExceeded" && task.error?.scope === "task_handler")
+        return "Task handler ran out of time"
       const next = retry?.successor_task_id ? byId.get(retry.successor_task_id) : undefined
       if (!next) return `Failed${reason}`
       const outcome = FINISHED_STATUSES.has(next.status) ? next.status : "queued"

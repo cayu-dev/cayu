@@ -106,7 +106,7 @@ function RecentSessionLink({ item }: { item: SessionSummaryItem }) {
 function TaskLink({ task }: { task: Task }) {
   return (
     <a
-      href={dashboardPath("/tasks", { q: task.id })}
+      href={dashboardPath(`/tasks/${encodeURIComponent(task.id)}`)}
       className="block rounded-md border border-border p-3 transition-colors hover:bg-muted/40"
     >
       <div className="flex min-w-0 items-center justify-between gap-3">

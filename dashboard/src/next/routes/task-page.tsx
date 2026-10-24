@@ -7,11 +7,12 @@ import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { useParams } from "@tanstack/react-router"
 import { ChevronRight, Copy, Ellipsis, Flag, Hand, Pause, Play } from "lucide-react"
 import { type ReactNode, useState } from "react"
+import { useViewer } from "@/components/dashboard/viewer"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { TaskHold, TaskInfo, TaskItem, TaskScheduleEvent } from "../api/types"
-import { useSessionRows, useTask, useTaskScheduleEvents, useTasks } from "../app/queries"
-import { useApi, useNow } from "../app/services"
+import { useTask, useTaskScheduleEvents } from "../app/queries"
+import { useApi, useNow, useServices } from "../app/services"
 import {
   groupOf,
   HELD_STATUSES,
@@ -21,8 +22,10 @@ import {
   taskName,
   when,
 } from "../app/task-model"
+import { useTaskAttempts, useTaskLinks, useTaskRelationPage } from "../app/task-queries"
 import { ErrorState, NavLink, PageBody, StateBadge, sessionPath, TopBar, taskPath } from "./common"
 import { ValueView } from "./session/value-view"
+import { TaskActions } from "./task-actions"
 import { GROUP_DOT, GROUP_TEXT } from "./tasks-page"
 
 const HOLDS: { hold: TaskHold; label: string; verb: string; icon: typeof Pause }[] = [
@@ -91,7 +94,7 @@ function TaskLink({
       {note && <span className="shrink-0 text-muted-foreground">{note}</span>}
       <span className="min-w-0 flex-1 truncate">{taskName(task)}</span>
       <span className={cn("shrink-0 truncate text-xs", GROUP_TEXT[group])}>
-        {statusLine(task, all, now)}
+        {statusLine(task, all, now, undefined, false)}
       </span>
     </NavLink>
   )
@@ -101,36 +104,39 @@ const List = ({ children }: { children: ReactNode }) => (
   <div className="overflow-hidden rounded-xl border border-border">{children}</div>
 )
 
-/** Every attempt in the task's retry series, first to last. */
-function attemptsOf(task: TaskItem, all: TaskItem[]): TaskItem[] {
-  const byId = new Map(all.map((t) => [t.id, t]))
-  let first = task
-  for (let prev = task.retry_series?.predecessor_task_id; prev; ) {
-    const p = byId.get(prev)
-    if (!p) break
-    first = p
-    prev = p.retry_series?.predecessor_task_id
-  }
-  const chain = [first]
-  for (let next = first.retry_series?.successor_task_id; next; ) {
-    const n = byId.get(next)
-    if (!n) break
-    chain.push(n)
-    next = n.retry_series?.successor_task_id
-  }
-  return chain
-}
-
 const seconds = (s: number) => (s >= 3600 ? `${s / 3600}h` : s >= 60 ? `${s / 60}m` : `${s}s`)
 
 export function TaskPage() {
   const { taskId } = useParams({ strict: false }) as { taskId: string }
+  return <TaskPageView key={taskId} taskId={taskId} />
+}
+
+function TaskPageView({ taskId }: { taskId: string }) {
   const api = useApi()
   const now = useNow()
   const queryClient = useQueryClient()
   const detail = useTask(taskId)
-  const tasks = useTasks()
-  const sessions = useSessionRows()
+  const services = useServices()
+  const viewer = useViewer()
+  const writable =
+    !!services.prototype || (viewer?.full_access === true && services.taskMutationsEnabled === true)
+  const [relationLimit, setRelationLimit] = useState(50)
+  const linked = useTaskLinks(
+    [
+      ...(detail.data?.prerequisite_task_ids ?? []).slice(0, relationLimit),
+      ...(detail.data?.parent_task_id ? [detail.data.parent_task_id] : []),
+    ],
+    true,
+    true,
+  )
+  const relatedSupported = !!services.prototype || services.taskIndexEnabled === true
+  const dependentsRead = useTaskRelationPage(
+    taskId,
+    "dependents",
+    !!detail.data && relatedSupported,
+  )
+  const childrenRead = useTaskRelationPage(taskId, "children", !!detail.data && relatedSupported)
+  const retryRead = useTaskAttempts(taskId, !!detail.data?.retry_series, relationLimit)
   const task: TaskInfo | undefined = detail.data
   const schedule = useTaskScheduleEvents(taskId, !!task?.schedule)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -162,19 +168,28 @@ export function TaskPage() {
     return (
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar>Task</TopBar>
+        <p role="status" className="p-6">
+          Loading task…
+        </p>
       </div>
     )
 
-  const all = tasks.data ?? [task]
-  const byId = new Map(all.map((t) => [t.id, t]))
+  const byId = new Map(
+    [
+      task,
+      ...(linked.data?.rows ?? []),
+      ...(dependentsRead.data?.pages.flatMap((page) => page.items) ?? []),
+      ...(childrenRead.data?.pages.flatMap((page) => page.items) ?? []),
+      ...(retryRead.data?.rows ?? []),
+    ].map((item) => [item.id, item]),
+  )
+  const all = [...byId.values()]
   const group = groupOf(task.status)
-  const rows = sessions.data?.rows ?? []
-  const sessionRow = rows.find((r) => r.session.id === task.session_id)
   const prerequisites = (task.prerequisite_task_ids ?? []).flatMap((id) => byId.get(id) ?? [])
   const dependents = all.filter((t) => t.prerequisite_task_ids?.includes(task.id))
   const parent = task.parent_task_id ? byId.get(task.parent_task_id) : undefined
   const children = all.filter((t) => t.parent_task_id === task.id)
-  const attempts = task.retry_series ? attemptsOf(task, all) : []
+  const attempts = retryRead.data?.rows ?? (task.retry_series ? [task] : [])
   const held = HELD_STATUSES.has(task.status)
   const at = (iso: string | null) => (iso ? when(Date.parse(iso), now()) : "–")
   const retry = task.retry_series
@@ -185,7 +200,7 @@ export function TaskPage() {
       <TopBar
         actions={
           <>
-            {held && (
+            {held && writable && (
               <Button
                 size="sm"
                 variant="outline"
@@ -210,28 +225,32 @@ export function TaskPage() {
                 size="icon-sm"
                 aria-label="More actions"
                 aria-expanded={menuOpen}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") setMenuOpen(false)
+                }}
                 onClick={() => setMenuOpen(!menuOpen)}
               >
                 <Ellipsis />
               </Button>
               {menuOpen && (
                 <div className="absolute top-9 right-0 z-20 w-60 rounded-lg border border-border bg-popover p-1 text-sm shadow-lg">
-                  {HOLDS.map(({ hold: h, label, icon: Icon }) => (
-                    <button
-                      key={h}
-                      type="button"
-                      disabled={!holdable(task)}
-                      onClick={() => {
-                        setHolding(h)
-                        setMenuOpen(false)
-                      }}
-                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-                    >
-                      <Icon className="size-4" aria-hidden="true" />
-                      {label}
-                    </button>
-                  ))}
-                  {!holdable(task) && (
+                  {writable &&
+                    HOLDS.map(({ hold: h, label, icon: Icon }) => (
+                      <button
+                        key={h}
+                        type="button"
+                        disabled={!holdable(task)}
+                        onClick={() => {
+                          setHolding(h)
+                          setMenuOpen(false)
+                        }}
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+                      >
+                        <Icon className="size-4" aria-hidden="true" />
+                        {label}
+                      </button>
+                    ))}
+                  {writable && !holdable(task) && (
                     <p className="px-2 py-1 text-xs text-muted-foreground">
                       {held
                         ? "Already held. Resume it first."
@@ -273,7 +292,13 @@ export function TaskPage() {
             className={cn("size-2 shrink-0 rounded-full", GROUP_DOT[group])}
             aria-hidden="true"
           />
-          {statusLine(task, all, now())}
+          {statusLine(
+            task,
+            all,
+            now(),
+            undefined,
+            childrenRead.isSuccess && !childrenRead.data.pages.at(-1)?.next_cursor,
+          )}
         </p>
         <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
           <span className="font-mono">{task.type}</span>
@@ -283,7 +308,13 @@ export function TaskPage() {
           )}
         </p>
 
-        {holding && holdLabel && (
+        <TaskActions task={task} />
+        {!writable && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            Your role can read tasks; task changes require full access.
+          </p>
+        )}
+        {holding && holdLabel && writable && (
           <form
             className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card p-3"
             onSubmit={(e) => {
@@ -323,10 +354,9 @@ export function TaskPage() {
         </dl>
 
         {attempts.length > 0 && retry ? (
-          <Section title={`Attempts (${attempts.length} of ${retry.policy.max_attempts})`}>
+          <Section title={`Attempts (${attempts.length} loaded)`}>
             <List>
               {attempts.map((a) => {
-                const s = rows.find((r) => r.session.id === a.session_id)
                 return (
                   <div
                     key={a.id}
@@ -344,14 +374,14 @@ export function TaskPage() {
                         GROUP_TEXT[groupOf(a.status)],
                       )}
                     >
-                      {statusLine(a, all, now())}
+                      {statusLine(a, all, now(), undefined, false)}
                     </span>
                     {a.session_id ? (
                       <NavLink
                         to={sessionPath(a.session_id)}
                         className="flex shrink-0 items-center gap-2 text-xs hover:underline"
                       >
-                        <StateBadge overview={s?.overview} />
+                        <StateBadge overview={undefined} />
                         Session
                       </NavLink>
                     ) : (
@@ -361,6 +391,12 @@ export function TaskPage() {
                 )
               })}
             </List>
+            {retryRead.error && <ErrorState error={retryRead.error} />}
+            {retryRead.data?.incomplete && (
+              <Button variant="outline" onClick={() => setRelationLimit((n) => n + 50)}>
+                Load more attempts
+              </Button>
+            )}
             <p className="mt-2 text-xs text-muted-foreground">
               Retries up to {retry.policy.max_attempts} times, waiting{" "}
               {seconds(retry.policy.initial_backoff_seconds)} and then{" "}
@@ -378,10 +414,8 @@ export function TaskPage() {
                   to={sessionPath(task.session_id)}
                   className="flex min-w-0 items-center gap-3 px-3 py-2 text-sm hover:bg-muted/60"
                 >
-                  <span className="min-w-0 flex-1 truncate">
-                    {sessionRow?.overview?.title ?? task.session_id}
-                  </span>
-                  <StateBadge overview={sessionRow?.overview} />
+                  <span className="min-w-0 flex-1 truncate">{task.session_id}</span>
+                  <StateBadge overview={undefined} />
                 </NavLink>
               </List>
             ) : (
@@ -394,10 +428,21 @@ export function TaskPage() {
           </Section>
         )}
 
+        {linked.error && <ErrorState error={linked.error} />}
+        {linked.data?.issues.map((issue) => (
+          <div key={issue.id} role="status">
+            <p>Related task {issue.id} is unavailable.</p>
+            <ErrorState error={issue.error} />
+          </div>
+        ))}
+        {linked.isFetching && <p role="status">Loading related tasks…</p>}
+        {(task.prerequisite_task_ids?.length ?? 0) > relationLimit && (
+          <Button variant="outline" onClick={() => setRelationLimit((n) => n + 50)}>
+            Load more prerequisites
+          </Button>
+        )}
         {prerequisites.length > 0 && (
-          <Section
-            title={`Waiting on (${prerequisites.filter((p) => p.status !== "completed").length} of ${prerequisites.length} still open)`}
-          >
+          <Section title={`Waiting on (${prerequisites.length} loaded)`}>
             <List>
               {prerequisites.map((p) => (
                 <TaskLink key={p.id} task={p} all={all} now={now()} />
@@ -414,6 +459,39 @@ export function TaskPage() {
             </List>
           </Section>
         )}
+        {dependentsRead.error && <ErrorState error={dependentsRead.error} />}
+        {dependentsRead.hasNextPage && (
+          <Button
+            variant="outline"
+            disabled={dependentsRead.isFetching}
+            onClick={() => void dependentsRead.fetchNextPage()}
+          >
+            Load more dependents
+          </Button>
+        )}
+        {dependentsRead.data?.pages.at(-1)?.next_cursor && !dependentsRead.hasNextPage && (
+          <p role="alert">
+            Dependent paging stopped at a repeated cursor. Refresh to restart the scan.
+          </p>
+        )}
+        {childrenRead.data?.pages.at(-1)?.next_cursor && !childrenRead.hasNextPage && (
+          <p role="alert">
+            Subtask paging stopped at a repeated cursor. Refresh to restart the scan.
+          </p>
+        )}
+        {childrenRead.error && <ErrorState error={childrenRead.error} />}
+        {childrenRead.hasNextPage && (
+          <Button
+            variant="outline"
+            disabled={childrenRead.isFetching}
+            onClick={() => void childrenRead.fetchNextPage()}
+          >
+            Load more subtasks
+          </Button>
+        )}
+        {!relatedSupported && (
+          <p role="status">Dependency and subtask pages are unavailable for this store.</p>
+        )}
         {parent && (
           <Section title="Started by">
             <List>
@@ -422,7 +500,7 @@ export function TaskPage() {
           </Section>
         )}
         {children.length > 0 && (
-          <Section title={`Subtasks (${children.length})`}>
+          <Section title={`Subtasks (${children.length} loaded)`}>
             <List>
               {children.map((c) => (
                 <TaskLink key={c.id} task={c} all={all} now={now()} />
@@ -462,20 +540,31 @@ export function TaskPage() {
                   : "Skipped"}
               </Row>
             </dl>
-            {schedule.data && schedule.data.length > 0 && (
+            {schedule.error && <ErrorState error={schedule.error} />}
+            {schedule.isPending && <p role="status">Loading schedule history…</p>}
+            {schedule.data && schedule.data.pages.flat().length > 0 && (
               <ol className="mt-3 space-y-1.5 border-l border-border pl-4 text-sm">
-                {schedule.data.map((e) => (
+                {schedule.data.pages.flat().map((e) => (
                   <li key={e.sequence} className="flex gap-3">
                     <span className="w-32 shrink-0 text-muted-foreground tabular-nums">
                       {at(e.occurred_at)}
                     </span>
                     <span>
-                      {SCHEDULE_EVENT[e.type]}
+                      {SCHEDULE_EVENT[e.type] ?? e.type}
                       {e.type === "task.rescheduled" && ` to ${at(e.available_at)}`}
                     </span>
                   </li>
                 ))}
               </ol>
+            )}
+            {schedule.hasNextPage && (
+              <Button
+                variant="outline"
+                disabled={schedule.isFetching}
+                onClick={() => void schedule.fetchNextPage()}
+              >
+                Load more schedule history
+              </Button>
             )}
           </Section>
         )}

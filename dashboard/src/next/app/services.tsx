@@ -16,6 +16,9 @@ type Services = {
   /** The app's clock. The prototype pins it to its seed; the real dashboard uses Date.now. */
   now: () => number
   prototype?: PrototypeControls
+  taskIndexEnabled?: boolean
+  taskCreationEnabled?: boolean
+  taskMutationsEnabled?: boolean
   executionEnabled?: boolean
   inboxEnabled?: boolean
   decisionsEnabled?: boolean

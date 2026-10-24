@@ -37,6 +37,7 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
@@ -663,7 +664,8 @@ def test_interrupt_session_stops_in_flight_provider_stream():
     assert EventType.MODEL_COMPLETED not in [event.type for event in stored_events]
 
 
-def test_interrupt_session_payload_is_durable_across_app_instances():
+@pytest.mark.parametrize("release_provider", [False, True], ids=["interrupt-first", "release-race"])
+def test_interrupt_session_payload_is_durable_across_app_instances(release_provider):
     class ReleasingProvider(ModelProvider):
         name = "fake"
 
@@ -676,6 +678,11 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
                 raise AssertionError("ReleasingProvider test events were not initialized.")
             self.started.set()
             await self.release.wait()
+            if not release_provider:
+                # Cross-app stop observation polls durable state at a bounded
+                # cadence; deliver a delta after that real interval expires.
+                await asyncio.sleep(session_control_module.STREAM_INTERRUPT_POLL_INTERVAL_S + 0.01)
+                yield ModelStreamEvent.text_delta("provider released")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     store = InMemorySessionStore()
@@ -725,12 +732,19 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
         provider.release.set()
 
         run_events, interrupt_events = await asyncio.gather(run_task, interrupt_task)
+        if not release_provider:
+            assert all(event.type is not EventType.MODEL_COMPLETED for event in run_events)
         assert await worker_app.drain_background_interruptions(timeout_s=1) is True
         assert await api_app.drain_background_interruptions(timeout_s=1) is True
         checkpoint = await store.load_checkpoint("sess_cross_app_interrupt")
-        return run_events, interrupt_events, checkpoint
+        return (
+            run_events,
+            interrupt_events,
+            checkpoint,
+            await store.load_invocation_snapshot("sess_cross_app_interrupt"),
+        )
 
-    run_events, interrupt_events, checkpoint = asyncio.run(run())
+    run_events, interrupt_events, checkpoint, session = asyncio.run(run())
 
     assert run_events[-1].type == EventType.SESSION_INTERRUPTED
     assert interrupt_events == [run_events[-1]]
@@ -745,6 +759,20 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
         "interruption_type": "operator_requested",
     }
     assert checkpoint is not None
+    from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+    configuration = InvocationConfiguration.model_validate(
+        checkpoint[INVOCATION_CONFIGURATION_CHECKPOINT_KEY]
+    )
+    active = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active is not None
+    assert session is not None
+    assert configuration.session_id == session.id == "sess_cross_app_interrupt"
+    assert configuration.session_instance_id == session.session_instance_id
+    assert configuration.execution_profile_fingerprint == active.profile.fingerprint
+    assert configuration.structured_output is None
     if any(event.type is EventType.MODEL_COMPLETED for event in run_events):
         assert_only_model_step_publication_checkpoint(checkpoint)
     else:
@@ -753,6 +781,7 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
             CHECKPOINT_SCHEMA_VERSION_KEY,
             execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
             INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
             SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         }
     assert settled_invocation_terminal_decision_from_checkpoint(checkpoint) is not None

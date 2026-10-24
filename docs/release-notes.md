@@ -492,6 +492,12 @@ Custom dashboard owners should port Sessions changes from `src/next/routes/sessi
   directory and the store root before returning, and an interrupted object
   directory creation is recovered.
 
+The dashboard Tasks list and task-detail pages now use exact server counts and
+cursor-based filters, graph and retry relations, schedule history and task Debug.
+Authorized operators can create declared tasks, recover uncertain creation/replay
+responses, hold/resume work and cancel through the native lifecycle owners.
+Members retain read-only task and schedule access.
+
 ## v0.13.0
 
 Upgrade: rebuild Lambda MicroVM images from this release's sidecar

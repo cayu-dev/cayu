@@ -170,7 +170,9 @@ those used by the Sessions production page. Counts are never inferred from sampl
 Task runtime contract60 supplies backend item13: graph/prerequisite fields,
 exact status counts with cursor pages, server internal-task exclusion, dependents
 and native cancellation. Schedule-history reads follow task read authority. The
-Tasks page port remains separate; retry attempts retain predecessor/successor reads.
+Tasks list and detail now use the real task index and exact task reads. Retry attempts
+retain predecessor/successor reads with explicit continuation; creation and replay
+retain exact operation identity after response loss. Legacy Tasks side-panel code is removed.
 
 ### Trace activation
 
