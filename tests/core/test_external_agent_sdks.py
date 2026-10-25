@@ -538,7 +538,7 @@ def test_codex_guest_teardown_unblocks_a_buffered_sdk_write(
     monkeypatch, deadline, guest_cleanup_fails
 ):
     import cayu.external_agents.codex as module
-    from cayu.external_agents._cleanup import ExternalCleanupIncomplete
+    from cayu.external_agents import ExternalCleanupIncomplete
 
     async def scenario():
         entered = asyncio.Event()

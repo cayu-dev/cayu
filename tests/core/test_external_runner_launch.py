@@ -15,8 +15,7 @@ import pytest
 from tests.runners.lambda_microvm_harness import ConformanceLambdaClient
 from tests.runners.test_aws_lambda_microvm_interactive import InteractiveTransport
 
-from cayu.external_agents import runner_agent_launch
-from cayu.external_agents._cleanup import ExternalCleanupIncomplete
+from cayu.external_agents import ExternalCleanupIncomplete, runner_agent_launch
 from cayu.external_agents.environment import scrub_external_environment
 from cayu.runners import (
     ExecCommand,

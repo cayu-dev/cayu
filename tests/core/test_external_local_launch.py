@@ -17,10 +17,10 @@ from cayu.deadlines import ExecutionDeadline
 from cayu.external_agents import (
     ClaudeAgentAdapter,
     CodexAgentAdapter,
+    ExternalCleanupIncomplete,
     local_agent_launch,
     run_external_agent,
 )
-from cayu.external_agents._cleanup import ExternalCleanupIncomplete
 from cayu.external_agents.environment import scrub_external_environment
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks import TaskStatus

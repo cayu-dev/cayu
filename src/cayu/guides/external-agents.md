@@ -15,6 +15,12 @@ Cayu agent instead (`cayu guide authoring`). These adapters are separate from
 Required:
 
 - The vendor SDK, `cayu[claude-agent-sdk]` or `cayu[codex]`, and the vendor's CLI.
+  `cayu[claude-agent-sdk]` accepts `claude-agent-sdk>=0.2.168,<0.3`, and Cayu's
+  package CI installs the newest version in that range and runs the adapter
+  against it. `cayu[codex]` pins `openai-codex==0.163.0` exactly, because the
+  Codex adapter's bounded transport depends on that SDK's internals. To hold
+  `claude-agent-sdk` at one version, pin it in your own requirements, inside the
+  range.
 - A `CayuApp` with a task store. Use SQLite or Postgres stores to inspect runs
   after the process exits.
 - A finite `execution_deadline` on the `RunRequest`.
@@ -432,6 +438,11 @@ supervisor evidence that the old process and sandbox are stopped before ordinary
 task recovery; lease expiry alone is not that evidence. Queue restart policy is
 separate from vendor session resumption; the adapter never adopts an old CLI session. Ordinary retry-series and verified-work execution are not supported.
 
+When an adapter, a launcher or `runner_port_forward` can't confirm that a guest
+process, sandbox or forward closed, it raises `ExternalCleanupIncomplete`, a
+subclass of `ExternalAgentError`. Await its `retry()` to try the close again
+before treating the guest as stopped.
+
 For an implicitly created, unleased task abandoned by a crashed process,
 `recover_external_agent_run(app, session_id, quiesce=..., evidence_id=...)`
 records interruption and unknown in-flight usage, then settles that old task.
@@ -749,7 +760,7 @@ What to know about this route:
   1 ms. Expect roughly one endpoint round trip per chunk. The gateway itself buffers each model
   response until it ends, so it can commit usage before the CLI sees a finished
   response; the CLI receives the whole stream then.
-- **Claude Code** (2.1.306, the CLI bundled with the pinned `claude-agent-sdk`)
+- **Claude Code** (2.1.306, the CLI bundled with `claude-agent-sdk` 0.2.170)
   uses `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` and sends the token as
   `Authorization: Bearer`, which the gateway accepts. It may substitute a newer
   model for a retired name (for example it sent `claude-opus-5-5` when asked for
@@ -762,7 +773,7 @@ What to know about this route:
   `guest_host` to `NO_PROXY` in `environment` so the CLI connects to it directly.
 
 To check this on real AWS, build a MicroVM image from this release's sidecar with
-the CLIs at the pinned versions, for example by adding
+the CLIs at the versions above, for example by adding
 `RUN python3.11 -m pip install claude-agent-sdk==0.2.170 openai-codex-cli-bin==0.163.0`
 to the exported Dockerfile and linking the bundled `claude` and `codex` binaries
 into `/usr/local/bin`. Then run the quick start with the launches above, a small

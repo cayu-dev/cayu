@@ -1,5 +1,26 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: no action needed. `cayu[claude-agent-sdk]` now accepts newer
+`claude-agent-sdk` releases below 0.3; pin the SDK in your own requirements to
+keep 0.2.170.
+
+### Breaking changes
+
+None.
+
+### Changes
+
+- `cayu[claude-agent-sdk]` accepts `claude-agent-sdk>=0.2.168,<0.3` again;
+  0.14.0 pinned exactly 0.2.170. Package CI installs the built wheel with the
+  extra, which resolves to the newest SDK in the range, and runs the adapter
+  against it, so a breaking SDK release fails CI. `cayu[codex]` still pins
+  `openai-codex==0.163.0`, because the Codex adapter's bounded transport depends
+  on that SDK's internals.
+- `ExternalCleanupIncomplete` is exported from `cayu.external_agents`, so code can
+  catch it without importing a private module.
+
 ## v0.14.0
 
 Upgrade: rebuild Lambda MicroVM images from this release's sidecar

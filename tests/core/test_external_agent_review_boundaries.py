@@ -11,8 +11,12 @@ from cayu import CayuApp, EventType
 from cayu.approvals import PendingToolApprovalEventView
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
-from cayu.external_agents import ExternalAgentError, ExternalAgentEvent, run_external_agent
-from cayu.external_agents._cleanup import ExternalCleanupIncomplete
+from cayu.external_agents import (
+    ExternalAgentError,
+    ExternalAgentEvent,
+    ExternalCleanupIncomplete,
+    run_external_agent,
+)
 from cayu.external_agents.base import ExternalAgentBudgetExceeded, ExternalAgentContext
 from cayu.external_agents.recording import ExternalAgentRecorder
 from cayu.external_agents.server import ExternalAgentGateway, ExternalModelRoute

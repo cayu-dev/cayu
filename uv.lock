@@ -333,7 +333,7 @@ requires-dist = [
     { name = "boto3", extras = ["crt"], marker = "extra == 'aws'", specifier = ">=1.43.44,<2" },
     { name = "brotli", marker = "extra == 'dev'", specifier = ">=1.2,<2" },
     { name = "certifi", specifier = ">=2024.0" },
-    { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = "==0.2.170" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = ">=0.2.168,<0.3" },
     { name = "cryptography", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'all'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=42" },
