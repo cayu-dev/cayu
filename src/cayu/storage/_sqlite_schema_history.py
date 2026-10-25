@@ -670,6 +670,22 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    129: """UPDATE cayu_transcript_messages
+    SET message_bytes = length(CAST(message_json AS BLOB))
+    WHERE message_bytes IS NULL;
+    CREATE TRIGGER IF NOT EXISTS cayu_transcript_messages_bytes_insert
+    AFTER INSERT ON cayu_transcript_messages
+    WHEN NEW.message_bytes IS NULL
+    BEGIN
+        UPDATE cayu_transcript_messages
+        SET message_bytes = length(CAST(NEW.message_json AS BLOB))
+        WHERE sequence = NEW.sequence;
+    END;
+    CREATE INDEX IF NOT EXISTS idx_cayu_sessions_root_session_created
+        ON cayu_sessions(
+            json_extract(invocation_json, '$."root_session_id"'), created_at DESC, id
+        );
+    """,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL
@@ -4355,6 +4371,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    129: (("cayu_transcript_messages", "message_bytes", "INTEGER"),),
     126: (("cayu_task_interrupted_continuation_claims", "expected_sha256", "TEXT COLLATE BINARY"),),
     124: (("cayu_tasks", "concurrency_key", "TEXT COLLATE BINARY"),),
     121: (

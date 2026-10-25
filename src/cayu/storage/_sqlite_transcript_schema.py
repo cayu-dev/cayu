@@ -160,3 +160,33 @@ def _validate_revision_46_transcript_search_schema(
         raise RuntimeError(
             "SQLite transcript search projection does not preserve the narrative-only boundary."
         )
+
+
+def _validate_transcript_message_bytes(
+    connection: sqlite3.Connection, *, revision_sql: str
+) -> None:
+    from cayu.storage import _sqlite_catalog as sqlite_catalog
+
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_transcript_messages)")
+    }
+    if columns.get("message_bytes") != ("INTEGER", 0):
+        raise RuntimeError("SQLite transcript message size column is missing or conflicting.")
+    statements = tuple(sqlite_catalog._iter_statements(revision_sql))
+    expected = {
+        name: next(statement for statement in statements if name in statement)
+        for name in (
+            "cayu_transcript_messages_bytes_insert",
+            "idx_cayu_sessions_root_session_created",
+        )
+    }
+    for name, statement in expected.items():
+        row = connection.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+        if (
+            row is None
+            or row[0] is None
+            or sqlite_catalog._normalize_sqlite_schema_definition(row[0])
+            != sqlite_catalog._normalize_sqlite_schema_definition(statement)
+        ):
+            raise RuntimeError(f"SQLite schema object {name} is missing or conflicting.")

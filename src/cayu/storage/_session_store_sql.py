@@ -297,6 +297,9 @@ def build_session_query_sql(
         column="agent_name",
         value=query.agent_name,
     )
+    if query.agent_names:
+        clauses.append(f"agent_name IN ({dialect.placeholders(len(query.agent_names))})")
+        params.extend(query.agent_names)
     _append_session_field_filter(
         clauses,
         params,
@@ -325,6 +328,20 @@ def build_session_query_sql(
         column="parent_session_id",
         value=query.parent_session_id,
     )
+    if query.root_session_id is not None:
+        invocation = (
+            "cayu_sessions.invocation_json"
+            if dialect.contains_style == "sqlite_nocase_like"
+            else "cayu_sessions.invocation"
+        )
+        root_expression = _json_text(dialect, invocation, "root_session_id")
+        if dialect.contains_style != "sqlite_nocase_like":
+            # Keep the index key bounded even for maximum-length session IDs.
+            # The exact predicate below also rejects any hash collisions.
+            clauses.append(f"md5({root_expression}) = md5({dialect.placeholder})")
+            params.append(query.root_session_id)
+        clauses.append(f"{root_expression} = {dialect.placeholder}")
+        params.append(query.root_session_id)
     _append_session_field_filter(
         clauses,
         params,

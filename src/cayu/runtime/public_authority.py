@@ -22,6 +22,9 @@ PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID_ENV = "CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_K
 PUBLIC_AUTHORITY_ALIAS_KEYS_ENV = "CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS"
 
 _KEY_ID_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z", flags=re.ASCII)
+# Session references the session read tools show one calling session. Each
+# alias is scoped to that caller, so another session cannot resolve it.
+SESSION_REFERENCE_FIELD_NAME = "session_ref"
 _FIELD_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", flags=re.ASCII)
 _BASE64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z", flags=re.ASCII)
 _HMAC_CONTEXT = b"cayu.public-authority-alias"
@@ -486,13 +489,18 @@ def _public_authority_alias_store_key(
         if scope_session_id is not None:
             raise ValueError(f"{field_name} aliases must not have a session scope.")
         scope_key = ""
-    elif field_name in {"interaction_id", TARGETED_TOOL_REFERENCE_FIELD_NAME}:
+    elif field_name in {
+        "interaction_id",
+        TARGETED_TOOL_REFERENCE_FIELD_NAME,
+        SESSION_REFERENCE_FIELD_NAME,
+    }:
         if scope_session_id is None:
             raise ValueError(f"{field_name} aliases require a private session scope.")
         scope_key = require_nonblank(scope_session_id, "scope_session_id")
     else:
         raise ValueError(
-            "field_name must be session_id, causal_budget_id, interaction_id, or tool_ref."
+            "field_name must be session_id, causal_budget_id, interaction_id, tool_ref "
+            "or session_ref."
         )
     if private_value is not None:
         require_nonblank(private_value, "private_value")

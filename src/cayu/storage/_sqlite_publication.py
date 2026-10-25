@@ -80,7 +80,6 @@ from cayu.sessions.records import (
     TranscriptRecord,
     _validate_status_set,
 )
-from cayu.sessions.transcript_queries import transcript_search_document
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
 from cayu.storage import _sqlite_model_stage as model_stage_ops
 from cayu.storage import _sqlite_records as sqlite_records
@@ -533,12 +532,8 @@ async def publish_runtime(
                 stored_target_checkpoint = checkpoint_codec.encode(loaded, checkpoint)
 
             transcript_rows = [
-                (
-                    session_id,
-                    str(message.role),
-                    request.interaction_id,
-                    sqlite_records.json_dumps(message_payload),
-                    transcript_search_document(message),
+                sqlite_records.transcript_row(
+                    session_id, request.interaction_id, message, message_payload
                 )
                 for message, message_payload in zip(
                     request.transcript_messages,
@@ -598,9 +593,9 @@ async def publish_runtime(
                     """
                         INSERT INTO cayu_transcript_messages (
                             session_id, role, interaction_id, message_json,
-                            transcript_search_document
+                            transcript_search_document, message_bytes
                         )
-                        VALUES (?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         """,
                     transcript_rows,
                 )

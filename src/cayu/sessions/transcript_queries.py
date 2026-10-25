@@ -10,7 +10,7 @@ import re
 import secrets
 import unicodedata
 from bisect import bisect_left
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from hashlib import sha256
 from itertools import islice
 
@@ -856,6 +856,103 @@ class TranscriptSnapshot(BaseModel):
         elif cursor != self.cursor:
             raise ValueError("Transcript cursor is not available in retained history.")
         return position
+
+
+# Bounds for ``SessionStore.load_bounded_transcript_window``.
+BOUNDED_TRANSCRIPT_WINDOW_MAX_LIMIT = 1000
+BOUNDED_TRANSCRIPT_WINDOW_MAX_BYTES = 16 * 1024 * 1024
+
+
+class BoundedTranscriptRecord(BaseModel):
+    """One window row; ``message`` is None when the row exceeded the per-record bound.
+
+    ``stored_bytes`` is the store's serialized size of the message, measured
+    without loading it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    interaction_id: str | None = None
+    role: MessageRole
+    stored_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    message: Message | None = None
+
+
+class BoundedTranscriptWindow(BaseModel):
+    """A byte-bounded absolute-index window plus the permanent append cursor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[BoundedTranscriptRecord] = Field(default_factory=list)
+    cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+
+    @model_validator(mode="after")
+    def validate_record_order(self) -> BoundedTranscriptWindow:
+        indices = [record.index for record in self.records]
+        if indices != sorted(indices) or len(indices) != len(set(indices)):
+            raise ValueError("Transcript window records must have unique ascending indices.")
+        if indices and indices[-1] >= self.cursor:
+            raise ValueError("Transcript window records must precede its append cursor.")
+        return self
+
+
+def validate_bounded_transcript_window(
+    session_id: str,
+    *,
+    start_index: int,
+    limit: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+) -> str:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    for name, value, minimum, maximum in (
+        ("start_index", start_index, 0, MAX_DURABLE_JSON_INTEGER),
+        ("limit", limit, 1, BOUNDED_TRANSCRIPT_WINDOW_MAX_LIMIT),
+        ("max_record_bytes", max_record_bytes, 1, BOUNDED_TRANSCRIPT_WINDOW_MAX_BYTES),
+        ("max_total_bytes", max_total_bytes, 1, BOUNDED_TRANSCRIPT_WINDOW_MAX_BYTES),
+    ):
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an integer.")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+    if max_record_bytes > max_total_bytes:
+        raise ValueError("max_record_bytes must not exceed max_total_bytes.")
+    return session_id
+
+
+def select_bounded_transcript_rows(
+    sizes: Sequence[int], *, max_record_bytes: int, max_total_bytes: int
+) -> list[bool]:
+    """Decide, from measured sizes alone, which leading rows a window returns.
+
+    Each returned flag says whether that row's message is loaded. A row over
+    ``max_record_bytes`` is returned without its message. The window ends
+    before the first row that fits the per-record bound but not the bytes
+    left, so the next window starts at that row; the first row always fits.
+    """
+
+    loads: list[bool] = []
+    remaining = max_total_bytes
+    for size in sizes:
+        if size > max_record_bytes:
+            loads.append(False)
+            continue
+        if size > remaining:
+            break
+        remaining -= size
+        loads.append(True)
+    return loads
+
+
+def message_stored_bytes(message: Message) -> int:
+    """Compact JSON size used as the in-memory store's stored message size."""
+
+    return len(
+        json.dumps(
+            message.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    )
 
 
 ForkTranscriptValidator = Callable[[tuple[Message, ...], TranscriptSnapshot], bool]

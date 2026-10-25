@@ -32,6 +32,7 @@ from cayu.sessions.records import (
 
 # A maximum-size session ID fits after base64 encoding in this cursor budget.
 MAX_SESSION_LIST_CURSOR_BYTES = 4096
+MAX_SESSION_QUERY_AGENT_NAMES = 100
 _SESSION_CURSOR_VERSION = 1
 
 
@@ -140,10 +141,16 @@ class SessionQuery(BaseModel):
     status: SessionStatus | None = None
     debug_state: SessionDebugState | None = None
     agent_name: str | None = None
+    # Sessions run by any of these agents.
+    agent_names: tuple[str, ...] = Field(
+        default_factory=tuple, max_length=MAX_SESSION_QUERY_AGENT_NAMES
+    )
     provider_name: str | None = None
     model: str | None = None
     environment_name: str | None = None
     parent_session_id: str | None = None
+    # Sessions whose invocation provenance names this root session, root included.
+    root_session_id: str | None = None
     causal_budget_id: str | None = None
     # Sessions created strictly after this instant.
     created_after: datetime | None = None
@@ -185,6 +192,7 @@ class SessionQuery(BaseModel):
         "model",
         "environment_name",
         "parent_session_id",
+        "root_session_id",
         "causal_budget_id",
     )
     @classmethod
@@ -196,6 +204,23 @@ class SessionQuery(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("agent_names", mode="before")
+    @classmethod
+    def copy_agent_names(cls, value) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if type(value) is str:
+            raise ValueError("`agent_names` must be a sequence of strings.")
+        names: list[str] = []
+        for item in tuple(value):
+            if type(item) is not str:
+                raise ValueError("`agent_names` must contain only strings.")
+            name = require_clean_nonblank(item, "agent_names")
+            if name in names:
+                raise ValueError("`agent_names` must not contain duplicates.")
+            names.append(name)
+        return tuple(names)
 
     @field_validator("created_after", "last_activity_before")
     @classmethod
@@ -322,10 +347,12 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         status=query.status,
         debug_state=query.debug_state,
         agent_name=query.agent_name,
+        agent_names=query.agent_names,
         provider_name=query.provider_name,
         model=query.model,
         environment_name=query.environment_name,
         parent_session_id=query.parent_session_id,
+        root_session_id=query.root_session_id,
         causal_budget_id=query.causal_budget_id,
         created_after=query.created_after,
         last_activity_before=query.last_activity_before,
@@ -373,11 +400,18 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
         raise ValueError("SessionQuery debug_state requires event-aware store filtering.")
     if query.agent_name is not None and session.agent_name != query.agent_name:
         return False
+    if query.agent_names and session.agent_name not in query.agent_names:
+        return False
     if query.provider_name is not None and session.provider_name != query.provider_name:
         return False
     if query.model is not None and session.model != query.model:
         return False
     if query.parent_session_id is not None and session.parent_session_id != query.parent_session_id:
+        return False
+    if (
+        query.root_session_id is not None
+        and session.invocation.root_session_id != query.root_session_id
+    ):
         return False
     if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
         return False

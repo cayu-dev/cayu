@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import sys
 from collections.abc import Callable
@@ -47,6 +48,7 @@ from cayu.tools.knowledge import (
 )
 from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.search import SearchTextTool
+from cayu.tools.session_reads import ListSessionsTool, OwnTreeSessionAccess, ReadSessionTool
 from cayu.tools.subagents import (
     SubagentExecutionMode,
     SubagentResultTool,
@@ -77,6 +79,19 @@ def _subagent_tool(bound: int | None) -> SubagentTool:
     )
 
 
+def _aliased_store() -> InMemorySessionStore:
+    from pydantic import SecretStr
+
+    from cayu.runtime.public_authority import (
+        PublicAuthorityAliasCodec,
+        PublicAuthorityAliasKeyring,
+    )
+
+    key = SecretStr(base64.urlsafe_b64encode(bytes([7]) * 32).decode().rstrip("="))
+    keyring = PublicAuthorityAliasKeyring(active_key_id="bounds", keys={"bounds": key})
+    return InMemorySessionStore(public_authority_alias_codec=PublicAuthorityAliasCodec(keyring))
+
+
 FACTORIES: dict[str, Callable[[int | None], Tool]] = {
     "exec_command": lambda bound: ExecCommandTool(max_terminal_payload_bytes=bound),
     "read_file": lambda bound: ReadFileTool(max_terminal_payload_bytes=bound),
@@ -102,6 +117,12 @@ FACTORIES: dict[str, Callable[[int | None], Tool]] = {
     ),
     "child_session_result": lambda bound: ChildSessionResultTool(
         InMemorySessionStore(), max_terminal_payload_bytes=bound
+    ),
+    "list_sessions": lambda bound: ListSessionsTool(
+        _aliased_store(), access=OwnTreeSessionAccess(), max_terminal_payload_bytes=bound
+    ),
+    "read_session": lambda bound: ReadSessionTool(
+        _aliased_store(), access=OwnTreeSessionAccess(), max_terminal_payload_bytes=bound
     ),
     "ask_user": lambda bound: UserInputTool(max_terminal_payload_bytes=bound),
 }

@@ -389,6 +389,7 @@ from cayu.sessions.transcript_input import (
     deferred_interaction_input_storage_payload,
 )
 from cayu.sessions.transcript_queries import (
+    BoundedTranscriptWindow,
     ForkTranscriptValidator,
     TranscriptPage,
     TranscriptQuery,
@@ -417,7 +418,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 113
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 129
 
 
 def _targeted_tool_grant_from_postgres(value: object) -> TargetedToolGrantRecord:
@@ -698,6 +699,12 @@ class PostgresSessionStore(
         self._public_authority_alias_codec = public_authority_alias_codec
         self._public_authority_alias_backfill_lock = asyncio.Lock()
         self._public_authority_aliases_reconciled = False
+
+    @property
+    def can_register_public_authority_aliases(self) -> bool:
+        """Whether this store instance can persist new public authority aliases."""
+
+        return not self._read_only
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
@@ -7150,6 +7157,25 @@ class PostgresSessionStore(
             session_id,
             start_index=start_index,
             limit=limit,
+            load_session=self._load,
+        )
+
+    async def load_bounded_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+    ) -> BoundedTranscriptWindow:
+        return await transcript_ops.load_bounded_transcript_window(
+            self._ready_connection,
+            session_id,
+            start_index=start_index,
+            limit=limit,
+            max_record_bytes=max_record_bytes,
+            max_total_bytes=max_total_bytes,
             load_session=self._load,
         )
 

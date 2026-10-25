@@ -1,6 +1,8 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "BoundedTranscriptRecord": ("cayu.sessions.transcript_queries", "BoundedTranscriptRecord"),
+    "BoundedTranscriptWindow": ("cayu.sessions.transcript_queries", "BoundedTranscriptWindow"),
     "ContextViewProjectionSource": ("cayu.sessions.context_views", "ContextViewProjectionSource"),
     "ContextViewExtensionProjection": (
         "cayu.sessions.context_views",
@@ -727,6 +729,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
 
 PUBLIC_NAMES = [
     "ActiveModelCompletionStage",
+    "BoundedTranscriptRecord",
+    "BoundedTranscriptWindow",
     "CONTEXT_VIEW_CONTRACT_VERSION",
     "CONTEXT_VIEW_STORE_VERSION",
     "CHECKPOINT_SCHEMA_VERSION_KEY",

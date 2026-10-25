@@ -549,6 +549,11 @@ REVISIONS: tuple[Revision, ...] = (
     # Retry-key budgets add one table that older binaries never read or write
     # (they cannot create retry-keyed tasks). Task stores require it.
     Revision(revision=128, kind=RevisionKind.ADDITIVE, compatible_from=127),
+    # Transcript rows record their stored message size so bounded reads never
+    # measure message bodies, and session lists index the root session tree.
+    # The size is filled for writers that omit it, so older binaries keep
+    # working; session stores require this revision.
+    Revision(revision=129, kind=RevisionKind.ADDITIVE, compatible_from=127),
 )
 
 #: The revision an empty database is initialized to.

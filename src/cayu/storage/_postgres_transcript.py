@@ -36,6 +36,8 @@ from cayu.sessions.transcript_queries import (
     LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
     LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
     LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES,
+    BoundedTranscriptRecord,
+    BoundedTranscriptWindow,
     TranscriptPage,
     TranscriptQuery,
     TranscriptSearchHit,
@@ -48,12 +50,14 @@ from cayu.sessions.transcript_queries import (
     decode_transcript_search_cursor,
     encode_transcript_search_cursor,
     filter_transcript_records,
+    select_bounded_transcript_rows,
     transcript_search_document,
     transcript_search_document_score,
     transcript_search_hit_from_message,
     transcript_search_position_after_cursor,
     transcript_search_query_document,
     transcript_search_session_token,
+    validate_bounded_transcript_window,
 )
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._participant_bindings_schema import PARTICIPANT_BINDING_PROJECTION
@@ -755,6 +759,86 @@ async def load_transcript_window(
             ],
             cursor=int(rows[0][0]),
         )
+
+
+async def load_bounded_transcript_window(
+    connect: PostgresConnection,
+    session_id: str,
+    *,
+    start_index: int,
+    limit: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+    load_session: SessionLoader,
+) -> BoundedTranscriptWindow:
+    from cayu.resource_access import current_data_bounds
+
+    access_bounds = await current_data_bounds()
+    session_id = validate_bounded_transcript_window(
+        session_id,
+        start_index=start_index,
+        limit=limit,
+        max_record_bytes=max_record_bytes,
+        max_total_bytes=max_total_bytes,
+    )
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if access_bounds is not None:
+            access_bounds.require_read(await load_session(cur, session_id))
+        await cur.execute(
+            """
+            SELECT session.transcript_seq,
+                   transcript.session_order - 1 AS transcript_index,
+                   transcript.interaction_id,
+                   transcript.message ->> 'role',
+                   transcript.sequence,
+                   COALESCE(
+                       transcript.message_bytes,
+                       octet_length(transcript.message::text)
+                   ) AS stored_bytes
+            FROM cayu_sessions AS session
+            LEFT JOIN cayu_transcript_messages AS transcript
+              ON transcript.session_id = session.id
+             AND transcript.session_order > %s
+            WHERE session.id = %s
+            ORDER BY transcript.session_order ASC
+            LIMIT %s
+            """,
+            (start_index, session_id, limit),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            raise KeyError(f"Session not found: {session_id}")
+        cursor = int(rows[0][0])
+        rows = [row for row in rows if row[1] is not None]
+        loads = select_bounded_transcript_rows(
+            [int(row[5]) for row in rows],
+            max_record_bytes=max_record_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        sequences = [row[4] for row, load in zip(rows, loads, strict=False) if load]
+        messages: dict[int, Message] = {}
+        if sequences:
+            await cur.execute(
+                "SELECT sequence, message FROM cayu_transcript_messages WHERE sequence = ANY(%s)",
+                (sequences,),
+            )
+            for sequence, message in await cur.fetchall():
+                messages[sequence] = Message(**pg_support._json_obj(message))
+        await conn.rollback()
+    return BoundedTranscriptWindow(
+        records=[
+            BoundedTranscriptRecord(
+                index=row[1],
+                interaction_id=row[2],
+                role=row[3],
+                stored_bytes=int(row[5]),
+                message=messages[row[4]] if load else None,
+            )
+            for row, load in zip(rows, loads, strict=False)
+        ],
+        cursor=cursor,
+    )
 
 
 async def query_transcript(

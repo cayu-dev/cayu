@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.events import Event
+from cayu.messages import Message
 from cayu.sessions.creation import session_invocation_for_run_request, session_metadata_for_creation
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
@@ -392,6 +393,27 @@ def parse_optional_datetime(value: str | None) -> datetime | None:
     if value is None:
         return None
     return parse_datetime(value)
+
+
+def transcript_row(
+    session_id: str,
+    interaction_id: Any,
+    message: Message,
+    payload: dict[str, Any] | None = None,
+) -> tuple[str, str, Any, str, str, int]:
+    """Values for one ``cayu_transcript_messages`` insert, including its stored size."""
+
+    from cayu.sessions.transcript_queries import transcript_search_document
+
+    message_json = json_dumps(message.model_dump(mode="json") if payload is None else payload)
+    return (
+        session_id,
+        str(message.role),
+        interaction_id,
+        message_json,
+        transcript_search_document(message),
+        len(message_json.encode("utf-8")),
+    )
 
 
 def json_dumps(value: Any) -> str:

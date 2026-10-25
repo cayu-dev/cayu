@@ -2,7 +2,17 @@
 
 ## Unreleased
 
-Upgrade: no action needed. `cayu[claude-agent-sdk]` now accepts newer
+Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
+confirm revision 129. SQLite and PostgreSQL session stores require revision 129
+and refuse an older database until it is migrated. The additive revision adds a
+`message_bytes` column to `cayu_transcript_messages`, backfills it in one
+statement (on large PostgreSQL transcript tables this rewrites every row inside
+the migration transaction), fills it for writers that omit it, and builds an
+index on each session's root session id (concurrently on existing PostgreSQL
+databases). The compatibility floor stays at 127, so older workers keep running
+during the migration.
+
+`cayu[claude-agent-sdk]` now accepts newer
 `claude-agent-sdk` releases below 0.3; pin the SDK in your own requirements to
 keep 0.2.170.
 
@@ -31,6 +41,23 @@ None.
   on that SDK's internals.
 - `ExternalCleanupIncomplete` is exported from `cayu.external_agents`, so code can
   catch it without importing a private module.
+- New read-only tools `ListSessionsTool` (`list_sessions`) and `ReadSessionTool`
+  (`read_session`) let a model page through earlier sessions and read bounded,
+  secret-redacted transcript windows. Each requires a `SessionReadAccess` policy
+  evaluated per call: `OwnTreeSessionAccess` for the caller's root session tree,
+  `MatchingSessionAccess` for agent names and labels with label exclusions, or
+  your own. A session outside the policy reads like a missing one. The tools
+  refuse to run without a resource-access scope unless constructed with
+  `unscoped=True` for a single-tenant store, and always apply the run's scope.
+  Applications register the tools explicitly; no preset adds them. Session ids
+  in their results are opaque aliases scoped to the calling session, and the
+  tools need a store with a public authority alias keyring. A parent id appears
+  only when the parent is itself readable. `SessionQuery` gains
+  `root_session_id` (indexed) and `agent_names` filters on every built-in store,
+  and `SessionStore.load_bounded_transcript_window` reads transcript windows
+  within per-message and total byte bounds using each message's stored size,
+  without loading oversized messages. See
+  [session inspection](session-inspection.md#let-agents-read-earlier-sessions).
 
 ## v0.14.0
 

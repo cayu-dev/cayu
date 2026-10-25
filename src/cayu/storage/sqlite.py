@@ -368,13 +368,13 @@ from cayu.sessions.transcript_input import (
     deferred_interaction_input_storage_payload,
 )
 from cayu.sessions.transcript_queries import (
+    BoundedTranscriptWindow,
     ForkTranscriptValidator,
     TranscriptPage,
     TranscriptQuery,
     TranscriptSearchQuery,
     TranscriptSearchResult,
     TranscriptSnapshot,
-    transcript_search_document,
 )
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage import _session_store_sql as session_store_sql
@@ -413,7 +413,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 113
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 129
 _T = TypeVar("_T")
 
 
@@ -1253,6 +1253,12 @@ class SQLiteSessionStore(
         if str(self.path) == ":memory:":
             return ()
         return (self.path.resolve(),)
+
+    @property
+    def can_register_public_authority_aliases(self) -> bool:
+        """Whether this store instance can persist new public authority aliases."""
+
+        return not self._read_only
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
@@ -3641,15 +3647,9 @@ class SQLiteSessionStore(
                         self._connection.executemany(
                             "INSERT INTO cayu_transcript_messages "
                             "(session_id, role, interaction_id, message_json, "
-                            "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
+                            "transcript_search_document, message_bytes) VALUES (?, ?, ?, ?, ?, ?)",
                             [
-                                (
-                                    session_id,
-                                    str(message.role),
-                                    interaction_id,
-                                    sqlite_records.json_dumps(message.model_dump(mode="json")),
-                                    transcript_search_document(message),
-                                )
+                                sqlite_records.transcript_row(session_id, interaction_id, message)
                                 for message in source_messages
                             ],
                         )
@@ -8033,6 +8033,24 @@ class SQLiteSessionStore(
     ) -> TranscriptSnapshot:
         return await transcript_ops.load_transcript_window(
             self._run_read, session_id, start_index=start_index, limit=limit
+        )
+
+    async def load_bounded_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+    ) -> BoundedTranscriptWindow:
+        return await transcript_ops.load_bounded_transcript_window(
+            self._run_read,
+            session_id,
+            start_index=start_index,
+            limit=limit,
+            max_record_bytes=max_record_bytes,
+            max_total_bytes=max_total_bytes,
         )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:

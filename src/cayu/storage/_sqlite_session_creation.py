@@ -70,7 +70,6 @@ from cayu.sessions.transcript_queries import (
     ForkTranscriptValidator,
     TranscriptSnapshot,
     fork_transcript_is_accepted,
-    transcript_search_document,
 )
 from cayu.storage import _creation_fence
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
@@ -292,16 +291,10 @@ async def create(
                             )
                         connection.executemany(
                             "INSERT INTO cayu_transcript_messages "
-                            "(session_id, role, interaction_id, message_json, transcript_search_document) "
-                            "VALUES (?, ?, ?, ?, ?)",
+                            "(session_id, role, interaction_id, message_json, transcript_search_document, message_bytes) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
                             [
-                                (
-                                    session.id,
-                                    str(message.role),
-                                    None,
-                                    sqlite_records.json_dumps(message.model_dump(mode="json")),
-                                    transcript_search_document(message),
-                                )
+                                sqlite_records.transcript_row(session.id, None, message)
                                 for message in request.messages
                             ],
                         )
@@ -734,17 +727,13 @@ async def create_fork(
                             role,
                             interaction_id,
                             message_json,
-                            transcript_search_document
+                            transcript_search_document, message_bytes
                         )
-                        VALUES (?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         """,
                     [
-                        (
-                            fork.id,
-                            str(message.role),
-                            copied_interaction_ids[index],
-                            sqlite_records.json_dumps(message.model_dump(mode="json")),
-                            transcript_search_document(message),
+                        sqlite_records.transcript_row(
+                            fork.id, copied_interaction_ids[index], message
                         )
                         for index, message in enumerate(copied_messages)
                     ],

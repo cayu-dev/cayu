@@ -259,6 +259,7 @@ from cayu.sessions.transcript_input import (
     DeferredInteractionInput,
 )
 from cayu.sessions.transcript_queries import (
+    BoundedTranscriptWindow,
     ForkTranscriptValidator,
     TranscriptPage,
     TranscriptQuery,
@@ -6925,6 +6926,24 @@ class InMemorySessionStore(
     async def load_transcript_cursor(self, session_id: str) -> int:
         return await memory_transcripts.load_transcript_cursor(
             self._read_transcript_state, session_id
+        )
+
+    async def load_bounded_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+    ) -> BoundedTranscriptWindow:
+        return await memory_transcripts.load_bounded_transcript_window(
+            self._read_transcript_state,
+            session_id,
+            start_index=start_index,
+            limit=limit,
+            max_record_bytes=max_record_bytes,
+            max_total_bytes=max_total_bytes,
         )
 
     async def load_latest_transcript_message(

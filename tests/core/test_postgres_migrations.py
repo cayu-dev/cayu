@@ -1575,10 +1575,11 @@ def test_revision_120_adds_agent_snapshot_tables_without_raising_the_floor(
 
     async def runner() -> None:
         await _create_then_rewind_agent_snapshot_revision(postgres_dsn)
-        # The session store still reads revision 119; task writers need the later floor.
+        # Session stores need revision 129 for transcript message sizes.
         session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            await session_store.ensure_schema()
+            with pytest.raises(schema.SchemaTooOld, match="cayu storage migrate"):
+                await session_store.ensure_schema()
         finally:
             await session_store.close()
         snapshot_store = PostgresAgentSnapshotStore(postgres_dsn)

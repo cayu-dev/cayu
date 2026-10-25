@@ -38,6 +38,8 @@ from cayu.sessions.transcript_queries import (
     LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
     LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
     LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES,
+    BoundedTranscriptRecord,
+    BoundedTranscriptWindow,
     TranscriptPage,
     TranscriptQuery,
     TranscriptSearchHit,
@@ -50,12 +52,14 @@ from cayu.sessions.transcript_queries import (
     decode_transcript_search_cursor,
     encode_transcript_search_cursor,
     filter_transcript_records,
+    select_bounded_transcript_rows,
     transcript_search_document,
     transcript_search_document_score,
     transcript_search_hit_from_message,
     transcript_search_position_after_cursor,
     transcript_search_query_document,
     transcript_search_session_token,
+    validate_bounded_transcript_window,
 )
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
@@ -202,18 +206,12 @@ async def append_transcript_messages(
                     role,
                     interaction_id,
                     message_json,
-                    transcript_search_document
+                    transcript_search_document, message_bytes
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (
-                        session_id,
-                        str(message.role),
-                        interaction_id,
-                        sqlite_records.json_dumps(message.model_dump(mode="json")),
-                        transcript_search_document(message),
-                    )
+                    sqlite_records.transcript_row(session_id, interaction_id, message)
                     for message in copied_messages
                 ],
             )
@@ -330,14 +328,10 @@ async def replace_initial_transcript_messages(
             connection.executemany(
                 "INSERT INTO cayu_transcript_messages "
                 "(session_id, role, interaction_id, message_json, "
-                "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
+                "transcript_search_document, message_bytes) VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (
-                        session_id,
-                        str(message.role),
-                        None if index < prefix_count else interaction_id,
-                        sqlite_records.json_dumps(message.model_dump(mode="json")),
-                        transcript_search_document(message),
+                    sqlite_records.transcript_row(
+                        session_id, None if index < prefix_count else interaction_id, message
                     )
                     for index, message in enumerate(replacement)
                 ],
@@ -427,15 +421,9 @@ async def materialize_deferred_interaction_input(
             connection.executemany(
                 "INSERT INTO cayu_transcript_messages "
                 "(session_id, role, interaction_id, message_json, "
-                "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
+                "transcript_search_document, message_bytes) VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (
-                        session_id,
-                        str(message.role),
-                        interaction_id,
-                        sqlite_records.json_dumps(message.model_dump(mode="json")),
-                        transcript_search_document(message),
-                    )
+                    sqlite_records.transcript_row(session_id, interaction_id, message)
                     for message in messages
                 ],
             )
@@ -537,18 +525,12 @@ async def append_transcript_messages_and_transform_checkpoint(
                         role,
                         interaction_id,
                         message_json,
-                        transcript_search_document
+                        transcript_search_document, message_bytes
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     [
-                        (
-                            session_id,
-                            str(message.role),
-                            interaction_id,
-                            sqlite_records.json_dumps(message.model_dump(mode="json")),
-                            transcript_search_document(message),
-                        )
+                        sqlite_records.transcript_row(session_id, interaction_id, message)
                         for message in copied_messages
                     ],
                 )
@@ -710,7 +692,10 @@ async def load_latest_transcript_text(
             """
             SELECT session.id,
                    transcript.sequence,
-                   length(CAST(transcript.message_json AS BLOB))
+                   COALESCE(
+                       transcript.message_bytes,
+                       length(CAST(transcript.message_json AS BLOB))
+                   )
             FROM cayu_sessions AS session
             LEFT JOIN cayu_transcript_messages AS transcript
               ON transcript.sequence = (
@@ -859,6 +844,93 @@ async def load_transcript_window(
     return await run_read(
         lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
     )
+
+
+async def load_bounded_transcript_window(
+    run_read: SQLiteOperationRunner,
+    session_id: str,
+    *,
+    start_index: int,
+    limit: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+) -> BoundedTranscriptWindow:
+    from cayu.resource_access import current_data_bounds
+
+    access_bounds = await current_data_bounds()
+    session_id = validate_bounded_transcript_window(
+        session_id,
+        start_index=start_index,
+        limit=limit,
+        max_record_bytes=max_record_bytes,
+        max_total_bytes=max_total_bytes,
+    )
+
+    def query(connection: sqlite3.Connection) -> BoundedTranscriptWindow:
+        rows = connection.execute(
+            """
+            SELECT session.transcript_seq,
+                   transcript.session_order - 1 AS transcript_index,
+                   transcript.interaction_id,
+                   transcript.role,
+                   transcript.sequence,
+                   COALESCE(
+                       transcript.message_bytes,
+                       length(CAST(transcript.message_json AS BLOB))
+                   ) AS stored_bytes
+            FROM cayu_sessions AS session
+            LEFT JOIN cayu_transcript_messages AS transcript
+              ON transcript.session_id = session.id
+             AND transcript.session_order > ?
+            WHERE session.id = ?
+            ORDER BY transcript.session_order ASC
+            LIMIT ?
+            """,
+            (start_index, session_id, limit),
+        ).fetchall()
+        if not rows:
+            raise KeyError(f"Session not found: {session_id}")
+        cursor = int(rows[0]["transcript_seq"])
+        rows = [row for row in rows if row["transcript_index"] is not None]
+        loads = select_bounded_transcript_rows(
+            [int(row["stored_bytes"]) for row in rows],
+            max_record_bytes=max_record_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        sequences = [row["sequence"] for row, load in zip(rows, loads, strict=False) if load]
+        messages: dict[int, Message] = {}
+        if sequences:
+            placeholders = ", ".join("?" for _ in sequences)
+            for loaded in connection.execute(
+                "SELECT sequence, message_json FROM cayu_transcript_messages "
+                f"WHERE sequence IN ({placeholders})",
+                sequences,
+            ):
+                messages[loaded["sequence"]] = Message(**json.loads(loaded["message_json"]))
+        return BoundedTranscriptWindow(
+            records=[
+                BoundedTranscriptRecord(
+                    index=row["transcript_index"],
+                    interaction_id=row["interaction_id"],
+                    role=row["role"],
+                    stored_bytes=int(row["stored_bytes"]),
+                    message=messages[row["sequence"]] if load else None,
+                )
+                for row, load in zip(rows, loads, strict=False)
+            ],
+            cursor=cursor,
+        )
+
+    def snapshot(connection: sqlite3.Connection) -> BoundedTranscriptWindow:
+        connection.execute("BEGIN")
+        try:
+            if access_bounds is not None:
+                access_bounds.require_read(sqlite_records.load_session(connection, session_id))
+            return query(connection)
+        finally:
+            connection.rollback()
+
+    return await run_read(snapshot)
 
 
 async def query_transcript(

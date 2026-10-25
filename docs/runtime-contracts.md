@@ -9789,6 +9789,29 @@ SessionQuery(
 )
 ```
 
+`SessionQuery.root_session_id` selects the sessions whose invocation provenance
+names that root session, the root included, which is one parent/child session
+tree. `SessionQuery.agent_names` matches any of up to 100 agent names and
+combines with `agent_name` by conjunction. Memory, SQLite and PostgreSQL stores
+apply both filters natively, before pagination and counting. Storage revision 129
+indexes `root_session_id` with creation order
+(`idx_cayu_sessions_root_session_created`), so tree-scoped, newest-first pages
+read the index without a sort.
+
+`SessionStore.load_bounded_transcript_window(session_id, start_index=...,
+limit=..., max_record_bytes=..., max_total_bytes=...)` reads an absolute-index
+transcript window without loading a message before its stored size is known.
+A row over `max_record_bytes` is returned as a `BoundedTranscriptRecord` with
+`message=None` and its `stored_bytes`. SQLite and PostgreSQL read the stored size
+from `cayu_transcript_messages.message_bytes` (storage revision 129), which
+writers set on insert and the database fills for writers that omit it, so the
+check reads no message bodies. The window ends before the first row that
+fits the per-record bound but not the bytes left, so the first row always
+returns and the next window starts where this one stopped. Rows, sizes,
+messages and the append cursor come from one read snapshot. Memory, SQLite and
+PostgreSQL implement it; the base method raises `NotImplementedError` for custom
+stores, because measuring rows by loading them would defeat the bound.
+
 The optional server exposes the same filtering on `GET /api/sessions` through
 repeated `label=key=value` and `label_selector=...` query parameters. Supported
 selector forms are `workflow`, `!archived`, `project=ap_q2`,

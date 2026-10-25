@@ -181,6 +181,7 @@ from cayu.sessions.topology import SessionTopologyQuery, SessionTopologyStoreRes
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.sessions.transcript_queries import (
     LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
+    BoundedTranscriptWindow,
     ForkTranscriptValidator,
     TranscriptPage,
     TranscriptQuery,
@@ -750,6 +751,12 @@ class SessionStore(ABC):
         """
 
         return ()
+
+    @property
+    def can_register_public_authority_aliases(self) -> bool:
+        """Whether this store instance can persist new public authority aliases."""
+
+        return self.supports_public_authority_aliases
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
@@ -5546,6 +5553,29 @@ class SessionStore(ABC):
                 record.model_copy(deep=True) for record in snapshot.records[start : start + limit]
             ],
             cursor=snapshot.cursor,
+        )
+
+    async def load_bounded_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+    ) -> BoundedTranscriptWindow:
+        """Load an absolute-index window whose loaded messages fit byte bounds.
+
+        Stores measure each row's stored size before loading it and follow
+        ``select_bounded_transcript_rows``: a row over ``max_record_bytes`` is
+        returned without its message, and the window ends before the first row
+        that no longer fits ``max_total_bytes``. Window rows, sizes, messages
+        and the append cursor come from one read snapshot. There is no
+        fallback, because loading rows to measure them defeats the bound.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support byte-bounded transcript windows."
         )
 
     async def load_latest_transcript_message(

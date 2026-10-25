@@ -93,3 +93,45 @@ async def _validate_transcript_search_document_column(cur: Any, *, tokenizer_ver
             "Postgres transcript search tokenizer identity conflicts with this runtime. "
             "Recreate a revision-46 Cayu database with this runtime."
         )
+
+
+async def _validate_transcript_message_bytes(cur: Any) -> None:
+    await cur.execute(
+        """
+            SELECT data_type, is_nullable, is_generated
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_transcript_messages'
+              AND column_name = 'message_bytes'
+            """
+    )
+    if await cur.fetchone() != ("bigint", "YES", "NEVER"):
+        raise RuntimeError("Postgres transcript message size column is missing or conflicting.")
+    await cur.execute(
+        """
+            SELECT trigger_definition.tgenabled,
+                   pg_get_triggerdef(trigger_definition.oid),
+                   pg_get_functiondef(trigger_definition.tgfoid)
+            FROM pg_trigger AS trigger_definition
+            JOIN pg_class AS relation ON relation.oid = trigger_definition.tgrelid
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND relation.relname = 'cayu_transcript_messages'
+              AND trigger_definition.tgname = 'cayu_record_transcript_message_bytes'
+              AND NOT trigger_definition.tgisinternal
+            """
+    )
+    row = await cur.fetchone()
+    trigger = "" if row is None else " ".join(str(row[1]).lower().split())
+    function = "" if row is None else " ".join(str(row[2]).lower().split())
+    if (
+        row is None
+        or row[0] != "O"
+        or "before insert or update of message on" not in trigger
+        or "for each row" not in trigger
+        or (
+            "new.message_bytes := octet_length((new.message)::text)" not in function
+            and "new.message_bytes := octet_length(new.message::text)" not in function
+        )
+    ):
+        raise RuntimeError("Postgres transcript message size trigger is missing or conflicting.")

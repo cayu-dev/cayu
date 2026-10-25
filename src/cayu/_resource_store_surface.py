@@ -20,6 +20,7 @@ _SESSION_OPERATIONS = frozenset(
         "load_transcript",
         "load_transcript_snapshot",
         "load_transcript_window",
+        "load_bounded_transcript_window",
         "load_checkpoint",
         "load_session_operation",
         "query_events",

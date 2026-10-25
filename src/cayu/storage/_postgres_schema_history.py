@@ -689,6 +689,26 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    129: (
+        "ALTER TABLE cayu_transcript_messages ADD COLUMN IF NOT EXISTS message_bytes BIGINT",
+        """
+        CREATE OR REPLACE FUNCTION cayu_record_transcript_message_bytes()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.message_bytes := octet_length(NEW.message::text);
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS cayu_record_transcript_message_bytes ON cayu_transcript_messages",
+        """
+        CREATE TRIGGER cayu_record_transcript_message_bytes
+        BEFORE INSERT OR UPDATE OF message ON cayu_transcript_messages
+        FOR EACH ROW EXECUTE FUNCTION cayu_record_transcript_message_bytes()
+        """,
+        "UPDATE cayu_transcript_messages SET message_bytes = octet_length(message::text) "
+        "WHERE message_bytes IS NULL",
+    ),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
@@ -4574,6 +4594,25 @@ class _ConcurrentIndexMigration:
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
+    129: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_sessions_root_session_created",
+            table_name="cayu_sessions",
+            key_definitions=(
+                "md5((invocation #>> '{root_session_id}'::text[]))",
+                "created_at",
+                "id",
+            ),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cayu_sessions_root_session_created "
+                "ON cayu_sessions (md5(invocation #>> '{root_session_id}'), created_at DESC, id)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_sessions_root_session_created"
+            ),
+        ),
+    ),
     109: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_budget_reservations_session_identity",

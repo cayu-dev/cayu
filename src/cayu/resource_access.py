@@ -521,6 +521,16 @@ async def model_data_access():
         _model_data_access.reset(token)
 
 
+@asynccontextmanager
+async def _runtime_owned_store_access():
+    """Lift model-facing store restrictions for one Cayu-owned bookkeeping call."""
+    token = _model_data_access.set(False)
+    try:
+        yield
+    finally:
+        _model_data_access.reset(token)
+
+
 async def current_data_bounds(kind="sessions"):
     execution = _active.get()
     if execution is None or not _model_data_access.get():

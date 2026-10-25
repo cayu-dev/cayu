@@ -142,6 +142,54 @@ async def load_transcript_snapshot(
         )
 
 
+async def load_bounded_transcript_window(
+    read: LockedTranscriptRead,
+    session_id: str,
+    *,
+    start_index: int,
+    limit: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+) -> session_transcript_queries.BoundedTranscriptWindow:
+    from cayu.resource_access import current_data_bounds
+
+    access_bounds = await current_data_bounds()
+    session_id = session_transcript_queries.validate_bounded_transcript_window(
+        session_id,
+        start_index=start_index,
+        limit=limit,
+        max_record_bytes=max_record_bytes,
+        max_total_bytes=max_total_bytes,
+    )
+    async with read() as state:
+        if access_bounds is not None:
+            access_bounds.require_read(state.sessions.get(session_id))
+        if session_id not in state.sessions:
+            raise KeyError(f"Session not found: {session_id}")
+        messages = state.indexes.messages.get(session_id, [])
+        interaction_ids = state.indexes.interaction_ids.get(session_id, [])
+        indexes = range(start_index, min(start_index + limit, len(messages)))
+        sizes = [
+            session_transcript_queries.message_stored_bytes(messages[index]) for index in indexes
+        ]
+        loads = session_transcript_queries.select_bounded_transcript_rows(
+            sizes, max_record_bytes=max_record_bytes, max_total_bytes=max_total_bytes
+        )
+        return session_transcript_queries.BoundedTranscriptWindow(
+            records=[
+                session_transcript_queries.BoundedTranscriptRecord(
+                    index=index,
+                    interaction_id=interaction_ids[index],
+                    role=messages[index].role,
+                    stored_bytes=size,
+                    message=detach_message(messages[index]) if load else None,
+                )
+                for index, size, load in zip(indexes, sizes, loads, strict=False)
+            ],
+            cursor=len(messages),
+        )
+
+
 async def load_transcript_cursor(read: LockedTranscriptRead, session_id: str) -> int:
     session_id = require_clean_nonblank(session_id, "session_id")
     async with read() as state:

@@ -118,6 +118,126 @@ The JSON value keeps the existing payload depth limit; typed transcript and
 publication envelopes have bounded nesting headroom for their enclosing fields.
 Byte and node limits remain unchanged.
 
+## Let agents read earlier sessions
+
+`ListSessionsTool` (`list_sessions`) and `ReadSessionTool` (`read_session`)
+give a model read-only access to durable session records. Neither tool is part
+of any preset; register them on the agents that need them, each with an access
+policy:
+
+```python
+from cayu.tools import ListSessionsTool, MatchingSessionAccess, ReadSessionTool
+
+verifier_access = MatchingSessionAccess(
+    labels={"app": "scout"},
+    exclude_labels={"role": "hunter"},
+)
+tools = [
+    ListSessionsTool(app.session_store, access=verifier_access),
+    ReadSessionTool(app.session_store, access=verifier_access),
+]
+```
+
+The policy is required and is evaluated against the calling session on every
+call. `OwnTreeSessionAccess()` admits the caller's root session tree: the root
+named by its invocation provenance and every descendant. `MatchingSessionAccess`
+admits sessions run by any of `agent_names` and carrying every pair in
+`labels`, minus sessions carrying any pair in `exclude_labels`; it needs
+`agent_names` or `labels`, so it never admits the whole store. Both hide the
+calling session unless `include_caller=True`. Other rules implement the
+`SessionReadAccess` protocol: `narrow(caller, query)` restricts the listing's
+`SessionQuery` (or returns `None` to admit nothing) and `allows(caller, session)`
+decides one session. The tools check every listed session with `allows`, and a
+session it rejects reads exactly like a missing one. A `narrow` broader than
+`allows` costs extra store reads but exposes nothing: when rows are filtered out,
+`list_sessions` reads up to five store pages to fill the page, and its
+`next_cursor` is built from the last session it returned. If those pages hold no
+more readable sessions, the result sets `scan_limited` and asks the model to
+narrow its filters.
+
+### Tenant isolation
+
+Both tools refuse to run unless the calling run has a resource-access scope
+(an execution binding from a `ResourceAccessPolicy`). Without one they return a
+`resource_scope_required` tool error that names the fix. An application with a
+single-tenant session store opts out explicitly with
+`ListSessionsTool(..., unscoped=True)` and `ReadSessionTool(..., unscoped=True)`;
+use the option only for single-tenant stores.
+
+With a scope active, every read applies it: listings, session loads, the
+transcript window and the structured-output search, and the tools check each
+returned session against it again. A session outside the scope reads exactly
+like a missing one, and not-found results do not repeat the requested id.
+Tenancy comes from the scope, never from the model: the `labels` filter rejects
+keys the scope protects, and a cursor or session alias the tools did not issue
+to this caller is rejected. Labels in a `MatchingSessionAccess` (trusted application
+configuration) are intersected with the scope, so naming another tenant there
+admits nothing.
+
+Multi-tenant applications must put the tenant label key, such as
+`organization`, in the scope's `protected_label_keys`. Keys used in the scope's
+rules are protected as well. A protected key is what stops a run from creating a
+session for another tenant or relabeling a session out of its own; the resource
+access tests for these tools cover both for the tenant key.
+
+`list_sessions` returns pages of at most 50 sessions, newest first, with
+`next_cursor` for the next page. Filters are agent name, labels, status,
+`created_after`, `last_activity_before` and case-insensitive text over the
+redacted title, agent name and labels; hidden text and raw session ids never
+select a row. Exact agent-name or label filters containing registered secrets
+match no rows. Each row has the session's alias, its parent's alias, agent,
+title, status, labels, timestamps, summary and a short outcome: the final
+assistant text, or the final structured output when there is no text, cut to
+`max_outcome_chars`.
+
+### Session aliases and parents
+
+The tools never show raw session ids. `session_id`, `parent_session_id` and
+`next_cursor` carry opaque aliases from the store's public authority alias
+codec (field `session_ref`), so the tools require a store with an alias keyring,
+for example `CayuApp(public_authority_alias_keyring=...)`. An alias is an HMAC of
+the session id, keyed and scoped to the calling session: it is stable for that
+caller, so the model can list, read and cite it, but it reveals nothing about
+the raw id, and another session gets a different alias it cannot resolve.
+The tools require a writable alias registry even though they do not modify
+session content. Construction rejects read-only and diagnostic stores before
+any tool call. `ToolEffect.NONE` describes the model's access to session content;
+Cayu still persists opaque alias mappings as internal bookkeeping.
+
+`read_session` accepts only these aliases; the tools record each alias they show
+so a later call, worker or restart can resolve it. Transcript content still
+shows whatever ids the original messages contained.
+
+A row's `parent_session_id` is the parent's alias only when the same scope and
+policy would let the caller read the parent; otherwise it is `null`, exactly as
+for a root session. The caller's own session counts as hidden unless the policy
+sets `include_caller=True`.
+
+`read_session` returns one session's details, its outcome including the final
+structured output, and up to 50 transcript messages from `offset`, with
+`next_offset` to continue. The window is read with
+`SessionStore.load_bounded_transcript_window`, which checks each message's
+stored size (`message_bytes`, recorded at write time since storage revision 129)
+before loading it, so the size check reads no message bodies: a message over 1 MiB is listed with its index, role and
+`stored_bytes` but not loaded, and the window stops before 4 MiB of loaded
+messages, so `next_offset` starts at the first message not returned. The structured-output search reads at most the last
+eight messages and 512 KiB of stored message bytes, newest first, through the
+same bounded window read, so it applies the calling run's resource-access scope.
+It reports `structured_output_status` as `found`, `none`,
+`not_found_within_limit`, `too_large` or `unavailable` (including when the scope
+denies the read) instead of reading further. Each message keeps at most `max_message_chars`
+characters across its parts. Text, tool calls, tool results, structured output,
+peer content, files and citations appear in the durable transcript's stored form,
+so tool arguments the runtime withheld stay unavailable. Reasoning and provider
+protocol state are omitted. Both tools redact the calling invocation's
+registered secrets before JSON encoding or cutting text and fit their results to the declared
+`max_terminal_payload_bytes`. Tool descriptions ask the model to cite the
+session aliases it relies on and to treat their content as possibly stale.
+
+`SessionQuery` supports the same scoping directly: `root_session_id` selects one
+root session tree, served by the revision-129 root-session index on SQLite and
+PostgreSQL, and `agent_names` selects sessions run by any listed agent.
+
 ## Configure the session store
 
 New local projects use one SQLite database at `data/cayu.db`:

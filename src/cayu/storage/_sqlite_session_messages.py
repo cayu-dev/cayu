@@ -71,7 +71,6 @@ from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     session_messages_input_contract_evidence,
 )
-from cayu.sessions.transcript_queries import transcript_search_document
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript as transcript_ops
@@ -1137,15 +1136,9 @@ async def deliver_queued_session_messages(
             connection.executemany(
                 "INSERT INTO cayu_transcript_messages "
                 "(session_id, role, interaction_id, message_json, "
-                "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
+                "transcript_search_document, message_bytes) VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (
-                        session_id,
-                        str(message.role),
-                        interaction_id,
-                        sqlite_records.json_dumps(message.model_dump(mode="json")),
-                        transcript_search_document(message),
-                    )
+                    sqlite_records.transcript_row(session_id, interaction_id, message)
                     for message in transcript_messages
                 ],
             )
