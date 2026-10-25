@@ -132,11 +132,18 @@ What the container can and cannot do:
 
 Before the runner is returned, Cayu inspects the live container and fails
 closed, removing it, if any declared control is missing. It also checks that
-the egress network gives the host no address and probes from the guest's
-network namespace that the host does not answer, and fails the same way if it
-does. That needs a Docker engine that honors the bridge network option
-`com.docker.network.bridge.inhibit_ipv4` (Docker Engine on Linux and Docker
-Desktop do). Admission evidence for
+the egress network is internal, has IPv6 off and sets the bridge option
+`com.docker.network.bridge.inhibit_ipv4`, which keeps the Docker host off the
+network. Then it probes from the guest's network namespace that nothing answers
+at the addresses the host would hold, and fails the same way if something does.
+Docker 27 still lists a gateway for the network in `docker network inspect`;
+that is expected, and the probe decides.
+
+Supported engines: Docker Engine 27.5 or later, on Linux or in Docker Desktop.
+Cayu has been checked on Docker Engine 27.5.1 on Linux and on Docker Desktop
+with Engine 29.8.2; 28.x has not been tested. An engine that ignores the option
+gives the host an address on the network, and the runner is refused with
+`egress_host_reachable`. Admission evidence for
 the environment then reports `guest_privilege_containment` and
 `unprivileged_guest` as available, `deny_by_default_network` and
 `brokered_egress` from the egress adapter, and `untrusted_code_isolation` as

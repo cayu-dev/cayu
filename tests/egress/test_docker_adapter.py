@@ -1004,6 +1004,22 @@ class _HostIsolationDocker:
         raise AssertionError(argv)
 
 
+# `docker network inspect` on Docker Engine 27.5.1 (API 1.47) for a network the
+# adapter created. The engine honors the inhibit option, so the host holds no
+# address on the bridge, yet IPAM still lists the gateway it reserved.
+def _docker_27_network() -> dict[str, object]:
+    return {
+        "Internal": True,
+        "EnableIPv6": False,
+        "Options": {"com.docker.network.bridge.inhibit_ipv4": "true"},
+        "IPAM": {"Config": [{"Subnet": "172.18.0.0/16", "Gateway": "172.18.0.1"}]},
+        "Containers": {
+            _SIDECAR_ID: {"IPv4Address": "172.18.0.2/16"},
+            _GUEST_ID: {"IPv4Address": "172.18.0.3/16"},
+        },
+    }
+
+
 def _hardened_runner_request() -> VirtualEgressRunnerRequest:
     return VirtualEgressRunnerRequest(
         name="hardened-tests",
@@ -1104,30 +1120,37 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
 @pytest.mark.parametrize(
     ("network", "probe", "reason"),
     [
-        # The bug: Docker gave the host the gateway address on the internal network.
-        (
-            _isolated_network(
-                IPAM={"Config": [{"Subnet": "10.213.42.0/24", "Gateway": "10.213.42.1"}]}
-            ),
-            (0, "isolated\n"),
-            "not an internal network without a host address",
-        ),
         (
             _isolated_network(Options={}),
             (0, "isolated\n"),
-            "not an internal network without a host address",
+            "not set up to keep the Docker host off it: it does not set "
+            "com.docker.network.bridge.inhibit_ipv4=true.",
+        ),
+        (
+            _isolated_network(Internal=False),
+            (0, "isolated\n"),
+            "not set up to keep the Docker host off it: it is not internal.",
         ),
         (
             _isolated_network(EnableIPv6=True),
             (0, "isolated\n"),
-            "not an internal network without a host address",
+            "not set up to keep the Docker host off it: it has IPv6 enabled.",
+        ),
+        (
+            _isolated_network(IPAM={"Config": ["10.213.42.0/24"]}),
+            (0, "isolated\n"),
+            "its IPAM config is unreadable",
         ),
         (
             _isolated_network(Containers={_SIDECAR_ID: {"IPv4Address": "10.213.42.1/24"}}),
             (0, "isolated\n"),
-            "not an internal network without a host address",
+            "not set up to keep the Docker host off it: the guest is not attached to it.",
         ),
         (_isolated_network(), (3, "host_reachable\n"), r"\(host_reachable\)"),
+        # An engine that ignores the inhibit option inspects like Docker 27 but
+        # gives the host the gateway address, so the probe finds it.
+        (_docker_27_network(), (3, "host_reachable\n"), r"\(host_reachable\)"),
+        (_docker_27_network(), (3, "host_address_present\n"), r"\(host_address_present\)"),
         (_isolated_network(), (3, "routed_path_present\n"), r"\(routed_path_present\)"),
         (_isolated_network(), (3, "ipv6_address_present\n"), r"\(ipv6_address_present\)"),
         (_isolated_network(), (125, "unexpected\n"), r"\(probe_failed\)"),
@@ -1210,6 +1233,132 @@ def test_host_probe_targets_a_free_gateway_address(monkeypatch) -> None:
     asyncio.run(adapter.create_runner(_hardened_runner_request()))
     probe = docker_run.calls[-1]
     assert probe[-2:] == ["10.213.42.1:41000", "172.17.0.1:41000"]
+
+
+def test_docker_27_network_with_a_listed_gateway_is_left_to_the_probe(monkeypatch) -> None:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    closed: list[str] = []
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner", _fake_hardened_runner_type({}, closed)
+    )
+    docker_run = _HostIsolationDocker(_docker_27_network(), (0, "isolated\n"))
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        docker_run=docker_run,
+        proxy_host="127.0.0.1",
+        workload_restrictions=DockerWorkloadRestrictions(),
+    )
+
+    runner = asyncio.run(adapter.create_runner(_hardened_runner_request()))
+
+    assert runner is not None
+    assert closed == []
+    # The listed gateway is where the host would be; the probe checks it.
+    probe = docker_run.calls[-1]
+    assert probe[-2:] == ["172.18.0.1:41000", "172.17.0.1:41000"]
+
+
+def test_host_probe_also_targets_a_gateway_other_than_the_first_address(monkeypatch) -> None:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner", _fake_hardened_runner_type({}, [])
+    )
+    docker_run = _HostIsolationDocker(
+        _isolated_network(
+            IPAM={"Config": [{"Subnet": "10.213.42.0/24", "Gateway": "10.213.42.254"}]}
+        ),
+        (0, "isolated\n"),
+    )
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        docker_run=docker_run,
+        proxy_host="127.0.0.1",
+        workload_restrictions=DockerWorkloadRestrictions(),
+    )
+    asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    probe = docker_run.calls[-1]
+    # 10.213.42.1 is the sidecar's, so only the listed gateway and the broker.
+    assert probe[-2:] == ["10.213.42.254:41000", "172.17.0.1:41000"]
+
+
+def _run_host_probe(tmp_path: Path, socat_output: str, arp_flags: str) -> tuple[int, str]:
+    """Run the probe script with stub connect tools and a fake guest /proc/net."""
+
+    import shutil
+    import subprocess
+
+    from cayu.egress.docker_adapter import _HOST_ISOLATION_PROBE_SCRIPT
+
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "timeout").write_text('#!/bin/sh\nshift\nexec "$@"\n')
+    (tools / "socat").write_text(f"#!/bin/sh\necho '{socat_output}' >&2\nexit 1\n")
+    for stub in ("timeout", "socat"):
+        (tools / stub).chmod(0o755)
+    awk = shutil.which("awk")
+    assert awk is not None
+    (tools / "awk").symlink_to(awk)
+    # A guest on 172.18.0.0/16 with only its link route, as on Docker 27.5.1.
+    proc_net = tmp_path / "net"
+    proc_net.mkdir()
+    (proc_net / "route").write_text(
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        "eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+    )
+    (proc_net / "arp").write_text(
+        "IP address       HW type     Flags       HW address            Mask     Device\n"
+        "172.18.0.2       0x1         0x2         02:42:ac:12:00:02     *        eth0\n"
+        f"172.18.0.1       0x1         {arp_flags}         00:00:00:00:00:00     *        eth0\n"
+    )
+    script = _HOST_ISOLATION_PROBE_SCRIPT.replace("/proc/net/", f"{proc_net}/")
+    assert "/proc/" not in script
+    completed = subprocess.run(
+        ["/bin/sh", "-c", script, "probe", "172.18.0.1:41000"],
+        env={"PATH": str(tools)},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    return completed.returncode, completed.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize(
+    ("socat_output", "arp_flags", "expected"),
+    [
+        # An engine that ignores the option: the host holds the gateway address
+        # and a closed port answers with a reset.
+        (
+            "socat[1] E connect(5, AF=2 172.18.0.1:41000, 16): Connection refused",
+            "0x2",
+            (3, "host_reachable\n"),
+        ),
+        # The same host behind a firewall that drops the probe: the connect
+        # times out but the address answered ARP.
+        (
+            "socat[1] E connect(5, AF=2 172.18.0.1:41000, 16): Connection timed out",
+            "0x2",
+            (3, "host_address_present\n"),
+        ),
+        # Docker 27.5.1 honoring the option: nothing answers at the gateway.
+        (
+            "socat[1] E connect(5, AF=2 172.18.0.1:41000, 16): Connection timed out",
+            "0x0",
+            (0, "isolated\n"),
+        ),
+        (
+            "socat[1] E connect(5, AF=2 172.18.0.1:41000, 16): No route to host",
+            "0x0",
+            (0, "isolated\n"),
+        ),
+    ],
+)
+def test_host_probe_tells_a_host_that_holds_the_gateway_from_one_that_does_not(
+    tmp_path, socat_output, arp_flags, expected
+) -> None:
+    assert _run_host_probe(tmp_path, socat_output, arp_flags) == expected
 
 
 def test_plain_egress_runner_skips_the_hardened_host_probe(monkeypatch) -> None:

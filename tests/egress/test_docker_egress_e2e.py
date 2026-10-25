@@ -774,15 +774,18 @@ def test_hardened_container_reaches_only_allowlisted_hosts() -> None:
     assert "index-ok" in stdout
     assert "denied 403" in stdout
     assert "direct-ip-denied True" in stdout
-    # A host service listening on every interface is out of reach: the network
-    # has no gateway, so the host has no address the guest can route to.
+    # A host service listening on every interface is out of reach: the host
+    # has no address on the network, so the guest has none to route to.
     assert "default-route" not in stdout
     host_lines = [line for line in stdout.splitlines() if line.startswith("host-denied ")]
     assert len(host_lines) >= 3, stdout
     assert all(line.endswith(" True") for line in host_lines), stdout
     network = results["network"]
     assert network["Internal"] is True
-    assert all(not config.get("Gateway") for config in network["IPAM"]["Config"])
+    # Docker 27 still lists a reserved gateway here even though the host holds
+    # no address on the bridge, so the host-denied lines above are the proof.
+    assert network["Options"]["com.docker.network.bridge.inhibit_ipv4"] == "true"
+    assert network["EnableIPv6"] is False
     evidence = results["evidence"]
     assert evidence.state_for("unprivileged_guest") == "available"
     assert evidence.state_for("untrusted_code_isolation") == "unsupported"

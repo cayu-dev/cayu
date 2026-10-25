@@ -92,14 +92,19 @@ _SIDECAR_READY_SCRIPT = (
 )
 # Without this option the bridge driver gives the engine's host an address on
 # every network, so an internal network still reaches host services through
-# its gateway. With it, the network has no gateway and the host no address.
+# its gateway. With it, the host gets no address on the network. Docker 27
+# still lists the gateway it reserved in the network's IPAM config, so the
+# inspect output cannot tell an honored option from an ignored one; the probe
+# decides.
 _HOST_ADDRESS_INHIBIT_OPTION = "com.docker.network.bridge.inhibit_ipv4"
 _HOST_ISOLATION_PROBE_TIMEOUT_S = 30.0
 # Runs from the sidecar image in the guest's network namespace, so it sees the
 # guest's interfaces and routes whatever tools the guest image has. A TCP
-# connect that succeeds or is refused means the host answered. A missing tool
-# is reported by name before any connect: its "not found" output would
-# otherwise read as an unverified host.
+# connect that succeeds or is refused means the host answered. A connect that
+# times out is not proof on its own, since a host firewall can drop the probe,
+# so a completed ARP entry for a target afterwards also means something holds
+# that address. A missing tool is reported by name before any connect: its
+# "not found" output would otherwise read as an unverified host.
 _HOST_ISOLATION_PROBE_TOOLS = ("timeout", "socat", "awk")
 _HOST_ISOLATION_PROBE_SCRIPT = (
     f"\nfor tool in {' '.join(_HOST_ISOLATION_PROBE_TOOLS)}; do\n"
@@ -116,6 +121,13 @@ for target do
     *) echo host_reachability_unverified; exit 3 ;;
   esac
 done
+if [ ! -r /proc/net/arp ]; then echo neighbor_table_unreadable; exit 3; fi
+if awk -v targets="$*" 'BEGIN { n = split(targets, list, " ")
+    for (i = 1; i <= n; i++) { sub(/:[0-9]+$/, "", list[i]); wanted[list[i]] = 1 } }
+  NR > 1 && ($1 in wanted) && $3 != "0x0" { found = 1 } END { exit !found }' \\
+  /proc/net/arp; then
+  echo host_address_present; exit 3
+fi
 if [ ! -r /proc/net/route ]; then echo route_table_unreadable; exit 3; fi
 if awk 'NR > 1 && ($2 == "00000000" || $3 != "00000000") { found = 1 } END { exit !found }' \\
   /proc/net/route; then
@@ -132,6 +144,8 @@ _HOST_ISOLATION_PROBE_FAILURES = frozenset(
     {
         "host_reachable",
         "host_reachability_unverified",
+        "neighbor_table_unreadable",
+        "host_address_present",
         "route_table_unreadable",
         "routed_path_present",
         "ipv6_address_present",
@@ -965,9 +979,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     ) -> None:
         """Prove a hardened guest cannot reach the engine's host.
 
-        The network must carry no host address, and a probe in the guest's
-        network namespace must find no answer from the address the host would
-        hold, no routed path off the network and no IPv6 address.
+        The network must be internal, set the option that keeps the host off
+        its bridge and have IPv6 off. A probe in the guest's network namespace
+        must then find no answer and no neighbor at the addresses the host
+        would hold, no routed path off the network and no IPv6 address.
         """
 
         container_id = runner.container_id
@@ -998,21 +1013,23 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         ipam = network.get("IPAM")
         configs = (ipam.get("Config") or []) if isinstance(ipam, dict) else None
         endpoints = network.get("Containers")
-        if (
-            network.get("Internal") is not True
-            or not isinstance(options, dict)
-            or options.get(_HOST_ADDRESS_INHIBIT_OPTION) != "true"
-            or network.get("EnableIPv6") is True
-            or not isinstance(configs, list)
-            or any(not isinstance(config, dict) or config.get("Gateway") for config in configs)
-            or not isinstance(endpoints, dict)
-            or container_id not in endpoints
-        ):
+        observed: list[str] = []
+        if network.get("Internal") is not True:
+            observed.append("it is not internal")
+        if not isinstance(options, dict) or options.get(_HOST_ADDRESS_INHIBIT_OPTION) != "true":
+            observed.append(f"it does not set {_HOST_ADDRESS_INHIBIT_OPTION}=true")
+        if network.get("EnableIPv6") is True:
+            observed.append("it has IPv6 enabled")
+        if not isinstance(configs, list) or not all(isinstance(c, dict) for c in configs):
+            observed.append("its IPAM config is unreadable")
+        if not isinstance(endpoints, dict) or container_id not in endpoints:
+            observed.append("the guest is not attached to it")
+        if observed:
             raise UnsupportedEgressError(
-                "egress_host_reachable: the egress network is not an internal network "
-                "without a host address; the Docker engine must honor the bridge option "
-                f"{_HOST_ADDRESS_INHIBIT_OPTION}."
+                "egress_host_reachable: the egress network is not set up to keep the "
+                f"Docker host off it: {'; '.join(observed)}."
             )
+        assert isinstance(configs, list) and isinstance(endpoints, dict)
         held: set[IPv4Address] = set()
         for endpoint in endpoints.values():
             with contextlib.suppress(AttributeError, TypeError, ValueError):
@@ -1020,12 +1037,19 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         port = binding.proxy_port or 443
         targets: list[str] = []
         for config in configs:
+            # Where the bridge driver would put the host: the subnet's first
+            # address and any listed gateway. Docker 27 lists a gateway even
+            # when the option keeps the host off the bridge, so the probe, not
+            # this listing, decides whether the host holds it. A container
+            # holding an address proves the host does not.
+            candidates: list[IPv4Address] = []
             with contextlib.suppress(TypeError, ValueError):
-                first = IPv4Network(config.get("Subnet")).network_address + 1
-                # Where the bridge driver puts the host when it reserves a
-                # gateway. A container holding it proves the host does not.
-                if first not in held:
-                    targets.append(f"{first}:{port}")
+                candidates.append(IPv4Network(config.get("Subnet")).network_address + 1)
+            with contextlib.suppress(TypeError, ValueError):
+                candidates.append(IPv4Address(config.get("Gateway")))
+            for address in dict.fromkeys(candidates):
+                if address not in held:
+                    targets.append(f"{address}:{port}")
         # The rest of the host: the address the broker listens on (Docker's
         # default bridge gateway on Linux) must have no route from the guest.
         with contextlib.suppress(TypeError, ValueError):
