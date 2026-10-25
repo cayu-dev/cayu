@@ -1109,8 +1109,10 @@ class LambdaMicroVMRunner(Runner):
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("control relay port must be an integer from 1 to 65535.")
         self._browser_control_relay_verified = False
+        # Isolated, like every trusted interpreter here: the agent can write the working
+        # directory, which must never shadow a module of a command that runs as root.
         installed = await self.exec_system(
-            ExecCommand.process("python3", "-c", _CONTROL_CA_INSTALL_SCRIPT, CONTROL_CA_PATH),
+            ExecCommand.process("python3", "-I", "-c", _CONTROL_CA_INSTALL_SCRIPT, CONTROL_CA_PATH),
             stdin=certificate.decode("ascii"),
             timeout_s=timeout_s,
             output_limit_bytes=_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES,

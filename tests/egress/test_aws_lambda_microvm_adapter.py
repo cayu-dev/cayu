@@ -541,6 +541,8 @@ def test_lambda_microvm_adapter_creates_private_vpc_enforced_runner(
         "poll_interval_s": 0,
     }
     ca_install = runner.calls[0]
+    # A root command: an isolated interpreter, whatever the guest left in its working directory.
+    assert list(ca_install["command"].argv[:3]) == ["python3", "-I", "-c"]
     assert ca_install["command"].argv[-1] == "/etc/cayu/ca.pem"
     assert ca_install["stdin"] == "session-ca"
     assert runner.calls[1]["command"] == ExecCommand.bash("python3 -V")

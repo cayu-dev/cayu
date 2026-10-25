@@ -612,6 +612,8 @@ def test_control_ca_install_carries_only_the_public_certificates(tmp_path: Path)
 
     installed = base64.b64decode(transport.installs[0]["stdin_base64"]).decode("ascii")
     assert "PRIVATE KEY" not in installed
+    # Installed as root by an isolated interpreter.
+    assert transport.installs[0]["argv"][:3] == ["python3", "-I", "-c"]
     assert installed.count("BEGIN CERTIFICATE") == 2
 
 

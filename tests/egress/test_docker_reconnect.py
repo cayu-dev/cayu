@@ -393,6 +393,41 @@ def test_partial_reconnect_never_exposes_runner_and_keeps_truthful_state(
     asyncio.run(scenario())
 
 
+def test_thaw_uses_isolated_python_in_guest_working_directory(tmp_path):
+    async def scenario():
+        docker, _, manager, _ = setup(tmp_path / "state")
+        claim = manager.claim(TOKEN)
+        claim.read()
+        claim.write(state="active")
+        try:
+            await manager.activate(claim)
+        finally:
+            claim.close()
+        return docker.commands[-1]
+
+    command = asyncio.run(scenario())
+    assert command[:7] == ["exec", "-u", "root", CID, "python3", "-I", "-c"]
+    # Exercise the emitted script without Docker or signaling real processes: an
+    # empty freeze record should be removed even with shadow modules in the cwd.
+    guest = tmp_path / "guest"
+    guest.mkdir()
+    (guest / "json.py").write_text("raise RuntimeError('guest module imported')\n")
+    (guest / "pathlib.py").write_text("raise RuntimeError('guest module imported')\n")
+    marker = tmp_path / "egress-frozen.json"
+    marker.write_text("{}")
+    script = command[-1].replace("'/run/cayu/egress-frozen.json'", repr(str(marker)))
+    result = subprocess.run(
+        [sys.executable, *command[5:-1], script],
+        cwd=guest,
+        env={**os.environ, "PYTHONPATH": str(guest)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
 def test_no_thaw_before_final_admission_and_no_dispatch_after_claim_loss(tmp_path, monkeypatch):
     from cayu.runners import ExecCommand, ExecResult
     from cayu.runners.docker import DockerRunner
@@ -483,7 +518,7 @@ def test_preflight_failure_never_admits_or_thaws_retained_guest(tmp_path, monkey
     from cayu.egress import EgressBinding, VirtualEgressRunnerRequest, _docker_reconnect
 
     async def scenario():
-        _, _, manager, identity = setup(tmp_path)
+        docker, _, manager, identity = setup(tmp_path)
         claim = manager.claim(TOKEN)
         claim.read()
         binding = EgressBinding(network=NID)
@@ -514,6 +549,12 @@ def test_preflight_failure_never_admits_or_thaws_retained_guest(tmp_path, monkey
             await manager.create_runner(request)
         assert claim.journal["state"] == "recovering"
         assert claim.runner._frozen and not claim.runner._admission_complete
+        # The guest is fenced by an isolated root interpreter, never one that imports from the
+        # guest-writable working directory.
+        assert any(
+            command[:7] == ["exec", "-u", "root", CID, "python3", "-I", "-c"]
+            for command in docker.commands
+        )
         assert claim.runner.close_action == "none"
         claim.close()
 

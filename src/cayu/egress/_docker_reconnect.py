@@ -476,8 +476,9 @@ class DockerReconnect:
         if identity is None:
             return
         try:
+            # Isolated: as root in the guest's working directory, which the guest can write.
             await self.run(
-                ["exec", "-u", "root", identity["container_id"], "python3", "-c", _FREEZE]
+                ["exec", "-u", "root", identity["container_id"], "python3", "-I", "-c", _FREEZE]
             )
         except Exception:
             raise DockerEgressReconnectError("fencing_failed") from None
@@ -496,6 +497,7 @@ class DockerReconnect:
                     "root",
                     claim.journal["identity"]["container_id"],
                     "python3",
+                    "-I",
                     "-c",
                     _THAW,
                 ]

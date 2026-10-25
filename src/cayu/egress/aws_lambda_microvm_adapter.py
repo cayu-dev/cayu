@@ -937,8 +937,10 @@ async def _install_ca(
         "path.write_bytes(sys.stdin.buffer.read()); "
         "os.chmod(path, 0o644)"
     )
+    # Root, in a working directory the agent can write: isolated mode keeps that directory, the
+    # user site and PYTHON* variables off the import path.
     result = await runner.exec_system(
-        ExecCommand.process("python3", "-c", script, request.guest_ca_path),
+        ExecCommand.process("python3", "-I", "-c", script, request.guest_ca_path),
         stdin=certificate.decode("utf-8"),
         timeout_s=30,
     )

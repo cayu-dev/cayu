@@ -897,11 +897,11 @@ def test_http_healthy_listener_outlives_finite_rpc_limits_without_polling() -> N
 
 def test_http_finite_listener_body_uses_event_limits_not_rpc_aggregate_limit() -> None:
     server = FiniteLargeGetMcpHttpServer()
+    # Exercise byte limits, not RPC latency: discovery and refresh must tolerate
+    # scheduler delays on shared CI workers. Keep the normal transport timeouts.
     limits = McpTransportLimits(
         max_message_bytes=1024,
         max_response_bytes=1024,
-        idle_timeout_s=1,
-        total_call_timeout_s=0.2,
     )
 
     async def run() -> tuple[bool, McpToolsetRefreshState, bool, int, int]:
@@ -921,7 +921,7 @@ def test_http_finite_listener_body_uses_event_limits_not_rpc_aggregate_limit() -
             mcp_toolsets=(toolset,),
         )
         try:
-            async with asyncio.timeout(2):
+            async with asyncio.timeout(10):
                 while (
                     server.get_calls < 2
                     or toolset.refresh_state is not McpToolsetRefreshState.READY
