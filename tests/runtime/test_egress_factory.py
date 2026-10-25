@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
+import stat
 import warnings
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -2870,6 +2872,41 @@ def test_factory_finalizes_adapter_runner_with_session_outcome() -> None:
     asyncio.run(run())
 
     assert adapter.finalize_calls == ["interrupted"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX umask")
+def test_factory_writes_guest_ca_world_readable_under_restrictive_umask() -> None:
+    # The CA is bind-mounted into a guest that may run as another UID, so the
+    # host process's umask must not make it private.
+    observed: dict[str, Any] = {}
+
+    async def _create(request: Any) -> Runner:
+        observed["mode"] = stat.S_IMODE(os.stat(request.ca_cert_host_path).st_mode)
+        observed["content"] = Path(request.ca_cert_host_path).read_bytes()
+        return await _FakeDockerRunner.create(request.name)
+
+    adapter = _RecordingAdapter(runner_factory=_create)
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_ca_mode",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+
+    previous_umask = os.umask(0o077)
+    try:
+        asyncio.run(run())
+    finally:
+        os.umask(previous_umask)
+
+    assert observed["mode"] == 0o644
+    assert observed["content"] == adapter.captured["binding"].ca_cert_pem
 
 
 def test_create_tears_down_egress_when_runner_start_fails() -> None:

@@ -207,6 +207,8 @@ DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
 VIRTUAL_EGRESS_RECONNECT_VERSION = 1
 _FACTORY_CLEANUP_RETRY_INITIAL_BACKOFF_SECONDS = 0.05
 _FACTORY_CLEANUP_RETRY_MAX_BACKOFF_SECONDS = 1.0
+# The session CA certificate is public; a guest under another UID must read it.
+_GUEST_CA_FILE_MODE = 0o644
 _CREDENTIALLESS_EGRESS_AUTHORITY_FINGERPRINT = sha256(
     b"cayu.egress-credential-authority.v1\0credentialless"
 ).hexdigest()
@@ -1368,8 +1370,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             authority_revoker.teardown_timeout_s = binding.teardown_timeout_s
             ca_dir = tempfile.mkdtemp(prefix="cayu-egress-ca-")
             ca_host = os.path.join(ca_dir, "ca.pem")
-            with open(ca_host, "wb") as handle:
-                handle.write(binding.ca_cert_pem or b"")
+            _write_guest_ca_file(ca_host, binding.ca_cert_pem or b"")
 
             env_overlay = {**binding.env, **{g.env_name: g.presented_value for g in grants}}
             guest_ca_path = _required_binding_field(binding, "guest_ca_path")
@@ -5584,6 +5585,18 @@ def _grant_payload(grant: VirtualCredentialGrant) -> dict[str, Any]:
         "policy_name": grant.policy_name,
         "env_name": grant.env_name,
     }
+
+
+def _write_guest_ca_file(path: str, certificate: bytes) -> None:
+    """Write the public session CA so a guest running as any UID can read it.
+
+    Adapters bind-mount or copy this file into the guest, so its mode must not
+    depend on the host process's umask. The parent is a private ``mkdtemp``
+    directory, so setting the mode by path cannot be raced.
+    """
+    with open(path, "xb") as handle:
+        handle.write(certificate)
+    os.chmod(path, _GUEST_CA_FILE_MODE)
 
 
 def _required_binding_field(binding: EgressBinding, field_name: str) -> str:

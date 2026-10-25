@@ -694,6 +694,7 @@ async def _drive_hardened_factory(host_port: int, bridge_gateway: str) -> dict[s
     script = (
         "import os, socket, urllib.error, urllib.request as u\n"
         "print('uid', os.getuid(), os.getgid())\n"
+        "print('ca-readable', os.access('/etc/cayu/ca.pem', os.R_OK))\n"
         "status = dict(line.split(':\\t', 1) for line in open('/proc/self/status'))\n"
         "print('caps', status['CapEff'].strip(), 'nnp', status['NoNewPrivs'].strip())\n"
         "def writable(path):\n"
@@ -762,12 +763,19 @@ async def _drive_hardened_factory(host_port: int, bridge_gateway: str) -> dict[s
 
 
 def test_hardened_container_reaches_only_allowlisted_hosts() -> None:
-    with _engine_host_listener() as (host_port, bridge_gateway):
-        results = asyncio.run(_drive_hardened_factory(host_port, bridge_gateway))
+    # A restrictive host umask must not hide the session CA from the guest,
+    # which runs as UID 1000 (a different UID from the CI host user).
+    previous_umask = os.umask(0o077)
+    try:
+        with _engine_host_listener() as (host_port, bridge_gateway):
+            results = asyncio.run(_drive_hardened_factory(host_port, bridge_gateway))
+    finally:
+        os.umask(previous_umask)
     call = results["call"]
     assert call.exit_code == 0, call.stderr
     stdout = call.stdout
     assert "uid 1000 1000" in stdout
+    assert "ca-readable True" in stdout
     assert "caps 0000000000000000 nnp 1" in stdout
     assert "root-writable False" in stdout
     assert "workspace-writable True" in stdout

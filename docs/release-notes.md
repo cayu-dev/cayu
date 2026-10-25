@@ -281,6 +281,11 @@ Custom dashboard owners should port Sessions changes from `src/next/routes/sessi
   `cayu.egress.docker_adapter`). The untrusted-code guide explains how to supply
   that image offline and why `memory_bytes` must stay below the memory the
   Docker engine has.
+- Fix: `VirtualEgressEnvironmentFactory` wrote the session CA file with the
+  host process's umask. Under `umask 077` only the host user could read it, so
+  a guest running as another UID failed TLS verification on every connection
+  through the broker. The file is now always written with mode 0644. The
+  certificate is public; the CA's private key stays in the host process.
 - A timed-out or cancelled Docker command can stop without removing its
   container. `DockerCodingEnvironmentFactory(command_cleanup="command_or_sandbox")`,
   and the same `timeout_cleanup` and `cancellation_cleanup` value on strict
