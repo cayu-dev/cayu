@@ -175,6 +175,66 @@ def test_reused_release_already_running_is_left_alone(tmp_path: Path) -> None:
     assert result["service"]["status"] == "running"
 
 
+@pytest.mark.parametrize("no_wait", [False, True])
+@pytest.mark.parametrize("transient_read", [False, True])
+def test_reused_selected_sleeping_release_succeeds_without_waking(
+    tmp_path: Path, no_wait: bool, transient_read: bool
+) -> None:
+    client = ReusingCloud(
+        service={"deployment_id": "dep_existing", "issues": [], "status": "sleeping"}
+    )
+    original = client.request
+
+    def request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        if (
+            transient_read
+            and method == "GET"
+            and path.endswith("/service")
+            and client.count("GET", "/service") == 0
+        ):
+            client.requests.append((method, path))
+            raise CloudApiError(
+                "api_request_rejected", "Cayu Cloud API returned HTTP 503.", status_code=503
+            )
+        return original(method, path, **kwargs)
+
+    client.request = request  # type: ignore[method-assign]
+    sleeps: list[float] = []
+    result = _deploy(client, tmp_path, no_wait=no_wait, sleeps=sleeps)["result"]
+
+    assert client.count("PUT", "/service") == 0
+    assert client.count("POST", "/promote") == 0
+    assert client.count("POST", "/service/wake") == 0
+    assert result["service_publication_requested"] is False
+    if no_wait and transient_read:
+        assert result["service_publication_pending"] is True
+        assert result["service"] is None
+    else:
+        assert result["service"]["status"] == "sleeping"
+        assert result["service_publication_pending"] is False
+        assert result["message"] == "The Agent is asleep and wakes on its next request."
+    assert sleeps == ([5.0] if transient_read and not no_wait else [])
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_sleeping_service_does_not_finish_a_fresh_or_different_release(
+    tmp_path: Path, fresh: bool
+) -> None:
+    client = ReusingCloud(
+        replay_status="smoke_tested" if fresh else "promoted",
+        service={
+            "deployment_id": "dep_existing" if fresh else "dep_old",
+            "issues": [],
+            "status": "sleeping",
+        },
+    )
+    sleeps: list[float] = []
+    with pytest.raises(cloud_cli._CloudServiceStillRunningError):
+        _deploy(client, tmp_path, sleeps=sleeps)
+    assert sleeps
+    assert client.count("PUT", "/service") == 0
+
+
 @pytest.mark.parametrize(
     ("current", "expected"),
     [

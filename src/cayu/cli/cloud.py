@@ -2236,6 +2236,7 @@ def _deploy(
         )
     service = None
     service_publication_requested = False
+    allow_sleeping = False
     # A candidate's service is published by its promotion, never by this command; its
     # release is reported as it stands.
     if (
@@ -2247,6 +2248,7 @@ def _deploy(
         # selected another Release since, and its service may have been destroyed;
         # either way no finalizer is going to publish this Release now.
         reused = previously_promoted
+        allow_sleeping = reused and application.get("current_deployment_id") == deployment.get("id")
         # The Agent was read when this deploy resolved it; a reused Release was promoted
         # before that, so its selection then is the one to report. Without the field
         # the selection is unknown, and the service wait below still applies.
@@ -2284,6 +2286,7 @@ def _deploy(
                 client,
                 application_id=str(application["id"]),
                 initial=service,
+                allow_sleeping=allow_sleeping,
                 expected_deployment_id=str(deployment["id"]),
                 poll_seconds=arguments.poll_seconds,
                 recovery_arguments=_cloud_recovery_arguments(arguments),
@@ -2311,6 +2314,13 @@ def _deploy(
             "revision": revision,
         },
     }
+    if (
+        allow_sleeping
+        and service is not None
+        and service.get("deployment_id") == deployment.get("id")
+        and service.get("status") == "sleeping"
+    ):
+        result["message"] = "The Agent is asleep and wakes on its next request."
     if retry is not None:
         result["retry"] = retry
     # Without processes there's no publication for the choice to govern.
@@ -3802,6 +3812,7 @@ def _wait_for_service(
     application_id: str,
     initial: dict[str, Any] | None,
     expected_deployment_id: str | None = None,
+    allow_sleeping: bool = False,
     poll_seconds: float,
     recovery_arguments: Sequence[str] = (),
     wait_seconds: float,
@@ -3859,7 +3870,9 @@ def _wait_for_service(
                 )
         elif service is not None:
             last_issue = _web_not_ready_message(service) or last_issue
-        if status in _SERVICE_READY:
+        # Reusing a selected Release does not wake an idle service. The pending
+        # check above still requires the service to belong to the expected Release.
+        if status in _SERVICE_READY or (allow_sleeping and status == "sleeping"):
             assert service is not None
             return service
         if status in _SERVICE_FAILURES:
