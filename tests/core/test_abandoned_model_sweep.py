@@ -145,8 +145,9 @@ def test_abandoned_model_sweep_preserves_live_dispatch_and_budget(backend, reque
             else request.getfixturevalue("postgres_dsn")
         )
         sid = "live-model"
-        child = await _start_child(backend, location, sid, mode="block")
+        # Finish schema setup before the child opens the same databases.
         store, ledger = _open(backend, location)
+        child = await _start_child(backend, location, sid, mode="block")
         try:
             ready = await asyncio.wait_for(child.stdout.readline(), 30)
             assert ready == b"dispatched\n", ready if ready else await child.stderr.read()

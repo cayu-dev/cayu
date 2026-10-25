@@ -16,6 +16,7 @@ from scripts.ci_shard_plan import (
     store_slot,
 )
 
+from cayu.cli import _release_check as release_check
 from cayu.releases import RELEASE_ID_ENV, RELEASE_SNAPSHOT_ROOT_ENV
 from tests.sqlite_resources import SQLiteResourceScope
 
@@ -25,6 +26,13 @@ def _no_ambient_release(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a Release stated by the surrounding environment out of every test."""
     monkeypatch.delenv(RELEASE_ID_ENV, raising=False)
     monkeypatch.delenv(RELEASE_SNAPSHOT_ROOT_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_release_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `cayu new` away from PyPI and the user's cache directory."""
+    monkeypatch.setattr(release_check, "fetch_latest_release", lambda: None)
+    monkeypatch.setattr(release_check, "release_cache_path", lambda: None)
 
 
 @pytest.fixture

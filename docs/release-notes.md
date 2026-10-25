@@ -6,12 +6,23 @@ Upgrade: no action needed. `cayu[claude-agent-sdk]` now accepts newer
 `claude-agent-sdk` releases below 0.3; pin the SDK in your own requirements to
 keep 0.2.170.
 
+`cayu new` may ask PyPI for the latest release; set `CAYU_NO_VERSION_CHECK=1`
+to keep it offline.
+
 ### Breaking changes
 
 None.
 
 ### Changes
 
+- `cayu new` warns when PyPI has a newer final Cayu release than the installed
+  one, printing both versions and the `uvx --from 'cayu==X.Y.Z' cayu new ...`
+  command with the same arguments. In a terminal it asks
+  `Continue with <installed> anyway? [y/N]` and stops by default; without one it
+  warns on stderr and continues, and `--json` output adds `newer_release`. The
+  check gives up after about two seconds, is cached for a day in the user's cache
+  directory, and is silent on failure. Pre-releases and dev builds never count as
+  newer, and a source checkout skips the check.
 - `cayu[claude-agent-sdk]` accepts `claude-agent-sdk>=0.2.168,<0.3` again;
   0.14.0 pinned exactly 0.2.170. Package CI installs the built wheel with the
   extra, which resolves to the newest SDK in the range, and runs the adapter

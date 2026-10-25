@@ -8,14 +8,17 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import sys
 import tempfile
 import tomllib
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
@@ -38,6 +41,7 @@ from cayu.cli._guarded_tree_publication import (
     publish_guarded_tree,
 )
 from cayu.cli._identity import identity_markdown
+from cayu.cli._release_check import newer_release
 from cayu.cli.scaffold_convention import (
     application_guidance,
     convention_files,
@@ -3308,6 +3312,71 @@ def _render_new_receipt(
         print(f"  Live provider: {plan.provider} (credentials authenticate this choice).")
 
 
+def _new_command_arguments(args: argparse.Namespace, *, name: str) -> list[str]:
+    arguments = [name]
+    if args.agent_name is not None:
+        arguments += ["--agent-name", args.agent_name]
+    if args.dir != ".":
+        arguments += ["--dir", args.dir]
+    for flag, value in (
+        ("--provider", args.provider),
+        ("--preset", args.preset),
+        ("--execution", args.execution),
+        ("--coding-toolchain", args.coding_toolchain),
+        ("--coding-command-authority", args.coding_command_authority),
+    ):
+        if value is not None:
+            arguments += [flag, value]
+    for capability in args.with_capabilities:
+        arguments += ["--with", capability]
+    for capability in args.without_capabilities:
+        arguments += ["--without", capability]
+    if args.dry_run:
+        arguments.append("--dry-run")
+    if args.json:
+        arguments.append("--json")
+    return arguments
+
+
+def _is_terminal(stream: TextIO | None) -> bool:
+    try:
+        return stream is not None and stream.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+def _newer_release_notice(args: argparse.Namespace, *, name: str) -> dict[str, str] | None:
+    """Warn on stderr when PyPI has a newer Cayu than the one scaffolding."""
+
+    # A source checkout scaffolds projects that point at the checkout itself.
+    if _cayu_source_checkout() is not None:
+        return None
+    newer = newer_release(_installed_cayu_version())
+    if newer is None:
+        return None
+    command = f"uvx --from 'cayu=={newer.latest}' cayu new " + shlex.join(
+        _new_command_arguments(args, name=name)
+    )
+    if sys.stderr is not None:
+        with suppress(OSError, ValueError):
+            print(
+                f"cayu new: Cayu {newer.latest} is available; this is Cayu {newer.installed}.\n"
+                f"To scaffold with the latest release, run in a POSIX shell:\n  {command}",
+                file=sys.stderr,
+            )
+    return {"installed": newer.installed, "latest": newer.latest, "command": command}
+
+
+def _confirm_older_release(installed: str) -> bool:
+    print(f"Continue with {installed} anyway? [y/N] ", end="", file=sys.stderr, flush=True)
+    try:
+        answer = input()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def run_new(args: argparse.Namespace) -> int:
     """Plan, render, validate, and atomically publish one Cayu application."""
 
@@ -3328,7 +3397,7 @@ def run_new(args: argparse.Namespace) -> int:
         )
     name = args.name
     if args.interactive:
-        if not sys.stdin.isatty():
+        if not _is_terminal(sys.stdin):
             return _new_error(
                 code="INTERACTIVE_TTY_REQUIRED",
                 message="--interactive requires a terminal",
@@ -3384,6 +3453,17 @@ def run_new(args: argparse.Namespace) -> int:
             message=f"{target} already exists and is not empty",
             as_json=args.json,
         )
+    newer = _newer_release_notice(args, name=name)
+    if (
+        newer is not None
+        and not args.json
+        and not args.dry_run
+        and _is_terminal(sys.stdin)
+        and _is_terminal(sys.stderr)
+        and not _confirm_older_release(newer["installed"])
+    ):
+        print("cayu new: stopped; nothing was created.", file=sys.stderr)
+        return 1
     try:
         files = project_files(
             name,
@@ -3398,7 +3478,7 @@ def run_new(args: argparse.Namespace) -> int:
     if "artifacts" in plan.capabilities:
         directories.add("data/artifacts")
     directories.update(parent for path in files if (parent := str(Path(path).parent)) != ".")
-    payload = {
+    payload: dict[str, object] = {
         "status": "planned" if args.dry_run else "created",
         "target": str(target),
         "plan": plan.as_dict(
@@ -3408,6 +3488,8 @@ def run_new(args: argparse.Namespace) -> int:
         ),
         "agent_context": _agent_context(plan),
     }
+    if newer is not None:
+        payload["newer_release"] = newer
     if args.dry_run:
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))

@@ -13,6 +13,14 @@ primary group. Cayu reads this from the local user and group databases; with a
 directory service that does not enumerate its users (some LDAP or SSSD setups)
 it cannot see every account, so prefer a parent that is not group-writable there.
 
+`cayu new` warns when PyPI has a newer final Cayu release than the installed one
+and prints the `uvx --from 'cayu==X.Y.Z' cayu new ...` command that scaffolds with
+it. Attached to a terminal, it asks `Continue with <installed> anyway? [y/N]` and
+stops by default. Without a terminal it warns on stderr and continues; `--json`
+output then includes `newer_release` with `installed`, `latest` and `command`.
+The check runs at most once a day, gives up after about two seconds, and is
+silent when PyPI is unreachable. `CAYU_NO_VERSION_CHECK=1` turns it off.
+
 ## Convention
 
 Normal agent, service, coding, and long-running presets share these ownership boundaries:
