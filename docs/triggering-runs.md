@@ -152,7 +152,9 @@ a task it did not settle fails with `ExecutionDeadlineExceeded` (`scope`
 `task_handler`); the failure lists the IDs of the sessions the call started
 and whether it had to be cancelled. A task with a `TaskRetryPolicy` records a
 retryable failed attempt instead, a pending cancellation still settles as
-cancelled, and a restartable task is not requeued. A handler that keeps
+cancelled, and a restartable task is not requeued. The `cayu.tasks.worker`
+logger warns when the soft limit passes and again when it fails the task, with
+the task ID, both settings and the session IDs. A handler that keeps
 running after it is cancelled keeps its lease, and its task gets a durable
 cancellation request with code `task_handler_timeout` that settles when the
 handler returns. The limit also bounds the drain when the worker itself is

@@ -544,8 +544,9 @@ async def run_task_worker(
       not settle fails with ``ExecutionDeadlineExceeded`` (scope
       ``task_handler``, with the IDs of the sessions it started); a task with a
       retry policy records a retryable failed attempt instead, and a pending
-      cancellation still wins. A restartable task is not requeued. A handler
-      that keeps running after it is cancelled keeps its lease, and its task
+      cancellation still wins. The worker logs a warning when the soft limit
+      passes and another when it fails the task. A restartable task is not
+      requeued. A handler that keeps running after it is cancelled keeps its lease, and its task
       gets a durable cancellation request (code ``task_handler_timeout``) that
       settles when it returns. The limit is
       :class:`cayu.deadlines.HandlerTimeLimit`, which a hand-written worker can
@@ -1310,20 +1311,11 @@ async def _handle_with_heartbeat_owned(
                     handler_error = None
                     return
                 if time_limit is not None and time_limit.expired:
-                    failure_payload = _handler_time_limit_failure_payload(
-                        app, time_limit, handler_error
+                    fail = _fail_task_for_handler_time_limit(
+                        app, task_store, task, worker_id, time_limit, handler_error, lease_authority
                     )
                     handler_error = None
-                    await _safe_fail_payload(
-                        task_store,
-                        task.id,
-                        worker_id,
-                        failure_payload,
-                        lease_expires_at=lease_authority.lease_expires_at,
-                        lease_authority=lease_authority,
-                        retryable=True,
-                        handoff_id=task.interrupted_handoff_id,
-                    )
+                    await fail
                     return
                 failure_payload = _task_failure_payload(app, handler_error)
                 handler_error = None
@@ -1359,15 +1351,8 @@ async def _handle_with_heartbeat_owned(
                 await _handoff_interrupted_session(app, task_store, task.id, worker_id)
             elif handler_outcome is None and time_limit is not None and time_limit.expired:
                 # Returning after the limit without settling is still a timeout.
-                await _safe_fail_payload(
-                    task_store,
-                    task.id,
-                    worker_id,
-                    _handler_time_limit_failure_payload(app, time_limit, None),
-                    lease_expires_at=lease_authority.lease_expires_at,
-                    lease_authority=lease_authority,
-                    retryable=True,
-                    handoff_id=task.interrupted_handoff_id,
+                await _fail_task_for_handler_time_limit(
+                    app, task_store, task, worker_id, time_limit, None, lease_authority
                 )
             elif handler_outcome is not None:
                 await _safe_fail(
@@ -1900,6 +1885,58 @@ def _retain_handler_time_limit_watcher(watcher: asyncio.Task[None]) -> None:
     watcher.add_done_callback(_HANDLER_TIME_LIMIT_WATCHERS.discard)
 
 
+async def _wait_for_handler_time_limit_expiry(
+    callback_done: asyncio.Future[None],
+    time_limit: HandlerTimeLimit,
+) -> bool:
+    """Wait until the limit passes; return False if the handler finished first."""
+
+    while not callback_done.done():
+        remaining = time_limit.remaining_seconds()
+        if remaining == 0:
+            return True
+        # The handler may not have entered its limit yet. Recheck after the
+        # soft interval, since the grace period is inside the total timeout.
+        timeout = max(time_limit.soft_timeout_s, 0.01) if remaining is None else remaining
+        await asyncio.wait((callback_done,), timeout=timeout)
+    return False
+
+
+async def _fail_task_for_handler_time_limit(
+    app: CayuApp,
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    time_limit: HandlerTimeLimit,
+    handler_error: Exception | None,
+    lease_authority: _TaskLeaseAuthority,
+) -> None:
+    """Fail a task whose handler outlived its time limit; log it if the failure landed."""
+
+    payload = _handler_time_limit_failure_payload(app, time_limit, handler_error)
+    del handler_error  # Not held across the store await.
+    if not await _safe_fail_payload(
+        task_store,
+        task.id,
+        worker_id,
+        payload,
+        lease_expires_at=lease_authority.lease_expires_at,
+        lease_authority=lease_authority,
+        retryable=True,
+        handoff_id=task.interrupted_handoff_id,
+    ):
+        return
+    logger.warning(
+        "Task failed because its handler exceeded its time limit: task_id=%s timeout_s=%s "
+        "grace_s=%s handler_cancelled=%s session_ids=%s",
+        app.redact_json(task.id),
+        time_limit.timeout_s,
+        time_limit.grace_s,
+        time_limit.cancelled,
+        app.redact_json(list(time_limit.session_ids)),
+    )
+
+
 async def _fence_handler_that_outlives_its_time_limit(
     app: CayuApp,
     task_store: TaskStore,
@@ -1917,6 +1954,16 @@ async def _fence_handler_that_outlives_its_time_limit(
     claimed and settles the task as cancelled once the handler returns.
     """
 
+    if not await _wait_for_handler_time_limit_expiry(callback_done, time_limit):
+        return
+    logger.warning(
+        "Task handler passed its time limit; new runs are refused and the handler is "
+        "cancelled after the grace period: task_id=%s timeout_s=%s grace_s=%s session_ids=%s",
+        app.redact_json(task.id),
+        time_limit.timeout_s,
+        time_limit.grace_s,
+        app.redact_json(list(time_limit.session_ids)),
+    )
     cancelled = asyncio.ensure_future(time_limit.wait_cancelled())
     try:
         await asyncio.wait((callback_done, cancelled), return_when=asyncio.FIRST_COMPLETED)
@@ -4630,10 +4677,12 @@ async def _safe_fail_payload(
     lease_authority: _TaskLeaseAuthority | None = None,
     handoff_id: str | None = None,
     retryable: bool = False,
-) -> None:
+) -> bool:
+    """Fail a live claimed task; return whether this call recorded the failure."""
+
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
-        return
+        return False
     if task.retry_series is not None:
         request = TaskRetrySettlementRequest(
             task_id=task_id,
@@ -4652,7 +4701,7 @@ async def _safe_fail_payload(
             ),
         )
         try:
-            await (
+            settled = await (
                 _settle_task_retry_request_with_lease_authority(
                     task_store,
                     request,
@@ -4662,8 +4711,9 @@ async def _safe_fail_payload(
                 else _settle_task_retry_request_honoring_cancellation(task_store, request)
             )
         except TaskClaimLost:
-            return
-        return
+            return False
+        # A cancellation committed first settles the attempt as cancelled.
+        return settled.task.status is TaskStatus.FAILED
     try:
         peer_terminalization_won = await _terminalize_claimed_task_or_detect_peer_winner(
             task_store,
@@ -4681,9 +4731,9 @@ async def _safe_fail_payload(
             ),
         )
         if peer_terminalization_won:
-            return
+            return False
     except TaskClaimLost:
-        return
+        return False
     except ValueError:
         if task_store.supports_idempotent_terminalization:
             raise
@@ -4696,8 +4746,9 @@ async def _safe_fail_payload(
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }:
-            return
+            return False
         raise
+    return True
 
 
 async def _settle_retry_attempt_report(

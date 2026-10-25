@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -59,6 +60,20 @@ def _app(store, provider=None) -> CayuApp:
     app.register_provider(provider or StalledProvider([]), default=True)
     app.register_agent(AgentSpec(name="worker", model="scripted"), tools=[StalledTool()])
     return app
+
+
+_EXPIRY_LOG = "Task handler passed its time limit"
+_FAILURE_LOG = "Task failed because its handler exceeded its time limit"
+
+
+def _worker_warnings(caplog, prefix):
+    return [
+        record
+        for record in caplog.records
+        if record.name == "cayu.tasks.worker"
+        and record.levelno == logging.WARNING
+        and record.getMessage().startswith(prefix)
+    ]
 
 
 async def _wait_for_status(store, task_id, statuses, give_up):
@@ -231,7 +246,9 @@ def test_run_in_flight_at_the_hard_limit_ends_interrupted(hang):
     asyncio.run(scenario())
 
 
-def test_grace_period_lets_the_handler_deliver_and_refuses_new_runs():
+def test_grace_period_lets_the_handler_deliver_and_refuses_new_runs(caplog):
+    caplog.set_level(logging.WARNING, logger="cayu.tasks.worker")
+
     async def scenario():
         store = InMemoryTaskStore()
         app = _app(store)
@@ -271,8 +288,65 @@ def test_grace_period_lets_the_handler_deliver_and_refuses_new_runs():
         assert seen["retry"].status is SessionStatus.FAILED
         assert "ExecutionDeadlineExceeded" in seen["retry"].error
         assert current_handler_time_limit() is None
+        # The limit passed, but the handler settled the task in its grace period.
+        assert len(_worker_warnings(caplog, _EXPIRY_LOG)) == 1
+        assert _worker_warnings(caplog, _FAILURE_LOG) == []
 
     asyncio.run(scenario())
+
+
+def test_time_limit_logs_when_it_passes_and_when_it_fails_the_task(caplog):
+    caplog.set_level(logging.WARNING, logger="cayu.tasks.worker")
+    timeout_s = 1.0
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        app = _app(store)
+        task = await store.create_task(TaskCreate(type="job"))
+
+        async def handler(app, task, worker_id):
+            # The model never answers, and the run's own deadline outlives the
+            # handler's limit, so the hard limit cancels the run.
+            await run_to_completion(
+                app,
+                RunRequest(
+                    agent_name="worker",
+                    session_id=f"{task.id}-run",
+                    messages=[Message.text("user", "go")],
+                    execution_deadline=ExecutionDeadline.after(60),
+                ),
+            )
+
+        await asyncio.wait_for(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="w",
+                max_tasks=1,
+                poll_interval_s=0.02,
+                execution_timeout_s=timeout_s,
+                execution_grace_s=GRACE_S,
+            ),
+            GIVE_UP_S,
+        )
+        final = await store.load_task(task.id)
+        assert final.status is TaskStatus.FAILED
+        assert final.error["error"] == "ExecutionDeadlineExceeded"
+        return task.id
+
+    task_id = asyncio.run(scenario())
+    expired = _worker_warnings(caplog, _EXPIRY_LOG)
+    failed = _worker_warnings(caplog, _FAILURE_LOG)
+    assert len(expired) == 1 and len(failed) == 1
+    expired_message = expired[0].getMessage()
+    failed_message = failed[0].getMessage()
+    assert caplog.records.index(expired[0]) < caplog.records.index(failed[0])
+    for message in (expired_message, failed_message):
+        assert f"task_id={task_id} " in message
+        assert f"timeout_s={timeout_s} grace_s={GRACE_S} " in message
+        assert message.endswith(f"session_ids=['{task_id}-run']")
+    assert "handler_cancelled=True" in failed_message
 
 
 def test_handler_that_returns_unsettled_after_the_limit_fails_with_the_timeout():
