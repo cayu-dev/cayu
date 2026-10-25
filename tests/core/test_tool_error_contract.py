@@ -169,8 +169,10 @@ def test_read_file_invalid_arguments_return_structured_error(tmp_path):
     _assert_invalid_arguments(result, match="cannot be blank")
 
     (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
-    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "pages": "1"}))
-    _assert_invalid_arguments(result, match="only valid for PDF")
+    result = asyncio.run(
+        ReadFileTool().run(ctx, {"path": "page.png", "image_region": [10, 10, 5, 5]})
+    )
+    _assert_invalid_arguments(result, match="image_region must be four non-negative integers")
 
     result = asyncio.run(ReadFileTool().run(ctx, {"path": "../outside.txt"}))
     _assert_invalid_arguments(result, match="escapes the workspace root")

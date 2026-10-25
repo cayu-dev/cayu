@@ -1489,6 +1489,234 @@ def test_read_file_accepts_recorded_calls_that_repeat_the_batch(tmp_path, args):
     assert ("Marker: beta" in result.content) is (len(files) == 2)
 
 
+# Recorded on 0.14.0 from a single-file read that fills in every schema field.
+# The image and PDF options carry placeholder values.
+_RECORDED_SINGLE_READ_CALL = {
+    "path": "/tmp/retain/root/req-b/inventory.txt",
+    "files": [],
+    "start_line": 1,
+    "end_line": 100,
+    "artifact_id": "",
+    "max_bytes": 10000,
+    "offset": 0,
+    "max_attachment_bytes": 8388608,
+    "image_region": [0, 0, 1, 1],
+    "pages": "",
+}
+
+
+def test_read_file_reads_the_recorded_single_file_call(tmp_path):
+    (tmp_path / "inventory.txt").write_text("Marker: alpha\nwidgets: 3\n")
+    ctx = _workspace_read_ctx(tmp_path)
+
+    # The workspace is rooted at the request directory, so the model's path
+    # names the same file relative to it.
+    args = {**_RECORDED_SINGLE_READ_CALL, "path": "inventory.txt"}
+    result = asyncio.run(ReadFileTool().run(ctx, args))
+
+    assert result.is_error is False, result.content
+    assert _read_text(result) == "Marker: alpha\nwidgets: 3\n"
+    assert result.structured["start_line"] == 1
+    assert result.structured["total_lines"] == 2
+    # Placeholders count as left out, so there is nothing to report.
+    assert "ignored_arguments" not in result.structured
+    assert "note" not in result.content
+
+
+def test_read_file_recorded_absolute_path_fails_only_on_the_path(tmp_path):
+    (tmp_path / "inventory.txt").write_text("Marker: alpha\n")
+
+    result = asyncio.run(
+        ReadFileTool().run(_workspace_read_ctx(tmp_path), _RECORDED_SINGLE_READ_CALL)
+    )
+
+    assert result.is_error is True
+    assert result.structured["error"] == "invalid_arguments"
+    assert "Workspace paths must be relative." in result.content
+    assert "image_region" not in result.content
+
+
+@pytest.mark.parametrize(
+    "placeholders",
+    [
+        {"pages": ""},
+        {"pages": "  "},
+        {"artifact_id": ""},
+        {"files": []},
+        {"image_region": [0, 0, 0, 0]},
+        {"image_region": [0, 0, 1, 1]},
+        {"image_region": [7, 7, 8, 8]},
+        {"image_region": [0, 0, 0, 50]},
+        {"pages": "", "artifact_id": "", "files": [], "image_region": [0, 0, 1, 1]},
+    ],
+)
+@pytest.mark.parametrize("line_range", [{}, {"start_line": 1, "end_line": 5}])
+def test_read_file_treats_placeholder_values_as_left_out(tmp_path, placeholders, line_range):
+    (tmp_path / "notes.txt").write_text("one\ntwo\n")
+    tool = ReadFileTool()
+    ctx = _workspace_read_ctx(tmp_path)
+
+    plain = asyncio.run(tool.run(ctx, {"path": "notes.txt", **line_range}))
+    result = asyncio.run(tool.run(ctx, {"path": "notes.txt", **line_range, **placeholders}))
+
+    assert result.is_error is False, result.content
+    assert result.content == plain.content
+    assert result.structured == plain.structured
+
+
+@pytest.mark.parametrize(
+    ("given", "ignored", "note"),
+    [
+        ({"image_region": [0, 0, 10, 10]}, ["image_region"], "Text file: ignored image_region."),
+        ({"image_region": [10, 10, 5, 5]}, ["image_region"], "Text file: ignored image_region."),
+        ({"image_region": [0, 0, 1]}, ["image_region"], "Text file: ignored image_region."),
+        ({"pages": "1-3"}, ["pages"], "Text file: ignored pages."),
+        (
+            {"image_region": [0, 0, 10, 10], "pages": "2"},
+            ["image_region", "pages"],
+            "Text file: ignored image_region and pages.",
+        ),
+    ],
+)
+@pytest.mark.parametrize("line_range", [{}, {"start_line": 2, "end_line": 2}])
+def test_read_file_ignores_image_and_pdf_options_for_text_files(
+    tmp_path, given, ignored, note, line_range
+):
+    (tmp_path / "notes.txt").write_text("one\ntwo\n")
+    tool = ReadFileTool()
+    ctx = _workspace_read_ctx(tmp_path)
+
+    plain = asyncio.run(tool.run(ctx, {"path": "notes.txt", **line_range}))
+    result = asyncio.run(tool.run(ctx, {"path": "notes.txt", **line_range, **given}))
+
+    assert result.is_error is False, result.content
+    assert _read_text(result) == _read_text(plain)
+    assert result.structured == {
+        **plain.structured,
+        "ignored_arguments": ignored,
+        "note": note,
+    }
+    metadata = json.loads(result.content.split("\n", 2)[1])
+    assert metadata["note"] == result.structured["note"]
+
+
+def test_read_file_ignores_image_and_pdf_options_for_text_artifacts(tmp_path):
+    async def run():
+        store = LocalArtifactStore(tmp_path / "artifacts")
+        artifact = await store.put_bytes(
+            b"artifact text\n", filename="notes.txt", content_type="text/plain", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        tool = ReadFileTool()
+        plain = await tool.run(ctx, {"artifact_id": artifact.id})
+        placeholders = await tool.run(
+            ctx, {"artifact_id": artifact.id, "path": "", "image_region": [0, 0, 0, 0]}
+        )
+        given = await tool.run(
+            ctx, {"artifact_id": artifact.id, "image_region": [5, 5, 1, 1], "pages": "1-2"}
+        )
+        return plain, placeholders, given
+
+    plain, placeholders, given = asyncio.run(run())
+
+    assert plain.content == "artifact text\n"
+    assert placeholders.content == plain.content
+    assert placeholders.structured == plain.structured
+    assert given.is_error is False, given.content
+    assert given.content == (
+        "artifact text\n\n[read_file note] Text file: ignored image_region and pages."
+    )
+    assert given.structured["ignored_arguments"] == ["image_region", "pages"]
+
+
+@pytest.mark.parametrize(
+    "thresholds",
+    [
+        {"max_inline_bytes": 2048, "max_inline_token_estimate": None},
+        {"max_inline_bytes": None, "max_inline_token_estimate": 512},
+    ],
+)
+@pytest.mark.parametrize(
+    "given", [{}, {"image_region": [0, 0, 10, 10], "pages": "1"}, {"pages": "1"}]
+)
+def test_text_artifact_readback_with_ignored_options_stays_inline(tmp_path, thresholds, given):
+    from cayu.tools.result_projection import ArtifactExternalizingToolResultPolicy
+
+    policy = ArtifactExternalizingToolResultPolicy(**thresholds)
+
+    async def run():
+        store = LocalArtifactStore(tmp_path / "artifacts")
+        artifact = await store.put_bytes(
+            b"x" * 10_000, filename="result.txt", content_type="text/plain", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        pages = []
+        offset = 0
+        while offset is not None:
+            args = {"artifact_id": artifact.id, "max_bytes": policy.readback_max_bytes}
+            result = await ReadFileTool().run(ctx, {**args, "offset": offset, **given})
+            pages.append(result)
+            offset = result.structured["next_offset"]
+        return pages
+
+    pages = asyncio.run(run())
+
+    assert len(pages) > 1
+    for page in pages:
+        assert page.is_error is False, page.content
+        assert ("[read_file note]" in page.content) is bool(given)
+        assert not policy._exceeds_threshold(
+            byte_count=len(page.content.encode()),
+            token_estimate=policy.estimate_tokens(page.content),
+        )
+
+
+def test_artifact_page_note_and_largest_footer_fit_the_metadata_allowance():
+    largest_footer = (
+        "\n[read_file "
+        + json.dumps(
+            {
+                "offset": 2**63 - 1,
+                "next_offset": 2**63 - 1,
+                "total_bytes": 2**63 - 1,
+                "truncated": True,
+            },
+            separators=(",", ":"),
+        )
+        + "]"
+    )
+    assert len(largest_footer.encode()) <= (
+        files_module._ARTIFACT_PAGE_METADATA_MAX_BYTES - files_module._ARTIFACT_PAGE_NOTE_MAX_BYTES
+    )
+    for ignored in [("image_region",), ("pages",), ("image_region", "pages")]:
+        note = files_module._ignored_arguments_fields(ignored)["note"]
+        page_note = files_module._artifact_page_note(note)
+        assert len(page_note.encode()) <= files_module._ARTIFACT_PAGE_NOTE_MAX_BYTES
+
+
+def test_text_artifact_reader_ignores_image_and_pdf_options(tmp_path):
+    async def run():
+        store = LocalArtifactStore(tmp_path / "artifacts")
+        artifact = await store.put_bytes(
+            b"artifact text\n", filename="notes.txt", content_type="text/plain", session_id="s"
+        )
+        initial = await store.read_bytes(artifact.id)
+        request = files_module.ArtifactReadRequest(
+            ctx=ToolContext(session_id="s", artifact_store=store),
+            artifact_store=store,
+            artifact=artifact,
+            initial_read=initial,
+            options=files_module.ReadFileOptions(image_region=(0, 0, 10, 10), pages="1"),
+            structured={},
+        )
+        return await files_module.TextArtifactReader().read(request)
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False, result.content
+    assert result.content == "artifact text\n"
+
+
 @pytest.mark.parametrize("entry_range", [{"offset": 0}, {"start_line": None}, {"end_line": None}])
 def test_read_file_batch_never_replaces_an_explicit_default_range(tmp_path, entry_range):
     (tmp_path / "record.txt").write_text("PUBLIC\nHIDDEN")
@@ -7231,6 +7459,53 @@ def test_recorded_read_call_passes_schema_and_policy_checks(tmp_path, path):
     assert len([e for e in events if e.type == EventType.TOOL_CALL_BLOCKED]) == 1
     assert ".env" not in reads
     assert "private-file-canary" not in repr([e.model_dump() for e in events])
+
+
+def test_recorded_single_read_call_passes_schema_checks_and_reads(tmp_path):
+    from cayu.tools.files import ReadFileTool
+
+    (tmp_path / "inventory.txt").write_text("Marker: alpha\n")
+    calls = [
+        {**_RECORDED_SINGLE_READ_CALL, "path": "inventory.txt"},
+        {
+            **_RECORDED_SINGLE_READ_CALL,
+            "path": "inventory.txt",
+            "image_region": [0, 0, 10, 10],
+            "pages": "1-3",
+        },
+    ]
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id=f"read_{index}", name="read_file", arguments=call)
+                for index, call in enumerate(calls)
+            ]
+            + [ModelStreamEvent.completed({"finish_reason": "tool_calls"})],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="files"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake"), tools=[ReadFileTool()])
+    events = asyncio.run(
+        collect_events(
+            app, RunRequest(agent_name="assistant", messages=[Message.text("user", "read")])
+        )
+    )
+
+    completed = [e.payload["result"] for e in events if e.type == EventType.TOOL_CALL_COMPLETED]
+    assert len(completed) == 2
+    assert all(result["is_error"] is False for result in completed)
+    assert all("Marker: alpha" in result["content"] for result in completed)
+    ignored = sorted(str(result["structured"].get("ignored_arguments")) for result in completed)
+    assert ignored == ["None", "['image_region', 'pages']"]
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])

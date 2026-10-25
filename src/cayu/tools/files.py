@@ -103,7 +103,12 @@ _LINE_CUT_PAGE_HINT = (
     "pages instead: omit start_line and follow offset=next_offset."
 )
 _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
+# Everything read_file appends to a text artifact page must fit in this, so a
+# readback sized by ArtifactExternalizingToolResultPolicy stays inline.
 _ARTIFACT_PAGE_METADATA_MAX_BYTES = 192
+# Part of that allowance kept for the ignored-arguments note. The paging
+# footer gets the rest, which fits offsets and sizes of up to 19 digits.
+_ARTIFACT_PAGE_NOTE_MAX_BYTES = 64
 
 _READ_FILE_ARGUMENTS = frozenset(
     {
@@ -351,13 +356,16 @@ def _read_file_tool_spec(
                         "Image-only crop [left, top, right, bottom] in original source pixels; "
                         "right/bottom are exclusive. Returns frame 0 at original resolution. "
                         "Repeat with other coordinates on the source artifact to inspect more. "
-                        "Source decoding must fit the host image policy."
+                        "Source decoding must fit the host image policy. Leave it out to read "
+                        "the whole image; a region of one pixel or less counts as left out. "
+                        "Text reads ignore it."
                     ),
                 },
                 "pages": {
                     "type": "string",
                     "description": (
-                        "PDF page range, such as '1-5' or '3'. At most 10 pages per read."
+                        "PDF page range, such as '1-5' or '3'. At most 10 pages per read. "
+                        "Text reads ignore it."
                     ),
                 },
             },
@@ -506,20 +514,14 @@ class ReadFileTool(Tool):
                 maximum=self.max_attachment_limit_bytes,
             )
             # Batches read text only, so the image and PDF options don't apply.
+            # A single read only learns the file type later, so a malformed
+            # region fails only if the file turns out to be an image or PDF.
             pages = None if entries is not None else _given_arg_string(args, "pages")
-            region = None if entries is not None else args.get("image_region")
-            if region is not None:
-                if (
-                    not isinstance(region, list)
-                    or len(region) != 4
-                    or any(type(value) is not int or value < 0 for value in region)
-                    or region[0] >= region[2]
-                    or region[1] >= region[3]
-                ):
-                    raise ValueError(
-                        "image_region must be [left, top, right, bottom] with positive area."
-                    )
-                region = tuple(region)
+            region, region_error = (
+                (None, None)
+                if entries is not None
+                else _image_region_argument(args.get("image_region"))
+            )
 
             if path is not None:
                 path = _validate_workspace_path_argument(path)
@@ -544,6 +546,7 @@ class ReadFileTool(Tool):
                     artifact_readers=self.artifact_readers,
                     offset=offset,
                     options=options,
+                    image_region_error=region_error,
                     line_range=line_range,
                     # A larger max_bytes cannot help once the bound limits it.
                     line_cut_hint=(
@@ -559,6 +562,7 @@ class ReadFileTool(Tool):
                     artifact_readers=self.artifact_readers,
                     options=options,
                     missing_as_result=True,
+                    image_region_error=region_error,
                 )
             raise AssertionError("unreachable")
 
@@ -616,6 +620,7 @@ async def _read_workspace_file(
     artifact_readers: list[ArtifactReader],
     offset: int,
     options: ReadFileOptions,
+    image_region_error: str | None = None,
     line_range: _LineRange | None = None,
     line_cut_hint: str = _LINE_CUT_RETRY_HINT,
 ) -> ToolResult:
@@ -624,6 +629,8 @@ async def _read_workspace_file(
         return _missing_workspace_result()
     content_type = _guess_workspace_content_type(path)
     if _is_workspace_file_attachment_content_type(content_type):
+        if image_region_error is not None:
+            return invalid_tool_arguments_result(ValueError(image_region_error))
         if offset != 0:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `offset` is only valid for workspace text files.")
@@ -652,6 +659,9 @@ async def _read_workspace_file(
             options=options,
             initial_result=result,
         )
+    # Models fill in every field, so the image and PDF options reach text
+    # reads too. Text reads don't use them, so say they were ignored.
+    ignored = _ignored_attachment_arguments(options, image_region_error)
     read = await _read_workspace_window(
         ctx,
         workspace,
@@ -664,9 +674,10 @@ async def _read_workspace_file(
     )
     if isinstance(read, ToolResult):
         return read
+    structured = {**read.structured, **_ignored_arguments_fields(ignored)}
     return ToolResult(
-        content=_model_visible_workspace_text(read.text, read.structured),
-        structured=read.structured,
+        content=_model_visible_workspace_text(read.text, structured),
+        structured=structured,
     )
 
 
@@ -803,12 +814,6 @@ async def _read_workspace_text(
             total_bytes=result.total_bytes,
             truncated=next_offset is not None,
             inspectable=False,
-        )
-    if options.image_region is not None:
-        return invalid_tool_arguments_result(ValueError("image_region is only valid for images."))
-    if options.pages is not None:
-        return invalid_tool_arguments_result(
-            ValueError("Tool argument `pages` is only valid for PDF files.")
         )
     page_end = offset + len(page)
     required_window_end = min(
@@ -1130,6 +1135,7 @@ _MODEL_VISIBLE_READ_METADATA = (
     "revision",
     "sha256",
     "truncated",
+    "note",
 )
 
 
@@ -1524,6 +1530,7 @@ async def _read_artifact(
     artifact_readers: list[ArtifactReader],
     options: ReadFileOptions,
     missing_as_result: bool,
+    image_region_error: str | None = None,
 ) -> ToolResult:
     artifact_store = _require_artifact_store(ctx)
     if artifact_store is None:
@@ -1573,6 +1580,13 @@ async def _read_artifact(
     )
     for reader in artifact_readers:
         if reader.can_read(artifact):
+            ignored: tuple[str, ...] = ()
+            if isinstance(reader, TextArtifactReader):
+                # The image and PDF options can't apply to text; drop them.
+                ignored = _ignored_attachment_arguments(options, image_region_error)
+                request = replace(request, options=replace(options, image_region=None, pages=None))
+            elif image_region_error is not None:
+                return invalid_tool_arguments_result(ValueError(image_region_error))
             if options.offset and not isinstance(reader, TextArtifactReader):
                 return _artifact_page_error(
                     "artifact_reader_range_unsupported",
@@ -1580,9 +1594,10 @@ async def _read_artifact(
                 )
             try:
                 reader_result = await reader.read(request)
-                return await _admit_artifact_reader_attachments(request, reader_result)
+                admitted = await _admit_artifact_reader_attachments(request, reader_result)
             except _ArtifactReadNotFound:
                 return _missing_artifact_result(artifact_id)
+            return _with_ignored_arguments_note(admitted, ignored)
     return ToolResult(
         content=(
             f"Artifact {artifact.id} ({artifact.filename}) is {artifact.content_type} "
@@ -1682,14 +1697,8 @@ class TextArtifactReader:
         return _is_text_content_type(artifact.content_type)
 
     async def read(self, request: ArtifactReadRequest) -> ToolResult:
-        if request.options.image_region is not None:
-            return invalid_tool_arguments_result(
-                ValueError("image_region is only valid for images.")
-            )
-        if request.options.pages is not None:
-            return invalid_tool_arguments_result(
-                ValueError("Tool argument `pages` is only valid for PDF artifacts.")
-            )
+        # `image_region` and `pages` don't apply to text. read_file drops
+        # them before this point and notes it in the result.
         return await _read_text_artifact_page(request)
 
 
@@ -1815,7 +1824,7 @@ async def _read_text_artifact_page(request: ArtifactReadRequest) -> ToolResult:
             )
             + "]"
         )
-        if len(footer.encode()) > _ARTIFACT_PAGE_METADATA_MAX_BYTES:
+        if len(footer.encode()) > _ARTIFACT_PAGE_METADATA_MAX_BYTES - _ARTIFACT_PAGE_NOTE_MAX_BYTES:
             return _artifact_page_error(
                 "artifact_size_unsupported", "Artifact size exceeds paging metadata capacity."
             )
@@ -3451,6 +3460,77 @@ def _given_arg_string(args: dict, key: str) -> str | None:
     if type(value) is str and not value.strip():
         return None
     return _optional_arg_string(args, key)
+
+
+_IMAGE_REGION_ERROR = (
+    "image_region must be four non-negative integers [left, top, right, bottom] with "
+    "right greater than left and bottom greater than top. Leave it out to read the whole image."
+)
+
+
+def _image_region_argument(
+    value: object,
+) -> tuple[tuple[int, int, int, int] | None, str | None]:
+    """Return a usable region, or the error to report if the file is an image or PDF.
+
+    Models that fill in every field send fillers such as ``[0, 0, 0, 0]`` or
+    ``[0, 0, 1, 1]``. A region that selects one pixel or none can't help
+    anyone inspect an image, so it counts as left out.
+    """
+
+    if value is None:
+        return None, None
+    if not isinstance(value, list):
+        return None, _IMAGE_REGION_ERROR
+    coordinates = [item for item in value if type(item) is int and item >= 0]
+    if len(value) != 4 or len(coordinates) != 4:
+        return None, _IMAGE_REGION_ERROR
+    left, top, right, bottom = coordinates
+    if right < left or bottom < top:
+        return None, _IMAGE_REGION_ERROR
+    if (right - left) * (bottom - top) <= 1:
+        return None, None
+    return (left, top, right, bottom), None
+
+
+def _ignored_attachment_arguments(
+    options: ReadFileOptions, image_region_error: str | None
+) -> tuple[str, ...]:
+    """Name the image and PDF options a text read drops."""
+
+    ignored = []
+    if options.image_region is not None or image_region_error is not None:
+        ignored.append("image_region")
+    if options.pages is not None:
+        ignored.append("pages")
+    return tuple(ignored)
+
+
+def _ignored_arguments_fields(ignored: tuple[str, ...]) -> dict[str, object]:
+    if not ignored:
+        return {}
+    # Kept short: on a text artifact page the note shares the paging footer's
+    # allowance (_ARTIFACT_PAGE_NOTE_MAX_BYTES).
+    return {
+        "ignored_arguments": list(ignored),
+        "note": f"Text file: ignored {' and '.join(ignored)}.",
+    }
+
+
+def _with_ignored_arguments_note(result: ToolResult, ignored: tuple[str, ...]) -> ToolResult:
+    fields = _ignored_arguments_fields(ignored)
+    if not fields or result.is_error:
+        return result
+    return result.model_copy(
+        update={
+            "content": f"{result.content}{_artifact_page_note(fields['note'])}",
+            "structured": {**(result.structured or {}), **fields},
+        }
+    )
+
+
+def _artifact_page_note(note: object) -> str:
+    return f"\n[read_file note] {note}"
 
 
 def _require_sha256(args: dict, key: str) -> str:

@@ -65,7 +65,8 @@ def test_long_image_regions_preserve_source_and_pixels(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "region", [[-1, 0, 1, 1], [0, 0, 0, 1], [0, 0, 1], [False, 0, 1, 1], [0, 0, 21, 20]]
+    "region",
+    [[-1, 0, 1, 1], [5, 0, 1, 10], [0, 5, 10, 1], [0, 0, 1], [False, 0, 1, 1], [0, 0, 21, 20]],
 )
 def test_invalid_regions_fail_without_image_delivery(tmp_path, region):
     async def run():
@@ -79,6 +80,44 @@ def test_invalid_regions_fail_without_image_delivery(tmp_path, region):
         )
         assert result.is_error
         assert not result.artifacts
+
+    asyncio.run(run())
+
+
+def test_invalid_region_fails_a_workspace_image_read(tmp_path):
+    from cayu.workspaces import LocalWorkspace
+
+    (tmp_path / "page.png").write_bytes(image_bytes((20, 20)))
+    ctx = ToolContext(
+        session_id="s",
+        artifact_store=LocalArtifactStore(tmp_path / "artifacts"),
+        workspace=LocalWorkspace(tmp_path),
+    )
+    result = asyncio.run(
+        ReadFileTool().run(ctx, {"path": "page.png", "image_region": [10, 10, 5, 5]})
+    )
+    assert result.is_error
+    assert result.structured["error"] == "invalid_arguments"
+    assert "image_region must be four non-negative integers" in result.content
+    assert not result.artifacts
+
+
+# Models that fill in every field send these. One pixel or none can't show
+# anything, so the image is read whole instead of failing or cropping.
+@pytest.mark.parametrize("region", [[0, 0, 0, 0], [0, 0, 1, 1], [0, 0, 0, 1], [7, 7, 8, 8]])
+def test_placeholder_regions_read_the_whole_image(tmp_path, region):
+    async def run():
+        store = LocalArtifactStore(tmp_path / "artifacts")
+        source = await store.put_bytes(
+            image_bytes((20, 20)), filename="small.png", content_type="image/png", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        whole = await ReadFileTool().run(ctx, {"artifact_id": source.id})
+        result = await ReadFileTool().run(ctx, {"artifact_id": source.id, "image_region": region})
+        assert not result.is_error, result.content
+        assert "source_region" not in result.structured
+        assert result.artifacts == whole.artifacts
+        assert result.structured == whole.structured
 
     asyncio.run(run())
 
@@ -254,7 +293,7 @@ def test_region_cannot_bypass_source_animation_policy(tmp_path, limits, message)
         )
         ctx = ToolContext(session_id="s", artifact_store=store, image_decode_limits=limits)
         result = await ReadFileTool().run(
-            ctx, {"artifact_id": source.id, "image_region": [0, 0, 1, 1]}
+            ctx, {"artifact_id": source.id, "image_region": [0, 0, 2, 2]}
         )
         assert result.is_error
         assert message in result.content
