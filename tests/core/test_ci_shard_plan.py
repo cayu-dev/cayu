@@ -185,6 +185,25 @@ def test_plan_puts_every_file_in_exactly_one_shard_per_family(tmp_path, mode):
     assert build_plan(root, mode, shards={"general": 4}).lanes == plan.lanes
 
 
+def test_single_worker_family_splits_a_file_below_its_target_lane_time(tmp_path):
+    durations = _durations()
+    scale = [f"tests/qualification/test_scale.py::test_scale[{i}]" for i in range(6)]
+    del durations["tests/qualification/test_scale.py::test_scale"]
+    durations |= dict.fromkeys(scale, 100.0)
+    root = _project(tmp_path, durations)
+    qualification = family("qualification")
+    assert qualification.workers == 1
+    assert qualification.split_seconds < qualification.target_minutes * 60
+    plan = build_plan(root, "all")
+    lanes = [lane for lane in plan.lanes.values() if lane.family == "qualification"]
+    # The general eight-minute threshold would split this 600-second file in
+    # two; the four-minute qualification threshold spreads it over three lanes.
+    assert sum("tests/qualification/test_scale.py" in lane.paths for lane in lanes) == 3
+    assert max(lane.wall_seconds() for lane in lanes) <= qualification.split_seconds
+    for nodeid in [*scale, "tests/qualification/test_scale.py::test_scale[new]"]:
+        assert sum(plan.selects(lane.name, nodeid) for lane in lanes) == 1
+
+
 def test_unmeasured_files_get_a_default_weight(tmp_path):
     root = _project(tmp_path, _durations())
     plan = build_plan(root, "sqlite", shards={"general": 4})

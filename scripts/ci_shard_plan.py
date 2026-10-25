@@ -4,7 +4,8 @@
 Every shard derives the same plan from the checked-out files and
 ``.test_durations`` without collecting the suite first. Whole test files are
 bin-packed by their summed durations; a file is split into deterministic
-pieces only when one lane would spend more than ``SPLIT_SECONDS`` on it.
+pieces only when one lane would spend more than its family's split threshold
+(``SPLIT_SECONDS`` by default) on it.
 
 Which lane family runs a test depends on markers that only collection
 resolves, so the planner estimates it from the node ID and the file's source.
@@ -64,6 +65,10 @@ class Family:
     # Work stealing spreads a large file across workers. "loadfile" keeps each
     # file on one worker, for module fixtures that must not run twice at once.
     distribution: str = "worksteal"
+    # Single-worker seconds of one file a lane may hold before the file splits.
+    # A single-worker family needs a threshold below its target lane time.
+    split_seconds: float = SPLIT_SECONDS
+    target_minutes: float = TARGET_SHARD_MINUTES
 
     def lane(self, shard: int) -> str:
         if max(self.shards.values()) == 1:
@@ -98,13 +103,17 @@ FAMILIES = (
         r"\bbrowser_docker\b",
         distribution="loadfile",
     ),
+    # One worker per lane keeps internally concurrent capacity scenarios
+    # isolated, so lane wall time is the lane's summed test time.
     Family(
         "qualification",
         "stress or qualification",
-        {"sqlite": 8, "all": 8},
+        {"sqlite": 12, "all": 12},
         1,
         r"mark\.(?:stress|qualification)\b",
         qualification_paths=True,
+        split_seconds=4 * 60,
+        target_minutes=6.0,
     ),
 )
 # Pull request and release CI run these; qualification has its own workflow.
@@ -552,7 +561,7 @@ def build_plan(
             else:
                 seconds = 0.0
             seconds += COLLECT_SECONDS_PER_FILE
-            count_pieces = max(1, min(count, math.ceil(seconds / SPLIT_SECONDS)))
+            count_pieces = max(1, min(count, math.ceil(seconds / candidate.split_seconds)))
             # Without work stealing a whole file (piece) runs on one worker.
             whole_files = candidate.distribution == "loadfile"
             if count_pieces == 1:
@@ -614,11 +623,11 @@ def load_lanes(root: Path, mode: str) -> dict[str, str | None]:
     return dict(corrections)
 
 
-def recommended_shards(plan: Plan, name: str, target_minutes: float = TARGET_SHARD_MINUTES) -> int:
+def recommended_shards(plan: Plan, name: str) -> int:
     candidate = family(name)
     workers = candidate.workers or DEFAULT_WORKERS
     total = sum(lane.seconds for lane in plan.lanes.values() if lane.family == name)
-    return max(1, math.ceil(total / (workers * target_minutes * 60)))
+    return max(1, math.ceil(total / (workers * candidate.target_minutes * 60)))
 
 
 def describe(plan: Plan, families: Sequence[str]) -> list[str]:

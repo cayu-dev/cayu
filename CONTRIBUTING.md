@@ -372,13 +372,14 @@ Release tags, manual runs and the nightly run every store across 32 general and 
 Postgres shards. General and Postgres shards use four pytest workers with work stealing, so
 idle workers take tests from a large file. Ordinary process recovery regressions remain
 in the PR gate. Tests marked `stress` or `qualification`, including full-scale evidence and
-capacity checks, run separately across eight shards in `qualification.yml`, daily and on
-manual dispatch.
+capacity checks, run separately across twelve single-worker shards in `qualification.yml`,
+daily and on manual dispatch.
 
 Shards do not wait for collection. `scripts/ci_shard_plan.py` assigns whole test files to
 shards by bin-packing each file's summed `.test_durations` (files without timings get a
 default weight). A file is split across shards only when one lane would spend more than
-eight minutes on it; each piece takes a fixed subset of the file's node IDs. Each shard
+eight minutes on it (four for the single-worker qualification lanes); each piece takes a
+fixed subset of the file's node IDs. Each shard
 collects only its own files and applies its lane's marker expression, so every collected
 test runs in exactly one shard of its lane. Print the plan with
 `python3 scripts/run_ci.py --lane plan --stores sqlite` (or `--stores all`), and one shard's
@@ -401,7 +402,10 @@ python3 scripts/run_ci.py --lane plan --stores sqlite  # check the resulting bal
 ```
 
 A pull request run refreshes the timings it measured but drops nothing; pass
-`--input DIRECTORY` to merge artifacts you already downloaded.
+`--input DIRECTORY` to merge artifacts you already downloaded. Qualification lanes upload
+their timings from the separate Full-scale qualification workflow, so also merge a recent
+run of it. A qualification test without a timing weighs nothing in the plan, and several of
+them can land on one shard.
 
 Which lane runs a test depends on markers that only collection resolves, so the planner
 estimates it from the node ID and the test file. The collection job uploads
