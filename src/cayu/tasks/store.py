@@ -115,6 +115,7 @@ from cayu.tasks.records import (
     TaskStatus,
 )
 from cayu.tasks.retry import TaskRetrySettlementRequest, TaskRetrySettlementResult
+from cayu.tasks.retry_budgets import TaskRetryKeyState
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -275,6 +276,9 @@ class TaskStore(ABC):
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = False
     supports_task_cancellation_reconciliation: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
+    # True only when create_task admits ``TaskCreate.retry_key`` atomically with
+    # the insert and load_task_retry_key reads the result.
+    supports_task_retry_keys: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
     supports_completion_verifier_dispatches: ClassVar[bool] = False
     supports_completion_evaluations: ClassVar[bool] = False
@@ -1249,6 +1253,18 @@ class TaskStore(ABC):
         """Load an exact retry-attempt settlement receipt for acknowledgement recovery."""
 
         raise NotImplementedError("This TaskStore does not support task retry series.")
+
+    async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        """Load one retry key's durable budget state, or ``None`` if it was never used.
+
+        A store that sets ``supports_task_retry_keys`` must, inside the
+        transaction that inserts a task with ``TaskCreate.retry_key``, rule out a
+        duplicate task ID, call ``admit_task_retry_key`` with store time, persist
+        the returned state, and raise ``TaskRetryBudgetExhausted`` after
+        committing a refusal. The state survives deletion of the key's tasks.
+        """
+
+        raise NotImplementedError("This TaskStore does not support task retry keys.")
 
     async def reconcile_task_retry_cancellation(
         self,

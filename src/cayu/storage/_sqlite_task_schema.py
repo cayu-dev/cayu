@@ -306,3 +306,18 @@ def _validate_task_creation_operations(
             raise RuntimeError(
                 "Required Cayu task creation receipt or identity fence is missing or conflicting."
             )
+
+
+def _validate_task_retry_keys(connection: sqlite3.Connection, *, revision_sql: str) -> None:
+    row = connection.execute(
+        "SELECT type, sql FROM sqlite_master WHERE name = 'cayu_task_retry_keys'"
+    ).fetchone()
+    (expected,) = tuple(sqlite_catalog._iter_statements(revision_sql))
+    if (
+        row is None
+        or row[0] != "table"
+        or row[1] is None
+        or sqlite_catalog._normalize_sqlite_schema_definition(row[1])
+        != sqlite_catalog._normalize_sqlite_schema_definition(expected)
+    ):
+        raise RuntimeError("Required Cayu task retry key table is missing or conflicting.")

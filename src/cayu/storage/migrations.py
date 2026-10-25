@@ -546,6 +546,9 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=126, kind=RevisionKind.BREAKING, compatible_from=126),
     # Exact creation receipts survive task deletion; writers must not reuse fenced IDs.
     Revision(revision=127, kind=RevisionKind.BREAKING, compatible_from=127),
+    # Retry-key budgets add one table that older binaries never read or write
+    # (they cannot create retry-keyed tasks). Task stores require it.
+    Revision(revision=128, kind=RevisionKind.ADDITIVE, compatible_from=127),
 )
 
 #: The revision an empty database is initialized to.

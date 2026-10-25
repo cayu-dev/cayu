@@ -135,29 +135,48 @@ await run_task_worker(app, task_store, handle, worker_id="worker-1",
                       execution_timeout_s=600)
 ```
 
-`execution_timeout_s` is the longest one handler call may take, counted from
-handler start, whether or not its runs are attached to the task. It defaults to
-`None` (no limit). Runs the handler builds without their own
-`execution_deadline` get it as their default, so a hung tool or model stream
-ends the run with `session.interrupted` (`limit_reached`) and an attached task
-fails with `ExecutionDeadlineExceeded`. Once the limit passes, a new top-level
-run in the call is refused with that error, and
+`execution_timeout_s` is the longest one handler call may take, grace period
+included, counted from handler start, whether or not its runs are attached to
+the task. It defaults to `None` (no limit). The last `execution_grace_s`
+seconds of it are the grace period: 30 seconds by default, or half the limit
+when that is shorter. An explicit grace that is not smaller than the limit is
+refused with `ValueError`. With `execution_timeout_s=600`, from 570 seconds a
+new top-level run in the call is refused with `ExecutionDeadlineExceeded` and
 `cayu.deadlines.current_handler_time_limit().expired` is true, so a retry loop
-can stop. `execution_grace_s` later (30 seconds by default) the handler is
-cancelled and a run still in flight ends `session.interrupted`. When the
-handler has stopped, a task it did not settle fails with
-`ExecutionDeadlineExceeded` (`scope` `task_handler`); the failure lists the IDs
-of the sessions the call started and whether it had to be cancelled. A task
-with a `TaskRetryPolicy` records a retryable failed attempt instead, a pending
-cancellation still settles as cancelled, and a restartable task is not
-requeued. A handler that keeps running after it is cancelled keeps its lease,
-and its task gets a durable cancellation request with code
-`task_handler_timeout` that settles when the handler returns. The limit also
-bounds the drain when the worker itself is cancelled. It does not change the
-deadline stored on sessions, so a session paused for a person keeps its own.
-Without `run_task_worker`, wrap a handler in
-`async with HandlerTimeLimit(600, grace_s=30):` from `cayu.deadlines`; it
+can stop. Runs the handler builds without their own `execution_deadline` get
+that 570-second mark as their default, so a hung tool or model stream ends the
+run with `session.interrupted` (`limit_reached`) and an attached task fails
+with `ExecutionDeadlineExceeded`. At 600 seconds the handler is cancelled and a
+run still in flight ends `session.interrupted`. When the handler has stopped,
+a task it did not settle fails with `ExecutionDeadlineExceeded` (`scope`
+`task_handler`); the failure lists the IDs of the sessions the call started
+and whether it had to be cancelled. A task with a `TaskRetryPolicy` records a
+retryable failed attempt instead, a pending cancellation still settles as
+cancelled, and a restartable task is not requeued. A handler that keeps
+running after it is cancelled keeps its lease, and its task gets a durable
+cancellation request with code `task_handler_timeout` that settles when the
+handler returns. The limit also bounds the drain when the worker itself is
+cancelled. It does not change the deadline stored on sessions, so a session
+paused for a person keeps its own. Without `run_task_worker`, wrap a handler
+in `async with HandlerTimeLimit(600, grace_s=30):` from `cayu.deadlines`; it
 raises `ExecutionDeadlineExceeded` when it cancels the block.
+
+The limit ends one handler call. An application that retries an event by
+creating a new task for it (a sweeper, a reconciler, a redelivered webhook)
+should pass the same `TaskCreate(retry_key=...)`, such as the event's ID, for
+every task of that event. Tasks with one key share a `TaskRetryBudget`: by
+default 3 tasks, created within 30 minutes of the first. The store counts each
+new task with the key in the transaction that inserts it; restarts of one
+task and duplicate task IDs do not count. The next task past the budget is not
+created: `create_task` raises `TaskRetryBudgetExhausted`, whose `state` is
+the key's durable `TaskRetryKeyState`, and the key stays `given_up` whatever
+budget a later request carries. `TaskStore.load_task_retry_key(key)` and
+`cayu inspect --retry-key KEY` show it. Pass
+`retry_budget=TaskRetryBudget(max_attempts=..., max_elapsed_seconds=...)` to
+raise the budget, or `TaskRetryBudget.unlimited()` to count without a cap; the
+budget on each new request is the one checked. Keys are store-wide, so scoped
+(tenant-bound) callers cannot set or read them, and keyed tasks cannot join
+graphs or groups. A `TaskRetryPolicy` still works per task alongside a key.
 
 `concurrency` defaults to one. `max_tasks`, when set, is a total for the whole
 call, not a per-slot quota; recovered continuations and contracted-task parking

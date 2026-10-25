@@ -32,7 +32,8 @@ from cayu.tasks import (
 )
 from cayu.tasks.worker import complete_managed_task
 
-TIMEOUT_S = 0.3
+# The grace period is the end of the limit: new runs are refused at 0.3 s.
+TIMEOUT_S = 0.5
 GRACE_S = 0.2
 # Old releases never end these handlers; the tests stop them after this long
 # so a regression fails instead of hanging.
@@ -240,7 +241,7 @@ def test_grace_period_lets_the_handler_deliver_and_refuses_new_runs():
         async def handler(app, task, worker_id):
             limit = current_handler_time_limit()
             seen["before"] = limit.expired
-            await asyncio.sleep(TIMEOUT_S + 0.05)  # The agent's work ran long.
+            await asyncio.sleep(TIMEOUT_S - GRACE_S + 0.05)  # The agent's work ran long.
             seen["after"] = limit.expired
             outcome = await run_to_completion(
                 app, RunRequest(agent_name="worker", messages=[Message.text("user", "again")])
@@ -257,7 +258,7 @@ def test_grace_period_lets_the_handler_deliver_and_refuses_new_runs():
                 worker_id="w",
                 max_tasks=1,
                 poll_interval_s=0.02,
-                execution_timeout_s=TIMEOUT_S,
+                execution_timeout_s=TIMEOUT_S - GRACE_S + 1.0,
                 execution_grace_s=1.0,
             ),
             GIVE_UP_S,
@@ -281,7 +282,7 @@ def test_handler_that_returns_unsettled_after_the_limit_fails_with_the_timeout()
         task = await store.create_task(TaskCreate(type="job"))
 
         async def handler(app, task, worker_id):
-            await asyncio.sleep(TIMEOUT_S + 0.05)
+            await asyncio.sleep(TIMEOUT_S - GRACE_S + 0.05)
             raise RuntimeError("delivery failed")
 
         await asyncio.wait_for(
@@ -292,7 +293,7 @@ def test_handler_that_returns_unsettled_after_the_limit_fails_with_the_timeout()
                 worker_id="w",
                 max_tasks=1,
                 poll_interval_s=0.02,
-                execution_timeout_s=TIMEOUT_S,
+                execution_timeout_s=TIMEOUT_S - GRACE_S + 1.0,
                 execution_grace_s=1.0,
             ),
             GIVE_UP_S,
@@ -459,7 +460,7 @@ def test_retry_policy_task_records_a_retryable_attempt():
 def test_handler_time_limit_works_without_the_worker():
     async def scenario():
         with pytest.raises(ExecutionDeadlineExceeded) as raised:
-            async with HandlerTimeLimit(0.05, grace_s=0.05) as limit:
+            async with HandlerTimeLimit(0.1, grace_s=0.05) as limit:
                 await asyncio.Event().wait()
         assert limit.expired and limit.cancelled
         assert raised.value.diagnostics["scope"] == "task_handler"
@@ -489,6 +490,159 @@ def test_handler_time_limit_works_without_the_worker():
             await outer
 
     asyncio.run(scenario())
+
+
+def test_grace_period_is_the_end_of_the_limit_not_extra_time():
+    """A 600 s limit with 30 s grace refuses new runs at 570 s and cancels at 600 s."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        # The 600/30 example from the guide, scaled down a thousand times.
+        async with HandlerTimeLimit(0.6, grace_s=0.03) as limit:
+            started = loop.time()
+            assert limit.soft_timeout_s == pytest.approx(0.57)
+            # The hard limit is fixed at entry: the timeout itself, not 0.63.
+            assert limit._timer.when() - started == pytest.approx(0.6, abs=0.005)
+            assert limit.deadline.remaining_seconds() == pytest.approx(0.57, abs=0.02)
+            assert limit.inspection()["runs_refused_after_seconds"] == pytest.approx(0.57)
+            assert admit_handler_run() is limit
+        assert not limit.expired
+
+        with pytest.raises(ExecutionDeadlineExceeded):
+            async with HandlerTimeLimit(0.6, grace_s=0.03) as limit:
+                started = loop.time()
+                while not limit.expired:
+                    await asyncio.sleep(0.005)
+                soft_at = loop.time() - started
+                with pytest.raises(ExecutionDeadlineExceeded):
+                    admit_handler_run()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    hard_at = loop.time() - started
+        assert limit.cancelled
+        assert 0.56 <= soft_at < 0.6
+        assert 0.6 <= hard_at < 0.63
+
+    asyncio.run(scenario())
+
+
+def test_worker_handler_ends_at_execution_timeout_with_grace_inside():
+    async def scenario():
+        store = InMemoryTaskStore()
+        app = _app(store)
+        task = await store.create_task(TaskCreate(type="job"))
+        marks = {}
+
+        async def handler(app, task, worker_id):
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            limit = current_handler_time_limit()
+            try:
+                while not limit.expired:
+                    await asyncio.sleep(0.005)
+                marks["soft"] = loop.time() - started
+                await asyncio.Event().wait()
+            finally:
+                marks["hard"] = loop.time() - started
+
+        await asyncio.wait_for(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="w",
+                max_tasks=1,
+                poll_interval_s=0.02,
+                execution_timeout_s=0.6,
+                execution_grace_s=0.03,
+            ),
+            GIVE_UP_S,
+        )
+        final = await store.load_task(task.id)
+        assert final.status is TaskStatus.FAILED
+        assert final.error["timeout_seconds"] == 0.6
+        assert final.error["grace_seconds"] == 0.03
+        assert final.error["handler_cancelled"] is True
+        assert 0.55 <= marks["soft"] < 0.6
+        assert 0.59 <= marks["hard"] < 0.63
+
+    asyncio.run(scenario())
+
+
+def test_default_run_deadline_comes_from_the_entered_limit():
+    """A run ended by its default deadline always finds the handler limit expired."""
+
+    async def scenario():
+        async with HandlerTimeLimit(5, grace_s=1) as limit:
+            run = limit.run_deadline()
+            assert run.expires_at == limit.deadline.expires_at
+            assert run._monotonic_expiry == limit.deadline._monotonic_expiry
+            assert run.scope == "execution" and run.source == limit.source
+
+        store = InMemoryTaskStore()
+        app = _app(store)
+        task = await store.create_task(TaskCreate(type="job"))
+        seen = {}
+
+        async def handler(app, task, worker_id):
+            # No execution_deadline of its own: the worker's default ends it.
+            outcome = await run_to_completion(
+                app, RunRequest(agent_name="worker", messages=[Message.text("user", "go")])
+            )
+            seen["status"] = outcome.status
+            seen["expired"] = current_handler_time_limit().expired
+            return None  # Returns straight away, without settling the task.
+
+        await asyncio.wait_for(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="w",
+                max_tasks=1,
+                poll_interval_s=0.02,
+                execution_timeout_s=1.0,
+                execution_grace_s=0.5,
+            ),
+            GIVE_UP_S,
+        )
+        # On a loaded host the deadline can also end the run during setup.
+        assert seen["status"] in {SessionStatus.INTERRUPTED, SessionStatus.FAILED}
+        assert seen["expired"] is True
+        final = await store.load_task(task.id)
+        assert final.status is TaskStatus.FAILED
+        assert final.error["error"] == "ExecutionDeadlineExceeded"
+        assert final.error["handler_cancelled"] is False
+
+    asyncio.run(scenario())
+
+
+def test_default_grace_fits_inside_short_limits_and_explicit_grace_must():
+    assert HandlerTimeLimit(600).grace_s == 30
+    assert HandlerTimeLimit(20).grace_s == 10  # Half the limit when 30 s would not fit.
+    assert HandlerTimeLimit(20).soft_timeout_s == 10
+    assert HandlerTimeLimit(1, grace_s=0).soft_timeout_s == 1
+    assert HandlerTimeLimit(0).grace_s == 0
+    for timeout_s, grace_s in ((30, 30), (10, 30), (0, 1)):
+        with pytest.raises(ValueError, match="smaller than timeout_s"):
+            HandlerTimeLimit(timeout_s, grace_s=grace_s)
+    store = InMemoryTaskStore()
+
+    async def handler(app, task, worker_id):
+        return None
+
+    with pytest.raises(ValueError, match="smaller than timeout_s"):
+        asyncio.run(
+            run_task_worker(
+                CayuApp(task_store=store, enable_logging=False),
+                store,
+                handler,
+                worker_id="w",
+                execution_timeout_s=10,
+                execution_grace_s=30,
+            )
+        )
 
 
 @pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), True])
@@ -659,7 +813,7 @@ def test_continuation_failure_settles_with_owned_handoff(outcome):
                 recovered_interrupted_task_handler=handler,
                 recover_interrupted_handoffs=False,
                 reclaim=False,
-                execution_timeout_s=0.05,
+                execution_timeout_s=0.15,
                 execution_grace_s=0.1,
             )
             == 1

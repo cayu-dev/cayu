@@ -322,6 +322,14 @@ from cayu.tasks.retry import (
     _validated_task_retry_terminal_accounting,
     prepare_task_retry_settlement,
 )
+from cayu.tasks.retry_budgets import (
+    TaskRetryBudgetExhausted,
+    TaskRetryKeyState,
+    admit_task_retry_key,
+    stored_task_retry_key_state,
+    task_retry_key_request,
+    unscoped_task_retry_key,
+)
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -370,7 +378,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 127
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 128
 
 
 @model_store_surface("tasks")
@@ -504,6 +512,7 @@ class SQLiteTaskStore(TaskStore):
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
+    supports_task_retry_keys: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_completion_evaluations: ClassVar[bool] = True
@@ -3633,6 +3642,7 @@ class SQLiteTaskStore(TaskStore):
         digest = None if operation is None else creation_operation_digest(request, operation)
         if request.schedule_policy is not None and not self.supports_task_scheduling:
             raise NotImplementedError("This store does not support managed task scheduling.")
+        refused: TaskRetryKeyState | None = None
         async with self._lock:
             with self._verified_transaction_unlocked():
                 task_id = request.task_id or str(uuid4())
@@ -3683,17 +3693,55 @@ class SQLiteTaskStore(TaskStore):
                     retry_started_at=admission_now,
                     supports_verified_work_contracts=True,
                 )
-                self._insert_task_unlocked(task)
-                self._record_task_transition_unlocked(None, task)
-                if operation is not None:
-                    self._connection.execute(
-                        "INSERT INTO cayu_task_creation_operations (task_id, request_sha256) "
-                        "VALUES (?, ?)",
-                        (task_id, digest),
-                    )
-                created = task.model_copy(deep=True)
+                refused = self._admit_task_retry_key_unlocked(request, task)
+                if refused is None:
+                    self._insert_task_unlocked(task)
+                    self._record_task_transition_unlocked(None, task)
+                    if operation is not None:
+                        self._connection.execute(
+                            "INSERT INTO cayu_task_creation_operations (task_id, request_sha256) "
+                            "VALUES (?, ?)",
+                            (task_id, digest),
+                        )
+                    created = task.model_copy(deep=True)
+        if refused is not None:
+            # Raised after commit so the given-up state is durable.
+            raise TaskRetryBudgetExhausted(refused)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
+
+    def _admit_task_retry_key_unlocked(
+        self, request: TaskCreate, task: Task
+    ) -> TaskRetryKeyState | None:
+        """Count a keyed task inside its insert transaction; return the state if refused."""
+        keyed = task_retry_key_request(request)
+        if keyed is None:
+            return None
+        if self._task_exists_unlocked(task.id):
+            raise ValueError(f"Task already exists: {task.id}")
+        prior = self._load_task_retry_key_unlocked(keyed[0])
+        # Store time read after the key state, right before the decision.
+        state, admitted = admit_task_retry_key(
+            prior, retry_key=keyed[0], budget=keyed[1], task_id=task.id, now=self._clock()
+        )
+        if state is not prior:
+            self._connection.execute(
+                "INSERT INTO cayu_task_retry_keys (retry_key, state_json) VALUES (?, ?) "
+                "ON CONFLICT (retry_key) DO UPDATE SET state_json = excluded.state_json",
+                (state.retry_key, state.model_dump_json()),
+            )
+        return None if admitted else state
+
+    def _load_task_retry_key_unlocked(self, retry_key: str) -> TaskRetryKeyState | None:
+        row = self._connection.execute(
+            "SELECT state_json FROM cayu_task_retry_keys WHERE retry_key = ?", (retry_key,)
+        ).fetchone()
+        return None if row is None else stored_task_retry_key_state(row[0], retry_key)
+
+    async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        retry_key = await unscoped_task_retry_key(retry_key)
+        async with self._lock:
+            return self._load_task_retry_key_unlocked(retry_key)
 
     def _record_task_transition_unlocked(
         self,

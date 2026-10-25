@@ -1234,6 +1234,10 @@ def reconcile_schema(
         sqlite_task_schema._validate_task_creation_operations(
             connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[127]
         )
+    if current.revision >= 128:
+        sqlite_task_schema._validate_task_retry_keys(
+            connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[128]
+        )
     if current.revision >= 109:
         sqlite_budget_schema._validate_reservation_inventory_index(
             connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[109]

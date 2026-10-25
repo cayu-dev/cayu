@@ -493,3 +493,25 @@ async def _validate_task_creation_operations(cur: Any, *, expected_guard_sql: st
         or row[7] != schema[0]
     ):
         raise RuntimeError("Required Cayu task creation identity fence is missing or conflicting.")
+
+
+async def _validate_task_retry_keys(cur: Any) -> None:
+    await cur.execute("""
+        SELECT column_name, data_type, is_nullable, collation_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'cayu_task_retry_keys'
+        ORDER BY ordinal_position
+    """)
+    if tuple(await cur.fetchall()) != (
+        ("retry_key", "text", "NO", "C"),
+        ("state_json", "text", "NO", None),
+    ):
+        raise RuntimeError("Required Cayu task retry key columns are missing or conflicting.")
+    await cur.execute("""
+        SELECT contype, pg_get_constraintdef(oid)
+        FROM pg_constraint WHERE conrelid = 'cayu_task_retry_keys'::regclass
+          AND contype IN ('c', 'p', 'u', 'f')
+        ORDER BY contype
+    """)
+    if tuple(await cur.fetchall()) != (("p", "PRIMARY KEY (retry_key)"),):
+        raise RuntimeError("Required Cayu task retry key constraints are missing or conflicting.")

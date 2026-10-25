@@ -670,6 +670,10 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
+        retry_key TEXT COLLATE BINARY PRIMARY KEY,
+        state_json TEXT NOT NULL
+    );""",
     127: """CREATE TABLE IF NOT EXISTS cayu_task_creation_operations (
         task_id TEXT COLLATE BINARY PRIMARY KEY,
         request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (

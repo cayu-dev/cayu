@@ -233,7 +233,11 @@ Pass `run_task_worker(..., execution_timeout_s=...)` so a handler call that
 hangs or retries forever is cancelled and fails its task instead of holding the
 claim, whether or not its runs are attached; without `run_task_worker`, wrap
 the handler in `async with HandlerTimeLimit(seconds):` from `cayu.deadlines`.
-See `cayu guide long-running#time-limit-for-worker-runs`.
+The grace period is the end of that limit, not extra time. When your code
+creates a new task to retry the same event, pass the same
+`TaskCreate(retry_key=...)` each time so its `TaskRetryBudget` (3 tasks or 30
+minutes by default) stops the event; past it `create_task` raises
+`TaskRetryBudgetExhausted`. See `cayu guide long-running#time-limit-for-worker-runs`.
 
 ## workflows-hooks
 

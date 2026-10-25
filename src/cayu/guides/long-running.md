@@ -104,10 +104,11 @@ import asyncio
 from cayu import Message, RunRequest, run_to_completion
 from cayu.deadlines import ExecutionDeadline
 from cayu.sessions import SessionStatus
-from cayu.tasks import TaskQuery, complete_managed_task, run_task_worker
+from cayu.tasks import TaskCreate, TaskQuery, TaskRetryBudgetExhausted
+from cayu.tasks import complete_managed_task, run_task_worker
 
-JOB_TIMEOUT_S = 300  # The longest one handler call may take, retries included.
-JOB_GRACE_S = 30  # Time left to finish a delivery once the limit has passed.
+JOB_TIMEOUT_S = 300  # The longest one handler call may take: retries and grace included.
+JOB_GRACE_S = 30  # Its last 30 seconds, kept for finishing a delivery.
 DELIVERED = {}  # Stands in for your outbox and the system you deliver to.
 
 
@@ -132,6 +133,14 @@ async def run_jobs(app, stop=None):
     await run_task_worker(app, app.task_store, handle_job, worker_id="jobs-1",
                           query=TaskQuery(type="invoice-job"), stop=stop,
                           execution_timeout_s=JOB_TIMEOUT_S, execution_grace_s=JOB_GRACE_S)
+
+
+async def retry_job(app, event_id, attempt, request):  # Your sweeper, after a failed task.
+    try:  # Same retry_key for every task of this event; TaskRetryBudget(...) changes the cap.
+        await app.create_task(TaskCreate(task_id=f"invoice-{event_id}-{attempt}",
+            type="invoice-job", input={"request": request}, retry_key=f"invoice-{event_id}"))
+    except TaskRetryBudgetExhausted as exhausted:
+        return exhausted.state  # Given up for good: record it and stop retrying.
 ```
 
 Runs are unattached (`RunRequest.task_id` is absent). An interruption completes
@@ -140,28 +149,27 @@ action, if any, and deliver the result in its continuation owner. Never retry a
 pause as a new payment session. Successful runs deliver before completing the task.
 Without `execution_timeout_s`, a hung call stays claimed. Which limit ends what:
 
-- `execution_timeout_s` ends the handler call, counted from its start. Then new
-  runs in the call are refused and `current_handler_time_limit().expired` (from
-  `cayu.deadlines`) is true. `execution_grace_s` later the handler is cancelled
-  and a run still going ends `session.interrupted`. An unsettled task fails with
-  `ExecutionDeadlineExceeded`, listing the sessions the call started; with a
-  `TaskRetryPolicy` the attempt fails as retryable and the policy decides.
+- `execution_timeout_s` is the whole call, grace included: at 270 of 300 seconds
+  new runs are refused and `current_handler_time_limit().expired` is true; at 300
+  the handler is cancelled and a running session ends `session.interrupted`. An
+  unsettled task fails with `ExecutionDeadlineExceeded`, or its `TaskRetryPolicy`
+  decides. Grace defaults to 30 s or half the limit; a larger one is refused.
 - A run's `execution_deadline` ends that session, here one attempt. Runs
-  without one get `execution_timeout_s` as their deadline.
-- `TaskRetryPolicy(max_elapsed_seconds=...)` bounds all attempts of a task.
+  without one end when new runs are refused.
+- `retry_key` ends the event: tasks with one key (the event's ID, not the
+  task's) share a `TaskRetryBudget`, by default 3 tasks within 30 minutes. The
+  next is refused with `TaskRetryBudgetExhausted` and the key stays given up, as
+  `cayu inspect --retry-key KEY` shows. Raise it with `retry_budget=`.
 
-A delivery still running when the grace period ends is cancelled and may or may
-not have happened, so make it idempotent. Don't catch `asyncio.CancelledError`:
-a handler that keeps running keeps its task claimed, with a
-`task_handler_timeout` cancellation request, until it returns. A run that pauses
-for a person returns, so the wait does not count; give it its own
-`execution_deadline` that covers the wait. Without `run_task_worker`, wrap the
-handler in `async with HandlerTimeLimit(300, grace_s=30):` and fail the task
-yourself on `ExecutionDeadlineExceeded`.
-
-A bounded handler also cancels inline continuations at its hard limit. The
-generated timer worker leaves `execution_timeout_s=None` so the user sessions
-it continues inline follow their own deadlines.
+A delivery still running at the limit is cancelled and may or may not have
+happened, so make it idempotent. Don't catch `asyncio.CancelledError`: a
+handler that keeps running keeps its task claimed, with a `task_handler_timeout`
+cancellation request, until it returns. A run that pauses for a person returns,
+so the wait does not count; give it an `execution_deadline` that covers the
+wait. Without `run_task_worker`, wrap the handler in `async with
+HandlerTimeLimit(300, grace_s=30):` and fail the task on
+`ExecutionDeadlineExceeded`. The generated timer worker sets no limit, so the
+sessions it continues inline follow their own deadlines.
 
 ## Spend cap
 

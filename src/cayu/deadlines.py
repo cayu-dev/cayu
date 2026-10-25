@@ -199,18 +199,57 @@ _HANDLER_LIMIT: ContextVar[HandlerTimeLimit | None] = ContextVar(
 _HANDLER_LIMIT_SESSION_IDS = 20
 
 
+_DEFAULT_HANDLER_GRACE_SECONDS = 30.0
+
+
+def require_handler_seconds(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"{name} must be a finite, nonnegative number of seconds.")
+    return float(value)
+
+
+def handler_grace_seconds(timeout_s: float, grace_s: float | None) -> float:
+    """Validate a handler time limit and return the grace period inside it.
+
+    ``timeout_s`` is the whole limit. ``grace_s=None`` means 30 seconds, or
+    half of ``timeout_s`` when that is shorter. An explicit ``grace_s`` must be
+    smaller than ``timeout_s`` (zero is always allowed); a larger one is
+    refused with ``ValueError`` instead of being shortened.
+    """
+    timeout_s = require_handler_seconds(timeout_s, "timeout_s")
+    if grace_s is None:
+        return min(_DEFAULT_HANDLER_GRACE_SECONDS, timeout_s / 2)
+    grace_s = require_handler_seconds(grace_s, "grace_s")
+    if grace_s and grace_s >= timeout_s:
+        raise ValueError(
+            "grace_s must be smaller than timeout_s: the grace period is the end of the "
+            "time limit, not extra time after it."
+        )
+    return grace_s
+
+
 class HandlerTimeLimit:
     """Bound one call of a task handler, or any other block of handler code.
 
-    ``async with HandlerTimeLimit(300, grace_s=30) as limit:`` starts the clock.
-    At ``timeout_s`` the limit has passed: ``limit.expired`` is true and a new
-    top-level ``app.run`` started inside the block is refused with
-    ``ExecutionDeadlineExceeded``. Runs already in flight and other code keep
-    going for ``grace_s`` more seconds, so a result that is being delivered can
-    finish. Then the block is cancelled and leaves with
+    ``async with HandlerTimeLimit(300, grace_s=30) as limit:`` starts the clock,
+    and the block ends at ``timeout_s`` (300 seconds) at the latest. At
+    ``timeout_s - grace_s`` (270 seconds) the limit has passed: ``limit.expired``
+    is true and a new top-level ``app.run`` started inside the block is refused
+    with ``ExecutionDeadlineExceeded``. Runs already in flight and other code
+    keep going for the last ``grace_s`` seconds, so a result that is being
+    delivered can finish. At ``timeout_s`` the block is cancelled and leaves with
     ``ExecutionDeadlineExceeded`` (scope ``task_handler``); a run that was still
     in flight ends ``session.interrupted``. Cancellation from outside the block
     passes through unchanged.
+
+    ``grace_s`` defaults to 30 seconds, or half of ``timeout_s`` when that is
+    shorter. An explicit ``grace_s`` must be smaller than ``timeout_s`` (or
+    zero); otherwise the constructor raises ``ValueError``.
 
     The limit does not change the deadline stored on sessions, so a session
     that pauses for a person retains its deadline. A continuation consumed
@@ -226,20 +265,13 @@ class HandlerTimeLimit:
         self,
         timeout_s: float,
         *,
-        grace_s: float = 30.0,
+        grace_s: float | None = None,
         source: str = "task_handler",
     ) -> None:
-        for name, value in (("timeout_s", timeout_s), ("grace_s", grace_s)):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int | float)
-                or not math.isfinite(value)
-                or value < 0
-            ):
-                raise ValueError(f"{name} must be a finite, nonnegative number of seconds.")
+        effective_grace_s = handler_grace_seconds(timeout_s, grace_s)
         ExecutionDeadline(source=source)  # Validates the diagnostic label.
         self.timeout_s = float(timeout_s)
-        self.grace_s = float(grace_s)
+        self.grace_s = effective_grace_s
         self.source = source
         self._deadline: ExecutionDeadline | None = None
         self._session_ids: list[str] = []
@@ -253,11 +285,25 @@ class HandlerTimeLimit:
         self._parent: HandlerTimeLimit | None = None
 
     @property
+    def soft_timeout_s(self) -> float:
+        """Seconds after the start when new runs are refused: ``timeout_s - grace_s``."""
+        return self.timeout_s - self.grace_s
+
+    @property
     def deadline(self) -> ExecutionDeadline:
-        """The soft limit, fixed when the block was entered."""
+        """The soft limit (``timeout_s - grace_s``), fixed when the block was entered."""
         if self._deadline is None:
             raise RuntimeError("HandlerTimeLimit has not been entered.")
         return self._deadline
+
+    def run_deadline(self) -> ExecutionDeadline:
+        """The default deadline for runs started in the block: the soft limit, same clock.
+
+        It carries the soft limit's exact UTC and monotonic expiry, so a run that
+        ends at its default deadline always finds ``expired`` true afterwards.
+        """
+        # model_copy keeps the private monotonic expiry.
+        return self.deadline.model_copy(update={"scope": "execution"})
 
     @property
     def started(self) -> bool:
@@ -272,15 +318,15 @@ class HandlerTimeLimit:
 
     @property
     def cancelled(self) -> bool:
-        """True once the grace period ended and the block was cancelled."""
+        """True once ``timeout_s`` passed and the block was cancelled."""
         return self._cancelled.is_set()
 
     def remaining_seconds(self) -> float | None:
-        """Seconds until the limit passes, or ``None`` before the block starts."""
+        """Seconds until the soft limit passes, or ``None`` before the block starts."""
         return None if self._deadline is None else self._deadline.remaining_seconds()
 
     async def wait_cancelled(self) -> None:
-        """Return once the grace period ended and the block was cancelled."""
+        """Return once ``timeout_s`` passed and the block was cancelled."""
         await self._cancelled.wait()
 
     @property
@@ -302,6 +348,7 @@ class HandlerTimeLimit:
         return {
             "timeout_seconds": self.timeout_s,
             "grace_seconds": self.grace_s,
+            "runs_refused_after_seconds": self.soft_timeout_s,
             "execution_deadline": self.deadline.inspection(),
             "handler_cancelled": self.cancelled,
             "session_ids": list(self._session_ids),
@@ -319,13 +366,13 @@ class HandlerTimeLimit:
         if self._deadline is not None:
             raise RuntimeError("A HandlerTimeLimit can be entered only once.")
         self._deadline = ExecutionDeadline.after(
-            self.timeout_s, source=self.source, scope="task_handler"
+            self.soft_timeout_s, source=self.source, scope="task_handler"
         )
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         assert task is not None
         self._initial_cancellations = task.cancelling()
-        self._timer = asyncio.timeout(self.timeout_s + self.grace_s)
+        self._timer = asyncio.timeout(self.timeout_s)
         await self._timer.__aenter__()
         # Mark the hard limit in the same loop turn as the timer's cancellation,
         # before the block resumes with it.

@@ -97,6 +97,7 @@ def creation_operation_digest(request: TaskCreate, operation: TaskCreationOperat
             request.work_contract,
             request.schedule_policy,
             request.retry_policy,
+            request.retry_key,
             request.available_at,
             request.concurrency_key,
             request.restartable,

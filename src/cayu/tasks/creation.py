@@ -56,6 +56,11 @@ from cayu.tasks.records import (
     copy_task,
 )
 from cayu.tasks.retry import _task_retry_series_id, _task_retry_series_snapshot
+from cayu.tasks.retry_budgets import (
+    TaskRetryBudget,
+    copy_task_retry_budget,
+    validate_task_retry_key,
+)
 from cayu.tasks.scheduling import (
     TaskSchedulePolicy,
     TaskScheduleState,
@@ -119,6 +124,10 @@ class TaskCreate(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     retry_policy: TaskRetryPolicy | None = None
+    retry_key: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    retry_budget: TaskRetryBudget | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     concurrency_key: ConcurrencyKey = None
     restartable: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
     work_contract: WorkContractRef | None = None
@@ -148,6 +157,26 @@ class TaskCreate(BaseModel):
     @classmethod
     def copy_schedule_policy(cls, value: object) -> object:
         return revalidate_model_input(value, TaskSchedulePolicy)
+
+    @field_validator("retry_key")
+    @classmethod
+    def validate_retry_key(cls, value: str | None) -> str | None:
+        return None if value is None else validate_task_retry_key(value)
+
+    @field_validator("retry_budget", mode="before")
+    @classmethod
+    def copy_retry_budget(cls, value: object) -> object:
+        return revalidate_model_input(value, TaskRetryBudget)
+
+    @model_validator(mode="after")
+    def validate_retry_key_shape(self) -> TaskCreate:
+        if self.retry_key is None:
+            if self.retry_budget is not None:
+                raise ValueError("retry_budget requires a retry_key.")
+            return self
+        if self.session_id is not None or self.work_contract is not None:
+            raise ValueError("Retry-keyed tasks must start as unattached queue work.")
+        return self
 
     @model_validator(mode="after")
     def validate_schedule(self) -> TaskCreate:
@@ -264,6 +293,8 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
                 request.retry_policy.model_dump(mode="python", warnings=False)
             )
         ),
+        retry_key=request.retry_key,
+        retry_budget=copy_task_retry_budget(request.retry_budget),
         work_contract=copy_work_contract_ref(request.work_contract),
         invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
     )

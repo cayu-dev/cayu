@@ -306,6 +306,13 @@ from cayu.tasks.retry import (
     _validated_task_retry_terminal_accounting,
     prepare_task_retry_settlement,
 )
+from cayu.tasks.retry_budgets import (
+    TaskRetryBudgetExhausted,
+    TaskRetryKeyState,
+    admit_task_retry_key,
+    task_retry_key_request,
+)
+from cayu.tasks.retry_budgets import unscoped_task_retry_key as _unscoped_task_retry_key
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -465,6 +472,7 @@ class InMemoryTaskStore(TaskStore):
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
+    supports_task_retry_keys: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_completion_evaluations: ClassVar[bool] = True
@@ -488,6 +496,7 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
         self._creation_operation_receipts: dict[str, str] = {}
+        self._task_retry_keys: dict[str, TaskRetryKeyState] = {}
         self._tasks: dict[str, Task] = {}
         self._retired_task_sessions: set[str] = set()
         self._task_groups: dict[str, TaskGroupSnapshot] = {}
@@ -2296,13 +2305,34 @@ class InMemoryTaskStore(TaskStore):
             )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
+            keyed = task_retry_key_request(request)
+            key_state = None
+            if keyed is not None:
+                key_state, admitted = admit_task_retry_key(
+                    self._task_retry_keys.get(keyed[0]),
+                    retry_key=keyed[0],
+                    budget=keyed[1],
+                    task_id=task.id,
+                    now=self._clock(),  # Read right before the decision.
+                )
+                if not admitted:
+                    self._task_retry_keys[keyed[0]] = key_state
+                    raise TaskRetryBudgetExhausted(key_state)
             self._store_task(task)
+            if key_state is not None:
+                self._task_retry_keys[key_state.retry_key] = key_state
             if operation is not None:
                 assert digest is not None
                 self._creation_operation_receipts[task_id] = digest
             created = task.model_copy(deep=True)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
+
+    async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        retry_key = await _unscoped_task_retry_key(retry_key)
+        async with self._lock:
+            state = self._task_retry_keys.get(retry_key)
+            return None if state is None else state.model_copy(deep=True)
 
     async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
         if type(request) is not TaskRescheduleRequest:

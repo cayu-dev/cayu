@@ -689,6 +689,12 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    128: (
+        """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
+        retry_key TEXT COLLATE "C" PRIMARY KEY,
+        state_json TEXT NOT NULL
+    )""",
+    ),
     127: (
         """CREATE TABLE IF NOT EXISTS cayu_task_creation_operations (
         task_id TEXT COLLATE "C" PRIMARY KEY,

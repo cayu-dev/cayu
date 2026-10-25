@@ -50,7 +50,7 @@ only when the requested behavior requires it.
 | "Require approval before it pays, sends or deletes" | `ToolPolicy` with `REQUIRE_APPROVAL` (`AlwaysRequireApprovalToolPolicy`), `ToolEffect.IDEMPOTENT`, idempotency key | `cayu guide long-running#approval-before-a-side-effect` |
 | "Wait for an email reply", a document or a goods receipt | `UserInputTool` (`ask_user`), `UserInputResponse`, `resolve_user_input` | `cayu guide long-running#waiting-for-an-outside-reply` |
 | "Remind after N hours", chase, or expire a request | `TaskCreate(available_at=...)`, `TaskSchedulePolicy(expires_at=...)`, `run_task_worker` | `cayu guide long-running#timers` |
-| "Stop a hung background job" or give each job a time limit | `run_task_worker(execution_timeout_s=..., execution_grace_s=...)`, `HandlerTimeLimit`, `ExecutionDeadline` | `cayu guide long-running#time-limit-for-worker-runs` |
+| "Stop a hung background job" or give each job a time limit | `run_task_worker(execution_timeout_s=..., execution_grace_s=...)`, `HandlerTimeLimit`, `ExecutionDeadline`, and `TaskCreate(retry_key=...)` so a sweeper that resubmits the event stops | `cayu guide long-running#time-limit-for-worker-runs` |
 | "Cap spending" per session or job | `BudgetLimit(scope="session")`, `default_price_book()`, `BudgetPolicy` for app or agent caps | `cayu guide long-running#spend-cap` |
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
 | Application workspace references or inventories | `WorkspaceReferenceBinding`, `ToolContext.require_workspace_binding` | `cayu guide authoring#workspace-references-and-inventories` |

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from typing import Any
@@ -30,6 +31,13 @@ def add_inspect_parser(subparsers: Any) -> None:
     subjects.add_argument("--agent", help="Return one agent from the manifest.")
     subjects.add_argument("--tool", help="Return agents registering this tool.")
     subjects.add_argument("--environment", help="Return one environment from the manifest.")
+    subjects.add_argument(
+        "--retry-key",
+        help=(
+            "Read one task retry key's budget state from the project's task store: "
+            "attempts, the budget, and whether it gave up."
+        ),
+    )
 
 
 def run_inspect(args: argparse.Namespace) -> int:
@@ -46,6 +54,8 @@ def _run_inspect(args: argparse.Namespace) -> int:
         project = resolve_project(args.target, command="cayu inspect")
         with project_context(project.root):
             app = build_project_app(project.target, command="Inspect")
+            if args.retry_key is not None:
+                return _inspect_retry_key(app, args.retry_key, args.output_format)
             manifest = app.describe(project_root=project.root)
     except Exception as exc:
         if args.output_format == "json":
@@ -104,6 +114,62 @@ def _run_inspect(args: argparse.Namespace) -> int:
         print(filtered.model_dump_json(indent=2))
     else:
         print(_render_human(filtered))
+    return 0
+
+
+def _inspect_retry_key(app: Any, retry_key: str, output_format: str) -> int:
+    async def load() -> Any:
+        try:
+            if app.task_store is None or not app.task_store.supports_task_retry_keys:
+                raise ProjectError("The project's task store does not support task retry keys.")
+            return await app.task_store.load_task_retry_key(retry_key)
+        finally:
+            await app.aclose()
+            # The CLI process owns the stores its project factory opened.
+            close = getattr(app.task_store, "close", None)
+            if close is not None:
+                await close()
+
+    state = asyncio.run(load())
+    if state is None:
+        error = {
+            "code": "SUBJECT_NOT_FOUND",
+            "message": f"Retry key not found: {retry_key}.",
+            "path": f"retry_keys.{retry_key}",
+        }
+        if output_format == "json":
+            print(json.dumps({"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error}))
+        else:
+            print(f"error: {error['message']}", file=sys.stderr)
+        return 1
+    if output_format == "json":
+        print(
+            json.dumps(
+                {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "retry_key": state.inspection()},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    budget = state.budget
+    cap = "no attempt cap" if budget.max_attempts is None else f"of {budget.max_attempts}"
+    window = (
+        "no time cap"
+        if budget.max_elapsed_seconds is None
+        else f"within {budget.max_elapsed_seconds:g}s of the first"
+    )
+    lines = [
+        f"Retry key {state.retry_key}: {state.status.value}",
+        f"Attempts: {state.attempts} {cap}, {window}",
+        f"First attempt: {state.first_attempt_at.isoformat()}",
+        f"Latest task: {state.latest_task_id} at {state.latest_attempt_at.isoformat()}",
+    ]
+    if state.given_up_at is not None and state.given_up_reason is not None:
+        lines.append(
+            f"Gave up: {state.given_up_at.isoformat()} ({state.given_up_reason.value}); "
+            f"refused task {state.refused_task_id}"
+        )
+    print("\n".join(lines))
     return 0
 
 

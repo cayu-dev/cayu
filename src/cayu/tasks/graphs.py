@@ -74,6 +74,8 @@ class TaskGraphNode(BaseModel):
         copied = copy_task_create(value)
         if copied.restartable:
             raise ValueError("Restartable tasks cannot be members of task graphs or groups.")
+        if copied.retry_key is not None:
+            raise ValueError("Retry-keyed tasks cannot be members of task graphs or groups.")
         if copied.task_id is None:
             raise ValueError("Graph nodes require explicit task identities.")
         graph_identifier(copied.task_id)

@@ -315,6 +315,11 @@ async def create_task(
             raise NotImplementedError(
                 f"{type(task_store).__name__} does not support task retry series."
             )
+        if request.retry_key is not None and not task_store.supports_task_retry_keys:
+            del request
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not support task retry keys."
+            )
         if request.work_contract is None:
             if creation_operation is not None:
                 return await task_store.create_task_operation(request, creation_operation)

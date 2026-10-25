@@ -53,6 +53,7 @@ from cayu.deadlines import (
     ExecutionDeadlineExceeded,
     HandlerTimeLimit,
     default_run_deadline,
+    require_handler_seconds,
 )
 from cayu.events import (
     Event,
@@ -199,7 +200,6 @@ RecoveredInterruptedTaskHandler = Callable[
 # output stay readable; truncation is marked instead of silent.
 _MAX_TASK_FAILURE_MESSAGE_BYTES = 4 * 1024
 _TASK_FAILURE_TRUNCATION_MARKER = "\u2026[truncated]"
-_DEFAULT_EXECUTION_GRACE_SECONDS = 30.0
 # A cancelled handler that is still running this long after the grace period
 # (never less than this floor) gets a durable cancellation request.
 _HANDLER_STOP_WAIT_FLOOR_SECONDS = 1.0
@@ -477,7 +477,7 @@ async def run_task_worker(
     max_tasks: int | None = None,
     concurrency: int = 1,
     execution_timeout_s: float | None = None,
-    execution_grace_s: float = _DEFAULT_EXECUTION_GRACE_SECONDS,
+    execution_grace_s: float | None = None,
 ) -> int:
     """Claim and handle durable tasks until stopped; return the number handled.
 
@@ -528,33 +528,41 @@ async def run_task_worker(
       stops new claims and drains active handlers; cancelling this coroutine
       applies the existing cancellation/settlement rules to every active slot.
       Infrastructure errors stop and drain the group before propagating.
-    - ``execution_timeout_s`` is the longest one handler call may take,
-      counted from handler start, whether or not its runs are attached to the
-      task. ``None`` (the default) sets no limit. Runs the handler starts without
-      their own ``execution_deadline`` get it as their default, so a hung run
-      ends ``session.interrupted`` with ``limit_reached``. When it passes, a new
-      top-level run in that call is refused with ``ExecutionDeadlineExceeded``,
-      and :func:`cayu.deadlines.current_handler_time_limit` reports it expired.
-      ``execution_grace_s`` later (30 seconds by default) the handler is
-      cancelled; a run still in flight ends ``session.interrupted``. Once the
-      handler has stopped, a task it did not settle fails with
-      ``ExecutionDeadlineExceeded`` (scope ``task_handler``, with the IDs of the
-      sessions it started); a task with a retry policy records a retryable
-      failed attempt instead, and a pending cancellation still wins. A
-      restartable task is not requeued. A handler that keeps running after it is
-      cancelled keeps its lease, and its task gets a durable cancellation
-      request (code ``task_handler_timeout``) that settles when it returns. The
-      limit is :class:`cayu.deadlines.HandlerTimeLimit`, which a hand-written
-      worker can use on its own.
+    - ``execution_timeout_s`` is the longest one handler call may take, grace
+      period included, counted from handler start, whether or not its runs are
+      attached to the task. ``None`` (the default) sets no limit. The last
+      ``execution_grace_s`` seconds of it are the grace period (30 seconds by
+      default, or half the limit if that is shorter; an explicit value must be
+      smaller than the limit). With 600 and 30, new top-level runs in the call
+      are refused with ``ExecutionDeadlineExceeded`` from 570 seconds, and
+      :func:`cayu.deadlines.current_handler_time_limit` reports it expired. Runs
+      the handler starts without their own ``execution_deadline`` get that
+      570-second mark as their deadline, so a hung run ends
+      ``session.interrupted`` with ``limit_reached`` and leaves the grace period
+      to deliver. At 600 seconds the handler is cancelled; a run still in flight
+      ends ``session.interrupted``. Once the handler has stopped, a task it did
+      not settle fails with ``ExecutionDeadlineExceeded`` (scope
+      ``task_handler``, with the IDs of the sessions it started); a task with a
+      retry policy records a retryable failed attempt instead, and a pending
+      cancellation still wins. A restartable task is not requeued. A handler
+      that keeps running after it is cancelled keeps its lease, and its task
+      gets a durable cancellation request (code ``task_handler_timeout``) that
+      settles when it returns. The limit is
+      :class:`cayu.deadlines.HandlerTimeLimit`, which a hand-written worker can
+      use on its own. The limit ends one handler call, not the work: an
+      application that creates a new task for the same event should pass
+      ``TaskCreate(retry_key=...)`` so the key's ``TaskRetryBudget`` stops it.
     """
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive int.")
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
     validate_worker_interval(poll_interval_s, "poll_interval_s")
-    HandlerTimeLimit(  # Validates both settings before any claim.
-        0 if execution_timeout_s is None else execution_timeout_s, grace_s=execution_grace_s
-    )
+    # Validates both settings before any claim.
+    if execution_timeout_s is not None:
+        HandlerTimeLimit(execution_timeout_s, grace_s=execution_grace_s)
+    elif execution_grace_s is not None:
+        require_handler_seconds(execution_grace_s, "execution_grace_s")
     if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
         raise TypeError("metrics must be a DurableWorkerMetrics instance.")
     demand_policy = DurableWorkerDemandPolicy(
@@ -1031,7 +1039,7 @@ async def _handle_with_heartbeat(
     *,
     recover_interrupted_authority_loss: bool = False,
     execution_timeout_s: float | None = None,
-    execution_grace_s: float = _DEFAULT_EXECUTION_GRACE_SECONDS,
+    execution_grace_s: float | None = None,
 ) -> None:
     settlement = TaskExecutionSettlement(task_store, app._secret_redactor)
     primary: BaseException | None = None
@@ -1080,7 +1088,7 @@ async def _handle_with_heartbeat_owned(
     settlement: TaskExecutionSettlement,
     recover_interrupted_authority_loss: bool,
     execution_timeout_s: float | None,
-    execution_grace_s: float,
+    execution_grace_s: float | None,
 ) -> None:
     (
         task,
@@ -1567,21 +1575,23 @@ async def _await_task_handler(
             from cayu._resource_access_errors import ResourceAccessDenied
 
             raise ResourceAccessDenied()
-        async with execution_access(
-            task.invocation.resource_access,
-            app.resource_access_policy,
-            task.invocation.access_labels,
-            kind="tasks",
+        # Fixed at handler start, so retries within this call share it. The run
+        # default comes from the entered limit, so the two cannot disagree.
+        async with (
+            execution_access(
+                task.invocation.resource_access,
+                app.resource_access_policy,
+                task.invocation.access_labels,
+                kind="tasks",
+            ),
+            contextlib.nullcontext() if time_limit is None else time_limit,
         ):
-            # Fixed at handler start, so retries within this call share it.
             with default_run_deadline(
-                ExecutionDeadline.after(
-                    None if time_limit is None else time_limit.timeout_s,
-                    source="task_worker",
-                )
+                ExecutionDeadline.after(None, source="task_worker")
+                if time_limit is None
+                else time_limit.run_deadline()
             ):
-                async with contextlib.nullcontext() if time_limit is None else time_limit:
-                    result = await handler(app, handler_view, worker_id)
+                result = await handler(app, handler_view, worker_id)
         return result
 
     async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
@@ -3616,7 +3626,7 @@ async def _run_recovered_interrupted_task_handler(
     max_unproductive_handoffs: int | None = None,
     stop: asyncio.Event | None = None,
     execution_timeout_s: float | None = None,
-    execution_grace_s: float = _DEFAULT_EXECUTION_GRACE_SECONDS,
+    execution_grace_s: float | None = None,
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
 
@@ -4574,18 +4584,17 @@ def _handler_time_limit_failure_payload(
 ) -> dict[str, Any]:
     """Describe a handler call that outlived its time limit, before a store await."""
 
-    action = (
-        "was cancelled after its grace period"
+    message = (
+        f"The task handler did not finish within its {time_limit.timeout_s:g}s time "
+        "limit and was cancelled."
         if time_limit.cancelled
-        else "stopped during its grace period without settling the task"
+        else f"The task handler passed {time_limit.soft_timeout_s:g}s of its "
+        f"{time_limit.timeout_s:g}s time limit, after which new runs are refused, and "
+        "stopped without settling the task."
     )
     payload: dict[str, Any] = {
         "error": "ExecutionDeadlineExceeded",
-        "message": (
-            f"The task handler did not finish within its {time_limit.timeout_s:g}s time "
-            f"limit and {action}. Anything it was doing then may or may not have taken "
-            "effect."
-        ),
+        "message": f"{message} Anything it was doing then may or may not have taken effect.",
         "scope": "task_handler",
         **time_limit.inspection(),
     }

@@ -890,7 +890,7 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
-    assert len(guide.splitlines()) <= 230
+    assert len(guide.splitlines()) <= 235
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
     assert len(snippets) == 6
     namespace: dict[str, Any] = {}
@@ -1034,6 +1034,25 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         assert events[-1].type.value == "session.interrupted"
 
     asyncio.run(hung_worker())
+
+    # Retry budget: the guide's sweeper stops creating tasks for one event.
+    async def sweeper_gives_up() -> None:
+        from cayu.evals.testing import ScriptedModelProvider
+        from cayu.sessions.memory import InMemorySessionStore
+        from cayu.tasks import InMemoryTaskStore, TaskRetryKeyStatus
+
+        app = namespace["build_app"](
+            provider=ScriptedModelProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        for attempt in (1, 2, 3):
+            assert await namespace["retry_job"](app, "INV-11", attempt, "Pay INV-11.") is None
+        given_up = await namespace["retry_job"](app, "INV-11", 4, "Pay INV-11.")
+        assert given_up.status is TaskRetryKeyStatus.GIVEN_UP
+        assert await app.task_store.load_task("invoice-INV-11-4") is None
+
+    asyncio.run(sweeper_gives_up())
 
     for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
         assert main(["guide", reference]) == 0, reference

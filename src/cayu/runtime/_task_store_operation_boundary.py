@@ -41,6 +41,7 @@ from cayu.tasks.groups import (
     TaskGroupUnavailable,
 )
 from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.retry_budgets import TaskRetryBudgetExhausted, TaskRetryKeyState
 from cayu.tasks.scheduling import TaskScheduleConflict
 from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
@@ -546,6 +547,40 @@ def _task_store_forwarded_cancellation(
     return safe_cancellation
 
 
+def _detached_retry_budget_exhaustion(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> TaskRetryBudgetExhausted | None:
+    """Rebuild a refused retry key with a detached copy of its validated state.
+
+    The state is the caller's contract (it says the key gave up for good), so it
+    survives the boundary when every rendering of it is credential-safe;
+    otherwise the ordinary classification applies.
+    """
+
+    if type(error) is not TaskRetryBudgetExhausted:
+        return None
+    state = getattr(error, "state", None)
+    if type(state) is not TaskRetryKeyState:
+        return None
+    try:
+        detached = TaskRetryKeyState.model_validate(state.model_dump(mode="python"))
+    except Exception:
+        return None
+    rebuilt = TaskRetryBudgetExhausted(detached)
+    # Check decoded values too: JSON escaping can hide a secret from text matching.
+    document = detached.model_dump_json()
+    payload = detached.model_dump(mode="json")
+    if (
+        redactor.redact_json(payload) != payload
+        or redactor.redact_text(document) != document
+        or not runtime_owned_exception_renderings_are_credential_safe(rebuilt, redactor=redactor)
+    ):
+        return None
+    return rebuilt
+
+
 def _detached_task_store_failure(
     error: BaseException,
     *,
@@ -554,6 +589,9 @@ def _detached_task_store_failure(
 ) -> BaseException:
     """Copy one extension failure without its traceback, context, or payload locals."""
 
+    exhausted = _detached_retry_budget_exhaustion(error, redactor=redactor)
+    if exhausted is not None:
+        return exhausted
     diagnostic = exception_diagnostic(
         error,
         empty_message=f"{operation_name.lower()} failed",
@@ -732,6 +770,9 @@ def _generic_task_store_failure(
 ) -> BaseException:
     """Preserve a detached store failure's public classification without text."""
 
+    exhausted = _detached_retry_budget_exhaustion(error, redactor=redactor)
+    if exhausted is not None:
+        return exhausted
     if isinstance(error, GeneratorExit):
         safe_type: type[BaseException] = GeneratorExit
     elif isinstance(error, KeyboardInterrupt):

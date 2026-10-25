@@ -28,8 +28,9 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 protocol 7 and refuses an image built from an earlier release at readiness.
 
 Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
-confirm revision 127. Task adapters require revision 127: exact declared task
-creation receipts and deletion-surviving identity fences are now persisted. Bound continuation
+confirm revision 128. Task adapters require revision 128: exact declared task
+creation receipts and deletion-surviving identity fences are now persisted, and
+additive revision 128 adds the `cayu_task_retry_keys` table for retry budgets. Bound continuation
 claims now persist their expected attachment and selected-operation digest in the
 existing claim registry. The compatibility floor is 127; stop older workers before
 migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
@@ -53,8 +54,9 @@ requirements below. An Agent reports to Cayu Cloud once
 attention to it once `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`
 are both set. Set both handoff variables or neither.
 If you set `run_task_worker(execution_timeout_s=...)`, it now bounds the whole
-handler call: check that delivery and retry work fits within it plus
-`execution_grace_s` (see the breaking change below). Hardened Docker egress now
+handler call, grace period included: check that delivery and retry work fits
+within it, and that an explicit `execution_grace_s` is smaller than it (see the
+breaking change below). Hardened Docker egress now
 refuses an engine that cannot keep the guest off the Docker host, and portable
 snapshot materialization refuses on Windows (both below). The Agent also trusts
 a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are set.
@@ -73,13 +75,19 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
   baseline. Invalid workspaces are refused before copying; a failed baseline
   abandons the sandbox binding.
 - `run_task_worker(execution_timeout_s=...)` is now the longest one handler call
-  may take, not only a default deadline for the runs it starts. Once it passes,
-  new runs in the call are refused, including ones with their own
-  `execution_deadline`. `execution_grace_s` later (new, 30 seconds by default)
-  the handler is cancelled, and a task it did not settle fails with
-  `ExecutionDeadlineExceeded` (`scope` `task_handler`). A handler that delivers
-  or retries after its runs end now has to fit in the limit plus the grace
-  period. The default is still `None`.
+  may take, grace period included, not only a default deadline for the runs it
+  starts. The last `execution_grace_s` seconds of it (new, 30 seconds by
+  default, or half the limit when that is shorter) are the grace period. With
+  600 and 30, new runs in the call are refused from 570 seconds, including ones
+  with their own `execution_deadline`, runs without their own deadline end
+  then, and at 600 seconds the handler is cancelled and a task it did not settle
+  fails with `ExecutionDeadlineExceeded` (`scope` `task_handler`). Earlier
+  0.14.0 development builds cancelled at the limit plus the grace period (630
+  seconds); a handler now has to deliver or retry within the limit itself. An
+  explicit `execution_grace_s` (or `HandlerTimeLimit(grace_s=...)`) that is not
+  smaller than the limit now raises `ValueError` instead of extending it, and
+  `HandlerTimeLimit`'s `grace_s` default is now `None` (the rule above). The
+  `execution_timeout_s` default is still `None`.
 - `DockerEgressAdapter(workload_restrictions=...)` now refuses a runner unless it
   can show that the guest cannot reach the Docker host. Its networks need a
   Docker engine that honors `com.docker.network.bridge.inhibit_ipv4`; Docker
@@ -105,6 +113,19 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
   Alternatively, start a new session.
 
 ### Changes
+
+- A retry budget now bounds an event that the application retries by creating
+  new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
+  for every task of that event; tasks with one key share a `TaskRetryBudget`,
+  by default 3 tasks created within 30 minutes of the first. Past it the store
+  creates no task, `create_task` raises `TaskRetryBudgetExhausted`, and the
+  key's durable `TaskRetryKeyState` stays `given_up`. Read it with
+  `TaskStore.load_task_retry_key(key)` or `cayu inspect --retry-key KEY`.
+  Pass `retry_budget=TaskRetryBudget(...)` to raise the budget or
+  `TaskRetryBudget.unlimited()` to only count. Tasks without a key are
+  unchanged. The memory, SQLite and PostgreSQL task stores support it
+  (`supports_task_retry_keys`); a custom store without it refuses keyed tasks
+  through `CayuApp.create_task`.
 
 - Pending-action recovery reads now expose the exact sibling tool-call reference when the interruption event itself cannot name it unambiguously. References come from matching durable start evidence, retain the same attention identity, and reconstruct after store reopen; recovery authorization is unchanged.
 

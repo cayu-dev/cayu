@@ -208,6 +208,14 @@ from cayu.tasks.retry import (
     _validated_task_retry_terminal_accounting,
     prepare_task_retry_settlement,
 )
+from cayu.tasks.retry_budgets import (
+    TaskRetryBudgetExhausted,
+    TaskRetryKeyState,
+    admit_task_retry_key,
+    stored_task_retry_key_state,
+    task_retry_key_request,
+    unscoped_task_retry_key,
+)
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -249,7 +257,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 127
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 128
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -391,6 +399,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
+    supports_task_retry_keys: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_completion_evaluations: ClassVar[bool] = True
@@ -1081,7 +1090,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         notification_sender_pid: int | None = None
         notification_sender_connection: Any | None = None
 
-        async def operation(conn: Any, cur: Any) -> tuple[Task, bool]:
+        async def operation(conn: Any, cur: Any) -> tuple[Task | TaskRetryKeyState, bool]:
             nonlocal notification_sender_connection, notification_sender_pid
             selected_request = request
             await self._lock_verified_work_task(cur, task_id)
@@ -1179,6 +1188,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     retry_started_at=retry_started_at,
                     supports_verified_work_contracts=True,
                 )
+            refused = await self._admit_task_retry_key(cur, selected_request, task)
+            if refused is not None:
+                # Committed by the caller, then raised, so the given-up state is durable.
+                return refused, False
             await cur.execute(
                 f"""
                 INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
@@ -1210,7 +1223,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             return task, publish_admission_wakeup
 
         try:
-            task, publish_admission_wakeup = await self._run_verified_work_mutation(operation)
+            outcome, publish_admission_wakeup = await self._run_verified_work_mutation(operation)
         except BaseException as exc:
             if notification_sender_pid is not None:
                 self._discard_task_admission_notification_sender(
@@ -1220,12 +1233,54 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             if isinstance(exc, UniqueViolation):
                 raise ValueError(f"Task already exists: {task_id}") from exc
             raise
+        if isinstance(outcome, TaskRetryKeyState):
+            raise TaskRetryBudgetExhausted(outcome)
+        task = outcome
         if publish_admission_wakeup:
             self._publish_task_admission_wakeup(
                 task,
                 now=task.available_at or task.created_at,
             )
         return task
+
+    async def _admit_task_retry_key(
+        self, cur: Any, request: TaskCreate, task: Task
+    ) -> TaskRetryKeyState | None:
+        """Count a keyed task inside its insert transaction; return the state if refused."""
+        keyed = task_retry_key_request(request)
+        if keyed is None:
+            return None
+        # The caller holds the task identity lock, so this check is exact.
+        await cur.execute("SELECT 1 FROM cayu_tasks WHERE id = %s", (task.id,))
+        if await cur.fetchone() is not None:
+            raise ValueError(f"Task already exists: {task.id}")
+        await self._lock_verified_work_identity(cur, "retry-key", keyed[0])
+        prior = await self._load_task_retry_key_row(cur, keyed[0])
+        # Store time sampled after the key lock wait, right before the decision.
+        now = await self._verified_evidence_now(cur)
+        state, admitted = admit_task_retry_key(
+            prior, retry_key=keyed[0], budget=keyed[1], task_id=task.id, now=now
+        )
+        if state is not prior:
+            await cur.execute(
+                "INSERT INTO cayu_task_retry_keys (retry_key, state_json) VALUES (%s, %s) "
+                "ON CONFLICT (retry_key) DO UPDATE SET state_json = EXCLUDED.state_json",
+                (state.retry_key, state.model_dump_json()),
+            )
+        return None if admitted else state
+
+    async def _load_task_retry_key_row(self, cur: Any, retry_key: str) -> TaskRetryKeyState | None:
+        await cur.execute(
+            "SELECT state_json FROM cayu_task_retry_keys WHERE retry_key = %s", (retry_key,)
+        )
+        row = await cur.fetchone()
+        return None if row is None else stored_task_retry_key_state(row[0], retry_key)
+
+    async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        retry_key = await unscoped_task_retry_key(retry_key)
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            return await self._load_task_retry_key_row(cur, retry_key)
 
     async def _record_task_transition(
         self,
