@@ -1499,6 +1499,14 @@ Notes on the Docker adapter:
   hardened guest's host isolation probe also runs from this image; if it lacks
   `timeout`, `socat` or `awk`, the runner is refused with
   `egress_probe_tool_missing` naming the tool.
+- The runner is refused with `egress_host_reachable` only when the probe finds
+  a way to the host: an answer from a host address, a routed path or an IPv6
+  address. A probe that ends without a verdict (no output, unexpected output,
+  a timeout, or a connect or route-table check it could not decide) is refused
+  with `egress_host_isolation_unverified` instead. That error names the reason
+  and carries the probe's exit code and its last stderr lines, masked like the
+  setup diagnostics above. A probe that prints nothing runs once more in a new
+  container before the runner is refused.
 - `setup_commands` run on the enforced network with the egress overlay applied, so they are
   subject to the **same egress policy** as the app. Bake tools that need arbitrary hosts into the
   image rather than installing them from `setup_commands` under `virtual_egress`.

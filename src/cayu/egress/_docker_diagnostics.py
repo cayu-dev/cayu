@@ -44,6 +44,10 @@ _PEM = re.compile(
     r"(?:-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----|\Z)",
     re.DOTALL,
 )
+# Private key armor lines, to find a key whose BEGIN line fell before a cut.
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+_PEM_END = re.compile(r"-----END [A-Z ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+_PEM_MARKER_MAX = len("-----BEGIN ") + 64 + len("PRIVATE KEY BLOCK-----")
 # Userinfo before ``@`` in a URL: user:password, or a bare token.
 _URL_USERINFO = re.compile(r"(?<=://)[^/\s@?#]++(?=@)")
 # Quoted mappings, masked even when the value's closing quote is missing (for
@@ -115,10 +119,19 @@ _CREDENTIAL_FLAGS = frozenset(
 # NAME= at the start of a name run, including after another ``=`` (--env=TOKEN=x).
 _KEY_NAME = re.compile(r"(?<![A-Za-z0-9_.-])(?P<name>[A-Za-z0-9_.-]++)=")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
-# Before masking: drop ANSI CSI sequences and turn other controls and
-# zero-width characters into spaces, so they cannot hide a flag or key from
-# the masks and then vanish when the text is flattened.
+# Before masking (see _normalized): drop ANSI escape sequences and turn other
+# controls and zero-width characters into spaces.
 _ANSI_CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*+[ -/]*+[@-~]")
+# Operating system commands (titles, hyperlinks), ended by BEL or ST, or left
+# unterminated up to the end of the line. Their introducer is ``ESC ]``, so
+# dropping one never eats a character of the text around it. Other escape
+# sequences are not dropped: their ESC becomes a space like any control, which
+# keeps a flag and its value apart.
+_ANSI_OSC = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c\n]*+(?:\x07|\x1b\\|\x9c)?")
+# The character-set selections terminal resets emit (``tput sgr0`` writes
+# ``ESC ( B``). Only the ASCII and line-drawing sets are matched, and the
+# sequence becomes a space, so it cannot join or shorten the words around it.
+_ANSI_CHARSET = re.compile(r"\x1b[()*+][B0]")
 _INVISIBLE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f\u200b-\u200d\u2060\ufeff]++")
 _OPERATIONS = frozenset({"run", "exec", "start", "stop", "rm", "pause", "unpause", "inspect"})
 _NETWORK_OPERATIONS = frozenset({"create", "connect", "disconnect", "rm", "inspect", "ls"})
@@ -143,9 +156,83 @@ def docker_setup_failure(
     )
 
 
+def docker_stderr_tail(
+    stderr: str,
+    *,
+    max_lines: int = 5,
+    redactor: SecretRedactor | None = None,
+) -> str:
+    """The last non-blank stderr lines, masked and bounded like a setup failure.
+
+    Lines are joined with `` | ``. The scan window is the end of *stderr*, and
+    masking runs on the whole window before lines are picked, so a multi-line
+    secret is masked as a whole. Earlier lines are dropped first to stay
+    within the byte bound; ``...[truncated]`` leads when stderr was longer
+    than the window.
+    """
+    redactor = redactor or SecretRedactor()
+    if not stderr.strip():
+        return "[unavailable]"
+    text, cut = _masked_tail(stderr, redactor)
+    lines = [line for line in text.split("\n") if line]
+    kept: list[str] = []
+    for line in reversed(lines[-max_lines:]):
+        if kept and len(" | ".join([line, *kept]).encode()) > _MAX_STDERR_BYTES:
+            break
+        kept.insert(0, line)
+    bounded, _ = redactor.redact_text_bounded_with_marker(
+        " | ".join(kept),
+        max_bytes=_MAX_STDERR_BYTES,
+        truncation_marker="...[truncated]",
+    )
+    if cut:
+        bounded = "...[truncated] " + bounded
+    return bounded or _REDACTED
+
+
 def _safe_stderr(stderr: str, redactor: SecretRedactor) -> str:
     if not stderr.strip():
         return "[unavailable]"
+    return _bounded(" ".join(_masked_window(stderr, redactor).split()), stderr, redactor)
+
+
+def _bounded(text: str, stderr: str, redactor: SecretRedactor) -> str:
+    bounded, truncated = redactor.redact_text_bounded_with_marker(
+        text,
+        max_bytes=_MAX_STDERR_BYTES,
+        truncation_marker="...[truncated]",
+    )
+    if len(stderr) > _MAX_SCAN_CHARACTERS and not truncated:
+        bounded += "...[truncated]"
+    return bounded or _REDACTED
+
+
+def _masked_tail(stderr: str, redactor: SecretRedactor) -> tuple[str, bool]:
+    """Redact and mask the last 64 Ki characters; also say whether text was cut.
+
+    Registered secrets are redacted in the whole string first, so the window
+    cannot cut one. The string is then normalized the way the masks see it,
+    so the private key scan finds the same armor lines the PEM mask would,
+    and the window is taken from that normalized text.
+    """
+    text = _normalized(redactor.redact_text(stderr))
+    if len(text) <= _MAX_SCAN_CHARACTERS:
+        return _flattened(_mask_credentials(text)), False
+    start = len(text) - _MAX_SCAN_CHARACTERS
+    # A private key whose BEGIN line falls before the window has no armor
+    # left for the PEM mask to find, so drop the window up to its END line,
+    # or all of it when the key never ends.
+    key_end = _private_key_end_after(text, start)
+    window = "" if key_end is None else text[max(start, key_end) :]
+    # Then drop the rest of the cut line, so no half-cut credential shape stays.
+    window = window[window.find("\n") + 1 :] if "\n" in window else ""
+    if key_end != start:
+        window = _REDACTED + "\n" + window
+    return _flattened(_mask_credentials(window)), True
+
+
+def _masked_window(stderr: str, redactor: SecretRedactor) -> str:
+    """Redact and mask the first 64 Ki characters; lines stay, each one flattened."""
     window = stderr[:_MAX_SCAN_CHARACTERS]
     if len(stderr) > _MAX_SCAN_CHARACTERS:
         # A secret cut at the scan limit, or one nested inside it, would survive
@@ -158,16 +245,42 @@ def _safe_stderr(stderr: str, redactor: SecretRedactor) -> str:
         text = text[:boundary] if boundary > 0 else ""
     else:
         text = redactor.redact_text(window)
-    text = _mask_credentials(_INVISIBLE.sub(" ", _ANSI_CSI.sub("", text)))
-    text = " ".join(_CONTROL.sub(" ", text).split())
-    bounded, truncated = redactor.redact_text_bounded_with_marker(
-        text,
-        max_bytes=_MAX_STDERR_BYTES,
-        truncation_marker="...[truncated]",
-    )
-    if len(stderr) > _MAX_SCAN_CHARACTERS and not truncated:
-        bounded += "...[truncated]"
-    return bounded or _REDACTED
+    return _flattened(_mask_credentials(_normalized(text)))
+
+
+def _normalized(text: str) -> str:
+    """Drop CSI and OSC sequences; turn character-set selections, other
+    controls and zero-width characters into spaces.
+
+    This runs before masking, so they cannot hide a flag, key or armor line
+    from the masks and then vanish when the text is flattened.
+    """
+    text = _ANSI_CHARSET.sub(" ", _ANSI_OSC.sub("", _ANSI_CSI.sub("", text)))
+    return _INVISIBLE.sub(" ", text)
+
+
+def _flattened(text: str) -> str:
+    return "\n".join(" ".join(_CONTROL.sub(" ", line).split()) for line in text.split("\n"))
+
+
+def _private_key_end_after(stderr: str, start: int) -> int | None:
+    """Where a private key open at *start* ends: *start* itself when none is open.
+
+    Returns the end of the key's END line, or None when the key never ends.
+    Both scans are single passes over *stderr*.
+    """
+    begin = None
+    # A BEGIN line that starts before *start* may end after it.
+    for match in _PEM_BEGIN.finditer(stderr, 0, start + _PEM_MARKER_MAX):
+        if match.start() >= start:
+            break
+        begin = match
+    if begin is None:
+        return start
+    end = _PEM_END.search(stderr, begin.end())
+    if end is None:
+        return None
+    return max(start, end.end())
 
 
 def _mask_credentials(text: str) -> str:

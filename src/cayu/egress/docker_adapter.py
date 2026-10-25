@@ -18,7 +18,7 @@ from typing import Any
 from cayu._exception_groups import add_exception_note_safely
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu.credentials import CredentialMode
-from cayu.egress._docker_diagnostics import docker_setup_failure
+from cayu.egress._docker_diagnostics import docker_setup_failure, docker_stderr_tail
 from cayu.egress._docker_reconnect import (
     OWNER_LABEL,
     PROXY_ALIAS,
@@ -152,11 +152,21 @@ _HOST_ISOLATION_PROBE_FAILURES = frozenset(
     }
 )
 
+# The failure verdicts that show a way to the host: an answer, an address held
+# on the network, a route or an IPv6 address. host_address_present comes from
+# the probe's neighbor-table check. Every other failure verdict means the probe
+# ran but could not decide.
+_HOST_ISOLATION_PROBE_REACHABLE = frozenset(
+    {"host_reachable", "host_address_present", "routed_path_present", "ipv6_address_present"}
+)
+
 # A docker executor returns (exit_code, stderr) so orchestration can be faked in
 # tests without a real Docker daemon.
 DockerExec = Callable[[Sequence[str]], Awaitable[tuple[int, str]]]
 # A docker STDOUT runner used only for host-interface discovery.
 DockerRun = Callable[[Sequence[str]], Awaitable[tuple[int, str]]]
+# A docker runner that returns (exit_code, stdout, stderr), for the host probe.
+_DockerCapture = Callable[[Sequence[str]], Awaitable[tuple[int, str, str]]]
 
 
 @dataclass
@@ -244,6 +254,17 @@ async def _default_docker_exec(
     *,
     docker_cli_env_allowlist: Sequence[str] = (),
 ) -> tuple[int, str]:
+    code, _, stderr = await _run_docker_captured(
+        argv, docker_cli_env_allowlist=docker_cli_env_allowlist
+    )
+    return code, stderr
+
+
+async def _run_docker_captured(
+    argv: Sequence[str],
+    *,
+    docker_cli_env_allowlist: Sequence[str] = (),
+) -> tuple[int, str, str]:
     docker = shutil.which("docker")
     if not docker:
         raise UnsupportedEgressError("docker CLI not found; cannot enforce virtual egress.")
@@ -255,7 +276,7 @@ async def _default_docker_exec(
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        _, stderr = await process.communicate()
+        stdout, stderr = await process.communicate()
     except asyncio.CancelledError as cancellation:
         # Killing the CLI does not cancel daemon mutations. The preparation
         # owner still rolls back its named resources; this settles the waiter.
@@ -269,7 +290,11 @@ async def _default_docker_exec(
             cancellation=cancellation,
         )
         raise
-    return process.returncode or 0, stderr.decode("utf-8", "replace")
+    return (
+        process.returncode or 0,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
 
 
 async def _run_docker_stdout(
@@ -496,6 +521,16 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         self._docker_run = docker_run or partial(
             _run_docker_stdout,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
+        )
+        # The host probe also keeps stderr for its diagnostics. An injected
+        # docker_run returns stdout only, so it is used with empty stderr.
+        self._docker_probe_run: _DockerCapture = (
+            partial(
+                _run_docker_captured,
+                docker_cli_env_allowlist=self._docker_cli_env_allowlist,
+            )
+            if docker_run is None
+            else partial(_without_stderr, docker_run)
         )
         self._sidecar_image = sidecar_image
         self._seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
@@ -1059,7 +1094,56 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         return tuple(targets)
 
     async def _probe_host_isolation(self, container_id: str, targets: Sequence[str]) -> None:
-        """Run the host isolation probe in the exact container's network namespace."""
+        """Run the host isolation probe in the exact container's network namespace.
+
+        A verdict that shows a way to the host raises ``egress_host_reachable``.
+        A probe that did not run to a verdict raises
+        ``egress_host_isolation_unverified`` with its exit code and the last
+        lines of its stderr. Both refuse the runner.
+        """
+
+        code, output, stderr = await self._run_host_isolation_probe(container_id, targets)
+        if code is not None and not output.strip():
+            # The probe ended without a verdict. Reports from Docker 27 show
+            # this occasionally on a healthy engine (exit 0, empty stdout), so
+            # run it once more in a fresh container before refusing.
+            code, output, stderr = await self._run_host_isolation_probe(container_id, targets)
+        lines = output.strip().splitlines()
+        result = lines[-1].strip() if lines else ""
+        if code == 0 and result == "isolated":
+            return
+        missing = result.removeprefix("probe_tool_missing:")
+        if missing != result and missing in _HOST_ISOLATION_PROBE_TOOLS:
+            raise UnsupportedEgressError(
+                "egress_probe_tool_missing: the sidecar image "
+                f"{self._sidecar_image} has no `{missing}`, which the host isolation "
+                "probe needs. Use an image that provides /bin/sh, ip, awk, sleep, "
+                "timeout and socat."
+            )
+        if result in _HOST_ISOLATION_PROBE_REACHABLE:
+            raise UnsupportedEgressError(
+                f"egress_host_reachable: a hardened guest may reach the Docker host ({result})."
+            )
+        if code is None:
+            reason = "probe_timed_out"
+        elif result in _HOST_ISOLATION_PROBE_FAILURES:
+            reason = result
+        elif not result:
+            reason = "probe_no_output"
+        else:
+            # Unknown text is not echoed: only fixed verdict words are trusted.
+            reason = "probe_unexpected_output"
+        exit_code = "none" if code is None else str(code)
+        raise UnsupportedEgressError(
+            "egress_host_isolation_unverified: the host isolation probe could not show "
+            f"that the hardened guest is kept off the Docker host ({reason}; "
+            f"exit_code={exit_code}; stderr: {docker_stderr_tail(stderr)})."
+        )
+
+    async def _run_host_isolation_probe(
+        self, container_id: str, targets: Sequence[str]
+    ) -> tuple[int | None, str, str]:
+        """Return the probe's (exit code, stdout, stderr); the code is None on timeout."""
 
         name = f"cayu-egress-probe-{secrets.token_hex(6)}"
         argv = [
@@ -1085,34 +1169,18 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             *targets,
         ]
         settled = False
-        reason = "probe_timed_out"
         try:
             async with asyncio.timeout(_HOST_ISOLATION_PROBE_TIMEOUT_S):
-                code, output = await self._docker_run(argv)
+                outcome = await self._docker_probe_run(argv)
             settled = True
-            lines = output.strip().splitlines()
-            result = lines[-1].strip() if lines else ""
-            if code == 0 and result == "isolated":
-                return
-            missing = result.removeprefix("probe_tool_missing:")
-            if missing != result and missing in _HOST_ISOLATION_PROBE_TOOLS:
-                raise UnsupportedEgressError(
-                    "egress_probe_tool_missing: the sidecar image "
-                    f"{self._sidecar_image} has no `{missing}`, which the host isolation "
-                    "probe needs. Use an image that provides /bin/sh, ip, awk, sleep, "
-                    "timeout and socat."
-                )
-            reason = result if result in _HOST_ISOLATION_PROBE_FAILURES else "probe_failed"
+            return outcome
         except TimeoutError:
-            pass
+            return None, "", ""
         finally:
             if not settled:
                 # The CLI may be gone while its probe container still runs.
                 with contextlib.suppress(Exception):
                     await self._docker_exec(["rm", "-f", name])
-        raise UnsupportedEgressError(
-            f"egress_host_reachable: a hardened guest may reach the Docker host ({reason})."
-        )
 
     async def egress_environment_fingerprint(self, runner: Runner) -> str:
         if not isinstance(runner, DockerRunner):
@@ -1554,6 +1622,11 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             if type(networks) is dict and network not in networks:
                 return
         raise UnsupportedEgressError("Control server network detachment is unconfirmed.")
+
+
+async def _without_stderr(run: DockerRun, argv: Sequence[str]) -> tuple[int, str, str]:
+    code, stdout = await run(argv)
+    return code, stdout, ""
 
 
 def _docker_resource_is_absent(stderr: str) -> bool:

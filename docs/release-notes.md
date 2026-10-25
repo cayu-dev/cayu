@@ -10,7 +10,12 @@ statement (on large PostgreSQL transcript tables this rewrites every row inside
 the migration transaction), fills it for writers that omit it, and builds an
 index on each session's root session id (concurrently on existing PostgreSQL
 databases). The compatibility floor stays at 127, so older workers keep running
-during the migration.
+during the migration. Revision 128 adds the `cayu_task_retry_keys` table for
+retry budgets.
+
+If you set `run_task_worker(execution_timeout_s=...)`, the grace period now comes
+out of that limit instead of being added after it (see the breaking change
+below).
 
 `cayu[claude-agent-sdk]` now accepts newer
 `claude-agent-sdk` releases below 0.3; pin the SDK in your own requirements to
@@ -21,10 +26,65 @@ to keep it offline.
 
 ### Breaking changes
 
-None.
+- `run_task_worker(execution_timeout_s=...)` now includes the grace period. The
+  last `execution_grace_s` seconds of the limit are the grace period (30 seconds
+  by default, or half the limit when that is shorter). With 600 and 30, new runs
+  in the handler call are refused from 570 seconds, and at 600 seconds the
+  handler is cancelled and a task it did not settle fails with
+  `ExecutionDeadlineExceeded`. 0.14.0 cancelled at the limit plus the grace
+  period (630 seconds), so a handler now has to deliver or retry within the
+  limit itself. An explicit `execution_grace_s` (or
+  `HandlerTimeLimit(grace_s=...)`) that is not smaller than the limit raises
+  `ValueError`. `HandlerTimeLimit`'s `grace_s` default is now `None`, which
+  applies the rule above.
+- A `read_file` `image_region` of one pixel or less, such as `[0, 0, 1, 1]` or
+  `[0, 0, 0, 0]`, now counts as left out, so on an image it reads the whole
+  image. 0.14.0 returned a one-pixel crop or failed.
 
 ### Changes
 
+- A retry budget now bounds an event that the application retries by creating
+  new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
+  for every task of that event. Tasks with one key share a budget of 3 tasks
+  created within 30 minutes of the first; set `retry_budget=TaskRetryBudget(...)`
+  to change it, or `TaskRetryBudget.unlimited()` to only count. Past the budget
+  the store creates no task, `create_task` raises `TaskRetryBudgetExhausted`, and
+  the key's state stays `given_up`. Read it with
+  `TaskStore.load_task_retry_key(key)` or `cayu inspect --retry-key KEY`. Tasks
+  without a key are unchanged. The memory, SQLite and PostgreSQL task stores
+  support it; a custom store without it refuses keyed tasks through
+  `CayuApp.create_task`.
+- The task worker now logs a warning when a handler passes its time limit, and
+  another when it records the task's timeout failure. Both name the task and
+  session IDs (redacted) and the limit and grace settings; the second also says
+  whether the handler was cancelled.
+- `read_file` ignores `image_region` and `pages` on a single text read instead
+  of failing, as batched reads already did, and says so with `ignored_arguments`
+  and a note. A malformed region is only rejected on an image or PDF read.
+- Hardened Docker egress works on Docker Engine 27. The adapter no longer
+  refuses a network because `docker network inspect` lists an IPAM gateway,
+  which Docker 27 does even when it keeps the host off the bridge; the probe
+  decides. The probe also targets a listed gateway and fails with
+  `host_address_present` when a target has a completed ARP entry in the guest's
+  network namespace. Supported engines are Docker Engine 27.5 or later, on Linux
+  or in Docker Desktop.
+- The hardened Docker egress probe now raises `egress_host_reachable` only when
+  it finds a way to the host. A probe that ends without a verdict (no output,
+  unexpected output, a timeout, or a check it could not decide) raises
+  `egress_host_isolation_unverified` with the reason, the exit code and the last
+  stderr lines, masked like Docker setup diagnostics. A probe that prints
+  nothing runs once more in a new container before the runner is refused.
+- Fix: `VirtualEgressEnvironmentFactory` wrote the session CA file with the
+  host process's umask. Under `umask 077` only the host user could read it, so
+  a guest running as another UID failed TLS verification on every connection
+  through the broker. The file is now always written with mode 0644. The
+  certificate is public; the CA's private key stays in the host process.
+- `help()` on `DockerRunner`, `DockerEgressAdapter`,
+  `VirtualEgressEnvironmentFactory`, the Claude and Codex agent adapters,
+  `run_external_agent`, `local_agent_launch`, `CayuApp.delete_session` and
+  `LocalWorkspaceEnvironmentFactory` now names the guide to read:
+  `untrusted-code`, `external-agents` or `anatomy`. The Cayu Map's sandbox row
+  now points at `cayu guide untrusted-code`.
 - `cayu new` warns when PyPI has a newer final Cayu release than the installed
   one, printing both versions and the `uvx --from 'cayu==X.Y.Z' cayu new ...`
   command with the same arguments. In a terminal it asks
@@ -66,9 +126,8 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 protocol 7 and refuses an image built from an earlier release at readiness.
 
 Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
-confirm revision 128. Task adapters require revision 128: exact declared task
-creation receipts and deletion-surviving identity fences are now persisted, and
-additive revision 128 adds the `cayu_task_retry_keys` table for retry budgets. Bound continuation
+confirm revision 127. Task adapters require revision 127: exact declared task
+creation receipts and deletion-surviving identity fences are now persisted. Bound continuation
 claims now persist their expected attachment and selected-operation digest in the
 existing claim registry. The compatibility floor is 127; stop older workers before
 migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
@@ -92,9 +151,8 @@ requirements below. An Agent reports to Cayu Cloud once
 attention to it once `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`
 are both set. Set both handoff variables or neither.
 If you set `run_task_worker(execution_timeout_s=...)`, it now bounds the whole
-handler call, grace period included: check that delivery and retry work fits
-within it, and that an explicit `execution_grace_s` is smaller than it (see the
-breaking change below). Hardened Docker egress now
+handler call: check that delivery and retry work fits within it plus
+`execution_grace_s` (see the breaking change below). Hardened Docker egress now
 refuses an engine that cannot keep the guest off the Docker host, and portable
 snapshot materialization refuses on Windows (both below). The Agent also trusts
 a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are set.
@@ -113,19 +171,13 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
   baseline. Invalid workspaces are refused before copying; a failed baseline
   abandons the sandbox binding.
 - `run_task_worker(execution_timeout_s=...)` is now the longest one handler call
-  may take, grace period included, not only a default deadline for the runs it
-  starts. The last `execution_grace_s` seconds of it (new, 30 seconds by
-  default, or half the limit when that is shorter) are the grace period. With
-  600 and 30, new runs in the call are refused from 570 seconds, including ones
-  with their own `execution_deadline`, runs without their own deadline end
-  then, and at 600 seconds the handler is cancelled and a task it did not settle
-  fails with `ExecutionDeadlineExceeded` (`scope` `task_handler`). Earlier
-  0.14.0 development builds cancelled at the limit plus the grace period (630
-  seconds); a handler now has to deliver or retry within the limit itself. An
-  explicit `execution_grace_s` (or `HandlerTimeLimit(grace_s=...)`) that is not
-  smaller than the limit now raises `ValueError` instead of extending it, and
-  `HandlerTimeLimit`'s `grace_s` default is now `None` (the rule above). The
-  `execution_timeout_s` default is still `None`.
+  may take, not only a default deadline for the runs it starts. Once it passes,
+  new runs in the call are refused, including ones with their own
+  `execution_deadline`. `execution_grace_s` later (new, 30 seconds by default)
+  the handler is cancelled, and a task it did not settle fails with
+  `ExecutionDeadlineExceeded` (`scope` `task_handler`). A handler that delivers
+  or retries after its runs end now has to fit in the limit plus the grace
+  period. The default is still `None`.
 - `DockerEgressAdapter(workload_restrictions=...)` now refuses a runner unless it
   can show that the guest cannot reach the Docker host. Its networks need a
   Docker engine that honors `com.docker.network.bridge.inhibit_ipv4`; Docker
@@ -151,19 +203,6 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
   Alternatively, start a new session.
 
 ### Changes
-
-- A retry budget now bounds an event that the application retries by creating
-  new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
-  for every task of that event; tasks with one key share a `TaskRetryBudget`,
-  by default 3 tasks created within 30 minutes of the first. Past it the store
-  creates no task, `create_task` raises `TaskRetryBudgetExhausted`, and the
-  key's durable `TaskRetryKeyState` stays `given_up`. Read it with
-  `TaskStore.load_task_retry_key(key)` or `cayu inspect --retry-key KEY`.
-  Pass `retry_budget=TaskRetryBudget(...)` to raise the budget or
-  `TaskRetryBudget.unlimited()` to only count. Tasks without a key are
-  unchanged. The memory, SQLite and PostgreSQL task stores support it
-  (`supports_task_retry_keys`); a custom store without it refuses keyed tasks
-  through `CayuApp.create_task`.
 
 - Pending-action recovery reads now expose the exact sibling tool-call reference when the interruption event itself cannot name it unambiguously. References come from matching durable start evidence, retain the same attention identity, and reconstruct after store reopen; recovery authorization is unchanged.
 
@@ -361,11 +400,6 @@ Custom dashboard owners should port Sessions changes from `src/next/routes/sessi
   `cayu.egress.docker_adapter`). The untrusted-code guide explains how to supply
   that image offline and why `memory_bytes` must stay below the memory the
   Docker engine has.
-- Fix: `VirtualEgressEnvironmentFactory` wrote the session CA file with the
-  host process's umask. Under `umask 077` only the host user could read it, so
-  a guest running as another UID failed TLS verification on every connection
-  through the broker. The file is now always written with mode 0644. The
-  certificate is public; the CA's private key stays in the host process.
 - A timed-out or cancelled Docker command can stop without removing its
   container. `DockerCodingEnvironmentFactory(command_cleanup="command_or_sandbox")`,
   and the same `timeout_cleanup` and `cancellation_cleanup` value on strict

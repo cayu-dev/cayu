@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from cayu.egress._docker_diagnostics import docker_setup_failure
+from cayu.egress._docker_diagnostics import docker_setup_failure, docker_stderr_tail
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.vaults import SecretRedactor
@@ -454,7 +454,9 @@ def test_ordinary_text_next_to_credential_shapes_is_kept(stderr, kept):
 )
 def test_invisible_characters_do_not_hide_credentials(stderr):
     message = docker_setup_failure(["run"], 1, stderr)
-    assert "hunter2" not in message
+    # No part of the value survives, including the rest after its first letter.
+    assert "unter2" not in message
+    assert "unter2" not in docker_stderr_tail(stderr)
     assert "\x1b" not in message and "​" not in message
 
 
@@ -508,3 +510,185 @@ def test_scan_cut_drops_a_multi_line_credential_blob_split_by_the_cut():
         ["run"], 1, stderr, redactor=SecretRedactor([blob, "cs-canary-0123456789"])
     )
     assert "canary" not in message and "service_account" not in message
+
+
+def test_stderr_tail_keeps_the_last_lines_after_masking_the_whole_window():
+    key = "\n".join(["-----BEGIN PRIVATE KEY-----", *(["A" * 64] * 8), "-----END PRIVATE KEY-----"])
+    stderr = f"first\nsecond\n{key}\nthird\n\n  fourth\twith  tabs  \n"
+    redactor = SecretRedactor(["registered-probe-secret"])
+
+    tail = docker_stderr_tail(stderr, max_lines=3, redactor=redactor)
+
+    # The key is masked before lines are picked, so no body line survives.
+    assert tail == "[REDACTED] | third | fourth with tabs"
+    assert docker_stderr_tail(" \n\t", redactor=redactor) == "[unavailable]"
+    assert docker_stderr_tail("x registered-probe-secret y\n", redactor=redactor) == (
+        "x [REDACTED_SECRET] y"
+    )
+    long = docker_stderr_tail("permission denied\n" * 5000)
+    assert long.startswith("...[truncated] permission denied | ")
+    assert len(long.encode()) <= 1024 + len("...[truncated] ")
+
+
+def test_stderr_tail_of_long_stderr_ends_with_its_last_line():
+    stderr = "".join(f"pull progress line {i}\n" for i in range(5000))
+    stderr += "docker: Error response from daemon: real cause\n"
+    assert len(stderr) > 65536
+
+    tail = docker_stderr_tail(stderr)
+
+    assert tail == (
+        "...[truncated] pull progress line 4996 | pull progress line 4997 | "
+        "pull progress line 4998 | pull progress line 4999 | "
+        "docker: Error response from daemon: real cause"
+    )
+
+
+def test_stderr_tail_drops_earlier_lines_to_keep_the_last_within_the_bound():
+    tail = docker_stderr_tail("x" * 900 + "\n" + "y" * 600 + "\nfinal error\n")
+    assert tail == "y" * 600 + " | final error"
+
+
+def test_stderr_tail_cut_drops_a_private_key_whose_header_fell_before_it():
+    body = "\n".join(["Q" * 64] * 40)
+    key = f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+    # The window's start lands inside the key body.
+    stderr = "early\n" + key + "\n" + "z" * (65536 - len(body) // 2) + "\nfinal error\n"
+
+    tail = docker_stderr_tail(stderr, max_lines=10)
+
+    assert "QQQQ" not in tail
+    assert tail.endswith("final error")
+
+
+def test_stderr_tail_cut_drops_a_registered_secret_split_by_it():
+    secret = "split-canary-" + "s" * 40
+    tail_text = "\nfinal error\n"
+    # The window starts 20 characters into the secret.
+    stderr = "x" * 100 + secret + " " * (65536 - len(secret) + 20 - len(tail_text)) + tail_text
+
+    tail = docker_stderr_tail(stderr, redactor=SecretRedactor([secret]))
+
+    assert "canary" not in tail and "sssss" not in tail
+    assert tail == "...[truncated] final error"
+
+
+@pytest.mark.parametrize(
+    "begin",
+    ["-----BEGIN PGP PRIVATE KEY BLOCK-----", "-----BEGIN PRIVATE KEY-----"],
+)
+def test_stderr_tail_masks_an_unterminated_private_key_open_at_the_window(begin):
+    # The window starts inside the key body, with neither armor line in it.
+    stderr = begin + "\n" + ("A" * 64 + "\n") * 1100
+    assert len(stderr) > 65536
+
+    tail = docker_stderr_tail(stderr)
+
+    assert tail == "...[truncated] [REDACTED]"
+    assert docker_stderr_tail(stderr + "late line\n") == "...[truncated] [REDACTED]"
+
+
+def test_stderr_tail_keeps_lines_after_a_key_that_closed_before_the_window():
+    key = "-----BEGIN PRIVATE KEY-----\n" + "Q" * 64 + "\n-----END PRIVATE KEY-----\n"
+    stderr = key + "progress\n" * 8000 + "final error\n"
+
+    tail = docker_stderr_tail(stderr, max_lines=2)
+
+    assert tail == "...[truncated] progress | final error"
+
+
+def test_stderr_tail_key_scan_is_linear_on_many_key_markers():
+    import time
+
+    keys = "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n" * 20000
+    stderr = keys + "-----BEGIN RSA PRIVATE KEY-----\n" * 3000 + "x\n" * 40000
+    elapsed = []
+    for _ in range(3):
+        started = time.perf_counter()
+        tail = docker_stderr_tail(stderr, redactor=SecretRedactor(["s3cr3t-canary"]))
+        elapsed.append(time.perf_counter() - started)
+    assert tail == "...[truncated] [REDACTED]"
+    assert min(elapsed) < 0.5
+
+
+_CANARY_BODY = ("SYNTHETIC_KEY_CANARY_" + "A" * 44 + "\n") * 1100
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "-----BEGIN \x1b[31mPRIVATE KEY-----",
+        "-----BEGIN \x1b[1;31mPGP PRIVATE\x1b[0m KEY BLOCK-----",
+        "-----BEGIN \x9b31mRSA PRIVATE KEY-----",
+        "-----BEGIN \x1b]0;title\x07PRIVATE KEY-----",
+        "-----BEGIN \x1b]8;;https://example.invalid\x1b\\PRIVATE KEY-----",
+    ],
+)
+def test_stderr_tail_masks_a_key_with_escape_formatted_armor_before_the_window(header):
+    unterminated = header + "\n" + _CANARY_BODY
+    assert docker_stderr_tail(unterminated) == "...[truncated] [REDACTED]"
+    # The same text in a setup failure is masked too.
+    assert "SYNTHETIC_KEY_CANARY" not in docker_setup_failure(["run"], 1, unterminated)
+
+    # A key that ends inside the window, with its END line formatted as well.
+    ended = unterminated + "-----END \x1b[31mPRIVATE KEY-----\n" + "final error\n"
+    assert docker_stderr_tail(ended) == "...[truncated] [REDACTED] | final error"
+
+
+@pytest.mark.parametrize("into_header", [1, 9, 20, 27])
+def test_stderr_tail_masks_a_formatted_armor_line_across_the_window_start(into_header):
+    header = "-----BEGIN \x1b[31mPRIVATE KEY-----\n"
+    shown = len("-----BEGIN PRIVATE KEY-----\n")
+    assert into_header < shown
+    # The window holds the last 65,536 characters after the escape is
+    # dropped, so it starts *into_header* characters into the BEGIN line.
+    body = _CANARY_BODY[: 65536 - (shown - into_header)]
+    stderr = "x" * 70000 + "\n" + header + body
+
+    assert docker_stderr_tail(stderr) == "...[truncated] [REDACTED]"
+    ended = stderr + "\n-----END PRIVATE KEY-----\nfinal error\n"
+    assert docker_stderr_tail(ended) == "...[truncated] [REDACTED] | final error"
+
+
+def test_stderr_tail_still_redacts_registered_secrets_after_normalizing():
+    secret = "registered-tail-secret-0123456789"
+    redactor = SecretRedactor([secret])
+    stderr = "x" * 70000 + "\n" + f"\x1b[31mfailed with {secret}\x1b[0m\n"
+    assert docker_stderr_tail(stderr, redactor=redactor) == (
+        "...[truncated] failed with [REDACTED_SECRET]"
+    )
+    # A registered secret split by the window start leaves no fragment.
+    split = "y" * 10 + secret + "z" * (65536 - len(secret) + 20) + "\nlast\n"
+    tail = docker_stderr_tail(split, redactor=redactor)
+    assert "tail-secret" not in tail and "0123456789" not in tail
+
+
+@pytest.mark.parametrize(
+    ("stderr", "leaked"),
+    [
+        ("\x1bpassword=hunter2-secret-value", "hunter2"),
+        ("\x1bAuthorization: Bearer tok-0123456789abcdef", "0123456789"),
+        ("--password\x1bhunter2 rest", "unter2"),
+        ("--token\x1bxyzsecret123", "secret123"),
+        ("\x1b(B\x1b[m password: hunter2-secret\n", "hunter2"),
+        ("\x1b(B--password\x1b(B hunter2", "unter2"),
+        ("\x1b(Authorization: Bearer tok-0123456789abcdef", "0123456789"),
+        ("\x1b(Bearer tok-0123456789abcdef\nAuthorization: \x1b(Bearer tok-1", "tok-1"),
+        (
+            "-----BEGIN \x1b(BPRIVATE KEY-----\nSYNTHETIC_PRIVATE_KEY_BODY\n-----END PRIVATE KEY-----",
+            "SYNTHETIC_PRIVATE_KEY_BODY",
+        ),
+        ("--password \x1b]0;title\x07 hunter2", "unter2"),
+        ("TOKEN=\x1b]8;;https://example.invalid\x1b\\secret-value", "secret-value"),
+        (
+            "\x1b-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANSECRETBODY\n-----END PRIVATE KEY-----",
+            "SECRETBODY",
+        ),
+    ],
+)
+def test_escape_bytes_never_join_or_hide_a_credential(stderr, leaked):
+    # A lone ESC becomes a space; only CSI and OSC sequences are dropped whole.
+    assert leaked not in docker_setup_failure(["run"], 1, stderr)
+    assert leaked not in docker_stderr_tail(stderr)
+    long = "x" * 70000 + "\n" + stderr + "\n"
+    assert leaked not in docker_stderr_tail(long)

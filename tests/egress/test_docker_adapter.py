@@ -29,6 +29,7 @@ from cayu.egress.docker_adapter import (
     GUEST_CA_PATH,
     DockerEgressAdapter,
     _default_docker_exec,
+    _run_docker_captured,
     _run_docker_stdout,
     resolve_proxy_bind_host,
 )
@@ -148,7 +149,7 @@ def test_prepare_preserves_caller_cancellation_during_probe_timeout_cleanup(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout])
+@pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout, _run_docker_captured])
 def test_docker_egress_helpers_use_bounded_operational_environment(
     monkeypatch: pytest.MonkeyPatch,
     helper,
@@ -189,7 +190,7 @@ def test_docker_egress_helpers_use_bounded_operational_environment(
     assert all(value not in repr(observed) for value in provider_canaries.values())
 
 
-@pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout])
+@pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout, _run_docker_captured])
 def test_docker_egress_helpers_accept_explicit_trusted_grants(
     monkeypatch: pytest.MonkeyPatch,
     helper,
@@ -1153,8 +1154,33 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
         (_docker_27_network(), (3, "host_address_present\n"), r"\(host_address_present\)"),
         (_isolated_network(), (3, "routed_path_present\n"), r"\(routed_path_present\)"),
         (_isolated_network(), (3, "ipv6_address_present\n"), r"\(ipv6_address_present\)"),
-        (_isolated_network(), (125, "unexpected\n"), r"\(probe_failed\)"),
-        (_isolated_network(), (0, ""), r"\(probe_failed\)"),
+        # A probe that ran but reached no verdict says so, with its exit code.
+        (
+            _isolated_network(),
+            (3, "host_reachability_unverified\n"),
+            r"^egress_host_isolation_unverified: .*\(host_reachability_unverified; "
+            r"exit_code=3; stderr: \[unavailable\]\)",
+        ),
+        (
+            _isolated_network(),
+            (3, "route_table_unreadable\n"),
+            r"^egress_host_isolation_unverified: .*\(route_table_unreadable; exit_code=3;",
+        ),
+        (
+            _isolated_network(),
+            (125, "unexpected\n"),
+            r"^egress_host_isolation_unverified: .*\(probe_unexpected_output; exit_code=125;",
+        ),
+        (
+            _isolated_network(),
+            (0, ""),
+            r"^egress_host_isolation_unverified: .*\(probe_no_output; exit_code=0;",
+        ),
+        (
+            _isolated_network(),
+            (137, ""),
+            r"^egress_host_isolation_unverified: .*\(probe_no_output; exit_code=137;",
+        ),
         # A sidecar image without a probe tool says so instead of reading as
         # an unverified host.
         (
@@ -1162,7 +1188,11 @@ def test_create_runner_hardens_the_egress_container_when_configured(monkeypatch)
             (4, "probe_tool_missing:timeout\n"),
             r"^egress_probe_tool_missing: the sidecar image .* has no `timeout`",
         ),
-        (_isolated_network(), (4, "probe_tool_missing:curl\n"), r"\(probe_failed\)"),
+        (
+            _isolated_network(),
+            (4, "probe_tool_missing:curl\n"),
+            r"^egress_host_isolation_unverified: .*\(probe_unexpected_output; exit_code=4;",
+        ),
     ],
 )
 def test_create_runner_refuses_a_hardened_guest_that_may_reach_the_host(
@@ -1185,6 +1215,203 @@ def test_create_runner_refuses_a_hardened_guest_that_may_reach_the_host(
         asyncio.run(adapter.create_runner(_hardened_runner_request()))
     # The runner is never handed out; its container is removed.
     assert closed == [_GUEST_ID]
+
+
+def test_every_probe_failure_verdict_is_reachable_or_unverified(monkeypatch) -> None:
+    from cayu.egress.docker_adapter import (
+        _HOST_ISOLATION_PROBE_FAILURES,
+        _HOST_ISOLATION_PROBE_REACHABLE,
+    )
+
+    assert {"host_reachable", "routed_path_present", "ipv6_address_present"} <= (
+        _HOST_ISOLATION_PROBE_REACHABLE & _HOST_ISOLATION_PROBE_FAILURES
+    )
+    for verdict in sorted(_HOST_ISOLATION_PROBE_FAILURES):
+        adapter = _hardened_adapter(
+            monkeypatch, _HostIsolationDocker(_isolated_network(), (3, f"{verdict}\n"))
+        )
+        expected = (
+            rf"^egress_host_reachable: .*\({verdict}\)\.$"
+            if verdict in _HOST_ISOLATION_PROBE_REACHABLE
+            else rf"^egress_host_isolation_unverified: .*\({verdict}; exit_code=3;"
+        )
+        with pytest.raises(UnsupportedEgressError, match=expected):
+            asyncio.run(adapter.create_runner(_hardened_runner_request()))
+
+
+class _ScriptedProbeDocker(_HostIsolationDocker):
+    """Answers each probe run with the next scripted result."""
+
+    def __init__(self, *probes: tuple[int, str]) -> None:
+        super().__init__(_isolated_network(), probes[0])
+        self.probes = list(probes)
+
+    async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
+        if argv[:1] == ["run"]:
+            self.calls.append(list(argv))
+            return self.probes.pop(0)
+        return await super().__call__(argv)
+
+
+def _hardened_adapter(monkeypatch, docker_run, closed=None) -> DockerEgressAdapter:
+    from cayu.runners.docker_workload import DockerWorkloadRestrictions
+
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.DockerRunner",
+        _fake_hardened_runner_type({}, [] if closed is None else closed),
+    )
+    return DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        docker_run=docker_run,
+        proxy_host="127.0.0.1",
+        workload_restrictions=DockerWorkloadRestrictions(),
+    )
+
+
+def test_host_probe_without_output_runs_once_more(monkeypatch) -> None:
+    docker_run = _ScriptedProbeDocker((0, ""), (0, "isolated\n"))
+    closed: list[str] = []
+    adapter = _hardened_adapter(monkeypatch, docker_run, closed)
+
+    asyncio.run(adapter.create_runner(_hardened_runner_request()))
+
+    probes = [argv for argv in docker_run.calls if argv[:1] == ["run"]]
+    assert len(probes) == 2
+    # Each attempt is its own container.
+    assert len({argv[argv.index("--name") + 1] for argv in probes}) == 2
+    assert closed == []
+
+
+@pytest.mark.parametrize(
+    ("probes", "expected"),
+    [
+        # Silent twice: unverified, never "reachable".
+        (
+            ((0, ""), (0, "")),
+            r"^egress_host_isolation_unverified: .*\(probe_no_output; exit_code=0;",
+        ),
+        # A retry that reports the host still refuses as reachable.
+        (
+            ((0, ""), (3, "host_reachable\n")),
+            r"^egress_host_reachable: .*\(host_reachable\)",
+        ),
+    ],
+)
+def test_host_probe_retries_only_once(monkeypatch, probes, expected) -> None:
+    docker_run = _ScriptedProbeDocker(*probes)
+    closed: list[str] = []
+    adapter = _hardened_adapter(monkeypatch, docker_run, closed)
+
+    with pytest.raises(UnsupportedEgressError, match=expected):
+        asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    assert docker_run.probes == []
+    assert closed == [_GUEST_ID]
+
+
+@pytest.mark.parametrize("probe", [(3, "host_reachable\n"), (125, "unexpected\n")])
+def test_host_probe_with_a_verdict_or_text_is_not_retried(monkeypatch, probe) -> None:
+    docker_run = _ScriptedProbeDocker(probe, (0, "isolated\n"))
+    adapter = _hardened_adapter(monkeypatch, docker_run)
+
+    with pytest.raises(UnsupportedEgressError):
+        asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    assert docker_run.probes == [(0, "isolated\n")]
+
+
+def test_unverified_host_probe_reports_its_redacted_stderr_tail(monkeypatch) -> None:
+    adapter = _hardened_adapter(monkeypatch, _HostIsolationDocker(_isolated_network(), (0, "")))
+    stderr = "\n".join(
+        [
+            "early line that is not kept",
+            "Unable to find image 'alpine/socat:1.8.1.3' locally",
+            "Authorization: Bearer probe-secret-0123456789",
+            "",
+            "docker: Error response from daemon: container exited before attach.",
+            "See 'docker run --help'.",
+            "password=probe-password-0123456789",
+            "",
+        ]
+    )
+    calls: list[list[str]] = []
+
+    async def probe_run(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        return 125, "", stderr
+
+    adapter._docker_probe_run = probe_run
+
+    with pytest.raises(UnsupportedEgressError) as raised:
+        asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    message = str(raised.value)
+    assert message.startswith("egress_host_isolation_unverified: ")
+    assert "(probe_no_output; exit_code=125; stderr: " in message
+    # The last five non-blank lines, in order, with credentials masked.
+    assert (
+        "stderr: Unable to find image 'alpine/socat:1.8.1.3' locally | "
+        "Authorization: [REDACTED] | "
+        "docker: Error response from daemon: container exited before attach. | "
+        "See 'docker run --help'. | password=[REDACTED])."
+    ) in message
+    assert "early line" not in message
+    assert "probe-secret" not in message
+    assert "probe-password" not in message
+    assert len(calls) == 2
+
+
+def test_host_probe_timeout_is_unverified_and_removes_the_probe(monkeypatch) -> None:
+    import cayu.egress.docker_adapter as docker_adapter
+
+    monkeypatch.setattr(docker_adapter, "_HOST_ISOLATION_PROBE_TIMEOUT_S", 0.01)
+
+    class HangingProbe(_HostIsolationDocker):
+        async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
+            if argv[:1] == ["run"]:
+                self.calls.append(list(argv))
+                await asyncio.Event().wait()
+            return await super().__call__(argv)
+
+    docker_run = HangingProbe(_isolated_network(), (0, "isolated\n"))
+    docker_exec = _FakeDocker()
+    adapter = _hardened_adapter(monkeypatch, docker_run)
+    adapter._docker_exec = docker_exec
+
+    with pytest.raises(
+        UnsupportedEgressError,
+        match=r"^egress_host_isolation_unverified: .*\(probe_timed_out; exit_code=none;",
+    ):
+        asyncio.run(adapter.create_runner(_hardened_runner_request()))
+    probe = docker_run.calls[-1]
+    assert docker_exec.calls == [["rm", "-f", probe[probe.index("--name") + 1]]]
+    # A timeout is not retried: it already spent the probe's whole budget.
+    assert len([argv for argv in docker_run.calls if argv[:1] == ["run"]]) == 1
+
+
+def test_default_host_probe_runner_keeps_stderr(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr("cayu.egress.docker_adapter.shutil.which", lambda _name: "/docker")
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"isolated\n", b"probe stderr\n"
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        observed.update(argv=argv)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    adapter = DockerEgressAdapter(proxy_host="127.0.0.1")
+
+    assert asyncio.run(adapter._docker_probe_run(["run", "probe"])) == (
+        0,
+        "isolated\n",
+        "probe stderr\n",
+    )
+    assert observed["argv"] == ("/docker", "run", "probe")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
