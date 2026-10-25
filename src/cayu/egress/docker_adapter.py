@@ -334,6 +334,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     the adapter then reports the guest privilege claims as available. The
     container still shares the host kernel, so untrusted-code isolation stays
     unsupported.
+
+    See ``cayu guide untrusted-code`` for the hardened composition.
     """
 
     runner_kind = "docker"

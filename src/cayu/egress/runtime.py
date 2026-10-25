@@ -537,6 +537,8 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     ``secret_env``/``secret_headers`` are resolved *host-side* (into the MCP
     server subprocess or the host HTTP client), never injected into the runner,
     so they sit at the ``trusted_tool`` boundary and are outside this factory.
+
+    See ``cayu guide untrusted-code`` for the hardened Docker composition.
     """
 
     def __init__(

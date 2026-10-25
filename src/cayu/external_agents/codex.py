@@ -27,6 +27,8 @@ from cayu.external_agents.environment import (
 
 
 class CodexAgentAdapter:
+    """Run Codex as a Cayu session. See ``cayu guide external-agents``."""
+
     name = "codex"
     provider_name = "openai"
 

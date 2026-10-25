@@ -601,6 +601,49 @@ def test_every_cayu_map_row_routes_to_a_package_shipped_local_guide(capsys) -> N
             assert main(command.split()[1:]) == 0, command
             assert capsys.readouterr().out
 
+    routes = {row.split("|")[1].strip(): row.split("|")[3].strip() for row in rows}
+    assert routes["Run untrusted code / choose a sandbox"] == "`cayu guide untrusted-code`"
+
+
+def test_entry_point_docstrings_name_a_guide_that_exists(capsys) -> None:
+    import inspect
+
+    from cayu.applications import CayuApp
+    from cayu.egress import VirtualEgressEnvironmentFactory
+    from cayu.egress.docker_adapter import DockerEgressAdapter
+    from cayu.environments import LocalWorkspaceEnvironmentFactory
+    from cayu.external_agents import (
+        ClaudeAgentAdapter,
+        CodexAgentAdapter,
+        local_agent_launch,
+        run_external_agent,
+    )
+    from cayu.runners import DockerRunner
+
+    expected = {
+        DockerRunner: "untrusted-code",
+        DockerEgressAdapter: "untrusted-code",
+        VirtualEgressEnvironmentFactory: "untrusted-code",
+        ClaudeAgentAdapter: "external-agents",
+        CodexAgentAdapter: "external-agents",
+        run_external_agent: "external-agents",
+        local_agent_launch: "external-agents",
+        CayuApp.delete_session: "anatomy#process-scoped-application-graph",
+        LocalWorkspaceEnvironmentFactory: "anatomy#process-scoped-application-graph",
+    }
+    for entry_point, topic in expected.items():
+        assert f"See ``cayu guide {topic}``" in (inspect.getdoc(entry_point) or ""), entry_point
+
+    rendered = {}
+    for topic in sorted(set(expected.values())):
+        assert main(["guide", topic]) == 0, topic
+        rendered[topic] = capsys.readouterr().out
+        assert rendered[topic]
+
+    section = rendered["anatomy#process-scoped-application-graph"]
+    assert "LocalWorkspaceEnvironmentFactory" in section
+    assert "delete_session" in section
+
 
 def test_structured_output_and_provider_guides_are_credential_free_and_public(capsys) -> None:
     assert main(["guide", "structured-output"]) == 0

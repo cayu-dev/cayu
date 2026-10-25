@@ -55,7 +55,7 @@ only when the requested behavior requires it.
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
 | Application workspace references or inventories | `WorkspaceReferenceBinding`, `ToolContext.require_workspace_binding` | `cayu guide authoring#workspace-references-and-inventories` |
 | Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |
-| Run untrusted code / choose a sandbox | Docker locally, Lambda MicroVM in the cloud; shared-kernel caveat | `cayu guide references#environments` |
+| Run untrusted code / choose a sandbox | Docker locally, Lambda MicroVM in the cloud; shared-kernel caveat | `cayu guide untrusted-code` |
 | Secrets or restricted network access | `cayu[egress]`, virtual credentials, `HttpEgressPolicy` | `cayu guide references#secrets-egress` |
 | Tools exposed over MCP | MCP adapters and manifest policy | `cayu guide references#mcp` |
 | Conversation history that survives restarts | `SessionStore`, transcripts, checkpoints, resume | `cayu guide references#sessions` |

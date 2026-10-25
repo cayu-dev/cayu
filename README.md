@@ -14,7 +14,7 @@ before each model call, and multi-agent collaboration.
 | Spend caps | `BudgetLimit` per request and `BudgetPolicy` per app (`cayu.budgets`), checked before each model call |
 | Timers and background work | `TaskStore` workers and `TaskSchedulePolicy` for scheduled follow-ups (`cayu.tasks`) |
 | Multi-agent collaboration | `SubagentTool` (`cayu.tools`), forks, and participants with durable requests (`cayu.collaboration`) |
-| Claude Code or Codex runs | `run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` (`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`), recorded as sessions with usage and deadlines; see `cayu guide external-agents` |
+| Claude Code or Codex runs | `run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` (`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`) and a launcher such as `local_agent_launch`, recorded as sessions with usage and deadlines; see `cayu guide external-agents` |
 
 Cayu is Python only and is not a graph DSL: agents, tools and workflows are
 ordinary Python. It is not only a hosted service: run it on your own
@@ -449,7 +449,10 @@ An environment is optional for a conversational agent. It becomes important
 when tools need files, commands, artifacts, secrets, network policy, or a
 sandbox. Static environments are useful for trusted local work;
 `EnvironmentFactory` creates or reattaches session-specific environments in
-production.
+production. One app can serve every request: `LocalWorkspaceEnvironmentFactory`
+attaches each request to its own prepared directory, and
+`CayuApp.delete_session` drops finished sessions. See
+`cayu guide anatomy#process-scoped-application-graph`.
 
 Choose the execution surface according to where code should run and which
 boundary should contain it:

@@ -4642,8 +4642,8 @@ class CayuApp:
 
         By default only completed or failed sessions qualify. Running sessions or
         incomplete cleanup raise ValueError. Missing sessions return None.
+        See ``cayu guide anatomy#process-scoped-application-graph``.
         """
-
         return await delete_app_session(self, session_id, finished_only=finished_only)
 
     @_tracked_entrance

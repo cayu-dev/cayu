@@ -2141,6 +2141,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
     host variables must receive their names explicitly through
     ``docker_cli_env_allowlist``; those trusted grants reach only the host-side
     Docker CLI and its helpers, never the container command.
+
+    See ``cayu guide untrusted-code`` to run untrusted code locally.
     """
 
     isolation = "docker"

@@ -49,9 +49,15 @@ stores carry shared state across processes. In-memory stores and Python object
 identity do not. Registration and live resource ownership remain local to the
 process that constructed the app.
 
-One app can serve many requests. Sessions stay in the session store until
-something deletes them, so a long-running app calls
-`await app.delete_session(session_id)` once a session has completed or failed.
+One app can serve many requests. Do not build a new app per request to give
+each one its own workspace: register an environment factory such as
+`LocalWorkspaceEnvironmentFactory`, which attaches each request to its own
+prepared directory. See
+[Per-request local workspaces](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md#per-request-local-workspaces).
+
+Sessions stay in the session store until something deletes them, so a
+long-running app calls `await app.delete_session(session_id)` once a session
+has completed or failed.
 It runs the same closure as `DELETE /api/sessions/{id}` and raises `ValueError`
 for a session that can still run or resume. With `InMemorySessionStore` this
 keeps memory bounded. See

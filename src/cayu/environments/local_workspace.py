@@ -80,6 +80,8 @@ class LocalWorkspaceEnvironmentFactory(EnvironmentFactory):
     owned container already sharing this directory. It must be synchronous,
     side-effect free, and select the same runner identity at admission and create.
     Container allocation and disposal remain the caller's responsibility.
+
+    See ``cayu guide anatomy#process-scoped-application-graph``.
     """
 
     def __init__(

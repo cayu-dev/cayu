@@ -340,6 +340,7 @@ async def run_external_agent(
     Use an existing worker-owned ``request.task_id`` for durable scheduling.
     Retry/restart always allocates a fresh session and fresh vendor thread.
     The adapter owns sandbox teardown and must join it before its stream closes.
+    See ``cayu guide external-agents``.
     """
     supported = {
         "agent_name",

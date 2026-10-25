@@ -42,8 +42,9 @@ CAYU_CAPABILITIES = (
     (
         "Claude Code or Codex runs",
         "`run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` "
-        "(`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`), "
-        "recorded as sessions with usage and deadlines; see `cayu guide external-agents`",
+        "(`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`) "
+        "and a launcher such as `local_agent_launch`, recorded as sessions with usage "
+        "and deadlines; see `cayu guide external-agents`",
     ),
 )
 

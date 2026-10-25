@@ -144,6 +144,8 @@ async def local_agent_launch(
     groups and returns once they are empty, or raises after
     ``close_timeout_s`` so the run's cleanup is retried. A descendant that
     starts its own session leaves the group and is not stopped. POSIX only.
+
+    See ``cayu guide external-agents``.
     """
     if os.name != "posix" or not hasattr(os, "fork"):
         raise RuntimeError("local_agent_launch needs a POSIX host.")

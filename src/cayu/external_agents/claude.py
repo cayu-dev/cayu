@@ -82,6 +82,8 @@ def _usage(value: dict[str, Any]) -> dict[str, int]:
 
 
 class ClaudeAgentAdapter:
+    """Run Claude Code as a Cayu session. See ``cayu guide external-agents``."""
+
     name = "claude-agent-sdk"
     provider_name = "anthropic"
 
