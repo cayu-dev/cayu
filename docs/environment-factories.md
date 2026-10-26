@@ -736,6 +736,32 @@ always runs on one backend can construct it directly.
 A session started on one backend isn't resumed on another: the factories have
 different execution-profile identities, so the runtime refuses the resume.
 
+### Per-agent default environment
+
+An agent can name its own default with `register_agent(..., environment_name=...)`.
+A new run picks its environment in this order: the request's
+`environment_name`, then the agent's registered default, then the application
+default. Pass `NO_ENVIRONMENT` to run the agent without any environment even
+when the application registers a default, for example a tool-only agent in a
+coding app whose default is a Docker sandbox:
+
+```python
+from cayu.environments import NO_ENVIRONMENT
+
+app.register_agent(ISSUE_FILER_AGENT, tools=[FileIssueTool()], environment_name=NO_ENVIRONMENT)
+app.register_agent(REVIEWER_AGENT, environment_name="review-checkout")
+```
+
+A stored session keeps the environment it started with, so resume, recovery
+and queued dispatches never re-resolve it, and a fork keeps its source's
+environment unless the fork request names one. A subagent child runs in its
+parent's environment unless `SubagentSpec.environment_name` names another one;
+the child agent's registered default does not override that inheritance, and a
+parent that ran without an environment has children that run without one.
+`cayu inspect --json` reports an agent's own default as `default_environment`
+or `runs_without_environment`, and `cayu check` reports
+`AGENT_ENVIRONMENT_NOT_FOUND` when the named environment is not registered.
+
 ### Per-child workspaces for subagents
 
 A `SubagentTool` child runs in its parent's environment by default. Set

@@ -19,6 +19,7 @@ from cayu.tools.gateway import tool_input_schema_supported
 CHECK_REPORT_SCHEMA_VERSION = "2"
 AVAILABLE_CHECK_TAGS = frozenset({"authoring", "configuration", "deploy", "providers", "security"})
 BUILTIN_DIAGNOSTIC_CODES = (
+    "AGENT_ENVIRONMENT_NOT_FOUND",
     "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
     "AGENT_PROVIDER_AMBIGUOUS",
     "AGENT_PROVIDER_NOT_FOUND",
@@ -225,7 +226,33 @@ def check_manifest(
                     verification_command="cayu inspect --json && cayu check --json",
                 )
             )
-        elif agent.provider_resolution == "ambiguous":
+        if agent.default_environment is not None and agent.default_environment not in {
+            environment.name for environment in manifest.environments
+        }:
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_ENVIRONMENT_NOT_FOUND",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"agent:{agent.name}",
+                    path=f"agents.{agent.name}.default_environment",
+                    message=(
+                        f"Agent '{agent.name}' defaults to environment "
+                        f"'{agent.default_environment}', which is not registered."
+                    ),
+                    hint=(
+                        f"Register environment '{agent.default_environment}' or change the "
+                        f"environment_name passed to register_agent for '{agent.name}'."
+                    ),
+                    tags=("configuration",),
+                    parameters={
+                        "agent": agent.name,
+                        "environment": agent.default_environment,
+                    },
+                    documentation_anchor="cayu guide diagnostics#agent-environment-not-found",
+                    verification_command="cayu inspect --json && cayu check --json",
+                )
+            )
+        if agent.provider_resolution == "ambiguous":
             diagnostics.append(
                 ProjectDiagnostic(
                     code="AGENT_PROVIDER_AMBIGUOUS",

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from enum import Enum
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -37,6 +38,23 @@ if TYPE_CHECKING:
 else:
     KnowledgeAccessScope = Any
     KnowledgeStore = Any
+
+
+class NoEnvironment(Enum):
+    """Type of ``NO_ENVIRONMENT``, the explicit choice to run without an environment."""
+
+    NO_ENVIRONMENT = "no_environment"
+
+    def __repr__(self) -> str:
+        return "NO_ENVIRONMENT"
+
+
+NO_ENVIRONMENT: Final = NoEnvironment.NO_ENVIRONMENT
+"""Run without an environment, even when the application registers a default one.
+
+Pass it as ``register_agent(..., environment_name=NO_ENVIRONMENT)`` so the agent's
+new runs get no workspace, runner or sandbox unless a request names one.
+"""
 
 DEFAULT_WORKSPACE_INSTRUCTION_PATHS = ("AGENTS.md", ".cayu/AGENTS.md")
 DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES = 32 * 1024

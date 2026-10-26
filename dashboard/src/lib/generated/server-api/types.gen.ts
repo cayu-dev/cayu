@@ -41,6 +41,10 @@ export type AgentManifest = {
      * Context Policy
      */
     context_policy: string;
+    /**
+     * Default Environment
+     */
+    default_environment?: string | null;
     execution_requirements: ExecutionRequirements;
     /**
      * Has System Prompt
@@ -76,6 +80,10 @@ export type AgentManifest = {
      * Resolved Provider
      */
     resolved_provider: string | null;
+    /**
+     * Runs Without Environment
+     */
+    runs_without_environment?: boolean;
     /**
      * Runtime Hooks
      */

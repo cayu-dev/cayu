@@ -3873,6 +3873,9 @@ async def _capture_probes(
         or requirements.artifact_requirements
     ):
         return TrajectoryProbes()
+    if session.environment_name is None:
+        # The session ran without an environment; never fall back to the app default.
+        return TrajectoryProbes()
     try:
         environment = app.get_environment(session.environment_name)
     except Exception:

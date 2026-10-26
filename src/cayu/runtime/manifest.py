@@ -33,6 +33,7 @@ from cayu.context.footprints import (
     REQUEST_FOOTPRINT_SCHEMA_VERSION,
 )
 from cayu.environments.admission import ExecutionRequirements
+from cayu.environments.base import NO_ENVIRONMENT
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools._terminal_bounds import application_tool_declares_no_bound
 from cayu.tools.catalogue import ToolExecutionContract
@@ -330,6 +331,10 @@ class AgentManifest(_ManifestModel):
     workflow_tool_names: tuple[str, ...] = ()
     authoring_state: AgentAuthoringState | None = None
     execution_requirements: ExecutionRequirements
+    # The agent's own default environment, from register_agent(environment_name=...).
+    # Both are omitted when the agent uses the application default.
+    default_environment: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    runs_without_environment: bool = Field(default=False, exclude_if=lambda value: not value)
     tools: tuple[ToolManifest, ...] = ()
     hosted_tools: tuple[HostedToolManifest, ...] = ()
     targeted_tool_mode: (
@@ -747,6 +752,12 @@ def _describe_agent(
         execution_requirements=ExecutionRequirements.model_validate(
             registration.execution_requirements.model_dump(mode="python", warnings=False)
         ),
+        default_environment=(
+            registration.default_environment_name
+            if type(registration.default_environment_name) is str
+            else None
+        ),
+        runs_without_environment=registration.default_environment_name is NO_ENVIRONMENT,
         tools=tuple(
             _describe_tool(
                 app,

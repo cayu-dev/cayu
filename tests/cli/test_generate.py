@@ -408,6 +408,9 @@ def test_coding_preset_generated_external_tool_keeps_approval_boundary(
     assert json.loads(capsys.readouterr().out)["status"] == "ready"
     registration = (project / "agents/registration.py").read_text(encoding="utf-8")
     assert "AlwaysRequireApprovalToolPolicy" in registration
+    # The tool-only slice must not inherit the coding sandbox as its environment.
+    assert "from cayu.environments import NO_ENVIRONMENT\n" in registration
+    assert "        environment_name=NO_ENVIRONMENT,\n" in registration
 
     _clear_generated_project_modules()
     output = project / "publish-summary-eval.json"
@@ -432,6 +435,9 @@ def test_coding_preset_generated_external_tool_keeps_approval_boundary(
     manifest = json.loads(capsys.readouterr().out)
     extension = next(agent for agent in manifest["agents"] if agent["name"] == "publisher_action")
     assert extension["tools"][0]["policy_coverage"] == "approval_required"
+    assert extension["runs_without_environment"] is True
+    primary = next(agent for agent in manifest["agents"] if agent["name"] == "publisher")
+    assert "runs_without_environment" not in primary
 
 
 def test_coding_generator_fails_closed_when_app_swaps_primary_and_reviewer(
@@ -619,6 +625,43 @@ def test_generate_tool_requires_intact_starter_markers_without_writes(
     )
     assert "manual_action_required" in capsys.readouterr().out
     assert _files(project) == before
+
+
+def test_generate_slice_environment_option_selects_the_agent_default(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    monkeypatch.chdir(tmp_path / "project")
+
+    def registration(**options: str) -> str:
+        plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none", **options)
+        assert plan.status == "ready"
+        (edit,) = [item for item in plan.edits if item.path == "agents/registration.py"]
+        return edit.content
+
+    default = registration()
+    assert "from cayu.environments import NO_ENVIRONMENT\n" in default
+    assert "        environment_name=NO_ENVIRONMENT,\n" in default
+    application = registration(environment="default")
+    assert "NO_ENVIRONMENT" not in application
+    assert "environment_name=" not in application
+    named = registration(environment="filing")
+    assert "NO_ENVIRONMENT" not in named
+    assert '        environment_name="filing",\n' in named
+    with pytest.raises(ValueError, match="registered environment name"):
+        plan_slice(
+            name="analyst",
+            tool_name="analyze_document",
+            effect="none",
+            environment="bad name",
+        )
+
+    command = ["generate", "slice", "analyst", "--tool", "analyze_document", "--effect", "none"]
+    assert main([*command, "--environment", "default", "--dry-run", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
 
 
 def test_generate_slice_dry_run_is_deterministic_and_write_free(
@@ -966,11 +1009,13 @@ def test_generate_slice_does_not_exempt_a_customized_same_symbol_registration(
                 "app.register_agent(\n"
                 "        _agent_for_provider_override(ANALYST_AGENT, provider_override),\n"
                 "        tools=[AnalyzeDocumentTool()],\n"
+                "        environment_name=NO_ENVIRONMENT,\n"
                 "    )"
             ),
             (
                 "app.register_agent(\n"
                 "        _agent_for_provider_override(ANALYST_AGENT, provider_override),\n"
+                "        environment_name=NO_ENVIRONMENT,\n"
                 "    )"
             ),
         ),

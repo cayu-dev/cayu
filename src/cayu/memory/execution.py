@@ -2347,8 +2347,9 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             raise MemoryInterventionExecutionConflict(
                 "Memory intervention runtime factory changed its bound budget ledger."
             )
-        registered_environment = app._get_registered_environment(
-            request.run_request.environment_name
+        registered_environment = app._session_preparation.resolve_new_run_environment(
+            request.run_request.environment_name,
+            registered_agent=app._get_registered_agent(request.run_request.agent_name),
         )
         if registered_environment is None or registered_environment.factory is not None:
             raise MemoryInterventionExecutionConflict(

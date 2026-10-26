@@ -284,7 +284,7 @@ from cayu.egress.transitions import (
     _drain_parked_egress_authority_allocations,
 )
 from cayu.environments.admission import ExecutionRequirements
-from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.base import Environment, EnvironmentSpec, NoEnvironment
 from cayu.environments.factory import EnvironmentFactory
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots
 from cayu.environments.snapshots import (
@@ -2004,7 +2004,7 @@ class CayuApp:
             route_registered_provider_for_model=(
                 lambda model: self._route_registered_provider_for_model(model=model)
             ),
-            resolve_registered_environment=self._get_registered_environment,
+            resolve_registered_environment=self._get_registered_environment_for_session,
             interrupt_session=self._interrupt_session_private,
             load_session_invocation=self.session_invocation_for_dispatch,
             classify_dispatch_settlement=self._queued_dispatch_settlement_state,
@@ -6007,6 +6007,7 @@ class CayuApp:
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
         execution_requirements: ExecutionRequirements | None = None,
+        environment_name: str | NoEnvironment | None = None,
     ) -> AgentSpec:
         return self._agent_registry.register_agent(
             spec,
@@ -6028,6 +6029,7 @@ class CayuApp:
             runtime_hooks=runtime_hooks,
             loop_policies=loop_policies,
             execution_requirements=execution_requirements,
+            environment_name=environment_name,
         )
 
     def enroll_fork_controller(self, controller: ForkController) -> None:
@@ -6391,7 +6393,7 @@ class CayuApp:
 
     @property
     def default_environment_name(self) -> str | None:
-        """Return the environment a new run without ``environment_name`` uses, if any."""
+        """Return the application default environment; an agent's own default overrides it."""
 
         return self._environment_registry.default_name
 
@@ -6407,8 +6409,8 @@ class CayuApp:
         """Return the profile Runtime would compare a session of ``agent_name`` with.
 
         Pass the session's recorded values. ``environment_name`` is used as a
-        stored session uses it, so ``None`` means no environment; pass
-        ``default_environment_name`` for what a new run would get. ``target`` is
+        stored session uses it, so ``None`` means no environment; pass the
+        agent's or application default for what a new run would get. ``target`` is
         the session's provider and model, and ``causal_budget_id`` selects the
         causal-scoped application budget limits; without it a fresh session id
         stands in, as it does for a new run.
@@ -6799,18 +6801,14 @@ class CayuApp:
         return self._provider_registry.route(model=model)
 
     def _get_registered_environment(
-        self,
-        name: str | None = None,
+        self, name: str | None = None
     ) -> runtime_records.RegisteredEnvironment | None:
         return self._environment_registry.get(name)
 
     def _get_registered_environment_for_session(
-        self,
-        name: str | None,
+        self, name: str | None
     ) -> runtime_records.RegisteredEnvironment | None:
-        if name is None:
-            return None
-        return self._get_registered_environment(name)
+        return None if name is None else self._get_registered_environment(name)
 
     def _effective_retry_policy(self, request_policy: RetryPolicy | None) -> RetryPolicy:
         if request_policy is not None:
@@ -8109,7 +8107,9 @@ class CayuApp:
         request: RunRequest,
     ) -> DurableSubagentPreparedRun:
         request = self._with_application_run_defaults(request)
-        preparation = self._session_preparation.prepare_initial_run(request)
+        preparation = self._session_preparation.prepare_initial_run(
+            request, session_environment=True
+        )
         del request
         prepared = await preparation
         del preparation

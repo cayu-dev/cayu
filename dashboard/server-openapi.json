@@ -66,6 +66,17 @@
             "title": "Context Policy",
             "type": "string"
           },
+          "default_environment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Environment"
+          },
           "execution_requirements": {
             "$ref": "#/components/schemas/ExecutionRequirements"
           },
@@ -132,6 +143,11 @@
               }
             ],
             "title": "Resolved Provider"
+          },
+          "runs_without_environment": {
+            "default": false,
+            "title": "Runs Without Environment",
+            "type": "boolean"
           },
           "runtime_hooks": {
             "default": [],

@@ -24,6 +24,7 @@ from cayu.configuration import CayuConfigSource
 from cayu.context.base import ContextPolicy, DefaultContextPolicy
 from cayu.context.thinking import ThinkingConfig
 from cayu.environments.admission import ExecutionRequirements
+from cayu.environments.base import NO_ENVIRONMENT, NoEnvironment
 from cayu.fork_controllers import ForkController, fork_lineage_budget_limits
 from cayu.mcp.tools import (
     McpToolAdapter,
@@ -217,6 +218,7 @@ class ApplicationAgentRegistry:
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
         execution_requirements: ExecutionRequirements | None = None,
+        environment_name: str | NoEnvironment | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
@@ -336,6 +338,7 @@ class ApplicationAgentRegistry:
             )
         else:
             raise TypeError("execution_requirements must be ExecutionRequirements or None.")
+        stored_default_environment_name = _agent_default_environment_name(environment_name)
 
         requested_mcp_toolsets = _copy_refreshable_mcp_toolsets(mcp_toolsets)
         resolved_mcp_toolsets: list[McpToolset] = []
@@ -533,6 +536,7 @@ class ApplicationAgentRegistry:
                 for index, policy in enumerate(stored_loop_policies)
             ),
             execution_requirements=stored_execution_requirements,
+            default_environment_name=stored_default_environment_name,
             mcp_toolsets=stored_mcp_toolsets,
             context_behavior_execution_profile_identities=(
                 _snapshot_context_behavior_execution_profile_identities(
@@ -881,6 +885,18 @@ class ApplicationAgentRegistry:
             return self._agents[agent_name]
         except KeyError as exc:
             raise KeyError(f"Agent not registered: {agent_name}") from exc
+
+
+def _agent_default_environment_name(
+    environment_name: object,
+) -> str | NoEnvironment | None:
+    """Validate an agent's default environment: a name, ``NO_ENVIRONMENT`` or unset."""
+
+    if environment_name is None or environment_name is NO_ENVIRONMENT:
+        return environment_name
+    if type(environment_name) is not str:
+        raise TypeError("Agent environment_name must be a string, NO_ENVIRONMENT, or None.")
+    return require_clean_nonblank(environment_name, "environment_name")
 
 
 def _copy_refreshable_mcp_toolsets(

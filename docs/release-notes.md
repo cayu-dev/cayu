@@ -53,6 +53,23 @@ not affect execution or approval.
 
 ### Changes
 
+- `register_agent(..., environment_name=...)` sets the environment a new run of
+  that agent uses when its request names none. Pass a registered environment
+  name, or the new `cayu.environments.NO_ENVIRONMENT` to run the agent without
+  any environment even when the application has a default. A request's own
+  `environment_name` still wins, stored sessions keep the environment they
+  started with, and a subagent child of a parent that ran without an
+  environment now runs without one instead of getting the application default.
+  `cayu inspect --json` shows an agent's own default, and `cayu check` reports
+  `AGENT_ENVIRONMENT_NOT_FOUND` for a name that is not registered.
+  `cayu execution-profile candidates` now resolves each agent with its own
+  default.
+- `cayu generate slice` registers the new agent with
+  `environment_name=NO_ENVIRONMENT`, because its generated tool needs no
+  workspace. In a coding project the slice no longer gets the Docker coding
+  sandbox and a copy of the project. Pass `--environment default` to keep the
+  application default, or `--environment NAME` to use a registered
+  environment.
 - `cayu.runners.LaunchedRunner` sends every command of a runner through your
   own launcher, such as `sudo -u sandbox` or bubblewrap: pass an argv prefix or
   a function from `ExecCommand` to `ExecCommand`. It wraps any runner, and

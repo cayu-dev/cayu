@@ -57,6 +57,14 @@ provider, correct `provider_name`, or define an unambiguous default route.
 matches the agent model. Make patterns disjoint or set the agent's
 `provider_name` explicitly.
 
+## agent-environment-not-found
+
+`AGENT_ENVIRONMENT_NOT_FOUND` means an agent was registered with
+`register_agent(..., environment_name="NAME")`, but no environment named `NAME`
+is registered, so a new run of that agent fails before it starts. Register the
+environment, correct the name, or pass `NO_ENVIRONMENT` to run the agent
+without one.
+
 ## agent-workflow-tool-not-registered
 
 `AGENT_WORKFLOW_TOOL_NOT_REGISTERED` means an agent's explicit

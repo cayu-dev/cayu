@@ -49,8 +49,10 @@ from cayu.environments.base import (
 from cayu.environments.base import (
     DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES as DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES,
 )
+from cayu.environments.base import NO_ENVIRONMENT as NO_ENVIRONMENT
 from cayu.environments.base import Environment as Environment
 from cayu.environments.base import EnvironmentSpec as EnvironmentSpec
+from cayu.environments.base import NoEnvironment as NoEnvironment
 from cayu.environments.base import WorkspaceInstructions as WorkspaceInstructions
 from cayu.environments.base import WorkspaceInstructionsConfig as WorkspaceInstructionsConfig
 from cayu.environments.base import copy_environment as copy_environment

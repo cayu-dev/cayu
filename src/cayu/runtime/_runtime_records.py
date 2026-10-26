@@ -10,7 +10,7 @@ from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.agents import AgentSpec
 from cayu.context.base import ContextPolicy
 from cayu.environments.admission import ExecutionEnvironmentAuthority, ExecutionRequirements
-from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.base import Environment, EnvironmentSpec, NoEnvironment
 from cayu.environments.bindings import BoundWorkspace
 from cayu.environments.factory import EnvironmentFactory, EnvironmentFactoryResult
 from cayu.observability.hooks import RuntimeHook
@@ -85,6 +85,9 @@ class RegisteredAgentState:
     loop_policies: tuple[LoopPolicy, ...]
     loop_policy_execution_profile_identities: tuple[ExecutionProfileBehaviorIdentity | None, ...]
     execution_requirements: ExecutionRequirements
+    # The environment a new run without ``environment_name`` uses: a registered
+    # name, ``NO_ENVIRONMENT``, or ``None`` for the application default.
+    default_environment_name: str | NoEnvironment | None = None
     context_behavior_execution_profile_identities: Mapping[
         int, ExecutionProfileBehaviorIdentity | None
     ] = field(default_factory=dict)

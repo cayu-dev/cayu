@@ -50,6 +50,9 @@ from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION
 
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")
 GENERATOR_PLAN_SCHEMA_VERSION = APP_MANIFEST_SCHEMA_VERSION
+# `cayu generate slice --environment` values that are not environment names.
+SLICE_NO_ENVIRONMENT = "none"
+SLICE_APPLICATION_ENVIRONMENT = "default"
 _P = ParamSpec("_P")
 _PlanT = TypeVar("_PlanT", bound="GeneratorPlan | ServiceContextMigrationPlan")
 
@@ -166,6 +169,18 @@ def add_generate_parser(subparsers: Any) -> None:
         required=True,
         help="Declared ToolEffect. See `cayu guide tool-effects` for the decision table.",
     )
+    slice_parser.add_argument(
+        "--environment",
+        default=SLICE_NO_ENVIRONMENT,
+        metavar="NAME",
+        help=(
+            "Environment the new agent's runs use when a request names none: "
+            f"'{SLICE_NO_ENVIRONMENT}' (default) registers it with NO_ENVIRONMENT, so "
+            "this tool-only agent gets no workspace, runner or sandbox; "
+            f"'{SLICE_APPLICATION_ENVIRONMENT}' keeps the application default "
+            "environment; any other value names a registered environment."
+        ),
+    )
     slice_parser.add_argument("--dry-run", action="store_true", help="Plan without writes.")
     add_output_options(slice_parser)
     tool_parser = generators.add_parser(
@@ -227,6 +242,7 @@ def _run_generate(args: argparse.Namespace) -> int:
                 name=args.name,
                 tool_name=args.tool,
                 effect=args.effect,
+                environment=args.environment,
             )
         elif args.generate_command == "tool":
             plan = plan_tool(
@@ -787,12 +803,23 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
 
 
 @_guarded_generator_plan
-def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
+def plan_slice(
+    *,
+    name: str,
+    tool_name: str,
+    effect: str,
+    environment: str = SLICE_NO_ENVIRONMENT,
+) -> GeneratorPlan:
     name = _identifier(name, "slice name")
     tool_name = _identifier(tool_name, "tool name")
     tool_name_constant = f"{_constant_name(tool_name)}_TOOL_NAME"
     if effect not in {"none", "idempotent", "external"}:
         raise ValueError("effect must be none, idempotent, or external.")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", environment):
+        raise ValueError(
+            f"environment must be '{SLICE_NO_ENVIRONMENT}', "
+            f"'{SLICE_APPLICATION_ENVIRONMENT}', or a registered environment name."
+        )
     project = resolve_project(command="cayu generate")
     root = project.root
     registration_relative, registration_path = _registration_target(root)
@@ -820,6 +847,8 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
     ]
     if effect == "external" and registration_relative != "app.py":
         import_lines.append("from cayu.tools import AlwaysRequireApprovalToolPolicy")
+    if environment == SLICE_NO_ENVIRONMENT:
+        import_lines.append("from cayu.environments import NO_ENVIRONMENT")
     agent_constant = f"{_constant_name(name)}_AGENT"
     tool_instance = f"{_class_name(tool_name)}Tool()"
     provider_variable = "provider_override" if registration_relative != "app.py" else "provider"
@@ -832,6 +861,12 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         registration_lines.append(
             f"    tool_policy=AlwaysRequireApprovalToolPolicy(tools=[{tool_name_constant}]),"
         )
+    if environment == SLICE_NO_ENVIRONMENT:
+        # The generated tool needs no workspace, so the slice must not inherit an
+        # application default such as the coding preset's sandbox.
+        registration_lines.append("    environment_name=NO_ENVIRONMENT,")
+    elif environment != SLICE_APPLICATION_ENVIRONMENT:
+        registration_lines.append(f'    environment_name="{environment}",')
     registration_lines.append(")")
     registration = "\n".join(registration_lines)
 

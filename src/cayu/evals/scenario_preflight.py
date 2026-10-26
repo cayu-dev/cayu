@@ -462,7 +462,18 @@ def _environment_material(
     diagnostics: list[ScenarioLaunchDiagnosticV2] = []
     if pinned is not None and requested is not None and requested != pinned:
         diagnostics.append(_diagnostic(ScenarioLaunchDiagnosticCode.EXECUTION_BINDING_REQUIRED))
-    environment_name = requested or pinned or manifest.defaults.environment
+    agent = next(
+        (item for item in manifest.agents if item.name == target.request_base.agent_name),
+        None,
+    )
+    # A new run without an environment uses the agent's own default before the app's.
+    if agent is not None and agent.runs_without_environment:
+        default_environment = None
+    elif agent is not None and agent.default_environment is not None:
+        default_environment = agent.default_environment
+    else:
+        default_environment = manifest.defaults.environment
+    environment_name = requested or pinned or default_environment
     environment_manifest = next(
         (item for item in manifest.environments if item.name == environment_name),
         None,

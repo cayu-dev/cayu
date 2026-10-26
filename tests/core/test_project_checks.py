@@ -108,6 +108,7 @@ class _UncalledEnvironmentFactory(EnvironmentFactory):
 
 def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
     assert BUILTIN_DIAGNOSTIC_CODES == (
+        "AGENT_ENVIRONMENT_NOT_FOUND",
         "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
         "AGENT_PROVIDER_AMBIGUOUS",
         "AGENT_PROVIDER_NOT_FOUND",
@@ -463,6 +464,10 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     missing.register_agent(AgentSpec(name="missing", model="model", provider_name="absent"))
     missing_codes = {item.code for item in check_manifest(missing.describe()).diagnostics}
 
+    homeless = CayuApp(enable_logging=False)
+    homeless.register_agent(AgentSpec(name="homeless", model="model"), environment_name="absent")
+    homeless_codes = {item.code for item in check_manifest(homeless.describe()).diagnostics}
+
     ambiguous = CayuApp(enable_logging=False)
     for name in ("one", "two"):
         ambiguous.register_provider(
@@ -599,6 +604,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | validity_codes
         | remote_schema_codes
         | missing_codes
+        | homeless_codes
         | ambiguous_codes
         | unsafe_codes
         | unknown_codes

@@ -26,7 +26,7 @@ from cayu.deadlines import (
     current_execution_deadline,
     effective_deadline,
 )
-from cayu.environments.base import WorkspaceInstructions
+from cayu.environments.base import NO_ENVIRONMENT, WorkspaceInstructions
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     changed_execution_profile_components,
@@ -66,7 +66,8 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions._model_failover import ModelTarget
-from cayu.sessions.records import SessionIdentity
+from cayu.sessions.invocation import SessionExecutionSource
+from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import (
     RunRequest,
     copy_run_request,
@@ -158,6 +159,22 @@ def _session_identity(
     )
 
 
+def _inherits_no_environment(request: RunRequest, parent: Session | None) -> bool:
+    """Return whether a subagent child inherits its parent's lack of an environment.
+
+    A built-in subagent request carries its parent's recorded environment, or
+    its ``SubagentSpec`` override. Without either, a parent stored with no
+    environment means the child runs without one too, not with a default.
+    """
+
+    return (
+        request._runtime_invocation_source is SessionExecutionSource.SUBAGENT
+        and request.environment_name is None
+        and parent is not None
+        and parent.environment_name is None
+    )
+
+
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
     # ``copy_run_request`` deliberately preserves the request's private runtime
     # authority provenance. Reconstructing a fresh model here would silently
@@ -228,6 +245,25 @@ class SessionPreparation:
             execution_profile_process_identity, "execution_profile_process_identity"
         )
         self._policy_selection = policy_selection
+
+    def resolve_new_run_environment(
+        self,
+        environment_name: str | None,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> runtime_records.RegisteredEnvironment | None:
+        """Resolve a new run's environment.
+
+        The request's ``environment_name`` wins, then the agent's registered
+        default (``NO_ENVIRONMENT`` selects none), then the application default.
+        """
+
+        if environment_name is None:
+            agent_default = registered_agent.default_environment_name
+            if agent_default is NO_ENVIRONMENT:
+                return None
+            environment_name = agent_default
+        return self._get_registered_environment(environment_name)
 
     def _resolve_initial_model_target(
         self,
@@ -555,8 +591,11 @@ class SessionPreparation:
         registered_provider.provider.preflight_model_target(model=model)
         registered_environment = (
             self._get_registered_environment_for_session(request.environment_name)
-            if session_environment
-            else self._get_registered_environment(request.environment_name)
+            if session_environment or _inherits_no_environment(request, parent)
+            else self.resolve_new_run_environment(
+                request.environment_name,
+                registered_agent=registered_agent,
+            )
         )
         if (
             expected_registered_environment is not None

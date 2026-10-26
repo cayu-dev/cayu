@@ -19,7 +19,7 @@ import cayu.runtime._session_preparation as session_preparation_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.configuration import CayuConfig, ToolExecutionConfig
-from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.base import NO_ENVIRONMENT, Environment, EnvironmentSpec, NoEnvironment
 from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -899,9 +899,11 @@ def _register_durable_subagent_agents(
     app: CayuApp,
     *,
     environment_name: str | None = None,
+    parent_environment_name: str | NoEnvironment | None = None,
 ) -> None:
     app.register_agent(
         AgentSpec(name="parent", model="model"),
+        environment_name=parent_environment_name,
         tools=[
             SubagentTool(
                 app,
@@ -1212,6 +1214,51 @@ def test_durable_subagent_child_runs_in_its_spec_environment() -> None:
         assert [
             (request.session_id, request.parent_session_id) for request in factory.requests
         ] == [(child.id, "durable-env-parent")]
+
+    asyncio.run(run())
+
+
+def test_durable_subagent_child_of_a_parent_without_environment_gets_none() -> None:
+    async def run() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(tasks)
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            dispatcher=dispatcher,
+            enable_logging=False,
+        )
+        app.register_provider(_DurableSubagentProvider(), default=True)
+        app.register_environment(Environment(EnvironmentSpec(name="coding")), default=True)
+        _register_durable_subagent_agents(app, parent_environment_name=NO_ENVIRONMENT)
+
+        parent_events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="parent",
+                    session_id="durable-no-env-parent",
+                    messages=[Message.text("user", "parent task")],
+                )
+            )
+        )
+
+        assert parent_events[-1].type == EventType.SESSION_COMPLETED
+        parent = await sessions.load("durable-no-env-parent")
+        (child,) = (
+            await sessions.list_sessions(SessionQuery(parent_session_id="durable-no-env-parent"))
+        ).sessions
+        assert parent is not None
+        assert parent.environment_name is None
+        # The child inherits "no environment", not the application default.
+        assert child.environment_name is None
+        handle = await dispatcher.process_next(app, worker_id="durable-no-env-worker")
+        assert handle is not None
+        assert handle.status.value == "completed"
+        completed = await sessions.load(child.id)
+        assert completed is not None
+        assert completed.status is SessionStatus.COMPLETED
+        assert completed.environment_name is None
 
     asyncio.run(run())
 

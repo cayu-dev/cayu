@@ -30,6 +30,7 @@ from cayu.cli.project import (
     project_context,
     resolve_project,
 )
+from cayu.environments.base import NO_ENVIRONMENT
 from cayu.execution_profiles import (
     ExecutionProfileAdmissionBoundary,
     ExecutionProfileIdentity,
@@ -126,7 +127,10 @@ def add_execution_profile_parser(subparsers: Any) -> None:
     environment = candidates.add_mutually_exclusive_group()
     environment.add_argument(
         "--environment",
-        help="Resolve candidates for this environment (default: the application default).",
+        help=(
+            "Resolve candidates for this environment (default: the environment a new run "
+            "of each agent gets)."
+        ),
     )
     environment.add_argument(
         "--no-environment",
@@ -200,6 +204,19 @@ def _add_target_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _new_run_environment(app: Any, agent_name: str) -> str | None:
+    """Return the environment a new run of the agent gets: its own default, else the app's."""
+
+    try:
+        agent_default = app._get_registered_agent(agent_name).default_environment_name
+    except KeyError:
+        # Candidate resolution reports the unregistered agent as unavailable.
+        return app.default_environment_name
+    if agent_default is NO_ENVIRONMENT:
+        return None
+    return app.default_environment_name if agent_default is None else agent_default
+
+
 def _run_candidates(args: argparse.Namespace) -> int:
     if (args.provider is None) != (args.model is None):
         return _fail(args, "INVALID_ARGUMENTS", "--provider and --model must be given together.")
@@ -208,18 +225,21 @@ def _run_candidates(args: argparse.Namespace) -> int:
         with project_context(project.root):
             app = build_project_app(project.target, command="Execution-profile")
             agents = tuple(args.agent) or app.list_agents()
-            environment = (
-                None
-                if args.no_environment
-                else app.default_environment_name
-                if args.environment is None
-                else args.environment
-            )
             candidates, errors = asyncio.run(
                 _resolve_candidates(
                     app,
                     [
-                        (agent, environment, args.provider, args.model, args.causal_budget_id)
+                        (
+                            agent,
+                            None
+                            if args.no_environment
+                            else _new_run_environment(app, agent)
+                            if args.environment is None
+                            else args.environment,
+                            args.provider,
+                            args.model,
+                            args.causal_budget_id,
+                        )
                         for agent in agents
                     ],
                 )

@@ -300,9 +300,15 @@ async def _materialize_inputs(
     references: dict[str, dict[str, str]] = {revision: {} for revision in scenarios}
     if not files:
         return references
-    environment = target.app.get_environment(target.request_base.environment_name)
-    if environment.factory is not None or not isinstance(
-        environment.environment.artifact_store, ArtifactStore
+    # Upload into the environment the target's runs use, including an agent default.
+    environment = target.app._session_preparation.resolve_new_run_environment(
+        target.request_base.environment_name,
+        registered_agent=target.app._get_registered_agent(target.request_base.agent_name),
+    )
+    if (
+        environment is None
+        or environment.factory is not None
+        or not isinstance(environment.environment.artifact_store, ArtifactStore)
     ):
         raise ValueError("Benchmark files require an existing environment with an ArtifactStore.")
     store = environment.environment.artifact_store
