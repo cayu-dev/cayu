@@ -96,6 +96,7 @@ class ControlPlaneCapabilitySnapshot:
                     mutation_supported=self.task_creation_supported,
                 ),
                 tool_inventory=_optional_surface(True, mutation_supported=False),
+                tool_display=_optional_surface(True, mutation_supported=False),
                 tool_usage=_optional_surface(
                     True, read_supported=self.tool_usage_supported, mutation_supported=False
                 ),

@@ -198,8 +198,9 @@ per-specialist recent work; `/agents?q=` redirects to `/specialists?q=`. Tools
 retains declaration variants and uses the real public-name usage aggregates and
 cursor-paged calls. Unavailable reads do not become zero counts. Exact call links
 carry the retained session incarnation into Trace. The old Agents page is removed.
-Built-in display-label runtime work remains separate; tool names remain the
-fallback until labels are supplied by the runtime.
+`/api/agents` supplies optional registered `display` labels, advertised by the
+read-only `tool_display` capability. Built-ins declare labels; custom, MCP and
+hosted tools retain the name fallback when none is declared.
 
 Knowledge page port: `/knowledge` uses runtime kept-entry reads and revision-fenced
 retirement. Reviews reuse Inbox decisions and source evidence; kept usage and

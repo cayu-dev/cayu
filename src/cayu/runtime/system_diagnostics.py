@@ -218,6 +218,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     task_index: OptionalSurfaceCapability | None = None
     task_creation: OptionalSurfaceCapability | None = None
     tool_inventory: OptionalSurfaceCapability | None = None
+    tool_display: OptionalSurfaceCapability | None = None
     tool_usage: OptionalSurfaceCapability | None = None
     session_trace: OptionalSurfaceCapability | None = None
     session_followups: OptionalSurfaceCapability | None = None

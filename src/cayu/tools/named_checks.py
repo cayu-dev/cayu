@@ -69,6 +69,7 @@ from cayu.tools.commands import (
     _command_output_label,
     _command_output_preview_encoding,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.tools.structured_commands import (
     _RECOVERY_EVIDENCE_HEADROOM_BYTES,
     RunCommandTool,
@@ -280,6 +281,7 @@ class RunCheckTool(Tool, DurableToolRecovery):
     """Run one application-owned check selected by its finite public name."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Ran", noun="check"),
         name="run_check",
         description="Run one application-defined bounded check by name.",
         parallel_safe=False,

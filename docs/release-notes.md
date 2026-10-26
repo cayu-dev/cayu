@@ -29,6 +29,11 @@ attribution and usage, and full-access revision-fenced Remove. Ejected dashboard
 owners should replace the former `src/routes/knowledge.tsx` route with the new
 Knowledge entry/page and regenerate their build.
 
+Tools can declare optional `ToolDisplay(verb=..., noun=..., plural=...)` metadata
+through `ToolSpec.display`. Built-ins ship labels and `/api/agents` returns their
+redacted declaration; tools without labels retain the name fallback. Labels do
+not affect execution or approval.
+
 ### Breaking changes
 
 - `run_task_worker(execution_timeout_s=...)` now includes the grace period. The

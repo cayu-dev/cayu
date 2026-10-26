@@ -48,6 +48,15 @@ def tool_declarations(
                 {
                     "name": sanitize(registered.name),
                     "description": sanitize(registered.description),
+                    "display": (
+                        None
+                        if registered.display is None
+                        else {
+                            "verb": sanitize(registered.display.verb),
+                            "noun": sanitize(registered.display.noun),
+                            "plural": sanitize(registered.display.plural),
+                        }
+                    ),
                     "input_schema": app.redact_json(registered.schema),
                     "parallel_safe": registered.parallel_safe,
                     "effect": EFFECTS.get(tool.effect, "external"),
@@ -63,6 +72,7 @@ def tool_declarations(
                 {
                     "name": sanitize(hosted.type),
                     "description": "Provider-hosted tool",
+                    "display": None,
                     "input_schema": {},
                     "parallel_safe": False,
                     "effect": "none",

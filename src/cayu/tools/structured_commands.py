@@ -63,6 +63,7 @@ from cayu.tools.commands import (
     _command_output_preview_encoding,
     _portable_command_output,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,
@@ -468,6 +469,7 @@ class RunCommandTool(Tool):
     """Run one bounded structured command selected from an admitted toolchain profile."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Ran", noun="command"),
         name="run_command",
         description=(
             "Run a bounded application-admitted command selector with structured arguments. "

@@ -62,6 +62,7 @@ from cayu.tools.base import (
     ToolSpec,
     _runtime_tool_invocation_authority,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.workspaces.base import Workspace, WorkspaceRevisionMismatchError
 
 if TYPE_CHECKING:
@@ -833,6 +834,7 @@ class PublishWorkspaceArtifactTool(Tool):
             raise TypeError("clock must be callable.")
         super().__init__(
             ToolSpec(
+                display=ToolDisplay(verb="Published", noun="artifact"),
                 name=PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME,
                 # Receipts and references only; attested, so never cut.
                 max_terminal_payload_bytes=tool_terminal_payload_bound(
@@ -1001,6 +1003,7 @@ class MaterializeSharedArtifactTool(Tool):
             raise TypeError("clock must be callable.")
         super().__init__(
             ToolSpec(
+                display=ToolDisplay(verb="Materialized", noun="artifact"),
                 name=MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME,
                 # Receipts and references only; attested, so never cut.
                 max_terminal_payload_bytes=tool_terminal_payload_bound(

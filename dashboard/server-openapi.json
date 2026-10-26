@@ -5085,6 +5085,42 @@
         "title": "ApiTaskTopologySessionBranch",
         "type": "object"
       },
+      "ApiToolDisplay": {
+        "additionalProperties": false,
+        "properties": {
+          "noun": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Noun"
+          },
+          "plural": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plural"
+          },
+          "verb": {
+            "title": "Verb",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verb"
+        ],
+        "title": "ApiToolDisplay",
+        "type": "object"
+      },
       "ApiToolSummary": {
         "additionalProperties": false,
         "properties": {
@@ -5102,6 +5138,16 @@
           "description": {
             "title": "Description",
             "type": "string"
+          },
+          "display": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApiToolDisplay"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "effect": {
             "title": "Effect",
@@ -9200,6 +9246,16 @@
           },
           "tasks": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
+          },
+          "tool_display": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "tool_inventory": {
             "anyOf": [
@@ -35383,7 +35439,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "63",
+            "default": "64",
             "title": "Contract Version",
             "type": "string"
           },
@@ -42799,7 +42855,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "63",
+            "default": "64",
             "title": "Contract Version",
             "type": "string"
           }

@@ -83,6 +83,7 @@ from cayu.tools._terminal_bounds import (
     tool_terminal_payload_bound,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 from cayu.tools.policy import metadata_with_taint_labels, taint_labels_from_metadata
 from cayu.vaults import SecretRedactor
 
@@ -395,6 +396,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         tool_description = description or _subagent_tool_description(self._agents)
         super().__init__(
             ToolSpec(
+                display=ToolDisplay(verb="Started", noun="subagent"),
                 name=require_clean_nonblank(name, "name"),
                 # Spawns nested sessions; never overlaps other tools in a round.
                 parallel_safe=False,
@@ -1071,6 +1073,7 @@ class SubagentResultTool(Tool):
         self._default_timeout_s = float(default_timeout_s)
         super().__init__(
             ToolSpec(
+                display=ToolDisplay(verb="Read subagent results"),
                 name=require_clean_nonblank(name, "name"),
                 effect=ToolEffect.NONE,
                 description=description

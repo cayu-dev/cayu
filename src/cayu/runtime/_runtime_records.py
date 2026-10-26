@@ -30,6 +30,7 @@ from cayu.tools.base import (
     ToolResult,
 )
 from cayu.tools.discovery import ToolDiscoveryMode
+from cayu.tools.display import ToolDisplay
 from cayu.tools.exposure import ToolExposureMode
 from cayu.tools.grants import (
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
@@ -131,6 +132,7 @@ class RegisteredTool:
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool
+    display: ToolDisplay | None = None
     execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
     auxiliary_inference: AuxiliaryInferencePolicy | None = None
     retain_arguments_for_model: bool = False

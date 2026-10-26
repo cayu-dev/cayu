@@ -478,6 +478,7 @@ class _RecordedTool(Tool):
             ToolSpec(
                 name=registered_tool.name,
                 description=registered_tool.description,
+                display=registered_tool.display,
                 input_schema=registered_tool.schema,
                 parallel_safe=registered_tool.parallel_safe,
                 effect=registered_tool.effect,

@@ -208,7 +208,8 @@ def test_docker_typed_tool_and_factory_identities_match_the_release_before() -> 
     policy = StructuredCommandToolPolicy(toolchain_profile=profile)
     check = _run_check_tool(profile)
 
-    assert _digest(command.spec.model_dump(mode="json")) == (
+    # Presentation metadata is outside the execution contract pinned here.
+    assert _digest(command.spec.model_dump(mode="json", exclude={"display"})) == (
         "38111b1966ff83a4878acd7e466d6ff019d29660177eecbe877cb435567ce9c5"
     )
     assert _digest(command._execution_profile_material()) == (
@@ -224,7 +225,7 @@ def test_docker_typed_tool_and_factory_identities_match_the_release_before() -> 
     assert _digest(policy._execution_profile_material()) == (
         "fd6ea04e1c252e58d371b0989d3b84c9f9e01433a3214909658fb23520dc50d6"
     )
-    assert _digest(check.spec.model_dump(mode="json")) == (
+    assert _digest(check.spec.model_dump(mode="json", exclude={"display"})) == (
         "15007c30c7200026eb30a7daeb4763f484f3e71c0a143d08e8972cf6e3048dc5"
     )
     assert _digest(check._execution_profile_material()) == (

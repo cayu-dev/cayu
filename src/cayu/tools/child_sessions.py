@@ -24,6 +24,7 @@ from cayu.tools._terminal_bounds import (
     tool_terminal_payload_bound,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 
 
 class ChildSessionResultTool(Tool):
@@ -43,6 +44,7 @@ class ChildSessionResultTool(Tool):
         self._session_store = session_store
         super().__init__(
             ToolSpec(
+                display=ToolDisplay(verb="Read child session results"),
                 name=require_clean_nonblank(name, "name"),
                 effect=ToolEffect.NONE,
                 description=description

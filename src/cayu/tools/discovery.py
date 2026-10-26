@@ -58,6 +58,7 @@ from cayu.tools.catalogue import (
     validate_tool_catalogue_revision,
     validate_tool_descriptor_version,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.tools.exposure import ToolCapabilityCeiling, copy_tool_capability_ceiling
 from cayu.tools.grants import (
     TARGETED_TOOL_DIGEST_PATTERN,
@@ -1594,6 +1595,7 @@ class SearchToolsTool(Tool):
     """Cayu-owned stable discovery tool executed through the ordinary tool path."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Searched tools"),
         name=SEARCH_TOOLS_NAME,
         description=search_tools_spec()["description"],
         input_schema=search_tools_spec()["input_schema"],

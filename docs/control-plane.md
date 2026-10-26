@@ -711,3 +711,35 @@ refresh is paused. An empty older page does not imply that the queue is empty; s
 cursor or an error. Members can review and read. Remove
 is full-access and confirms the displayed revision; after an unconfirmed or
 conflicting removal, refresh canonical state before starting a new intent.
+
+### Tool display labels
+
+`GET /api/agents` includes optional `display` metadata on each tool declaration:
+`{verb, noun, plural}` or null. Built-in tools declare their own labels, including
+renamed built-ins. Custom tools can supply `ToolSpec(display=ToolDisplay(...))`;
+`ToolDisplay` is imported from `cayu.tools`.
+For class-level declarations checked by `cayu check`, use a literal dictionary
+(`display={"verb": "Read", "noun": "file"}`); the static declaration checker does
+not evaluate nested `ToolDisplay(...)` constructors.
+MCP and provider-hosted tools need not supply labels. Use the tool name when no
+label is declared rather than guessing from its name. The read-only
+`tool_display` capability advertises this metadata. Server contract 64 adds this
+nullable field; independently hosted dashboards should regenerate their client
+and update their supported contract version together.
+
+A noun uses singular for one call and the declared plural (or noun plus `s`) for
+other counts: `{verb: "Read", noun: "file"}` describes “Read 9 files”. Without a
+noun, use the verb and call count: `{verb: "Searched"}` describes “Searched 10
+times”. A missing label falls back to “Used query_ledger 2 times”. These strings
+are public presentation metadata, redacted by the same owner as other tool
+summaries. They do not change approval, execution identity or model tool schemas.
+
+```python
+from cayu import ToolSpec
+from cayu.tools import ToolDisplay
+
+spec = ToolSpec(
+    name="query_ledger",
+    display=ToolDisplay(verb="Queried", noun="ledger"),
+)
+```

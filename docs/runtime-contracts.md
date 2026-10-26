@@ -20319,3 +20319,26 @@ state. SQLite can invoke it on a worker thread. Publish accumulated state only
 after successful return; failure or cancellation invalidates it. Native stores
 finish owned read cleanup before propagating cancellation. Cloud registration limits, payload fitting and reporting
 windows are unchanged.
+
+### Tool presentation declarations
+
+`ToolDisplay` is an optional frozen declaration on `ToolSpec.display`. Its
+required `verb` and optional `noun` and `plural` are exact nonblank Unicode
+strings, with no surrounding whitespace, control characters or line separators.
+A plural requires a noun. Values are rejected rather than trimmed or coerced;
+unknown fields are rejected. `None` leaves the tool name as the presentation
+fallback. Both typed declarations and dictionaries are accepted by `ToolSpec`.
+
+Construction, validating copies and registration own snapshots of all three
+fields. The built-in declarations use the same convention and custom-named
+built-ins retain their labels. A supplied replacement spec may omit display.
+Recorded eval tools preserve the registered source declaration. Display is not
+part of execution-profile identity, model-callable schemas, tool discovery
+eligibility, approval or dispatch. Tools without declarations, including MCP and
+provider-hosted tools, publish null; a familiar name alone does not prove a label.
+
+The agents API projects registered labels through the existing public redactor
+and includes nullable `display` on each `ApiToolSummary`. Public projection may
+replace a label with a redaction marker. Consumers treat it as text, never HTML
+or execution authority. `tool_display.read` is available on every server with
+this contract; it grants no mutation capability.

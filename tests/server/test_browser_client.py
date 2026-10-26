@@ -160,6 +160,9 @@ def test_browser_client_is_versioned_with_the_server_contract(entrance: str, tmp
     )
     assert _exported_constant(types, "CLIENT_VERSION") == BROWSER_CLIENT_VERSION
     assert "eval_suite_views" in contract["capabilities"]["surfaces"]
+    display = contract["capabilities"]["surfaces"]["tool_display"]
+    assert display["read"]["enabled"] is True
+    assert display["mutate"]["enabled"] is False
     assert "cayu guide app-ui" in module
 
 
@@ -205,6 +208,9 @@ if (CONTRACT_VERSION !== connected.contract.contract_version || !Object.hasOwn(c
 }
 if (connected.contract.capabilities.surfaces.session_trace?.read?.enabled !== true || connected.contract.capabilities.surfaces.session_trace?.mutate?.enabled !== false) {
   throw new Error('Shipped client must retain the read-only trace capability');
+}
+if (connected.contract.capabilities.surfaces.tool_display?.read?.enabled !== true || connected.contract.capabilities.surfaces.tool_display?.mutate?.enabled !== false) {
+  throw new Error('Shipped client must retain the read-only tool display capability');
 }
 if (connected.contract.capabilities.surfaces.session_followups?.mutate?.enabled !== true) {
   throw new Error('Shipped client must retain the follow-up capability');

@@ -9,7 +9,7 @@ def with_intrinsic_execution_requirements(
     """Preserve implementation dependencies when customizing a built-in spec."""
     if not isinstance(spec, ToolSpec):
         raise TypeError("Tool spec must be a ToolSpec.")
-    spec = ToolSpec.model_validate(spec.model_dump(mode="python", warnings=False))
+    spec = spec.model_copy()
     requirements = {item.name: item for item in spec.execution_requirements}
     for requirement in intrinsic:
         previous = requirements.setdefault(requirement.name, requirement)

@@ -48,6 +48,7 @@ from cayu.tools.base import (
     ToolSpec,
     _runtime_tool_invocation_authority,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.base import (
     Workspace,
@@ -279,6 +280,7 @@ def _apply_patch_tool_spec(*, max_operations: int) -> ToolSpec:
         "additionalProperties": False,
     }
     return ToolSpec(
+        display=ToolDisplay(verb="Applied", noun="patch", plural="patches"),
         name="apply_patch",
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,

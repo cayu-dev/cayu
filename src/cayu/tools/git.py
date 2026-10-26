@@ -31,6 +31,7 @@ from cayu.tools.base import (
     ToolResult,
     ToolSpec,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces.base import RunnerBoundWorkspace
 from cayu.workspaces.local import LocalWorkspace
@@ -88,6 +89,7 @@ class GitChangesTool(Tool):
         )
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Checked git changes"),
         name="git_changes",
         execution_requirements=(
             ToolExecutionRequirement(

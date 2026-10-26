@@ -54,6 +54,7 @@ from cayu.tools.base import (
     ToolSpec,
     _bound_policy_denial_result,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.tools.process_diagnostics import (
     MAX_COMMAND_TIMEOUT_SECONDS,
     ProcessCommandCapabilities,
@@ -187,6 +188,7 @@ class CommandPolicy(ABC):
 
 class ExecCommandTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Ran", noun="command"),
         name="exec_command",
         # Runs commands with side effects; never overlaps other tools in a round.
         parallel_safe=False,

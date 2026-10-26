@@ -89,10 +89,10 @@ export type SessionState =
   | "interrupted"
 
 /**
- * Proposed (backend item 9): how a tool reads in a summary line, declared with the tool
+ * How a tool reads in a summary line, declared with the tool
  * (`"Read"` + `"file"` gives "read 9 files"). Built-in tools ship one; others may set it.
  */
-export type ToolDisplay = { verb: string; noun?: string; plural?: string }
+export type ToolDisplay = import("@/lib/generated/server-api").ApiToolDisplay
 /**
  * Where a tool comes from, as Cloud's inventory reports it (`CloudToolSource` in
  * cayu/cloud_inventory.py): the agent's own code, Cayu, a package (with its version), an

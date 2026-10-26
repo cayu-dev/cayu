@@ -2462,6 +2462,24 @@ export type ApiTaskTopologySessionBranch = {
 };
 
 /**
+ * ApiToolDisplay
+ */
+export type ApiToolDisplay = {
+    /**
+     * Noun
+     */
+    noun?: string | null;
+    /**
+     * Plural
+     */
+    plural?: string | null;
+    /**
+     * Verb
+     */
+    verb: string;
+};
+
+/**
  * ApiToolSummary
  */
 export type ApiToolSummary = {
@@ -2473,6 +2491,7 @@ export type ApiToolSummary = {
      * Description
      */
     description: string;
+    display?: ApiToolDisplay | null;
     /**
      * Effect
      */
@@ -4462,6 +4481,7 @@ export type ControlPlaneSurfaceCapabilities = {
     task_creation?: OptionalSurfaceCapability | null;
     task_index?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
+    tool_display?: OptionalSurfaceCapability | null;
     tool_inventory?: OptionalSurfaceCapability | null;
     tool_usage?: OptionalSurfaceCapability | null;
     usage: OptionalSurfaceCapability;

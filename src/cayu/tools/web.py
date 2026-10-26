@@ -27,6 +27,7 @@ from cayu.tools._terminal_bounds import (
     spec_with_terminal_payload_bound,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 from cayu.tools.web_access import (
     WebAccessEvidenceSource,
     WebAccessOutcome,
@@ -350,6 +351,7 @@ class WebFetchTool(Tool):
     """Fetch bounded text from public HTTPS pages in the trusted Cayu process."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Fetched", noun="page"),
         name="web_fetch",
         effect=ToolEffect.NONE,
         description=(
@@ -740,6 +742,7 @@ def _result_claims_web_access(result: ToolResult) -> bool:
 
 def _web_search_tool_spec(*, default_results: int, max_results: int) -> ToolSpec:
     return ToolSpec(
+        display=ToolDisplay(verb="Searched the web"),
         name="web_search",
         effect=ToolEffect.NONE,
         description=(

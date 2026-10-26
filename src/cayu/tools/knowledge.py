@@ -112,6 +112,7 @@ from cayu.tools._terminal_bounds import (
     spec_with_terminal_payload_bound,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_KNOWLEDGE_TOOL_LIMIT = DEFAULT_KNOWLEDGE_LIMIT
@@ -342,6 +343,7 @@ def _copy_remember_knowledge_policy(
 
 class SearchKnowledgeTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Searched knowledge"),
         name="search_knowledge",
         effect=ToolEffect.NONE,
         description=(
@@ -659,6 +661,7 @@ class SearchKnowledgeTool(Tool):
 
 class RememberKnowledgeTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Proposed", noun="memory", plural="memories"),
         name="remember_knowledge",
         # Writes to the knowledge store; never overlaps other tools in a round.
         parallel_safe=False,
@@ -2073,6 +2076,7 @@ def _remember_knowledge_already_known_result(entry: KnowledgeEntry) -> ToolResul
 
 class ListKnowledgeTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Listed knowledge"),
         name="list_knowledge",
         effect=ToolEffect.NONE,
         description=(
@@ -2330,6 +2334,7 @@ class ListKnowledgeTool(Tool):
 
 class ReadKnowledgeTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Read knowledge"),
         name="read_knowledge",
         effect=ToolEffect.NONE,
         description=(

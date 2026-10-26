@@ -62,6 +62,7 @@ from cayu.tools._terminal_bounds import (
     tool_result_fits,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.base import (
     Workspace,
@@ -244,6 +245,7 @@ def _read_file_tool_spec(
     max_attachment_limit_bytes: int,
 ) -> ToolSpec:
     return ToolSpec(
+        display=ToolDisplay(verb="Read", noun="file"),
         name="read_file",
         # Attachments are references to stored artifacts, not inline bytes. A
         # text page that would not fit is read again with a smaller max_bytes.
@@ -2291,6 +2293,7 @@ class EditFileTool(Tool):
     """Apply exact text replacements to one existing workspace file."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Edited", noun="file"),
         name="edit_file",
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
@@ -2580,6 +2583,7 @@ class DeleteFileTool(Tool):
     """Delete one workspace file only when its content precondition matches."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Deleted", noun="file"),
         name="delete_file",
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
@@ -2706,6 +2710,7 @@ class DeleteFileTool(Tool):
 
 class WriteFileTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Wrote", noun="file"),
         name="write_file",
         # Mutates the workspace; never overlaps other tools in a round.
         parallel_safe=False,
@@ -2842,6 +2847,7 @@ class WriteFileTool(Tool):
 
 class ListFilesTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Listed files"),
         name="list_files",
         effect=ToolEffect.NONE,
         description="List files in the active workspace.",
@@ -3150,6 +3156,7 @@ def _projected_list_result_bytes(content: str, structured: Mapping[str, object])
 
 class ListArtifactsTool(Tool):
     spec = ToolSpec(
+        display=ToolDisplay(verb="Listed artifacts"),
         name="list_artifacts",
         effect=ToolEffect.NONE,
         description=(

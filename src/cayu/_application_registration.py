@@ -35,6 +35,7 @@ from cayu.tools.catalogue import (
     mcp_source_tool_fingerprint,
     validate_application_tool_name,
 )
+from cayu.tools.display import copy_tool_display
 from cayu.tools.isolated import ProcessIsolatedTool
 from cayu.vaults.redaction import SecretRedactor
 
@@ -43,6 +44,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
     return runtime_records.RegisteredTool(
         name=tool.name,
         description=tool.description,
+        display=copy_tool_display(tool.display),
         schema=deepcopy(tool.schema),
         parallel_safe=tool.parallel_safe,
         effect=tool.effect,
@@ -120,6 +122,7 @@ def _validate_registered_tool(
     validated_spec = ToolSpec(
         name=name,
         description=spec.description,
+        display=spec.display,
         input_schema=schema,
         parallel_safe=spec.parallel_safe,
         effect=spec.effect,
@@ -157,6 +160,7 @@ def _validate_registered_tool(
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
         description=validated_spec.description,
+        display=validated_spec.display,
         schema=validated_spec.input_schema,
         parallel_safe=validated_spec.parallel_safe,
         effect=validated_spec.effect,

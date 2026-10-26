@@ -34,6 +34,7 @@ from cayu.tools.base import (
     _runtime_tool_invocation_authority,
     _RuntimeToolInvocationAuthority,
 )
+from cayu.tools.display import ToolDisplay
 
 if TYPE_CHECKING:
     from cayu.tools.webbridge import WebBridge
@@ -359,6 +360,7 @@ class WebAccessRoutingTool(Tool):
     """Execute only the finite application-owned WebBridge route graph."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Fetched", noun="page"),
         name="web_fetch",
         effect=ToolEffect.NONE,
         parallel_safe=False,

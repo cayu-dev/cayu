@@ -2737,7 +2737,14 @@ class ToolCallsResponse(ApiBaseModel):
     next_cursor: str | None
 
 
+class ApiToolDisplay(ApiBaseModel):
+    verb: str
+    noun: str | None = None
+    plural: str | None = None
+
+
 class ApiToolSummary(ApiBaseModel):
+    display: ApiToolDisplay | None = None
     source: ToolSource
     approval: ToolApproval
     name: str

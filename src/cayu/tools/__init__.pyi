@@ -97,6 +97,7 @@ from cayu.tools.discovery import (
     ToolDiscoveryViewNotEnabledError as ToolDiscoveryViewNotEnabledError,
 )
 from cayu.tools.discovery import ToolDiscoveryViewState as ToolDiscoveryViewState
+from cayu.tools.display import ToolDisplay as ToolDisplay
 from cayu.tools.exa import ExaWebAdapter as ExaWebAdapter
 from cayu.tools.exposure import ALL_REGISTERED_TOOLS_PROFILE_ID as ALL_REGISTERED_TOOLS_PROFILE_ID
 from cayu.tools.exposure import (

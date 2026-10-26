@@ -63,6 +63,7 @@ from cayu.tools.base import (
     ToolResult,
     ToolSpec,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.tools.web import (
     MAX_WEB_FETCH_TITLE_BYTES,
     MAX_WEB_FETCH_URL_LENGTH,
@@ -297,7 +298,7 @@ def _browser_worker_tool_spec(spec: ToolSpec, command: ExecCommand) -> ToolSpec:
 
     if not isinstance(spec, ToolSpec):
         raise TypeError("Browser tool spec must be a ToolSpec.")
-    spec = ToolSpec.model_validate(spec.model_dump(mode="python", warnings=False))
+    spec = spec.model_copy()
     assert command.argv
     requirement = ToolExecutionRequirement(
         name="browser_worker",
@@ -440,6 +441,7 @@ class ScreenshotPageTool(Tool):
     """Capture one bounded public HTTPS page as an artifact-backed PNG attachment."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Took", noun="screenshot"),
         name="screenshot_page",
         effect=ToolEffect.EXTERNAL,
         description=(

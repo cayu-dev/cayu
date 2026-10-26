@@ -38,6 +38,7 @@ from cayu.tools.base import (
     ToolRunnerCapabilityRequirement,
     ToolSpec,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_SEARCH_LIMIT = 100
@@ -123,6 +124,7 @@ class _BoundedSearchPage:
 
 def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
     return ToolSpec(
+        display=ToolDisplay(verb="Searched"),
         name="search_text",
         execution_requirements=(
             ToolExecutionRequirement(

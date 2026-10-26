@@ -43,6 +43,7 @@ from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
+from cayu.tools.display import ToolDisplay, copy_tool_display
 from cayu.tools.inference import (
     AuxiliaryInferencePolicy,
     InferenceInvoker,
@@ -362,6 +363,7 @@ class _ToolSpecInput(BaseModel):
 
     name: str
     description: str = ""
+    display: ToolDisplay | None = None
     input_schema: dict[str, Any] = Field(default_factory=dict)
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
@@ -377,6 +379,11 @@ class _ToolSpecInput(BaseModel):
         default_factory=tuple,
         max_length=MAX_TOOL_EXECUTION_REQUIREMENTS,
     )
+
+    @field_validator("display", mode="before")
+    @classmethod
+    def copy_display(cls, value: object) -> ToolDisplay | None:
+        return copy_tool_display(value)
 
     @field_validator("execution_requirements", mode="before")
     @classmethod
@@ -424,6 +431,7 @@ class ToolSpec(BaseModel):
 
     name: str
     description: str = ""
+    display: ToolDisplay | None = None
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
     workspace_mutation: StrictBool = False
@@ -442,6 +450,7 @@ class ToolSpec(BaseModel):
         *,
         name: str,
         description: str = "",
+        display: ToolDisplay | dict[str, str | None] | None = None,
         input_schema: dict[str, Any] | None = None,
         parallel_safe: bool = True,
         effect: ToolEffect = ToolEffect.EXTERNAL,
@@ -456,6 +465,7 @@ class ToolSpec(BaseModel):
             {
                 "name": name,
                 "description": description,
+                "display": display,
                 "input_schema": {} if input_schema is None else input_schema,
                 "parallel_safe": parallel_safe,
                 "effect": effect,
@@ -470,6 +480,7 @@ class ToolSpec(BaseModel):
         super().__init__(
             name=parsed.name,
             description=parsed.description,
+            display=parsed.display,
             parallel_safe=parsed.parallel_safe,
             effect=parsed.effect,
             workspace_mutation=parsed.workspace_mutation,

@@ -105,6 +105,7 @@ from cayu.tools.browser_visual import (
     BrowserVisualPolicy,
     canonical_visual_point,
 )
+from cayu.tools.display import ToolDisplay
 from cayu.tools.policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
 from cayu.tools.web import MAX_WEB_FETCH_URL_LENGTH, _canonicalize_url
 from cayu.tools.web_access import (
@@ -1916,6 +1917,7 @@ class BrowserSessionTool(Tool):
     """One closed stateful browser interface backed by an admitted runner."""
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Used the browser"),
         name="browser_session",
         effect=ToolEffect.EXTERNAL,
         description=(

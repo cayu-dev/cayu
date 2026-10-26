@@ -67,6 +67,7 @@ from cayu.tools._terminal_bounds import (
     tool_terminal_payload_bound,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 from cayu.vaults import SecretRedactor
 
 DEFAULT_LIST_SESSIONS_LIMIT = 10
@@ -516,6 +517,7 @@ class ListSessionsTool(_SessionReadTool):
             session_store,
             access,
             ToolSpec(
+                display=ToolDisplay(verb="Listed sessions"),
                 name=require_clean_nonblank(name, "name"),
                 effect=ToolEffect.NONE,
                 description=description
@@ -810,6 +812,7 @@ class ReadSessionTool(_SessionReadTool):
             session_store,
             access,
             ToolSpec(
+                display=ToolDisplay(verb="Read", noun="session"),
                 name=require_clean_nonblank(name, "name"),
                 effect=ToolEffect.NONE,
                 description=description

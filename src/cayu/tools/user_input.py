@@ -7,6 +7,7 @@ from cayu.tools._terminal_bounds import (
     spec_with_terminal_payload_bound,
 )
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.display import ToolDisplay
 
 ASK_USER_TOOL_NAME = "ask_user"
 
@@ -27,6 +28,7 @@ class UserInputTool(Tool):
     pauses_session = True
 
     spec = ToolSpec(
+        display=ToolDisplay(verb="Asked", noun="question"),
         name=ASK_USER_TOOL_NAME,
         description=(
             "Ask the user a question and wait for their answer before continuing. Use "

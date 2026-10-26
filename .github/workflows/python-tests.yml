@@ -18,7 +18,9 @@ jobs:
   test-collection:
     name: Test collection (${{ inputs.stores }} stores)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
+    # Serial collection can take over four minutes before teardown, shard-plan
+    # output and uploads; include headroom for variation on shared runners.
+    timeout-minutes: 10
     env:
       CAYU_TEST_STORES: ${{ inputs.stores }}
     steps:
