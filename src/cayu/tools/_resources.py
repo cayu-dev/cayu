@@ -635,14 +635,14 @@ class InvocationWorkspaceHandle(Workspace):
     def _authenticated_cwd_for_runner(self, runner: Any) -> str | None:
         """Return private workspace binding evidence to Cayu's runner facade."""
 
-        from cayu.runners import LocalRunner
+        from cayu.runners.launched import _runs_from_local_host_root
         from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
 
         if isinstance(self.__workspace, RunnerBoundWorkspace):
             if not self.__workspace.is_bound_to_runner(runner):
                 return None
             return self.__workspace.runner_cwd
-        if isinstance(self.__workspace, LocalWorkspace) and isinstance(runner, LocalRunner):
+        if isinstance(self.__workspace, LocalWorkspace) and _runs_from_local_host_root(runner):
             from pathlib import Path
 
             runner_root = Path(runner.resolve_cwd(None)).resolve()

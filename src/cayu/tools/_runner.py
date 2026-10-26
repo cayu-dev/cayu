@@ -38,7 +38,6 @@ from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
-    LocalRunner,
     Runner,
     RunnerExecutionError,
     RunnerUnavailableError,
@@ -75,6 +74,7 @@ from cayu.runners.base import (
     runner_pending_command_settlement_cancellation_safe,
     runner_workspace_mutation_settlement,
 )
+from cayu.runners.launched import _runs_from_local_host_root
 from cayu.tools._operation_boundary import (
     _RetainedInvocationOperationProbe,
     await_invocation_cancellation_checkpoint,
@@ -930,7 +930,7 @@ class InvocationRunnerHandle:
             if not workspace.is_bound_to_runner(self.__runner):
                 return None
             return workspace.runner_cwd
-        if isinstance(workspace, LocalWorkspace) and isinstance(self.__runner, LocalRunner):
+        if isinstance(workspace, LocalWorkspace) and _runs_from_local_host_root(self.__runner):
             runner_root = Path(self.__runner.resolve_cwd(None)).resolve()
             workspace_root = workspace.root.resolve()
             try:

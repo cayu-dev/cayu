@@ -1159,7 +1159,7 @@ There is no implicit bidirectional sync between artifacts and the workspace. Cop
 
 Model-facing file reads should persist artifact references, not provider-specific file payloads. The runtime resolves those references from the active artifact store immediately before provider calls, and provider adapters translate them into Anthropic/OpenAI/etc. native file/image/document content. Built-in context policies strip older native attachment references from provider-facing history while keeping transcript summaries, so file-heavy sessions do not resend the same bytes indefinitely. This keeps transcripts portable while still allowing multimodal providers to inspect images and PDFs.
 
-`LocalRunner` is not a sandbox. It is only a development or already-disposable-environment execution backend.
+`LocalRunner` is not a sandbox. It is only a development or already-disposable-environment execution backend. To run its commands (or any runner's) through your own sandbox, such as bubblewrap or `sudo -u sandbox`, wrap it in `LaunchedRunner`; otherwise use the Docker runner locally ([build a runner](build-a-runner.md#send-commands-through-your-own-launcher)).
 
 Process commands should use argv form. Shell execution should be an explicit mode, because hosted runners need to enforce quoting, limits, logging, and security consistently.
 

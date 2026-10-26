@@ -92,6 +92,8 @@ from cayu.runners.e2b import E2BGuestProvisioner as E2BGuestProvisioner
 from cayu.runners.e2b import E2BRunner as E2BRunner
 from cayu.runners.e2b import E2BWorkspaceCapability as E2BWorkspaceCapability
 from cayu.runners.e2b import E2BWorkspaceEntry as E2BWorkspaceEntry
+from cayu.runners.launched import CommandLauncher as CommandLauncher
+from cayu.runners.launched import LaunchedRunner as LaunchedRunner
 from cayu.runners.local import LocalRunner as LocalRunner
 from cayu.runners.microsandbox import DEFAULT_MICROSANDBOX_CWD as DEFAULT_MICROSANDBOX_CWD
 from cayu.runners.microsandbox import DEFAULT_MICROSANDBOX_IMAGE as DEFAULT_MICROSANDBOX_IMAGE

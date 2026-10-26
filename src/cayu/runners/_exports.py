@@ -3,6 +3,7 @@
 EXPORTS: dict[str, tuple[str, str]] = {
     "BROWSER_FETCH_WORKLOAD_NAME": ("cayu.runners.workloads", "BROWSER_FETCH_WORKLOAD_NAME"),
     "BROWSER_SESSION_WORKLOAD_NAME": ("cayu.runners.workloads", "BROWSER_SESSION_WORKLOAD_NAME"),
+    "CommandLauncher": ("cayu.runners.launched", "CommandLauncher"),
     "DEFAULT_DOCKER_CWD": ("cayu.runners.docker", "DEFAULT_DOCKER_CWD"),
     "DEFAULT_DOCKER_IMAGE": ("cayu.runners.docker", "DEFAULT_DOCKER_IMAGE"),
     "DEFAULT_E2B_CWD": ("cayu.runners.e2b", "DEFAULT_E2B_CWD"),
@@ -103,6 +104,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.runners.aws_lambda_microvm",
         "LambdaMicroVMSubmissionClosed",
     ),
+    "LaunchedRunner": ("cayu.runners.launched", "LaunchedRunner"),
     "LocalRunner": ("cayu.runners.local", "LocalRunner"),
     "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS": (
         "cayu.runners.microsandbox",
@@ -153,6 +155,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 PUBLIC_NAMES = [
     "BROWSER_FETCH_WORKLOAD_NAME",
     "BROWSER_SESSION_WORKLOAD_NAME",
+    "CommandLauncher",
     "DEFAULT_DOCKER_CWD",
     "DEFAULT_DOCKER_IMAGE",
     "DEFAULT_E2B_CWD",
@@ -199,6 +202,7 @@ PUBLIC_NAMES = [
     "LambdaMicroVMProtocolError",
     "LambdaMicroVMRunner",
     "LambdaMicroVMSubmissionClosed",
+    "LaunchedRunner",
     "LocalRunner",
     "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS",
     "MICROSANDBOX_NAME_MAX_BYTES",

@@ -11,6 +11,110 @@ The built-in runners (`LocalRunner`, `DockerRunner`, `E2BRunner`,
 `MicrosandboxRunner`, `LambdaMicroVMRunner`) all implement this same contract;
 read their source in `src/cayu/runners/` alongside this guide.
 
+If you only want an existing runner's commands to go through your own wrapper
+(`sudo` to another user, bubblewrap, firejail, a `docker exec`), you don't need
+a new runner; see [Send commands through your own launcher](#send-commands-through-your-own-launcher).
+
+## Send commands through your own launcher
+
+`LaunchedRunner` wraps any runner and rewrites every command before the wrapped
+runner sees it. Pass an argv prefix, or a function that takes an `ExecCommand`
+and returns the command to run:
+
+```python
+from cayu.environments.admission import ExecutionCapabilityClaim
+from cayu.runners import ExecCommand, LaunchedRunner, LocalRunner
+
+root = "/srv/review/checkout"
+
+# Run as the unprivileged "sandbox" user. -n fails instead of prompting for a
+# password. sudo resets the environment; the command's own variables still
+# arrive (see below), but drop --preserve-env if the sandbox user must not see
+# the wrapped runner's environment, such as its secret_env.
+runner = LaunchedRunner(
+    LocalRunner(root),
+    ["sudo", "-n", "-u", "sandbox", "--preserve-env", "--"],
+)
+
+# Bubblewrap: read-only host, writable checkout, no network, and the sandbox
+# dies with the launcher, so LocalRunner can still stop the whole command.
+runner = LaunchedRunner(
+    LocalRunner(root),
+    [
+        "bwrap", "--ro-bind", "/", "/", "--bind", root, root,
+        "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+        "--unshare-all", "--die-with-parent", "--",
+    ],
+    preserve_claims=["confirmed_cancellation", "confirmed_cleanup"],
+    claims=[ExecutionCapabilityClaim.declared("deny_by_default_network")],
+)
+
+
+# A function can choose the wrapper per command, for example your own script.
+def through_script(command: ExecCommand) -> ExecCommand:
+    argv = command.argv if command.kind == "process" else ["bash", "-c", command.shell]
+    return ExecCommand.process("/usr/local/bin/run-sandboxed", *argv)
+
+
+runner = LaunchedRunner(LocalRunner(root), through_script)
+```
+
+A prefix goes in front of process commands as they are. A shell command becomes
+`[*prefix, "sh", "-c", script]`; pass `shell=("bash", "-c")` to use another
+shell. End the prefix with `--`: without it, a command whose first argument
+starts with `-` is refused, because the launcher would read it as its own
+option (`--bind / /` for bwrap, `-s` for sudo). A function gets a private copy
+of the command and may be called more than once for one command (preflight,
+then dispatch), so keep it deterministic, and make it keep the command from
+passing options to your wrapper.
+
+A command's `env` and `env_remove` never reach the launcher's own process. The
+wrapped runner starts the launcher with its own environment, and the command's
+variables are applied inside the launcher by `env -u NAME ... -- NAME=VALUE ...`
+in front of the command (a function launcher receives that `env` command).
+Otherwise a command could set `PATH` to a workspace directory holding a fake
+`bwrap`, or `LD_PRELOAD` to a library there, and run code outside the sandbox
+before it starts. The values therefore appear in the launcher's argument list;
+keep secrets in the wrapped runner's own `secret_env`, which the launcher
+inherits. `runner.launch(command, env=..., env_remove=...)` returns the command
+the wrapped runner would receive.
+
+Every path built-in tools use goes through the launcher: `exec`,
+`exec_redacted`, `exec_stream` when the wrapped runner supports binary streams,
+interactive processes when it offers them, and `preflight_exec`, so the wrapped
+runner validates the launched command. `LaunchedRunner` doesn't offer durable
+command receipts; tools then use the ordinary redacted `exec`, which is
+launched too. `exec_system`, which runs Cayu's own control-plane commands such
+as a coding sandbox's Git baseline, goes to the wrapped runner unlaunched, so
+`LaunchedRunner` declares `system_execution_mode = "separate"`. Native workspace
+file capabilities and port forwards are passed through because they run no
+command. Closing the `LaunchedRunner` closes the runner it wraps.
+
+Admission evidence covers what runs, not what the wrapped runner would have
+run:
+
+- Executables that tools require are probed through the launcher, so a
+  launcher that hides `rg` makes `search_text` fail admission instead of failing
+  at its first call. Before collection, a snapshot reports them as declared.
+- The wrapped runner's negative claims (unsupported, unverified) pass through.
+  Each positive claim becomes `unverified` with reason `launcher_unverified`,
+  because a launcher can change where and as whom a command runs. For example,
+  `LocalRunner` confirms cleanup of its own process group, but `sudo` to
+  another user takes the command out of what it can kill.
+- `preserve_claims` names capabilities your launcher keeps, and passes the
+  wrapped runner's claims for them through unchanged. `claims` adds your own
+  declarations for what the launcher provides. Cayu doesn't check either; they
+  are your statements, so make them only for what the launcher enforces.
+  Live-verified claims are refused because nothing observed them.
+- The environment fingerprint changes, and the wrapped runner's image and
+  toolchain fingerprints are folded into it instead of passed through.
+
+`LaunchedRunner` is a `Runner`, so it goes anywhere a runner does: an
+`Environment`, a binding, or the `runner_factory` of
+`LocalWorkspaceEnvironmentFactory`. If you don't need your own wrapper, Cayu's
+intended local sandbox is the Docker runner; see
+[Choose a sandbox and restrict network access](execution-capabilities.md#choose-a-sandbox-and-restrict-network-access).
+
 ## The Runner contract
 
 A runner subclasses `cayu.runners.Runner` and implements one method, `exec`

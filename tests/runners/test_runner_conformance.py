@@ -44,6 +44,7 @@ from cayu.runners.base import (
 )
 from cayu.runners.docker import DockerRunner
 from cayu.runners.e2b import E2BRunner
+from cayu.runners.launched import LaunchedRunner
 from cayu.runners.local import LocalRunner
 from cayu.runners.microsandbox import MicrosandboxRunner
 
@@ -65,6 +66,26 @@ def _local_process_running(pid: int) -> bool:
 
 async def _local_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
     return RunnerHarness(LocalRunner(root, inherit_env=False), root)
+
+
+class _SystemLaneLocalRunner(LocalRunner):
+    """Records system-lane commands that reach the wrapped runner directly."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root, inherit_env=False)
+        self.system_lanes: list[str] = []
+
+    async def exec_system(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+        self.system_lanes.append("trusted")
+        return await super().exec_system(command, **kwargs)
+
+
+async def _launched_local_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
+    inner = _SystemLaneLocalRunner(root)
+    # ``env`` replaces itself with the command, like most launchers' final exec.
+    return RunnerHarness(
+        LaunchedRunner(inner, ("env",)), root, system_execution_profiles=inner.system_lanes
+    )
 
 
 async def _run_cli_guest_locally(command: SubprocessCommand, **kwargs: object):
@@ -912,6 +933,15 @@ LOCAL = RunnerConformanceRegistration(
 )
 
 
+LAUNCHED_LOCAL = RunnerConformanceRegistration(
+    name="launched-local",
+    runner_type=LaunchedRunner,
+    factory=_launched_local_factory,
+    system_execution_mode="separate",
+    capabilities=LOCAL.capabilities,
+)
+
+
 CLI_CAPABILITIES = RunnerCapabilities(
     command_cleanup=CapabilityClaim.supported(),
     sandbox_cleanup=CapabilityClaim.supported(),
@@ -987,7 +1017,7 @@ LAMBDA_MICROVM = RunnerConformanceRegistration(
     suspend_resume_probe=_probe_lambda_microvm_lifecycle,
 )
 
-REGISTRATIONS = (LOCAL, DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
+REGISTRATIONS = (LOCAL, LAUNCHED_LOCAL, DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
 OVERLAY_REGISTRATIONS = (DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
 CLEANUP_CASES = tuple(
     (registration, policy)

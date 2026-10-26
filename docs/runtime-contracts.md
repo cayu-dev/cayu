@@ -14247,6 +14247,31 @@ the default mode, local commands run as the host user and may read absolute
 paths permitted by the operating system, so Cayu reports only environment
 minimization—not provider-credential or filesystem isolation—for `LocalRunner`.
 
+`LaunchedRunner(runner, launcher)` sends every command of any runner through a
+caller-chosen launcher: an argv prefix, or a function from `ExecCommand` to
+`ExecCommand`. `exec`, `exec_redacted`, `exec_stream`, interactive processes,
+`preflight_exec`, and admission executable probes all receive the launched
+command; durable command receipts are not offered, so tools use the launched
+redacted `exec`. A command's `env` and `env_remove` are applied inside the
+launcher by an `env` command and never reach the launcher's own process, so a
+command cannot change how the launcher is found or loaded. A prefix that does
+not end with `--` refuses a command whose first argument starts with `-`. The
+wrapper declares cancellation-safe deferred settlement and delegates its waiter
+only when the wrapped runner declares the same, failing closed otherwise.
+Snapshots restate the wrapped runner's current claims and reuse executables
+probed through the launcher only while the wrapped environment fingerprint is
+unchanged. A `LocalWorkspace` pairs with a `LaunchedRunner` around a
+`LocalRunner` as it does with the `LocalRunner` itself. `exec_system` reaches the wrapped runner unlaunched and the
+wrapper declares `system_execution_mode = "separate"`. Its admission evidence
+keeps the wrapped runner's negative claims, turns each positive claim into
+`unverified` with reason `launcher_unverified` unless the caller names it in
+`preserve_claims`, adds the caller's own non-live `claims`, probes executables
+through the launcher, and derives a new environment fingerprint that folds in
+the wrapped runner's environment, image, and toolchain fingerprints. It
+forwards the wrapped runner's execution-environment authority, and closing it
+closes the wrapped runner. See
+[Send commands through your own launcher](build-a-runner.md#send-commands-through-your-own-launcher).
+
 ### General local execution-attempt containment
 
 `LocalExecutionAttemptCoordinator` is the task-backed boundary for one complete

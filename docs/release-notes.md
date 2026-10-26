@@ -53,6 +53,19 @@ not affect execution or approval.
 
 ### Changes
 
+- `cayu.runners.LaunchedRunner` sends every command of a runner through your
+  own launcher, such as `sudo -u sandbox` or bubblewrap: pass an argv prefix or
+  a function from `ExecCommand` to `ExecCommand`. It wraps any runner, and
+  covers `exec`, `exec_redacted`, `exec_stream`, interactive processes,
+  `preflight_exec` and the executable probes of admission, so overriding the
+  private `LocalRunner._exec` is no longer needed. Admission keeps the wrapped
+  runner's negative claims, reports each positive claim as `unverified`
+  (reason `launcher_unverified`) unless you pass it in `preserve_claims`, and
+  accepts your own declarations in `claims`. A command's `env` is applied
+  inside the launcher, never to the launcher's own process, so a command
+  can't swap the launcher through `PATH` or `LD_PRELOAD`. `exec_system` stays
+  on the wrapped runner, unlaunched. See
+  [Send commands through your own launcher](build-a-runner.md#send-commands-through-your-own-launcher).
 - A retry budget now bounds an event that the application retries by creating
   new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
   for every task of that event. Tasks with one key share a budget of 3 tasks
