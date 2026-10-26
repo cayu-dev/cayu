@@ -6047,8 +6047,18 @@ def _coding_app_source(source: str, *, app_build: str = _APP_BUILD) -> str:
         ),
         1,
     )
-    source = source.replace("from configuration.storage import build_stores\n", "", 1)
-    source = source.replace("from configuration.runtime import build_runtime_options\n", "", 1)
+    # The coding build_app body below constructs these through operations.coding.
+    for unused_import in (
+        "from cayu.artifacts import ArtifactStore\n",
+        "from cayu.storage import KnowledgeStore\n",
+        "from cayu.model_policy import configured_model_policy\n",
+        "from configuration.storage import build_stores\n",
+        "from configuration.runtime import build_runtime_options\n",
+        "from environments.local import build_local_environment\n",
+        "from knowledge.retrieval import build_knowledge_scope\n",
+        "from memory.context import build_context_policy\n",
+    ):
+        source = source.replace(unused_import, "", 1)
     start = source.index("def build_app(")
     end_marker = "\n    return app\n"
     end = source.index(end_marker, start) + len(end_marker)

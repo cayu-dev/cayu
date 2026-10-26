@@ -2341,7 +2341,14 @@ def _statement_key(source: str) -> str:
 
 def _identifier(value: str, label: str) -> str:
     if not _IDENTIFIER_RE.fullmatch(value):
-        raise ValueError(f"{label} must be a snake_case Python identifier.")
+        # Agent names elsewhere are often dashed, such as `issue-filer`.
+        suggestion = value.replace("-", "_").lower()
+        hint = (
+            f"; use {suggestion!r}"
+            if _IDENTIFIER_RE.fullmatch(suggestion) and not keyword.iskeyword(suggestion)
+            else ""
+        )
+        raise ValueError(f"{label} must be a snake_case Python identifier{hint}.")
     if keyword.iskeyword(value):
         raise ValueError(f"{label} must not be a Python keyword: {value}.")
     return value

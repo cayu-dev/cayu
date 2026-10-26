@@ -313,6 +313,24 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "none selected" in output
 
 
+def test_cayu_new_ignores_dotenv_credentials_but_not_the_example(tmp_path: Path) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myproj"
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    names = (".env", ".env.local", ".env.example")
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", *names],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ignored.stdout.splitlines() == [".env", ".env.local"]
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    assert "doesn't load a `.env` file itself" in readme
+    assert "uv run --no-sync --env-file .env python run.py" in readme
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX umask semantics")
 def test_cayu_new_preserves_restrictive_creation_umask(tmp_path: Path) -> None:
     repository_root = Path(__file__).resolve().parents[2]
@@ -2177,6 +2195,41 @@ def test_scaffold_gateway_uses_explicit_configuration(tmp_path, monkeypatch, sel
         settings = importlib.import_module("configuration.settings")
         assert settings.configured_provider_name() == "cayu_gateway"
         assert settings.configured_model() == "example/model"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        (None, "https://api.openai.com"),
+        ("https://proxy.example/v1", "https://proxy.example"),
+        ("http://127.0.0.1:2455/v1", "http://127.0.0.1:2455"),
+    ],
+)
+def test_scaffold_openai_reads_openai_base_url(tmp_path, monkeypatch, base_url, expected):
+    from cayu.providers import OpenAIProvider
+
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openai"]) == 0
+    monkeypatch.delenv("CAYU_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai-key")
+    if base_url is None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_BASE_URL", base_url)
+    with project_context(tmp_path / "myproj"):
+        provider = importlib.import_module("configuration.providers").configured_provider()
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.base_url == expected
+
+
+def test_scaffold_openai_refuses_plain_http_base_url_off_this_machine(tmp_path, monkeypatch):
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openai"]) == 0
+    monkeypatch.delenv("CAYU_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://proxy.example/v1")
+    with project_context(tmp_path / "myproj"):
+        module = importlib.import_module("configuration.providers")
+        with pytest.raises(ValueError, match="must use https"):
+            module.configured_provider()
 
 
 def test_scaffold_gateway_resolves_model_set_after_agent_import(tmp_path, monkeypatch):

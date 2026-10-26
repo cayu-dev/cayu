@@ -136,6 +136,39 @@ to keep it offline.
   within per-message and total byte bounds using each message's stored size,
   without loading oversized messages. See
   [session inspection](session-inspection.md#let-agents-read-earlier-sessions).
+- Generated projects read `OPENAI_BASE_URL` for the `openai` provider and pass
+  it to `OpenAIProvider(base_url=...)`, as the OpenAI SDK does; 0.14.0 projects
+  ignored it and sent every request to `https://api.openai.com`. Plain `http://`
+  is accepted only for localhost. `OpenAIProvider` itself still doesn't read the
+  variable.
+- The generated `.gitignore` excludes `.env` and `.env.*` (but not
+  `.env.example`), so `git add .` no longer commits credentials kept there. The
+  generated README says that the project reads provider variables from the
+  process environment and doesn't load `.env` itself, and shows
+  `uv run --env-file .env ...` for loading one.
+- The generated coding-preset `app.py` no longer imports six names it doesn't
+  use, so a fresh coding project passes `ruff check`.
+- On the coding preset, the generated `AGENTS.md` now points "approval before
+  the agent acts" at `cayu generate slice NAME --tool TOOL --effect external`.
+  It named `cayu generate tool ... --effect external`, which that preset
+  refuses. A dashed slice or tool name, such as `issue-filer`, is still refused,
+  but the error now names the snake_case form to use.
+- `cayu session events --type` accepts comma-separated types, such as
+  `--type tool.call.failed,tool.call.blocked`, as well as repeated `--type`
+  options. An unknown type is refused as unknown before the store is opened;
+  0.14.0 read the comma-joined value as one type and failed with an error about
+  the `custom.` namespace. `--help` now describes `--type` and
+  `--include-payload`, and `cayu session tools --help` shows how to read why
+  calls failed or were blocked.
+- When a run started by a generated project's `run.py` fails because a model
+  call ran out of retries, it now prints the number of attempts and the total
+  backoff, and names `RetryPolicy` and where to set it. The default policy is
+  unchanged (5 attempts, 7.5 to 9.5 seconds of backoff). The new
+  `cayu guide providers#provider-retries` section explains what is retried and
+  how to widen the policy for every run (`CayuConfig(run=RunDefaults(...))`) or
+  one run (`RunRequest(retry_policy=...)`); `cayu guide long-running`,
+  `cayu guide references#background-work` and the generated
+  `policies/retries.py` point to it.
 - A `run_command` result that did not succeed now says why in its first line,
   which is all most providers send the model. A read-only selector whose passing
   test wrote a file used to read only "Command selector 'target-test' failed."

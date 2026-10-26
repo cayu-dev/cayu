@@ -887,6 +887,12 @@ override it with `CAYU_PROVIDER=openai`, `anthropic`, `openrouter`, `cayu-gatewa
 `openai-subscription`. API-key variables authenticate that choice and never
 select it automatically.
 
+`configuration/settings.py` reads these variables from the process environment;
+the project doesn't load a `.env` file itself. To keep them in `.env`, which
+`.gitignore` excludes, add `--env-file .env` to `uv run`, for example
+`uv run --no-sync --env-file .env python run.py --message "YOUR REQUEST"`.
+Variables already set in the shell take precedence.
+
 __PROVIDER_GUIDE_POINTER__
 
 OpenAI Platform API:
@@ -896,6 +902,10 @@ export CAYU_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
 uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
+
+Set `OPENAI_BASE_URL` to send these requests to an OpenAI-compatible Responses
+endpoint instead, as the OpenAI SDK does; `configuration/settings.py` reads it.
+Plain `http://` is accepted only for localhost.
 
 Anthropic API:
 
@@ -996,7 +1006,7 @@ yourself, use the Cayu feature that already does it:
 | The user asks for | Use | Read |
 | --- | --- | --- |
 | A chat, follow-up questions, "remember what I said" | Keep `outcome.session_id`, then `run_to_completion(app, ResumeRequest(session_id=..., messages=[...]))`. A new `RunRequest` always starts an empty conversation. | `cayu guide references#sessions` |
-| Approval before the agent acts, "let me confirm first" | A tool generated with `cayu generate tool NAME --agent __AGENT_NAME__ --effect external`. Listed external tools pause for approval under `policies/tools.py`; resolve pauses on the Developer dashboard's Pending page. Do not build a separate approve button or approval table. | `cayu guide durable-operations` |
+| Approval before the agent acts, "let me confirm first" | __EXTERNAL_APPROVAL_GENERATOR__. Listed external tools pause for approval under `policies/tools.py`; resolve pauses on the Developer dashboard's Pending page. Do not build a separate approve button or approval table. | `cayu guide durable-operations` |
 | The agent asking the user a question mid-task | The `ask_user` tool, a durable user-input pause | `cayu guide references#approvals` |
 | Structured data back (JSON, fields, a list) | `RunRequest(structured_output=StructuredOutputSpec(...))`, then `outcome.structured_output.output`. Do not parse JSON out of `final_text`. | `cayu guide structured-output` |
 | A new capability: call an API, read data, compute | A typed tool with a declared `ToolEffect` | `cayu guide references#domain-tool` |
@@ -2553,7 +2563,9 @@ Before declaring production work complete, run:
 - `uv run --no-sync pytest -q tests/test_public_service_security.py`
 """
 
-_GITIGNORE = ".cayu/\ndata/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
+_GITIGNORE = (
+    ".cayu/\ndata/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n.env\n.env.*\n!.env.example\n"
+)
 
 
 def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -2900,6 +2912,16 @@ def _rendered_project_files(
                 else "The registered specialist identity is `__AGENT_NAME__`.\n\nEdit the existing agent, test, and eval to implement the user's first requested\njob. Do not retain the starter and add a second agent. Tools are registered in\n`agents/registration.py`; change their policies deliberately. Do not create echo,\npass-through, or placeholder tools.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
+            ),
+            # The coding primary's constrained policy refuses `generate tool --effect external`.
+            "__EXTERNAL_APPROVAL_GENERATOR__": (
+                "A specialist generated with `cayu generate slice NAME --tool TOOL --effect "
+                "external`, which gets its own approval boundary; use snake_case names, such "
+                "as `issue_filer`"
+                if plan.preset == "coding"
+                else "A tool generated with `cayu generate tool NAME --agent "
+                + resolved_agent_name
+                + " --effect external`"
             ),
             "__AGENT_NAME__": resolved_agent_name,
             "__REVIEWER_NAME__": reviewer_name,

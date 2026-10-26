@@ -134,11 +134,13 @@ from configuration.settings import (
     configured_gateway_base_url,
     configured_model_override,
     configured_openai_api_key,
+    configured_openai_base_url,
     configured_openrouter_api_key,
     configured_openrouter_app_title,
     configured_openrouter_http_referer,
     configured_openrouter_router_metadata_enabled,
     configured_provider_choice,
+    openai_base_url_is_local,
 )
 
 
@@ -170,13 +172,18 @@ def configured_provider() -> ModelProvider:
         return OpenAISubscriptionProvider()
     if choice == "openai":
         api_key = configured_openai_api_key()
-        return (
-            OpenAIProvider(api_key=api_key)
-            if api_key
-            else _ScaffoldPlaceholderProvider(
+        if not api_key:
+            return _ScaffoldPlaceholderProvider(
                 name="openai",
                 setup_error="provider 'openai' is selected but OPENAI_API_KEY is not set",
             )
+        base_url = configured_openai_base_url()
+        if base_url is None:
+            return OpenAIProvider(api_key=api_key)
+        return OpenAIProvider(
+            api_key=api_key,
+            base_url=base_url,
+            allow_http=openai_base_url_is_local(base_url),
         )
     if choice == "cayu-gateway":
         api_key = configured_gateway_api_key()
@@ -246,6 +253,7 @@ _SETTINGS_PY = '''"""Validated source-controlled defaults and environment overri
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cayu import AgentSpec
 from cayu.runtime import (
@@ -337,6 +345,18 @@ def configured_model_override() -> str:
 
 def configured_openai_api_key() -> str | None:
     return os.environ.get("OPENAI_API_KEY")
+
+
+def configured_openai_base_url() -> str | None:
+    """Return OPENAI_BASE_URL, which the OpenAI SDK also reads (with or without /v1)."""
+
+    return os.environ.get("OPENAI_BASE_URL") or None
+
+
+def openai_base_url_is_local(base_url: str) -> bool:
+    """Plain http is accepted only for a server on this machine, such as a local proxy."""
+
+    return urlsplit(base_url).hostname in {"localhost", "127.0.0.1", "::1"}
 
 
 def configured_anthropic_api_key() -> str | None:
@@ -1594,7 +1614,18 @@ _OWNERSHIP_FILES: dict[str, str] = {
     "policies/execution.py": '"""Execution admission and isolation policy extension seam."""\n',
     "policies/egress.py": '"""Network egress and credential-release policy extension seam."""\n',
     "policies/budgets.py": '"""Token, cost, time, and operation budget policy extension seam."""\n',
-    "policies/retries.py": '"""Provider and operation retry policy extension seam."""\n',
+    "policies/retries.py": (
+        '"""Provider and operation retry policy extension seam.\n'
+        "\n"
+        "A run retries a model call that fails with a rate limit, an overload, or another\n"
+        "retryable provider error. The default RetryPolicy() gives up after 5 attempts\n"
+        "and 7.5 to 9.5 seconds of backoff. To wait out longer outages or usage\n"
+        "limits, define a RetryPolicy here and pass it to\n"
+        "CayuConfig(run=RunDefaults(retry_policy=...)) in configuration/runtime.py for\n"
+        "every run, or to RunRequest(retry_policy=...) for one run. See\n"
+        "`uv run --no-sync cayu guide providers#provider-retries`.\n"
+        '"""\n'
+    ),
     "environments/__init__.py": '"""Per-session workspaces, runners, artifacts, vaults, and resources."""\n',
     "environments/registration.py": '"""Explicit environment factory and environment registration seam."""\n',
     "environments/local.py": '"""Trusted-local environment construction owned by the application."""\n',

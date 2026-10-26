@@ -149,6 +149,33 @@ def test_rendered_capability_owners_are_formatted(preset):
         assert result.returncode == 0, path + ": " + result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    ("preset", "execution"),
+    (
+        ("agent", None),
+        ("service", None),
+        ("long-running", None),
+        ("coding", None),
+        ("coding", "docker"),
+    ),
+)
+def test_rendered_projects_pass_default_ruff_checks(tmp_path, preset, execution):
+    # Generated projects add ruff without a [tool.ruff] section, so check with its defaults.
+    for relative, content in project_files("profile", preset=preset, execution=execution).items():
+        if relative.endswith(".py"):
+            path = tmp_path / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-m", "ruff", "check", "--isolated", "--no-cache", "."],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 _EXCLUSIONS = (
     ("knowledge",),
     ("tasks", "delegation", "human-input", "artifacts", "knowledge"),

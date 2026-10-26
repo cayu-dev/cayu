@@ -21,10 +21,18 @@ from cayu import AgentSpec, CayuApp
 from cayu.cli import _build_parser
 from cayu.cli import main as cayu_main
 from cayu.cli.project import project_context
-from cayu.configuration import MAX_STEPS
+from cayu.configuration import MAX_STEPS, CayuConfig, RunDefaults
 from cayu.entrypoint import run_project_entrypoint
 from cayu.evals import ScriptedModelProvider
-from cayu.providers import HttpxOpenAITransport, ModelStreamEvent, OpenAISubscriptionProvider
+from cayu.providers import (
+    HttpxOpenAITransport,
+    ModelStreamEvent,
+    OpenAISubscriptionProvider,
+    RetryPolicy,
+)
+from cayu.providers.base import ModelProviderError
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
@@ -376,6 +384,79 @@ def test_entrypoint_prints_provider_errors_only_when_asked(capsys, show) -> None
         # The run failure already carries the backend's reason (#1974).
         assert detail in err
         assert "Rerun with --show-provider-errors" in err
+
+
+class _LookupTool(Tool):
+    def __init__(self) -> None:
+        self.spec = ToolSpec(
+            name="lookup",
+            description="Look something up.",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            effect=ToolEffect.NONE,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:entrypoint-lookup", behavior_version="1", implementation_version="1"
+            ),
+        )
+        super().__init__()
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(content="found")
+
+
+def test_entrypoint_counts_only_the_exhausted_steps_retry_backoff(capsys) -> None:
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        # The first step succeeds on its second attempt; the second step never does.
+        if len(requests) == 2:
+            return [
+                ModelStreamEvent.tool_call(name="lookup", arguments={}, id="c1"),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        raise ModelProviderError("busy", provider="scripted", status_code=503, retryable=True)
+
+    retry_policy = RetryPolicy(max_attempts=3, initial_delay_s=0.1, jitter_s=0.0)
+
+    def factory() -> CayuApp:
+        app = CayuApp(config=CayuConfig(run=RunDefaults(retry_policy=retry_policy)))
+        app.register_provider(ScriptedModelProvider(response_factory=respond), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="scripted"), tools=[_LookupTool()])
+        return app
+
+    assert run_project_entrypoint(factory, ["--message", "Run."]) == 1
+    assert len(requests) == 5
+    # 0.1 + 0.2 seconds for the second step, not the first step's 0.1 as well.
+    assert "Cayu gave up after 3 attempts and 0.3 s of retry backoff." in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("status", "exhausted"), [(503, True), (400, False)])
+def test_entrypoint_reports_exhausted_provider_retries(capsys, status, exhausted) -> None:
+    transport = HttpxOpenAITransport()
+    transport._client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"detail": "Try again later."})
+        )
+    )
+    retry_policy = RetryPolicy(max_attempts=3, initial_delay_s=0.1, jitter_s=0.0)
+
+    def factory() -> CayuApp:
+        app = CayuApp(config=CayuConfig(run=RunDefaults(retry_policy=retry_policy)))
+        app.register_provider(
+            OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+        return app
+
+    assert run_project_entrypoint(factory, ["--message", "Run."]) == 1
+    err = capsys.readouterr().err
+    if exhausted:
+        # Backoffs of 0.1 and 0.2 seconds before the second and third attempts.
+        assert "Cayu gave up after 3 attempts and 0.3 s of retry backoff." in err
+        assert "RunRequest(retry_policy=...)" in err
+    else:
+        assert "retry backoff" not in err
 
 
 @pytest.mark.parametrize("prefix_length", [0, 4070])

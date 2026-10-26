@@ -374,6 +374,21 @@ def test_coding_preset_generated_external_tool_keeps_approval_boundary(
     assert plan["status"] == "manual_action_required"
     assert "independent approval boundary" in plan["conflicts"][0]["reason"]
     assert _stable_files(project) == before
+    # The guidance names the generator that works on this preset.
+    instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
+    approval_row = next(
+        line for line in instructions.splitlines() if line.startswith("| Approval before the agent")
+    )
+    assert "`cayu generate slice NAME --tool TOOL --effect external`" in approval_row
+    assert "cayu generate tool" not in approval_row
+
+    dashed = ["generate", "slice", "publisher-action", "--tool", "publish_summary"]
+    assert main([*dashed, "--effect", "external", "--json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["message"] == (
+        "slice name must be a snake_case Python identifier; use 'publisher_action'."
+    )
+    assert _stable_files(project) == before
 
     assert (
         main(

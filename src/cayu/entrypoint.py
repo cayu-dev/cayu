@@ -5,14 +5,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from typing import Any
 
 from cayu.applications import CayuApp
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
-from cayu.events import EventType
+from cayu.events import Event, EventType
 from cayu.messages import Message
+from cayu.providers._retry_decision import RetryDisposition
 from cayu.providers.diagnostics import capture_provider_errors
 from cayu.sessions.outcomes import run_to_completion
 from cayu.sessions.requests import RunRequest
@@ -83,6 +84,15 @@ def run_project_entrypoint(
     print(f"run failed: {detail} (session {outcome.session_id})", file=sys.stderr)
     for record in provider_errors:
         print(f"provider error: {_describe_provider_error(record)}", file=sys.stderr)
+    retries = _exhausted_retries(outcome.events)
+    if retries is not None:
+        attempts, waited_s = retries
+        print(
+            f"Cayu gave up after {attempts} attempts and {waited_s:.1f} s of retry backoff. "
+            "To wait longer, pass a RetryPolicy as CayuConfig(run=RunDefaults(retry_policy=...)) "
+            "or RunRequest(retry_policy=...); see `cayu guide providers#provider-retries`.",
+            file=sys.stderr,
+        )
     if not args.show_provider_errors and any(
         event.type == EventType.MODEL_ERROR for event in outcome.events
     ):
@@ -91,6 +101,36 @@ def run_project_entrypoint(
             file=sys.stderr,
         )
     return 1
+
+
+def _exhausted_retries(events: Sequence[Event]) -> tuple[int, float] | None:
+    """Return attempts and total backoff when the last model step ran out of retries."""
+
+    index = next(
+        (i for i in reversed(range(len(events))) if events[i].type == EventType.MODEL_ERROR),
+        None,
+    )
+    if index is None:
+        return None
+    error = events[index].payload
+    if error.get("retry_disposition") != RetryDisposition.CONFIGURED_ATTEMPT_EXHAUSTION.value:
+        return None
+    attempts = error.get("attempt")
+    if type(attempts) is not int:
+        return None
+    # The public stream redacts model_step_id, so walk back through this step's
+    # attempts and stop at its first one.
+    step = error.get("step")
+    waited_s = 0.0
+    for event in reversed(events[:index]):
+        if event.payload.get("step") != step:
+            break
+        delay = event.payload.get("delay_seconds")
+        if event.type == EventType.MODEL_RETRY and isinstance(delay, (int, float)):
+            waited_s += float(delay)
+        if event.type == EventType.MODEL_STARTED and event.payload.get("attempt") == 1:
+            break
+    return attempts, waited_s
 
 
 def _describe_provider_error(record: dict[str, Any]) -> str:

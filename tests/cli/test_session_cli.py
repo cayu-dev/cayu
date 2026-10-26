@@ -2308,6 +2308,31 @@ def test_session_events_filters_paginates_and_bounds_explicit_payloads(
     assert page["next_sequence"] == page["events"][0]["sequence"]
     assert "payload_preview" not in page["events"][0]
 
+    events_command = ["session", "events", "sess_events", "--sqlite", str(database)]
+    selected = ["tool.call.started", "tool.call.completed", "custom.audit"]
+    for type_options in (
+        ["--type", "tool.call.started, tool.call.completed", "--type", "custom.audit"],
+        ["--type", "tool.call.started", "--type", "tool.call.completed,custom.audit"],
+    ):
+        assert main([*events_command, *type_options, "--json"]) == 0
+        page = json.loads(capsys.readouterr().out)
+        assert [row["type"] for row in page["events"]] == selected
+
+    with pytest.raises(SystemExit) as rejected:
+        main([*events_command, "--type", "tool.call.started,tool.call.missing", "--json"])
+    assert rejected.value.code == 2
+    error = capsys.readouterr().err
+    assert "unknown event type 'tool.call.missing'" in error
+    assert "custom.' namespace" not in error
+
+
+def test_session_events_help_explains_repeated_types_and_payloads(capsys) -> None:
+    with pytest.raises(SystemExit):
+        main(["session", "events", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "Repeat --type or separate types with commas" in help_text
+    assert "Payloads are omitted without it." in help_text
+
 
 def test_session_transcript_sizes_find_large_records_without_dumping_content(
     tmp_path: Path,

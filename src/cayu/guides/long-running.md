@@ -160,6 +160,9 @@ Without `execution_timeout_s`, a hung call stays claimed. Which limit ends what:
   task's) share a `TaskRetryBudget`, by default 3 tasks within 30 minutes. The
   next is refused with `TaskRetryBudgetExhausted` and the key stays given up, as
   `cayu inspect --retry-key KEY` shows. Raise it with `retry_budget=`.
+- `RetryPolicy` ends a model call that keeps hitting rate limits or outages:
+  5 attempts and under 10 seconds of backoff by default, short for a usage
+  limit. Widen it before retrying sessions; see `cayu guide providers#provider-retries`.
 
 A delivery still running at the limit is cancelled and may or may not have
 happened, so make it idempotent. Don't catch `asyncio.CancelledError`: a

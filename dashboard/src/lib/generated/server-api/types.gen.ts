@@ -16038,8 +16038,10 @@ export type RetireKnowledgeResponse = {
  * Retry controls for one provider model step.
  *
  * `max_attempts` includes the initial attempt. The default permits five total
- * attempts for classified transient provider failures. Unknown provider
- * failures retain the stricter `max_unknown_attempts` ceiling.
+ * attempts for classified transient provider failures, with 7.5 to 9.5 seconds
+ * of backoff in all; `cayu guide providers#provider-retries` shows how to wait
+ * out longer outages. Unknown provider failures retain the stricter
+ * `max_unknown_attempts` ceiling.
  *
  * Frozen: policies are immutable value objects, so they can be shared across
  * attempts and sessions without per-attempt defensive copies.

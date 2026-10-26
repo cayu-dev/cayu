@@ -36,6 +36,7 @@ from cayu.cli.store_targets import (
     resolve_session_store_target,
 )
 from cayu.events import EventType
+from cayu.events import _validate_custom_event_type as validate_custom_event_type
 from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.provider_operations import inspect_provider_operation
@@ -164,7 +165,9 @@ def add_session_parser(subparsers: Any) -> None:
         help="Show paired durable tool calls.",
         description=(
             "Show paired durable tool calls without result bodies. "
-            "Use event inspection for bounded payload metadata."
+            "Use event inspection for bounded payload metadata; for example, "
+            "`cayu session events SESSION_ID --type tool.call.failed,tool.call.blocked "
+            "--include-payload` shows why calls failed or were blocked."
         ),
     )
     tools_parser.add_argument("session_id")
@@ -186,7 +189,18 @@ def add_session_parser(subparsers: Any) -> None:
     )
     events_parser.add_argument("session_id")
     _add_target_options(events_parser)
-    events_parser.add_argument("--type", action="append", dest="event_types", default=[])
+    events_parser.add_argument(
+        "--type",
+        action="extend",
+        dest="event_types",
+        default=[],
+        type=_event_types_argument,
+        metavar="EVENT_TYPE",
+        help=(
+            "Show only this event type, such as tool.call.failed or a custom.* type. "
+            "Repeat --type or separate types with commas to show several."
+        ),
+    )
     events_parser.add_argument("--tool")
     events_parser.add_argument("--agent")
     events_parser.add_argument("--environment")
@@ -202,6 +216,10 @@ def add_session_parser(subparsers: Any) -> None:
         const=2048,
         type=_payload_limit,
         metavar="BYTES",
+        help=(
+            "Include a bounded preview of each event's payload, such as a failed tool "
+            "call's error (default 2048 bytes). Payloads are omitted without it."
+        ),
     )
     add_output_options(events_parser, formats=FORMAT_CHOICES)
 
@@ -2506,6 +2524,25 @@ def _bounded_content_bytes(value: str, *, kind: str) -> int:
     if not 16 <= parsed <= 65_536:
         raise argparse.ArgumentTypeError(f"{kind} bytes must be between 16 and 65536.")
     return parsed
+
+
+def _event_types_argument(value: str) -> list[EventType | str]:
+    selected: list[EventType | str] = []
+    for item in value.split(","):
+        item = item.strip()
+        try:
+            selected.append(EventType(item))
+        except ValueError:
+            if not item.startswith("custom."):
+                raise argparse.ArgumentTypeError(
+                    f"unknown event type {item!r}; use a built-in type, such as "
+                    "tool.call.failed, or a custom.* type."
+                ) from None
+            try:
+                selected.append(validate_custom_event_type(item))
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(str(exc)) from None
+    return selected
 
 
 def _datetime_argument(value: str) -> datetime:

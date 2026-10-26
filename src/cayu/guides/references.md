@@ -288,6 +288,10 @@ creates a new task to retry the same event, pass the same
 `TaskCreate(retry_key=...)` each time so its `TaskRetryBudget` (3 tasks or 30
 minutes by default) stops the event; past it `create_task` raises
 `TaskRetryBudgetExhausted`. See `cayu guide long-running#time-limit-for-worker-runs`.
+Provider rate limits and outages are retried inside each run by `RetryPolicy`
+(5 attempts and 7.5 to 9.5 seconds of backoff by default); widen it before
+creating new tasks or sessions to retry them. See
+`cayu guide providers#provider-retries`.
 
 ## workflows-hooks
 

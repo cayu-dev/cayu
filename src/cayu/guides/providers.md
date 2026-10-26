@@ -28,7 +28,10 @@ another OpenAI-compatible Vertex or gateway endpoint, pass
 `OpenAIProvider` and `ChatCompletionsProvider` read `base_url` differently.
 `OpenAIProvider` takes the API root, such as `https://api.openai.com`, and adds
 `/v1/responses` itself. It also accepts a base ending in `/v1`, so you can pass
-`OPENAI_BASE_URL` as the OpenAI SDK uses it. `ChatCompletionsProvider` takes
+`OPENAI_BASE_URL` as the OpenAI SDK uses it. `OpenAIProvider` doesn't read
+`OPENAI_BASE_URL` from the environment itself; generated projects read it in
+`configuration/settings.py` and pass it on, allowing plain `http://` only for
+localhost. `ChatCompletionsProvider` takes
 the base including its version path, such as `https://host/v1`, and adds only
 `/chat/completions`. It doesn't add `/v1` for you, because compatible services
 put the version in different places; the one exception is a bare
@@ -70,6 +73,40 @@ services, credential sharing, resale, or bypassing plan limits. Use the OpenAI
 Platform API in production. Model availability follows the subscription;
 generated projects select `gpt-6-luna`, and `CAYU_MODEL` overrides it. Sign-in
 credentials stay in the trusted Cayu process and never reach runners or sandboxes.
+
+## Provider retries
+
+A run retries a model call that fails with HTTP 429, 500, 502, 503, 504 or 529,
+a timeout, a connection error, a rate limit, or another error the provider marks
+retryable. `RetryPolicy` controls how. The default allows 5 attempts with 0.5,
+1, 2 and 4 seconds of backoff between them, each plus up to 0.5 seconds of
+jitter: 7.5 to 9.5 seconds in all. That suits an interactive run and is short
+for a usage limit or an outage of a minute or more. A provider `Retry-After` is
+honored up to `max_delay_s` (30 seconds by default). Failures Cayu can't
+classify stop after `max_unknown_attempts` (2).
+
+Widen it for every run of an application, or for one run, before writing your
+own loop that retries whole sessions:
+
+```python
+from cayu import CayuApp, CayuConfig, RunRequest
+from cayu.configuration import RunDefaults
+from cayu.providers import RetryPolicy
+
+# Backoff of 5, 10, 20, 40, 80 and 160 s, then 240 s three times: about 17 minutes.
+patient = RetryPolicy(max_attempts=10, initial_delay_s=5.0, max_delay_s=240.0)
+app = CayuApp(config=CayuConfig(run=RunDefaults(retry_policy=patient)))
+request = RunRequest(agent_name="scout", messages=[...], retry_policy=patient)
+```
+
+Generated projects build their `CayuConfig` in `configuration/runtime.py`; keep
+the policy in `policies/retries.py`. Retry waits count against the run's
+`execution_deadline` and a worker's `execution_timeout_s`. Each retry records a
+`model.retry` event with its `attempt`, `delay_seconds` and `status_code`, and
+the final `model.error` has `retry_disposition: configured_attempt_exhaustion`
+when the attempts ran out: `cayu session events SESSION_ID --type
+model.retry,model.error --include-payload`. With fallback targets, these local
+retries run before Cayu moves to the next candidate.
 
 ## Explicit fallback targets
 
