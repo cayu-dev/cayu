@@ -105,10 +105,12 @@ export function EvaluationPromotionAction({
   sessionId,
   status,
   label = "Evaluate",
+  compact = false,
 }: {
   sessionId: string
   status: string
   label?: string
+  compact?: boolean
 }) {
   const readiness = useServerContract().capabilities.evals_readiness
   const capturedReadiness = readiness.captured_evaluation
@@ -467,9 +469,15 @@ export function EvaluationPromotionAction({
 
   return (
     <>
-      <Button size="sm" variant="outline" data-testid="evaluate-session" onClick={openPromotion}>
+      <Button
+        size="sm"
+        variant="outline"
+        aria-label={label}
+        data-testid="evaluate-session"
+        onClick={openPromotion}
+      >
         <FlaskConical className="h-4 w-4" />
-        {label}
+        <span className={compact ? "hidden sm:inline" : undefined}>{label}</span>
       </Button>
       <Sheet open={open} onOpenChange={changeOpen}>
         <SheetContent

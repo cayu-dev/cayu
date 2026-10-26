@@ -1,0 +1,84 @@
+import type {
+  EvalRunViewMetadata,
+  EvalSuiteViewIdentity,
+  EvalViewComparison,
+} from "@/lib/generated/server-api"
+import type { EvalCaseFilter } from "../api/eval-views"
+
+/** Canonical selectors locate records; the server alone resolves their authority. */
+export function evalViewSelector(value: unknown): string {
+  const ascii = JSON.stringify(value).replace(
+    /[\u007f-\uffff]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  )
+  return btoa(ascii).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")
+}
+export const nativeRunSelector = (id: string) => evalViewSelector(["run", id])
+export const resultSelector = (revision: string) => evalViewSelector(["result", revision])
+export const suiteSelector = (identity: EvalSuiteViewIdentity) =>
+  evalViewSelector([
+    "suite",
+    {
+      source: identity.source,
+      target_key: identity.target_key,
+      revision: identity.revision,
+      suite_id: identity.suite_id ?? null,
+    },
+  ])
+export const suiteViewPath = (id: string) => `/evals/suites/${encodeURIComponent(id)}`
+export const runViewPath = (id: string) => `/evals/runs/${encodeURIComponent(id)}`
+export function runOrigin(run: Pick<EvalRunViewMetadata, "origin" | "actor">): string {
+  const origins: Record<string, string> = {
+    captured_session: "Captured session",
+    authored_suite: "Authored suite",
+    fresh_execution: "Fresh execution",
+    dashboard: "Dashboard",
+    sdk: "SDK",
+    http: "HTTP",
+    ci: "CI",
+  }
+  return (
+    [origins[run.origin] ?? run.origin.replaceAll("_", " "), run.actor]
+      .filter(Boolean)
+      .join(" · ") || "Origin unavailable"
+  )
+}
+export function comparisonLabel(comparison: EvalViewComparison): string {
+  if (comparison.state === "compared" && comparison.verdict)
+    return {
+      improvement: "Improvement",
+      regression: "Regression",
+      tradeoff: "Tradeoff",
+      tie: "No change",
+    }[comparison.verdict]
+  return {
+    pending: "Comparison pending",
+    unavailable: "Comparison unavailable",
+    no_baseline: "No baseline to compare",
+    incompatible: "Incompatible runs",
+    compared: "Comparison unavailable",
+  }[comparison.state]
+}
+export function evalCaseFilter(value: unknown): EvalCaseFilter | undefined {
+  return value === "regressed" || value === "improved" || value === "failing" || value === "flaky"
+    ? value
+    : undefined
+}
+export function evidenceText(value: unknown): string {
+  return typeof value === "string"
+    ? value
+    : value == null
+      ? "Not retained"
+      : JSON.stringify(value, null, 2)
+}
+export function checkLabel(check: unknown): string {
+  if (!check || typeof check !== "object") return evidenceText(check)
+  const value = check as Record<string, unknown>
+  if (typeof value.label === "string") return value.label
+  const kind = String(value.kind ?? "Check").replaceAll("_", " ")
+  return typeof value.value === "string"
+    ? `${kind}: ${value.value}`
+    : typeof value.text === "string"
+      ? `${kind}: ${value.text}`
+      : kind
+}

@@ -18,6 +18,12 @@ import { validateSessionDetailSearch, workflowSearchPatch } from "../lib/session
 import { validateSessionIndexSearch } from "../lib/session-index-search"
 import { validateUsageRollupSearch } from "../lib/usage-rollup-search"
 import { validateWorkflowSearch } from "../lib/workflow-search"
+import {
+  evalCaseFilter,
+  nativeRunSelector,
+  resultSelector,
+  suiteSelector,
+} from "../next/app/eval-view-model"
 import { PageBody, ShellContext, TopBar } from "../next/routes/common"
 import { Layout } from "./layout"
 
@@ -32,7 +38,22 @@ const EnvironmentsPage = lazyRouteComponent(
   () => import("../routes/environments"),
   "EnvironmentsPage",
 )
-const EvalsPage = lazyRouteComponent(() => import("../routes/evals"), "EvalsPage")
+const EvalsPage = lazyRouteComponent(
+  () => import("../next/routes/evals/index-page"),
+  "EvalsIndexPage",
+)
+const EvalSuitePage = lazyRouteComponent(
+  () => import("../next/routes/evals/suite-page"),
+  "EvalSuiteViewPage",
+)
+const EvalRunPage = lazyRouteComponent(
+  () => import("../next/routes/evals/run-page"),
+  "EvalRunViewPage",
+)
+const EvalSettingsPage = lazyRouteComponent(
+  () => import("../next/routes/evals/settings-page"),
+  "EvalSettingsViewPage",
+)
 const KnowledgePage = lazyRouteComponent(
   () => import("../next/routes/knowledge-entry"),
   "KnowledgeEntry",
@@ -106,15 +127,81 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const evalsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/evals",
     validateSearch: validateEvalsSearch,
+    beforeLoad: ({ search }) => {
+      if (search.run || search.result)
+        throw redirect({
+          to: "/evals/runs/$runId",
+          params: {
+            runId: search.run ? nativeRunSelector(search.run) : resultSelector(search.result!),
+          },
+          search: {
+            compare: search.baseline ? resultSelector(search.baseline) : undefined,
+            placement: undefined,
+            filter: undefined,
+            case: undefined,
+          },
+          replace: true,
+        })
+      if (search.corpus && search.suite && search.target)
+        throw redirect({
+          to: "/evals/suites/$suiteId",
+          params: {
+            suiteId: suiteSelector({
+              source: "corpus",
+              target_key: search.target,
+              revision: search.corpus,
+              suite_id: search.suite,
+            }),
+          },
+          replace: true,
+        })
+    },
     component: () => (
-      <FullAccessRoute title="Evals">
-        <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
-          <EvalsPage />
-        </CapabilityRoute>
-      </FullAccessRoute>
+      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
+        <EvalsPage />
+      </CapabilityRoute>
+    ),
+  })
+  const evalSuiteRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/evals/suites/$suiteId",
+    remountDeps: ({ params }) => params,
+    component: () => (
+      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
+        <EvalSuitePage />
+      </CapabilityRoute>
+    ),
+  })
+  const evalRunRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/evals/runs/$runId",
+    remountDeps: ({ params }) => params,
+    validateSearch: (s: Record<string, unknown>) => ({
+      compare: typeof s.compare === "string" ? s.compare : undefined,
+      placement: typeof s.placement === "string" ? s.placement : undefined,
+      filter: evalCaseFilter(s.filter),
+      case: typeof s.case === "string" ? s.case : undefined,
+    }),
+    component: () => (
+      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
+        <EvalRunPage />
+      </CapabilityRoute>
+    ),
+  })
+  const evalSettingsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/evals/settings",
+    component: () => (
+      <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
+        <EvalSettingsPage />
+      </CapabilityRoute>
     ),
   })
 
@@ -271,6 +358,9 @@ export function createDashboardRouter(history?: RouterHistory) {
     dashboardRoute,
     sessionsRoute,
     evalsRoute,
+    evalSuiteRoute,
+    evalRunRoute,
+    evalSettingsRoute,
     usageRoute,
     tasksRoute,
     taskRoute,

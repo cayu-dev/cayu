@@ -978,8 +978,10 @@ export function createEvalStore(context: EvalContext) {
     for (const r of done) {
       const o = outcomeOf(r, run.trials)
       if (o === "passed") cases.passed++
-      else if (o === "flaky") cases.flaky++
-      else cases.failed++
+      else if (o === "flaky") {
+        cases.flaky++
+        cases.passed++
+      } else cases.failed++
     }
     const trials = done.flatMap((r) => r.trials)
     const other = against === undefined ? baselineRun(st, suite) : against

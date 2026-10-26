@@ -585,7 +585,7 @@ concurrency one; V1/V2 documents remain readable with that fail-closed policy.
 
 For an ordinary project started with `cayu serve`, users do not need to write an
 Evals-specific Python suite. Select a server-published target on the **Evals**
-page and choose **New evaluation**. The authoring sheet supports the complete
+page and choose **New suite**. The authoring sheet supports the complete
 deterministic and structured-judge workflow:
 
 1. name a reusable suite and set trials per case, required passes, maximum
@@ -601,7 +601,7 @@ deterministic and structured-judge workflow:
    priced cost (when fully priceable), and execution profiles for either the
    full suite or an explicit subset;
 6. launch the selected cases and follow the resulting durable run in the normal
-   Runs and Results views.
+   suite run pages.
 
 Saved revisions remain in the authoring catalog and can be loaded, revised into
 a new immutable revision, or run again. A launch freezes an
@@ -874,7 +874,7 @@ artifact_output = ArtifactAssertionSpec(
 )
 ```
 
-Both kinds are available in **Evals → New evaluation**, saved-suite editing and
+Both kinds are available in **Evals → New suite**, saved-suite editing and
 duplication, imported/exported corpus JSON, and captured-session promotion. No
 Python assertion class is required. The Developer dashboard supplies expectation values;
 the trusted target continues to own the app, environment, stores, redactor, and
@@ -934,7 +934,7 @@ memory_reached_provider = MemoryAttributionAssertionSpec(
 )
 ```
 
-Ordinary users do not need this Python form. In **Evals → New evaluation →
+Ordinary users do not need this Python form. In **Evals → New suite →
 Evaluate memory**, choose **Require memory exposure** to add the same structural
 contract. When promoting a completed production session, quick-add freezes only
 complete observed counts; otherwise it creates no false observed claim.
@@ -1835,7 +1835,7 @@ judgments retain their bounded rubric revision and threshold. Private reference
 content, judge prompts, provider credentials/options, and raw judge output are
 not part of this contract.
 
-The Developer dashboard Results and Runs views expose the same projection with
+The Developer dashboard run pages expose the same projection with
 case/trial drill-down. Users can see why a judgment passed or failed, including
 each bounded explanation and contribution, without opening JSON. Downloaded
 JSON reports use the versioned `EvalResultReportV2` envelope, which binds the
@@ -1920,7 +1920,7 @@ distributions, canonical accounting aggregates, gates, and recommendation
 without launching another trial; consumers that require complete retained
 authority use JSON.
 
-The **Paired memory report** action on the Evals page exposes the same protected
+The **Paired memory report** action in Evals Settings exposes the same protected
 boundary without application code. Select an exact schema-version-1 campaign
 request JSON, review its experiment/case/variant/repetition dimensions, and
 build the report against stored results. The browser shows the selected variant
@@ -2345,7 +2345,11 @@ output across processes.
 
 On an authenticated server with a generated or explicitly registered eval
 target, every coherently retained completed or failed session exposes
-**Evaluate**. No per-session Python configuration is required. The server maps
+**Add to evals** in its action menu. The destination picker supports existing
+or new suites and distinguishes immutable case membership from a one-case
+captured score. The **Captured evidence, export and fresh execution** disclosure
+retains the detailed review, export, standalone save and launch controls.
+No per-session Python configuration is required. The server maps
 the session's root agent to one unambiguous target, reconstructs bounded terminal
 evidence, and returns a side-effect-free preview. Preview never calls a provider,
 tool, environment, hook, or application workload and never writes a corpus or
@@ -2444,7 +2448,7 @@ explicit application-owned target profile. A session that cannot be
 reconstructed is not partially replayed; captured scoring remains usable while
 conversion returns a factual diagnostic.
 
-Saved results appear in the target-scoped **Evals → Results** catalog alongside
+Saved results appear in the target-scoped **Evals** suite list and each suite’s run history alongside
 fresh results. Selecting a result exposes its immutable public-safe score and
 corpus identity. **Approve baseline** performs an actor-attributed, idempotent
 compare-and-swap update; the request cannot supply or spoof its actor. Concurrent
@@ -2526,13 +2530,13 @@ as one coherent scenario. The authenticated Developer dashboard preview exposes 
 result and never invokes providers, tools, environments, hooks, recovery, or
 mutation paths.
 
-The same Evaluate sheet now opens an ordered scenario editor. Operators can
+The captured evaluation details sheet also opens an ordered scenario editor. Operators can
 rename the scenario, edit text and portable JSON, add/remove/reorder queued,
 resumed, and approval-checkpoint events, edit named secret requirements, select
 an environment, and set ordinary trial, concurrency, timeout, and per-run
 bounds. Saving writes the exact immutable revision shown by preview; a stale
 revision fails before any store or artifact mutation. Saved scenarios appear in
-the target-scoped **Evals → Catalog** view and can be reopened, edited into a new
+the target-scoped **Evals → Settings → Production scenarios** disclosure and can be reopened, edited into a new
 revision, and downloaded.
 
 **Check readiness** performs launch preflight against current server authority.
@@ -3212,50 +3216,44 @@ not scan their complete histories as a fallback.
 
 ### First-class dashboard Evals area
 
-The bundled dashboard always exposes an **Evals** navigation area and accepts
-authenticated direct links to `/evals`. The contract's required
-`capabilities.evals_readiness` projection reports each product operation as
-`ready`, `gated`, or `unsupported` with a closed reason code. The operations are
-captured evaluation, catalog read and write, captured-result persistence,
-scenario conversion, fresh launch, cancellation, comparison, and reports.
-This projection is discovery metadata, not authorization: the authenticated
-routes and their mutation and runtime checks remain authoritative.
+The **Evals** navigation area is available when `surfaces.eval_suite_views.read`
+is enabled. `/evals` lists authored and corpus suites with server-provided case
+counts, latest runs, recorded origins, verdicts and baseline approval metadata.
+`/evals/suites/:id` shows the baseline scope, independently paged runs and cases.
+Authored suites use a baseline per exact execution group, never one aggregate
+baseline across unrelated selections.
 
-If catalog reads are not ready, the page renders a deterministic readiness
-shell and does not query absent Evals endpoints. Deployment-gated operations
-remain visible with their factual missing dependency, planned framework work is
-labeled separately from a genuine runtime incompatibility, and ready operations
-remain independently visible. Project serving automatically assembles durable
-storage, project/release identity, and the bounded generated target registry
-when their declarations are available. Existing explicit Evals and
-evaluation-promotion configuration remains supported and authoritative.
+`/evals/runs/:id` compares against the approved baseline or the run selected in
+**Compared with**. Regressed, Improved, Failing and Flaky filter the full run
+before pagination. Flaky measures variability and overlaps the settled outcome
+counts; it is never added to passing or total cases. Missing provenance, usage,
+output, source-session and trace linkage are shown as unavailable, without
+reconstructing facts from a display label. The case drawer shows retained
+trial outputs and checks, including judge scores and reasons. The collapsed
+**Details** section retains lifecycle, all six result dimensions, manifests,
+evidence and trial policies, pricing, revisions, raw results and reports.
 
-When `surfaces.evals.read` and `evals_readiness.catalog_read` are enabled, the
-catalog pages through immutable corpus revisions, suites, and cases without
-hydrating complete corpus documents. Operators can import an 8 MiB-or-smaller
-corpus file, download canonical corpus JSON, select a suite, choose bounded
-concurrency and runtime ceilings, and launch a durable run against the selected
-published target. After a bounded browser preflight, import forwards the selected
-file bytes unchanged so
-the server's strict duplicate-key, UTF-8, portable-JSON, and corpus validation
-remains authoritative. Mutation controls remain disabled when
-`surfaces.evals.mutate` is unavailable even when catalog reads are allowed.
+**Settings** holds execution profiles and readiness reasons, configured judges
+and limits, corpus import, memory reports, scenario editing and full suite
+and judge authoring. **New suite** and **Run suite** keep the existing checked
+immutable authoring and launch workflow reachable. Corpus imports preserve the
+selected bytes after bounded preflight; strict duplicate-key, UTF-8, portable
+JSON and corpus validation remain server-owned.
 
-The same page also provides **New evaluation** for an author-first path that
-does not depend on an imported corpus or captured production session. Its
-bounded editor previews and saves immutable suite and scenario definitions,
-preflights a full or explicit subset selection against current target
-authority, and admits the selection through the existing durable workers. It
-does not maintain a browser-only definition format or execution engine.
+Members may read suite and run comparison views. Launch, cancellation, baseline
+approval, session evaluation and authoring require full access. Native lifecycle,
+report and retained trace-link reads currently require full access too. The
+server remains authoritative for every request; client controls only mirror
+its role and capability policy. A missing `eval_suite_views` capability produces
+an unavailable screen without probing the absent endpoints.
 
-Launches use a cryptographically random `Idempotency-Key`. If a response is
-ambiguous, retrying the unchanged launch reuses that key rather than duplicating
-provider work. The dashboard follows queued, running, and cancelling records by
-their durable run ID; cancellation is a server request, not a fabricated local
-terminal state. Opaque catalog/run cursors and selected corpus, suite, run,
-status, and comparison identities remain in bounded URL state. Superseded reads
-are cancelled and a changed corpus never reuses another corpus's suite or case
-projection.
+Launches use a cryptographically random `Idempotency-Key`. An ambiguous retry of
+the same exact launch reuses the key. Baseline approval binds the result revision,
+expected baseline generation and operation ID. Cancellation requests a durable
+server transition; it does not fabricate a local terminal state. Reads use
+independent cursor identities and abort observation when navigation supersedes
+them. Old `/evals?tab=runs&run=…` and result links redirect to the corresponding
+run page; old corpus/suite links resolve their complete selector from the catalog.
 
 The session-side **Run on current app** action uses the same retry registry and run
 worker. It executes through the current server-published application target, not the

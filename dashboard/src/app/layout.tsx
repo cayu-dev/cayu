@@ -183,7 +183,6 @@ const sections = [
         to: "/evals",
         label: "Evals",
         icon: FlaskConical,
-        fullAccess: true,
         capability: DASHBOARD_ROUTE_REQUIREMENTS["/evals"],
       },
       {

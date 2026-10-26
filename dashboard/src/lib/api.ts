@@ -318,7 +318,7 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function queryString(query: Record<string, unknown> = {}): string {
+export function queryString(query: Record<string, unknown> = {}): string {
   const params = new URLSearchParams()
   for (const [key, value] of Object.entries(query)) {
     if (value === undefined || value === null || value === "") continue
@@ -355,7 +355,7 @@ async function requestResponse(path: string, init: RequestInit = {}): Promise<Re
   return res
 }
 
-async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await requestResponse(path, init)
   return res.json() as Promise<T>
 }

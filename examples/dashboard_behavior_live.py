@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
+from weakref import WeakKeyDictionary
 
 import uvicorn
 from playwright.async_api import (
@@ -28,6 +30,9 @@ from playwright.async_api import (
     Request,
     async_playwright,
     expect,
+)
+from playwright.async_api import (
+    Error as PlaywrightError,
 )
 
 from _live_checks import is_superseded_browser_read_abort, require, require_equal
@@ -193,6 +198,10 @@ class DashboardContractProvider(ModelProvider):
             for part in message.content
             if isinstance(part, TextPart)
         )
+        if "dashboard large-output boundary" in request_text.lower():
+            yield ModelStreamEvent.text_delta("x" * 16_384)
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
         if "criterion ids must appear exactly once" in request_text.lower():
             self.judge_requests.append(request)
             yield ModelStreamEvent.text_delta(
@@ -538,6 +547,9 @@ async def main() -> None:
         ToolEffect.NONE,
         "dashboard contract tool must remain mutation-free",
     )
+    from dashboard_eval_boundaries import exercise_eval_boundaries
+
+    await exercise_eval_boundaries()
     app, provider, store, task_store, runtime_directory = await _seed_app()
     price_book = _dashboard_price_book()
     judge_app = CayuApp(enable_logging=False)
@@ -1365,6 +1377,7 @@ async def _run_browser_contract(
                 task_store,
                 expected_query_aborts,
             )
+            _require_expected_eval_faults(page)
             _require_no_browser_failures(browser_failures)
             run_observer_aborts = [
                 detail
@@ -1378,31 +1391,14 @@ async def _run_browser_contract(
                 f"observed={run_observer_aborts!r}",
             )
             eval_query_aborts = [
-                detail for detail in expected_query_aborts if "/api/evals/runs?" in detail
-            ]
-            eval_catalog_root_query_aborts = [
-                detail for detail in expected_query_aborts if "/api/evals/corpora?" in detail
-            ]
-            eval_catalog_projection_aborts = [
-                detail for detail in expected_query_aborts if "/api/evals/corpora/" in detail
+                detail for detail in expected_query_aborts if "/api/evals/" in detail
             ]
             require_equal(
-                len(expected_query_aborts)
-                - len(eval_query_aborts)
-                - len(eval_catalog_root_query_aborts)
-                - len(eval_catalog_projection_aborts),
+                len(expected_query_aborts) - len(eval_query_aborts),
                 3,
-                "the superseded session, usage, and Workflow queries must each abort one "
-                "browser request",
+                "session, usage and Workflow queries must each abort once",
             )
-            require(
-                bool(eval_query_aborts),
-                "leaving a refreshing Evals run list must abort its superseded browser read",
-            )
-            require(
-                bool(eval_catalog_root_query_aborts),
-                "leaving an importing Evals page must abort its superseded catalog read",
-            )
+            require(bool(eval_query_aborts), "leaving Evals must abort its superseded suite read")
             require_equal(
                 len(expected_edit_rejections),
                 1,
@@ -1568,12 +1564,824 @@ async def _exercise_specialists_tools(page: Page, base_url: str) -> None:
     await expect(page.locator("main header")).to_have_count(1)
 
 
+def _eval_view_selector(kind: str, value: object) -> str:
+    return (
+        base64.urlsafe_b64encode(json.dumps([kind, value], separators=(",", ":")).encode())
+        .decode()
+        .rstrip("=")
+    )
+
+
+def _selected_eval_run(page: Page) -> str:
+    selector = urlsplit(page.url).path.rsplit("/", 1)[-1]
+    kind, identity = json.loads(base64.urlsafe_b64decode(selector + "=" * (-len(selector) % 4)))
+    require_equal(kind, "run", "the page must select a native run")
+    return identity
+
+
+async def _open_eval_details(page: Page) -> None:
+    details = (
+        page.locator("details")
+        .filter(has=page.locator("summary", has_text=re.compile(r"^Details$")))
+        .first
+    )
+    if await details.get_attribute("open") is None:
+        await details.locator("summary").first.click()
+
+
+async def _exercise_session_additions(page: Page, base_url: str) -> None:
+    """The production destination workflow uses real immutable server publication."""
+    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.get_by_role("button", name="More actions", exact=True).click()
+    await page.get_by_test_id("evaluate-session").click()
+    sheet = page.get_by_test_id("eval-addition-sheet")
+    await expect(sheet).to_be_visible(timeout=5000)
+    await expect(sheet.get_by_label("Suite", exact=True)).to_be_visible()
+    await sheet.get_by_label("Suite", exact=True).select_option("new")
+    await sheet.get_by_label("New suite name", exact=True).fill("Session addition checks")
+    await sheet.get_by_label("Case name", exact=True).fill("Captured membership case")
+    await sheet.get_by_text("Case identifiers and expectations", exact=True).click()
+    await sheet.get_by_label("Case ID", exact=True).fill("captured-membership")
+    await sheet.get_by_label("New suite ID", exact=True).fill("session-addition-checks")
+    for width in (1440, 900, 768, 600, 390):
+        await page.set_viewport_size({"width": width, "height": 1000})
+        field = await sheet.get_by_label("Case name", exact=True).bounding_box()
+        require(
+            field is not None and field["width"] >= 180,
+            "addition input stays usable at intermediate widths",
+        )
+        require(
+            await page.evaluate("document.documentElement.scrollWidth <= innerWidth"),
+            "addition dialog must not overflow the viewport",
+        )
+    await sheet.get_by_label("Case name", exact=True).focus()
+    await page.keyboard.press("Tab")
+    require(
+        await page.evaluate("document.activeElement?.tagName !== 'BODY'"),
+        "keyboard focus stays on an actionable control",
+    )
+    await page.set_viewport_size({"width": 1440, "height": 1000})
+    await sheet.get_by_role("button", name="Review addition", exact=True).click()
+    await expect(sheet.get_by_role("region", name="Reviewed addition")).to_be_visible()
+    await expect(sheet.get_by_text("Save a new revision with 1 case.", exact=True)).to_be_visible()
+    await sheet.get_by_role("button", name="Add case", exact=True).click()
+    await expect(page).to_have_url(re.compile(r"/cayu/evals/suites/"))
+    await expect(page.get_by_role("heading", name="Cases (1)", exact=True)).to_be_visible()
+    await page.get_by_role("button", name="Find source session", exact=True).click()
+    await expect(page.get_by_role("link", name="Source session", exact=True)).to_have_attribute(
+        "href", f"/cayu/sessions/{PROMOTION_SESSION_ID}"
+    )
+
+    parent_selector = page.url.rsplit("/", 1)[-1]
+    await page.get_by_role("link", name="Source session", exact=True).click()
+    await page.get_by_role("button", name="More actions", exact=True).click()
+    await page.get_by_test_id("evaluate-session").click()
+    sheet = page.get_by_test_id("eval-addition-sheet")
+    await expect(sheet.get_by_label("Suite", exact=True)).to_be_visible()
+    await sheet.get_by_label("Suite", exact=True).select_option(parent_selector)
+    await sheet.get_by_label("Case name", exact=True).fill("Second captured member")
+    await sheet.get_by_text("Case identifiers and expectations", exact=True).click()
+    await sheet.get_by_label("Case ID", exact=True).fill("second-member")
+    await sheet.get_by_role("button", name="Review addition", exact=True).click()
+    await expect(sheet.get_by_text("Save a new revision with 2 cases.", exact=True)).to_be_visible()
+    await sheet.get_by_role("button", name="Add case", exact=True).click()
+    await expect(page.get_by_role("heading", name="Cases (2)", exact=True)).to_be_visible()
+    destination = page.url.rsplit("/", 1)[-1]
+    require(
+        destination != parent_selector, "membership append must publish a new immutable revision"
+    )
+
+    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.get_by_role("button", name="More actions", exact=True).click()
+    await page.get_by_test_id("evaluate-session").click()
+    sheet = page.get_by_test_id("eval-addition-sheet")
+    await sheet.get_by_label("Score this session", exact=False).check()
+    await expect(sheet.get_by_label("Suite", exact=True)).to_be_visible()
+    await sheet.get_by_label("Suite", exact=True).select_option(destination)
+    await sheet.get_by_role("button", name="Review addition", exact=True).click()
+    await expect(
+        sheet.get_by_text(
+            "One captured case will be scored. Existing runnable membership stays unchanged.",
+            exact=True,
+        )
+    ).to_be_visible()
+    submissions = []
+
+    async def lose_first_acknowledgement(route):
+        submissions.append(
+            (route.request.headers.get("idempotency-key"), route.request.post_data_json)
+        )
+        response = await route.fetch()
+        require_equal(
+            response.status, 201, "the dropped response follows a real committed publication"
+        )
+        if len(submissions) == 1:
+            _expect_eval_fault(page, route.request, failure="net::ERR_FAILED")
+            await route.abort("failed")
+        else:
+            await route.fulfill(response=response)
+
+    pattern = "**/api/evals/sessions/*/additions"
+    await page.route(pattern, lose_first_acknowledgement)
+    try:
+        await sheet.get_by_role("button", name="Score and save", exact=True).click()
+        await expect(sheet.get_by_role("alert")).to_be_visible()
+        await expect(
+            sheet.get_by_role("button", name="Retry saved addition", exact=True)
+        ).to_be_enabled()
+        await page.reload(wait_until="networkidle")
+        recovery_capture_reads = []
+
+        def record_recovery_capture(request):
+            if (
+                request.method == "POST"
+                and urlsplit(request.url).path
+                == f"/api/evals/sessions/{PROMOTION_SESSION_ID}/evaluation/preview"
+            ):
+                recovery_capture_reads.append(request)
+
+        page.on("request", record_recovery_capture)
+        try:
+            await page.get_by_role("button", name="More actions", exact=True).click()
+            await page.get_by_test_id("evaluate-session").click()
+            sheet = page.get_by_test_id("eval-addition-sheet")
+            await expect(
+                sheet.get_by_text("An addition is awaiting confirmation.", exact=False)
+            ).to_be_visible()
+            await page.wait_for_load_state("networkidle")
+            require_equal(
+                len(recovery_capture_reads),
+                0,
+                "restored additions recover the saved operation without fresh capture dispatch",
+            )
+            await sheet.get_by_role("button", name="Retry saved addition", exact=True).click()
+            await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/.*placement="))
+            require_equal(
+                len(recovery_capture_reads),
+                0,
+                "successful recovery stays owned until close without restarting capture",
+            )
+        finally:
+            page.remove_listener("request", record_recovery_capture)
+    finally:
+        await page.unroute(pattern, lose_first_acknowledgement)
+    require_equal(len(submissions), 2, "ambiguous publication must use one recovery retry")
+    require_equal(
+        submissions[0],
+        submissions[1],
+        "reload recovery preserves the complete request and exact key",
+    )
+    await expect(
+        page.get_by_text("Scored session · one captured case.", exact=False)
+    ).to_be_visible()
+    await page.get_by_role("button", name="Find source session", exact=True).click()
+    await expect(page.get_by_role("link", name="Source session", exact=True)).to_be_visible()
+    await page.get_by_role("link", name="Destination suite /", exact=True).click()
+    await expect(page.get_by_role("heading", name="Cases (2)", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Scored session · one captured case", exact=True)).to_have_count(
+        1
+    )
+
+    catalog_response = await page.request.get(f"{base_url}/api/evals/suite-views")
+    require_equal(catalog_response.status, 200, "captured corpus remains visible in the catalog")
+    catalog = await catalog_response.json()
+    corpus_parent = next(item["id"] for item in catalog["items"] if item["source"] == "corpus")
+    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.get_by_role("button", name="More actions", exact=True).click()
+    await page.get_by_test_id("evaluate-session").click()
+    sheet = page.get_by_test_id("eval-addition-sheet")
+    await sheet.get_by_label("Suite", exact=True).select_option(corpus_parent)
+    await sheet.get_by_label("Case name", exact=True).fill("Corpus runnable member")
+    await sheet.get_by_text("Case identifiers and expectations", exact=True).click()
+    await sheet.get_by_label("Case ID", exact=True).fill("corpus-member")
+    await sheet.get_by_role("button", name="Review addition", exact=True).click()
+    await expect(sheet.get_by_text("Save a new revision with 2 cases.", exact=True)).to_be_visible()
+    await sheet.get_by_role("button", name="Add case", exact=True).click()
+    await expect(page.get_by_role("heading", name="Cases (2)", exact=True)).to_be_visible()
+    corpus_destination = page.url.rsplit("/", 1)[-1]
+    require(
+        corpus_destination != corpus_parent,
+        "corpus membership also publishes a new immutable revision",
+    )
+
+    # Closing a busy form does not cancel an already committed write or steal
+    # later navigation. The acknowledgement is delivered through the real browser.
+    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.get_by_role("button", name="More actions", exact=True).click()
+    await page.get_by_test_id("evaluate-session").click()
+    sheet = page.get_by_test_id("eval-addition-sheet")
+    await sheet.get_by_label("Score this session", exact=False).check()
+    await sheet.get_by_label("Suite", exact=True).select_option(corpus_destination)
+    await sheet.get_by_role("button", name="Review addition", exact=True).click()
+    await expect(sheet.get_by_role("button", name="Score and save", exact=True)).to_be_enabled()
+    committed, release = asyncio.Event(), asyncio.Event()
+
+    async def delay_acknowledgement(route):
+        response = await route.fetch()
+        require_equal(
+            response.status, 201, "busy-close fixture commits before withholding acknowledgement"
+        )
+        committed.set()
+        await release.wait()
+        await route.fulfill(response=response)
+
+    await page.route(pattern, delay_acknowledgement)
+    try:
+        await sheet.get_by_role("button", name="Score and save", exact=True).click()
+        await asyncio.wait_for(committed.wait(), timeout=10)
+        await expect(sheet.get_by_role("button", name="Saving…", exact=True)).to_be_disabled()
+        await sheet.get_by_role("button", name="Close", exact=True).first.click()
+        await expect(sheet).to_be_hidden()
+        await page.get_by_role("link", name="Evals", exact=True).first.click()
+        release.set()
+        await page.wait_for_timeout(150)
+        await expect(page).to_have_url(f"{base_url}/cayu/evals")
+    finally:
+        release.set()
+        await page.unroute(pattern, delay_acknowledgement)
+    detail_response = await page.request.get(
+        f"{base_url}/api/evals/suite-views/{corpus_destination}"
+    )
+    require_equal(
+        detail_response.status, 200, "corpus attachment remains readable after closing the form"
+    )
+    detail = await detail_response.json()
+    require_equal(detail["suite"]["case_count"], 2, "scoring leaves corpus membership unchanged")
+    require_equal(len(detail["runs"]["items"]), 1, "one attached execution appears once")
+    require_equal(
+        detail["runs"]["items"][0]["cases"]["total"],
+        1,
+        "captured coverage never becomes the destination's full case count",
+    )
+
+
+async def _exercise_eval_addition_ownership(page: Page, base_url: str) -> None:
+    """A late acknowledgement cannot remove a newer dialog's exact recovery tuple."""
+    catalog = await (await page.request.get(f"{base_url}/api/evals/suite-views")).json()
+    destination = next(item["id"] for item in catalog["items"] if item["source"] == "authored")
+    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+
+    async def open_form(recover=False):
+        await page.get_by_role("button", name="More actions", exact=True).click()
+        await page.get_by_test_id("evaluate-session").click()
+        sheet = page.get_by_test_id("eval-addition-sheet")
+        if not recover:
+            await sheet.get_by_label("Score this session", exact=False).check()
+            await sheet.get_by_label("Suite", exact=True).select_option(destination)
+            await sheet.get_by_role("button", name="Review addition", exact=True).click()
+            await expect(
+                sheet.get_by_role("button", name="Score and save", exact=True)
+            ).to_be_enabled()
+        return sheet
+
+    async def recovery_record():
+        return await page.evaluate("""() => Object.entries(sessionStorage)
+          .find(([key]) => key.startsWith('cayu.eval-addition.v1:'))?.[1] ?? null""")
+
+    async def return_to_source():
+        find = page.get_by_role("button", name="Find source session", exact=True)
+        source = page.get_by_role("link", name="Source session", exact=True)
+        await expect(find.or_(source)).to_be_visible()
+        if await find.is_visible():
+            await find.click()
+        await source.click()
+
+    async def exercise_variant(settlement):
+        arrivals = [asyncio.Event(), asyncio.Event()]
+        releases = [asyncio.Event(), asyncio.Event()]
+        settled = asyncio.Event()
+        submissions = []
+
+        async def publication(route):
+            index = len(submissions)
+            submissions.append(
+                (route.request.headers.get("idempotency-key"), route.request.post_data_json)
+            )
+            response = await route.fetch()
+            require_equal(
+                response.status, 201, "ownership fixture uses real committed publications"
+            )
+            if index in (0, 2):
+                slot = 0 if index == 0 else 1
+                arrivals[slot].set()
+                await releases[slot].wait()
+            if index == 2:
+                _expect_eval_fault(page, route.request, failure="net::ERR_FAILED")
+                await route.abort("failed")
+            elif (index == 0 and settlement == "definitive-error") or (
+                index == 1 and settlement == "abandon"
+            ):
+                _expect_eval_fault(page, route.request, status=409 if index == 1 else 422)
+                await route.fulfill(
+                    status=409 if index == 1 else 422, json={"detail": "Delayed original rejection"}
+                )
+            else:
+                await route.fulfill(response=response)
+            if index == 0:
+                settled.set()
+
+        pattern = "**/api/evals/sessions/*/additions"
+        await page.route(pattern, publication)
+        try:
+            sheet = await open_form()
+            await sheet.get_by_role("button", name="Score and save", exact=True).click()
+            await asyncio.wait_for(arrivals[0].wait(), 10)
+            await sheet.get_by_role("button", name="Close", exact=True).first.click()
+            sheet = await open_form(recover=True)
+            await sheet.get_by_role("button", name="Retry saved addition", exact=True).click()
+            if settlement == "abandon":
+                await sheet.get_by_role("button", name="Review a new addition", exact=True).click()
+                await sheet.get_by_role("button", name="Close", exact=True).first.click()
+            else:
+                await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+                await return_to_source()
+            sheet = await open_form()
+            await sheet.get_by_role("button", name="Score and save", exact=True).click()
+            await asyncio.wait_for(arrivals[1].wait(), 10)
+            expected = await recovery_record()
+            require(expected is not None, "B must retain its complete operation before dispatch")
+            releases[0].set()
+            await asyncio.wait_for(settled.wait(), 10)
+            await page.wait_for_timeout(150)
+            require_equal(
+                await recovery_record(),
+                expected,
+                "late A settlement must preserve B's exact recovery record",
+            )
+            # Browser reload abandons the old observer, not the committed server write.
+            releases[1].set()
+            await expect(sheet.get_by_role("alert")).to_be_visible()
+            await page.reload(wait_until="domcontentloaded")
+            sheet = await open_form(recover=True)
+            await sheet.get_by_role("button", name="Retry saved addition", exact=True).click()
+            await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+            require_equal(submissions[0], submissions[1], "A recovery uses its original tuple")
+            require_equal(submissions[2], submissions[3], "B recovery uses its original tuple")
+            require(
+                submissions[0][0] != submissions[2][0], "separate operations retain separate keys"
+            )
+            history = await (
+                await page.request.get(f"{base_url}/api/evals/suite-views/{destination}")
+            ).json()
+            result_revision = json.loads(expected)["plan"]["captured_result_revision"]
+            require_equal(
+                sum(
+                    item["result_revision"] == result_revision for item in history["runs"]["items"]
+                ),
+                1,
+                "B replay publishes one destination history entry",
+            )
+            await return_to_source()
+        finally:
+            for release in releases:
+                release.set()
+            await page.wait_for_timeout(250)
+            await page.unroute(pattern, publication)
+
+    for settlement in ("success", "definitive-error", "abandon"):
+        await exercise_variant(settlement)
+
+
+async def _exercise_eval_role_transition(page: Page, base_url: str) -> None:
+    """Refresh identity on a mounted page without replacing its populated QueryClient."""
+
+    async def exercise_variant(response_state):
+        member = False
+        held, release = asyncio.Event(), asyncio.Event()
+        private_reads = []
+
+        async def identity(route):
+            response = await route.fetch()
+            body = await response.json()
+            if member:
+                body.update(role="member", full_access=False)
+            await route.fulfill(response=response, json=body)
+
+        async def targets(route):
+            response = await route.fetch()
+            if response_state == "late":
+                held.set()
+                await release.wait()
+            if response_state == "error":
+                _expect_eval_fault(page, route.request, status=403)
+                await route.fulfill(status=403, json={"detail": "Private target diagnostic"})
+            else:
+                await route.fulfill(response=response)
+
+        def observe(request):
+            path = urlsplit(request.url).path
+            if (
+                member
+                and "/api/evals/" in path
+                and not any(part in path for part in ("/evals/suite-views", "/evals/run-views"))
+            ):
+                private_reads.append(path)
+
+        await page.route("**/api/app", identity)
+        await page.route("**/api/evals/targets", targets)
+        page.on("request", observe)
+        try:
+            await page.goto(f"{base_url}/cayu/evals/settings", wait_until="domcontentloaded")
+            if response_state == "cached":
+                await expect(
+                    page.get_by_role("heading", name="What trials run with", exact=True)
+                ).to_be_visible()
+            elif response_state == "late":
+                await asyncio.wait_for(held.wait(), 10)
+            else:
+                await expect(
+                    page.get_by_text("Private target diagnostic", exact=False)
+                ).to_be_visible(timeout=15000)
+            member = True
+            # Query's real focus subscription refreshes identity; the document and cache stay alive.
+            async with page.expect_response(
+                lambda response: urlsplit(response.url).path == "/api/app"
+            ):
+                await page.evaluate("""() => {
+                  Object.defineProperty(document, 'visibilityState', {configurable:true, value:'hidden'});
+                  window.dispatchEvent(new Event('visibilitychange'));
+                  Object.defineProperty(document, 'visibilityState', {configurable:true, value:'visible'});
+                  window.dispatchEvent(new Event('visibilitychange'));
+                }""")
+            await expect(
+                page.get_by_text("Your role can read eval suites", exact=False)
+            ).to_be_visible()
+            release.set()
+            await page.wait_for_timeout(150)
+            await expect(
+                page.get_by_role("heading", name="What trials run with", exact=True)
+            ).to_have_count(0)
+            await expect(page.get_by_text("Execution profile details", exact=True)).to_have_count(0)
+            await expect(page.get_by_text("Private target diagnostic", exact=False)).to_have_count(
+                0
+            )
+            await expect(page.get_by_role("button", name="Retry", exact=True)).to_have_count(0)
+            # A focus event may already have dispatched before identity resolved; only
+            # requests after the authoritative member render are forbidden.
+            private_reads.clear()
+            await page.get_by_role("link", name="Evals /", exact=True).click()
+            await expect(page.get_by_role("heading", name="Evals", exact=True)).to_be_visible()
+            await expect(page.get_by_text("Private target diagnostic", exact=False)).to_have_count(
+                0
+            )
+            await expect(page.get_by_role("button", name="Retry", exact=True)).to_have_count(0)
+            require_equal(private_reads, [], "member navigation does not initiate private reads")
+        finally:
+            release.set()
+            page.remove_listener("request", observe)
+            await page.unroute("**/api/app", identity)
+            await page.unroute("**/api/evals/targets", targets)
+
+    for response_state in ("cached", "late", "error"):
+        await exercise_variant(response_state)
+
+
+async def _exercise_eval_launch_navigation(page: Page, base_url: str) -> None:
+    catalog = await (await page.request.get(f"{base_url}/api/evals/suite-views")).json()
+    from cayu.evals.corpus import EvalCorpusDocument
+
+    parent = next(
+        item for item in catalog["items"] if item["source"] == "corpus" and item["case_count"] == 2
+    )
+    downloaded = await page.request.get(
+        f"{base_url}/api/evals/corpora/{parent['identity']['revision']}/download"
+    )
+    corpus = EvalCorpusDocument.model_validate(await downloaded.json())
+    runnable = tuple(case for case in corpus.cases if case.input is not None)
+    require(bool(runnable), "fixture contains positively recorded runnable input")
+    corpus = EvalCorpusDocument.create(
+        target_key=corpus.target_key,
+        evidence_policy=corpus.evidence_policy,
+        pricing_profile=corpus.pricing_profile,
+        suites=corpus.suites,
+        cases=runnable,
+    )
+    imported = await page.request.post(
+        f"{base_url}/api/evals/corpora", data=corpus.model_dump(mode="json")
+    )
+    require_equal(imported.status, 201, "runnable navigation corpus imports through the public API")
+    destination = _eval_view_selector(
+        "suite",
+        {
+            "source": "corpus",
+            "target_key": corpus.target_key,
+            "revision": corpus.revision,
+            "suite_id": corpus.suites[0].id,
+        },
+    )
+    run_ids = []
+
+    async def exercise_variant(boundary):
+        accepted, release = asyncio.Event(), asyncio.Event()
+        invalidating = False
+
+        async def launch(route):
+            nonlocal invalidating
+            response = await route.fetch()
+            require_equal(response.status, 202, "navigation fixture accepts a real corpus run")
+            run_ids.append((await response.json())["spec"]["run_id"])
+            if boundary == "acknowledgement":
+                accepted.set()
+                await release.wait()
+            invalidating = True
+            await route.fulfill(response=response)
+
+        async def suite_read(route):
+            response = await route.fetch()
+            if invalidating and boundary == "invalidation":
+                accepted.set()
+                await release.wait()
+            await route.fulfill(response=response)
+
+        await page.goto(f"{base_url}/cayu/evals/suites/{destination}", wait_until="networkidle")
+        await page.route("**/api/evals/runs", launch)
+        await page.route(f"**/api/evals/suite-views/{destination}*", suite_read)
+        try:
+            await page.get_by_role("button", name="Run suite", exact=True).click()
+            await asyncio.wait_for(accepted.wait(), 10)
+            await page.get_by_role("link", name="Sessions", exact=True).first.click()
+            await expect(page).to_have_url(f"{base_url}/cayu/sessions")
+            release.set()
+            await page.wait_for_timeout(250)
+            await expect(page).to_have_url(f"{base_url}/cayu/sessions")
+            detail = await (
+                await page.request.get(f"{base_url}/api/evals/suite-views/{destination}")
+            ).json()
+            require(
+                any(item["native_run_id"] == run_ids[-1] for item in detail["runs"]["items"]),
+                "leaving the view does not cancel or hide the accepted run",
+            )
+        finally:
+            release.set()
+            await page.wait_for_timeout(100)
+            await page.unroute("**/api/evals/runs", launch)
+            await page.unroute(f"**/api/evals/suite-views/{destination}*", suite_read)
+
+    for boundary in ("acknowledgement", "invalidation"):
+        await exercise_variant(boundary)
+    await page.goto(f"{base_url}/cayu/evals/suites/{destination}", wait_until="networkidle")
+    await page.get_by_role("button", name="Run suite", exact=True).click()
+    await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+    await _open_eval_details(page)
+    await expect(page.get_by_role("button", name="JSON", exact=True)).to_be_visible(timeout=15000)
+    await _exercise_eval_run_role_transition(page, page.url)
+
+
+async def _exercise_eval_run_role_transition(page: Page, run_url: str) -> None:
+    async def exercise_variant(response_state):
+        member = False
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def identity(route):
+            response = await route.fetch()
+            body = await response.json()
+            if member:
+                body.update(role="member", full_access=False)
+            await route.fulfill(response=response, json=body)
+
+        async def private_result(route):
+            response = await route.fetch()
+            if response_state == "late":
+                held.set()
+                await release.wait()
+            if response_state == "error":
+                _expect_eval_fault(page, route.request, status=403)
+                await route.fulfill(status=403, json={"detail": "Private result diagnostic"})
+            else:
+                await route.fulfill(response=response)
+
+        await page.route("**/api/app", identity)
+        await page.route("**/api/evals/runs/*/result", private_result)
+        try:
+            await page.goto(run_url, wait_until="domcontentloaded")
+            await _open_eval_details(page)
+            if response_state == "late":
+                await asyncio.wait_for(held.wait(), 10)
+            elif response_state == "error":
+                await expect(
+                    page.get_by_text("Private result diagnostic", exact=False)
+                ).to_be_visible(timeout=15000)
+            else:
+                await expect(page.get_by_role("button", name="JSON", exact=True)).to_be_visible(
+                    timeout=15000
+                )
+            member = True
+            async with page.expect_response(
+                lambda response: urlsplit(response.url).path == "/api/app"
+            ):
+                await page.evaluate("""() => {
+                  Object.defineProperty(document, 'visibilityState', {configurable:true, value:'hidden'});
+                  window.dispatchEvent(new Event('visibilitychange'));
+                  Object.defineProperty(document, 'visibilityState', {configurable:true, value:'visible'});
+                  window.dispatchEvent(new Event('visibilitychange'));
+                }""")
+            await expect(
+                page.get_by_text("Lifecycle, reports and retained trace", exact=False)
+            ).to_be_visible()
+            release.set()
+            await page.wait_for_timeout(150)
+            for label in ("JSON", "HTML", "Download JSON", "Download HTML", "Cancel run", "Retry"):
+                await expect(page.get_by_role("button", name=label, exact=True)).to_have_count(0)
+            for label in (
+                "Private result diagnostic",
+                "Raw result JSON",
+                "Concurrency",
+                "Ownership claims",
+                "Published result",
+            ):
+                await expect(page.get_by_text(label, exact=True)).to_have_count(0)
+            await expect(page.get_by_label("Compared with", exact=True)).to_be_visible()
+        finally:
+            release.set()
+            await page.wait_for_timeout(100)
+            await page.unroute("**/api/app", identity)
+            await page.unroute("**/api/evals/runs/*/result", private_result)
+
+    for response_state in ("cached", "late", "error"):
+        await exercise_variant(response_state)
+
+
+async def _exercise_eval_design_contract(page: Page, base_url: str) -> None:
+    """Exercise responsive states without changing the shared journey's viewport."""
+    original_viewport = page.viewport_size
+    require(original_viewport is not None, "responsive audit requires a bounded viewport")
+    try:
+        await _exercise_eval_design_states(page, base_url)
+    finally:
+        if original_viewport is not None:
+            await page.set_viewport_size(original_viewport)
+
+
+async def _exercise_eval_design_states(page: Page, base_url: str) -> None:
+    """Prototype-facing case outcomes and readable configuration use real read DTOs."""
+    catalog = await (await page.request.get(f"{base_url}/api/evals/suite-views")).json()
+    suite = next(item for item in catalog["items"] if item["last_run"])
+    run_id = suite["last_run"]["id"]
+    run = await (await page.request.get(f"{base_url}/api/evals/run-views/{run_id}")).json()
+    failures = []
+    await page.goto(f"{base_url}/cayu/evals/runs/{run_id}", wait_until="networkidle")
+    for item in run["results"]["items"]:
+        row = page.get_by_role("button", name=item["case"]["name"], exact=False)
+        if await row.get_by_label("Trial outcomes", exact=True).count() != 1:
+            failures.append("run case lacks retained trial dots")
+        if (
+            await row.get_by_text(item["presentation"]["status"].capitalize(), exact=True).count()
+            != 1
+        ):
+            failures.append("run case hides outcome behind comparison change")
+    corpus = next(item for item in catalog["items"] if item["source"] == "corpus")
+    await page.goto(f"{base_url}/cayu/evals/suites/{corpus['id']}", wait_until="networkidle")
+    suite_detail = await (
+        await page.request.get(f"{base_url}/api/evals/suite-views/{corpus['id']}")
+    ).json()
+    for case in suite_detail["cases"]["items"]:
+        if case["last"]:
+            row = (
+                page.locator("div.border-b")
+                .filter(has=page.get_by_text(case["name"], exact=True))
+                .last
+            )
+            if await row.get_by_label("Trial outcomes", exact=True).count() != 1:
+                failures.append("suite case lacks retained trial dots")
+    menu = page.get_by_role("button", name="More actions", exact=True)
+    if await menu.count() != 1:
+        failures.append("suite corpus tools are absent from the top-bar actions menu")
+    else:
+        await menu.click()
+        await expect(page.get_by_role("button", name="Download corpus", exact=True)).to_be_visible()
+        await expect(
+            page.get_by_role("link", name="Import corpus and advanced tools", exact=True)
+        ).to_be_visible()
+        await page.keyboard.press("Escape")
+        await expect(page.get_by_role("button", name="Download corpus", exact=True)).to_be_hidden()
+    for width in (1440, 900, 390):
+        await page.set_viewport_size({"width": width, "height": 900})
+        await page.wait_for_timeout(250)
+        require_equal(
+            await page.evaluate("document.documentElement.scrollWidth <= innerWidth"),
+            True,
+            f"case outcomes stay within the {width}px viewport",
+        )
+    await page.goto(f"{base_url}/cayu/evals/settings", wait_until="networkidle")
+    targets = await (await page.request.get(f"{base_url}/api/evals/targets")).json()
+    target = next(
+        item for item in targets["items"] if item["target_key"] == targets["default_target_key"]
+    )
+    judge_section = page.locator("section").filter(
+        has=page.get_by_role("heading", name="Judge", exact=True)
+    )
+    for profile in target["judge_profiles"]:
+        summary = f"{profile['model']} via {profile['provider_name']}"
+        if not await judge_section.get_by_text(summary, exact=True).is_visible():
+            failures.append("judge model/provider require opening raw details")
+        policy = (
+            "Same model allowed and labelled"
+            if profile["same_model_use"] == "allowed_and_labeled"
+            else "Same model forbidden"
+        )
+        if not await judge_section.get_by_text(policy, exact=True).is_visible():
+            failures.append("judge same-model policy requires opening raw details")
+    if await page.get_by_text(
+        "Available in this deployment; the API still enforces authorization and request preconditions.",
+        exact=True,
+    ).count():
+        failures.append("ready rows repeat API implementation prose")
+    empty_targets = {**targets, "items": [], "default_target_key": None}
+    empty_suite = {
+        **suite_detail,
+        "suite": {**suite_detail["suite"], "case_count": 0},
+        "cases": {"items": [], "total": 0, "has_more": False, "next_cursor": None},
+    }
+    long_specialist = "LongUnbrokenSpecialist" * 18
+    long_case = "LongUnbrokenCase" * 20
+    long_suite = {
+        **suite_detail,
+        "suite": {**suite_detail["suite"], "specialist": long_specialist},
+        "cases": {
+            **suite_detail["cases"],
+            "items": [{**suite_detail["cases"]["items"][0], "name": long_case}],
+        },
+    }
+    for url, pattern, value, message in (
+        (
+            "/evals/settings",
+            "**/api/evals/targets",
+            empty_targets,
+            "No specialists are configured for evals.",
+        ),
+        (
+            f"/evals/suites/{corpus['id']}",
+            f"**/api/evals/suite-views/{corpus['id']}*",
+            empty_suite,
+            "No cases in this suite.",
+        ),
+        (
+            f"/evals/suites/{corpus['id']}",
+            f"**/api/evals/suite-views/{corpus['id']}*",
+            long_suite,
+            None,
+        ),
+    ):
+
+        async def empty_response(route, *, value=value):
+            await route.fulfill(json=value)
+
+        await page.route(pattern, empty_response)
+        try:
+            await page.goto(f"{base_url}/cayu{url}", wait_until="networkidle")
+            if message is not None:
+                if not await page.get_by_text(message, exact=True).is_visible():
+                    failures.append(message)
+            else:
+                paragraph = page.locator("main p").filter(has_text=long_specialist)
+                if not await paragraph.evaluate("e => e.scrollWidth <= e.clientWidth"):
+                    failures.append("long specialist clips inside the page scroller")
+                bounds = await page.get_by_text(long_case, exact=True).bounding_box()
+                if bounds is None or bounds["width"] < 150:
+                    failures.append("case controls squeeze the case name into an unreadable column")
+        finally:
+            await page.unroute(pattern, empty_response)
+    contract = await (await page.request.get(f"{base_url}/api/contract")).json()
+    contract["capabilities"]["evals_readiness"]["scenario_conversion"] = {
+        "state": "unavailable",
+        "reason_code": "scenario_v2_not_available",
+    }
+
+    async def unavailable_scenarios(route):
+        await route.fulfill(json=contract)
+
+    await page.route("**/api/contract", unavailable_scenarios)
+    try:
+        await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
+        if not await page.get_by_text(
+            "Some eval features aren't available here.", exact=False
+        ).is_visible():
+            failures.append("suite list only warns about unavailable fresh execution")
+    finally:
+        await page.unroute("**/api/contract", unavailable_scenarios)
+    require_equal(failures, [], "final Evals prototype presentation")
+
+
 async def _exercise_captured_evaluation(
     page: Page,
     base_url: str,
     provider: DashboardContractProvider,
     expected_query_aborts: list[str],
 ) -> None:
+    await _exercise_session_additions(page, base_url)
+    journey_viewport = page.viewport_size
+    await _exercise_eval_design_contract(page, base_url)
+    require_equal(
+        page.viewport_size, journey_viewport, "responsive audit restores journey viewport"
+    )
+    await _exercise_eval_addition_ownership(page, base_url)
+    await _exercise_eval_role_transition(page, base_url)
+    previous_block = provider.block_next_promotion_run
+    provider.block_next_promotion_run = False
+    try:
+        await _exercise_eval_launch_navigation(page, base_url)
+    finally:
+        provider.block_next_promotion_run = previous_block
     await page.goto(
         f"{base_url}/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}",
         wait_until="networkidle",
@@ -1590,6 +2398,12 @@ async def _exercise_captured_evaluation(
     await evaluate.focus()
     await page.keyboard.press("Enter")
 
+    addition = page.get_by_test_id("eval-addition-sheet")
+    await expect(addition).to_be_visible()
+    await addition.get_by_text("Captured evidence, export and fresh execution", exact=True).click()
+    await addition.get_by_role(
+        "button", name="Open captured evaluation details", exact=True
+    ).click()
     sheet = page.get_by_test_id("promotion-sheet")
     await expect(sheet).to_be_visible()
     await expect(sheet.get_by_text("Captured evidence", exact=True)).to_be_visible()
@@ -1717,40 +2531,28 @@ async def _exercise_captured_evaluation(
     await expect(sheet.get_by_text("Baseline approved", exact=True)).to_be_visible()
     await sheet.get_by_role("link", name="Open Evals").click()
 
-    await expect(page).to_have_url(re.compile(r"/cayu/evals\?"))
-    await expect(page.get_by_role("heading", name="Evals")).to_be_visible()
-    await expect(page.locator("#evals-panel-catalog")).to_have_count(1)
-    await expect(page.locator("#evals-panel-results")).to_have_count(1)
-    await expect(page.locator("#evals-panel-runs")).to_have_count(1)
-    await expect(page.get_by_role("tab", name="Results", exact=True)).to_have_attribute(
-        "aria-selected", "true"
-    )
-    await expect(page.get_by_text("Explainable result", exact=True)).to_be_visible()
-    await expect(page.get_by_text("Baseline", exact=True)).to_be_visible()
+    await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+    await expect(page.get_by_role("heading", name="Baseline", exact=True)).to_be_visible()
+    await _open_eval_details(page)
+    await expect(page.get_by_text("Captured score", exact=True)).to_be_visible()
 
-    await page.get_by_role("tab", name="Runs", exact=True).click()
-    retained_corpus_filter = page.get_by_role("tabpanel", name="Runs").get_by_role(
-        "button", name=re.compile(r"^Corpus ")
-    )
-    if await retained_corpus_filter.count() == 1:
-        await retained_corpus_filter.click()
-    scenario_run_button = page.get_by_title(scenario_run_id, exact=True)
-    await expect(scenario_run_button).to_be_visible()
-    await scenario_run_button.click()
-    scenario_progress = page.get_by_test_id("scenario-run-progress")
+    # Published HTML reports and older session links still use query parameters.
+    await page.goto(f"{base_url}/cayu/evals?tab=runs&run={scenario_run_id}")
+    await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+    await _open_eval_details(page)
+    scenario_progress = page.get_by_test_id("scenario-run-progress").last
     await expect(scenario_progress).to_contain_text("awaiting approval", timeout=20_000)
     await expect(scenario_progress).to_contain_text(
         "Fresh approval required for dashboard_contract_tool."
     )
     await scenario_progress.get_by_role("button", name="Approve", exact=True).click()
-    await expect(
-        page.get_by_text("Approved trial 1's fresh tool request.", exact=True)
-    ).to_be_visible()
     await expect(page.get_by_test_id("eval-run-status-announcement")).to_have_text(
         "Eval run status: completed.",
         timeout=20_000,
     )
-    await expect(scenario_progress).to_contain_text("completed")
+    await expect(scenario_progress.get_by_role("button", name="Approve", exact=True)).to_have_count(
+        0
+    )
     await expect(
         page.locator('[data-slot="card-title"]').filter(has_text="Published result")
     ).to_be_visible()
@@ -1783,6 +2585,7 @@ async def _exercise_captured_evaluation(
         "the scenario run must publish the ordinary HTML report",
     )
 
+    await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
     await page.get_by_test_id("new-evaluation").click()
     authoring = page.get_by_test_id("eval-suite-authoring-sheet")
     await expect(authoring).to_be_visible()
@@ -2058,20 +2861,11 @@ async def _exercise_captured_evaluation(
         "candidate cost not hard bounded"
     )
     await authoring.get_by_test_id("authored-suite-launch").click()
-    await expect(
-        authoring.get_by_text(
-            "Started 1 durable eval run for 1 selected case.",
-            exact=True,
-        )
-    ).to_be_visible()
-    authored_run_ids = parse_qs(urlsplit(page.url).query).get("run", [])
-    require_equal(
-        len(authored_run_ids),
-        1,
-        "the authored subset launch must open its exact durable run",
-    )
-    authored_run_id = authored_run_ids[0]
-    await page.keyboard.press("Escape")
+    # Admission and the active catalog refresh both complete before navigation.
+    # Use the same bounded budget as durable completion with the populated catalog.
+    await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"), timeout=20_000)
+    authored_run_id = _selected_eval_run(page)
+    await _open_eval_details(page)
     await expect(page.get_by_test_id("eval-run-status-announcement")).to_have_text(
         "Eval run status: completed.",
         timeout=20_000,
@@ -2294,6 +3088,7 @@ async def _exercise_captured_evaluation(
         "HTML must render readable structured evidence without raw judge payload fields",
     )
 
+    await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
     await page.get_by_test_id("new-evaluation").click()
     authoring = page.get_by_test_id("eval-suite-authoring-sheet")
     await authoring.get_by_role(
@@ -2421,17 +3216,10 @@ async def _exercise_captured_evaluation(
     await expect(authoring.get_by_test_id("authored-suite-run-preview")).to_be_disabled()
     await expect(authoring.get_by_test_id("authored-suite-launch")).to_be_disabled()
     await page.keyboard.press("Escape")
-    require(
-        authored_run_id in page.url,
-        "reviewing a reusable authored suite must not replace the selected run",
-    )
     provider.block_next_promotion_run = True
 
-    await page.get_by_role("tab", name="Results", exact=True).click()
-    captured_result_row = page.get_by_role("row").filter(has_text="Captured")
-    await expect(captured_result_row).to_have_count(1)
-    await captured_result_row.get_by_role("button").click()
-    await page.get_by_role("button", name="Open corpus", exact=True).click()
+    await page.goto(f"{base_url}/cayu/evals/settings", wait_until="networkidle")
+    await page.locator("summary", has_text="Production scenarios").click()
     scenario_row = (
         page.get_by_test_id("scenario-catalog")
         .get_by_role("row")
@@ -2466,16 +3254,28 @@ async def _exercise_captured_evaluation(
     suite_name = corpus["suites"][0]["name"]
     suite_id = corpus["suites"][0]["id"]
 
-    await page.get_by_test_id("eval-import-file").set_input_files(
+    await page.get_by_label("Import corpus file", exact=True).set_input_files(
         {
             "name": "dashboard-browser-contract.eval.json",
             "mimeType": "application/json",
             "buffer": json.dumps(corpus).encode(),
         }
     )
-    await expect(page.get_by_text(re.compile(r"Imported corpus .*\."))).to_be_visible()
+    await expect(page.get_by_text("Corpus imported.", exact=False)).to_be_visible()
+    suite_selector = _eval_view_selector(
+        "suite",
+        {
+            "source": "corpus",
+            "target_key": corpus["target_key"],
+            "revision": corpus["revision"],
+            "suite_id": suite_id,
+        },
+    )
+    suite_url = f"{base_url}/cayu/evals/suites/{suite_selector}"
+    await page.goto(suite_url, wait_until="networkidle")
+    await page.get_by_role("button", name="More actions", exact=True).click()
     async with page.expect_download() as corpus_download_info:
-        await page.get_by_role("button", name="Download JSON", exact=True).click()
+        await page.get_by_role("button", name="Download corpus", exact=True).click()
     corpus_download = await corpus_download_info.value
     require_equal(
         corpus_download.suggested_filename,
@@ -2485,56 +3285,15 @@ async def _exercise_captured_evaluation(
     await page.wait_for_load_state("networkidle")
 
     async def launch_saved_suite() -> str:
-        await page.get_by_role(
-            "button",
-            name=f"Run suite {suite_name} ({suite_id}) on current app",
-            exact=True,
-        ).click()
-        await expect(page).to_have_url(re.compile(r"[?&]tab=runs(?:&|$)"))
-        run_ids = parse_qs(urlsplit(page.url).query).get("run", [])
-        require_equal(len(run_ids), 1, "a dashboard launch must select its exact durable run")
-        await expect(
-            page.get_by_text(
-                re.compile(
-                    r"^Opened eval run .+ "
-                    r"\((queued|running|cancelling|completed|failed|cancelled)\)\.$"
-                )
-            )
-        ).to_be_visible()
-        return run_ids[0]
-
-    tab_keyboard_contract_checked = False
+        await page.get_by_role("button", name="Run suite", exact=True).click()
+        await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+        identity = _selected_eval_run(page)
+        await _open_eval_details(page)
+        return identity
 
     async def reopen_catalog() -> None:
-        nonlocal tab_keyboard_contract_checked
-        runs_tab = page.get_by_role("tab", name="Runs", exact=True)
-        catalog_tab = page.get_by_role("tab", name="Catalog", exact=True)
-        await runs_tab.focus()
-        if tab_keyboard_contract_checked:
-            await page.keyboard.press("Home")
-            await expect(catalog_tab).to_have_attribute("aria-selected", "true")
-            await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
-            await page.wait_for_load_state("networkidle")
-            return
-
-        await page.keyboard.press("ArrowRight")
-        await expect(catalog_tab).to_have_attribute("aria-selected", "true")
-        await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
-        await page.wait_for_load_state("networkidle")
-        await catalog_tab.focus()
-        await page.keyboard.press("ArrowLeft")
-        await expect(runs_tab).to_have_attribute("aria-selected", "true")
-        await page.keyboard.press("Home")
-        await expect(catalog_tab).to_have_attribute("aria-selected", "true")
-        await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
-        await page.wait_for_load_state("networkidle")
-        await page.keyboard.press("End")
-        await expect(runs_tab).to_have_attribute("aria-selected", "true")
-        await page.keyboard.press("Home")
-        await expect(catalog_tab).to_have_attribute("aria-selected", "true")
-        await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
-        await page.wait_for_load_state("networkidle")
-        tab_keyboard_contract_checked = True
+        await page.goto(suite_url, wait_until="networkidle")
+        await expect(page.get_by_role("heading", name=suite_name, exact=True)).to_be_visible()
 
     cancelled_run_id = await launch_saved_suite()
     await asyncio.wait_for(provider.blocked_promotion_run_started.wait(), timeout=10)
@@ -2560,15 +3319,12 @@ async def _exercise_captured_evaluation(
         0,
         "background polling must not mutate the run-status live region",
     )
-    cancel = page.get_by_role("button", name="Cancel run", exact=True)
+    cancel = page.get_by_role("button", name="Cancel run", exact=True).first
     await expect(cancel).to_be_visible(timeout=15_000)
     await cancel.click()
-    await expect(page.get_by_role("cell", name="cancelled", exact=True)).to_be_visible(
-        timeout=15_000
-    )
     await expect(run_status).to_have_text("Eval run status: cancelled.")
     require(
-        cancelled_run_id in page.url,
+        _selected_eval_run(page) == cancelled_run_id,
         "cancellation must retain the selected durable run identity",
     )
 
@@ -2604,6 +3360,9 @@ async def _exercise_captured_evaluation(
         f"{baseline_run_id}.eval-report.html",
         "the dashboard must preserve the server-owned eval HTML filename",
     )
+    await _approve_eval_baseline_with_lost_response(page.context, page.url)
+    await page.reload(wait_until="networkidle")
+    await expect(page.get_by_role("heading", name="Baseline", exact=True)).to_be_visible()
 
     await reopen_catalog()
     current_run_id = await launch_saved_suite()
@@ -2612,10 +3371,19 @@ async def _exercise_captured_evaluation(
         current_run_id != baseline_run_id,
         "two explicit dashboard launches must create distinct durable runs",
     )
-    await page.get_by_label("Baseline result revision").fill(baseline_result_revision)
-    await page.get_by_role("button", name="Compare", exact=True).click()
+    baseline_selector = _eval_view_selector("run", baseline_run_id)
+    await page.get_by_label("Compared with", exact=True).select_option(baseline_selector)
+    await expect(page.get_by_role("heading", name="No change", exact=True)).to_be_visible()
+    await _open_eval_details(page)
+    await page.locator("summary").filter(has_text="Full comparison details").click()
+    await expect(page.get_by_test_id("eval-tool-json-comparison")).to_be_visible()
     await expect(page.get_by_text("These results are comparable.", exact=True)).to_be_visible()
-    await expect(page.get_by_text("No compatible-result regressions.", exact=True)).to_be_visible()
+    require(bool(baseline_result_revision), "the report must retain the exact result revision")
+    await page.locator("summary").filter(has_text="Compare another result revision").click()
+    await page.get_by_label("Result revision", exact=True).fill(baseline_result_revision)
+    async with page.expect_response(lambda response: "/api/evals/run-views/" in response.url):
+        await page.get_by_role("button", name="Compare", exact=True).click()
+    await expect(page.get_by_role("heading", name="No change", exact=True)).to_be_visible()
     await _exercise_local_eval_acceptance(
         corpus=corpus,
         dashboard_result_path=Path(json_result_path),
@@ -2623,86 +3391,158 @@ async def _exercise_captured_evaluation(
         authored_result_path=authored_result_path,
     )
 
-    await reopen_catalog()
-    await page.get_by_role("button", name=suite_name, exact=True).click()
+    await _exercise_eval_member_views(page.context, suite_url, page.url)
 
-    async def expose_all_catalog_pagination(route, request) -> None:
-        if request.method != "GET":
-            await route.continue_()
-            return
+    # Exercise cursor-driven suite/case/run lists and abandonment through the new reads.
+    await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
+
+    async def expose_pagination(route) -> None:
         response = await route.fetch()
         body = await response.json()
-        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
-            await route.fulfill(response=response)
-            return
         body["has_more"] = True
         body["next_cursor"] = "dashboard-next-page"
         await route.fulfill(response=response, json=body)
 
-    corpus_path = "**/api/evals/corpora*"
-    nested_catalog_path = "**/api/evals/corpora/**"
-    await page.route(corpus_path, expose_all_catalog_pagination)
-    await page.route(nested_catalog_path, expose_all_catalog_pagination)
+    await page.route("**/api/evals/suite-views?*", expose_pagination)
     try:
         await page.reload(wait_until="networkidle")
-        for scope in ("corpus catalog", "corpus suites", "suite cases"):
-            await expect(
-                page.get_by_role("navigation", name=f"{scope} pagination", exact=True)
-            ).to_be_visible()
-            await expect(
-                page.get_by_role("button", name=f"First {scope} page", exact=True)
-            ).to_be_visible()
-            await expect(
-                page.get_by_role("button", name=f"Next {scope} page", exact=True)
-            ).to_be_visible()
+        await expect(page.get_by_role("navigation", name="Suites pages")).to_be_visible()
+        await expect(page.get_by_role("button", name="Next suites")).to_be_enabled()
     finally:
-        await page.unroute(nested_catalog_path, expose_all_catalog_pagination)
-        await page.unroute(corpus_path, expose_all_catalog_pagination)
+        await page.unroute("**/api/evals/suite-views?*", expose_pagination)
 
-    catalog_refresh_started = asyncio.Event()
-    release_catalog_refresh = asyncio.Event()
-    catalog_refresh_continued = asyncio.Event()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    settled = asyncio.Event()
 
-    async def delay_abandoned_catalog_refresh(route, request) -> None:
-        if request.method != "GET":
-            await route.continue_()
-            return
-        catalog_refresh_started.set()
-        await release_catalog_refresh.wait()
+    async def delay_view(route) -> None:
+        started.set()
+        await release.wait()
         try:
             await route.continue_()
-        except Exception:
-            pass
+        except PlaywrightError as error:
+            if "Route is already handled" not in str(error):
+                raise
         finally:
-            catalog_refresh_continued.set()
+            settled.set()
 
     aborted_before = len(expected_query_aborts)
-    await page.route(corpus_path, delay_abandoned_catalog_refresh)
+    await page.route("**/api/evals/suite-views?*", delay_view)
     try:
-        await page.get_by_test_id("eval-import-file").set_input_files(
-            {
-                "name": "dashboard-abandoned-import.eval.json",
-                "mimeType": "application/json",
-                "buffer": json.dumps(corpus).encode(),
-            }
-        )
-        await asyncio.wait_for(catalog_refresh_started.wait(), timeout=5)
+        await page.reload(wait_until="domcontentloaded")
+        await asyncio.wait_for(started.wait(), timeout=10)
         await page.get_by_role("link", name="Sessions", exact=True).click()
         await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
-        await expect(page.get_by_role("heading", name="Sessions").first).to_be_visible()
     finally:
-        release_catalog_refresh.set()
-        if catalog_refresh_started.is_set():
-            await asyncio.wait_for(catalog_refresh_continued.wait(), timeout=5)
-        await page.unroute(corpus_path, delay_abandoned_catalog_refresh)
-
+        release.set()
+        await asyncio.wait_for(settled.wait(), timeout=5)
+        await page.unroute("**/api/evals/suite-views?*", delay_view)
     deadline = asyncio.get_running_loop().time() + 5
     while len(expected_query_aborts) == aborted_before:
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError("leaving Evals did not abort the delayed catalog refresh")
+            raise AssertionError("leaving Evals did not abort the delayed suite read")
         await asyncio.sleep(0.05)
-    await page.wait_for_timeout(250)
-    await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
+
+
+async def _approve_eval_baseline_with_lost_response(context: BrowserContext, run_url: str) -> None:
+    """Commit through the real server, then lose its successful acknowledgement."""
+    approval_page = await context.new_page()
+    committed: list[dict] = []
+
+    async def lose_acknowledgement(route) -> None:
+        response = await route.fetch()
+        require_equal(response.status, 200, "baseline write must commit before response loss")
+        committed.append(route.request.post_data_json)
+        await route.fulfill(status=503, json={"detail": "Baseline acknowledgement unavailable"})
+
+    await approval_page.route("**/api/evals/results/*/baseline", lose_acknowledgement)
+    try:
+        await approval_page.goto(run_url, wait_until="networkidle")
+        await approval_page.get_by_role("button", name="Approve as baseline", exact=True).click()
+        await expect(
+            approval_page.get_by_role("heading", name="Baseline", exact=True)
+        ).to_be_visible()
+        await expect(approval_page.get_by_role("alert")).to_contain_text(
+            "Baseline acknowledgement unavailable"
+        )
+        await expect(
+            approval_page.get_by_role("button", name="Approve as baseline", exact=True)
+        ).to_have_count(0)
+        require_equal(len(committed), 1, "reconciliation must not blindly repeat a committed write")
+        require(
+            isinstance(committed[0]["expected_generation"], int)
+            and bool(committed[0]["result_revision"])
+            and bool(committed[0]["operation_id"]),
+            "baseline approval must bind the complete CAS operation tuple",
+        )
+    finally:
+        await approval_page.close()
+
+
+async def _exercise_eval_member_views(
+    context: BrowserContext, suite_url: str, run_url: str
+) -> None:
+    """Exercise the member UI against real view responses, with a member viewer projection."""
+    member_page = await context.new_page()
+    forbidden_reads: list[str] = []
+
+    async def member_identity(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        body.update(role="member", full_access=False)
+        await route.fulfill(response=response, json=body)
+
+    def observe_request(request: Request) -> None:
+        path = urlsplit(request.url).path
+        if "/api/evals/" in path and not any(
+            entrance in path for entrance in ("/evals/suite-views", "/evals/run-views")
+        ):
+            forbidden_reads.append(path)
+
+    member_page.on("request", observe_request)
+    await member_page.route("**/api/app", member_identity)
+    try:
+        await member_page.goto(suite_url, wait_until="networkidle")
+        await expect(
+            member_page.get_by_role("heading", name=re.compile(r"Cases \("))
+        ).to_be_visible()
+        for name in ("Run suite", "Download corpus", "Edit suites and scenarios"):
+            await expect(member_page.get_by_role("button", name=name, exact=True)).to_have_count(0)
+        await member_page.goto(run_url, wait_until="networkidle")
+        await expect(member_page.get_by_label("Compared with", exact=True)).to_be_visible()
+        async with member_page.expect_response(
+            lambda response: "case_filter=failing" in response.url
+        ):
+            await member_page.get_by_role("button", name="Failing", exact=True).click()
+        await expect(member_page.get_by_text("No matching cases.", exact=True)).to_be_visible()
+        await member_page.get_by_role("button", name="All", exact=True).click()
+        await expect(
+            member_page.get_by_role("button", name=re.compile(r"\bpassed\b")).first
+        ).to_be_visible()
+        for name in ("Approve as baseline", "Cancel run", "Approve", "Deny"):
+            await expect(member_page.get_by_role("button", name=name, exact=True)).to_have_count(0)
+        for width in (1440, 900, 768, 600, 390):
+            await member_page.set_viewport_size({"width": width, "height": 1000})
+            require(
+                await member_page.evaluate("document.documentElement.scrollWidth <= innerWidth"),
+                f"eval run must fit a {width}px viewport",
+            )
+            compare = member_page.get_by_label("Compared with", exact=True)
+            bounds = await compare.bounding_box()
+            require(
+                bounds is not None and bounds["width"] >= 140, "comparison control stays usable"
+            )
+            await compare.focus()
+            await expect(compare).to_be_focused()
+        case = member_page.get_by_role("button", name=re.compile(r"\bpassed\b")).first
+        await case.click()
+        await expect(member_page.get_by_role("dialog")).to_be_visible()
+        await member_page.keyboard.press("Escape")
+        await expect(member_page.get_by_role("dialog")).to_have_count(0)
+        await expect(case).to_be_focused()
+        require_equal(forbidden_reads, [], "members must not probe full-access eval reads")
+    finally:
+        await member_page.close()
 
 
 async def _exercise_local_eval_acceptance(
@@ -3627,7 +4467,7 @@ async def _exercise_unconfigured_evals_shell(page: Page, base_url: str) -> None:
     async def serve_without_evals_configuration(route) -> None:
         response = await route.fetch()
         body = await response.json()
-        body["capabilities"]["surfaces"]["evals"] = {
+        body["capabilities"]["surfaces"]["eval_suite_views"] = {
             "configured": False,
             "read": {
                 "enabled": False,
@@ -5315,6 +6155,60 @@ async def _exercise_idle_overview_polling(
         return observed
 
 
+# Fault authority is attached to the exact intercepted request, never a status code
+# or an endpoint allow-list. Console events lack request IDs, so consume at most
+# one matching resource diagnostic for each positively injected request.
+_EVAL_FAULTS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def _expect_eval_fault(page: Page, request: Request, *, status=None, failure=None) -> None:
+    _EVAL_FAULTS.setdefault(page, {})[request] = {
+        "status": status,
+        "failure": failure,
+        "observed": False,
+        "console": False,
+    }
+
+
+def _consume_eval_fault(page: Page, request: Request, *, status=None, failure=None) -> bool:
+    fault = _EVAL_FAULTS.get(page, {}).get(request)
+    if (
+        fault is None
+        or fault["observed"]
+        or (fault["status"], fault["failure"]) != (status, failure)
+    ):
+        return False
+    fault["observed"] = True
+    return True
+
+
+def _consume_eval_fault_console(page: Page, message) -> bool:
+    for request, fault in _EVAL_FAULTS.get(page, {}).items():
+        if fault["console"] or request.url != message.location.get("url"):
+            continue
+        expected = (
+            "Failed to load resource: net::ERR_FAILED"
+            if fault["failure"] == "net::ERR_FAILED"
+            else {
+                403: "Failed to load resource: the server responded with a status of 403 (Forbidden)",
+                409: "Failed to load resource: the server responded with a status of 409 (Conflict)",
+                422: "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)",
+            }.get(fault["status"])
+        )
+        if message.text == expected:
+            fault["console"] = True
+            return True
+    return False
+
+
+def _require_expected_eval_faults(page: Page) -> None:
+    faults = _EVAL_FAULTS.pop(page, {})
+    require(
+        all(fault["observed"] for fault in faults.values()),
+        "an injected eval fault was not observed on its exact request",
+    )
+
+
 def _record_browser_failures(
     page: Page,
     failures: dict[str, list[str]],
@@ -5330,6 +6224,8 @@ def _record_browser_failures(
     expected_queue_console_errors: list[str],
 ) -> None:
     def record_request_failure(request: Request) -> None:
+        if _consume_eval_fault(page, request, failure=request.failure):
+            return
         path = urlsplit(request.url).path
         headers = request.headers
         last_event_id = headers.get("last-event-id")
@@ -5365,14 +6261,18 @@ def _record_browser_failures(
                 return
         if (
             request.method == "GET"
-            and path == "/api/evals/runs"
+            and (path == "/api/evals/runs" or path.startswith("/api/evals/run-views/"))
             and request.failure == "net::ERR_ABORTED"
         ):
             expected_query_aborts.append(detail)
             return
         if (
             request.method == "GET"
-            and (path == "/api/evals/corpora" or path.startswith("/api/evals/corpora/"))
+            and (
+                path.startswith("/api/evals/suite-views")
+                or path == "/api/evals/corpora"
+                or path.startswith("/api/evals/corpora/")
+            )
             and request.failure == "net::ERR_ABORTED"
         ):
             expected_query_aborts.append(detail)
@@ -5402,6 +6302,8 @@ def _record_browser_failures(
 
     def record_response(response) -> None:
         request = response.request
+        if _consume_eval_fault(page, request, status=response.status):
+            return
         path = urlsplit(response.url).path
         detail = f"{response.status} {request.method} {response.url}"
         if (
@@ -5428,6 +6330,8 @@ def _record_browser_failures(
 
     def record_console(message) -> None:
         if message.type != "error":
+            return
+        if _consume_eval_fault_console(page, message):
             return
         if (
             message.text

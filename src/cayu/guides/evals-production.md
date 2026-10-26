@@ -26,7 +26,15 @@ receipts and worker results; preserve application session stores separately.
 
 ## Evaluate a retained session
 
-Open the session in the Developer dashboard and choose **Evaluate**.
+Open the finished session's action menu in the Developer dashboard and choose
+**Add to evals**. Select an existing authored or corpus suite, or create a new one.
+**Add as a case** saves runnable input in a new immutable suite revision;
+**Score this session** records one captured case without changing an existing
+suite's runnable membership. Review the exact addition before saving. A saved
+request can be retried after a lost response without creating a second operation.
+
+For the detailed capture, export and fresh-run tools, expand **Captured evidence,
+export and fresh execution**, then choose **Open captured evaluation details**.
 
 1. Review **Captured evidence** before adding expectations. Missing, redacted,
    truncated, or unavailable evidence is not a failed assertion and must not be
@@ -52,7 +60,7 @@ current dependency—not a request to fabricate it in the browser.
 ## Build a controlled multi-stage scenario
 
 Use **Production scenario** from a captured session, or choose **Multi-stage
-scenario** for a case in **New evaluation**.
+scenario** for a case in **New suite**.
 
 - The initial event creates one fresh session.
 - **Queue input** delivers ordered follow-up input on the next turn or when the
@@ -71,7 +79,7 @@ effects, evidence policy, limits, trials, concurrency, timeout, and cost bound.
 Prepare retained artifacts only through the displayed server-owned **Prepare
 fixture** action. **Run scenario** admits that exact reviewed binding.
 
-During execution, the Runs view shows queued, running, awaiting-input,
+During execution, the run page shows queued, running, awaiting-input,
 awaiting-approval, cancelling, and terminal trial phases. Approve or deny only
 the displayed fresh request. Cancellation is a durable server request, not a
 browser-only status change.

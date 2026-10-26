@@ -23,7 +23,7 @@ export type EvalRunSummary = {
   origin: EvalRunOrigin
   started_at: string
   finished_at: string | null
-  /** Cases counted once trials settle; a flaky case passed its minimum but not every trial. */
+  /** Cases counted once trials settle; flaky overlaps passed and never adds to totals. */
   cases: { total: number; passed: number; failed: number; flaky: number }
   /** Mean model-judge score from 0 to 1, when the suite has judges. */
   score: number | null

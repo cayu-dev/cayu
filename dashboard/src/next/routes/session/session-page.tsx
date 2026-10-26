@@ -75,11 +75,13 @@ import {
   TopBar,
   useGo,
 } from "../common"
+import { useEvalAccess } from "../evals/shared"
 import { selectClassName } from "../session-filters"
 import { AddToEvalsDialog } from "./add-to-evals"
 import { Composer } from "./composer"
 import { Conversation, SubagentRows } from "./conversation"
 import { DetailsPanel, PANEL_TABS, type PanelTab } from "./details-panel"
+import { SessionEvalAdditionDialog } from "./eval-addition-action"
 import { InboxCard } from "./inbox-card"
 import { TraceView } from "./trace-view"
 
@@ -107,6 +109,7 @@ export function SessionPage({
   const go = useGo()
   const api = useApi()
   const viewer = useViewer()
+  const { canWrite: canAddEvals, readiness: evalReadiness } = useEvalAccess()
   const services = useServices()
   const canExecute =
     !!services.prototype || (viewer?.full_access === true && services.executionEnabled === true)
@@ -162,6 +165,7 @@ export function SessionPage({
   const [menuOpen, setMenuOpen] = useState(false)
   const detailsOpener = useRef<HTMLButtonElement>(null)
   const [prototypeEvals, setPrototypeEvals] = useState(false)
+  const [productionEvals, setProductionEvals] = useState(false)
   const endRef = useRef<HTMLDivElement>(null)
 
   const panel = PANEL_TABS.find((t) => t === search.panel) as PanelTab | undefined
@@ -364,6 +368,7 @@ export function SessionPage({
   useEffect(() => {
     setMenuOpen(false)
     setConfirmingStop(false)
+    setProductionEvals(false)
   }, [sessionId])
 
   if (detail.error) {
@@ -390,6 +395,15 @@ export function SessionPage({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1">
+      {!services.prototype && detail.data && (
+        <SessionEvalAdditionDialog
+          key={`${sessionId}:${detail.data.status}`}
+          sessionId={sessionId}
+          status={detail.data.status}
+          open={productionEvals}
+          onOpenChange={setProductionEvals}
+        />
+      )}
       {services.prototype && prototypeEvals && detail.data && (
         <AddToEvalsDialog
           sessionId={sessionId}
@@ -465,6 +479,17 @@ export function SessionPage({
               >
                 <PanelRight />
               </Button>
+              {!services.prototype &&
+                !canAddEvals &&
+                viewer?.full_access === true &&
+                evalReadiness.captured_evaluation.state === "ready" &&
+                finished && (
+                  <EvaluationPromotionAction
+                    compact
+                    sessionId={sessionId}
+                    status={detail.data?.status ?? ""}
+                  />
+                )}
               <ActionsMenu open={menuOpen} onOpenChange={setMenuOpen}>
                 {canExecute && (
                   <MenuItem
@@ -506,12 +531,15 @@ export function SessionPage({
                     }}
                   />
                 )}
-                {!services.prototype && viewer?.full_access === true && detail.data && (
-                  <EvaluationPromotionAction
-                    key={`${sessionId}:${detail.data.status}`}
-                    sessionId={sessionId}
-                    status={detail.data.status}
+                {!services.prototype && canAddEvals && finished && (
+                  <MenuItem
+                    icon={FlaskConical}
                     label="Add to evals"
+                    testId="evaluate-session"
+                    onClick={() => {
+                      setMenuOpen(false)
+                      setProductionEvals(true)
+                    }}
                   />
                 )}
               </ActionsMenu>
@@ -1222,14 +1250,17 @@ function MenuItem({
   label,
   onClick,
   disabled,
+  testId,
 }: {
   icon: typeof Copy
   label: string
   onClick: () => void
   disabled?: boolean
+  testId?: string
 }) {
   return (
     <button
+      data-testid={testId}
       type="button"
       onClick={onClick}
       disabled={disabled}

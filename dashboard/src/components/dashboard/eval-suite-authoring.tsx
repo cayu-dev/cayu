@@ -73,15 +73,49 @@ import type {
 
 const FIELD_LABEL = "mb-1 block text-xs font-medium text-muted-foreground"
 
-export function EvalSuiteAuthoringAction({
+type EvalSuiteAuthoringProps = {
+  targetKey: string
+  initialRevision?: string
+  label?: string
+  disabled: boolean
+  onLaunched: (runIds: string[]) => Promise<void>
+}
+
+/** Keep each specialist's draft when switching the surrounding catalog filter. */
+export function EvalSuiteAuthoringAction(props: EvalSuiteAuthoringProps) {
+  const scope = JSON.stringify([props.targetKey, props.initialRevision ?? null])
+  const [owners, setOwners] = useState([
+    { scope, targetKey: props.targetKey, initialRevision: props.initialRevision },
+  ])
+  if (props.initialRevision) {
+    return <EvalSuiteAuthoringEditor {...props} key={scope} active />
+  }
+  if (!owners.some((owner) => owner.scope === scope)) {
+    setOwners([
+      ...owners,
+      { scope, targetKey: props.targetKey, initialRevision: props.initialRevision },
+    ])
+  }
+  return owners.map((owner) => (
+    <EvalSuiteAuthoringEditor
+      {...props}
+      key={owner.scope}
+      targetKey={owner.targetKey}
+      initialRevision={owner.initialRevision}
+      active={owner.scope === scope}
+    />
+  ))
+}
+
+function EvalSuiteAuthoringEditor({
   targetKey,
   disabled,
   onLaunched,
-}: {
-  targetKey: string
-  disabled: boolean
-  onLaunched: (runIds: string[]) => Promise<void>
-}) {
+  initialRevision,
+  label = "New suite",
+  active,
+}: EvalSuiteAuthoringProps & { active: boolean }) {
+  const initialized = useRef(!initialRevision)
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState<EvalAuthoredSuiteDraft>(() => newEvalSuiteDraft(targetKey))
@@ -115,12 +149,12 @@ export function EvalSuiteAuthoringAction({
   const authoredSuites = useQuery({
     queryKey: ["evals", "authored-suites", targetKey],
     queryFn: ({ signal }) => fetchEvalAuthoredSuites({ target_key: targetKey, limit: 50 }, signal),
-    enabled: open,
+    enabled: open && active,
   })
   const targets = useQuery({
     queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),
-    enabled: open,
+    enabled: open && active,
   })
   const target = targets.data?.items.find((item) => item.target_key === targetKey)
   const independentJudgeProfile = target?.judge_profiles?.find(
@@ -181,6 +215,7 @@ export function EvalSuiteAuthoringAction({
     queryFn: ({ signal }) => fetchEvalScenario(activeScenarioRevision ?? "", signal),
     enabled:
       open &&
+      active &&
       activeScenarioRevision !== null &&
       (activeCaseRowKey === undefined || savedScenarios[activeCaseRowKey] === undefined),
   })
@@ -254,11 +289,17 @@ export function EvalSuiteAuthoringAction({
     savedRevision !== null &&
     savedRevision === suitePreview?.suite.revision
   const authoringPending = pending !== null || activeScenarioPending
-  const authoringLocked = disabled || authoringPending
+  const authoringLocked = disabled || !active || authoringPending
   const scenarioHasUnsavedChanges = unsavedScenarioReference || activeScenarioDirty
   const scenarioTransitionLocked = authoringPending || scenarioHasUnsavedChanges
 
   useEffect(() => () => controllerRef.current?.abort(), [])
+  useEffect(() => {
+    if (!active) {
+      setOpen(false)
+      controllerRef.current?.abort()
+    }
+  }, [active])
 
   useEffect(() => {
     const currencies = target?.cost_budget_currencies ?? []
@@ -268,6 +309,7 @@ export function EvalSuiteAuthoringAction({
   }, [launchCostCurrency, target?.cost_budget_currencies])
 
   const editDraft = (edit: (next: EvalAuthoredSuiteDraft) => void) => {
+    initialized.current = true
     setDraft((current) => {
       const next = structuredClone(current)
       edit(next)
@@ -298,6 +340,7 @@ export function EvalSuiteAuthoringAction({
 
   const resetToNewSuite = () => {
     if (authoringLocked || scenarioHasUnsavedChanges) return
+    initialized.current = true
     const next = newEvalSuiteDraft(targetKey)
     const nextCaseKeys = allocateCaseRowKeys(next.cases.length)
     setDraft(next)
@@ -328,6 +371,7 @@ export function EvalSuiteAuthoringAction({
   }
 
   const loadDocument = (document: EvalAuthoredSuite) => {
+    initialized.current = true
     const next = evalSuiteDraftFromDocument(document)
     const nextCaseKeys = allocateCaseRowKeys(next.cases.length)
     setDraft(next)
@@ -489,7 +533,7 @@ export function EvalSuiteAuthoringAction({
         return new Set([...current].filter((caseKey) => retainedKeys.has(caseKey)))
       })
       setNotice(`Saved immutable suite ${shortEvalIdentity(saved.suite.revision)}.`)
-      await queryClient.invalidateQueries({ queryKey: ["evals", "authored-suites"] })
+      await queryClient.invalidateQueries({ queryKey: ["evals"] })
     })
   }
 
@@ -581,10 +625,7 @@ export function EvalSuiteAuthoringAction({
       for (const item of launched.runs) {
         queryClient.setQueryData(["evals", "run", item.run.spec.run_id], item.run)
       }
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["evals", "runs"] }),
-        queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] }),
-      ])
+      await queryClient.invalidateQueries({ queryKey: ["evals"] })
       if (signal.aborted) return
       registry.resolve(requestIdentity)
       setNotice(
@@ -682,16 +723,21 @@ export function EvalSuiteAuthoringAction({
 
   return (
     <>
-      <Button
-        type="button"
-        data-testid="new-evaluation"
-        disabled={disabled}
-        onClick={() => setOpen(true)}
-      >
-        <Plus /> New evaluation
-      </Button>
+      {active && (
+        <Button
+          type="button"
+          data-testid="new-evaluation"
+          disabled={disabled}
+          onClick={() => {
+            setOpen(true)
+            if (initialRevision && !initialized.current) loadSuite(initialRevision)
+          }}
+        >
+          <Plus /> {label}
+        </Button>
+      )}
       <Sheet
-        open={open}
+        open={open && active}
         onOpenChange={(next) => {
           if (!next && scenarioTransitionLocked) return
           setOpen(next)
@@ -702,19 +748,19 @@ export function EvalSuiteAuthoringAction({
         }}
       >
         <SheetContent
-          className="w-[min(96vw,88rem)] overflow-hidden sm:max-w-none"
+          className="@container/eval-sheet overflow-hidden data-[side=right]:w-[min(96vw,88rem)] data-[side=right]:sm:max-w-none"
           data-testid="eval-suite-authoring-sheet"
         >
           <SheetHeader>
-            <SheetTitle>New evaluation</SheetTitle>
-            <SheetDescription>
+            <SheetTitle>{initialRevision ? "Edit and run suite" : "New suite"}</SheetTitle>
+            <SheetDescription className="break-words">
               Build a reusable deterministic suite, save its immutable revision, then run all cases
               or an explicit subset against {targetKey}.
             </SheetDescription>
           </SheetHeader>
 
-          <div className="grid min-h-0 flex-1 gap-4 overflow-hidden px-4 pb-2 xl:grid-cols-[18rem_minmax(0,1fr)]">
-            <aside className="min-h-0 space-y-3 overflow-y-auto rounded-lg border border-border p-3">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-2 @min-[56rem]/eval-sheet:grid @min-[56rem]/eval-sheet:grid-cols-[18rem_minmax(0,1fr)] @min-[56rem]/eval-sheet:overflow-hidden">
+            <aside className="max-h-64 min-h-0 min-w-0 shrink-0 space-y-3 overflow-y-auto rounded-lg border border-border p-3 @min-[56rem]/eval-sheet:max-h-none">
               <div className="flex items-center justify-between gap-2">
                 <div>
                   <div className="text-sm font-medium">Suites</div>
@@ -823,8 +869,8 @@ export function EvalSuiteAuthoringAction({
               </div>
             </aside>
 
-            <div className="min-h-0 overflow-y-auto pr-1">
-              <fieldset className="space-y-4" disabled={authoringLocked}>
+            <div className="@container/eval-form min-w-0 shrink-0 pr-1 @min-[56rem]/eval-sheet:min-h-0 @min-[56rem]/eval-sheet:overflow-y-auto">
+              <fieldset className="min-w-0 space-y-4" disabled={authoringLocked}>
                 <Card size="sm">
                   <CardHeader className="grid-cols-[1fr_auto]">
                     <div>
@@ -837,7 +883,7 @@ export function EvalSuiteAuthoringAction({
                       <Badge variant="outline">Saved {shortEvalIdentity(savedRevision)}</Badge>
                     )}
                   </CardHeader>
-                  <CardContent className="grid gap-3 sm:grid-cols-2">
+                  <CardContent className="grid gap-3 @min-[28rem]/eval-form:grid-cols-2">
                     <Field label="Suite ID" id="authored-suite-id">
                       <Input
                         id="authored-suite-id"
@@ -985,7 +1031,7 @@ export function EvalSuiteAuthoringAction({
                           </Button>
                         </div>
                       </CardHeader>
-                      <CardContent className="grid gap-3 sm:grid-cols-2">
+                      <CardContent className="grid gap-3 @min-[28rem]/eval-form:grid-cols-2">
                         <Field label="Case ID" id="authored-case-id">
                           <Input
                             id="authored-case-id"
@@ -1027,7 +1073,7 @@ export function EvalSuiteAuthoringAction({
                             }
                           />
                         </Field>
-                        <div className="sm:col-span-2">
+                        <div className="@min-[28rem]/eval-form:col-span-2">
                           <span className={FIELD_LABEL}>Scenario type</span>
                           <div className="flex gap-2">
                             <Button
@@ -1296,7 +1342,7 @@ export function EvalSuiteAuthoringAction({
                     </p>
                   </div>
                 </CardHeader>
-                <CardContent className="grid gap-3 sm:grid-cols-2">
+                <CardContent className="grid gap-3 @min-[28rem]/eval-form:grid-cols-2">
                   <Field label="Maximum cost per trial" id="authored-suite-maximum-cost">
                     <Input
                       id="authored-suite-maximum-cost"
@@ -1320,7 +1366,7 @@ export function EvalSuiteAuthoringAction({
                     />
                   </Field>
                   <p
-                    className={`text-xs sm:col-span-2 ${
+                    className={`text-xs @min-[28rem]/eval-form:col-span-2 ${
                       launchCostBudgetInvalid ? "text-destructive" : "text-muted-foreground"
                     }`}
                   >
@@ -1579,7 +1625,7 @@ function ReadinessSummary({
 function RunExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) {
   return (
     <div
-      className="mt-3 grid gap-2 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2"
+      className="mt-3 grid gap-2 rounded-lg border border-border bg-muted/20 p-3 text-xs @min-[28rem]/eval-form:grid-cols-2"
       data-testid="authored-suite-exposure"
     >
       <div>
@@ -1615,7 +1661,7 @@ function RunExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) 
           {formatExposureCost(exposure.judge_cost)}
         </div>
       </div>
-      <div className="font-mono text-[11px] text-muted-foreground sm:col-span-2">
+      <div className="font-mono text-[11px] text-muted-foreground @min-[28rem]/eval-form:col-span-2">
         Accepted exposure {shortEvalIdentity(exposure.revision)}
       </div>
     </div>
@@ -1656,7 +1702,7 @@ function Field({
   children: ReactNode
 }) {
   return (
-    <label htmlFor={id} className={wide ? "sm:col-span-2" : undefined}>
+    <label htmlFor={id} className={wide ? "min-w-0 @min-[28rem]/eval-form:col-span-2" : "min-w-0"}>
       <span className={FIELD_LABEL}>{label}</span>
       {children}
     </label>

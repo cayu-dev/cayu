@@ -29,7 +29,7 @@ export type DashboardCapabilityRequirement =
 
 export const DASHBOARD_ROUTE_REQUIREMENTS = {
   "/": { kind: "surface", surface: "session_overview_queries" },
-  "/evals": { kind: "surface", surface: "evals" },
+  "/evals": { kind: "surface", surface: "eval_suite_views" },
   "/tasks": { kind: "surface", surface: "tasks" },
   "/usage": { kind: "surface", surface: "usage" },
   "/knowledge": { kind: "surface", surface: "reviewed_knowledge" },

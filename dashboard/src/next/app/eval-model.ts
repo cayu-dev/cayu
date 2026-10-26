@@ -1,8 +1,8 @@
 /** How eval runs read: pass counts, verdicts, where a run came from. */
 import type { EvalCaseOutcome, EvalRunOrigin, EvalRunSummary, EvalVerdict } from "../api/eval-types"
 
-/** A flaky case still passed its minimum, so it counts as passing. */
-export const passing = (cases: EvalRunSummary["cases"]) => cases.passed + cases.flaky
+/** Variability overlaps settled outcomes and must never be added to them. */
+export const passing = (cases: EvalRunSummary["cases"]) => cases.passed
 
 export function passRate(cases: EvalRunSummary["cases"]): string {
   return cases.total ? `${passing(cases)}/${cases.total}` : "–"

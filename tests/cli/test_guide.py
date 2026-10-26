@@ -118,9 +118,9 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert main(["guide", "evals-first"]) == 0
     first = capsys.readouterr().out
     assert "# Run your first evaluation" in first
-    assert "New evaluation" in first
+    assert "New suite" in first
     assert "Check launch" in first
-    assert "Approve baseline" in first
+    assert "Approve as baseline" in first
     assert "cayu eval compare" in first
 
     assert main(["guide", "evals-ai-quality", "--json"]) == 0
@@ -134,6 +134,9 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert main(["guide", "evals-production"]) == 0
     production = capsys.readouterr().out
     assert "# Evaluate production sessions, scenarios, and memory" in production
+    assert "Add to evals" in production
+    assert "Score this session" in production
+    assert "Open captured evaluation details" in production
     assert "Evaluate a retained session" in production
     assert "Build a controlled multi-stage scenario" in production
     assert "Structural exposure" in production

@@ -28,6 +28,7 @@ export function parseDashboardIdentity(value: unknown): AppInfoResponse {
 }
 
 const MEMBER_READ_SURFACES = new Set([
+  "eval_suite_views",
   "app_info",
   "artifacts",
   "dashboard",

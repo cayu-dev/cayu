@@ -23,13 +23,14 @@ Open `http://127.0.0.1:8000/cayu/evals`. `--dev` is loopback-only trusted-local
 access. A deployed Developer dashboard needs its normal authentication and durable
 store; do not expose `OpenAccess` publicly.
 
-The Evals page names each operation that is ready and each missing dependency.
+Evals lists your suites and their latest runs. Open **Settings** for readiness,
+execution profiles, judges, limits, corpus import and advanced tools.
 Fix a readiness diagnostic before running. The browser cannot create a missing
 provider, credential, tool, environment, policy, or store.
 
 ## Create one deterministic suite
 
-1. Choose **New evaluation**.
+1. Choose **New suite**.
 2. Give the suite and first case stable IDs and useful names. IDs identify the
    logical contract; editing content creates a new immutable revision.
 3. Replace the sample input with a representative user request.
@@ -61,13 +62,17 @@ case and trial before trusting the aggregate status.
 - A repeated-trial policy retains every outcome. Required passes are not a way
   to hide evaluator errors or unavailable evidence; those still fail closed.
 
-After a representative passing result, choose **Approve baseline**. Future
+After a representative passing result, choose **Approve as baseline** on its run
+page. For authored suites, approval applies to the exact execution group; there is no
+aggregate baseline across different case selections. Future
 compatible results compare against that exact result revision. Cayu permits a
 new application release to compare, but changed cases, assertions, evidence,
 execution authority, judge semantics, trial policy, or applicable pricing may
 make results explicitly incomparable.
 
-Download JSON for automation and standalone HTML for review. The same files are
+The run’s **Details** disclosure retains lifecycle, all six result dimensions,
+manifest, evidence, pricing and trial policies, revisions and raw JSON. Download
+JSON for automation and standalone HTML for review. The same files are
 accepted by the package CLI:
 
 ```console

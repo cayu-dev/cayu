@@ -56,7 +56,7 @@ provider fails configuration instead of silently choosing another route.
 
 ## Author a rubric
 
-Open **Evals → New evaluation**, select the case, and choose **Add AI judge** or
+Open **Evals → New suite**, select the case, and choose **Add AI judge** or
 **Add same-model AI judge**.
 
 1. Give the assertion and rubric stable IDs.
