@@ -37,7 +37,7 @@ The per-target policies add:
 
 | Policy | Extra fields |
 | --- | --- |
-| `SessionRetentionPolicy` | `statuses` (`completed` and `failed` by default; only terminal statuses are accepted) and `compact_tool_output_min_bytes` (default 16 KiB). Age is the session's last update. |
+| `SessionRetentionPolicy` | `statuses` (`completed` and `failed` by default; only terminal statuses are accepted), `compact_tool_output_min_bytes` (default 16 KiB) and `compaction_level` (`events` by default, or `transcript`; see [Sessions](#sessions)). Age is the session's last update. |
 | `EvalRetentionPolicy` | `statuses` (`completed`, `failed` and `cancelled` by default; queued, running and cancelling runs are never selected). Age is the run's `finished_at`. |
 | `ArtifactRetentionPolicy` | `scopes` (`session` and `environment`), `min_size_bytes`, and `target_total_bytes`, which stops a run once the store's total size is at or below that size. Age is the artifact's `created_at`. |
 | `WorkspaceRetentionPolicy` | `statuses` (terminal session statuses). Age is the session's last update. |
@@ -68,16 +68,72 @@ report = await session_store.apply_retention_policy(
 `model.thinking.delta` events, and replaces the body of a stored
 `tool.call.completed` or `tool.call.failed` result whose `content` is at least
 `compact_tool_output_min_bytes` with a marker naming its size and SHA-256. It
-keeps the session record and status, the transcript (including the tool
-results the model saw), the checkpoint, terminal events, `model.completed`
-events and their usage, structured tool results, artifact references and every
-other event. Usage and cost accounting read the same totals before and after.
-Compaction never touches an event that an interaction pointer or an
-undelivered event side effect still references, and running it again finds
-nothing to do. The removed payloads cannot be recovered: replaying a compacted
-session's token stream, or reading the full tool output from its stored event,
-is no longer possible. Transcript retention remains the separate
+keeps the session record and status, the checkpoint, terminal events,
+`model.completed` events and their usage, structured tool results, artifact
+references and every other event. Usage and cost accounting read the same
+totals before and after. Compaction never touches an event that an
+interaction pointer or an undelivered event side effect still references, and
+running it again finds nothing to do. The removed payloads cannot be
+recovered: replaying a compacted session's token stream, or reading the full
+tool output from its stored event, is no longer possible.
+
+`compaction_level` chooses how far `compact` goes:
+
+| Level | What it also changes |
+| --- | --- |
+| `events` (default) | Nothing else. The transcript, including the tool results the model saw, is unchanged. |
+| `transcript` | Replaces each `tool_result` body of at least `compact_tool_output_min_bytes` in the transcript's tool messages with the same marker. The tool name, call id, `structured` result, artifacts and error flag stay. |
+
+A tool result is stored twice, once in its `tool.call.completed` event and once
+in the transcript, so the `events` level halves a large tool output's footprint
+and `transcript` removes the rest. The transcript level rewrites only tool
+messages that a runtime-publication receipt covers, which is every tool result
+the runtime published; messages the caller supplied, such as initial input
+that a session's input contract digests, are left alone. After compaction at
+this level the console and dashboard show the marker where the output was, a
+continued session's model sees the marker instead of the original output, and
+an eval scenario captured from the session afterwards sees the marker too
+(sessions that an eval already references are protected). Report counts add
+`transcript_tool_results_compacted`.
+
+Runtime-publication receipts bind the exact transcript segment and events they
+published by SHA-256, and recovery, replay, the inbox, producer outputs and
+collaboration outputs re-check that binding whenever they load a receipt.
+Before compaction rewrites a body that a receipt binds, it verifies the
+receipt against the stored material; if the receipt no longer verifies, that
+receipt's material is left untouched. After the rewrite it stores a
+retention attestation (a runtime-owned session operation under
+`__cayu_retention_compaction_v1__:`) with the receipt's original digests and
+the digests of the compacted material, in the same transaction. A receipt
+load accepts compacted material only when an attestation bound to that exact
+receipt names its digests; any other change still fails. Events a receipt
+appends or references are never deleted. Databases compacted by an earlier
+release, which rewrote tool events without an attestation, keep failing the
+check for those receipts.
+
+Transcript retention by message count remains the separate
 `compact_transcript(keep_last=...)` operation.
+
+### What `cayu_session_operations` holds
+
+Session operations are durable, keyed records that make the runtime's writes
+exactly-once. They are often the largest table after transcripts and events,
+and `compact` keeps all of them:
+
+| Key | Record | Why it stays |
+| --- | --- | --- |
+| `__cayu_runtime_publication_v1__:` | Receipt of one atomic publication (model step, tool round, approval, user input): request, transcript and event digests | A retried or late publication replays against it instead of publishing twice; recovery, the inbox and output readers verify it. |
+| `__cayu_model_completion_stage_v1__:` | Preparation, dispatch, completed response and winner of one model step | Crash recovery finishes or replays the step from these instead of calling the provider again. |
+| `__cayu_interaction_transition_v1__:`, `__cayu_invocation_terminal_event_v1__:` | The session and event at an interaction transition or an invocation's terminal event | A retried transition or terminal publication must match the original exactly. |
+| `__cayu_child_session_notification_v1__:`, `__cayu_zero_work_interruption_v1__` | Child-session notification delivery and zero-work interruption receipts | Delivery and interruption stay exactly-once across restarts. |
+| `tool-effect:`, `producer-output:`, `session-continuation:`, `session-export:` | Act-once tool effects, producer outputs, continuations and session exports | Dropping a tool-effect record lets a retried act-once tool run its effect again; the others back public reads. |
+| `__cayu_retention_compaction_v1__:` | Retention attestations | Keep compacted receipts verifiable. |
+
+No record type is dropped on its own: each one is the evidence a later retry,
+recovery or read compares against, and Cayu cannot prove that none will come
+(a completed session can be resumed, and a stale worker can retry a
+publication after the session finished). They are removed with their session
+by `delete`, which goes through the store's deletion guards.
 
 `delete` removes the whole session through the store's own `delete_session`
 transaction and guards.
@@ -276,6 +332,25 @@ retention = "workers:run_retention"
 
 Run it with `cayu worker retention`.
 
+## Growth warning
+
+Because retention is opt-in, a service can fill its disk without noticing.
+`SQLiteSessionStore.inspect_storage_growth()` and
+`PostgresSessionStore.inspect_storage_growth()` return a read-only
+`StorageGrowthReport`: the database's allocated bytes (and, for SQLite, the
+free pages only `VACUUM` returns), the session and terminal-session counts, the
+last update of the oldest terminal session, and the start of the newest
+session retention apply recorded in the audit tables.
+`storage_growth_warning(report)` turns it into an operator hint when the store
+holds at least 1 GiB or a terminal session older than 30 days, and no session
+retention apply is recorded within the last 7 days; the thresholds are
+keyword arguments.
+
+`cayu serve` runs this check once in the background at startup and logs the
+hint as a warning. `report_storage_growth(session_store)` in `cayu.runtime`
+does the same for workers and other entry points. Nothing is pruned: the
+warning only says that retention exists.
+
 ## Audit records
 
 Every apply writes a durable audit record, including an apply that changes
@@ -298,14 +373,45 @@ storage revision 118, an additive migration. Dry runs work on older databases;
 an apply asks you to run `cayu storage migrate` first.
 
 Counts and bytes are logical stored sizes (the JSON text or content Cayu
-stored), not file sizes. SQLite reuses freed pages but does not shrink the
-database file; run `VACUUM` during a maintenance window to return the space.
+stored), not file sizes.
+
+## Reclaiming disk space
+
+Pruning frees space inside the database; it does not shrink the files.
+
+**SQLite** reuses freed pages for new writes but keeps the file at its largest
+size. `cayu storage prune --apply --vacuum` runs `VACUUM` after the apply and
+reports the file size before and after (`vacuum` in JSON). `VACUUM` rewrites
+the whole database: it copies the remaining data into a temporary database in
+SQLite's temporary directory (`SQLITE_TMPDIR`, `TMPDIR`, then `/var/tmp` or
+`/tmp`) and writes it back through the write-ahead log next to the database.
+The command refuses to start unless each place has free space for the data,
+or twice that when both are on one file system, and it holds the write lock
+while it runs, so run it in a quiet period. `inspect_storage_growth()`
+reports the reclaimable free pages as `reclaimable_bytes`. Cayu does not
+enable `auto_vacuum`; `PRAGMA incremental_vacuum` only works on a database
+created with `auto_vacuum = INCREMENTAL`.
+
+**PostgreSQL** autovacuum marks the rows that pruning deleted or rewrote as
+reusable, so the tables stop growing without any action. Cayu does not run
+`VACUUM FULL`: it rewrites each table under an `ACCESS EXCLUSIVE` lock that
+blocks every reader and writer. To return space to the operating system after
+a large prune, run `VACUUM (FULL, ANALYZE)` on the largest tables
+(`cayu_transcript_messages`, `cayu_events`, `cayu_session_operations`) in a
+maintenance window, or use an online tool such as `pg_repack`. A plain
+`VACUUM (ANALYZE)` right after a large prune is safe at any time and refreshes
+planner statistics.
+
+**Migration backups** are full copies; see
+[Session-store targets](session-store-targets.md#backup-authority) for
+`--backup-dir` and `--keep-backups`.
 
 ## CLI
 
 ```bash
 cayu storage prune --dry-run --older-than 30d --json
 cayu storage prune --apply --older-than 30d --mode compact
+cayu storage prune --apply --older-than 7d --mode compact --compaction-level transcript
 cayu storage prune --apply --older-than 90d --target sessions --target evals --mode delete
 cayu storage prune --dry-run --older-than 30d --target all --json
 ```
@@ -322,9 +428,11 @@ cayu storage prune --dry-run --older-than 30d --target all --json
   `[tool.cayu] factory` and use its configured stores; `--sqlite` and
   `--postgres` are rejected with them.
 
-Other options: `--mode compact|delete` (sessions), `--status completed|failed`
-(sessions and workspaces), `--max-items`, `--max-bytes`,
-`--compact-tool-output-min-bytes`, `--artifact-min-bytes`,
+Other options: `--mode compact|delete` (sessions),
+`--compaction-level events|transcript` (sessions with `--mode compact`),
+`--status completed|failed` (sessions and workspaces), `--max-items`,
+`--max-bytes`, `--compact-tool-output-min-bytes`, `--vacuum` (SQLite with
+`--apply`), `--artifact-min-bytes`,
 `--artifact-target-total-bytes`, and the repeatable `--protect-session`,
 `--protect-eval` and `--protect-artifact`. JSON output has `schema_version`,
 `backend`, `target_source`, `dry_run`, per-target `totals`, one entry in

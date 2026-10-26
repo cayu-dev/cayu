@@ -43,6 +43,12 @@ from cayu.sessions._operation_records import (
     _apply_runtime_publication_operation_record_mutations,
     _validate_session_operation_record_keys,
 )
+from cayu.sessions._retention_attestation import (
+    ReceiptMaterial,
+    RetentionCompactionAttestation,
+    parse_retention_attestation,
+    retention_attestation_storage_key,
+)
 from cayu.sessions._runtime_publication import (
     RuntimePublicationReceipt,
     RuntimePublicationResult,
@@ -59,7 +65,7 @@ from cayu.sessions._runtime_publication_rules import (
     _PreparedRuntimePublication,
     _reconstruct_runtime_publication_receipt,
     _runtime_publication_receipt_record,
-    _validate_runtime_publication_durable_material,
+    _validate_runtime_publication_receipt_material,
     _validate_runtime_publication_replay_receipt,
 )
 from cayu.sessions._tool_round_publication_rules import (
@@ -136,54 +142,80 @@ async def load_receipt_record(
         return None
 
 
+async def load_material(
+    cur, receipt: RuntimePublicationReceipt, *, lock_events: bool = True
+) -> ReceiptMaterial:
+    await cur.execute(
+        "SELECT interaction_id, message FROM cayu_transcript_messages "
+        "WHERE session_id = %s AND session_order > %s AND session_order <= %s "
+        "ORDER BY session_order ASC",
+        (
+            receipt.session_id,
+            receipt.transcript_start_cursor,
+            receipt.transcript_end_cursor,
+        ),
+    )
+    transcript_rows = await cur.fetchall()
+    transcript = [Message(**pg_support._json_obj(row[1])) for row in transcript_rows]
+    transcript_interaction_ids = [row[0] for row in transcript_rows]
+
+    referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
+    requested_event_ids = tuple(dict.fromkeys((*receipt.appended_event_ids, *referenced_event_ids)))
+    events_by_id: dict[str, Event] = {}
+    if requested_event_ids:
+        await cur.execute(
+            "SELECT event_id, event FROM cayu_events "
+            "WHERE session_id = %s AND event_id = ANY(%s)" + (" FOR SHARE" if lock_events else ""),
+            (receipt.session_id, list(requested_event_ids)),
+        )
+        events_by_id = {
+            row[0]: Event(**pg_support._json_obj(row[1])) for row in await cur.fetchall()
+        }
+    return ReceiptMaterial(
+        transcript=transcript,
+        transcript_interaction_ids=transcript_interaction_ids,
+        appended_events=[
+            events_by_id[event_id]
+            for event_id in receipt.appended_event_ids
+            if event_id in events_by_id
+        ],
+        referenced_events=[
+            events_by_id[event_id] for event_id in referenced_event_ids if event_id in events_by_id
+        ],
+    )
+
+
+async def load_attestation(
+    cur, receipt: RuntimePublicationReceipt
+) -> RetentionCompactionAttestation | None:
+    await cur.execute(
+        "SELECT record FROM cayu_session_operations WHERE session_id = %s AND idempotency_key = %s",
+        (receipt.session_id, retention_attestation_storage_key(receipt.publication_id)),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    try:
+        record = pg_support._json_obj(row[0])
+    except (TypeError, ValueError):
+        return None
+    return parse_retention_attestation(record, receipt)
+
+
 async def validate_material(
     cur, receipt: RuntimePublicationReceipt, *, lock_events: bool = True
 ) -> None:
     try:
-        await cur.execute(
-            "SELECT interaction_id, message FROM cayu_transcript_messages "
-            "WHERE session_id = %s AND session_order > %s AND session_order <= %s "
-            "ORDER BY session_order ASC",
-            (
-                receipt.session_id,
-                receipt.transcript_start_cursor,
-                receipt.transcript_end_cursor,
-            ),
-        )
-        transcript_rows = await cur.fetchall()
-        transcript = [Message(**pg_support._json_obj(row[1])) for row in transcript_rows]
-        transcript_interaction_ids = [row[0] for row in transcript_rows]
-
-        referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
-        requested_event_ids = tuple(
-            dict.fromkeys((*receipt.appended_event_ids, *referenced_event_ids))
-        )
-        events_by_id: dict[str, Event] = {}
-        if requested_event_ids:
-            await cur.execute(
-                "SELECT event_id, event FROM cayu_events "
-                "WHERE session_id = %s AND event_id = ANY(%s)"
-                + (" FOR SHARE" if lock_events else ""),
-                (receipt.session_id, list(requested_event_ids)),
-            )
-            events_by_id = {
-                row[0]: Event(**pg_support._json_obj(row[1])) for row in await cur.fetchall()
-            }
-        _validate_runtime_publication_durable_material(
-            receipt,
-            transcript_messages=transcript,
-            transcript_interaction_ids=transcript_interaction_ids,
-            appended_events=(
-                events_by_id[event_id]
-                for event_id in receipt.appended_event_ids
-                if event_id in events_by_id
-            ),
-            durable_referenced_events=(
-                events_by_id[event_id]
-                for event_id in referenced_event_ids
-                if event_id in events_by_id
-            ),
-        )
+        material = await load_material(cur, receipt, lock_events=lock_events)
+        try:
+            _validate_runtime_publication_receipt_material(receipt, material)
+        except SessionRuntimePublicationConflict:
+            # Storage-retention compaction may have replaced tool-output bodies
+            # under an attestation bound to this exact receipt.
+            attestation = await load_attestation(cur, receipt)
+            if attestation is None:
+                raise
+            _validate_runtime_publication_receipt_material(receipt, material, attestation)
     except SessionRuntimePublicationConflict:
         raise
     except (TypeError, ValueError, json.JSONDecodeError) as exc:

@@ -21,6 +21,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from glob import escape as glob_escape
 from pathlib import Path
 from typing import Any, TextIO, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -154,9 +155,27 @@ def add_storage_parser(subparsers: Any) -> None:
                     ),
                 )
                 backup.add_argument(
+                    "--backup-dir",
+                    metavar="DIR",
+                    help=(
+                        "SQLite: write the uniquely named backup into this directory "
+                        "instead of next to the database. Not valid for Postgres."
+                    ),
+                )
+                backup.add_argument(
                     "--waive-backup",
                     action="store_true",
                     help="Explicitly waive retained backup/restore authority.",
+                )
+                sub.add_argument(
+                    "--keep-backups",
+                    metavar="N",
+                    type=_positive_int,
+                    help=(
+                        "SQLite: after a successful migration, keep only the newest N "
+                        "automatically named backups of this database in the backup "
+                        "directory and delete older ones. Not valid for Postgres."
+                    ),
                 )
             if name in {"migrate", "status"}:
                 sub.add_argument(
@@ -336,6 +355,24 @@ def _add_prune_arguments(sub: argparse.ArgumentParser) -> None:
         "--compact-tool-output-min-bytes",
         type=_positive_int,
         help="Sessions: compact stored tool outputs at least this large (default: 16384).",
+    )
+    sub.add_argument(
+        "--compaction-level",
+        choices=("events", "transcript"),
+        help=(
+            "Sessions with --mode compact: events rewrites stored tool events only; "
+            "transcript also replaces large tool results in the transcript with a "
+            "marker naming their size and SHA-256 (default: events)."
+        ),
+    )
+    sub.add_argument(
+        "--vacuum",
+        action="store_true",
+        help=(
+            "SQLite with --apply: run VACUUM afterwards so the file shrinks. It needs "
+            "free disk space about the size of the database and blocks writers while "
+            "it runs. PostgreSQL reuses freed space itself; see docs/storage-retention.md."
+        ),
     )
     sub.add_argument(
         "--artifact-min-bytes",
@@ -828,6 +865,9 @@ def _migrate_sqlite(args: argparse.Namespace) -> int:
         raise ValueError("--backup-sha256 is only valid with --postgres.")
     if args.backup_managed is not None:
         raise ValueError("--backup-managed is only valid for a Postgres target.")
+    backup_dir = _backup_dir_arg(args)
+    if backup_dir is not None and Path(backup_dir).is_file():
+        raise ValueError("--backup-dir must name a directory.")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     pending_receipt_path, durable_receipt_path = _sqlite_migration_receipt_paths(path)
@@ -901,7 +941,7 @@ def _migrate_sqlite_locked(
     backup_sha256: str | None = None
     if recovery is None:
         backup_path = (
-            _sqlite_backup_path(path, args.backup)
+            _sqlite_backup_path(path, args.backup, backup_dir=_backup_dir_arg(args))
             if retained_backup
             else _new_sqlite_path(
                 path.parent,
@@ -1053,6 +1093,18 @@ def _migrate_sqlite_locked(
             os.replace(pending_receipt_path, durable_receipt_path)
             _sync_directory(path.parent)
 
+        keep_backups = _keep_backups_arg(args)
+        backup_dir = _backup_dir_arg(args)
+        removed_backups = (
+            ()
+            if keep_backups is None
+            else _prune_sqlite_backups(
+                path,
+                directory=path.parent if backup_dir is None else Path(backup_dir),
+                keep=keep_backups,
+                current=backup_path if retained_backup else None,
+            )
+        )
         _render_migration(
             "sqlite",
             str(path),
@@ -1061,6 +1113,7 @@ def _migrate_sqlite_locked(
             target_source=args.target_source,
             output_format=args.output_format,
             output=args.output,
+            removed_backups=removed_backups,
         )
         _discard_durable_sqlite_receipt(durable_receipt_path)
         return 0
@@ -1090,6 +1143,10 @@ def _migrate_sqlite_locked(
 def _migrate_postgres(args: argparse.Namespace) -> int:
     if args.backup is not None:
         raise ValueError("--backup is only valid with --sqlite.")
+    if _backup_dir_arg(args) is not None:
+        raise ValueError("--backup-dir is only valid with --sqlite.")
+    if _keep_backups_arg(args) is not None:
+        raise ValueError("--keep-backups is only valid with --sqlite.")
     _preflight_migration_output(args.output, forbidden=())
     requested_backup = _requested_postgres_backup_authority(args)
     codec = public_authority_alias_codec_from_environment()
@@ -1656,7 +1713,10 @@ def _resume_sqlite_migration_backup(
         raise RuntimeError("SQLite pending migration receipt is not resumable.")
     backup_path = Path(backup_path_value)
     _preflight_migration_output(args.output, forbidden=(backup_path,))
-    if args.backup is not None and Path(args.backup).resolve() != backup_path.resolve():
+    backup_dir = _backup_dir_arg(args)
+    if (args.backup is not None and Path(args.backup).resolve() != backup_path.resolve()) or (
+        backup_dir is not None and Path(backup_dir).resolve() != backup_path.parent.resolve()
+    ):
         raise RuntimeError(
             "SQLite pending migration receipt belongs to a different backup destination."
         )
@@ -1718,9 +1778,40 @@ def _discard_durable_sqlite_receipt(path: Path) -> None:
         pass
 
 
-def _sqlite_backup_path(path: Path, requested: str | None) -> Path:
+def _backup_dir_arg(args: argparse.Namespace) -> str | None:
+    # Programmatic namespaces may omit options added after they were written.
+    value = getattr(args, "backup_dir", None)
+    return value if isinstance(value, str) else None
+
+
+def _keep_backups_arg(args: argparse.Namespace) -> int | None:
+    value = getattr(args, "keep_backups", None)
+    return value if isinstance(value, int) else None
+
+
+def _sqlite_backup_prefix(path: Path, directory: Path) -> str:
+    """The name prefix that identifies ``path``'s automatic backups in ``directory``.
+
+    Next to the database the file name alone identifies it. A shared
+    ``--backup-dir`` can hold backups of several databases with the same file
+    name, so there the prefix also carries a digest of the database's resolved
+    path.
+    """
+
+    resolved = path.resolve()
+    if directory.resolve() == resolved.parent:
+        return f"{path.name}.cayu-backup-"
+    owner = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    return f"{path.name}.{owner}.cayu-backup-"
+
+
+def _sqlite_backup_path(
+    path: Path, requested: str | None, *, backup_dir: str | None = None
+) -> Path:
     if requested is None:
-        return _new_sqlite_path(path.parent, prefix=f"{path.name}.cayu-backup-")
+        parent = path.parent if backup_dir is None else Path(backup_dir)
+        parent.mkdir(parents=True, exist_ok=True)
+        return _new_sqlite_path(parent, prefix=_sqlite_backup_prefix(path, parent))
     backup_path = Path(requested)
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     if backup_path.resolve() == path.resolve():
@@ -1731,6 +1822,44 @@ def _sqlite_backup_path(path: Path, requested: str | None) -> Path:
         raise ValueError(f"SQLite backup already exists: {backup_path}") from None
     os.close(descriptor)
     return backup_path
+
+
+def _prune_sqlite_backups(
+    path: Path, *, directory: Path, keep: int, current: Path | None
+) -> tuple[dict[str, object], ...]:
+    """Delete all but the newest ``keep`` automatically named backups of ``path``.
+
+    Only files with this database's automatic backup prefix are considered
+    (see :func:`_sqlite_backup_prefix`); backups of other databases and a
+    backup written to an explicit ``--backup`` path are never touched. The
+    backup this migration just wrote always counts as the newest.
+    """
+
+    prefix = _sqlite_backup_prefix(path, directory)
+    candidates = [
+        candidate
+        for candidate in directory.glob(f"{glob_escape(prefix)}*.sqlite3")
+        if candidate.is_file() and not candidate.is_symlink()
+    ]
+    current_resolved = None if current is None else current.resolve()
+    candidates.sort(
+        key=lambda candidate: (
+            candidate.resolve() == current_resolved,
+            candidate.stat().st_mtime_ns,
+            candidate.name,
+        ),
+        reverse=True,
+    )
+    removed: list[dict[str, object]] = []
+    for candidate in candidates[keep:]:
+        if current_resolved is not None and candidate.resolve() == current_resolved:
+            continue
+        size = candidate.stat().st_size
+        _remove_sqlite_file_set(candidate)
+        removed.append({"path": str(candidate), "bytes": size})
+    if removed:
+        _sync_directory(directory)
+    return tuple(removed)
 
 
 def _new_sqlite_path(parent: Path, *, prefix: str) -> Path:
@@ -1960,15 +2089,34 @@ def _render_migration(
     target_source: str,
     output_format: str,
     output: str | None,
+    removed_backups: tuple[dict[str, object], ...] = (),
 ) -> None:
+    retained = _retained_backup_summary(receipt) if backend == "sqlite" else None
     with _output_stream(output) as stream:
         if output_format == "json":
             payload = _status_payload(backend, target, state, target_source=target_source)
             payload["migration_receipt"] = receipt
+            if backend == "sqlite":
+                payload["backup"] = {
+                    "path": None if retained is None else retained["path"],
+                    "bytes": None if retained is None else retained["bytes"],
+                    "removed": list(removed_backups),
+                }
             print(json.dumps(payload, sort_keys=True), file=stream)
             return
         _print_status(backend, target, state, stream=stream)
         print(f"  migration receipt: {receipt['receipt_sha256']}", file=stream)
+        if retained is not None:
+            print(
+                f"  backup: {retained['path']} ({retained['bytes']} bytes); delete it once "
+                "the migrated database is verified, or pass --keep-backups next time",
+                file=stream,
+            )
+        for removed in removed_backups:
+            print(
+                f"  removed old backup: {removed['path']} ({removed['bytes']} bytes)",
+                file=stream,
+            )
         backup = receipt["backup"]
         backup_sha256: object | None = None
         backup_reference: object | None = None
@@ -1982,6 +2130,24 @@ def _render_migration(
             print(f"  backup sha256: {backup_sha256}", file=stream)
         if backup_reference is not None:
             print(f"  managed backup: {backup_reference}", file=stream)
+
+
+def _retained_backup_summary(receipt: dict[str, object]) -> dict[str, object] | None:
+    backup_value = receipt.get("backup")
+    if not isinstance(backup_value, dict):
+        return None
+    backup = cast("dict[str, object]", backup_value)
+    if backup.get("mode") != "retained":
+        return None
+    path_value = backup.get("path")
+    if not isinstance(path_value, str):
+        return None
+    backup_path = Path(path_value)
+    try:
+        size: int | None = backup_path.stat().st_size
+    except OSError:
+        size = None
+    return {"path": str(backup_path), "bytes": size}
 
 
 @contextlib.contextmanager
@@ -2089,6 +2255,7 @@ def _prune_policy(args: argparse.Namespace) -> Any:
         ArtifactRetentionPolicy,
         EvalRetentionPolicy,
         RetentionMode,
+        SessionCompactionLevel,
         SessionRetentionPolicy,
         StorageRetentionPolicy,
         WorkspaceRetentionPolicy,
@@ -2105,6 +2272,8 @@ def _prune_policy(args: argparse.Namespace) -> Any:
     session_extra: dict[str, Any] = {}
     if args.compact_tool_output_min_bytes is not None:
         session_extra["compact_tool_output_min_bytes"] = args.compact_tool_output_min_bytes
+    if args.compaction_level is not None:
+        session_extra["compaction_level"] = SessionCompactionLevel(args.compaction_level)
     artifact_extra: dict[str, Any] = {}
     if args.artifact_min_bytes is not None:
         artifact_extra["min_size_bytes"] = args.artifact_min_bytes
@@ -2159,6 +2328,13 @@ async def _close_quietly(store: Any) -> None:
 def _prune(args: argparse.Namespace) -> int:
     from cayu.runtime.storage_retention import apply_storage_retention
 
+    if getattr(args, "vacuum", False) and not args.apply:
+        raise ValueError("--vacuum requires --apply.")
+    if getattr(args, "vacuum", False) and args.postgres is not None:
+        raise ValueError(
+            "--vacuum is only valid for SQLite. PostgreSQL reuses the space that "
+            "pruning frees; see docs/storage-retention.md for VACUUM on PostgreSQL."
+        )
     policy = _prune_policy(args)
     targets = _prune_targets(args)
 
@@ -2175,8 +2351,9 @@ def _prune(args: argparse.Namespace) -> int:
         finally:
             await _close_quietly(eval_store)
             await store.close()
-        _render_prune(args, report)
-        return 1 if report.errors else 0
+        vacuum = _vacuum_after_prune(args.sqlite) if getattr(args, "vacuum", False) else None
+        _render_prune(args, report, vacuum=vacuum)
+        return 1 if report.errors or (vacuum is not None and "error" in vacuum) else 0
 
     async def run_with_app() -> int:
         from cayu.cli.project import (
@@ -2194,13 +2371,20 @@ def _prune(args: argparse.Namespace) -> int:
         with project_context(project.root):
             app = build_project_app(project.factory_target, command="Storage prune")
             eval_store = _eval_store_for(app.session_store) if "evals" in targets else None
+            sqlite_path = _sqlite_store_path(app.session_store)
             try:
+                if getattr(args, "vacuum", False) and sqlite_path is None:
+                    raise ValueError(
+                        "--vacuum is only valid when the application's session store is "
+                        "a file-backed SQLite database."
+                    )
                 report = await app.apply_storage_retention(policy, eval_store=eval_store)
             finally:
                 await _close_quietly(eval_store)
                 await close_project_app(app)
-        _render_prune(args, report)
-        return 1 if report.errors else 0
+        vacuum = _vacuum_after_prune(sqlite_path) if getattr(args, "vacuum", False) else None
+        _render_prune(args, report, vacuum=vacuum)
+        return 1 if report.errors or (vacuum is not None and "error" in vacuum) else 0
 
     run = run_with_app if _prune_needs_app(args) else run_with_store
     if args.postgres is None:
@@ -2214,7 +2398,110 @@ def _prune(args: argparse.Namespace) -> int:
         return 1
 
 
-def _render_prune(args: argparse.Namespace, report: Any) -> None:
+def _sqlite_store_path(store: Any) -> str | None:
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    if isinstance(store, SQLiteSessionStore) and str(store.path) != ":memory:":
+        # Resolve inside the project context: a relative store path names a
+        # file under the project root, not under the caller's directory.
+        return str(Path(store.path).resolve())
+    return None
+
+
+def _vacuum_after_prune(path_value: str | None) -> dict[str, object]:
+    """Run VACUUM on the pruned SQLite file; report its size before and after."""
+
+    if path_value is None:  # pragma: no cover - validated before the apply
+        raise ValueError("--vacuum requires a file-backed SQLite database.")
+    path = Path(path_value)
+    try:
+        return vacuum_sqlite_database(path)
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        return {"path": str(path), "error": str(exc)}
+
+
+def vacuum_sqlite_database(path: Path, *, busy_timeout_ms: int = 30_000) -> dict[str, object]:
+    """``VACUUM`` a SQLite database file so freed pages return to the file system.
+
+    VACUUM copies the live data into a temporary database in SQLite's temporary
+    directory and then rewrites the file through the write-ahead log next to
+    it, so it needs free space about the size of the data in each place (twice
+    that when they share a file system). It holds the write lock until it
+    finishes, so writers wait up to ``busy_timeout_ms``.
+    """
+
+    if not path.is_file():
+        raise RuntimeError(f"SQLite database not found for VACUUM: {path}")
+    before = _sqlite_file_set_bytes(path)
+    connection = sqlite3.connect(
+        f"{path.resolve().as_uri()}?mode=rw",
+        uri=True,
+        isolation_level=None,
+        timeout=busy_timeout_ms / 1000,
+    )
+    try:
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+        _require_vacuum_space(path, (page_count - free_pages) * page_size)
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+        connection.execute("VACUUM")
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        checkpoint_busy = checkpoint is not None and int(checkpoint[0]) != 0
+    finally:
+        connection.close()
+    after = _sqlite_file_set_bytes(path)
+    result: dict[str, object] = {
+        "path": str(path),
+        "bytes_before": before,
+        "bytes_after": after,
+        "reclaimed_bytes": max(0, before - after),
+    }
+    if checkpoint_busy:
+        result["note"] = "a reader kept the write-ahead log open; it shrinks at the next checkpoint"
+    return result
+
+
+def _sqlite_temp_directory() -> Path:
+    """The directory SQLite uses for VACUUM's temporary database on POSIX."""
+
+    for name in ("SQLITE_TMPDIR", "TMPDIR"):
+        value = os.environ.get(name)
+        if value and Path(value).is_dir():
+            return Path(value)
+    for candidate in ("/var/tmp", "/usr/tmp", "/tmp"):
+        if Path(candidate).is_dir():
+            return Path(candidate)
+    return Path(tempfile.gettempdir())
+
+
+def _require_vacuum_space(path: Path, data_bytes: int) -> None:
+    database_directory = path.resolve().parent
+    temp_directory = _sqlite_temp_directory()
+    if database_directory.stat().st_dev == temp_directory.stat().st_dev:
+        needs = {database_directory: 2 * data_bytes}
+    else:
+        needs = {database_directory: data_bytes, temp_directory: data_bytes}
+    for directory, needed in needs.items():
+        available = shutil.disk_usage(directory).free
+        if available < needed:
+            raise RuntimeError(
+                f"VACUUM needs about {needed} bytes free in {directory} (a temporary copy "
+                f"in {temp_directory} and a rewrite next to {path}); {available} are available."
+            )
+
+
+def _sqlite_file_set_bytes(path: Path) -> int:
+    total = 0
+    for candidate in (path, Path(f"{path}-wal")):
+        with contextlib.suppress(FileNotFoundError):
+            total += candidate.stat().st_size
+    return total
+
+
+def _render_prune(
+    args: argparse.Namespace, report: Any, *, vacuum: dict[str, object] | None = None
+) -> None:
     with _output_stream(args.output) as stream:
         if args.output_format == "json":
             payload = {
@@ -2233,6 +2520,8 @@ def _render_prune(args: argparse.Namespace, report: Any) -> None:
                 "skipped": report.skipped,
                 "errors": report.errors,
             }
+            if vacuum is not None:
+                payload["vacuum"] = vacuum
             print(json.dumps(payload, sort_keys=True), file=stream)
             return
         action = "would act on" if report.dry_run else "acted on"
@@ -2257,6 +2546,16 @@ def _render_prune(args: argparse.Namespace, report: Any) -> None:
             print(f"{target}: skipped ({reason})", file=stream)
         for target, error in report.errors.items():
             print(f"{target}: failed ({error})", file=stream)
+        if vacuum is not None and "error" in vacuum:
+            print(f"vacuum: failed ({vacuum['error']})", file=stream)
+        elif vacuum is not None:
+            print(
+                f"vacuum: {vacuum['path']} {vacuum['bytes_before']} -> {vacuum['bytes_after']} "
+                f"byte(s), {vacuum['reclaimed_bytes']} reclaimed",
+                file=stream,
+            )
+            if "note" in vacuum:
+                print(f"  {vacuum['note']}", file=stream)
 
 
 async def _export_sessions(

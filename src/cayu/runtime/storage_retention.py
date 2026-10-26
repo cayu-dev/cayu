@@ -20,10 +20,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from cayu.storage.retention import (
+    DEFAULT_STORAGE_GROWTH_WARNING_AGE,
+    DEFAULT_STORAGE_GROWTH_WARNING_BYTES,
+    DEFAULT_STORAGE_RETENTION_RECENT_WINDOW,
     MAX_RETENTION_ITEMS_PER_RUN,
     RetentionAuditEntry,
     RetentionAuditSink,
@@ -41,6 +44,7 @@ from cayu.storage.retention import (
     WorkspaceRetentionPolicy,
     bounded_retention_detail,
     retention_audit_summary,
+    storage_growth_warning,
 )
 
 if TYPE_CHECKING:
@@ -657,9 +661,39 @@ async def run_storage_retention_worker(
             continue
 
 
+async def report_storage_growth(
+    session_store: Any,
+    *,
+    max_bytes: int = DEFAULT_STORAGE_GROWTH_WARNING_BYTES,
+    max_age: timedelta = DEFAULT_STORAGE_GROWTH_WARNING_AGE,
+    retention_window: timedelta = DEFAULT_STORAGE_RETENTION_RECENT_WINDOW,
+    log: logging.Logger | None = None,
+) -> str | None:
+    """Log one warning when a session store grows with no retention running.
+
+    The store is inspected read-only (see
+    :meth:`~cayu.sessions.SessionStore.inspect_storage_growth`); the thresholds
+    are those of :func:`~cayu.storage.storage_growth_warning`. Returns the
+    warning, or ``None`` for a store that does not support retention, a store
+    under the thresholds, or one with a recent retention run. Nothing is
+    pruned: retention stays opt-in.
+    """
+
+    if not getattr(session_store, "supports_storage_retention", False):
+        return None
+    report = await session_store.inspect_storage_growth()
+    warning = storage_growth_warning(
+        report, max_bytes=max_bytes, max_age=max_age, retention_window=retention_window
+    )
+    if warning is not None:
+        (log or logger).warning(warning)
+    return warning
+
+
 __all__ = [
     "apply_storage_retention",
     "apply_workspace_retention",
     "live_task_session_ids",
+    "report_storage_growth",
     "run_storage_retention_worker",
 ]

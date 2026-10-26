@@ -174,6 +174,96 @@ def test_storage_migrate_receipt_binds_backup_path_authority_and_checks(
     assert secret not in json.dumps(payload)
 
 
+def test_storage_migrate_reports_backup_and_writes_it_to_backup_dir(tmp_path, capsys):
+    db = tmp_path / "data" / "sessions.db"
+    backups = tmp_path / "backups"
+
+    assert main(["storage", "migrate", "--sqlite", str(db), "--backup-dir", str(backups)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    backup = Path(payload["backup"]["path"])
+    assert backup.parent == backups
+    # A shared backup directory names the database's resolved path by digest.
+    owner = hashlib.sha256(str(db.resolve()).encode()).hexdigest()[:16]
+    assert backup.name.startswith(f"sessions.db.{owner}.cayu-backup-")
+    assert payload["backup"]["bytes"] == backup.stat().st_size
+    assert payload["backup"]["removed"] == []
+    assert payload["migration_receipt"]["backup"]["path"] == str(backup)
+    assert not list(db.parent.glob("*.cayu-backup-*"))
+
+    assert main(["storage", "migrate", "--sqlite", str(db), "--table"]) == 0
+    text = capsys.readouterr().out
+    [sibling] = db.parent.glob("sessions.db.cayu-backup-*.sqlite3")
+    assert f"backup: {sibling} ({sibling.stat().st_size} bytes)" in text
+
+    assert main(["storage", "migrate", "--sqlite", str(db), "--waive-backup"]) == 0
+    assert json.loads(capsys.readouterr().out)["backup"] == {
+        "path": None,
+        "bytes": None,
+        "removed": [],
+    }
+
+
+def test_storage_migrate_keep_backups_deletes_only_older_default_backups(tmp_path, capsys):
+    import os
+
+    db = tmp_path / "sessions.db"
+    assert main(["storage", "migrate", "--sqlite", str(db), "--waive-backup"]) == 0
+    capsys.readouterr()
+    old = [tmp_path / f"sessions.db.cayu-backup-old{index}.sqlite3" for index in range(3)]
+    for index, path in enumerate(old):
+        path.write_bytes(b"x" * (index + 1))
+        os.utime(path, (1_000_000 + index, 1_000_000 + index))
+    explicit = tmp_path / "sessions.db.manual-backup.sqlite3"
+    explicit.write_bytes(b"keep")
+    other_database = tmp_path / "other.db.cayu-backup-old.sqlite3"
+    other_database.write_bytes(b"keep")
+
+    assert main(["storage", "migrate", "--sqlite", str(db), "--keep-backups", "2"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    current = Path(payload["backup"]["path"])
+    assert current.exists() and old[2].exists()
+    assert sorted(item["path"] for item in payload["backup"]["removed"]) == [
+        str(old[0]),
+        str(old[1]),
+    ]
+    assert not old[0].exists() and not old[1].exists()
+    assert explicit.exists() and other_database.exists()
+
+    assert (
+        main(
+            [
+                "storage",
+                "migrate",
+                "--postgres",
+                "postgresql://x@127.0.0.1:1/none",
+                "--keep-backups",
+                "1",
+            ]
+        )
+        == 1
+    )
+    assert "--keep-backups is only valid with --sqlite" in capsys.readouterr().out
+
+
+def test_storage_migrate_keep_backups_spares_same_named_databases_in_a_shared_dir(tmp_path, capsys):
+    backups = tmp_path / "backups"
+    first = tmp_path / "service-a" / "sessions.db"
+    second = tmp_path / "service-b" / "sessions.db"
+    command = ["--backup-dir", str(backups), "--keep-backups", "1"]
+
+    assert main(["storage", "migrate", "--sqlite", str(first), *command]) == 0
+    first_backup = Path(json.loads(capsys.readouterr().out)["backup"]["path"])
+    assert main(["storage", "migrate", "--sqlite", str(second), *command]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backup"]["removed"] == []
+    assert first_backup.exists() and Path(payload["backup"]["path"]).exists()
+
+    assert main(["storage", "migrate", "--sqlite", str(first), *command]) == 0
+    removed = json.loads(capsys.readouterr().out)["backup"]["removed"]
+    assert [item["path"] for item in removed] == [str(first_backup)]
+    assert Path(payload["backup"]["path"]).exists()
+
+
 def test_storage_migrate_missing_breaking_acknowledgement_is_byte_identical(
     tmp_path,
     capsys,
@@ -1159,6 +1249,90 @@ def test_storage_prune_dry_run_lists_what_apply_removes(tmp_path, capsys):
 
     assert main([*command, "--dry-run", "--table"]) == 0
     assert "would act on 0 item(s)" in capsys.readouterr().out
+
+
+def test_storage_prune_compaction_level_reaches_the_session_policy(tmp_path, capsys):
+    db = tmp_path / "prune.sqlite"
+    _seed_retention_store(db)
+    command = ["storage", "prune", "--sqlite", str(db), "--older-than", "1d", "--dry-run"]
+
+    assert main([*command, "--compaction-level", "transcript", "--json"]) == 0
+    [plan] = json.loads(capsys.readouterr().out)["reports"]
+    assert plan["policy"]["compaction_level"] == "transcript"
+    [item] = plan["items"]
+    assert item["counts"]["transcript_tool_results_compacted"] == 0
+
+    assert main([*command, "--mode", "delete", "--compaction-level", "transcript"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "compaction_level applies only to mode='compact'" in payload["error"]["message"]
+
+
+def test_storage_prune_vacuum_shrinks_the_sqlite_file_after_apply(tmp_path, capsys):
+    db = tmp_path / "prune.sqlite"
+    _seed_retention_store(db)
+    command = ["storage", "prune", "--sqlite", str(db), "--older-than", "1d", "--mode", "delete"]
+
+    assert main([*command, "--apply", "--vacuum", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    [report] = payload["reports"]
+    assert [item["item_id"] for item in report["items"]] == ["old"]
+    vacuum = payload["vacuum"]
+    assert vacuum["path"] == str(db)
+    assert vacuum["bytes_after"] <= vacuum["bytes_before"]
+    assert vacuum["reclaimed_bytes"] == vacuum["bytes_before"] - vacuum["bytes_after"]
+    assert not Path(f"{db}-wal").exists() or Path(f"{db}-wal").stat().st_size == 0
+
+    assert main([*command, "--apply", "--vacuum", "--table"]) == 0
+    assert "vacuum: " in capsys.readouterr().out
+
+    assert main([*command, "--dry-run", "--vacuum"]) == 1
+    assert "--vacuum requires --apply" in json.loads(capsys.readouterr().out)["error"]["message"]
+    postgres = ["storage", "prune", "--postgres", "postgresql://cayu@127.0.0.1:1/none"]
+    assert main([*postgres, "--older-than", "1d", "--apply", "--vacuum"]) == 1
+    assert "only valid for SQLite" in json.loads(capsys.readouterr().out)["error"]["message"]
+
+
+def test_vacuum_requires_space_for_the_temporary_copy_and_the_rewrite(tmp_path, monkeypatch):
+    import collections
+    import sqlite3
+
+    from cayu.cli import storage as storage_cli
+
+    db = tmp_path / "space.sqlite"
+    with sqlite3.connect(db) as connection:
+        connection.execute("CREATE TABLE filler (value BLOB)")
+        connection.execute("INSERT INTO filler VALUES (zeroblob(200000))")
+    data_bytes = db.stat().st_size
+    monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path))
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        storage_cli.shutil, "disk_usage", lambda _path: usage(0, 0, data_bytes * 3 // 2)
+    )
+    with pytest.raises(RuntimeError, match="VACUUM needs about"):
+        storage_cli.vacuum_sqlite_database(db)
+
+    missing = tmp_path / "missing.sqlite"
+    with pytest.raises(RuntimeError, match="not found"):
+        storage_cli.vacuum_sqlite_database(missing)
+    assert not missing.exists()
+
+
+def test_prune_vacuum_resolves_a_relative_store_path_in_the_project(tmp_path, monkeypatch):
+    from cayu.cli import storage as storage_cli
+    from cayu.storage import SQLiteSessionStore
+
+    project = tmp_path / "project"
+    elsewhere = tmp_path / "elsewhere"
+    project.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(project)
+    store = SQLiteSessionStore("sessions.db")
+    try:
+        resolved = storage_cli._sqlite_store_path(store)
+    finally:
+        asyncio.run(store.close())
+    monkeypatch.chdir(elsewhere)
+    assert resolved == str((project / "sessions.db").resolve())
 
 
 def test_storage_prune_evals_target_uses_the_same_database(tmp_path, capsys):

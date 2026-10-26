@@ -26,6 +26,17 @@ processes. In-memory stores are for hermetic tests, never production ownership.
 The `CayuApp` object remains process-local; every replacement process rebuilds
 it against the same stores.
 
+A persistent session store keeps every session, event, transcript and session
+operation until something removes it; a service that runs a few hundred
+sessions a day can reach gigabytes within weeks. Storage retention is off by
+default. Preview it with `cayu storage prune --dry-run --older-than 30d`, then
+apply a policy on a schedule with `run_storage_retention_worker` (run as
+`cayu worker retention`) or `cayu storage prune --apply`. `cayu serve` logs a
+warning at startup when a SQLite or Postgres session store passes 1 GiB or
+keeps terminal sessions older than 30 days with no retention run in the last
+week. See
+[storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md).
+
 Reconstruction also requires compatible identities for service-backed tools,
 custom policies, and environments. See `cayu guide durable-service-tools` for
 those declarations, explicit knowledge bindings, and a fresh-process example.

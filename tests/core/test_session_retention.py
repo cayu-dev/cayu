@@ -58,12 +58,17 @@ def _sqlite_scenario(sqlite_resources, scenario) -> None:
             async def snapshot_tables():
                 SQLiteAgentSnapshotStore(path)
 
+            async def query(sql, parameters=()):
+                with contextlib.closing(sqlite3.connect(path, timeout=5)) as connection:
+                    return [tuple(row) for row in connection.execute(sql, parameters)]
+
             await scenario(
                 RetentionHarness(
                     store=store,
                     tasks=tasks,
                     clock=clock,
                     execute=execute,
+                    query=query,
                     snapshot_tables=snapshot_tables,
                 )
             )
@@ -129,12 +134,18 @@ def _postgres_scenario(dsn: str, scenario) -> None:
             # Revision 120 puts the agent snapshot tables in the migrated database.
             return None
 
+        async def query(statement, parameters=()):
+            async with await psycopg.AsyncConnection.connect(dsn) as connection:
+                cursor = await connection.execute(statement.replace("?", "%s"), parameters)
+                return [tuple(row) for row in await cursor.fetchall()]
+
         try:
             await scenario(
                 RetentionHarness(
                     store=store,
                     tasks=tasks,
                     execute=execute,
+                    query=query,
                     postgres=True,
                     snapshot_tables=snapshot_tables,
                 )
@@ -225,5 +236,28 @@ def test_read_only_store_can_dry_run_but_not_apply(sqlite_resources) -> None:
             assert report.dry_run is True
             with pytest.raises(PermissionError):
                 await reader.apply_retention_policy(policy(dry_run=False))
+
+    asyncio.run(run())
+
+
+def test_report_storage_growth_logs_one_retention_hint(sqlite_resources, caplog) -> None:
+    from cayu.runtime import report_storage_growth
+    from cayu.sessions.memory import InMemorySessionStore
+
+    async def run() -> None:
+        assert await report_storage_growth(InMemorySessionStore()) is None
+        async with sqlite_resources as resources:
+            path = resources.path()
+            clock = RetentionClock()
+            store = resources.own(SQLiteSessionStore(path, ownership_clock=clock))
+            harness = RetentionHarness(store=store, clock=clock)
+            await create_retention_session(harness, "old")
+            assert await report_storage_growth(store) is None
+            await harness.age(days=31)
+            with caplog.at_level("WARNING", logger="cayu.runtime.storage_retention"):
+                warning = await report_storage_growth(store)
+            assert warning is not None
+            assert [record.getMessage() for record in caplog.records] == [warning]
+            assert len(await store.load_events("old")) == 6, "inspection changes nothing"
 
     asyncio.run(run())

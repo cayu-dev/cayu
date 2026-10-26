@@ -322,12 +322,15 @@ from cayu.storage.retention import RetentionProgress as RetentionProgress
 from cayu.storage.retention import RetentionProgressCallback as RetentionProgressCallback
 from cayu.storage.retention import RetentionProtection as RetentionProtection
 from cayu.storage.retention import RetentionReport as RetentionReport
+from cayu.storage.retention import SessionCompactionLevel as SessionCompactionLevel
 from cayu.storage.retention import SessionRetentionPolicy as SessionRetentionPolicy
 from cayu.storage.retention import SessionRetentionTarget as SessionRetentionTarget
+from cayu.storage.retention import StorageGrowthReport as StorageGrowthReport
 from cayu.storage.retention import StorageRetentionPolicy as StorageRetentionPolicy
 from cayu.storage.retention import StorageRetentionReport as StorageRetentionReport
 from cayu.storage.retention import StorageRetentionTarget as StorageRetentionTarget
 from cayu.storage.retention import WorkspaceRetentionPolicy as WorkspaceRetentionPolicy
+from cayu.storage.retention import storage_growth_warning as storage_growth_warning
 from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
 from cayu.storage.targets import configured_database_url as configured_database_url
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
@@ -500,8 +503,10 @@ __all__ = [
     "SQLiteSessionStore",
     "SQLiteTaskStore",
     "SQLiteToolAuthorizationGrantStore",
+    "SessionCompactionLevel",
     "SessionRetentionPolicy",
     "SessionRetentionTarget",
+    "StorageGrowthReport",
     "StorageRetentionPolicy",
     "StorageRetentionReport",
     "StorageRetentionTarget",
@@ -518,4 +523,5 @@ __all__ = [
     "prepare_knowledge_publication",
     "prepare_knowledge_relations",
     "require_empty_knowledge_revision_transition",
+    "storage_growth_warning",
 ]

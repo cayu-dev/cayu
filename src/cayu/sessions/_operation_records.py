@@ -17,6 +17,8 @@ from cayu.sessions import authority as session_authority_rules
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 
 RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX = "__cayu_runtime_publication_v1__:"
+#: Storage-retention attestations that keep compacted receipts verifiable.
+RETENTION_COMPACTION_ATTESTATION_OPERATION_KEY_PREFIX = "__cayu_retention_compaction_v1__:"
 
 
 ZERO_WORK_INTERRUPTION_OPERATION_KEY = "__cayu_zero_work_interruption_v1__"
@@ -116,6 +118,8 @@ def _reject_reserved_runtime_publication_key(
         raise ValueError(f"{field_name} cannot use the reserved zero-work interruption key.")
     if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved runtime publication namespace.")
+    if value.startswith(RETENTION_COMPACTION_ATTESTATION_OPERATION_KEY_PREFIX):
+        raise ValueError(f"{field_name} cannot use the reserved retention attestation namespace.")
     if value.startswith(INTERACTION_TRANSITION_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved interaction-transition namespace.")
     if value.startswith(INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX):

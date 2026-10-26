@@ -93,6 +93,7 @@ if TYPE_CHECKING:
         RetentionProtection,
         RetentionReport,
         SessionRetentionPolicy,
+        StorageGrowthReport,
     )
 
 try:
@@ -2125,6 +2126,15 @@ class PostgresSessionStore(
         from cayu.storage import _session_retention as retention
 
         return await retention.session_artifact_references(
+            retention.PostgresSessionRetentionBackend(self)
+        )
+
+    async def inspect_storage_growth(self) -> StorageGrowthReport:
+        """Read-only size, age and retention-history summary of this store."""
+
+        from cayu.storage import _session_retention as retention
+
+        return await retention.inspect_storage_growth(
             retention.PostgresSessionRetentionBackend(self)
         )
 

@@ -312,6 +312,10 @@ the exact private detail behind a retained source reference.
 
 - **Durability:** back the app with `PostgresSessionStore` / `PostgresTaskStore`
   (`pip install "cayu[postgres]"`) so many workers can claim safely.
+- **Retention:** the session store keeps every review until something removes it,
+  and retention is off by default. Run `run_storage_retention_worker` as a
+  `cayu worker` entrypoint, or `cayu storage prune --apply` on a schedule; see
+  [Storage retention](../storage-retention.md).
 - **Isolation:** `E2BRunner` / `E2BWorkspace` for the sandbox.
 - **Worker loop:** `run_task_worker(...)` instead of a hand-rolled claim loop.
 - **Scale:** run N identical workers; the task store's `FOR UPDATE SKIP LOCKED`

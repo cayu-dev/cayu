@@ -22,6 +22,10 @@ from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions._retention_attestation import (
+    ReceiptMaterial,
+    RetentionCompactionAttestation,
+)
 from cayu.sessions._runtime_publication import (
     RUNTIME_PUBLICATION_RECORD_TYPE,
     RUNTIME_PUBLICATION_SCHEMA_VERSION,
@@ -417,6 +421,23 @@ def _validate_runtime_publication_replay_receipt(
         )
 
 
+def _validate_runtime_publication_receipt_material(
+    receipt: RuntimePublicationReceipt,
+    material: ReceiptMaterial,
+    compaction_attestation: RetentionCompactionAttestation | None = None,
+) -> None:
+    """Validate loaded receipt material; see the function below."""
+
+    _validate_runtime_publication_durable_material(
+        receipt,
+        transcript_messages=material.transcript,
+        transcript_interaction_ids=material.transcript_interaction_ids,
+        appended_events=material.appended_events,
+        durable_referenced_events=material.referenced_events,
+        compaction_attestation=compaction_attestation,
+    )
+
+
 def _validate_runtime_publication_durable_material(
     receipt: RuntimePublicationReceipt,
     *,
@@ -424,14 +445,21 @@ def _validate_runtime_publication_durable_material(
     transcript_interaction_ids: Iterable[str | None],
     appended_events: Iterable[Event],
     durable_referenced_events: Iterable[Event],
+    compaction_attestation: RetentionCompactionAttestation | None = None,
 ) -> None:
     """Fail closed when a receipt no longer describes its committed durable material.
 
     Checkpoints intentionally are not re-read here: later legitimate checkpoint
     transforms replace that mutable snapshot. ``checkpoint_digest`` remains
     commit-time evidence, while transcript/event records are immutable material
-    that must continue to match on every load and replay.
+    that must continue to match on every load and replay. The one exception is
+    storage-retention compaction of large tool-output bodies: a digest that
+    differs from the receipt is accepted only when ``compaction_attestation``
+    is bound to this exact receipt and names the compacted digest.
     """
+
+    if compaction_attestation is not None and not compaction_attestation.binds(receipt):
+        compaction_attestation = None
 
     try:
         transcript = tuple(detach_message(message) for message in transcript_messages)
@@ -457,7 +485,10 @@ def _validate_runtime_publication_durable_material(
         [message.model_dump(mode="json") for message in transcript],
         max_nesting=MAX_DURABLE_JSON_ENVELOPE_NESTING,
     )
-    if transcript_digest != receipt.transcript_digest:
+    if transcript_digest != receipt.transcript_digest and (
+        compaction_attestation is None
+        or transcript_digest != compaction_attestation.compacted.transcript_digest
+    ):
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication transcript segment conflicts with its receipt."
         )
@@ -469,7 +500,10 @@ def _validate_runtime_publication_durable_material(
     events_digest = session_authority_rules._canonical_runtime_publication_digest(
         [event.model_dump(mode="json") for event in events]
     )
-    if events_digest != receipt.events_digest:
+    if events_digest != receipt.events_digest and (
+        compaction_attestation is None
+        or events_digest != compaction_attestation.compacted.events_digest
+    ):
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication event batch conflicts with its receipt."
         )
@@ -485,14 +519,23 @@ def _validate_runtime_publication_durable_material(
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication references a missing event."
         )
-    for reference, durable_event in zip(
-        receipt.referenced_events,
-        durable_references,
-        strict=True,
+    compacted_references = (
+        None
+        if compaction_attestation is None
+        else compaction_attestation.compacted.referenced_event_digests
+    )
+    for index, (reference, durable_event) in enumerate(
+        zip(
+            receipt.referenced_events,
+            durable_references,
+            strict=True,
+        )
     ):
-        if (
-            publication_contracts._runtime_publication_event_digest(durable_event)
-            != reference.event_digest
+        event_digest = publication_contracts._runtime_publication_event_digest(durable_event)
+        if event_digest != reference.event_digest and (
+            compacted_references is None
+            or index >= len(compacted_references)
+            or event_digest != compacted_references[index]
         ):
             raise SessionRuntimePublicationConflict(
                 "The durable runtime publication referenced event content conflicts with "

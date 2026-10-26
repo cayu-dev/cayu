@@ -207,6 +207,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+_STORAGE_GROWTH_REPORT_TIMEOUT_SECONDS = 30.0
 
 _PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS = 30.0
 _PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE = 1000
@@ -395,6 +396,7 @@ def create_server(
         side_effect_recovery_task: asyncio.Task[None] | None = None
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
         attention_repair_task: asyncio.Task[None] | None = None
+        storage_growth_task: asyncio.Task[None] | None = None
         try:
             # aclose() owns stopping it, within the shutdown deadline.
             await app.start_model_policy()
@@ -409,12 +411,14 @@ def create_server(
                 app, side_effect_health
             )
             attention_repair_task = _start_human_attention_repair(app)
+            storage_growth_task = _start_storage_growth_report(app)
             yield
         finally:
             try:
                 try:
                     # Stop the server's own loops before the app seals, so
                     # neither starts new work against a closing application.
+                    await _cancel_background_task(storage_growth_task)
                     await _cancel_background_task(incomplete_session_recovery_task)
                     await _cancel_background_task(attention_repair_task)
                     await _cancel_background_task(side_effect_recovery_task)
@@ -1412,6 +1416,28 @@ def _start_persisted_event_side_effect_recovery(
         _recover_persisted_event_side_effects_forever(app, status),
         name="cayu-persisted-event-side-effect-recovery",
     )
+
+
+def _start_storage_growth_report(app: CayuApp) -> asyncio.Task[None] | None:
+    """Log one retention hint when the session store has grown without retention."""
+
+    if not app.session_store.supports_storage_retention:
+        return None
+
+    async def report() -> None:
+        from cayu.runtime.storage_retention import report_storage_growth
+
+        try:
+            await asyncio.wait_for(
+                report_storage_growth(app.session_store, log=logger),
+                timeout=_STORAGE_GROWTH_REPORT_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Session store growth inspection failed.", exc_info=True)
+
+    return asyncio.create_task(report(), name="cayu-storage-growth-report")
 
 
 def _start_human_attention_repair(app: CayuApp) -> asyncio.Task[None] | None:

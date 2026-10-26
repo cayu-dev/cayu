@@ -338,6 +338,7 @@ from cayu.runtime.stop_policy import StopLimit as StopLimit
 from cayu.runtime.stop_policy import first_reached_limit as first_reached_limit
 from cayu.runtime.storage_retention import apply_storage_retention as apply_storage_retention
 from cayu.runtime.storage_retention import apply_workspace_retention as apply_workspace_retention
+from cayu.runtime.storage_retention import report_storage_growth as report_storage_growth
 from cayu.runtime.storage_retention import (
     run_storage_retention_worker as run_storage_retention_worker,
 )
@@ -564,6 +565,7 @@ __all__ = [
     "parse_public_authority_alias",
     "public_authority_alias_codec_from_environment",
     "public_authority_alias_is_reserved",
+    "report_storage_growth",
     "retry_decision",
     "run_storage_retention_worker",
     "runtime_evidence",

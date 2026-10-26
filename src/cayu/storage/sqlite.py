@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         RetentionProtection,
         RetentionReport,
         SessionRetentionPolicy,
+        StorageGrowthReport,
     )
 
 
@@ -2706,6 +2707,13 @@ class SQLiteSessionStore(
         return await retention.session_artifact_references(
             retention.SQLiteSessionRetentionBackend(self)
         )
+
+    async def inspect_storage_growth(self) -> StorageGrowthReport:
+        """Read-only size, age and retention-history summary of this store."""
+
+        from cayu.storage import _session_retention as retention
+
+        return await retention.inspect_storage_growth(retention.SQLiteSessionRetentionBackend(self))
 
     async def list_retention_audits(
         self,

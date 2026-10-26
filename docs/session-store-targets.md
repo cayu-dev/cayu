@@ -186,6 +186,20 @@ likewise skips it.
 
 ### Backup authority
 
+A SQLite migration copies the database to a retained backup before it
+changes anything: by default a uniquely named
+`<database>.cayu-backup-<random>.sqlite3` next to the database, at `--backup
+PATH`, or in `--backup-dir DIR`. In a backup directory the name also carries a
+digest of the database's resolved path
+(`<database>.<digest>.cayu-backup-<random>.sqlite3`), so databases with the
+same file name can share one directory. The backup is a full copy and stays
+after a successful migration. `migrate` reports its path and size (`backup.path`,
+`backup.bytes` in JSON). `--keep-backups N` deletes all but the newest `N`
+automatically named backups of the same database in the backup directory
+after a successful migration; files at an explicit `--backup` path, or of
+other databases, are never touched, and the removed files are listed in
+`backup.removed`. `--waive-backup` skips the copy.
+
 A Postgres migration of a database that already holds Cayu data records its
 backup authority in the migration receipt. Pass exactly one of:
 

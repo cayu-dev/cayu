@@ -273,7 +273,10 @@ the verifier, and the resolver as read-only.
 For durable stores, give `SQLiteSessionStore` a stable
 `public_authority_alias_codec` (for example from
 `public_authority_alias_codec_from_environment()`) so a restarted process can
-verify workspace aliases written before it. The worker never closes stores. Use
+verify workspace aliases written before it. A persistent store keeps every
+session until something removes it; storage retention is off by default, so
+schedule one with `run_storage_retention_worker` or `cayu storage prune --apply`
+([storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md)). The worker never closes stores. Use
 it as an async context manager; if closing reports `VerifiedTaskWorkerDraining`,
 alone or inside an exception group, keep the worker and its stores and retry
 `aclose()` until it returns. A cancellation is reported as a cancellation; when

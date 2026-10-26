@@ -377,8 +377,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.authorization_grants_sqlite",
         "SQLiteToolAuthorizationGrantStore",
     ),
+    "SessionCompactionLevel": ("cayu.storage.retention", "SessionCompactionLevel"),
     "SessionRetentionPolicy": ("cayu.storage.retention", "SessionRetentionPolicy"),
     "SessionRetentionTarget": ("cayu.storage.retention", "SessionRetentionTarget"),
+    "StorageGrowthReport": ("cayu.storage.retention", "StorageGrowthReport"),
     "StorageRetentionPolicy": ("cayu.storage.retention", "StorageRetentionPolicy"),
     "StorageRetentionReport": ("cayu.storage.retention", "StorageRetentionReport"),
     "StorageRetentionTarget": ("cayu.storage.retention", "StorageRetentionTarget"),
@@ -413,6 +415,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.knowledge_transition",
         "require_empty_knowledge_revision_transition",
     ),
+    "storage_growth_warning": ("cayu.storage.retention", "storage_growth_warning"),
 }
 
 PUBLIC_NAMES = [
@@ -588,8 +591,10 @@ PUBLIC_NAMES = [
     "SQLiteSessionStore",
     "SQLiteTaskStore",
     "SQLiteToolAuthorizationGrantStore",
+    "SessionCompactionLevel",
     "SessionRetentionPolicy",
     "SessionRetentionTarget",
+    "StorageGrowthReport",
     "StorageRetentionPolicy",
     "StorageRetentionReport",
     "StorageRetentionTarget",
@@ -606,4 +611,5 @@ PUBLIC_NAMES = [
     "prepare_knowledge_publication",
     "prepare_knowledge_relations",
     "require_empty_knowledge_revision_transition",
+    "storage_growth_warning",
 ]

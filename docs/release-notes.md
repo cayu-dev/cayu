@@ -278,6 +278,47 @@ not affect execution or approval.
   optional `image_identity` names what a broker-built image was built from.
 - `DockerCodingBackendOptions(cancel_timeout_s=...)` passes the cleanup
   deadline to every factory the Docker backend builds.
+- `cayu serve` now logs one warning at startup when a SQLite or PostgreSQL
+  session store holds at least 1 GiB or a terminal session older than 30 days
+  and no session retention apply is recorded in the last 7 days. Retention
+  stays off by default; the warning names `cayu storage prune` and
+  `run_storage_retention_worker`. The parts are public:
+  `SessionStore.inspect_storage_growth()` returns a read-only
+  `StorageGrowthReport`, `storage_growth_warning(report, ...)` applies the
+  thresholds, and `report_storage_growth(session_store)` in `cayu.runtime` logs
+  the hint from any entry point. The guides that set up a persistent session
+  store now point at retention and its worker.
+- Session compaction can now bound the transcript copy of large tool results.
+  `SessionRetentionPolicy(compaction_level=SessionCompactionLevel.TRANSCRIPT)`
+  (`cayu storage prune --compaction-level transcript`) also replaces each
+  transcript tool-result body of at least `compact_tool_output_min_bytes` with
+  the marker the event copy already gets (size and SHA-256), keeping the tool
+  name, call id, structured result and artifacts. The default level, `events`,
+  leaves the transcript as before. A continued session's model sees the
+  marker. `docs/storage-retention.md` now lists what `cayu_session_operations`
+  holds and why compaction keeps it.
+- Fixed: compacting a session's tool events made its tool-round
+  runtime-publication receipts fail verification ("referenced event content
+  conflicts with its receipt"), so recovery, the inbox and output readers could
+  no longer load them. Compaction now verifies each affected receipt first and
+  stores an attestation with the compacted digests in the same transaction;
+  receipt loads accept the compacted material only through that attestation.
+  It also no longer deletes delta events that a receipt binds. Sessions
+  compacted by 0.14.0 or earlier keep failing for those receipts.
+- `cayu storage migrate` on SQLite now reports the retained backup's path and
+  size (`backup` in JSON, a `backup:` line in text). `--backup-dir DIR` writes
+  the backup into another directory, and `--keep-backups N` deletes all but
+  the newest `N` automatically named backups of that database after a
+  successful migration. Backups in a backup directory carry a digest of the
+  database path, so same-named databases sharing one directory never delete
+  each other's backups, and backups at an explicit `--backup` path are never
+  deleted.
+- `cayu storage prune --apply --vacuum` runs SQLite `VACUUM` after the apply
+  and reports the file size before and after; it first checks that the
+  temporary directory and the database's directory have room for the
+  temporary copy and the rewrite. On PostgreSQL the flag is rejected: autovacuum reuses the freed
+  space, and `docs/storage-retention.md` describes `VACUUM (FULL)` and
+  `pg_repack` for returning it to the operating system.
 
 ## v0.14.0
 

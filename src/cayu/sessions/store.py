@@ -274,6 +274,7 @@ if TYPE_CHECKING:
         RetentionProtection,
         RetentionReport,
         SessionRetentionPolicy,
+        StorageGrowthReport,
     )
 
 
@@ -5288,6 +5289,14 @@ class SessionStore(ABC):
 
     async def retention_artifact_references(self) -> frozenset[str]:
         """Artifact ids that this store's transcripts, operations or evidence name."""
+        raise NotImplementedError("This SessionStore does not support storage retention.")
+
+    async def inspect_storage_growth(self) -> StorageGrowthReport:
+        """Read-only size, age and retention-history summary of this store.
+
+        Pass the report to :func:`cayu.storage.storage_growth_warning` to decide
+        whether an operator should be told about retention.
+        """
         raise NotImplementedError("This SessionStore does not support storage retention.")
 
     async def list_retention_audits(

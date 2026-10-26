@@ -75,6 +75,18 @@ class RetentionMode(StrEnum):
     DELETE = "delete"
 
 
+class SessionCompactionLevel(StrEnum):
+    """How much ``compact`` removes from a session."""
+
+    #: Remove model text and thinking deltas and replace large tool-output
+    #: bodies in stored tool events. The transcript is unchanged.
+    EVENTS = "events"
+    #: ``events``, and also replace large tool-result bodies in the
+    #: transcript's tool messages. The model sees the marker instead of the
+    #: original output if the session is continued.
+    TRANSCRIPT = "transcript"
+
+
 class RetentionDisposition(StrEnum):
     """The outcome of one item in a retention report."""
 
@@ -193,10 +205,13 @@ class SessionRetentionPolicy(RetentionPolicy):
     ``statuses`` defaults to the terminal statuses and may only narrow them.
     ``compact`` removes model text and thinking delta events and replaces
     tool-output bodies larger than ``compact_tool_output_min_bytes`` in stored
-    tool events with a short marker naming their size and digest. It keeps the
-    session record, transcript, checkpoint, terminal events, usage-bearing
-    events and every other audit-relevant event. ``delete`` removes the whole
-    session through the store's own deletion path.
+    tool events with a short marker naming their size and digest. With
+    ``compaction_level=TRANSCRIPT`` it also replaces such tool-result bodies in
+    the transcript. It keeps the session record, checkpoint, terminal events,
+    usage-bearing events and every other audit-relevant event, and records an
+    attestation so runtime-publication receipts over the compacted material
+    still verify. ``delete`` removes the whole session through the store's own
+    deletion path.
     """
 
     statuses: frozenset[SessionStatus] = RETENTION_TERMINAL_SESSION_STATUSES
@@ -204,6 +219,16 @@ class SessionRetentionPolicy(RetentionPolicy):
         default=DEFAULT_COMPACT_TOOL_OUTPUT_MIN_BYTES,
         ge=MIN_COMPACT_TOOL_OUTPUT_BYTES,
     )
+    compaction_level: SessionCompactionLevel = SessionCompactionLevel.EVENTS
+
+    @model_validator(mode="after")
+    def validate_compaction_level(self) -> SessionRetentionPolicy:
+        if (
+            self.mode is not RetentionMode.COMPACT
+            and self.compaction_level is not SessionCompactionLevel.EVENTS
+        ):
+            raise ValueError("compaction_level applies only to mode='compact'.")
+        return self
 
     @field_validator("statuses", mode="before")
     @classmethod
@@ -394,6 +419,7 @@ class StorageRetentionPolicy(BaseModel):
         *,
         older_than: timedelta,
         session_mode: RetentionMode = RetentionMode.COMPACT,
+        session_compaction_level: SessionCompactionLevel = SessionCompactionLevel.EVENTS,
         dry_run: bool = True,
         max_items: int = DEFAULT_RETENTION_ITEMS_PER_RUN,
         max_bytes: int | None = None,
@@ -412,7 +438,9 @@ class StorageRetentionPolicy(BaseModel):
         }
         return cls(
             sessions=(
-                SessionRetentionPolicy(mode=session_mode, **common)
+                SessionRetentionPolicy(
+                    mode=session_mode, compaction_level=session_compaction_level, **common
+                )
                 if StorageRetentionTarget.SESSIONS in selected
                 else None
             ),
@@ -720,3 +748,89 @@ def _protected_by_reason(items: tuple[RetentionItem, ...]) -> dict[str, int]:
         for protection in item.protections:
             counts[protection.value] = counts.get(protection.value, 0) + 1
     return dict(sorted(counts.items()))
+
+
+#: A session store at least this large, with no recent retention run, gets a
+#: growth warning.
+DEFAULT_STORAGE_GROWTH_WARNING_BYTES = 1024**3
+#: Terminal sessions older than this, with no recent retention run, get a
+#: growth warning.
+DEFAULT_STORAGE_GROWTH_WARNING_AGE = timedelta(days=30)
+#: A retention apply recorded within this window counts as configured retention.
+DEFAULT_STORAGE_RETENTION_RECENT_WINDOW = timedelta(days=7)
+
+
+class StorageGrowthReport(BaseModel):
+    """A read-only summary of how much a session store holds.
+
+    ``stored_bytes`` is the database's allocated size: the SQLite page count
+    times the page size (``reclaimable_bytes`` of it are free pages that only
+    ``VACUUM`` returns to the file system), or the total size of the Postgres
+    ``cayu_*`` tables with their indexes and TOAST data.
+    ``last_retention_run_at`` is the start of the newest durable session
+    retention apply; dry runs leave no record.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    backend: str
+    inspected_at: datetime
+    stored_bytes: StrictInt = Field(ge=0)
+    reclaimable_bytes: StrictInt | None = Field(default=None, ge=0)
+    session_count: StrictInt = Field(ge=0)
+    terminal_session_count: StrictInt = Field(ge=0)
+    oldest_terminal_session_updated_at: datetime | None = None
+    last_retention_run_at: datetime | None = None
+
+
+def _format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{value} bytes" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def storage_growth_warning(
+    report: StorageGrowthReport,
+    *,
+    max_bytes: int = DEFAULT_STORAGE_GROWTH_WARNING_BYTES,
+    max_age: timedelta = DEFAULT_STORAGE_GROWTH_WARNING_AGE,
+    retention_window: timedelta = DEFAULT_STORAGE_RETENTION_RECENT_WINDOW,
+) -> str | None:
+    """Return an operator hint when a store grows with no retention running.
+
+    The hint is returned when the store is at least ``max_bytes`` large or
+    holds a terminal session last updated more than ``max_age`` ago, and no
+    session retention apply was recorded within ``retention_window``.
+    Retention stays opt-in; this only says that it exists.
+    """
+
+    if report.last_retention_run_at is not None and (
+        report.inspected_at - report.last_retention_run_at <= retention_window
+    ):
+        return None
+    reasons: list[str] = []
+    if report.stored_bytes >= max_bytes:
+        reasons.append(f"holds {_format_bytes(report.stored_bytes)}")
+    oldest = report.oldest_terminal_session_updated_at
+    if oldest is not None and report.inspected_at - oldest > max_age:
+        days = (report.inspected_at - oldest).days
+        reasons.append(f"keeps terminal sessions last updated {days} days ago")
+    if not reasons:
+        return None
+    last_run = (
+        "no session retention run is recorded"
+        if report.last_retention_run_at is None
+        else "the last session retention run started "
+        f"{(report.inspected_at - report.last_retention_run_at).days} days ago"
+    )
+    return (
+        f"The {report.backend} session store {' and '.join(reasons)} "
+        f"({report.terminal_session_count} terminal of {report.session_count} sessions), "
+        f"and {last_run}. Storage retention is off by default: preview it with "
+        "`cayu storage prune --dry-run --older-than 30d`, then apply it on a schedule "
+        "with `run_storage_retention_worker` or `cayu storage prune --apply`. "
+        "See docs/storage-retention.md."
+    )

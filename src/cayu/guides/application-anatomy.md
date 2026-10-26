@@ -251,6 +251,11 @@ One PostgreSQL-backed application process opens at most `CAYU_DATABASE_POOL_MAX`
 pooled connections plus the listener, and the Evals store's pool when a Cayu
 command serves the project. Cayu CLI commands resolve `CAYU_DATABASE_URL` before
 `[tool.cayu.session_store]`, so they inspect the same database the app uses.
+The database keeps every session until something removes it: storage retention
+is off by default, so schedule a policy with `run_storage_retention_worker` (a
+`cayu worker` entrypoint) or `cayu storage prune --apply`. `cayu serve` logs a
+warning at startup when the session store has grown past 1 GiB or 30 days with
+no retention run in the last week. See [storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md).
 
 Keep application-owned durable records in the configured database. Application
 tables may share it with their own table prefix; Cayu reserves `cayu_` for its

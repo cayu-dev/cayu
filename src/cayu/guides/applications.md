@@ -291,6 +291,11 @@ authorization, claims, and settlement) in the same database with
 - `CAYU_DATABASE_POOL_MAX` (default 5) bounds the shared connection pool. Behind a
   transaction-pooling proxy such as PgBouncer, `CAYU_DATABASE_DIRECT_URL` gives the
   task-admission `LISTEN` connection a direct server address.
+- The configured database keeps every session until something removes it, and
+  storage retention is off by default. Preview it with
+  `cayu storage prune --dry-run --older-than 30d` and apply a policy on a schedule
+  with `run_storage_retention_worker` or `cayu storage prune --apply`; see
+  [storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md).
 - Deployments of applications with automatic memory must set
   `CAYU_MEMORY_EVIDENCE_KEY`; the local `data/memory-evidence.key` is git-ignored
   and never reaches a deployment.

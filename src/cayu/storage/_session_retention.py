@@ -25,7 +25,27 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from cayu.messages import Message
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._operation_records import (
+    RETENTION_COMPACTION_ATTESTATION_OPERATION_KEY_PREFIX,
+    RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
+)
+from cayu.sessions._retention_attestation import (
+    ReceiptMaterial,
+    RetentionCompactionAttestation,
+    parse_retention_attestation,
+    receipt_material_digests,
+    retention_attestation_storage_key,
+    runtime_publication_material_digests,
+)
+from cayu.sessions._runtime_publication import RuntimePublicationReceipt
+from cayu.sessions._runtime_publication_rules import (
+    _reconstruct_runtime_publication_receipt,
+    _validate_runtime_publication_receipt_material,
+)
 from cayu.storage import _retention_sql as audit
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage._retention_sql import (
     PostgresRetentionSql,
     RetentionSql,
@@ -35,6 +55,7 @@ from cayu.storage._retention_sql import (
 )
 from cayu.storage.retention import (
     MAX_RETENTION_ITEMS_PER_RUN,
+    RETENTION_TERMINAL_SESSION_STATUSES,
     RetentionAuditEntry,
     RetentionAuditRecord,
     RetentionDisposition,
@@ -45,7 +66,9 @@ from cayu.storage.retention import (
     RetentionProgressCallback,
     RetentionProtection,
     RetentionReport,
+    SessionCompactionLevel,
     SessionRetentionPolicy,
+    StorageGrowthReport,
     bounded_retention_detail,
     copy_protected_ids,
     retention_audit_summary,
@@ -141,6 +164,19 @@ class SessionRetentionBackend(ABC):
     @abstractmethod
     async def delete(self, sql: RetentionSql, session_id: str) -> bool: ...
 
+    @abstractmethod
+    async def stored_bytes(self, sql: RetentionSql) -> tuple[int, int | None]:
+        """Allocated database bytes and, when the backend knows it, free bytes."""
+
+    @abstractmethod
+    async def load_receipt_material(
+        self, sql: RetentionSql, receipt: RuntimePublicationReceipt
+    ) -> ReceiptMaterial:
+        """The durable transcript segment and events a receipt binds."""
+
+    backend_name: str = "sqlite"
+    transcript_role: str = "role"
+
     # Column names differ between the backends' schemas.
     event_payload: str = "payload_json"
     transcript_message: str = "message_json"
@@ -218,8 +254,26 @@ class SQLiteSessionRetentionBackend(SessionRetentionBackend):
     async def delete(self, sql: RetentionSql, session_id: str) -> bool:
         return self.store._delete_session_in_transaction_unlocked(session_id)
 
+    async def stored_bytes(self, sql: RetentionSql) -> tuple[int, int | None]:
+        page_size = await sql.one("PRAGMA page_size")
+        page_count = await sql.one("PRAGMA page_count")
+        free_pages = await sql.one("PRAGMA freelist_count")
+        assert page_size and page_count and free_pages
+        size = int(page_size[0])
+        return int(page_count[0]) * size, int(free_pages[0]) * size
+
+    async def load_receipt_material(
+        self, sql: RetentionSql, receipt: RuntimePublicationReceipt
+    ) -> ReceiptMaterial:
+        from cayu.storage import _sqlite_publication as publication
+
+        assert isinstance(sql, SQLiteRetentionSql)
+        return publication.load_material(sql.connection, receipt)
+
 
 class PostgresSessionRetentionBackend(SessionRetentionBackend):
+    backend_name = "postgres"
+    transcript_role = "message ->> 'role'"
     event_payload = "payload"
     transcript_message = "message"
     checkpoint_state = "state"
@@ -293,6 +347,25 @@ class PostgresSessionRetentionBackend(SessionRetentionBackend):
         assert isinstance(sql, PostgresRetentionSql)
         return await self.store._delete_session_in_transaction(sql.cursor, session_id)
 
+    async def stored_bytes(self, sql: RetentionSql) -> tuple[int, int | None]:
+        row = await sql.one(
+            "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0) FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') "
+            "AND substr(c.relname, 1, 5) = 'cayu_'"
+        )
+        assert row is not None
+        return int(row[0]), None
+
+    async def load_receipt_material(
+        self, sql: RetentionSql, receipt: RuntimePublicationReceipt
+    ) -> ReceiptMaterial:
+        from cayu.storage import _postgres_publication as publication
+
+        assert isinstance(sql, PostgresRetentionSql)
+        # The apply transaction already holds the lineage's row locks.
+        return await publication.load_material(sql.cursor, receipt, lock_events=False)
+
 
 # -- records ----------------------------------------------------------------------
 
@@ -331,24 +404,67 @@ class _Plan:
     deferred: int = 0
 
 
+@dataclass(frozen=True)
+class _BoundReceipt:
+    """A runtime-publication receipt and the material it binds by digest."""
+
+    receipt: RuntimePublicationReceipt
+    attestation: RetentionCompactionAttestation | None
+    event_ids: frozenset[str]
+
+    def covers(self, session_order: int) -> bool:
+        return (
+            self.receipt.transcript_start_cursor
+            < session_order
+            <= self.receipt.transcript_end_cursor
+        )
+
+
+@dataclass(frozen=True)
+class _EventRewrite:
+    sequence: int
+    event_id: str
+    payload: Any
+    #: The rewritten full event document (Postgres), or ``None``.
+    event: Any
+    saved: int
+
+
+@dataclass(frozen=True)
+class _TranscriptRewrite:
+    sequence: int
+    session_order: int
+    message: dict[str, Any]
+    saved: int
+
+
 @dataclass
 class _CompactionPlan:
-    delete_sequences: tuple[int, ...]
-    delete_bytes: int
-    #: (sequence, new payload, new event document or None, bytes saved)
-    rewrites: tuple[tuple[int, Any, Any, int], ...]
-    rewrite_bytes: int
+    transcript_level: bool = False
+    delete_sequences: tuple[int, ...] = ()
+    delete_bytes: int = 0
+    rewrites: tuple[_EventRewrite, ...] = ()
+    transcript_rewrites: tuple[_TranscriptRewrite, ...] = ()
+    #: Receipts whose bound material the rewrites change; each gets an attestation.
+    attest: tuple[_BoundReceipt, ...] = ()
 
     @property
     def counts(self) -> dict[str, int]:
-        return {
+        counts = {
             "delta_events_removed": len(self.delete_sequences),
             "tool_outputs_compacted": len(self.rewrites),
         }
+        if self.transcript_level:
+            counts["transcript_tool_results_compacted"] = len(self.transcript_rewrites)
+        return counts
 
     @property
     def bytes(self) -> int:
-        return self.delete_bytes + self.rewrite_bytes
+        return (
+            self.delete_bytes
+            + sum(rewrite.saved for rewrite in self.rewrites)
+            + sum(rewrite.saved for rewrite in self.transcript_rewrites)
+        )
 
 
 class _Blocked(Exception):
@@ -488,6 +604,42 @@ async def load_retention_audit(
 ) -> RetentionAuditRecord | None:
     async with backend.snapshot() as sql:
         return await audit.load_audit(sql, audit_id)
+
+
+async def inspect_storage_growth(backend: SessionRetentionBackend) -> StorageGrowthReport:
+    """Read-only size, age and retention-history summary of the session store."""
+
+    terminal = tuple(sorted(status.value for status in RETENTION_TERMINAL_SESSION_STATUSES))
+    async with backend.snapshot() as sql:
+        inspected_at = await backend.now(sql)
+        stored, reclaimable = await backend.stored_bytes(sql)
+        totals = await sql.one("SELECT COUNT(*) FROM cayu_sessions")
+        terminal_row = await sql.one(
+            "SELECT COUNT(*), MIN(updated_at) FROM cayu_sessions "
+            f"WHERE status IN ({marks(terminal)})",
+            terminal,
+        )
+        last_run = None
+        if set(audit.AUDIT_TABLES) <= await sql.existing_tables(audit.AUDIT_TABLES):
+            row = await sql.one(
+                "SELECT MAX(started_at) FROM cayu_storage_retention_runs WHERE store_kind = ?",
+                (STORE_KIND,),
+            )
+            if row is not None and row[0] is not None:
+                last_run = sql.read_timestamp(row[0])
+    assert totals is not None and terminal_row is not None
+    return StorageGrowthReport(
+        backend=backend.backend_name,
+        inspected_at=inspected_at,
+        stored_bytes=stored,
+        reclaimable_bytes=reclaimable,
+        session_count=int(totals[0]),
+        terminal_session_count=int(terminal_row[0]),
+        oldest_terminal_session_updated_at=(
+            None if terminal_row[1] is None else sql.read_timestamp(terminal_row[1])
+        ),
+        last_retention_run_at=last_run,
+    )
 
 
 async def inspect_session_protections(
@@ -827,10 +979,15 @@ async def _apply_group(
             if not deleted:
                 raise _Blocked(_changed(group, session_id, "session no longer exists"))
         else:
-            compaction = await _compaction_plan(
-                backend, sql, session_id, policy.compact_tool_output_min_bytes
-            )
-            if not await _execute_compaction(backend, sql, session_id, compaction):
+            compaction = await _compaction_plan(backend, sql, session_id, policy)
+            if not await _execute_compaction(
+                backend,
+                sql,
+                session_id,
+                compaction,
+                audit_id=audit_id,
+                recorded_at=recorded_at,
+            ):
                 raise _Blocked(_changed(group, session_id, "events changed during compaction"))
             counts, size = compaction.counts, compaction.bytes
         await audit.record_audit_entry(
@@ -1179,7 +1336,7 @@ async def _item_size(
 ) -> tuple[dict[str, int], int]:
     if policy.mode is RetentionMode.DELETE:
         return await _deletion_size(backend, sql, session_id)
-    plan = await _compaction_plan(backend, sql, session_id, policy.compact_tool_output_min_bytes)
+    plan = await _compaction_plan(backend, sql, session_id, policy)
     return plan.counts, plan.bytes
 
 
@@ -1263,36 +1420,151 @@ def _compact_document(document: Any) -> tuple[Any, int] | None:
     return compacted, saved
 
 
-async def _compaction_plan(
-    backend: SessionRetentionBackend, sql: RetentionSql, session_id: str, min_bytes: int
-) -> _CompactionPlan:
-    deltas = await sql.all(
-        f"SELECT sequence, {sql.size(backend.event_payload)} FROM cayu_events "
-        f"WHERE {_COMPACTABLE_EVENT_FILTER} AND pending_action_lookup_key IS NULL "
-        "AND event_type IN (?, ?) ORDER BY sequence",
-        (session_id, *_DELTA_EVENT_TYPES),
+def _compact_message(document: Any, min_bytes: int) -> tuple[dict[str, Any], int] | None:
+    """Replace large tool-result bodies in a transcript message document."""
+
+    if type(document) is not dict or type(document.get("content")) is not list:
+        return None
+    parts: list[Any] = []
+    changed = False
+    for part in document["content"]:
+        content = part.get("content") if type(part) is dict else None
+        if (
+            type(part) is dict
+            and part.get("type") == "tool_result"
+            and type(content) is str
+            and len(content.encode("utf-8")) >= min_bytes
+        ):
+            parts.append({**part, "content": compacted_tool_output_marker(content)})
+            changed = True
+        else:
+            parts.append(part)
+    if not changed:
+        return None
+    compacted = {**document, "content": parts}
+    Message.model_validate(compacted)  # It must stay a valid transcript message.
+    saved = len(sqlite_records.json_dumps(document).encode("utf-8")) - len(
+        sqlite_records.json_dumps(compacted).encode("utf-8")
     )
+    return compacted, saved
+
+
+async def _session_receipts(
+    backend: SessionRetentionBackend, sql: RetentionSql, session_id: str
+) -> list[_BoundReceipt] | None:
+    """The session's runtime-publication receipts, or ``None`` if one is unreadable.
+
+    A session with an unreadable receipt is not compacted: its bound material
+    cannot be identified, so no rewrite can be proven not to touch it.
+    """
+
+    receipt_prefix = RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX
+    attestation_prefix = RETENTION_COMPACTION_ATTESTATION_OPERATION_KEY_PREFIX
+    rows = await sql.all(
+        f"SELECT idempotency_key, {backend.operation_record} FROM cayu_session_operations "
+        "WHERE session_id = ? AND (substr(idempotency_key, 1, ?) = ? "
+        "OR substr(idempotency_key, 1, ?) = ?)",
+        (
+            session_id,
+            len(receipt_prefix),
+            receipt_prefix,
+            len(attestation_prefix),
+            attestation_prefix,
+        ),
+    )
+    records: dict[str, Any] = {}
+    attestations: dict[str, Any] = {}
+    for key, value in rows:
+        try:
+            document = sql.read_json(value)
+        except ValueError:
+            if key.startswith(receipt_prefix):
+                return None
+            continue
+        if key.startswith(attestation_prefix):
+            attestations[key.removeprefix(attestation_prefix)] = document
+        else:
+            records[key] = document
+    receipts: list[_BoundReceipt] = []
+    for key, document in sorted(records.items()):
+        try:
+            publication_id = document["publication_id"]
+            if type(publication_id) is not str:
+                return None
+            receipt = _reconstruct_runtime_publication_receipt(
+                document, storage_key=key, session_id=session_id, publication_id=publication_id
+            )
+        except (KeyError, TypeError, ValueError, SessionRuntimePublicationConflict):
+            return None
+        stored = attestations.get(key.removeprefix(receipt_prefix))
+        receipts.append(
+            _BoundReceipt(
+                receipt=receipt,
+                attestation=(
+                    None if stored is None else parse_retention_attestation(stored, receipt)
+                ),
+                event_ids=frozenset(
+                    (
+                        *receipt.appended_event_ids,
+                        *(reference.event_id for reference in receipt.referenced_events),
+                    )
+                ),
+            )
+        )
+    return receipts
+
+
+async def _receipt_verifies(
+    backend: SessionRetentionBackend, sql: RetentionSql, bound: _BoundReceipt
+) -> bool:
+    try:
+        material = await backend.load_receipt_material(sql, bound.receipt)
+        _validate_runtime_publication_receipt_material(bound.receipt, material, bound.attestation)
+    except (SessionRuntimePublicationConflict, TypeError, ValueError):
+        return False
+    return True
+
+
+async def _compaction_plan(
+    backend: SessionRetentionBackend,
+    sql: RetentionSql,
+    session_id: str,
+    policy: SessionRetentionPolicy,
+) -> _CompactionPlan:
+    min_bytes = policy.compact_tool_output_min_bytes
+    transcript_level = policy.compaction_level is SessionCompactionLevel.TRANSCRIPT
+    receipts = await _session_receipts(backend, sql, session_id)
+    if receipts is None:
+        return _CompactionPlan(transcript_level=transcript_level)
+    # Events a receipt appends or references are never deleted; their bodies
+    # are only rewritten under an attestation.
+    bound_events = frozenset(event_id for bound in receipts for event_id in bound.event_ids)
+    delta_size = sql.size(backend.event_payload)
     if sql.postgres:
-        delta_extra = await sql.all(
-            f"SELECT COALESCE(SUM({sql.size('event')}), 0) FROM cayu_events "
+        delta_size = f"{delta_size} + {sql.size('event')}"
+    deltas = [
+        (int(sequence), int(size))
+        for sequence, event_id, size in await sql.all(
+            f"SELECT sequence, event_id, {delta_size} FROM cayu_events "
             f"WHERE {_COMPACTABLE_EVENT_FILTER} AND pending_action_lookup_key IS NULL "
-            "AND event_type IN (?, ?)",
+            "AND event_type IN (?, ?) ORDER BY sequence",
             (session_id, *_DELTA_EVENT_TYPES),
         )
-        delete_bytes = sum(int(row[1]) for row in deltas) + int(delta_extra[0][0])
+        if event_id not in bound_events
+    ]
+    if sql.postgres:
         tool_rows = await sql.all(
-            "SELECT sequence, payload, event FROM cayu_events "
+            "SELECT sequence, event_id, payload, event FROM cayu_events "
             f"WHERE {_COMPACTABLE_EVENT_FILTER} AND event_type IN (?, ?) "
             "AND jsonb_typeof(payload->'result'->'content') = 'string' "
             "AND octet_length(payload->'result'->>'content') >= ? ORDER BY sequence",
             (session_id, *_TOOL_OUTPUT_EVENT_TYPES, min_bytes),
         )
     else:
-        delete_bytes = sum(int(row[1]) for row in deltas)
         tool_rows = [
-            (row[0], json.loads(row[1]), None)
+            (row[0], row[1], json.loads(row[2]), None)
             for row in await sql.all(
-                "SELECT sequence, payload_json FROM cayu_events "
+                "SELECT sequence, event_id, payload_json FROM cayu_events "
                 f"WHERE {_COMPACTABLE_EVENT_FILTER} AND event_type IN (?, ?) "
                 "AND json_type(payload_json, '$.result.content') = 'text' "
                 "AND length(CAST(json_extract(payload_json, '$.result.content') AS BLOB)) >= ? "
@@ -1300,8 +1572,8 @@ async def _compaction_plan(
                 (session_id, *_TOOL_OUTPUT_EVENT_TYPES, min_bytes),
             )
         ]
-    rewrites: list[tuple[int, Any, Any, int]] = []
-    for sequence, payload, event in tool_rows:
+    rewrites: list[_EventRewrite] = []
+    for sequence, event_id, payload, event in tool_rows:
         compacted = _compact_document(sql.read_json(payload))
         if compacted is None:
             continue
@@ -1316,12 +1588,68 @@ async def _compaction_plan(
                     saved += compacted_event[1]
         if saved <= 0:
             continue
-        rewrites.append((int(sequence), new_payload, new_event, saved))
+        rewrites.append(_EventRewrite(int(sequence), event_id, new_payload, new_event, saved))
+    transcript_rewrites: list[_TranscriptRewrite] = []
+    if transcript_level:
+        message_size = sql.size(backend.transcript_message)
+        for sequence, session_order, message in await sql.all(
+            f"SELECT sequence, session_order, {backend.transcript_message} "
+            f"FROM cayu_transcript_messages WHERE session_id = ? "
+            f"AND {backend.transcript_role} = ? AND {message_size} >= ? ORDER BY sequence",
+            (session_id, "tool", min_bytes),
+        ):
+            # Only runtime-published tool results are rewritten. Messages no
+            # receipt covers, such as caller-supplied initial input that a
+            # session-start input contract digests, are left alone.
+            if session_order is None or not any(
+                bound.covers(int(session_order)) for bound in receipts
+            ):
+                continue
+            compacted_message = _compact_message(sql.read_json(message), min_bytes)
+            if compacted_message is None or compacted_message[1] <= 0:
+                continue
+            transcript_rewrites.append(
+                _TranscriptRewrite(
+                    int(sequence), int(session_order), compacted_message[0], compacted_message[1]
+                )
+            )
+    # Rewrite only material whose receipt verifies now; a receipt that already
+    # fails keeps its material untouched so the failure stays diagnosable.
+    verified: dict[str, bool] = {}
+    while True:
+        orders = {rewrite.session_order for rewrite in transcript_rewrites}
+        rewritten_events = {rewrite.event_id for rewrite in rewrites}
+        affected = [
+            bound
+            for bound in receipts
+            if bound.event_ids & rewritten_events or any(bound.covers(order) for order in orders)
+        ]
+        failing = []
+        for bound in affected:
+            publication_id = bound.receipt.publication_id
+            if publication_id not in verified:
+                verified[publication_id] = await _receipt_verifies(backend, sql, bound)
+            if not verified[publication_id]:
+                failing.append(bound)
+        if not failing:
+            break
+        transcript_rewrites = [
+            rewrite
+            for rewrite in transcript_rewrites
+            if not any(bound.covers(rewrite.session_order) for bound in failing)
+        ]
+        rewrites = [
+            rewrite
+            for rewrite in rewrites
+            if not any(rewrite.event_id in bound.event_ids for bound in failing)
+        ]
     return _CompactionPlan(
-        delete_sequences=tuple(int(row[0]) for row in deltas),
-        delete_bytes=delete_bytes,
+        transcript_level=transcript_level,
+        delete_sequences=tuple(sequence for sequence, _ in deltas),
+        delete_bytes=sum(size for _, size in deltas),
         rewrites=tuple(rewrites),
-        rewrite_bytes=sum(rewrite[3] for rewrite in rewrites),
+        transcript_rewrites=tuple(transcript_rewrites),
+        attest=tuple(affected),
     )
 
 
@@ -1330,8 +1658,11 @@ async def _execute_compaction(
     sql: RetentionSql,
     session_id: str,
     plan: _CompactionPlan,
+    *,
+    audit_id: str,
+    recorded_at: datetime,
 ) -> bool:
-    """Apply a compaction plan; ``False`` when the events changed underneath it."""
+    """Apply a compaction plan; ``False`` when the session changed underneath it."""
 
     for chunk in chunks(plan.delete_sequences):
         deleted = await sql.run(
@@ -1340,26 +1671,76 @@ async def _execute_compaction(
         )
         if deleted != len(chunk):
             return False
-    for sequence, payload, event, _saved in plan.rewrites:
+    for rewrite in plan.rewrites:
         if sql.postgres:
             updated = await sql.run(
                 "UPDATE cayu_events SET payload = ?, event = COALESCE(?, event) "
                 "WHERE session_id = ? AND sequence = ?",
                 (
-                    sql.json(payload),
-                    None if event is None else sql.json(event),
+                    sql.json(rewrite.payload),
+                    None if rewrite.event is None else sql.json(rewrite.event),
                     session_id,
-                    sequence,
+                    rewrite.sequence,
                 ),
             )
         else:
             updated = await sql.run(
                 f"UPDATE cayu_events SET {backend.event_payload} = ? "
                 "WHERE session_id = ? AND sequence = ?",
-                (sql.json(payload), session_id, sequence),
+                (sql.json(rewrite.payload), session_id, rewrite.sequence),
             )
         if updated != 1:
             return False
+    for message in plan.transcript_rewrites:
+        if sql.postgres:
+            # A trigger keeps message_bytes in step; the search document
+            # indexes narrative text only, which tool results never carry.
+            updated = await sql.run(
+                "UPDATE cayu_transcript_messages SET message = ? "
+                "WHERE session_id = ? AND sequence = ?",
+                (sql.json(message.message), session_id, message.sequence),
+            )
+        else:
+            encoded = sqlite_records.json_dumps(message.message)
+            updated = await sql.run(
+                "UPDATE cayu_transcript_messages SET message_json = ?, message_bytes = ? "
+                "WHERE session_id = ? AND sequence = ?",
+                (encoded, len(encoded.encode("utf-8")), session_id, message.sequence),
+            )
+        if updated != 1:
+            return False
+    for bound in plan.attest:
+        receipt = bound.receipt
+        try:
+            material = await backend.load_receipt_material(sql, receipt)
+            attestation = RetentionCompactionAttestation(
+                session_id=session_id,
+                publication_id=receipt.publication_id,
+                receipt=receipt_material_digests(receipt),
+                compacted=runtime_publication_material_digests(
+                    transcript_messages=material.transcript,
+                    appended_events=material.appended_events,
+                    durable_referenced_events=material.referenced_events,
+                ),
+                audit_id=audit_id,
+                recorded_at=recorded_at,
+            )
+            # The receipt must verify against the compacted material.
+            _validate_runtime_publication_receipt_material(receipt, material, attestation)
+        except (SessionRuntimePublicationConflict, TypeError, ValueError):
+            return False
+        record = backend.operation_record
+        await sql.run(
+            f"INSERT INTO cayu_session_operations (session_id, idempotency_key, {record}, "
+            "updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (session_id, idempotency_key) "
+            f"DO UPDATE SET {record} = excluded.{record}, updated_at = excluded.updated_at",
+            (
+                session_id,
+                retention_attestation_storage_key(receipt.publication_id),
+                sql.json(attestation.model_dump(mode="json")),
+                sql.timestamp(recorded_at),
+            ),
+        )
     return True
 
 
@@ -1372,6 +1753,7 @@ __all__ = [
     "compacted_tool_output_marker",
     "complete_retention_audit",
     "inspect_session_protections",
+    "inspect_storage_growth",
     "list_retention_audits",
     "load_retention_audit",
     "record_retention_entry",

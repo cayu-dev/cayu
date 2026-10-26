@@ -43,6 +43,12 @@ from cayu.sessions._operation_records import (
     _apply_runtime_publication_operation_record_mutations,
     _validate_session_operation_record_keys,
 )
+from cayu.sessions._retention_attestation import (
+    ReceiptMaterial,
+    RetentionCompactionAttestation,
+    parse_retention_attestation,
+    retention_attestation_storage_key,
+)
 from cayu.sessions._runtime_publication import (
     RuntimePublicationReceipt,
     RuntimePublicationResult,
@@ -58,7 +64,7 @@ from cayu.sessions._runtime_publication_rules import (
     _PreparedRuntimePublication,
     _reconstruct_runtime_publication_receipt,
     _runtime_publication_receipt_record,
-    _validate_runtime_publication_durable_material,
+    _validate_runtime_publication_receipt_material,
     _validate_runtime_publication_replay_receipt,
 )
 from cayu.sessions._tool_round_publication_rules import (
@@ -129,49 +135,76 @@ async def load_receipt_record(
     return await run_read(query)
 
 
+def load_material(
+    connection: sqlite3.Connection, receipt: RuntimePublicationReceipt
+) -> ReceiptMaterial:
+    transcript_rows = connection.execute(
+        "SELECT interaction_id, message_json FROM cayu_transcript_messages "
+        "WHERE session_id = ? AND session_order > ? AND session_order <= ? "
+        "ORDER BY session_order ASC",
+        (
+            receipt.session_id,
+            receipt.transcript_start_cursor,
+            receipt.transcript_end_cursor,
+        ),
+    ).fetchall()
+    transcript = [Message(**json.loads(row["message_json"])) for row in transcript_rows]
+    transcript_interaction_ids = [row["interaction_id"] for row in transcript_rows]
+
+    referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
+    requested_event_ids = tuple(dict.fromkeys((*receipt.appended_event_ids, *referenced_event_ids)))
+    events_by_id: dict[str, Event] = {}
+    if requested_event_ids:
+        placeholders = ", ".join("?" for _ in requested_event_ids)
+        rows = connection.execute(
+            f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
+            f"WHERE session_id = ? AND event_id IN ({placeholders})",
+            (receipt.session_id, *requested_event_ids),
+        ).fetchall()
+        events_by_id = {row["event_id"]: sqlite_records.event_from_row(row) for row in rows}
+    return ReceiptMaterial(
+        transcript=transcript,
+        transcript_interaction_ids=transcript_interaction_ids,
+        appended_events=[
+            events_by_id[event_id]
+            for event_id in receipt.appended_event_ids
+            if event_id in events_by_id
+        ],
+        referenced_events=[
+            events_by_id[event_id] for event_id in referenced_event_ids if event_id in events_by_id
+        ],
+    )
+
+
+def load_attestation(
+    connection: sqlite3.Connection, receipt: RuntimePublicationReceipt
+) -> RetentionCompactionAttestation | None:
+    row = connection.execute(
+        "SELECT record_json FROM cayu_session_operations "
+        "WHERE session_id = ? AND idempotency_key = ?",
+        (receipt.session_id, retention_attestation_storage_key(receipt.publication_id)),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        record = json.loads(row["record_json"])
+    except json.JSONDecodeError:
+        return None
+    return parse_retention_attestation(record, receipt)
+
+
 def validate_material(connection: sqlite3.Connection, receipt: RuntimePublicationReceipt) -> None:
     try:
-        transcript_rows = connection.execute(
-            "SELECT interaction_id, message_json FROM cayu_transcript_messages "
-            "WHERE session_id = ? AND session_order > ? AND session_order <= ? "
-            "ORDER BY session_order ASC",
-            (
-                receipt.session_id,
-                receipt.transcript_start_cursor,
-                receipt.transcript_end_cursor,
-            ),
-        ).fetchall()
-        transcript = [Message(**json.loads(row["message_json"])) for row in transcript_rows]
-        transcript_interaction_ids = [row["interaction_id"] for row in transcript_rows]
-
-        referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
-        requested_event_ids = tuple(
-            dict.fromkeys((*receipt.appended_event_ids, *referenced_event_ids))
-        )
-        events_by_id: dict[str, Event] = {}
-        if requested_event_ids:
-            placeholders = ", ".join("?" for _ in requested_event_ids)
-            rows = connection.execute(
-                f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
-                f"WHERE session_id = ? AND event_id IN ({placeholders})",
-                (receipt.session_id, *requested_event_ids),
-            ).fetchall()
-            events_by_id = {row["event_id"]: sqlite_records.event_from_row(row) for row in rows}
-        _validate_runtime_publication_durable_material(
-            receipt,
-            transcript_messages=transcript,
-            transcript_interaction_ids=transcript_interaction_ids,
-            appended_events=(
-                events_by_id[event_id]
-                for event_id in receipt.appended_event_ids
-                if event_id in events_by_id
-            ),
-            durable_referenced_events=(
-                events_by_id[event_id]
-                for event_id in referenced_event_ids
-                if event_id in events_by_id
-            ),
-        )
+        material = load_material(connection, receipt)
+        try:
+            _validate_runtime_publication_receipt_material(receipt, material)
+        except SessionRuntimePublicationConflict:
+            # Storage-retention compaction may have replaced tool-output bodies
+            # under an attestation bound to this exact receipt.
+            attestation = load_attestation(connection, receipt)
+            if attestation is None:
+                raise
+            _validate_runtime_publication_receipt_material(receipt, material, attestation)
     except SessionRuntimePublicationConflict:
         raise
     except (TypeError, ValueError, json.JSONDecodeError) as exc:

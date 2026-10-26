@@ -131,7 +131,10 @@ if __name__ == "__main__":
 
 `cayu session usage SESSION_ID --sqlite sessions.db` shows the run's model calls
 after the script exits. Use a `claude` CLI version that the installed
-`claude-agent-sdk` supports.
+`claude-agent-sdk` supports. `sessions.db` keeps every run until something removes
+it; for a long-lived service, schedule storage retention with
+`run_storage_retention_worker` or `cayu storage prune --apply`
+([storage retention](https://github.com/cayu-dev/cayu/blob/main/docs/storage-retention.md)).
 
 `local_agent_launch` gives the CLI `PATH`, `HOME` and the locale settings of this
 process, so a CLI that is already logged in keeps using its login. No other host

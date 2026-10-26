@@ -436,6 +436,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.runtime.public_authority",
         "public_authority_alias_is_reserved",
     ),
+    "report_storage_growth": ("cayu.runtime.storage_retention", "report_storage_growth"),
     "retry_decision": ("cayu.runtime.retry_policy", "retry_decision"),
     "run_storage_retention_worker": (
         "cayu.runtime.storage_retention",
@@ -645,6 +646,7 @@ PUBLIC_NAMES = [
     "parse_public_authority_alias",
     "public_authority_alias_codec_from_environment",
     "public_authority_alias_is_reserved",
+    "report_storage_growth",
     "retry_decision",
     "run_storage_retention_worker",
     "runtime_evidence",
