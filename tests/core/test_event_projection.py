@@ -3313,3 +3313,39 @@ def test_terminal_failure_evidence_keys_survive_secret_collisions(event_type: Ev
         assert actual[key] == value
     assert actual["deadline"]["source"] == REDACTED_SECRET
     assert actual["run_epoch"] == 7
+
+
+def test_policy_path_matching_indexes_literal_and_wildcard_patterns():
+    from cayu.runtime._event_projection import _path_matches_any
+
+    patterns = frozenset(
+        {
+            ("result", "artifacts"),
+            ("result", "*", "id"),
+            ("items", "*"),
+            ("*",),
+        }
+    )
+    matching = [
+        ("result", "artifacts"),
+        ("result", "anything", "id"),
+        ("result", "*", "id"),
+        ("items", "0"),
+        ("items", "*"),
+        ("top",),
+    ]
+    not_matching = [
+        (),
+        ("result", "artifacts", "id", "extra"),
+        ("result", "artifact"),
+        ("result", "anything", "name"),
+        ("items", "0", "id"),
+        ("*", "artifacts"),
+    ]
+    for path in matching:
+        assert _path_matches_any(path, patterns)
+        assert _path_matches_any(path, list(patterns))
+    for path in not_matching:
+        assert not _path_matches_any(path, patterns)
+        assert not _path_matches_any(path, list(patterns))
+    assert not _path_matches_any(("result", "artifacts"), frozenset())

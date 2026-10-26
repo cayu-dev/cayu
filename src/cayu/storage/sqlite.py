@@ -8168,7 +8168,10 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
+                        # The preservation step returns a fresh validated copy.
+                        sqlite_records.checkpoint_row_values(
+                            session_id, transformed, updated_at, owned=True
+                        ),
                     )
                 connection.commit()
             except BaseException as primary:
@@ -8234,7 +8237,10 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_records.checkpoint_row_values(session_id, transformed, now),
+                        # The preservation step returns a fresh validated copy.
+                        sqlite_records.checkpoint_row_values(
+                            session_id, transformed, now, owned=True
+                        ),
                     )
                 connection.commit()
             except BaseException:

@@ -169,6 +169,11 @@ _DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN = 3
 _DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS = 32
 _DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS = 0
 _DEFAULT_ESTIMATE_TOOL_SCHEMA_CHARS_PER_TOKEN = 4
+# ASCII bytes for which str.isspace/isalnum/isdigit hold, so ASCII text can be
+# classified with bytes.translate instead of a Python pass per character.
+_ASCII_SPACE_BYTES = bytes(byte for byte in range(128) if chr(byte).isspace())
+_ASCII_ALNUM_BYTES = bytes(byte for byte in range(128) if chr(byte).isalnum())
+_ASCII_DIGIT_BYTES = bytes(byte for byte in range(128) if chr(byte).isdigit())
 _INTERNAL_REQUEST_OPTION_KEYS = frozenset(
     {
         "agent_metadata",
@@ -682,14 +687,21 @@ class ObservedDeltaContextEstimator:
         length = len(value)
         if length < 200:
             return float(self.chars_per_token)
-        whitespace_count = sum(1 for char in value if char.isspace())
-        alnum_count = sum(1 for char in value if char.isalnum())
+        if value.isascii():
+            encoded = value.encode("ascii")
+            whitespace_count = length - len(encoded.translate(None, _ASCII_SPACE_BYTES))
+            alnum_count = length - len(encoded.translate(None, _ASCII_ALNUM_BYTES))
+            digit_count = length - len(encoded.translate(None, _ASCII_DIGIT_BYTES))
+        else:
+            whitespace_count = sum(1 for char in value if char.isspace())
+            alnum_count = sum(1 for char in value if char.isalnum())
+            digit_count = sum(1 for char in value if char.isdigit())
         punctuation_count = length - whitespace_count - alnum_count
         whitespace_ratio = whitespace_count / length
         punctuation_ratio = punctuation_count / length
         quote_ratio = value.count('"') / length
         comma_ratio = value.count(",") / length
-        digit_ratio = sum(1 for char in value if char.isdigit()) / length
+        digit_ratio = digit_count / length
         if whitespace_ratio <= 0.03 or punctuation_ratio >= 0.30:
             if comma_ratio >= 0.05 or digit_ratio >= 0.12 or punctuation_ratio < 0.10:
                 return min(float(self.chars_per_token), 2.5)

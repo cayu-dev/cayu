@@ -287,6 +287,80 @@ def test_copy_event_reuses_validated_text_but_revalidates_mutation(monkeypatch) 
         copy_event(event)
 
 
+def test_event_deepcopy_copies_a_stamped_payload_once_and_restamps_it(monkeypatch) -> None:
+    from copy import deepcopy
+
+    from cayu.events import event_payload_authority_is_runtime_generated
+
+    content = "validated-deepcopy-content-" + ("x" * 50_000)
+    event = event_with_runtime_payload_authority(
+        Event(
+            type=EventType.TOOL_CALL_COMPLETED,
+            session_id="session-deepcopy",
+            payload={
+                "tool_call_id": "call-deepcopy",
+                "result": {"content": content, "structured": {"nested": ["safe"]}},
+            },
+        ),
+        "tool_call_id",
+    )
+    validated_lengths: list[int] = []
+    original = validation._require_durable_text
+
+    def counted(value: str, field_name: str, *, path: str) -> str:
+        validated_lengths.append(len(value))
+        return original(value, field_name, path=path)
+
+    monkeypatch.setattr(validation, "_require_durable_text", counted)
+
+    for copied in (event.model_copy(deep=True), deepcopy(event)):
+        assert copied == event
+        assert copied.payload is not event.payload
+        assert copied.payload["result"] is not event.payload["result"]
+        assert copied.payload["result"]["structured"] is not event.payload["result"]["structured"]
+        assert copied.payload["result"]["content"] is content
+        assert event_payload_authority_is_runtime_generated(
+            copied, field_name="tool_call_id", value="call-deepcopy"
+        )
+        # The copy's stamp proves its own payload, so copying it again does
+        # not revalidate the text.
+        assert copy_event(copied).payload["result"]["content"] is content
+    assert len(content) not in validated_lengths
+
+    shared = deepcopy([event, event])
+    assert shared[0] is shared[1]
+
+    copied = event.model_copy(deep=True)
+    copied.payload["result"]["structured"]["nested"][0] = "changed-copy"
+    assert event.payload["result"]["structured"]["nested"] == ["safe"]
+
+    event.payload["result"]["structured"]["nested"][0] = "changed"
+    mutated = deepcopy(event)
+    assert mutated.payload["result"]["structured"]["nested"] == ["changed"]
+    assert mutated.payload["result"] is not event.payload["result"]
+    event.payload["result"]["structured"]["nested"][0] = object()
+    with pytest.raises(DurableValueError, match="invalid_json_type"):
+        copy_event(deepcopy(event))
+
+
+def test_event_deepcopy_keeps_payload_references_shared_through_the_memo() -> None:
+    from copy import deepcopy
+
+    event = Event(type="custom.example", session_id="s", payload={"items": [], "nested": {}})
+
+    copied_event, copied_items = deepcopy([event, event.payload["items"]])
+    copied_items.append("added")
+    assert copied_event.payload["items"] == ["added"]
+
+    copied_payload, copied_event = deepcopy([event.payload, event])
+    assert copied_payload is copied_event.payload
+    assert copied_payload is not event.payload
+
+    copied_nested, copied_event, again = deepcopy([event.payload["nested"], event, event])
+    assert copied_nested is copied_event.payload["nested"]
+    assert again is copied_event
+
+
 def test_copy_event_reuses_only_the_exact_admitted_envelope(monkeypatch):
     from cayu import events
 

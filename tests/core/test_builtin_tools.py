@@ -3237,6 +3237,26 @@ def test_read_file_rejects_binary_bytes_even_with_text_extension(tmp_path):
     assert result.structured["inspectable"] is False
 
 
+def test_read_file_classifies_control_characters_by_share_of_decoded_text(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+    # Tabs, newlines, form feeds, carriage returns and ESC are text. Other
+    # control bytes count against a 5% share of the decoded characters, and
+    # multibyte characters count once.
+    text = ("é" * 60 + "\t\n\x0c\r\x1b") * 20 + "\x01\x02\x03"
+    binary = "é" * 60 + "\x01\x02\x03\x04"
+    asyncio.run(workspace.write_bytes("notes/text.txt", text.encode()))
+    asyncio.run(workspace.write_bytes("notes/control.txt", binary.encode()))
+
+    text_result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes/text.txt"}))
+    binary_result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes/control.txt"}))
+
+    assert text_result.is_error is False
+    assert "é" in text_result.content
+    assert binary_result.is_error is True
+    assert binary_result.structured["binary"] is True
+
+
 def test_read_file_rejects_binary_bytes_after_text_prefix(tmp_path):
     workspace = LocalWorkspace(tmp_path, workspace_id="local")
     ctx = ToolContext(session_id="sess_1", workspace=workspace)

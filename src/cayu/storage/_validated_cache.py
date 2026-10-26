@@ -18,6 +18,7 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _MAX_SOURCE_BYTES = 8 * 1024 * 1024
 _MAX_ENTRIES = 64
+_IMMUTABLE_SCALARS = frozenset({str, int, float, bool})
 
 
 def _key(value: Any) -> tuple[Any, int]:
@@ -33,6 +34,25 @@ def _key(value: Any) -> tuple[Any, int]:
     if isinstance(value, bytes):
         return (bytes, value), 64 + len(value)
     return (type(value), value), 64
+
+
+def _detached_copy(value: Any) -> Any:
+    """Deep-copy a cached projection, rebuilding JSON containers directly.
+
+    Decoded checkpoints are fresh trees of dicts, lists and immutable scalars
+    with no shared or circular containers, so rebuilding the containers
+    detaches them exactly as ``deepcopy`` would, without its per-node memo
+    work. Anything else (models, tuples, non-string keys) uses ``deepcopy``.
+    """
+
+    value_type = type(value)
+    if value_type is dict and all(type(key) is str for key in value):
+        return {key: _detached_copy(item) for key, item in value.items()}
+    if value_type is list:
+        return [_detached_copy(item) for item in value]
+    if value is None or value_type in _IMMUTABLE_SCALARS:
+        return value
+    return deepcopy(value)
 
 
 def validated_row_cache(function: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -58,9 +78,9 @@ def validated_row_cache(function: Callable[_P, _T]) -> Callable[_P, _T]:
             if cached is not None:
                 cache.move_to_end(key)
         if cached is not None:
-            return deepcopy(cached[0])
+            return _detached_copy(cached[0])
         result = function(*args, **kwargs)
-        private = deepcopy(result)
+        private = _detached_copy(result)
         with lock:
             previous = cache.pop(key, None)
             if previous is not None:

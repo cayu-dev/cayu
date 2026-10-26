@@ -143,6 +143,7 @@ _PIL_IMAGE_FORMAT_CONTENT_TYPES = {
     "WEBP": "image/webp",
 }
 _CONTROL_TEXT_BYTES = {9, 10, 12, 13, 27}
+_BINARY_CONTROL_BYTES = bytes(byte for byte in range(32) if byte not in _CONTROL_TEXT_BYTES)
 _TEXT_CONTENT_TYPES = {
     "application/javascript",
     "application/json",
@@ -1422,9 +1423,9 @@ def _is_binary_workspace_file(*, content_type: str, content: bytes) -> bool:
         return True
     if not decoded:
         return False
-    control_count = sum(
-        1 for char in decoded if ord(char) < 32 and ord(char) not in _CONTROL_TEXT_BYTES
-    )
+    # Valid UTF-8 encodes code points below 32 as those single bytes and never
+    # uses such bytes inside a multibyte sequence, so count them in C.
+    control_count = len(content) - len(content.translate(None, _BINARY_CONTROL_BYTES))
     if control_count / len(decoded) > 0.05:
         return True
     if _is_text_content_type(content_type):

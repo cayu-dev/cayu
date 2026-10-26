@@ -662,6 +662,44 @@ def test_observed_delta_context_estimator_uses_adaptive_text_density():
     assert markdown_tokens == math.ceil(len(markdown) / 3.75)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "".join(chr(code) for code in range(128)) * 3,
+        "\x1c\x1d\x1e\x1f" * 60 + "word " * 20,
+        "1,2,3,4,5,6,7,8,9\n" * 20,
+        "prose with words and spaces. " * 10 + "é",
+        "²³ digits ٣ and spaces\u2028" * 20,
+    ],
+)
+def test_text_density_classifies_ascii_and_unicode_text_alike(text):
+    estimator = ObservedDeltaContextEstimator(chars_per_token=5)
+
+    def reference(value: str) -> float:
+        length = len(value)
+        whitespace = sum(1 for char in value if char.isspace()) / length
+        punctuation = (
+            length
+            - sum(1 for char in value if char.isspace())
+            - sum(1 for char in value if char.isalnum())
+        ) / length
+        digits = sum(1 for char in value if char.isdigit()) / length
+        quotes, commas = value.count('"') / length, value.count(",") / length
+        if whitespace <= 0.03 or punctuation >= 0.30:
+            if commas >= 0.05 or digits >= 0.12 or punctuation < 0.10:
+                return 2.5
+            return 3.0
+        if punctuation >= 0.25 or quotes >= 0.08:
+            return 2.5
+        if digits >= 0.15 and punctuation >= 0.10:
+            return 2.75
+        if punctuation >= 0.12:
+            return 3.75
+        return 5.0
+
+    assert estimator._text_chars_per_token(text) == reference(text)
+
+
 def test_observed_delta_context_estimator_uses_tool_schema_density_override():
     estimator = ObservedDeltaContextEstimator(chars_per_token=5, json_chars_per_token=5)
     tools = [

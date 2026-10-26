@@ -4,6 +4,7 @@ from collections.abc import Collection, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from hmac import compare_digest
 from typing import Any, cast
 
@@ -2817,6 +2818,13 @@ def _path_matches_any(
     path: tuple[str, ...],
     patterns: Collection[tuple[str, ...]],
 ) -> bool:
+    if type(patterns) is frozenset:
+        # Payload projection asks this for every node of every event, so look
+        # literal patterns up by hash and scan only wildcards of equal length.
+        literal, wildcards = _indexed_path_patterns(patterns)
+        if path in literal:
+            return True
+        patterns = wildcards.get(len(path), ())
     return any(
         len(path) == len(pattern)
         and all(
@@ -2824,6 +2832,25 @@ def _path_matches_any(
             for actual, expected in zip(path, pattern, strict=True)
         )
         for pattern in patterns
+    )
+
+
+@lru_cache(maxsize=512)
+def _indexed_path_patterns(
+    patterns: frozenset[tuple[str, ...]],
+) -> tuple[frozenset[tuple[str, ...]], dict[int, tuple[tuple[str, ...], ...]]]:
+    """Split one immutable policy pattern set into literal paths and wildcards."""
+
+    literal: set[tuple[str, ...]] = set()
+    wildcards: dict[int, list[tuple[str, ...]]] = {}
+    for pattern in patterns:
+        if "*" in pattern:
+            wildcards.setdefault(len(pattern), []).append(pattern)
+        else:
+            literal.add(pattern)
+    return (
+        frozenset(literal),
+        {length: tuple(group) for length, group in wildcards.items()},
     )
 
 
@@ -3539,6 +3566,10 @@ def _copy_projected_event(
                 codec=_require_public_authority_alias_codec(public_authority_alias_codec),
                 session_id=event.session_id,
             )
+    # copy_event already owns a detached copy and the update replaces every
+    # field except the immutable timestamp, so a shallow copy is enough. A deep
+    # copy would also copy the stale payload stamp, which holds the whole
+    # replaced payload; the stamp cannot match the new payload either way.
     projected = copy_event(event).model_copy(
         update={
             "type": event_type,
@@ -3561,7 +3592,6 @@ def _copy_projected_event(
             ),
             "payload": payload,
         },
-        deep=True,
     )
     if not redact_session_id:
         return projected

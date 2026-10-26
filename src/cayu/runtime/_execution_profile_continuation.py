@@ -7,6 +7,7 @@ import hmac
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
@@ -907,7 +908,11 @@ class ExecutionProfileContinuation:
         return target
 
 
+@lru_cache(maxsize=1)
 def _runtime_version() -> str | None:
+    # The running code cannot change version within a process; like
+    # current_runtime_build_provenance, resolve it once instead of parsing
+    # package metadata for every live profile check.
     try:
         return version("cayu")
     except PackageNotFoundError:

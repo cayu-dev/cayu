@@ -429,10 +429,20 @@ def checkpoint_row_values(
     session_id: str,
     checkpoint: dict[str, Any],
     updated_at: datetime,
+    *,
+    owned: bool = False,
 ) -> tuple[object, ...]:
+    """Serialize one checkpoint row.
+
+    ``owned`` is only for a checkpoint the calling statement just produced with
+    ``copy_durable_json_object`` and has not shared, so copying it again would
+    repeat the same validation on the same private object.
+    """
+
     from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
 
-    checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
+    if not owned:
+        checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
     return (
         session_id,

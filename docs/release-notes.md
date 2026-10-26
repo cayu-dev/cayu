@@ -53,6 +53,13 @@ not affect execution or approval.
 
 ### Changes
 
+- A tool call uses about 15% less runtime CPU with the SQLite store and about
+  20% less with the in-memory store. Copying a validated event no longer
+  copies its validation stamp or validates a changed payload twice, event
+  projection looks up policy paths by hash, the Cayu package version is read
+  once per process, `read_file` and context estimates classify ASCII text in C,
+  and the SQLite checkpoint cache and checkpoint writes skip redundant copies.
+  Validation, durable formats and recovery are unchanged.
 - `register_agent(..., environment_name=...)` sets the environment a new run of
   that agent uses when its request names none. Pass a registered environment
   name, or the new `cayu.environments.NO_ENVIRONMENT` to run the agent without

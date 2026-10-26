@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -32,6 +33,11 @@ class _PayloadIdentity:
 
     def __eq__(self, other: object) -> bool:
         return type(other) is _PayloadIdentity and self.value is other.value
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _PayloadIdentity:
+        # Same result as the generic slots reconstruction, which dominated
+        # deep copies of stamped events.
+        return _PayloadIdentity(deepcopy(self.value, memo))
 
 
 class _PayloadStampMismatch(Exception):
@@ -349,6 +355,33 @@ class Event(BaseModel):
         finally:
             value = None
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Event:
+        """Deep-copy a stamped payload in one pass instead of copying its stamp too.
+
+        The generic copy also deep-copies ``_payload_validation_stamp``, which
+        holds an identity node for every payload value. For a standalone copy
+        (``model_copy(deep=True)``) whose stamp still proves the payload is the
+        validated tree, copy its containers once and restamp the copy; every
+        other field and private attribute still takes the generic path.
+
+        A caller memo means the event is copied as part of a larger structure
+        that may also hold its payload or part of it, so that copy, like a
+        changed payload, takes the generic path and keeps the shared references.
+        """
+
+        if type(self) is not Event or memo is not None:
+            return super().__deepcopy__(memo)
+        stamp = self._payload_validation_stamp
+        try:
+            payload = _copy_prevalidated_payload(self.payload, stamp)
+        except _PayloadStampMismatch:
+            return super().__deepcopy__()
+        # Nothing outside this event refers to the payload or its stamp, and a
+        # validated payload is a tree, so mapping just these two is complete.
+        return super().__deepcopy__(
+            {id(self.payload): payload, id(stamp): _durable_payload_stamp(payload)}
+        )
+
     def __eq__(self, other: object) -> bool:
         """Compare only public durable fields, never private projection metadata."""
 
@@ -508,9 +541,14 @@ def copy_event(event: Event) -> Event:
         )
     except _PayloadStampMismatch:
         payload_is_unchanged = False
+        # The same admission Event's payload validator applies, so an object
+        # result is installed below instead of being copied a second time. A
+        # non-object still goes through the constructor and fails its type check.
         payload = copy_durable_record(event.payload, "payload", limits=DURABLE_DOCUMENT_LIMITS)
+        payload_is_admitted = type(payload) is dict
     else:
         payload_is_unchanged = True
+        payload_is_admitted = True
     copied = Event(
         type=event.type,
         session_id=event.session_id,
@@ -523,12 +561,15 @@ def copy_event(event: Event) -> Event:
         tool_name=event.tool_name,
         # Validate the small envelope normally. The payload is installed below
         # only when its structural stamp proves it is the exact graph already
-        # accepted by Event's durable validator.
-        payload={} if payload_is_unchanged else payload,
+        # accepted by Event's durable validator, or it was just admitted above.
+        payload={} if payload_is_admitted else payload,
     )
-    if payload_is_unchanged:
+    if payload_is_admitted:
         copied.payload = payload
-        if event._candidate_envelope_stamp != copied._candidate_envelope_stamp:
+        if (
+            not payload_is_unchanged
+            or event._candidate_envelope_stamp != copied._candidate_envelope_stamp
+        ):
             copied._candidate_envelope_stamp = _validate_event_candidate(copied)
         copied._payload_validation_stamp = _durable_payload_stamp(payload)
     copied._id_origin = event._id_origin
