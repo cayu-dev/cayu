@@ -5955,7 +5955,7 @@ def test_postgres_listener_start_during_admission_does_not_duplicate_wake(postgr
         await _truncate(postgres_dsn)
         store = _new_store(postgres_dsn)
         original_ensure_listener = store._ensure_task_admission_listener
-        original_run_mutation = store._run_verified_work_mutation
+        original_run_mutation = store._run_owned_mutation
         mutation_ready = asyncio.Event()
         allow_commit = asyncio.Event()
         wakeups = []
@@ -5979,7 +5979,7 @@ def test_postgres_listener_start_during_admission_does_not_duplicate_wake(postgr
 
                 return await original_run_mutation(paused_operation)
 
-            store._run_verified_work_mutation = MethodType(pause_before_commit, store)
+            store._run_owned_mutation = MethodType(pause_before_commit, store)
             waits = [asyncio.create_task(wakeup.wait(10.0, None)) for wakeup in wakeups]
             await asyncio.sleep(0)
             creation = asyncio.create_task(

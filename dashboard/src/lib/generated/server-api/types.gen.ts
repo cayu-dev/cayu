@@ -9210,6 +9210,10 @@ export type EvalSuiteSaveRequest = {
      */
     expected_suite_revision: string;
     /**
+     * Parent Suite Revision
+     */
+    parent_suite_revision?: string | null;
+    /**
      * Suite
      */
     suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3;

@@ -1063,7 +1063,9 @@ class _PostgresStoreBase:
                                 cur
                             )
                         if self._min_required_revision >= 64:
-                            await postgres_eval_schema._validate_eval_authored_suite_schema(cur)
+                            await postgres_eval_schema._validate_eval_authored_suite_schema(
+                                cur, require_parent_binding=self._min_required_revision >= 131
+                            )
                         if self._min_required_revision >= 66:
                             await postgres_task_schema._validate_local_execution_attempt_schema(cur)
                         if self._min_required_revision >= 70:
@@ -1433,7 +1435,9 @@ class _PostgresStoreBase:
             await postgres_verified_work_schema._validate_deferred_interaction_input_payloads(cur)
             await postgres_verified_work_schema._validate_work_attempt_continuation_authority(cur)
         if self._min_required_revision >= 64:
-            await postgres_eval_schema._validate_eval_authored_suite_schema(cur)
+            await postgres_eval_schema._validate_eval_authored_suite_schema(
+                cur, require_parent_binding=self._min_required_revision >= 131
+            )
         if self._min_required_revision >= 68:
             await postgres_eval_schema._validate_eval_judge_calibration_schema(cur)
         if self._min_required_revision >= 72:
@@ -1576,8 +1580,10 @@ class _PostgresStoreBase:
             await postgres_verified_work_schema._validate_work_attempt_continuation_authority(cur)
         if revision.revision == 63:
             await postgres_knowledge_schema._validate_knowledge_maintenance_schema(cur)
-        if revision.revision == 64:
-            await postgres_eval_schema._validate_eval_authored_suite_schema(cur)
+        if revision.revision in (64, 131):
+            await postgres_eval_schema._validate_eval_authored_suite_schema(
+                cur, require_parent_binding=revision.revision >= 131
+            )
         if revision.revision == 65:
             await postgres_knowledge_schema._validate_knowledge_revision_schema(
                 cur,

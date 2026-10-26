@@ -19161,6 +19161,20 @@
             "title": "Expected Suite Revision",
             "type": "string"
           },
+          "parent_suite_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Suite Revision"
+          },
           "suite": {
             "anyOf": [
               {
@@ -36064,7 +36078,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "65",
+            "default": "66",
             "title": "Contract Version",
             "type": "string"
           },
@@ -43480,7 +43494,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "65",
+            "default": "66",
             "title": "Contract Version",
             "type": "string"
           }

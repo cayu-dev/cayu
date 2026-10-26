@@ -244,7 +244,9 @@ def _validate_eval_scenario_schema(connection: sqlite3.Connection) -> None:
             )
 
 
-def _validate_eval_authored_suite_schema(connection: sqlite3.Connection) -> None:
+def _validate_eval_authored_suite_schema(
+    connection: sqlite3.Connection, *, require_parent_binding: bool = False
+) -> None:
     expected_columns = (
         ("revision", "TEXT", 0, 1),
         ("suite_id", "TEXT", 1, 0),
@@ -266,6 +268,11 @@ def _validate_eval_authored_suite_schema(connection: sqlite3.Connection) -> None
         (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
         for row in connection.execute("PRAGMA table_info(cayu_eval_authored_suites)")
     )
+    parent_binding = require_parent_binding or any(
+        row[0] == "parent_revision" for row in actual_columns
+    )
+    if parent_binding:
+        expected_columns += (("parent_revision", "TEXT", 0, 0),)
     if actual_columns != expected_columns:
         _raise_eval_authored_suite_schema_error("cayu_eval_authored_suites")
     table_row = connection.execute(
@@ -289,6 +296,11 @@ def _validate_eval_authored_suite_schema(connection: sqlite3.Connection) -> None
         "check(simple_input_count+scenario_count=case_count)",
         "check(assertion_count*trials<=10000)",
     )
+    if parent_binding:
+        required_fragments += (
+            "check(parent_revisionisnullor(length(parent_revision)=71and"
+            "substr(parent_revision,1,7)='sha256:'andsubstr(parent_revision,8)notglob'*[^0-9a-f]*'))",
+        )
     if "collatenocase" in normalized or any(
         fragment not in normalized for fragment in required_fragments
     ):

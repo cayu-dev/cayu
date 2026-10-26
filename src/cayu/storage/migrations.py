@@ -556,6 +556,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=129, kind=RevisionKind.ADDITIVE, compatible_from=127),
     # Atomic session additions retain exact replay and nonportable source provenance.
     Revision(revision=130, kind=RevisionKind.ADDITIVE, compatible_from=127),
+    # Bind authored child publication to its exact parent independently of portable content.
+    Revision(revision=131, kind=RevisionKind.ADDITIVE, compatible_from=127),
 )
 
 #: The revision an empty database is initialized to.

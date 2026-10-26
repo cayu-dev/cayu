@@ -871,7 +871,7 @@ def test_sqlite_eval_store_requires_current_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 130"):
+    with pytest.raises(SchemaTooOld, match="requires >= 131"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
@@ -965,7 +965,7 @@ def test_sqlite_eval_store_requires_and_migrates_revision_seventy_four(
         finally:
             connection.close()
 
-        with pytest.raises(SchemaTooOld, match="requires >= 130"):
+        with pytest.raises(SchemaTooOld, match="requires >= 131"):
             SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
         migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
@@ -1043,7 +1043,7 @@ def test_sqlite_revision_sixty_four_rejects_conflicting_authored_suite_table(
     finally:
         connection.close()
 
-    with pytest.raises(RuntimeError, match="authored suite safety constraints"):
+    with pytest.raises(RuntimeError, match="revision-64 authored-suite contract"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
     connection = sqlite3.connect(path)
     try:

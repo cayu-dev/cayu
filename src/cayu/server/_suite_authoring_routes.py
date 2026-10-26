@@ -323,6 +323,7 @@ def register_suite_authoring_routes(
             entry = await eval_store.save_authored_suite(
                 suite,
                 redact_json=registration.target.app.redact_json,
+                parent_suite_revision=body.parent_suite_revision,
             )
         except EvalAuthoredSuiteConflict as exc:
             raise HTTPException(

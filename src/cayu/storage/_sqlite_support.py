@@ -1301,7 +1301,9 @@ def reconcile_schema(
         # payload is validated again at its indexed read boundary.
         sqlite_session_schema._validate_revision_sixty_two_payload_schema(connection)
     if app_min_supported >= 64:
-        sqlite_eval_schema._validate_eval_authored_suite_schema(connection)
+        sqlite_eval_schema._validate_eval_authored_suite_schema(
+            connection, require_parent_binding=app_min_supported >= 131
+        )
     if app_min_supported >= 66:
         sqlite_task_schema._validate_local_execution_attempt_schema(connection)
     if app_min_supported >= 68:
@@ -1716,8 +1718,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             sqlite_knowledge_schema._validate_revision_60_knowledge_schema(connection)
         if rev.revision == 63:
             sqlite_knowledge_schema._validate_revision_63_knowledge_schema(connection)
-        if rev.revision == 64:
-            sqlite_eval_schema._validate_eval_authored_suite_schema(connection)
+        if rev.revision in (64, 131):
+            sqlite_eval_schema._validate_eval_authored_suite_schema(
+                connection, require_parent_binding=rev.revision >= 131
+            )
         if rev.revision == 65:
             sqlite_knowledge_schema._validate_revision_42_knowledge_schema(
                 connection,

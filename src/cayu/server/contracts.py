@@ -1704,6 +1704,7 @@ class EvalSuiteSaveRequest(ApiBaseModel):
 
     expected_suite_revision: EvalRevision
     suite: EvalSuiteDocument
+    parent_suite_revision: EvalRevision | None = None
 
 
 class EvalSuiteSaveResponse(ApiBaseModel):

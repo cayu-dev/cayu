@@ -765,8 +765,10 @@ def test_postgres_task_store_accepts_static_nonbehavioral_pool_options() -> None
     assert PostgresTaskStore(pool=pool)._pool is pool
 
 
+@pytest.mark.parametrize("publication", ["verified-work", "eval-authored"])
 def test_postgres_verified_work_rollback_failure_preserves_primary_and_fences_connection(
     monkeypatch,
+    publication,
 ) -> None:
     _allow_test_postgres_mutation_boundary(monkeypatch)
     primary = ValueError("primary mutation failure")
@@ -827,8 +829,31 @@ def test_postgres_verified_work_rollback_failure_preserves_primary_and_fences_co
             del conn, cursor
             raise primary
 
+        if publication == "eval-authored":
+            from tests.evals.test_suite_authoring import _draft
+
+            from cayu.evals.suite_authoring import compile_eval_suite_draft
+            from cayu.storage.evals_postgres import PostgresEvalStore
+
+            class EvalStore(PostgresEvalStore):
+                def __init__(self):
+                    self._pool = Pool()
+                    self._owns_pool = False
+                    self._read_only = False
+
+                async def _ensure_ready(self):
+                    pass
+
+                async def _save_prepared_authored_suite_in_transaction(self, *args, **kwargs):
+                    raise primary
+
+            mutation = EvalStore().save_authored_suite(
+                compile_eval_suite_draft(_draft()), redact_json=lambda value: value
+            )
+        else:
+            mutation = Store()._run_owned_mutation(operation)
         with pytest.raises(BaseExceptionGroup) as captured:
-            await Store()._run_verified_work_mutation(operation)
+            await mutation
 
         assert captured.value.exceptions == (primary, rollback_failure)
         assert connection.closed is True
@@ -913,7 +938,7 @@ def test_postgres_cancelled_mutation_closes_exact_connection_before_return(
                 await connection_closed.wait()
                 raise
 
-        caller = asyncio.create_task(Store()._run_verified_work_mutation(operation))
+        caller = asyncio.create_task(Store()._run_owned_mutation(operation))
         await wait_for_fake_step(operation_started, caller)
         caller.cancel("stop blocked Postgres mutation")
         assert caller.cancelling() == 1
@@ -1010,7 +1035,7 @@ def test_postgres_cancelled_mutation_preserves_owner_and_abort_failures(
             operation_started.set()
             await asyncio.Event().wait()
 
-        caller = asyncio.create_task(Store()._run_verified_work_mutation(operation))
+        caller = asyncio.create_task(Store()._run_owned_mutation(operation))
         await wait_for_fake_step(operation_started, caller)
         caller.cancel("cancel with compound settlement failures")
 
@@ -1108,7 +1133,7 @@ def test_public_boundary_preserves_redacted_postgres_cancellation_settlement_fai
                     await asyncio.Event().wait()
                     return contract
 
-                return await self._run_verified_work_mutation(operation)
+                return await self._run_owned_mutation(operation)
 
         app = CayuApp(
             task_store=Store(),
@@ -1158,3 +1183,17 @@ def test_public_boundary_preserves_redacted_postgres_cancellation_settlement_fai
         assert connection.closed is True
 
     asyncio.run(scenario())
+
+
+def test_owned_postgres_pool_accepts_builtin_health_check_but_rejects_custom_check():
+    from psycopg_pool import AsyncConnectionPool
+
+    standard = AsyncConnectionPool("", open=False, check=AsyncConnectionPool.check_connection)
+    postgres_verified_work._require_quiescent_postgres_mutation_pool(standard)
+
+    async def unverified_check(connection):
+        await AsyncConnectionPool.check_connection(connection)
+
+    custom = AsyncConnectionPool("", open=False, check=unverified_check)
+    with pytest.raises(TypeError, match="check callback"):
+        postgres_verified_work._require_quiescent_postgres_mutation_pool(custom)

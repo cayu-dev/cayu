@@ -539,7 +539,9 @@ async def _validate_eval_scenario_schema(cur: Any) -> None:
         _raise_eval_scenario_schema_error(str(unexpected_unique_index[0]))
 
 
-async def _validate_eval_authored_suite_schema(cur: Any) -> None:
+async def _validate_eval_authored_suite_schema(
+    cur: Any, *, require_parent_binding: bool = False
+) -> None:
     await cur.execute(
         """
             SELECT column_name, data_type, is_nullable, collation_name
@@ -566,7 +568,13 @@ async def _validate_eval_authored_suite_schema(cur: Any) -> None:
         ("document_bytes", "bigint", "NO", None),
         ("created_at", "timestamp with time zone", "NO", None),
     )
-    if tuple(await cur.fetchall()) != expected_columns:
+    actual_columns = tuple(await cur.fetchall())
+    parent_binding = require_parent_binding or any(
+        row[0] == "parent_revision" for row in actual_columns
+    )
+    if parent_binding:
+        expected_columns += (("parent_revision", "text", "YES", "C"),)
+    if actual_columns != expected_columns:
         _raise_eval_authored_suite_schema_error("cayu_eval_authored_suites")
     expected_constraints = (
         ("p", ("primary key (revision)",)),
@@ -582,6 +590,10 @@ async def _validate_eval_authored_suite_schema(cur: Any) -> None:
         ("c", ("assertion_count * trials", "<= 10000")),
         ("c", ("document_json", "::jsonb is not null")),
     )
+    if parent_binding:
+        expected_constraints += (
+            ("c", ("parent_revision is null", "parent_revision ~", "^sha256:[0-9a-f]{64}$")),
+        )
     await cur.execute(
         """
             SELECT constraint_record.contype,

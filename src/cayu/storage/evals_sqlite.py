@@ -23,6 +23,10 @@ if TYPE_CHECKING:
         RetentionReport,
     )
 
+from cayu.evals._authored_publication import (
+    authored_parent_scope,
+    require_authored_parent_replay,
+)
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
     EvalJudgeCalibrationReportV1,
@@ -175,7 +179,7 @@ from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 130
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 131
 
 logger = logging.getLogger(__name__)
 
@@ -1092,7 +1096,27 @@ class SQLiteEvalStore(EvalStore):
 
         return await self._run(operation)
 
-    def _save_prepared_authored_suite_in_transaction(self, connection, validated, payload):
+    def _inherit_case_addition_sources(
+        self,
+        connection,
+        parent_selector: str,
+        child_selector: str,
+        members: frozenset[tuple[str, str]],
+    ) -> None:
+        rows = connection.execute(
+            "SELECT case_id, case_revision, operation_id FROM cayu_eval_case_addition_sources WHERE destination_selector = ?",
+            (parent_selector,),
+        ).fetchall()
+        for case_id, case_revision, operation_id in rows:
+            if (case_id, case_revision) in members:
+                connection.execute(
+                    "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (child_selector, case_id, case_revision, operation_id),
+                )
+
+    def _save_prepared_authored_suite_in_transaction(
+        self, connection, validated, payload, *, parent_suite_revision=None, parent_scope=None
+    ):
         document_text = payload.decode("utf-8")
         scenario_cases = authored_suite_scenario_cases(validated)
         scenario_revisions = tuple(
@@ -1117,7 +1141,7 @@ class SQLiteEvalStore(EvalStore):
                 scenario_by_revision.get(reference.scenario_revision),
             )
         existing = connection.execute(
-            "SELECT document_json FROM cayu_eval_authored_suites WHERE revision = ?",
+            "SELECT document_json, parent_revision FROM cayu_eval_authored_suites WHERE revision = ?",
             (validated.revision,),
         ).fetchone()
         if existing is not None:
@@ -1125,6 +1149,9 @@ class SQLiteEvalStore(EvalStore):
                 raise EvalAuthoredSuiteConflict(
                     f"Authored eval suite revision {validated.revision} has conflicting content."
                 )
+            require_authored_parent_replay(
+                validated.revision, existing["parent_revision"], parent_suite_revision
+            )
             entry = self._load_authored_suite_entry(
                 connection,
                 validated.revision,
@@ -1142,8 +1169,8 @@ class SQLiteEvalStore(EvalStore):
                 revision, suite_id, suite_revision, target_key, name,
                 description, case_count, assertion_count,
                 simple_input_count, scenario_count, trials,
-                timeout_seconds, document_json, document_bytes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                timeout_seconds, document_json, document_bytes, created_at, parent_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry.revision,
@@ -1161,8 +1188,16 @@ class SQLiteEvalStore(EvalStore):
                 document_text,
                 entry.document_bytes,
                 _format_datetime(entry.created_at),
+                parent_suite_revision,
             ),
         )
+        if parent_scope is not None:
+            self._inherit_case_addition_sources(
+                connection,
+                parent_scope.parent_selector,
+                parent_scope.child_selector,
+                parent_scope.unchanged_members,
+            )
         return entry
 
     async def save_authored_suite(
@@ -1170,7 +1205,10 @@ class SQLiteEvalStore(EvalStore):
         document: EvalSuiteDocument,
         *,
         redact_json: Callable[[Any], Any],
+        parent_suite_revision: str | None = None,
     ) -> EvalAuthoredSuiteCatalogEntry:
+        if parent_suite_revision is not None:
+            parent_suite_revision = _sha256_revision(parent_suite_revision, "parent_suite_revision")
         validated, payload = await asyncio.to_thread(
             _prepare_authored_suite_for_store,
             document,
@@ -1178,16 +1216,23 @@ class SQLiteEvalStore(EvalStore):
         )
 
         def operation(connection):
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                entry = self._save_prepared_authored_suite_in_transaction(
-                    connection, validated, payload
+            with sqlite_connection._transaction(connection):
+                scope = None
+                if parent_suite_revision is not None:
+                    parent = connection.execute(
+                        "SELECT document_json FROM cayu_eval_authored_suites WHERE revision = ?",
+                        (parent_suite_revision,),
+                    ).fetchone()
+                    scope = authored_parent_scope(
+                        validated, parent_suite_revision, None if parent is None else parent[0]
+                    )
+                return self._save_prepared_authored_suite_in_transaction(
+                    connection,
+                    validated,
+                    payload,
+                    parent_suite_revision=parent_suite_revision,
+                    parent_scope=scope,
                 )
-                connection.commit()
-                return entry
-            except BaseException:
-                connection.rollback()
-                raise
 
         return await self._run(operation)
 
@@ -2751,7 +2796,13 @@ class SQLiteEvalStore(EvalStore):
                 now = record.receipt.created_at
                 if documents.authored is not None:
                     self._save_prepared_authored_suite_in_transaction(
-                        connection, *documents.authored
+                        connection,
+                        *documents.authored,
+                        parent_suite_revision=(
+                            documents.authored[0].revision
+                            if record.receipt.plan.parent == record.receipt.plan.destination
+                            else None
+                        ),
                     )
                 if documents.corpus is not None:
                     corpus, payload, inspection, suites, cases = documents.corpus
@@ -2794,16 +2845,9 @@ class SQLiteEvalStore(EvalStore):
                         child_selector,
                         members,
                     ) in documents.inherited_membership_scopes:
-                        inherited = connection.execute(
-                            "SELECT case_id, case_revision, operation_id FROM cayu_eval_case_addition_sources WHERE destination_selector = ?",
-                            (parent_selector,),
-                        ).fetchall()
-                        for case_id, case_revision, operation_id in inherited:
-                            if (case_id, case_revision) in members:
-                                connection.execute(
-                                    "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                                    (child_selector, case_id, case_revision, operation_id),
-                                )
+                        self._inherit_case_addition_sources(
+                            connection, parent_selector, child_selector, members
+                        )
                     connection.execute(
                         "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
                         (

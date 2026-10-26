@@ -3328,11 +3328,17 @@ class EvalStore(ABC):
         self,
         document: EvalSuiteDocument,
         *,
+        parent_suite_revision: str | None = None,
         redact_json: Callable[[Any], Any],
     ) -> EvalAuthoredSuiteCatalogEntry:
-        """Scan and atomically save one reviewed immutable authored suite."""
+        """Publish exact content and parent binding; inherit only unchanged private links.
 
-        del document, redact_json
+        A parent must resolve to the same target and suite ID. Replay binds its
+        revision (including None); saving the selected document unchanged is a
+        read-only no-op. Portable case metadata never authenticates source links.
+        """
+
+        del document, redact_json, parent_suite_revision
         raise NotImplementedError("Authored eval suite persistence is not supported.")
 
     async def load_authored_suite(
@@ -3847,6 +3853,7 @@ class InMemoryEvalStore(EvalStore):
             # on any failure, including a late receipt serialization/publication failure.
             names = (
                 "_authored_suite_documents",
+                "_authored_suite_parents",
                 "_authored_suites",
                 "_corpus_documents",
                 "_corpora",
@@ -3860,7 +3867,14 @@ class InMemoryEvalStore(EvalStore):
             try:
                 now = record.receipt.created_at
                 if documents.authored is not None:
-                    self._save_prepared_authored_suite(*documents.authored)
+                    self._save_prepared_authored_suite(
+                        *documents.authored,
+                        parent_suite_revision=(
+                            documents.authored[0].revision
+                            if record.receipt.plan.parent == record.receipt.plan.destination
+                            else None
+                        ),
+                    )
                 if documents.corpus is not None:
                     corpus, payload, _, suites, cases = documents.corpus
                     self._save_prepared_corpus(corpus, payload, suites, cases, created_at=now)
@@ -3874,12 +3888,9 @@ class InMemoryEvalStore(EvalStore):
                         child_selector,
                         members,
                     ) in documents.inherited_membership_scopes:
-                        for case_id, case_revision in members:
-                            inherited = self._case_addition_sources.get((parent_selector, case_id))
-                            if inherited is not None and inherited[0] == case_revision:
-                                self._case_addition_sources.setdefault(
-                                    (child_selector, case_id), inherited
-                                )
+                        self._inherit_case_addition_sources(
+                            parent_selector, child_selector, members
+                        )
                     self._case_addition_sources.setdefault(
                         (destination, record.receipt.plan.case_id),
                         (record.receipt.plan.case_revision, operation_id),
@@ -4106,6 +4117,7 @@ class InMemoryEvalStore(EvalStore):
         self._scenario_documents: dict[str, bytes] = {}
         self._scenarios: dict[str, EvalScenarioCatalogEntry] = {}
         self._authored_suite_documents: dict[str, bytes] = {}
+        self._authored_suite_parents: dict[str, str | None] = {}
         self._authored_suites: dict[str, EvalAuthoredSuiteCatalogEntry] = {}
         self._judge_calibration_documents: dict[str, bytes] = {}
         self._judge_calibration_revisions_by_run_id: dict[str, str] = {}
@@ -4289,7 +4301,19 @@ class InMemoryEvalStore(EvalStore):
                 ]
             return _bounded_scenario_page(items, query)
 
-    def _save_prepared_authored_suite(self, validated, payload):
+    def _inherit_case_addition_sources(
+        self, parent_selector: str, child_selector: str, members: frozenset[tuple[str, str]]
+    ) -> None:
+        for case_id, case_revision in members:
+            inherited = self._case_addition_sources.get((parent_selector, case_id))
+            if inherited is not None and inherited[0] == case_revision:
+                self._case_addition_sources.setdefault((child_selector, case_id), inherited)
+
+    def _save_prepared_authored_suite(
+        self, validated, payload, *, parent_suite_revision=None, parent_scope=None
+    ):
+        from cayu.evals._authored_publication import require_authored_parent_replay
+
         scenario_cases = authored_suite_scenario_cases(validated)
         scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
         revisions = {reference.scenario_revision for _, reference in scenario_cases}
@@ -4311,6 +4335,11 @@ class InMemoryEvalStore(EvalStore):
                 raise EvalAuthoredSuiteConflict(
                     f"Authored eval suite revision {validated.revision} has conflicting content."
                 )
+            require_authored_parent_replay(
+                validated.revision,
+                self._authored_suite_parents[validated.revision],
+                parent_suite_revision,
+            )
             return self._authored_suites[validated.revision].model_copy(deep=True)
         entry = authored_suite_catalog_entry(
             validated,
@@ -4318,18 +4347,66 @@ class InMemoryEvalStore(EvalStore):
             document_bytes=len(payload),
         )
         self._authored_suite_documents[validated.revision] = payload
+        self._authored_suite_parents[validated.revision] = parent_suite_revision
         self._authored_suites[validated.revision] = entry
+        if parent_scope is not None:
+            self._inherit_case_addition_sources(
+                parent_scope.parent_selector,
+                parent_scope.child_selector,
+                parent_scope.unchanged_members,
+            )
         return entry.model_copy(deep=True)
 
     async def save_authored_suite(
         self,
         document: EvalSuiteDocument,
         *,
+        parent_suite_revision: str | None = None,
         redact_json: Callable[[Any], Any],
     ) -> EvalAuthoredSuiteCatalogEntry:
+        from cayu.evals._authored_publication import authored_parent_scope
+
+        if parent_suite_revision is not None:
+            parent_suite_revision = _sha256_revision(parent_suite_revision, "parent_suite_revision")
         validated, payload = _prepare_authored_suite_for_store(document, redact_json=redact_json)
         async with self._lock:
-            return self._save_prepared_authored_suite(validated, payload)
+            scope = None
+            if parent_suite_revision is not None:
+                parent = self._authored_suite_documents.get(parent_suite_revision)
+                scope = authored_parent_scope(
+                    validated, parent_suite_revision, None if parent is None else parent.decode()
+                )
+            # Existing revisions are read-only. For a new revision snapshot only
+            # its bounded case associations, never the whole catalog.
+            existed = validated.revision in self._authored_suite_documents
+            previous_sources = (
+                {}
+                if scope is None
+                else {
+                    (scope.child_selector, case_id): self._case_addition_sources.get(
+                        (scope.child_selector, case_id)
+                    )
+                    for case_id, _ in scope.unchanged_members
+                }
+            )
+            try:
+                return self._save_prepared_authored_suite(
+                    validated,
+                    payload,
+                    parent_suite_revision=parent_suite_revision,
+                    parent_scope=scope,
+                )
+            except BaseException:
+                if not existed:
+                    self._authored_suite_documents.pop(validated.revision, None)
+                    self._authored_suite_parents.pop(validated.revision, None)
+                    self._authored_suites.pop(validated.revision, None)
+                    for key, value in previous_sources.items():
+                        if value is None:
+                            self._case_addition_sources.pop(key, None)
+                        else:
+                            self._case_addition_sources[key] = value
+                raise
 
     async def load_authored_suite(
         self,

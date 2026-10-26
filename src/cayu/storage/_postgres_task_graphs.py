@@ -299,7 +299,7 @@ async def create_graph(
         await notify_readiness(cur)
         return admission.receipt
 
-    return await store._run_verified_work_mutation(operation)
+    return await store._run_owned_mutation(operation)
 
 
 async def record_transition(

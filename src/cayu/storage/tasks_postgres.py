@@ -859,7 +859,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 await self._store_local_execution_attempt_row(cur, record, insert=True)
             return record.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(mutation)
+        return await self._run_owned_mutation(mutation)
 
     async def start_local_execution_attempt(
         self,
@@ -906,7 +906,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 await self._store_local_execution_attempt_row(cur, updated, insert=False)
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(mutation)
+        return await self._run_owned_mutation(mutation)
 
     async def settle_local_execution_attempt(
         self,
@@ -941,7 +941,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 await self._store_local_execution_attempt_row(cur, updated, insert=False)
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(mutation)
+        return await self._run_owned_mutation(mutation)
 
     async def load_local_execution_attempt(
         self,
@@ -1028,7 +1028,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 await self._store_local_execution_attempt_row(cur, updated, insert=False)
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(mutation)
+        return await self._run_owned_mutation(mutation)
 
     @runtime_task_creation
     async def create_task_operation(
@@ -1223,7 +1223,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             return task, publish_admission_wakeup
 
         try:
-            outcome, publish_admission_wakeup = await self._run_verified_work_mutation(operation)
+            outcome, publish_admission_wakeup = await self._run_owned_mutation(operation)
         except BaseException as exc:
             if notification_sender_pid is not None:
                 self._discard_task_admission_notification_sender(
@@ -1369,7 +1369,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             await cur.execute("SELECT pg_notify(%s, %s)", (_TASK_ADMISSION_NOTIFY_CHANNEL, ""))
             return receipt
 
-        receipt = await self._run_verified_work_mutation(operation)
+        receipt = await self._run_owned_mutation(operation)
         self._publish_task_admission_broadcast()
         return receipt
 
@@ -1455,7 +1455,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             )
             return receipt
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def list_task_schedule_events(
         self, task_id: str, *, after_sequence: int = 0, limit: int = 100
@@ -2341,7 +2341,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             await self._record_task_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def attach_task(
         self,
@@ -2420,7 +2420,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             await self._record_task_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def complete_task(
         self,
@@ -4064,7 +4064,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             await self._record_task_transition(cur, current, started)
             return (await self._require_task(cur, task_id)).model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     @runtime_task_mutation
     async def pause_task(
@@ -5233,7 +5233,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             await self._record_task_transition(cur, prior, updated)
             return updated
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def _finish_task_in_transaction(
         self,

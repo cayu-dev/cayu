@@ -418,7 +418,7 @@ def addition_environment(tmp_path):
             if backend == "memory"
             else SQLiteEvalStore(tmp_path / f"additions-{len(contexts)}.db")
         )
-        if backend == "postgres":
+        if backend == "postgres" and store_override is None:
             from cayu.storage.evals_postgres import PostgresEvalStore
             from cayu.storage.migrations import SchemaMode
 

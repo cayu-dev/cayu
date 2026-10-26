@@ -689,6 +689,11 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    131: (
+        "ALTER TABLE cayu_eval_authored_suites ADD COLUMN IF NOT EXISTS "
+        'parent_revision TEXT COLLATE "C" CONSTRAINT cayu_eval_authored_parent_revision_check '
+        "CHECK (parent_revision IS NULL OR parent_revision ~ '^sha256:[0-9a-f]{64}$')",
+    ),
     130: (
         """CREATE TABLE IF NOT EXISTS cayu_eval_session_additions (
         operation_id TEXT PRIMARY KEY,

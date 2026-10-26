@@ -20,7 +20,12 @@ from cayu.evals.session_additions import (
     addition_operation_id,
     addition_revision,
 )
-from cayu.evals.store import EvalStore, EvalStorePublicationRejected, EvalStoreResultTooLarge
+from cayu.evals.store import (
+    EvalAuthoredSuiteConflict,
+    EvalStore,
+    EvalStorePublicationRejected,
+    EvalStoreResultTooLarge,
+)
 from cayu.server._captured_evaluation_source import CapturedEvaluationSource
 from cayu.server._eval_addition_planner import EvalAdditionPlanner
 from cayu.server._eval_view_reader import EvalViewReader
@@ -138,7 +143,7 @@ def register_eval_addition_routes(
             saved = await active_store.publish_session_addition(
                 prepared, record, redact_json=source.app.redact_json
             )
-        except EvalAdditionConflict as exc:
+        except (EvalAdditionConflict, EvalAuthoredSuiteConflict) as exc:
             raise HTTPException(
                 status_code=409, detail="The session addition conflicts with its stored operation."
             ) from exc

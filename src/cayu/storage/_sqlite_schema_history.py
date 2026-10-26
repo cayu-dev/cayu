@@ -4391,6 +4391,16 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    131: (
+        (
+            "cayu_eval_authored_suites",
+            "parent_revision",
+            "TEXT COLLATE BINARY CONSTRAINT cayu_eval_authored_parent_revision_check "
+            "CHECK (parent_revision IS NULL OR (length(parent_revision) = 71 AND "
+            "substr(parent_revision, 1, 7) = 'sha256:' AND "
+            "substr(parent_revision, 8) NOT GLOB '*[^0-9a-f]*'))",
+        ),
+    ),
     129: (("cayu_transcript_messages", "message_bytes", "INTEGER"),),
     126: (("cayu_task_interrupted_continuation_claims", "expected_sha256", "TEXT COLLATE BINARY"),),
     124: (("cayu_tasks", "concurrency_key", "TEXT COLLATE BINARY"),),

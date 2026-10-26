@@ -223,8 +223,8 @@ def test_postgres_graph_cancel_before_commit_rolls_back_all_members(
 
 def test_postgres_graph_creation_commit_then_raise_replays(postgres_dsn: str) -> None:
     class LostAcknowledgementStore(PostgresTaskStore):
-        async def _run_verified_work_mutation(self, operation):
-            await super()._run_verified_work_mutation(operation)
+        async def _run_owned_mutation(self, operation):
+            await super()._run_owned_mutation(operation)
             raise RuntimeError("acknowledgement lost after graph commit")
 
     async def run() -> None:

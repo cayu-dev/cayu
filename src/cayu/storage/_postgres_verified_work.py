@@ -174,8 +174,8 @@ def _require_quiescent_postgres_mutation_pool(
         raise TypeError(f"{boundary} require the built-in psycopg AsyncConnection implementation.")
     if pool._configure is not allowed_configure:
         raise TypeError(f"{boundary} do not accept an unverified pool configure callback.")
-    if pool._check is not None:
-        raise TypeError(f"{boundary} do not accept a pool check callback.")
+    if pool._check is not None and pool._check is not AsyncConnectionPool.check_connection:
+        raise TypeError(f"{boundary} do not accept an unverified pool check callback.")
     if pool._reset is not None:
         raise TypeError(f"{boundary} do not accept a pool reset callback.")
     if pool._reconnect_failed is not None:
@@ -346,34 +346,12 @@ def _json_document(value: object) -> object:
     return json.loads(value) if isinstance(value, str) else value
 
 
-class PostgresVerifiedWorkMixin:
-    """Transactional verified-work behavior mixed into ``PostgresTaskStore``."""
-
-    verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
+class PostgresMutationMixin:
+    """Own transactional dispatch, bounded cancellation and connection revocation."""
 
     if TYPE_CHECKING:
         _pool: Any
-        _clock_is_injected: bool
-        _clock: Callable[[], datetime]
         _postgres_mutation_allowed_configure: Any
-
-        async def _ensure_ready(self) -> None: ...
-
-        async def _claim_concurrency_key(self, cur: Any, task: Task) -> bool: ...
-        async def _lock_concurrency_key_for_renewal(self, cur: Any, task_id: str) -> None: ...
-        async def _concurrency_key_available(self, cur: Any, task: Task) -> bool: ...
-
-        async def _record_task_transition(
-            self,
-            cur: Any,
-            prior: Task | None,
-            current: Task,
-            *,
-            operation_id: str | None = None,
-            settled_execution: tuple[str, str, datetime] | None = None,
-        ) -> None: ...
-
-        def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]: ...
 
     async def _await_owned_store_mutation(
         self,
@@ -459,12 +437,14 @@ class PostgresVerifiedWorkMixin:
                 # Key admission rechecks require a fresh statement snapshot,
                 # including behind transaction pools and nondefault DB roles.
                 await connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                if getattr(self, "_read_only", False):
+                    await connection.execute("SET TRANSACTION READ ONLY")
                 yield timed_postgres_connection(connection)
         finally:
             if connection is not None:
                 connection_owner.release(connection)
 
-    async def _run_verified_work_mutation(
+    async def _run_owned_mutation(
         self,
         operation: Callable[[Any, Any], Coroutine[Any, Any, _T]],
     ) -> _T:
@@ -502,8 +482,7 @@ class PostgresVerifiedWorkMixin:
                             abort_failure.__context__ = None
                             failures.append(abort_failure)
                         raise BaseExceptionGroup(
-                            "Postgres verified-work transaction failed and rollback "
-                            "could not be proven",
+                            "Postgres mutation transaction failed and rollback could not be proven",
                             failures,
                         ) from None
                     raise
@@ -512,6 +491,34 @@ class PostgresVerifiedWorkMixin:
             transact(),
             connection_owner=connection_owner,
         )
+
+
+class PostgresVerifiedWorkMixin(PostgresMutationMixin):
+    """Transactional verified-work behavior mixed into ``PostgresTaskStore``."""
+
+    verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
+
+    if TYPE_CHECKING:
+        _clock_is_injected: bool
+        _clock: Callable[[], datetime]
+
+        async def _ensure_ready(self) -> None: ...
+
+        async def _claim_concurrency_key(self, cur: Any, task: Task) -> bool: ...
+        async def _lock_concurrency_key_for_renewal(self, cur: Any, task_id: str) -> None: ...
+        async def _concurrency_key_available(self, cur: Any, task: Task) -> bool: ...
+
+        async def _record_task_transition(
+            self,
+            cur: Any,
+            prior: Task | None,
+            current: Task,
+            *,
+            operation_id: str | None = None,
+            settled_execution: tuple[str, str, datetime] | None = None,
+        ) -> None: ...
+
+        def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]: ...
 
     async def _database_now(self, cur: Any) -> datetime:
         # Lease authority must be evaluated after any preceding row-lock wait.
@@ -1186,7 +1193,7 @@ class PostgresVerifiedWorkMixin:
             )
             return copy_work_contract(contract)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
         copied = copy_work_contract_ref(reference)
@@ -1256,7 +1263,7 @@ class PostgresVerifiedWorkMixin:
                 await self._raise_if_retired_task_session(cur, session_id)
             await self._ensure_session_authority(cur, session_id, "ordinary")
 
-        await self._run_verified_work_mutation(operation)
+        await self._run_owned_mutation(operation)
 
     async def hold_claimed_work_contract_task(
         self,
@@ -1313,7 +1320,7 @@ class PostgresVerifiedWorkMixin:
             await self._record_task_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def _work_attempt_continuation_context(
         self,
@@ -1672,7 +1679,7 @@ class PostgresVerifiedWorkMixin:
             await self._insert_work_attempt_execution_claim_row(cur, claim)
             return admission.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def activate_work_attempt_admission(
         self,
@@ -1784,7 +1791,7 @@ class PostgresVerifiedWorkMixin:
             await self._update_work_attempt_admission_row(cur, activated)
             return activated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_work_attempt_admission(
         self,
@@ -1899,7 +1906,7 @@ class PostgresVerifiedWorkMixin:
                 await self._update_work_attempt_admission_row(cur, result.admission)
             return result
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def record_work_attempt_execution_stop(
         self, request: WorkAttemptExecutionStopRequest
@@ -1926,7 +1933,7 @@ class PostgresVerifiedWorkMixin:
                 await self._update_work_attempt_admission_row(cur, result)
             return result
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def _load_work_attempt_preparation_hold(
         self, cur: Any, hold_id: str
@@ -2006,7 +2013,7 @@ class PostgresVerifiedWorkMixin:
             )
             return receipt
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def list_unsettled_work_attempt_admissions(
         self,
@@ -2158,7 +2165,7 @@ class PostgresVerifiedWorkMixin:
             return receipt
 
         try:
-            return await self._run_verified_work_mutation(operation)
+            return await self._run_owned_mutation(operation)
         except (LockNotAvailable, DeadlockDetected):
             raise WorkAttemptExecutionClaimLost(
                 "Lifecycle settlement is contending with another owner."
@@ -2261,7 +2268,7 @@ class PostgresVerifiedWorkMixin:
             )
             return renewed.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def claim_work_attempt_recovery(
         self,
@@ -2420,7 +2427,7 @@ class PostgresVerifiedWorkMixin:
             )
             return recovering.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def activate_work_attempt_recovery(
         self,
@@ -2510,7 +2517,7 @@ class PostgresVerifiedWorkMixin:
             await self._update_work_attempt_admission_row(cur, active)
             return active.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def begin_work_attempt(self, request: WorkAttemptCreate) -> WorkAttempt:
         request = copy_work_attempt_create(request)
@@ -2619,7 +2626,7 @@ class PostgresVerifiedWorkMixin:
             )
             return attempt.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
@@ -2711,7 +2718,7 @@ class PostgresVerifiedWorkMixin:
             )
             return proposal.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def submit_admitted_completion_proposal(
         self,
@@ -2865,7 +2872,7 @@ class PostgresVerifiedWorkMixin:
             )
             return proposal.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
@@ -2986,7 +2993,7 @@ class PostgresVerifiedWorkMixin:
             )
             return copy_completion_verifier_profile_record(record)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_completion_verifier_profile(
         self,
@@ -3156,7 +3163,7 @@ class PostgresVerifiedWorkMixin:
             )
             return claim.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_completion_verification_claim(
         self,
@@ -3262,7 +3269,7 @@ class PostgresVerifiedWorkMixin:
                 )
             return renewed.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def record_completion_decision(
         self,
@@ -3389,7 +3396,7 @@ class PostgresVerifiedWorkMixin:
             )
             return decision.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_completion_decision(
         self,
@@ -3538,7 +3545,7 @@ class PostgresVerifiedWorkMixin:
             )
             return copy_completion_verifier_dispatch(record)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def settle_completion_verifier_dispatch(
         self,
@@ -3576,7 +3583,7 @@ class PostgresVerifiedWorkMixin:
                     )
             return copy_completion_verifier_dispatch(updated)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def list_completion_verifier_dispatches(
         self,
@@ -3703,7 +3710,7 @@ class PostgresVerifiedWorkMixin:
             )
             return copy_completion_evaluation_run(record)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def settle_completion_evaluation_run(
         self,
@@ -3734,7 +3741,7 @@ class PostgresVerifiedWorkMixin:
                     )
             return copy_completion_evaluation_run(updated)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def list_completion_evaluation_runs(
         self,
@@ -3881,7 +3888,7 @@ class PostgresVerifiedWorkMixin:
             )
             return updated.model_copy(deep=True)
 
-        return await self._run_verified_work_mutation(operation)
+        return await self._run_owned_mutation(operation)
 
     async def load_completion_decision_application_receipt(
         self,

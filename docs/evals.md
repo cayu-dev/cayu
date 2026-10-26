@@ -558,12 +558,25 @@ Protected servers with durable Evals expose preview/save/catalog/download at
 `/api/evals/suites`. Preview canonicalizes a draft without persistence or
 execution and reports target or scenario-reference readiness. Save accepts only
 the exact reviewed revision, scans it through the target's credential-redaction
-boundary, and atomically verifies every scenario reference. The authored-suite
- catalog was introduced at storage revision 64; current SQLite and PostgreSQL
- EvalStore implementations require revision 72 for restart-safe trial
- checkpoints. Custom EvalStore adapters remain readable but cannot admit fresh
- eval work unless they implement the fenced terminal-checkpoint contract and
- declare `trial_checkpointing = True`. These authoring contracts
+boundary, and atomically verifies every scenario reference. When editing a saved
+suite, send its exact revision as `parent_suite_revision`. The store verifies
+that parent belongs to the same target and suite ID, then atomically saves the
+child and inherits private source-session associations only for unchanged case
+IDs and revisions. Copied portable source metadata alone never creates a link.
+Changed or removed cases do not inherit links; baselines and executions are not
+copied.
+
+The child revision is durably bound to its original publication parent, including
+an omitted/null parent. Retrying the same child with another or omitted parent
+returns a conflict; an existing unparented import cannot be upgraded into trusted
+provenance. Saving an unchanged document with its own revision as parent is a
+read-only no-op: the document must already exist and no associations are added.
+New saves without a parent retain ordinary immutable authored-suite behavior.
+Current SQLite and PostgreSQL EvalStore implementations require storage revision
+131 for this atomic parent binding and source preservation. Custom EvalStore
+adapters remain readable but cannot admit fresh eval work unless they implement
+the fenced terminal-checkpoint contract and declare `trial_checkpointing = True`.
+These authoring contracts
 do not create provider, tool, environment, fixture, secret, or runtime
 authority. New V3 drafts still default to one trial, one required pass, and
 concurrency one; V1/V2 documents remain readable with that fail-closed policy.

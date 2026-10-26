@@ -18,6 +18,10 @@ if TYPE_CHECKING:
         RetentionReport,
     )
 
+from cayu.evals._authored_publication import (
+    authored_parent_scope,
+    require_authored_parent_replay,
+)
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
     EvalJudgeCalibrationReportV1,
@@ -161,9 +165,10 @@ from cayu.evals.suite_authoring import (
     eval_suite_document_from_json,
 )
 from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
-from cayu.storage._postgres_base import _PostgresStoreBase
+from cayu.storage._postgres_base import _configure_store_connection, _PostgresStoreBase
+from cayu.storage._postgres_verified_work import PostgresMutationMixin
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 130
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 131
 
 logger = logging.getLogger(__name__)
 
@@ -425,10 +430,14 @@ def _baseline_mutation_from_row(row: Any) -> EvalBaselineMutationRecord:
     )
 
 
-class PostgresEvalStore(_PostgresStoreBase, EvalStore):
+class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
     """Restart-durable, multi-worker eval persistence for PostgreSQL."""
 
     supports_storage_retention: ClassVar[bool] = True
+
+    @property
+    def _postgres_mutation_allowed_configure(self) -> Any:
+        return _configure_store_connection if self._owns_pool else None
 
     async def apply_retention_policy(
         self,
@@ -735,7 +744,23 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             query,
         )
 
-    async def _save_prepared_authored_suite_in_transaction(self, cur, validated, payload):
+    async def _inherit_case_addition_sources(
+        self, cur, parent_selector: str, child_selector: str, members: frozenset[tuple[str, str]]
+    ) -> None:
+        await cur.execute(
+            "SELECT case_id, case_revision, operation_id FROM cayu_eval_case_addition_sources WHERE destination_selector = %s",
+            (parent_selector,),
+        )
+        for case_id, case_revision, operation_id in await cur.fetchall():
+            if (case_id, case_revision) in members:
+                await cur.execute(
+                    "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (child_selector, case_id, case_revision, operation_id),
+                )
+
+    async def _save_prepared_authored_suite_in_transaction(
+        self, cur, validated, payload, *, parent_suite_revision=None, parent_scope=None
+    ):
         document_text = payload.decode("utf-8")
         scenario_cases = authored_suite_scenario_cases(validated)
         scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
@@ -769,10 +794,10 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                 revision, suite_id, suite_revision, target_key, name,
                 description, case_count, assertion_count,
                 simple_input_count, scenario_count, trials,
-                timeout_seconds, document_json, document_bytes, created_at
+                timeout_seconds, document_json, document_bytes, created_at, parent_revision
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (revision) DO NOTHING
             RETURNING revision
@@ -793,11 +818,12 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                 document_text,
                 entry.document_bytes,
                 entry.created_at,
+                parent_suite_revision,
             ),
         )
         if await cur.fetchone() is None:
             await cur.execute(
-                "SELECT document_json FROM cayu_eval_authored_suites WHERE revision = %s",
+                "SELECT document_json, parent_revision FROM cayu_eval_authored_suites WHERE revision = %s",
                 (validated.revision,),
             )
             existing = await cur.fetchone()
@@ -805,12 +831,20 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                 raise EvalAuthoredSuiteConflict(
                     f"Authored eval suite revision {validated.revision} has conflicting content."
                 )
+            require_authored_parent_replay(validated.revision, existing[1], parent_suite_revision)
             loaded = await self._load_authored_suite_entry(
                 cur,
                 validated.revision,
             )
             assert loaded is not None
-            entry = loaded
+            return loaded
+        if parent_scope is not None:
+            await self._inherit_case_addition_sources(
+                cur,
+                parent_scope.parent_selector,
+                parent_scope.child_selector,
+                parent_scope.unchanged_members,
+            )
         return entry
 
     async def save_authored_suite(
@@ -818,24 +852,37 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         document: EvalSuiteDocument,
         *,
         redact_json: Callable[[Any], Any],
+        parent_suite_revision: str | None = None,
     ) -> EvalAuthoredSuiteCatalogEntry:
+        if parent_suite_revision is not None:
+            parent_suite_revision = _sha256_revision(parent_suite_revision, "parent_suite_revision")
         validated, payload = await asyncio.to_thread(
             _prepare_authored_suite_for_store,
             document,
             redact_json=redact_json,
         )
         await self._ensure_ready()
-        async with self._connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    entry = await self._save_prepared_authored_suite_in_transaction(
-                        cur, validated, payload
-                    )
-                await conn.commit()
-                return entry
-            except BaseException:
-                await conn.rollback()
-                raise
+
+        async def publish(conn, cur):
+            scope = None
+            if parent_suite_revision is not None:
+                await cur.execute(
+                    "SELECT document_json FROM cayu_eval_authored_suites WHERE revision = %s",
+                    (parent_suite_revision,),
+                )
+                parent = await cur.fetchone()
+                scope = authored_parent_scope(
+                    validated, parent_suite_revision, None if parent is None else parent[0]
+                )
+            return await self._save_prepared_authored_suite_in_transaction(
+                cur,
+                validated,
+                payload,
+                parent_suite_revision=parent_suite_revision,
+                parent_scope=scope,
+            )
+
+        return await self._run_owned_mutation(publish)
 
     async def load_authored_suite(
         self,
@@ -2315,109 +2362,99 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         )
         record = documents.record
         await self._ensure_ready()
-        async with self._connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    # Unique insertion fences concurrent keys inside the same transaction.
+
+        async def publish(conn, cur):
+            # Unique insertion fences concurrent keys inside the same transaction.
+            await cur.execute(
+                "INSERT INTO cayu_eval_session_additions (operation_id, destination_selector, case_id, case_revision, result_revision, record_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (operation_id) DO NOTHING RETURNING operation_id",
+                (
+                    record.receipt.operation_id,
+                    record.receipt.plan.destination.id,
+                    record.receipt.plan.case_id,
+                    record.receipt.plan.case_revision,
+                    record.receipt.plan.captured_result_revision,
+                    record.model_dump_json(),
+                    record.receipt.created_at,
+                ),
+            )
+            if await cur.fetchone() is None:
+                await cur.execute(
+                    "SELECT record_json FROM cayu_eval_session_additions WHERE operation_id = %s",
+                    (record.receipt.operation_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise EvalAdditionConflict("The operation receipt is unavailable.")
+                return replay_addition(EvalAdditionRecord.model_validate_json(row[0]), record)
+            parent = record.receipt.plan.parent
+            if parent is not None:
+                if parent.source == "authored":
                     await cur.execute(
-                        "INSERT INTO cayu_eval_session_additions (operation_id, destination_selector, case_id, case_revision, result_revision, record_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (operation_id) DO NOTHING RETURNING operation_id",
-                        (
-                            record.receipt.operation_id,
-                            record.receipt.plan.destination.id,
-                            record.receipt.plan.case_id,
-                            record.receipt.plan.case_revision,
-                            record.receipt.plan.captured_result_revision,
-                            record.model_dump_json(),
-                            record.receipt.created_at,
-                        ),
+                        "SELECT 1 FROM cayu_eval_authored_suites WHERE revision = %s AND target_key = %s",
+                        (parent.revision, parent.target_key),
                     )
-                    if await cur.fetchone() is None:
-                        await cur.execute(
-                            "SELECT record_json FROM cayu_eval_session_additions WHERE operation_id = %s",
-                            (record.receipt.operation_id,),
-                        )
-                        row = await cur.fetchone()
-                        if row is None:
-                            raise EvalAdditionConflict("The operation receipt is unavailable.")
-                        replayed = replay_addition(
-                            EvalAdditionRecord.model_validate_json(row[0]), record
-                        )
-                        await conn.commit()
-                        return replayed
-                    parent = record.receipt.plan.parent
-                    if parent is not None:
-                        if parent.source == "authored":
-                            await cur.execute(
-                                "SELECT 1 FROM cayu_eval_authored_suites WHERE revision = %s AND target_key = %s",
-                                (parent.revision, parent.target_key),
-                            )
-                        else:
-                            await cur.execute(
-                                "SELECT 1 FROM cayu_eval_corpora WHERE revision = %s AND target_key = %s",
-                                (parent.revision, parent.target_key),
-                            )
-                        if await cur.fetchone() is None:
-                            raise EvalAdditionConflict(
-                                "The selected destination is no longer available."
-                            )
-                    now = record.receipt.created_at
-                    if documents.authored is not None:
-                        await self._save_prepared_authored_suite_in_transaction(
-                            cur, *documents.authored
-                        )
-                    if documents.corpus is not None:
-                        corpus, payload, inspection, suites, cases = documents.corpus
-                        await self._save_prepared_corpus_in_transaction(
-                            cur,
-                            corpus=corpus,
-                            document_text=payload.decode(),
-                            document_bytes=len(payload),
-                            inspection=inspection,
-                            suites=suites,
-                            cases=cases,
-                            created_at=now,
-                        )
-                    if documents.captured is not None:
-                        result, payload = documents.captured
-                        await self._save_result_in_transaction(
-                            cur,
-                            result=result,
-                            document_text=payload.decode(),
-                            document_bytes=len(payload),
-                            created_at=now,
-                            fresh_run_id=None,
-                        )
-                    if record.receipt.plan.mode == "case":
-                        destination = record.receipt.plan.destination.id
-                        for (
-                            parent_selector,
-                            child_selector,
-                            members,
-                        ) in documents.inherited_membership_scopes:
-                            await cur.execute(
-                                "SELECT case_id, case_revision, operation_id FROM cayu_eval_case_addition_sources WHERE destination_selector = %s",
-                                (parent_selector,),
-                            )
-                            for case_id, case_revision, operation_id in await cur.fetchall():
-                                if (case_id, case_revision) in members:
-                                    await cur.execute(
-                                        "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                        (child_selector, case_id, case_revision, operation_id),
-                                    )
-                        await cur.execute(
-                            "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (
-                                destination,
-                                record.receipt.plan.case_id,
-                                record.receipt.plan.case_revision,
-                                record.receipt.operation_id,
-                            ),
-                        )
-                await conn.commit()
-                return record
-            except BaseException:
-                await conn.rollback()
-                raise
+                else:
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_eval_corpora WHERE revision = %s AND target_key = %s",
+                        (parent.revision, parent.target_key),
+                    )
+                if await cur.fetchone() is None:
+                    raise EvalAdditionConflict("The selected destination is no longer available.")
+            now = record.receipt.created_at
+            if documents.authored is not None:
+                await self._save_prepared_authored_suite_in_transaction(
+                    cur,
+                    *documents.authored,
+                    parent_suite_revision=(
+                        documents.authored[0].revision
+                        if record.receipt.plan.parent == record.receipt.plan.destination
+                        else None
+                    ),
+                )
+            if documents.corpus is not None:
+                corpus, payload, inspection, suites, cases = documents.corpus
+                await self._save_prepared_corpus_in_transaction(
+                    cur,
+                    corpus=corpus,
+                    document_text=payload.decode(),
+                    document_bytes=len(payload),
+                    inspection=inspection,
+                    suites=suites,
+                    cases=cases,
+                    created_at=now,
+                )
+            if documents.captured is not None:
+                result, payload = documents.captured
+                await self._save_result_in_transaction(
+                    cur,
+                    result=result,
+                    document_text=payload.decode(),
+                    document_bytes=len(payload),
+                    created_at=now,
+                    fresh_run_id=None,
+                )
+            if record.receipt.plan.mode == "case":
+                destination = record.receipt.plan.destination.id
+                for (
+                    parent_selector,
+                    child_selector,
+                    members,
+                ) in documents.inherited_membership_scopes:
+                    await self._inherit_case_addition_sources(
+                        cur, parent_selector, child_selector, members
+                    )
+                await cur.execute(
+                    "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (
+                        destination,
+                        record.receipt.plan.case_id,
+                        record.receipt.plan.case_revision,
+                        record.receipt.operation_id,
+                    ),
+                )
+            return record
+
+        return await self._run_owned_mutation(publish)
 
     async def save_captured_result(
         self,
